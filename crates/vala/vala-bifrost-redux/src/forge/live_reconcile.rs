@@ -491,12 +491,12 @@ impl Forge {
                     )?,
                 )
                 .await?;
-                self.core.metrics.record_operation(
+                self.core.telemetry.record_operation(
                     super::metrics::ForgeMetricSource::Iceberg,
                     super::metrics::ForgeOperationResult::Recovered,
                     1,
                 );
-                self.core.metrics.record_rewrite_volume(
+                self.core.telemetry.record_rewrite_volume(
                     super::metrics::ForgeMetricSource::Iceberg,
                     volume.input_files,
                     volume.input_bytes,
@@ -588,7 +588,7 @@ impl Forge {
             iceberg_terminal_detail(&row.prepared_detail, ForgeIcebergRewritePhase::Reset, None)?,
         )
         .await?;
-        self.core.metrics.record_operation(
+        self.core.telemetry.record_operation(
             super::metrics::ForgeMetricSource::Iceberg,
             super::metrics::ForgeOperationResult::Reset,
             1,

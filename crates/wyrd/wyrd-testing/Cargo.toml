@@ -27,6 +27,7 @@ chrono = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 futures-util = { workspace = true }
 hdrhistogram = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 iceberg = { workspace = true }
 http = { workspace = true }
 opendal = { workspace = true }
@@ -67,6 +68,7 @@ wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
+wyrd-telemetry = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
 
 [[bench]]

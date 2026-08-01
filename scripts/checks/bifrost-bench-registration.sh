@@ -9,6 +9,15 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 1
 fi
 
+require_lane_runner() {
+  local manifest="$1"
+  local lane="$2"
+  local runner="$3"
+  local task_body
+  task_body="$(sed -n "/^\[tasks\.\"$lane\"\]/,/^\[tasks\./p" "$manifest")"
+  printf '%s\n' "$task_body" | rg -n -F -- "$runner" >/dev/null
+}
+
 for lane in \
   "bench:bifrost:scribe:slo" \
   "bench:bifrost:scribe:components" \
@@ -22,14 +31,34 @@ for lane in \
   fi
 done
 
-require_lane_runner() {
-  local manifest="$1"
-  local lane="$2"
-  local runner="$3"
-  local task_body
-  task_body="$(sed -n "/^\[tasks\.\"$lane\"\]/,/^\[tasks\./p" "$manifest")"
-  printf '%s\n' "$task_body" | rg -n -F -- "$runner" >/dev/null
-}
+forge_topology_lanes=(
+  "bench:bifrost:forge:single-tenant-single-node"
+  "bench:bifrost:forge:multi-tenant-single-node"
+  "bench:bifrost:forge:multi-tenant-multi-node"
+)
+for lane in "${forge_topology_lanes[@]}"; do
+  if ! rg -n -F "[tasks.\"$lane\"]" mise.toml >/dev/null; then
+    echo "missing required Forge topology benchmark lane: $lane" >&2
+    exit 1
+  fi
+  if ! require_lane_runner mise.toml "$lane" "--bench bench_bifrost_forge"; then
+    echo "Forge topology lane does not execute bench_bifrost_forge: $lane" >&2
+    exit 1
+  fi
+done
+
+forge_reports="$(for lane in "${forge_topology_lanes[@]}"; do
+  sed -n "/^\[tasks\.\"$lane\"\]/,/^\[tasks\./p" mise.toml | rg -o 'WYRD_BIFROST_REPORT = "[^"]+"' || true
+done)"
+if [[ "$(printf '%s\n' "$forge_reports" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')" != "3" ]]; then
+  echo "Forge topology lanes must write three distinct WYRD_BIFROST_REPORT paths" >&2
+  exit 1
+fi
+if ! rg -n -F '[tasks."bench:bifrost:forge:matrix"]' mise.toml >/dev/null || \
+  ! rg -n -F 'bifrost-forge-report-matrix.sh' mise.toml >/dev/null; then
+  echo "missing Forge topology report aggregation lane" >&2
+  exit 1
+fi
 
 for lane in \
   "bench:bifrost:scribe:slo" \
@@ -78,6 +107,26 @@ done
 if rg -n 'bench_real_bifrost_workload|bench_ingest_ack_latency|bench_otlp_span_ingest|otlp:ingest:rewrite' \
   mise.toml crates/wyrd/wyrd-testing/Cargo.toml crates/wyrd/wyrd-testing/benches; then
   echo "legacy Bifrost benchmark registration remains" >&2
+  exit 1
+fi
+
+if ! rg -n '^test-support = \[\]$' crates/shared/wyrd-telemetry/Cargo.toml >/dev/null; then
+  echo "wyrd-telemetry test-support must remain an empty capture-only feature" >&2
+  exit 1
+fi
+production_features="$(cargo tree --locked -p wyrd-server -e features,no-dev)"
+if printf '%s\n' "$production_features" | rg -n 'wyrd-telemetry feature "test-support"|opentelemetry_sdk feature "testing"' >/dev/null; then
+  echo "production wyrd-server feature graph enables test capture support" >&2
+  exit 1
+fi
+test_features="$(cargo tree --locked -p wyrd-testing -e features,no-dev)"
+capture_edges="$(printf '%s\n' "$test_features" | rg -c 'wyrd-telemetry feature "test-support"' || true)"
+if [[ "$capture_edges" != "1" ]]; then
+  echo "wyrd-testing graph must enable wyrd-telemetry/test-support exactly once" >&2
+  exit 1
+fi
+if printf '%s\n' "$test_features" | rg -n 'opentelemetry_sdk feature "testing"' >/dev/null; then
+  echo "test capture must not enable the broad OpenTelemetry SDK testing feature" >&2
   exit 1
 fi
 

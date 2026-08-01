@@ -10,6 +10,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
+use iceberg::Catalog;
 use opendal::{Buffer, Entry, Metadata, Operator};
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -21,7 +22,7 @@ use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
-    ForgeRewriteRuntime,
+    ForgeRewriteRuntime, ForgeSchedulerTrigger, ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::scribe::ScribeImpl;
@@ -47,12 +48,12 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
-use wyrd_server::config::ServeMode;
-use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
+use wyrd_server::config::{ForgeProcessRole, IssuerEntry, ServeMode, WorkloadBindingEntry};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::BifrostIngestRuntime;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
+use wyrd_telemetry::TelemetryGuard;
 
 /// Production-shaped object-store seam for the embedded Forge fixture.
 #[derive(Debug)]
@@ -142,14 +143,22 @@ struct WyrdTestServerInner {
     bifrost_catalog: Arc<BifrostCatalog>,
     /// Manual wall-clock control shared by every Forge fixture derived from this server.
     forge_clock: ForgeClockControl,
+    /// Test-tier trigger that wakes this server's real supervised Forge scheduler.
+    forge_scheduler_trigger: ForgeSchedulerTrigger,
+    /// Process composition selected for the real bound server supervisor.
+    forge_process_role: ForgeProcessRole,
 }
 
+/// Socket state for an in-process or production-supervised test server.
 enum Mode {
     InProcess,
     Bound {
-        addr: std::net::SocketAddr,
-        base_url: String,
-        grpc_addr: std::net::SocketAddr,
+        /// Bound HTTP address when the selected role serves the public API.
+        addr: Option<std::net::SocketAddr>,
+        /// Public HTTP origin when the selected role serves the public API.
+        base_url: Option<String>,
+        /// Bound gRPC address when the selected role serves the public API.
+        grpc_addr: Option<std::net::SocketAddr>,
     },
 }
 
@@ -169,6 +178,16 @@ pub struct WyrdTestServerBuilder {
     forge_max_files_per_bin: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
+    /// Process composition exercised when the fixture is bound to real sockets.
+    forge_process_role: ForgeProcessRole,
+    /// Optional observer of completed work from real supervised Forge workers.
+    forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
+    /// Optional test-only catalog wrapper used by supervised Forge roles.
+    forge_catalog: Option<Arc<dyn Catalog>>,
+    /// Optional complete Forge limit profile for deterministic role journeys.
+    forge_config: Option<ForgeConfig>,
+    /// Process runtime guard injected by production-shaped telemetry capture.
+    telemetry: Option<Arc<TelemetryGuard>>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -187,6 +206,11 @@ impl Default for WyrdTestServerBuilder {
             forge_max_files_per_bin: 3,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
+            forge_process_role: ForgeProcessRole::All,
+            forge_completion_observer: None,
+            forge_catalog: None,
+            forge_config: None,
+            telemetry: None,
         }
     }
 }
@@ -367,7 +391,7 @@ impl WyrdTestServer {
     #[must_use]
     pub fn base_url(&self) -> Option<&str> {
         match &self.mode {
-            Mode::Bound { base_url, .. } => Some(base_url.as_str()),
+            Mode::Bound { base_url, .. } => base_url.as_deref(),
             Mode::InProcess => None,
         }
     }
@@ -376,7 +400,7 @@ impl WyrdTestServer {
     #[must_use]
     pub fn bound_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.mode {
-            Mode::Bound { addr, .. } => Some(*addr),
+            Mode::Bound { addr, .. } => *addr,
             Mode::InProcess => None,
         }
     }
@@ -385,8 +409,14 @@ impl WyrdTestServer {
     #[must_use]
     pub fn grpc_url(&self) -> Option<String> {
         match &self.mode {
-            Mode::Bound { grpc_addr, .. } => Some(format!("http://{grpc_addr}")),
+            Mode::Bound {
+                grpc_addr: Some(grpc_addr),
+                ..
+            } => Some(format!("http://{grpc_addr}")),
             Mode::InProcess => None,
+            Mode::Bound {
+                grpc_addr: None, ..
+            } => None,
         }
     }
 
@@ -400,6 +430,26 @@ impl WyrdTestServer {
     #[must_use]
     pub fn state(&self) -> &AppState {
         &self.inner.state
+    }
+
+    /// Return the production process composition selected for this fixture.
+    #[must_use]
+    pub const fn forge_process_role(&self) -> ForgeProcessRole {
+        self.inner.forge_process_role
+    }
+
+    /// Request one pass from this bound server's production Forge scheduler.
+    ///
+    /// The request is observed only by the normal supervisor loop. It does not
+    /// call a scheduler directly or bypass durable fencing.
+    pub fn trigger_forge_scheduler_for_test(&self) {
+        self.inner.forge_scheduler_trigger.request_pass();
+    }
+
+    /// Return completed real scheduler-pass count for deterministic test waits.
+    #[must_use]
+    pub fn forge_scheduler_trigger_for_test(&self) -> ForgeSchedulerTrigger {
+        self.inner.forge_scheduler_trigger.clone()
     }
 
     /// Return the publisher paired with this server's Forge inbox.
@@ -1066,6 +1116,7 @@ impl WyrdTestServer {
         config.grpc.bind = loopback;
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
+        config.role = self.inner.forge_process_role;
 
         let bound = WyrdServer::new(config, state)
             .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
@@ -1073,13 +1124,16 @@ impl WyrdTestServer {
             .await
             .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
 
-        let addr = bound
-            .http_addr()
-            .ok_or_else(|| WyrdTestServerError::Bind("no HTTP address bound".to_owned()))?;
-        let grpc_addr = bound
-            .grpc_addr()
-            .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
-        let base_url = format!("http://{addr}");
+        let addr = bound.http_addr();
+        let grpc_addr = bound.grpc_addr();
+        let base_url = addr.map(|address| format!("http://{address}"));
+        if self.inner.forge_process_role != ForgeProcessRole::ForgeWorker
+            && (addr.is_none() || grpc_addr.is_none())
+        {
+            return Err(WyrdTestServerError::Bind(
+                "server role did not bind both public API listeners".to_owned(),
+            ));
+        }
 
         let serve_handle = wyrd_runtime::runtime().spawn(async move { bound.run().await });
 
@@ -1091,7 +1145,9 @@ impl WyrdTestServer {
             grpc_addr,
         };
 
-        if let Err(error) = wait_for_ready(&base_url).await {
+        if let Some(base_url) = base_url
+            && let Err(error) = wait_for_ready(&base_url).await
+        {
             if let Some(handle) = self.serve_handle.take()
                 && handle.is_finished()
                 && let Ok(Err(exit)) = handle.await
@@ -1134,6 +1190,12 @@ impl Drop for WyrdTestServer {
 }
 
 impl WyrdTestServerBuilder {
+    /// Attach the production telemetry guard retained by the test process.
+    #[must_use]
+    pub fn with_telemetry_for_test(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
     /// Override the default allow policy hook.
     #[must_use]
     pub fn with_policy_hook(mut self, hook: Arc<dyn PolicyHook>) -> Self {
@@ -1247,6 +1309,53 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_scribe_admission_for_test(mut self, admission: AdmissionConfig) -> Self {
         self.scribe_admission = Some(admission);
+        self
+    }
+
+    /// Select the production Forge process composition for this test server.
+    ///
+    /// Bound fixtures pass this value unchanged to [`WyrdServer`], so a
+    /// `ForgeWorker` fixture runs the real worker supervisor without opening
+    /// public HTTP or gRPC listeners. In-process fixtures retain their router
+    /// for focused handler tests regardless of this setting.
+    #[must_use]
+    pub fn with_forge_process_role_for_test(mut self, role: ForgeProcessRole) -> Self {
+        self.forge_process_role = role;
+        self
+    }
+
+    /// Observe successful completions from this fixture's supervised Forge worker.
+    ///
+    /// The observer is passed into the production Forge owner and fires only
+    /// after a worker has returned from its durable execution path. It cannot
+    /// schedule, claim, or alter work.
+    #[must_use]
+    pub fn with_forge_completion_observer_for_test(
+        mut self,
+        observer: ForgeWorkerCompletionObserver,
+    ) -> Self {
+        self.forge_completion_observer = Some(observer);
+        self
+    }
+
+    /// Replace only the Forge worker catalog with a deterministic test wrapper.
+    ///
+    /// The normal server query catalog remains unchanged. This lets a bound
+    /// production Forge role encounter one real catalog response boundary such
+    /// as post-commit uncertainty without changing server production behavior.
+    #[must_use]
+    pub fn with_forge_catalog_for_test(mut self, catalog: Arc<dyn Catalog>) -> Self {
+        self.forge_catalog = Some(catalog);
+        self
+    }
+
+    /// Use one complete validated Forge configuration for a real role fixture.
+    ///
+    /// The value still flows through normal [`Forge::new`] validation. It is
+    /// limited to the test builder so production configuration is unchanged.
+    #[must_use]
+    pub fn with_forge_config_for_test(mut self, config: ForgeConfig) -> Self {
+        self.forge_config = Some(config);
         self
     }
 
@@ -1411,10 +1520,10 @@ impl WyrdTestServerBuilder {
             scribe_admission.scribe_memory_limit_bytes,
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge_config = ForgeConfig {
+        let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
             ..ForgeConfig::default()
-        };
+        });
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_memory = Arc::new(
@@ -1435,11 +1544,14 @@ impl WyrdTestServerBuilder {
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));
         let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
+        let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
         let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
                 vala: postgres.vala().clone(),
                 operator_pool,
-                catalog: bifrost_redux.iceberg_catalog(),
+                catalog: self
+                    .forge_catalog
+                    .unwrap_or_else(|| bifrost_redux.iceberg_catalog()),
                 staging,
                 object_store,
                 rewrite_runtime: forge_runtime,
@@ -1447,6 +1559,9 @@ impl WyrdTestServerBuilder {
                 config: forge_config,
                 maintenance_interval: self.forge_interval,
                 clock: forge_clock,
+                completion_observer: self.forge_completion_observer,
+                scheduler_trigger: Some(forge_scheduler_trigger.clone()),
+                telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
             })
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
@@ -1516,6 +1631,9 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
             });
+        if let Some(telemetry) = self.telemetry {
+            state = state.with_telemetry(telemetry);
+        }
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer
@@ -1539,6 +1657,8 @@ impl WyrdTestServerBuilder {
                 forge_publisher,
                 bifrost_catalog: bifrost_redux,
                 forge_clock: forge_clock_control,
+                forge_scheduler_trigger,
+                forge_process_role: self.forge_process_role,
             },
             mode: Mode::InProcess,
             shutdown_token: None,

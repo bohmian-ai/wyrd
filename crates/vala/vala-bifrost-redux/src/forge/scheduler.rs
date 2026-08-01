@@ -1,12 +1,72 @@
 //! Supervision for the single durable Forge planning scheduler.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
 use super::error::ForgeError;
 use super::{Forge, ForgeScheduler, ForgeTickOutcome};
 use crate::maintenance::StagingFileCommitted;
+
+/// Test-tier control and observation for a supervised production scheduler loop.
+///
+/// The trigger only wakes the already-running [`Forge::run`] loop. It never
+/// constructs a scheduler, claims work, or executes a planning pass itself.
+#[derive(Clone, Default)]
+pub struct ForgeSchedulerTrigger {
+    /// Wakeup consumed by the production supervisor select loop.
+    requested: Arc<tokio::sync::Notify>,
+    /// Completed scheduler passes observed after their durable result returns.
+    completed: Arc<AtomicUsize>,
+    /// Wakeup for deterministic test waits on completed passes.
+    completed_ready: Arc<tokio::sync::Notify>,
+}
+
+impl ForgeSchedulerTrigger {
+    /// Construct an idle control for one supervised Forge owner.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request one pass from the production scheduler loop.
+    pub fn request_pass(&self) {
+        self.requested.notify_one();
+    }
+
+    /// Return the number of production scheduler passes that have returned.
+    #[must_use]
+    pub fn completed_passes(&self) -> usize {
+        self.completed.load(Ordering::Acquire)
+    }
+
+    /// Wait until at least `expected` supervised passes have returned.
+    ///
+    /// The notification is registered before inspecting the atomic count, so
+    /// a scheduler result racing this wait cannot be lost.
+    pub async fn wait_for_passes_at_least(&self, expected: usize) {
+        loop {
+            let notified = self.completed_ready.notified();
+            if self.completed_passes() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Wait for one request without exposing the scheduler loop to tests.
+    async fn wait_for_request(&self) {
+        self.requested.notified().await;
+    }
+
+    /// Record that the real supervised pass returned, including handled failures.
+    fn record_completed_pass(&self) {
+        self.completed.fetch_add(1, Ordering::AcqRel);
+        self.completed_ready.notify_waiters();
+    }
+}
 
 impl Forge {
     /// Runs durable hint ingestion and periodic planning until cancellation.
@@ -34,9 +94,67 @@ impl Forge {
                     },
                     None => hints_open = false,
                 },
-                _ = ticker.tick() => match scheduler.schedule_once(&shutdown).await {
-                    Ok(outcome) => tracing::debug!(demands_seen = outcome.demands_seen, tasks_enqueued = outcome.tasks_enqueued, incomplete = outcome.incomplete, "Forge scheduling pass completed"),
-                    Err(error) => tracing::error!(error = %error, "Forge scheduling pass failed"),
+                _ = ticker.tick() => {
+                    let started = Instant::now();
+                    let pass_span = tracing::info_span!(
+                        "bifrost.forge.scheduler.pass",
+                        result = tracing::field::Empty,
+                        role = "server",
+                    );
+                    match tracing::Instrument::instrument(
+                        scheduler.schedule_once(&shutdown),
+                        pass_span.clone(),
+                    ).await {
+                    Ok(outcome) => {
+                        pass_span.record("result", "succeeded");
+                        self.core.telemetry.record_scheduler_pass(&outcome, started.elapsed());
+                        tracing::debug!(demands_seen = outcome.demands_seen, tasks_enqueued = outcome.tasks_enqueued, incomplete = outcome.incomplete, "Forge scheduling pass completed");
+                        if let Some(trigger) = &self.core.scheduler_trigger {
+                            trigger.record_completed_pass();
+                        }
+                    }
+                    Err(error) => {
+                        pass_span.record("result", "failed");
+                        tracing::error!(error = %error, "Forge scheduling pass failed");
+                        if let Some(trigger) = &self.core.scheduler_trigger {
+                            trigger.record_completed_pass();
+                        }
+                    }
+                }
+                },
+                () = async {
+                    if let Some(trigger) = &self.core.scheduler_trigger {
+                        trigger.wait_for_request().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    let started = Instant::now();
+                    let pass_span = tracing::info_span!(
+                        "bifrost.forge.scheduler.pass",
+                        result = tracing::field::Empty,
+                        role = "server",
+                    );
+                    match tracing::Instrument::instrument(
+                        scheduler.schedule_once(&shutdown),
+                        pass_span.clone(),
+                    ).await {
+                    Ok(outcome) => {
+                        pass_span.record("result", "succeeded");
+                        self.core.telemetry.record_scheduler_pass(&outcome, started.elapsed());
+                        tracing::debug!(demands_seen = outcome.demands_seen, tasks_enqueued = outcome.tasks_enqueued, incomplete = outcome.incomplete, "Forge triggered scheduling pass completed");
+                        if let Some(trigger) = &self.core.scheduler_trigger {
+                            trigger.record_completed_pass();
+                        }
+                    }
+                    Err(error) => {
+                        pass_span.record("result", "failed");
+                        tracing::error!(error = %error, "Forge triggered scheduling pass failed");
+                        if let Some(trigger) = &self.core.scheduler_trigger {
+                            trigger.record_completed_pass();
+                        }
+                    }
+                }
                 },
             }
         }

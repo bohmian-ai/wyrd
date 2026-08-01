@@ -37,6 +37,7 @@ use super::Forge;
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::metrics::{ForgeCatalogCommitStrategy, ForgeTelemetry};
 use super::planner::ForgePlanCandidate;
 use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
@@ -611,18 +612,22 @@ impl Forge {
     ) -> Result<iceberg::table::Table, ForgeError> {
         let (key, bin) = self.load_exact_staging_bin(binding, inputs).await?;
         let policy = self.table_right_size_policy(binding).await?;
-        self.compact_bin(StagingRewriteRequest {
-            lease,
-            key: &key,
-            binding,
-            bin: &bin,
-            right_size_policy: &policy,
-            attempt_generation: ForgeAttemptGeneration::from_attempt(attempt_id),
-            task_identity: Some((task_id, attempt_id)),
-            stop,
-        })
-        .await
-        .map(|commit| commit.committed_table)
+        let commit = self
+            .compact_bin(StagingRewriteRequest {
+                lease,
+                key: &key,
+                binding,
+                bin: &bin,
+                right_size_policy: &policy,
+                attempt_generation: ForgeAttemptGeneration::from_attempt(attempt_id),
+                task_identity: Some((task_id, attempt_id)),
+                stop,
+            })
+            .await?;
+        self.core
+            .telemetry
+            .record_task_spill("staging_fold", commit.spill_bytes);
+        Ok(commit.committed_table)
     }
 
     /// Reconstructs and validates the exact durable staging payload from SQL.
@@ -1059,6 +1064,7 @@ impl Forge {
             spill_bytes = rewrite.spill_bytes,
             "Forge streaming rewrite completed"
         );
+        let output_bytes = rewrite_output_bytes(&rewrite.files)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let prepared = forge_detail(
             key,
@@ -1069,27 +1075,55 @@ impl Forge {
             None,
         )?;
         self.prepare_inputs(lease, key, bin, prepared).await?;
-        self.commit_rewrite(
-            lease,
-            CommitRewriteRequest {
-                key,
-                binding,
-                bin,
-                operation_id,
-                rewrite: &rewrite,
-                task_identity,
-                stop,
-            },
-        )
-        .await
-        .map(|committed_table| CompactCommit { committed_table })
+        let committed_table = self
+            .commit_rewrite(
+                lease,
+                CommitRewriteRequest {
+                    key,
+                    binding,
+                    bin,
+                    operation_id,
+                    rewrite: &rewrite,
+                    task_identity,
+                    stop,
+                },
+            )
+            .await?;
+        self.core.telemetry.record_rewrite_volume(
+            super::metrics::ForgeMetricSource::Staging,
+            bin.files.len(),
+            bin.total_bytes,
+            rewrite.files.len(),
+            output_bytes,
+        );
+        Ok(CompactCommit {
+            committed_table,
+            spill_bytes: rewrite.spill_bytes,
+        })
     }
+}
+
+/// Sum exact output-file sizes for the production rewrite-volume counter.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the committed byte total exceeds `u64`.
+fn rewrite_output_bytes(files: &[iceberg::spec::DataFile]) -> Result<u64, ForgeError> {
+    files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.file_size_in_bytes())
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "staging rewrite output bytes overflowed u64".to_owned(),
+            })
+    })
 }
 
 /// One staging rewrite commit retaining exact returned catalog evidence.
 struct CompactCommit {
     /// Exact table returned by the Iceberg transaction.
     committed_table: iceberg::table::Table,
+    /// Final spill accounting observed by the completed rewrite.
+    spill_bytes: u64,
 }
 
 /// Immutable inputs for one fenced Iceberg commit and its durable bookkeeping.
@@ -1118,7 +1152,10 @@ impl Forge {
     /// fence; uncertain failures remain prepared for reconciliation.
     /// Cancellation while the catalog future is unresolved returns shutdown
     /// without resetting inputs, allowing the normal lease-release path and a
-    /// successor reconciliation tick to decide the terminal state.
+    /// successor reconciliation tick to decide the terminal state. The catalog
+    /// future runs inside the shared Forge commit span with only its closed
+    /// strategy/result/role fields and scrubbed durable task UUIDs; tenant,
+    /// table, SQL, object-path, and error details never enter the span.
     ///
     /// # Errors
     ///
@@ -1166,18 +1203,32 @@ impl Forge {
                 lease_key: lease.lease_key.clone(),
             });
         }
+        let span = ForgeTelemetry::catalog_commit_span(
+            ForgeCatalogCommitStrategy::StagingFold,
+            task_identity,
+        );
         let commit = transaction.commit_once(self.core.catalog.as_ref());
         tokio::pin!(commit);
         let response = tokio::select! {
-            response = tokio::time::timeout(
-                self.core.config.iceberg_total_retry_timeout,
-                &mut commit,
+            response = tracing::Instrument::instrument(
+                tokio::time::timeout(
+                    self.core.config.iceberg_total_retry_timeout,
+                    &mut commit,
+                ),
+                span.clone(),
             ) => response,
-            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            () = stop.cancelled() => {
+                span.record("result", "cancelled");
+                return Err(ForgeError::Shutdown);
+            },
         };
         let committed_table = match response {
-            Ok(Ok(committed_table)) => committed_table,
+            Ok(Ok(committed_table)) => {
+                span.record("result", "succeeded");
+                committed_table
+            }
             Ok(Err(error)) => {
+                span.record("result", "failed");
                 if Self::is_retryable(&error)
                     && let Some(recovered) = self
                         .recover_uncertain_staging_commit(binding, task_identity)
@@ -1201,11 +1252,35 @@ impl Forge {
                 }
             }
             Err(_) => {
+                span.record("result", "timed_out");
                 return Err(ForgeError::Timeout {
                     operation: "Iceberg commit",
                 });
             }
         };
+        self.finalize_staging_commit(lease, key, bin, rewrite, operation_id, committed_table)
+            .await
+    }
+
+    /// Stamp SQL terminal state after a staging catalog commit has succeeded.
+    ///
+    /// The Iceberg mutation has already committed before this method runs. A
+    /// failure therefore leaves the prepared SQL state for reconciliation by a
+    /// successor owner rather than attempting to reverse the catalog commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns reconciliation errors when the committed table has no current
+    /// snapshot, or SQL, audit, and fencing errors from the terminal stamp.
+    async fn finalize_staging_commit(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        bin: &RewriteBin,
+        rewrite: &RewriteOutput,
+        operation_id: Uuid,
+        committed_table: iceberg::table::Table,
+    ) -> Result<iceberg::table::Table, ForgeError> {
         let snapshot_id = committed_table
             .metadata()
             .current_snapshot_id()

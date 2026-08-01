@@ -14,7 +14,7 @@ use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
-    ForgeWorker, ForgeWorkerConfig,
+    ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -449,6 +449,9 @@ async fn build_bifrost_parts_from_boot(
         config: forge_config,
         maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
         clock: ForgeClock::system(),
+        completion_observer: None,
+        scheduler_trigger: None,
+        telemetry: Arc::new(ForgeTelemetry::new()),
     })?);
 
     let state = AppState::new(postgres, storage, bifrost)
@@ -1003,6 +1006,9 @@ mod pg_tests {
                 config,
                 maintenance_interval: Duration::from_millis(10),
                 clock: ForgeClock::system(),
+                completion_observer: None,
+                scheduler_trigger: None,
+                telemetry: Arc::new(ForgeTelemetry::new()),
             })
             .expect("Forge"),
         );

@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use metrics::{Counter, Histogram};
+use num_traits::ToPrimitive;
+use uuid::Uuid;
 use wyrd_spec::vala::api::StoragePath;
 
 use crate::catalog::TenantTableBinding;
 
-use super::Forge;
 use super::error::ForgeError;
 use super::path::catalog_path_to_object_key;
+use super::{Forge, ForgeScheduleOutcome};
 
 /// Validated object-key contract for one rewrite source.
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +96,25 @@ impl ForgeMetricStage {
     }
 }
 
+/// Closed strategy inventory for authoritative Forge catalog commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeCatalogCommitStrategy {
+    /// A staged-file fold publishes its replacement output.
+    StagingFold,
+    /// A live small-file rewrite replaces current Iceberg data files.
+    SmallFiles,
+}
+
+impl ForgeCatalogCommitStrategy {
+    /// Return the stable span value for this catalog commit strategy.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StagingFold => "staging_fold",
+            Self::SmallFiles => "small_files",
+        }
+    }
+}
+
 /// Closed terminal classification for staging and Iceberg operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum ForgeOperationResult {
@@ -164,7 +185,7 @@ pub(super) struct ForgeRewriteVolume {
 }
 
 /// Registered Forge metric handles retained by one Forge owner.
-pub(super) struct ForgeMetrics {
+pub struct ForgeTelemetry {
     /// Terminal operation counters for every source/result combination.
     operations: BTreeMap<(ForgeMetricSource, ForgeOperationResult), Counter>,
     /// Lease-boundary counters for every closed result.
@@ -181,11 +202,22 @@ pub(super) struct ForgeMetrics {
     rewrite_output_files: BTreeMap<ForgeMetricSource, Counter>,
     /// Committed/recovered replacement output-byte counters.
     rewrite_output_bytes: BTreeMap<ForgeMetricSource, Counter>,
+    /// One terminal duration series for each closed strategy/result pair.
+    task_duration: BTreeMap<(&'static str, &'static str), Histogram>,
+    /// Final spill observations partitioned by closed Forge strategy.
+    task_spill: BTreeMap<&'static str, Histogram>,
+    /// Conflict counters emitted exactly at durable rejection boundaries.
+    conflicts: BTreeMap<&'static str, Counter>,
+    /// Completed cleanup obligation duration by closed cleanup provenance.
+    cleanup_duration: BTreeMap<&'static str, Histogram>,
+    /// Scheduler pass duration retained by the injected production handle.
+    scheduler_duration: Histogram,
 }
 
-impl ForgeMetrics {
+impl ForgeTelemetry {
     /// Registers the complete fixed-cardinality Forge metric inventory.
-    pub(super) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             operations: operation_counters(),
             lease_events: lease_counters(),
@@ -195,7 +227,80 @@ impl ForgeMetrics {
             rewrite_input_bytes: source_counters("bifrost_forge_rewrite_input_bytes_total"),
             rewrite_output_files: source_counters("bifrost_forge_rewrite_output_files_total"),
             rewrite_output_bytes: source_counters("bifrost_forge_rewrite_output_bytes_total"),
+            task_duration: task_duration_histograms(),
+            task_spill: strategy_histograms("bifrost_forge_task_spill_bytes"),
+            conflicts: conflict_counters(),
+            cleanup_duration: cleanup_histograms(),
+            scheduler_duration: metrics::histogram!("bifrost_forge_scheduler_duration_seconds"),
         }
+    }
+
+    /// Record one finished scheduler pass through the production metric owner.
+    ///
+    /// Complete-only gauges remain published at the scheduler's authoritative
+    /// roster-status query rather than inferred from this aggregate outcome.
+    pub(crate) fn record_scheduler_pass(&self, _outcome: &ForgeScheduleOutcome, elapsed: Duration) {
+        self.scheduler_duration.record(elapsed.as_secs_f64());
+    }
+
+    /// Record one terminal worker attempt with closed strategy and result labels.
+    pub(crate) fn record_task_terminal(&self, strategy: &str, result: &str, elapsed: Duration) {
+        let Some(strategy) = closed_strategy(strategy) else {
+            return;
+        };
+        let Some(result) = closed_task_result(result) else {
+            return;
+        };
+        if let Some(histogram) = self.task_duration.get(&(strategy, result)) {
+            histogram.record(elapsed.as_secs_f64());
+        }
+    }
+
+    /// Record final `DataFusion` spill accounting for one completed Forge attempt.
+    pub(crate) fn record_task_spill(&self, strategy: &str, bytes: u64) {
+        if let Some(strategy) = closed_strategy(strategy)
+            && let Some(histogram) = self.task_spill.get(strategy)
+        {
+            histogram.record(bytes.to_f64().unwrap_or(f64::MAX));
+        }
+    }
+
+    /// Record one exact durable conflict before its caller returns the rejection.
+    pub(crate) fn record_conflict(&self, kind: &'static str) {
+        if let Some(counter) = self.conflicts.get(kind) {
+            counter.increment(1);
+        }
+    }
+
+    /// Record completion of one durable cleanup obligation.
+    pub(crate) fn record_cleanup(&self, kind: &'static str, elapsed: Duration) {
+        if let Some(histogram) = self.cleanup_duration.get(kind) {
+            histogram.record(elapsed.as_secs_f64());
+        }
+    }
+
+    /// Construct the shared closed-schema span for one catalog commit future.
+    ///
+    /// Only the strategy, result, role, and scrubbed durable task UUIDs are
+    /// owner-authored. Tenant, table, SQL, object-path, and error details must
+    /// never be added by callers.
+    pub(super) fn catalog_commit_span(
+        strategy: ForgeCatalogCommitStrategy,
+        task_identity: Option<(Uuid, Uuid)>,
+    ) -> tracing::Span {
+        let span = tracing::info_span!(
+            "bifrost.forge.catalog.commit",
+            strategy = strategy.as_str(),
+            result = tracing::field::Empty,
+            role = "forge_worker",
+            task_id = tracing::field::Empty,
+            attempt_id = tracing::field::Empty,
+        );
+        if let Some((task_id, attempt_id)) = task_identity {
+            span.record("task_id", tracing::field::display(task_id));
+            span.record("attempt_id", tracing::field::display(attempt_id));
+        }
+        span
     }
 
     /// Records one typed terminal operation event.
@@ -235,6 +340,93 @@ impl ForgeMetrics {
         self.rewrite_output_files[&source].increment(output_files as u64);
         self.rewrite_output_bytes[&source].increment(output_bytes);
     }
+}
+
+impl Default for ForgeTelemetry {
+    /// Register the standard production Forge metric inventory.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Convert a durable strategy tag to the fixed telemetry label vocabulary.
+fn closed_strategy(strategy: &str) -> Option<&'static str> {
+    match strategy {
+        "staging_fold" => Some("staging_fold"),
+        "small_files" => Some("small_files"),
+        "snapshot_expiry" => Some("snapshot_expiry"),
+        _ => None,
+    }
+}
+
+/// Convert an execution result to the fixed telemetry label vocabulary.
+fn closed_task_result(result: &str) -> Option<&'static str> {
+    match result {
+        "succeeded" => Some("succeeded"),
+        "retryable" => Some("retryable"),
+        "failed" => Some("failed"),
+        "cancelled" => Some("cancelled"),
+        "unschedulable" => Some("unschedulable"),
+        _ => None,
+    }
+}
+
+/// Registers every closed strategy/result task-duration series eagerly.
+fn task_duration_histograms() -> BTreeMap<(&'static str, &'static str), Histogram> {
+    let mut histograms = BTreeMap::new();
+    for strategy in ["staging_fold", "small_files", "snapshot_expiry"] {
+        for result in [
+            "succeeded",
+            "retryable",
+            "failed",
+            "cancelled",
+            "unschedulable",
+        ] {
+            histograms.insert(
+                (strategy, result),
+                metrics::histogram!(
+                    "bifrost_forge_task_duration_seconds",
+                    "strategy" => strategy,
+                    "result" => result
+                ),
+            );
+        }
+    }
+    histograms
+}
+
+/// Register one histogram for every strategy accepted by the v1 worker.
+fn strategy_histograms(name: &'static str) -> BTreeMap<&'static str, Histogram> {
+    ["staging_fold", "small_files", "snapshot_expiry"]
+        .into_iter()
+        .map(|strategy| (strategy, metrics::histogram!(name, "strategy" => strategy)))
+        .collect()
+}
+
+/// Register one counter for every stable Forge conflict classification.
+fn conflict_counters() -> BTreeMap<&'static str, Counter> {
+    ["lease_contention", "fence_lost", "snapshot_changed"]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                metrics::counter!("bifrost_forge_conflicts_total", "kind" => kind),
+            )
+        })
+        .collect()
+}
+
+/// Register cleanup duration histograms for the closed cleanup provenance set.
+fn cleanup_histograms() -> BTreeMap<&'static str, Histogram> {
+    ["expired", "orphan", "spill"]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                metrics::histogram!("bifrost_forge_cleanup_duration_seconds", "kind" => kind),
+            )
+        })
+        .collect()
 }
 
 impl Forge {

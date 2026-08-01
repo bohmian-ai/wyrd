@@ -396,6 +396,9 @@ mod pg_tests {
                     config,
                     maintenance_interval: Duration::from_millis(10),
                     clock: ForgeClock::system(),
+                    completion_observer: None,
+                    scheduler_trigger: None,
+                    telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
                 })
                 .expect("forge"),
             );

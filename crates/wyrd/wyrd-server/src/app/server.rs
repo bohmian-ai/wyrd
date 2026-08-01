@@ -316,6 +316,7 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error or if the process-
     /// global metrics recorder fails to install.
     pub async fn run(mut self) -> Result<(), BootExit> {
+        let _role_telemetry = super::metrics::ForgeRoleTelemetryGuard::started(self.config.role);
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
         let serves_api = self.config.role != ForgeProcessRole::ForgeWorker;

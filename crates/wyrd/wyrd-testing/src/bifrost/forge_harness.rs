@@ -17,15 +17,20 @@ use opendal::{
     Buffer, Entry, Error as ObjectStoreError, ErrorKind as ObjectStoreErrorKind, Metadata, Operator,
 };
 use parquet::arrow::ArrowWriter;
-use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
+use vala_bifrost_redux::catalog::{
+    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
+};
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    ForgeSchedulerTrigger, ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::with_managed_columns;
+use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::DataTenantId;
+use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
 use super::super::WyrdTestServer;
 
@@ -54,6 +59,177 @@ pub struct ForgeFixture {
     pub binding: TenantTableBinding,
     /// The tenant that owns the table and file-list rows.
     pub tenant: DataTenantId,
+}
+
+/// Real dependency graph used to seed a Forge fixture without an HTTP server.
+#[derive(Clone)]
+struct ForgeFixtureResources {
+    /// The production-shaped Forge owner that consumes seeded work.
+    forge: Arc<Forge>,
+    /// Tenant-scoped durable state used by file-list setup.
+    vala: vala_sql::ValaPostgres,
+    /// Privileged Forge operation pool.
+    operator_pool: vala_sql::OperatorPool,
+    /// Catalog owner used to create the physical test table.
+    bifrost_catalog: Arc<BifrostCatalog>,
+    /// Real object store shared by setup and Forge.
+    staging: Arc<Operator>,
+    /// Forge cleanup/rewrite object-store seam.
+    object_store: Arc<dyn ForgeObjectStore>,
+    /// Keep the Forge spill root alive for the complete fixture lifetime.
+    spill_root: Arc<tempfile::TempDir>,
+    /// Shared production memory governor.
+    memory: vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor,
+    /// Validated configuration held by rebuilt fixtures.
+    config: ForgeConfig,
+}
+
+/// Passive controls attached to real supervised Forge loops in test-tier compositions.
+#[derive(Default)]
+struct ForgeFixtureSupervision {
+    /// Observer notified only after a production worker completes durable work.
+    completion_observer: Option<ForgeWorkerCompletionObserver>,
+    /// Trigger that wakes the production scheduler loop without invoking it directly.
+    scheduler_trigger: Option<ForgeSchedulerTrigger>,
+}
+
+/// Owns a real Forge fixture without composing an HTTP or gRPC server.
+pub struct StandaloneForgeFixture {
+    /// Database lifetime guard shared by catalog, scheduler, and worker owners.
+    _database: Arc<PgFixture>,
+    /// Object storage lifetime guard shared by setup and Forge.
+    _storage: Arc<StorageHandle>,
+    /// Local backend lifetime guard.
+    _storage_root: Arc<tempfile::TempDir>,
+    /// Seeded Forge owner and durable table state.
+    fixtures: Vec<ForgeFixture>,
+}
+
+impl StandaloneForgeFixture {
+    /// Start real Postgres, catalog, object storage, and Forge owners without a server.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, storage, catalog, or Forge construction errors. No HTTP,
+    /// gRPC, `AppState`, or [`WyrdTestServer`] is created by this constructor.
+    pub async fn start(table_name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::start_topology(table_name, 1).await
+    }
+
+    /// Start one shared standalone Forge graph with the requested tenant count.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, tenant, storage, catalog, or Forge construction errors,
+    /// including a zero-tenant topology.
+    pub async fn start_topology(
+        table_name: &str,
+        tenant_count: u32,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if tenant_count == 0 {
+            return Err("standalone Forge topology needs at least one tenant".into());
+        }
+        let database = Arc::new(PgFixture::start().await?);
+        let storage_root = Arc::new(tempfile::tempdir()?);
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: std::time::Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await?;
+        let catalog = crate::server::test_redux_catalog(&database, &storage).await?;
+        let config = ForgeConfig::default();
+        let memory =
+            vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)?;
+        let query_memory = Arc::new(
+            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(memory.clone()),
+        );
+        let spill_root = Arc::new(tempfile::tempdir()?);
+        let runtime =
+            ForgeRewriteRuntime::new(query_memory, spill_root.path(), config.spill_limit_bytes)?;
+        let staging = Arc::new(storage.operator().clone());
+        let object_store: Arc<dyn ForgeObjectStore> =
+            ForgeObjectStoreControl::new(Arc::clone(&staging));
+        let (_, inbox) = staging_file_channel(config.max_hints_per_wake)?;
+        let forge = Arc::new(Forge::new(ForgeBuildConfig {
+            vala: database.vala_postgres().clone(),
+            operator_pool: database.operator_pool().clone(),
+            catalog: catalog.iceberg_catalog(),
+            staging: Arc::clone(&staging),
+            object_store: Arc::clone(&object_store),
+            rewrite_runtime: runtime,
+            hints: inbox,
+            config: config.clone(),
+            maintenance_interval: std::time::Duration::from_secs(60),
+            clock: vala_bifrost_redux::forge::ForgeClock::system(),
+            completion_observer: None,
+            scheduler_trigger: None,
+            telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
+        })?);
+        let resources = ForgeFixtureResources {
+            forge,
+            vala: database.vala_postgres().clone(),
+            operator_pool: database.operator_pool().clone(),
+            bifrost_catalog: catalog,
+            staging,
+            object_store,
+            spill_root,
+            memory,
+            config,
+        };
+        let mut tenants = Vec::with_capacity(usize::try_from(tenant_count)?);
+        tenants.push(database.data_tenant_id());
+        for index in 1..tenant_count {
+            tenants.push(
+                database
+                    .seed_additional_tenant(&format!("forge-benchmark-{index}"))
+                    .await?,
+            );
+        }
+        let partition_day =
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).ok_or("invalid standalone fixture day")?;
+        let mut fixtures = Vec::with_capacity(tenants.len());
+        for tenant in tenants {
+            fixtures.push(
+                seed_forge_group_with_resources(
+                    resources.clone(),
+                    tenant,
+                    table_name,
+                    false,
+                    &[partition_day],
+                )
+                .await,
+            );
+        }
+        Ok(Self {
+            _database: database,
+            _storage: storage,
+            _storage_root: storage_root,
+            fixtures,
+        })
+    }
+
+    /// Return the seeded real Forge fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the constructor invariant requiring at least one tenant
+    /// fixture is violated.
+    #[must_use]
+    pub fn fixture(&self) -> &ForgeFixture {
+        &self.fixtures[0]
+    }
+
+    /// Borrow every tenant-scoped table in the shared standalone Forge graph.
+    #[must_use]
+    pub fn fixtures(&self) -> &[ForgeFixture] {
+        &self.fixtures
+    }
 }
 
 /// Read-only probe for the DataFusion pool owned by one Forge fixture.
@@ -87,6 +263,7 @@ impl ForgeMemoryProbe {
 #[derive(Debug)]
 pub struct CommitUncertaintyCatalog {
     inner: Arc<dyn Catalog>,
+    update_attempts: AtomicUsize,
     fail_after_next_commit: AtomicBool,
     uncertainty_active: AtomicBool,
     pause_after_commit: AtomicBool,
@@ -162,6 +339,7 @@ impl CommitUncertaintyCatalog {
     pub fn new(inner: Arc<dyn Catalog>) -> Arc<Self> {
         Arc::new(Self {
             inner,
+            update_attempts: AtomicUsize::new(0),
             fail_after_next_commit: AtomicBool::new(false),
             uncertainty_active: AtomicBool::new(false),
             pause_after_commit: AtomicBool::new(false),
@@ -188,6 +366,7 @@ impl CommitUncertaintyCatalog {
 
     /// Pause after the real catalog has accepted one commit.
     pub fn pause_after_commit(&self) {
+        self.update_attempts.store(0, Ordering::Release);
         self.commit_reached.store(false, Ordering::Release);
         self.reject_after_commit.store(false, Ordering::Release);
         self.after_commit_dropped.store(false, Ordering::Release);
@@ -218,6 +397,12 @@ impl CommitUncertaintyCatalog {
     pub fn reject_paused_commit(&self) {
         self.reject_after_commit.store(true, Ordering::Release);
         self.commit_release.notify_waiters();
+    }
+
+    /// Return catalog update attempts observed since the uncertainty seam was armed.
+    #[must_use]
+    pub fn update_attempts(&self) -> usize {
+        self.update_attempts.load(Ordering::Acquire)
     }
 
     /// Pause immediately before delegating a catalog commit.
@@ -332,6 +517,7 @@ impl Catalog for CommitUncertaintyCatalog {
     }
 
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        self.update_attempts.fetch_add(1, Ordering::AcqRel);
         if self.uncertainty_active.load(Ordering::Acquire) {
             return Err(IcebergError::new(
                 IcebergErrorKind::Unexpected,
@@ -719,6 +905,32 @@ impl ForgeFixture {
         )
     }
 
+    /// Clone the server-owned graph with passive controls for its real supervised loops.
+    ///
+    /// The returned owner still executes only through [`Forge::run`] and
+    /// `ForgeWorker::run`; the controls observe completion and request a normal
+    /// production scheduler wakeup without planning or executing work themselves.
+    #[must_use]
+    pub fn context_with_supervision(
+        &self,
+        config: ForgeConfig,
+        completion_observer: ForgeWorkerCompletionObserver,
+        scheduler_trigger: ForgeSchedulerTrigger,
+    ) -> Arc<Forge> {
+        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+            config,
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.object_store),
+            None,
+            ForgeFixtureSupervision {
+                completion_observer: Some(completion_observer),
+                scheduler_trigger: Some(scheduler_trigger),
+            },
+        )
+        .map(|(forge, _publisher, _probe)| forge)
+        .expect("validated Forge fixture config")
+    }
+
     /// Build a production-shaped Forge together with its paired local hint
     /// publisher for scheduler journey tests.
     #[must_use]
@@ -878,6 +1090,28 @@ impl ForgeFixture {
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
     ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
+        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+            config,
+            catalog,
+            object_store,
+            memory_limit_bytes,
+            ForgeFixtureSupervision::default(),
+        )
+    }
+
+    /// Construct Forge, its memory probe, and optional passive supervisor controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied Forge configuration is invalid.
+    fn build_forge_with_publisher_and_memory_probe_and_supervision(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        memory_limit_bytes: Option<usize>,
+        supervision: ForgeFixtureSupervision,
+    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
         let (publisher, inbox) =
             staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
         let query_memory = if let Some(limit) = memory_limit_bytes {
@@ -912,6 +1146,9 @@ impl ForgeFixture {
                 config,
                 maintenance_interval: std::time::Duration::from_secs(60),
                 clock: self.forge.clock_for_test(),
+                completion_observer: supervision.completion_observer,
+                scheduler_trigger: supervision.scheduler_trigger,
+                telemetry: std::sync::Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
             })
             .map_err(|_| "invalid Forge fixture config")?,
         );
@@ -1171,21 +1408,62 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
     schema_variant: bool,
     partition_days: &[chrono::NaiveDate],
 ) -> ForgeFixture {
+    let resources = ForgeFixtureResources {
+        forge: server
+            .state()
+            .forge()
+            .cloned()
+            .expect("production server has Forge"),
+        vala: server.state().postgres.vala().clone(),
+        operator_pool: server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool"),
+        bifrost_catalog: Arc::clone(
+            server
+                .state()
+                .bifrost_redux
+                .as_ref()
+                .expect("Bifrost Redux"),
+        ),
+        staging: Arc::new(server.state().storage.operator().clone()),
+        object_store: ForgeObjectStoreControl::new(Arc::new(
+            server.state().storage.operator().clone(),
+        )),
+        spill_root: Arc::new(tempfile::tempdir().expect("Forge spill root")),
+        memory: server
+            .state()
+            .bifrost_memory
+            .clone()
+            .expect("Bifrost memory governor"),
+        config: ForgeConfig::default(),
+    };
+    seed_forge_group_with_resources(
+        resources,
+        tenant,
+        table_name,
+        schema_variant,
+        partition_days,
+    )
+    .await
+}
+
+/// Seed a real Forge fixture from explicit non-server dependencies.
+async fn seed_forge_group_with_resources(
+    resources: ForgeFixtureResources,
+    tenant: DataTenantId,
+    table_name: &str,
+    schema_variant: bool,
+    partition_days: &[chrono::NaiveDate],
+) -> ForgeFixture {
     assert!(
         !partition_days.is_empty(),
         "Forge fixture needs one partition day"
     );
-    let forge = server
-        .state()
-        .forge()
-        .cloned()
-        .expect("production server has Forge");
-    let bifrost_catalog = server
-        .state()
-        .bifrost_redux
-        .as_ref()
-        .expect("Bifrost Redux");
-    let staging = Arc::new(server.state().storage.operator().clone());
+    let forge = resources.forge.clone();
+    let bifrost_catalog = &resources.bifrost_catalog;
+    let staging = Arc::clone(&resources.staging);
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("Forge fixture table binding");
@@ -1212,10 +1490,8 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         vec![Field::new("value", DataType::Int64, false)]
     }));
 
-    let mut conn = server
-        .state()
-        .postgres
-        .vala()
+    let mut conn = resources
+        .vala
         .tenant_conn(tenant)
         .await
         .expect("Forge fixture tenant connection");
@@ -1310,28 +1586,20 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
     .bind(tenant.as_uuid())
     .bind(&binding.logical_namespace)
     .bind(&binding.table_name)
-    .execute(server.state().postgres.operator_pool().expect("operator pool").pool())
+    .execute(resources.operator_pool.pool())
     .await
     .expect("Forge fixture aging");
 
     ForgeFixture {
         forge,
-        vala: server.state().postgres.vala().clone(),
-        operator_pool: server
-            .state()
-            .postgres
-            .operator_pool()
-            .expect("operator pool"),
+        vala: resources.vala,
+        operator_pool: resources.operator_pool,
         catalog,
         staging: Arc::clone(&staging),
-        object_store: ForgeObjectStoreControl::new(Arc::clone(&staging)),
-        spill_root: Arc::new(tempfile::tempdir().expect("Forge spill root")),
-        memory: server
-            .state()
-            .bifrost_memory
-            .clone()
-            .expect("Bifrost memory governor"),
-        config: ForgeConfig::default(),
+        object_store: resources.object_store,
+        spill_root: resources.spill_root,
+        memory: resources.memory,
+        config: resources.config,
         binding,
         tenant,
     }

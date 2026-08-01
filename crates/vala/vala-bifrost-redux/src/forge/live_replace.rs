@@ -20,6 +20,7 @@ use super::binpack::ForgeGroupKey;
 use super::compact::forge_transition_event;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::metrics::{ForgeCatalogCommitStrategy, ForgeTelemetry};
 use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::IcebergRewriteGroup;
 use crate::catalog::TenantTableBinding;
@@ -440,21 +441,9 @@ impl Forge {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        let commit = transaction.commit_once(self.core.catalog.as_ref());
-        tokio::pin!(commit);
-        let response = tokio::select! {
-            response = tokio::time::timeout(self.core.config.iceberg_total_retry_timeout, &mut commit) => response,
-            () = stop.cancelled() => return Err(ForgeError::Shutdown),
-        };
-        let committed = match response {
-            Ok(Ok(committed)) => committed,
-            Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
-            Err(_) => {
-                return Err(ForgeError::Timeout {
-                    operation: "Iceberg live replacement commit",
-                });
-            }
-        };
+        let committed = self
+            .commit_catalog_transaction(transaction, task_identity, stop)
+            .await?;
         let snapshot_id = committed.metadata().current_snapshot_id().ok_or_else(|| {
             ForgeError::Reconciliation {
                 detail: "Iceberg live replacement committed without a current snapshot".to_owned(),
@@ -480,6 +469,55 @@ impl Forge {
             },
             committed_table: Some(committed),
         })
+    }
+
+    /// Commit one prepared Iceberg transaction under the production trace boundary.
+    ///
+    /// Durable task callers attach only their scrubbed task and attempt UUIDs;
+    /// tenant, table, SQL, object-path, and error details never enter span fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns shutdown, catalog, or bounded commit-timeout failures. Cancellation
+    /// may leave an uncertain catalog result for normal reconciliation.
+    async fn commit_catalog_transaction(
+        &self,
+        transaction: Transaction,
+        task_identity: Option<(Uuid, Uuid)>,
+        stop: &CancellationToken,
+    ) -> Result<Table, ForgeError> {
+        let span = ForgeTelemetry::catalog_commit_span(
+            ForgeCatalogCommitStrategy::SmallFiles,
+            task_identity,
+        );
+        let commit = transaction.commit_once(self.core.catalog.as_ref());
+        tokio::pin!(commit);
+        let response = tokio::select! {
+            response = tracing::Instrument::instrument(
+                tokio::time::timeout(self.core.config.iceberg_total_retry_timeout, &mut commit),
+                span.clone(),
+            ) => response,
+            () = stop.cancelled() => {
+                span.record("result", "cancelled");
+                return Err(ForgeError::Shutdown);
+            },
+        };
+        match response {
+            Ok(Ok(table)) => {
+                span.record("result", "succeeded");
+                Ok(table)
+            }
+            Ok(Err(error)) => {
+                span.record("result", "failed");
+                Err(ForgeError::Catalog(error))
+            }
+            Err(_) => {
+                span.record("result", "timed_out");
+                Err(ForgeError::Timeout {
+                    operation: "Iceberg live replacement commit",
+                })
+            }
+        }
     }
 
     /// Execute one explicit-base live replacement through the test-support seam.

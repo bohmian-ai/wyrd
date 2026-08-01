@@ -6,9 +6,9 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::info;
-use wyrd_telemetry::{TelemetryGuard, init as init_telemetry};
+use wyrd_telemetry::TelemetryGuard;
 
-use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
+use crate::app::metrics::{WyrdTelemetryRuntime, metrics_router, serve_metrics};
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
 use crate::boot::{StateOverrides, build_state, production_guards, spawn_forge_worker};
 use crate::config::{ForgeProcessRole, ServeMode, WyrdServerConfig};
@@ -40,14 +40,13 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
     production_guards(&config);
 
-    let telemetry: Arc<TelemetryGuard> = Arc::new(
-        init_telemetry(config.telemetry.clone()).map_err(|e| BootExit::Other(Box::new(e)))?,
-    );
-    let metrics_handle = if config.metrics.enabled {
-        Some(install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?)
-    } else {
-        None
-    };
+    let telemetry_runtime = WyrdTelemetryRuntime::install(config.telemetry.clone())
+        .map_err(|error| BootExit::Other(Box::new(error)))?;
+    let telemetry: Arc<TelemetryGuard> = telemetry_runtime.guard();
+    let metrics_handle = config
+        .metrics
+        .enabled
+        .then(|| telemetry_runtime.prometheus());
     info!(
         service.name = config
             .telemetry
@@ -73,6 +72,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     };
 
     drop(telemetry); // flush OTLP exporters after serving stops
+    drop(telemetry_runtime);
     result
 }
 

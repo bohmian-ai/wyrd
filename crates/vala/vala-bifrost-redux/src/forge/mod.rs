@@ -37,6 +37,7 @@ pub use clock::ForgeClock;
 pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectStore, ForgeTickOutcome};
 pub use error::ForgeError;
+pub use metrics::ForgeTelemetry;
 pub use planner::{
     ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
     PlannedForgeTask,
@@ -45,7 +46,8 @@ pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 pub use rewrite::ForgeRewriteRuntime;
 #[cfg(feature = "test-support")]
 pub use rewrite::deterministic_output_path_for_test;
-pub use worker::{ForgeWorker, ForgeWorkerConfig};
+pub use scheduler::ForgeSchedulerTrigger;
+pub use worker::{ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig};
 
 #[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};
@@ -82,6 +84,12 @@ pub struct ForgeBuildConfig {
     pub maintenance_interval: Duration,
     /// Concrete wall clock captured once by each Forge work batch.
     pub clock: ForgeClock,
+    /// Optional test-only observer of successful supervised task completion.
+    pub completion_observer: Option<ForgeWorkerCompletionObserver>,
+    /// Optional test-only trigger that wakes this owner’s supervised scheduler loop.
+    pub scheduler_trigger: Option<ForgeSchedulerTrigger>,
+    /// Fixed-cardinality production telemetry injected by process composition.
+    pub telemetry: Arc<ForgeTelemetry>,
 }
 
 /// The single stateful owner for all Forge maintenance workflows.
@@ -114,8 +122,12 @@ pub(crate) struct ForgeCore {
     maintenance_interval: Duration,
     /// Wall clock shared by periodic and hinted maintenance batches.
     clock: ForgeClock,
+    /// Optional observer notified only after a supervised worker returns success.
+    completion_observer: Option<ForgeWorkerCompletionObserver>,
+    /// Optional trigger/observer retained only by test-built supervised schedulers.
+    scheduler_trigger: Option<ForgeSchedulerTrigger>,
     /// Fixed-cardinality operational metric handles registered at construction.
-    metrics: metrics::ForgeMetrics,
+    telemetry: Arc<ForgeTelemetry>,
 }
 
 impl Forge {
@@ -155,7 +167,9 @@ impl Forge {
             config: build.config,
             maintenance_interval: build.maintenance_interval,
             clock: build.clock,
-            metrics: metrics::ForgeMetrics::new(),
+            completion_observer: build.completion_observer,
+            scheduler_trigger: build.scheduler_trigger,
+            telemetry: build.telemetry,
         };
         debug_assert!(core.rewrite.uses_staging(&core.staging));
         Ok(Self {

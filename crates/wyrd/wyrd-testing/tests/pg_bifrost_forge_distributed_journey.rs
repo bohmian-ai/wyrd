@@ -5,10 +5,15 @@ use std::time::{Duration, Instant};
 use secrecy::SecretString;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::forge::{ForgeScheduler, ForgeWorker, ForgeWorkerConfig};
+use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, ForgeTaskTableIdentity};
+use wyrd_server::config::ForgeProcessRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, SyncQueryRequest};
-use wyrd_testing::bifrost::BifrostHarness;
 use wyrd_testing::bifrost::forge_harness::seed_forge_group;
+use wyrd_testing::bifrost::{
+    BifrostHarness, BifrostQueryTelemetryReport, BifrostTopology, WyrdTestCluster,
+};
 use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -33,12 +38,12 @@ const SCENARIOS: [Scenario; 3] = [
     Scenario {
         name: "single-node-multi-tenant-multi-writer",
         pods: 1,
-        tenants: 3,
+        tenants: 10,
     },
     Scenario {
         name: "multi-node-multi-tenant-multi-writer",
         pods: 3,
-        tenants: 3,
+        tenants: 10,
     },
 ];
 
@@ -50,6 +55,41 @@ const WRITE_CYCLES: usize = 3;
 
 /// Number of spans carried by each OTLP writer request.
 const SPANS_PER_WRITE: usize = 6;
+
+/// Stable cross-topology evidence from one complete supervised Forge fixture.
+#[derive(Debug, PartialEq, Eq)]
+struct RoleTopologyEvidence {
+    /// Exact public query row counts in provisioned tenant order.
+    rows: Vec<u64>,
+    /// Terminal Forge task counts in the same tenant order.
+    terminal_tasks: Vec<i64>,
+    /// Terminal Forge audit counts in the same tenant order.
+    terminal_audits: Vec<i64>,
+    /// Terminal task rows retaining exact commit evidence in the same tenant order.
+    evidence_rows: Vec<i64>,
+    /// Terminal task rows retaining active watermark state in the same tenant order.
+    watermark_rows: Vec<i64>,
+    /// Remaining table-scoped Forge leases after Scribe retirement.
+    cleanup_leases: i64,
+}
+
+/// Typed server-integrated query artifact joined with Forge reports by scenario.
+#[derive(serde::Serialize)]
+struct QueryTelemetryArtifact {
+    /// Immutable process and tenant identity shared with the Forge benchmark.
+    scenario: QueryScenarioIdentity,
+    /// Production query histogram mapped by the server-only report owner.
+    query: BifrostQueryTelemetryReport,
+}
+
+/// Exact scenario join key shared by independent maintenance and query artifacts.
+#[derive(serde::Serialize)]
+struct QueryScenarioIdentity {
+    /// Number of serving/scheduling pods in the integrated journey.
+    pods: usize,
+    /// Number of isolated tenants queried in the integrated journey.
+    tenants: usize,
+}
 
 #[tokio::test]
 #[ignore = "gated journey: real bound Wyrd servers, Postgres, Scribe, Forge, and Iceberg"]
@@ -99,6 +139,910 @@ async fn forge_fixture_rebuilds_retain_manual_forge_clock() {
     server.shutdown().await.expect("server shutdown");
 }
 
+/// Prove the production worker-only role shares dependencies without serving APIs.
+///
+/// The cluster starts the same production `WyrdServer` supervisor used by the
+/// bound journey: one `server` process owns the public API and scheduler while
+/// three `forge-worker` processes join the shared durable Forge work pool. The
+/// journey writes and queries through the sole server endpoint, then uses a
+/// deterministic claim barrier to make all three worker-only processes claim
+/// independent tenant tasks through the production worker loop. Listener
+/// assertions prevent a worker role from silently becoming a second serving
+/// surface.
+///
+/// # Panics
+///
+/// Panics when the real shared Postgres/catalog/storage topology cannot start,
+/// a process role differs from its requested composition, a worker binds an
+/// API listener, or shutdown cannot complete.
+#[tokio::test]
+#[ignore = "gated journey: real server role topology, Postgres, and shared Forge dependencies"]
+async fn dedicated_forge_workers_share_dependencies_without_public_listeners() {
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers()
+        .await
+        .expect("dedicated Forge worker cluster");
+    assert_eq!(cluster.topology(), BifrostTopology::DedicatedForgeWorkers);
+    let roles = cluster
+        .servers()
+        .iter()
+        .map(WyrdTestServer::forge_process_role)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        vec![
+            ForgeProcessRole::Server,
+            ForgeProcessRole::ForgeWorker,
+            ForgeProcessRole::ForgeWorker,
+            ForgeProcessRole::ForgeWorker,
+        ]
+    );
+    let scheduler_server = cluster.server(0).expect("scheduler/server pod");
+    assert!(scheduler_server.base_url().is_some());
+    assert!(scheduler_server.grpc_url().is_some());
+    for worker in &cluster.servers()[1..] {
+        assert_eq!(worker.base_url(), None);
+        assert_eq!(worker.grpc_url(), None);
+        assert_eq!(worker.bound_addr(), None);
+    }
+    let completion = cluster
+        .forge_completion_observer()
+        .expect("dedicated worker completion observer");
+    let scenario = Scenario {
+        name: "dedicated-forge-workers",
+        pods: 1,
+        tenants: 3,
+    };
+    let tenants = provision_tenants(scheduler_server, scenario).await;
+    assert_active_traces_roster(scheduler_server, &tenants, scenario).await;
+    for cycle in 0..WRITE_CYCLES {
+        write_cycle(
+            std::slice::from_ref(scheduler_server),
+            &tenants,
+            cycle,
+            scenario,
+        )
+        .await;
+        for tenant in &tenants {
+            scheduler_server
+                .flush_bifrost_for_tenant(tenant.id)
+                .await
+                .expect("dedicated scheduler/server flush");
+        }
+    }
+    scheduler_server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("advance scheduler Forge clock");
+    completion.hold_after_claims_for_test(3);
+    trigger_supervised_scheduler(scheduler_server, scenario).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_claims_for_test(),
+    )
+    .await
+    .expect("each worker-only process claimed one independent durable task");
+    assert_claim_barrier_shape(scheduler_server, 3, scenario).await;
+    completion.release_claims_for_test();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_distinct_workers_at_least(3),
+    )
+    .await
+    .expect("all three worker-only processes completed durable work");
+    let scribe = scheduler_server
+        .bifrost_scribe()
+        .expect("server-role Scribe");
+    scribe
+        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .await
+        .expect("retire committed Scribe generations");
+    let expected_rows =
+        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded dedicated journey row count");
+    for tenant in &tenants {
+        assert_eq!(
+            query_rows(scheduler_server, &tenant.jwt).await,
+            expected_rows,
+            "dedicated worker tenant {} rows",
+            tenant.id
+        );
+        assert_terminal_audits(scheduler_server, tenant.id, scenario).await;
+        assert_snapshot(scheduler_server, tenant.id, scenario).await;
+    }
+    assert_no_forge_leases(scheduler_server, scenario).await;
+    cluster
+        .shutdown()
+        .await
+        .expect("dedicated cluster shutdown");
+}
+
+/// Compare embedded and dedicated supervised roles through identical tenant work.
+///
+/// # Panics
+///
+/// Panics when either real topology diverges in public rows or its durable
+/// task, audit, evidence, watermark, or cleanup footprint.
+#[tokio::test]
+#[ignore = "gated journey: paired real Forge role topologies, Postgres, and shared Iceberg dependencies"]
+async fn embedded_and_dedicated_forge_roles_preserve_exact_durable_parity() {
+    let embedded = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("embedded Forge cluster");
+    assert_eq!(
+        embedded
+            .server(0)
+            .expect("embedded server")
+            .forge_process_role(),
+        ForgeProcessRole::All
+    );
+    let embedded_evidence = run_supervised_role_fixture(&embedded, 1, "embedded-forge-role").await;
+    embedded
+        .shutdown()
+        .await
+        .expect("embedded cluster shutdown");
+
+    let dedicated = WyrdTestCluster::start_with_dedicated_forge_workers()
+        .await
+        .expect("dedicated Forge cluster");
+    assert_eq!(dedicated.topology(), BifrostTopology::DedicatedForgeWorkers);
+    assert!(dedicated.servers()[1..].iter().all(|worker| {
+        worker.forge_process_role() == ForgeProcessRole::ForgeWorker
+            && worker.base_url().is_none()
+            && worker.grpc_url().is_none()
+            && worker.bound_addr().is_none()
+    }));
+    let dedicated_evidence =
+        run_supervised_role_fixture(&dedicated, 3, "dedicated-forge-role").await;
+    dedicated
+        .shutdown()
+        .await
+        .expect("dedicated cluster shutdown");
+
+    assert_eq!(embedded_evidence, dedicated_evidence);
+}
+
+/// Prove a real dedicated worker loss is reclaimed without duplicate public rows.
+///
+/// One worker stops only after PostgreSQL has persisted its claim. The test
+/// invokes the production planner once, then lets only supervised worker roles
+/// claim, lose, reclaim, publish, and retire the work.
+///
+/// # Panics
+///
+/// Panics when the supervised role topology does not reclaim the lost claim,
+/// creates duplicate rows, or leaves task/audit/evidence/lease state divergent.
+#[tokio::test]
+#[ignore = "gated journey: supervised dedicated Forge worker loss and lease reclaim"]
+async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows() {
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers()
+        .await
+        .expect("dedicated Forge cluster");
+    let server = cluster.server(0).expect("scheduler server");
+    let completion = cluster
+        .forge_completion_observer()
+        .expect("shared supervised observer");
+    let scenario = Scenario {
+        name: "supervised-worker-reclaim",
+        pods: 1,
+        tenants: 3,
+    };
+    let tenants = provision_tenants(server, scenario).await;
+    assert_active_traces_roster(server, &tenants, scenario).await;
+    for cycle in 0..WRITE_CYCLES {
+        write_cycle(std::slice::from_ref(server), &tenants, cycle, scenario).await;
+        for tenant in &tenants {
+            server
+                .flush_bifrost_for_tenant(tenant.id)
+                .await
+                .expect("supervised loss fixture flush");
+        }
+    }
+    completion.abandon_next_claim_for_test();
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("age staged files for production planner");
+    trigger_supervised_scheduler(server, scenario).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_abandoned_claim_for_test(),
+    )
+    .await
+    .expect("one real worker stopped after its durable claim");
+    let (lost_task, lost_attempt, lost_owner) = completion.abandoned_claim_identity_for_test();
+    let expired: uuid::Uuid = sqlx::query_scalar(
+        "UPDATE vala.forge_tasks SET claim_expires_at = statement_timestamp() - interval '1 millisecond' WHERE task_id = $1 AND attempt_id = $2 AND claimed_by = $3 AND state = 'claimed' RETURNING task_id",
+    )
+    .bind(lost_task)
+    .bind(lost_attempt)
+    .bind(lost_owner)
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("expire the exact abandoned durable claim");
+    assert_eq!(expired, lost_task, "only the stopped claim may expire");
+    let staged_completion = tokio::time::timeout(
+        Duration::from_secs(15),
+        completion.wait_for_strategy_at_least(ForgeTaskStrategy::StagingFold, 3),
+    )
+    .await;
+    if staged_completion.is_err() {
+        panic!(
+            "remaining supervised workers did not reclaim staged tasks: {:?}",
+            forge_task_diagnostics(server).await
+        );
+    }
+
+    server
+        .bifrost_scribe()
+        .expect("server-role Scribe")
+        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .await
+        .expect("retire committed Scribe generations");
+    let expected_rows =
+        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded reclaim rows");
+    for tenant in &tenants {
+        assert_terminal_audits(server, tenant.id, scenario).await;
+        assert_snapshot(server, tenant.id, scenario).await;
+        let mut conn = server
+            .state()
+            .postgres
+            .vala()
+            .tenant_conn(tenant.id)
+            .await
+            .expect("reclaim tenant connection");
+        let (terminal, evidence): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE evidence IS NOT NULL) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND strategy = 'staging_fold' AND state = 'succeeded'",
+        )
+        .bind(tenant.id.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("reclaimed terminal task evidence");
+        assert_eq!(
+            terminal, 1,
+            "tenant {} has one terminal reclaimed task",
+            tenant.id
+        );
+        assert_eq!(
+            evidence, 1,
+            "tenant {} retained exact task evidence",
+            tenant.id
+        );
+        assert_eq!(
+            supervised_reclaim_query_rows(server, &tenant.jwt).await,
+            expected_rows,
+            "reclaimed tenant {} public rows after terminal={terminal}, evidence={evidence}",
+            tenant.id
+        );
+    }
+    assert_no_forge_leases(server, scenario).await;
+    cluster
+        .shutdown()
+        .await
+        .expect("dedicated cluster shutdown");
+}
+
+/// Prove real dedicated workers reconcile a post-commit uncertain publication exactly once.
+///
+/// # Panics
+///
+/// Panics when the catalog boundary is not reached, prepared recovery does not
+/// terminalize through a supervised worker, or public/durable results duplicate.
+#[tokio::test]
+#[ignore = "gated journey: supervised dedicated Forge uncertain-commit recovery"]
+async fn supervised_dedicated_roles_recover_uncertain_commit_without_duplicate_rows() {
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers_with_uncertainty_for_test()
+        .await
+        .expect("dedicated uncertain Forge cluster");
+    let server = cluster.server(0).expect("scheduler server");
+    let completion = cluster
+        .forge_completion_observer()
+        .expect("shared supervised observer");
+    let control = cluster
+        .commit_uncertainty_catalog()
+        .expect("shared commit uncertainty catalog");
+    let scenario = Scenario {
+        name: "supervised-uncertain-commit",
+        pods: 1,
+        tenants: 1,
+    };
+    let tenants = provision_tenants(server, scenario).await;
+    for cycle in 0..WRITE_CYCLES {
+        write_cycle(std::slice::from_ref(server), &tenants, cycle, scenario).await;
+        server
+            .flush_bifrost_for_tenant(tenants[0].id)
+            .await
+            .expect("uncertain fixture flush");
+    }
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("age uncertain fixture files");
+    control.pause_after_commit();
+    trigger_supervised_scheduler(server, scenario).await;
+    tokio::time::timeout(Duration::from_secs(10), control.wait_for_commit())
+        .await
+        .expect("supervised worker reached real post-commit boundary");
+    control.reject_paused_commit();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_strategy_at_least(ForgeTaskStrategy::StagingFold, 1),
+    )
+    .await
+    .expect("supervised worker reconciled prepared uncertain commit");
+    assert_eq!(
+        control.update_attempts(),
+        1,
+        "staging publication performs one catalog update attempt"
+    );
+    server
+        .bifrost_scribe()
+        .expect("server-role Scribe")
+        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .await
+        .expect("retire uncertain fixture Scribe generations");
+    let tail_stats = server
+        .bifrost_scribe()
+        .expect("server-role Scribe")
+        .memtable_stats()
+        .expect("uncertain fixture Scribe stats");
+    assert_eq!(
+        tail_stats.writable_rows, 0,
+        "uncertain writable tail drained"
+    );
+    assert_eq!(
+        tail_stats.immutable_rows, 0,
+        "uncertain immutable tail retired"
+    );
+    let expected_rows =
+        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded uncertain rows");
+    assert_terminal_audits(server, tenants[0].id, scenario).await;
+    assert_snapshot(server, tenants[0].id, scenario).await;
+    let mut conn = server
+        .state()
+        .postgres
+        .vala()
+        .tenant_conn(tenants[0].id)
+        .await
+        .expect("uncertain tenant connection");
+    let (terminal, evidence): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE evidence IS NOT NULL) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND strategy = 'staging_fold' AND state = 'succeeded'",
+    )
+    .bind(tenants[0].id.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("uncertain terminal task evidence");
+    assert_eq!(terminal, 1, "uncertain publication terminalized once");
+    assert_eq!(evidence, 1, "uncertain publication retained exact evidence");
+    let (files, compacted, committed): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE compacted), count(*) FILTER (WHERE committed_snapshot_id IS NOT NULL) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans'",
+    )
+    .bind(tenants[0].id.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("uncertain file-list convergence");
+    conn.commit()
+        .await
+        .expect("complete uncertain evidence read");
+    assert_eq!(
+        committed, files,
+        "uncertain recovery stamps every exact staging input"
+    );
+    assert_eq!(
+        query_rows(server, &tenants[0].jwt).await,
+        expected_rows,
+        "uncertain commit public rows after terminal={terminal}, evidence={evidence}, files={files}, compacted={compacted}, committed={committed}"
+    );
+    assert_no_forge_leases(server, scenario).await;
+    cluster
+        .shutdown()
+        .await
+        .expect("dedicated cluster shutdown");
+}
+
+/// Prove real planner admission reaches a cluster-exclusive large lane and terminal unschedulable lane.
+///
+/// # Panics
+///
+/// Panics when production planning does not persist the configured lane state.
+#[tokio::test]
+#[ignore = "gated journey: real Forge unschedulable admission"]
+async fn dedicated_roles_terminalize_unschedulable_work() {
+    let large_config = vala_bifrost_redux::forge::ForgeConfig {
+        max_bytes_per_tick: 1,
+        max_memory_bytes: i64::MAX as u64,
+        max_large_task_bytes: i64::MAX as u64,
+        ..vala_bifrost_redux::forge::ForgeConfig::default()
+    };
+    let cluster =
+        WyrdTestCluster::start_with_dedicated_forge_workers_with_config_for_test(large_config)
+            .await
+            .expect("large-lane cluster");
+    let server = cluster.server(0).expect("scheduler server");
+    let completion = cluster
+        .forge_completion_observer()
+        .expect("large-lane completion observer");
+    let scenario = Scenario {
+        name: "large-lane",
+        pods: 1,
+        tenants: 2,
+    };
+    let tenants = provision_tenants(server, scenario).await;
+    for cycle in 0..WRITE_CYCLES {
+        write_cycle(std::slice::from_ref(server), &tenants, cycle, scenario).await;
+        for tenant in &tenants {
+            server
+                .flush_bifrost_for_tenant(tenant.id)
+                .await
+                .expect("large flush");
+        }
+    }
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("age large files");
+    completion.hold_after_claims_for_test(1);
+    trigger_supervised_scheduler(server, scenario).await;
+    let tasks: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT strategy, lane, state FROM vala.forge_tasks WHERE data_tenant_id = ANY($1) ORDER BY data_tenant_id, strategy",
+    )
+    .bind(tenants.iter().map(|tenant| tenant.id.as_uuid()).collect::<Vec<_>>())
+    .fetch_all(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("large singleton task states");
+    assert!(
+        tasks.len() >= tenants.len()
+            && tasks
+                .iter()
+                .all(|(strategy, lane, state)| strategy == "staging_fold"
+                    && lane == "large_singleton"
+                    && (state == "ready" || state == "claimed" || state == "running"))
+            && tasks.iter().any(|(_, _, state)| state == "ready"),
+        "planner must retain a ready multi-input large task while the supervised worker claims one: {tasks:?}"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_claims_for_test(),
+    )
+    .await
+    .expect("one worker claimed a cluster-exclusive large task");
+    let (active_large, ready_large): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE lane = 'large_singleton' AND state IN ('claimed', 'running', 'prepared')), count(*) FILTER (WHERE lane = 'large_singleton' AND state = 'ready') FROM vala.forge_tasks WHERE data_tenant_id = ANY($1)",
+    )
+    .bind(tenants.iter().map(|tenant| tenant.id.as_uuid()).collect::<Vec<_>>())
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("cluster-exclusive large task state");
+    assert_eq!(active_large, 1, "one large task may be active cluster-wide");
+    assert!(
+        ready_large >= 1,
+        "another large task must wait for the cluster lane"
+    );
+    let active_tenant_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT data_tenant_id FROM vala.forge_tasks WHERE lane = 'large_singleton' AND state IN ('claimed', 'running', 'prepared')",
+    )
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("active large task tenant");
+    let active_tenant = tenants
+        .iter()
+        .find(|tenant| tenant.id.as_uuid() == active_tenant_id)
+        .expect("active task belongs to a fixture tenant");
+    let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.traces", "spans")
+        .expect("canonical traces task identity");
+    ForgeTasks::new()
+        .upsert_periodic(
+            &server
+                .state()
+                .postgres
+                .operator_pool()
+                .expect("operator pool"),
+            active_tenant.id,
+            &identity,
+        )
+        .await
+        .expect("enqueue same-table periodic demand");
+    trigger_supervised_scheduler(server, scenario).await;
+    let active_same_table: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND namespace_name = 'vala.traces' AND table_name = 'spans' AND state IN ('claimed', 'running', 'prepared')",
+    )
+    .bind(active_tenant.id.as_uuid())
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("same-table active publication count");
+    assert_eq!(
+        active_same_table, 1,
+        "same-table planning must not create an overlapping real-worker publication"
+    );
+    completion.release_claims_for_test();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        completion.wait_for_strategy_at_least(ForgeTaskStrategy::StagingFold, tenants.len()),
+    )
+    .await
+    .expect("supervised workers completed the serialized large tasks");
+    cluster.shutdown().await.expect("large cluster shutdown");
+
+    let unschedulable_config = vala_bifrost_redux::forge::ForgeConfig {
+        max_bytes_per_tick: 1,
+        max_large_task_bytes: 1,
+        ..vala_bifrost_redux::forge::ForgeConfig::default()
+    };
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers_with_config_for_test(
+        unschedulable_config,
+    )
+    .await
+    .expect("unschedulable cluster");
+    let server = cluster.server(0).expect("scheduler server");
+    let scenario = Scenario {
+        name: "unschedulable",
+        pods: 1,
+        tenants: 1,
+    };
+    let tenants = provision_tenants(server, scenario).await;
+    for cycle in 0..WRITE_CYCLES {
+        write_cycle(std::slice::from_ref(server), &tenants, cycle, scenario).await;
+        server
+            .flush_bifrost_for_tenant(tenants[0].id)
+            .await
+            .expect("unschedulable flush");
+    }
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("age unschedulable files");
+    trigger_supervised_scheduler(server, scenario).await;
+    let (state, audits): (String, i64) = sqlx::query_as("SELECT state, (SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation='forge.task.unschedulable') FROM vala.forge_tasks WHERE data_tenant_id=$1 AND strategy='staging_fold'").bind(tenants[0].id.as_uuid()).fetch_one(server.state().postgres.operator_pool().expect("operator pool").pool()).await.expect("unschedulable terminal");
+    assert_eq!(state, "unschedulable");
+    assert_eq!(audits, 1);
+    cluster
+        .shutdown()
+        .await
+        .expect("unschedulable cluster shutdown");
+}
+
+/// Drive independent tenant tasks through one supervised production role topology.
+///
+/// # Panics
+///
+/// Panics when production ingest, durable scheduling, supervised worker
+/// completion, public query, or durable parity inspection fails.
+async fn run_supervised_role_fixture(
+    cluster: &WyrdTestCluster,
+    worker_count: usize,
+    name: &'static str,
+) -> RoleTopologyEvidence {
+    let server = cluster.server(0).expect("serving Forge server");
+    let completion = cluster
+        .forge_completion_observer()
+        .expect("shared supervised completion observer");
+    let scenario = Scenario {
+        name,
+        pods: 1,
+        tenants: worker_count.max(3),
+    };
+    let tenants = provision_tenants(server, scenario).await;
+    assert_active_traces_roster(server, &tenants, scenario).await;
+    for cycle in 0..WRITE_CYCLES {
+        write_cycle(std::slice::from_ref(server), &tenants, cycle, scenario).await;
+        for tenant in &tenants {
+            server
+                .flush_bifrost_for_tenant(tenant.id)
+                .await
+                .expect("supervised role fixture flush");
+        }
+    }
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("advance supervised role fixture clock");
+    completion.hold_after_claims_for_test(worker_count);
+    trigger_supervised_scheduler(server, scenario).await;
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = ANY($1) AND state = 'ready'",
+    )
+    .bind(
+        tenants
+            .iter()
+            .map(|tenant| tenant.id.as_uuid())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("supervised queued tenant tasks");
+    assert!(
+        usize::try_from(queued).expect("nonnegative queued count") >= worker_count,
+        "{name} constrained tenant must remain inside the measured eligible set"
+    );
+    assert_scheduler_takeover_preserves_fairness_bound(server, scenario).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_claims_for_test(),
+    )
+    .await
+    .expect("configured supervised roles claimed independent tasks");
+    assert_claim_barrier_shape(server, worker_count, scenario).await;
+    completion.release_claims_for_test();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_distinct_workers_at_least(worker_count),
+    )
+    .await
+    .expect("configured supervised roles completed durable work");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_at_least(tenants.len()),
+    )
+    .await
+    .expect("every role fixture tenant reached a terminal supervised completion");
+    server
+        .bifrost_scribe()
+        .expect("server-role Scribe")
+        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .await
+        .expect("retire Scribe generations");
+
+    let expected_rows =
+        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded role fixture rows");
+    let mut rows = Vec::with_capacity(tenants.len());
+    let mut terminal_tasks = Vec::with_capacity(tenants.len());
+    let mut terminal_audits = Vec::with_capacity(tenants.len());
+    let mut evidence_rows = Vec::with_capacity(tenants.len());
+    let mut watermark_rows = Vec::with_capacity(tenants.len());
+    for tenant in &tenants {
+        let row_count = query_rows(server, &tenant.jwt).await;
+        assert_eq!(row_count, expected_rows, "{name} tenant {} rows", tenant.id);
+        assert_terminal_audits(server, tenant.id, scenario).await;
+        assert_snapshot(server, tenant.id, scenario).await;
+        rows.push(row_count);
+        let mut conn = server
+            .state()
+            .postgres
+            .vala()
+            .tenant_conn(tenant.id)
+            .await
+            .expect("role fixture tenant connection");
+        let durable: (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE evidence IS NOT NULL), count(*) FILTER (WHERE watermark_snapshot_id IS NOT NULL) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND state IN ('succeeded', 'unschedulable', 'failed', 'cancelled')",
+        )
+        .bind(tenant.id.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("role fixture durable task evidence");
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation IN ('forge.file_compact.committed', 'forge.file_compact.recovered', 'forge.file_compact.reset')",
+        )
+        .bind(tenant.id.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("role fixture terminal audit count");
+        terminal_tasks.push(durable.0);
+        evidence_rows.push(durable.1);
+        watermark_rows.push(durable.2);
+        terminal_audits.push(audits);
+    }
+    assert_no_forge_leases(server, scenario).await;
+    let cleanup_leases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.maintenance_leases WHERE lease_key LIKE 'forge:table:%'",
+    )
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("role fixture cleanup lease count");
+    RoleTopologyEvidence {
+        rows,
+        terminal_tasks,
+        terminal_audits,
+        evidence_rows,
+        watermark_rows,
+        cleanup_leases,
+    }
+}
+
+/// Return durable task strategy, state, owner, and expiry data for a failing role journey.
+///
+/// # Panics
+///
+/// Panics when platform-admin task inspection fails during failure reporting.
+async fn forge_task_diagnostics(
+    server: &WyrdTestServer,
+) -> Vec<(
+    String,
+    String,
+    Option<uuid::Uuid>,
+    Option<chrono::DateTime<chrono::Utc>>,
+)> {
+    sqlx::query_as(
+        "SELECT strategy, state, claimed_by, claim_expires_at FROM vala.forge_tasks ORDER BY data_tenant_id, created_at",
+    )
+    .fetch_all(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("Forge task diagnostic query")
+}
+
+/// Assert a real-role claim barrier has one active task per independent tenant table.
+///
+/// The durable unique active-publication constraint is inspected before the
+/// barrier releases a worker. This proves concurrent independent-table claims
+/// without allowing overlapping publication for a tenant/table identity.
+///
+/// # Panics
+///
+/// Panics when platform-admin claim inspection fails or the observed claim
+/// shape differs from the configured production worker topology.
+async fn assert_claim_barrier_shape(server: &WyrdTestServer, expected: usize, scenario: Scenario) {
+    let rows: Vec<(uuid::Uuid, String, String, i64)> = sqlx::query_as(
+        "SELECT data_tenant_id, namespace_name, table_name, count(*) FROM vala.forge_tasks WHERE state IN ('claimed', 'running', 'prepared') GROUP BY data_tenant_id, namespace_name, table_name ORDER BY data_tenant_id, namespace_name, table_name",
+    )
+    .fetch_all(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("claim-barrier durable task inspection");
+    assert_eq!(
+        rows.len(),
+        expected,
+        "{} must expose one independent active claim per worker: {rows:?}",
+        scenario.name
+    );
+    assert!(
+        rows.iter().all(|(_, _, _, count)| *count == 1),
+        "{} same-table publication overlap: {rows:?}",
+        scenario.name
+    );
+}
+
+/// Expire one exact scheduler lease and prove the next owner preserves the fair cursor bound.
+///
+/// # Panics
+///
+/// Panics when the exact lease cannot be expired, takeover planning fails, or
+/// the durable scheduler fence/cursor no longer describes a bounded tenant ring.
+async fn assert_scheduler_takeover_preserves_fairness_bound(
+    server: &WyrdTestServer,
+    scenario: Scenario,
+) {
+    let first_owner: uuid::Uuid = sqlx::query_scalar(
+        "SELECT owner FROM vala.forge_scheduler_state WHERE singleton AND owner IS NOT NULL",
+    )
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("read exact scheduler owner lease");
+    let expired: uuid::Uuid = sqlx::query_scalar(
+        "UPDATE vala.forge_scheduler_state SET expires_at = statement_timestamp() - interval '1 millisecond' WHERE singleton AND owner = $1 RETURNING owner",
+    )
+    .bind(first_owner)
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("expire exact scheduler owner lease");
+    assert_eq!(
+        expired, first_owner,
+        "only the first scheduler lease may expire"
+    );
+    trigger_supervised_scheduler(server, scenario).await;
+    let (fencing_token, cursor): (i64, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT fencing_token, last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+    )
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("takeover scheduler state");
+    assert!(
+        fencing_token >= 2,
+        "{} scheduler takeover did not fence",
+        scenario.name
+    );
+    assert!(
+        cursor.is_some(),
+        "{} scheduler takeover lost fair cursor",
+        scenario.name
+    );
+}
+
+/// Request and await one pass from the server's already-supervised scheduler.
+///
+/// This preserves the real server role's durable scheduler owner and avoids a
+/// test-created scheduler bypassing lifecycle composition.
+///
+/// # Panics
+///
+/// Panics when the supervised scheduler does not return one pass inside the
+/// bounded journey deadline.
+async fn trigger_supervised_scheduler(server: &WyrdTestServer, scenario: Scenario) {
+    let trigger = server.forge_scheduler_trigger_for_test();
+    let expected = trigger.completed_passes().saturating_add(1);
+    server.trigger_forge_scheduler_for_test();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        trigger.wait_for_passes_at_least(expected),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{} supervised Forge scheduler did not return",
+            scenario.name
+        )
+    });
+}
+
 /// Run one deployment shape from authenticated ingest through query readback.
 ///
 /// # Panics
@@ -109,6 +1053,14 @@ async fn run_scenario(scenario: Scenario) {
     let harness = BifrostHarness::start(scenario.pods, 1)
         .await
         .unwrap_or_else(|error| panic!("{} harness: {error}", scenario.name));
+    let telemetry = harness.cluster().telemetry().clone();
+    let checkpoint = telemetry
+        .checkpoint()
+        .unwrap_or_else(|error| panic!("{} query telemetry checkpoint: {error}", scenario.name));
+    let sampler = telemetry
+        .begin_gauge_sampling(&checkpoint)
+        .await
+        .unwrap_or_else(|error| panic!("{} query telemetry sampler: {error}", scenario.name));
     let servers = harness.cluster().servers();
     assert_eq!(servers.len(), scenario.pods, "{} pod count", scenario.name);
     let control = &servers[0];
@@ -219,10 +1171,49 @@ async fn run_scenario(scenario: Scenario) {
     }
     assert_no_forge_leases(control, scenario).await;
 
+    let delta = telemetry
+        .delta_since(checkpoint, sampler)
+        .await
+        .unwrap_or_else(|error| panic!("{} query telemetry delta: {error}", scenario.name));
+    let query = BifrostQueryTelemetryReport::from_server_delta(&delta)
+        .unwrap_or_else(|error| panic!("{} query telemetry report: {error}", scenario.name));
+    write_query_telemetry_artifact(scenario, query);
+
     harness
         .shutdown()
         .await
         .unwrap_or_else(|error| panic!("{} shutdown: {error}", scenario.name));
+}
+
+/// Write one server-only query artifact without copying any Forge maintenance field.
+///
+/// # Panics
+///
+/// Panics when the report directory cannot be created or typed JSON cannot be
+/// serialized and written.
+fn write_query_telemetry_artifact(scenario: Scenario, query: BifrostQueryTelemetryReport) {
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("wyrd-testing manifest is nested below the repository root");
+    let directory = repository.join("target/bifrost-benchmarks/task16");
+    std::fs::create_dir_all(&directory).expect("create Task 16 query report directory");
+    let artifact = QueryTelemetryArtifact {
+        scenario: QueryScenarioIdentity {
+            pods: scenario.pods,
+            tenants: scenario.tenants,
+        },
+        query,
+    };
+    let path = directory.join(format!("query-{}-{}.json", scenario.pods, scenario.tenants));
+    std::fs::write(
+        path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&artifact).expect("serialize typed query artifact")
+        ),
+    )
+    .expect("write typed query artifact");
 }
 
 /// Authenticated tenant identity used by concurrent writers and query checks.
@@ -664,6 +1655,30 @@ async fn wait_for_query_rows(
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Return one public read while retaining the exact failure payload for role-loss diagnosis.
+///
+/// # Panics
+///
+/// Panics when the public read does not succeed or omits its row-count header.
+async fn supervised_reclaim_query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
+    let response = query_response(server, jwt).await;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .text()
+        .await
+        .expect("public reclaim query response body");
+    assert!(
+        status.is_success(),
+        "supervised reclaimed public query {status}: {body}"
+    );
+    headers
+        .get("x-wyrd-row-count")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("successful supervised reclaim query row-count header")
 }
 
 /// Assert every prepared operation has one terminal event and ordered outputs.

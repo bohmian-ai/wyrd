@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
+use num_traits::ToPrimitive;
 
 use crate::contracts::ScribeError;
 
@@ -463,24 +464,30 @@ impl BifrostDataFusionMemoryPool {
 impl MemoryPool for BifrostDataFusionMemoryPool {
     fn grow(
         &self,
-        _reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
         additional: usize,
     ) {
-        self.governor
+        let reserved = self
+            .governor
             .inner
             .bifrost_total_bytes
-            .fetch_add(additional, Ordering::AcqRel);
+            .fetch_add(additional, Ordering::AcqRel)
+            .saturating_add(additional);
+        record_forge_memory(reservation, reserved, Some("accepted"));
     }
 
     fn shrink(
         &self,
-        _reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
         shrink: usize,
     ) {
-        self.governor
+        let reserved = self
+            .governor
             .inner
             .bifrost_total_bytes
-            .fetch_sub(shrink, Ordering::AcqRel);
+            .fetch_sub(shrink, Ordering::AcqRel)
+            .saturating_sub(shrink);
+        record_forge_memory(reservation, reserved, None);
     }
 
     fn try_grow(
@@ -490,7 +497,11 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
     ) -> datafusion::error::Result<()> {
         self.governor
             .try_reserve_parent_bytes(additional)
+            .map(|()| {
+                record_forge_memory(reservation, self.reserved(), Some("accepted"));
+            })
             .map_err(|error| {
+                record_forge_memory(reservation, self.reserved(), Some("rejected"));
                 DataFusionError::ResourcesExhausted(format!(
                     "Bifrost parent memory limit rejected {} bytes for `{}`: {error}",
                     additional,
@@ -508,6 +519,30 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
 
     fn memory_limit(&self) -> MemoryLimit {
         MemoryLimit::Finite(self.governor.bifrost_limit_bytes())
+    }
+}
+
+/// Emit Forge-only parent-memory telemetry for a fixed `DataFusion` consumer.
+///
+/// Every ownership change updates the live gauge. Only an attempted reserve
+/// supplies `reservation_outcome` and advances the accepted/rejected activity
+/// counter; releasing memory must not masquerade as a successful reservation.
+fn record_forge_memory(
+    reservation: &datafusion::execution::memory_pool::MemoryReservation,
+    reserved: usize,
+    reservation_outcome: Option<&'static str>,
+) {
+    if reservation.consumer().name().contains("forge") {
+        metrics::gauge!("bifrost_memory_reserved_bytes", "consumer" => "forge")
+            .set(reserved.to_f64().unwrap_or(f64::MAX));
+        if let Some(outcome) = reservation_outcome {
+            metrics::counter!(
+                "bifrost_memory_reservations_total",
+                "consumer" => "forge",
+                "outcome" => outcome
+            )
+            .increment(1);
+        }
     }
 }
 

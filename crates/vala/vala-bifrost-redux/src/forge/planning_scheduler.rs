@@ -1,5 +1,7 @@
 //! Durable demand scheduling without rewrite or Iceberg commit execution.
 
+use std::collections::BTreeMap;
+
 use chrono::Utc;
 use num_traits::ToPrimitive;
 use tokio_util::sync::CancellationToken;
@@ -31,6 +33,8 @@ pub struct ForgeScheduleOutcome {
     pub tasks_enqueued: usize,
     /// Plans classified terminally outside every lane.
     pub unschedulable: usize,
+    /// Maximum-minus-minimum admitted task count across this complete pass's tenants.
+    pub fairness_lag_tasks: usize,
     /// Whether the bounded page or any demand remained incomplete.
     pub incomplete: bool,
 }
@@ -171,6 +175,7 @@ impl<'forge> ForgeScheduler<'forge> {
             .map_err(ForgeError::Sql)?;
         outcome.incomplete |= overflowed;
         outcome.demands_seen = demands.len();
+        let mut admitted_by_tenant = BTreeMap::<_, usize>::new();
         for demand in demands {
             if stop.is_cancelled() {
                 outcome.incomplete = true;
@@ -186,6 +191,14 @@ impl<'forge> ForgeScheduler<'forge> {
                     outcome.demands_acknowledged = outcome
                         .demands_acknowledged
                         .saturating_add(usize::from(planned.acknowledged));
+                    if planned.acknowledged {
+                        admitted_by_tenant
+                            .entry(demand.data_tenant_id)
+                            .and_modify(|count| {
+                                *count = count.saturating_add(planned.tasks_enqueued);
+                            })
+                            .or_insert(planned.tasks_enqueued);
+                    }
                     outcome.incomplete |= !planned.acknowledged;
                 }
                 Err(error) => {
@@ -194,6 +207,11 @@ impl<'forge> ForgeScheduler<'forge> {
                 }
             }
         }
+        outcome.fairness_lag_tasks = admitted_by_tenant
+            .values()
+            .min()
+            .zip(admitted_by_tenant.values().max())
+            .map_or(0, |(minimum, maximum)| maximum.saturating_sub(*minimum));
         self.publish_status(&mut outcome).await?;
         metrics::counter!("bifrost_forge_scheduling_total", "result" => if outcome.incomplete { "incomplete" } else { "complete" }).increment(1);
         metrics::counter!("bifrost_forge_unschedulable_total")
@@ -386,6 +404,10 @@ impl<'forge> ForgeScheduler<'forge> {
                     .as_secs_f64()
             });
             metrics::gauge!("bifrost_forge_oldest_planning_demand_seconds").set(age);
+            metrics::gauge!("bifrost_forge_oldest_backlog_seconds").set(age);
+            metrics::gauge!("bifrost_forge_fairness_lag_tasks")
+                .set(exact_gauge(outcome.fairness_lag_tasks as u64));
+            metrics::counter!("bifrost_forge_complete_gauge_publications_total").increment(1);
         } else {
             outcome.incomplete = true;
         }

@@ -42,7 +42,9 @@ def test_bifrost_query_missing_terminal_fails_closed(
         stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
         )
-        with pytest.raises(IncompleteQueryStreamError, match="WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"):
+        with pytest.raises(
+            IncompleteQueryStreamError, match="WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
+        ):
             while True:
                 await stream.__anext__()
         await stream.aclose()

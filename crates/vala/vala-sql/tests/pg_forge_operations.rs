@@ -1410,16 +1410,16 @@ mod pg_tests {
         }
 
         // -----------------------------------------------------------------------
-        // Reset -> Prepared reopen
+        // Reset is terminal; retry requires a new generation.
         // -----------------------------------------------------------------------
 
-        /// Verifies Reset followed by Prepared reopens the operation.
+        /// Verifies Reset rejects resurrection while a new generation may retry.
         ///
         /// # Panics
         ///
         /// Panics when setup, any transition, or exact state/audit assertions fail.
         #[tokio::test]
-        async fn reset_retry_reopens_exact_deterministic_operation() {
+        async fn reset_retry_requires_new_operation_generation() {
             let TestFixtures { fixture, .. } = setup().await;
             let pool = fixture.app_pool();
             let tenant = fixture.data_tenant_id();
@@ -1461,36 +1461,26 @@ mod pg_tests {
                 ForgeOperationFamily::StagingFold,
                 &new_prepared_event,
             )
-            .await
-            .expect("reopened prepared");
+            .await;
+            assert!(reopened.is_err(), "Reset generation cannot reopen");
 
-            match reopened {
-                ForgeOperationTransition::Applied { audit_seq } => {
-                    assert!(audit_seq > 0, "new seq after reopen");
-                }
-                _ => panic!("expected Applied after Reset -> Prepared"),
-            }
-
-            // New terminal should work after reopen
-            let new_detail = new_prepared_event.detail.as_ref().expect("detail");
-            let new_committed = compact_committed_event(new_detail, resource());
-            let after_reopen = append_terminal(
+            let fresh_prepared = compact_prepared_event(resource());
+            assert_ne!(
+                fresh_prepared.detail, new_prepared_event.detail,
+                "retry receives a fresh operation and output generation"
+            );
+            append_prepared(
                 pool,
                 tenant,
                 resource(),
                 ForgeOperationFamily::StagingFold,
-                &new_committed,
+                &fresh_prepared,
             )
             .await
-            .expect("terminal after reopen");
-            assert!(
-                matches!(after_reopen, ForgeOperationTransition::Applied { .. }),
-                "terminal after reopen must succeed"
-            );
+            .expect("fresh generation prepared");
 
-            // Exactly one state row for this (resource, family, operation_id)
-            assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(count_audit(pool, tenant).await, 4);
+            assert_eq!(count_state(pool, tenant).await, 2);
+            assert_eq!(count_audit(pool, tenant).await, 3);
         }
 
         /// Verifies a changed detail cannot reopen a reset operation.

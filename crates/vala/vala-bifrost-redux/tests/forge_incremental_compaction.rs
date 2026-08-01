@@ -1165,6 +1165,25 @@ mod pg_tests {
         }
     }
 
+    /// Builds exact never-published generation evidence for orphan-GC tests.
+    fn reset_detail_for_output(
+        operation_id: uuid::Uuid,
+        resource: &str,
+        phase: ForgeCompactionPhase,
+        output: &str,
+    ) -> AuditDetail {
+        AuditDetail::ForgeCompaction {
+            operation_id,
+            phase,
+            group: resource.to_owned(),
+            input_file_ids: vec![uuid::Uuid::now_v7()],
+            input_paths: vec![StoragePath::new("staging/input.parquet").expect("input")],
+            output_paths: vec![StoragePath::new(output.to_owned()).expect("output")],
+            snapshot_id: None,
+            writer_recipe_version: "bifrost-writer-v1".to_owned(),
+        }
+    }
+
     /// Build one deterministic snapshot-expiry detail for an exact phase.
     fn expiry_transition_detail(
         operation_id: uuid::Uuid,
@@ -1225,12 +1244,12 @@ mod pg_tests {
         .expect("fixture lease")
     }
 
-    /// Proves a terminal staging row alone cannot retain an otherwise eligible object.
+    /// Proves terminal file-list history neither grants nor suppresses GC eligibility.
     ///
     /// # Panics
     ///
     /// Panics when the real catalog roster, tenant row, object store, or Forge
-    /// GC workflow fails to delete the expired object.
+    /// GC workflow violates exact Reset provenance.
     #[tokio::test]
     async fn terminal_file_list_history_does_not_protect_expired_object() {
         let fixture = Fixture::new_with_config(
@@ -1282,11 +1301,41 @@ mod pg_tests {
         .expect("terminal staging history");
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let deleted = fixture
+        let protected = fixture
             .forge
             .run_orphan_gc_for_test(&fixture.binding)
             .await
             .expect("Forge GC pass");
+        assert_eq!(protected, 0);
+        assert!(fixture.staging.stat(&path).await.is_ok());
+
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
+        );
+        let operation_id = uuid::Uuid::now_v7();
+        let prepared = operation_event(
+            "forge.file_compact.prepared",
+            &resource,
+            reset_detail_for_output(
+                operation_id,
+                &resource,
+                ForgeCompactionPhase::Prepared,
+                &path,
+            ),
+        );
+        append_operation(&fixture, ForgeOperationFamily::StagingFold, &prepared, true).await;
+        let reset = operation_event(
+            "forge.file_compact.reset",
+            &resource,
+            reset_detail_for_output(operation_id, &resource, ForgeCompactionPhase::Reset, &path),
+        );
+        append_operation(&fixture, ForgeOperationFamily::StagingFold, &reset, false).await;
+        let deleted = fixture
+            .forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("proven Forge GC pass");
         assert_eq!(deleted, 1);
         assert!(fixture.staging.stat(&path).await.is_err());
     }
@@ -1477,11 +1526,24 @@ mod pg_tests {
         let second = fixture.schedule_and_execute().await;
         assert_eq!(second.tasks_enqueued, 1, "second outcome: {second:?}");
 
+        let (expired_candidates, pending_terminals) = fixture
+            .forge
+            .run_snapshot_expiry_commit_boundary_for_test(&fixture.binding)
+            .await
+            .expect("post-commit evidence boundary");
+        assert!(
+            expired_candidates > 0,
+            "exact cleanup candidates survive commit"
+        );
+        assert_eq!(
+            pending_terminals, 1,
+            "expiry stays Prepared before task evidence"
+        );
         fixture
             .forge
             .run_snapshot_expiry_for_test(&fixture.binding)
             .await
-            .expect("snapshot expiry pass");
+            .expect("snapshot expiry recovery pass");
         let orphan = deterministic_output_path_for_test(
             &fixture.binding.object_prefix,
             uuid::Uuid::now_v7(),
@@ -1492,6 +1554,33 @@ mod pg_tests {
             .write(&orphan, Buffer::from(vec![1_u8]))
             .await
             .expect("destructive maintenance orphan");
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
+        );
+        let operation_id = uuid::Uuid::now_v7();
+        let prepared = operation_event(
+            "forge.file_compact.prepared",
+            &resource,
+            reset_detail_for_output(
+                operation_id,
+                &resource,
+                ForgeCompactionPhase::Prepared,
+                &orphan,
+            ),
+        );
+        append_operation(&fixture, ForgeOperationFamily::StagingFold, &prepared, true).await;
+        let reset = operation_event(
+            "forge.file_compact.reset",
+            &resource,
+            reset_detail_for_output(
+                operation_id,
+                &resource,
+                ForgeCompactionPhase::Reset,
+                &orphan,
+            ),
+        );
+        append_operation(&fixture, ForgeOperationFamily::StagingFold, &reset, false).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
         fixture
             .forge
@@ -1501,6 +1590,231 @@ mod pg_tests {
 
         assert_terminal_family_parity(&fixture, "snapshot_expire").await;
         assert_terminal_family_parity(&fixture, "orphan_gc").await;
+    }
+
+    /// Aligns the live target with the largest current file to suppress rewrite work.
+    async fn make_current_files_right_sized(fixture: &Fixture) {
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("table");
+        let snapshot = table.metadata().current_snapshot().expect("snapshot");
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .expect("manifests");
+        let mut target = 0_u64;
+        for file in manifests.entries() {
+            let manifest = file.load_manifest(table.file_io()).await.expect("manifest");
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                target = target.max(entry.data_file().file_size_in_bytes());
+            }
+        }
+        fixture
+            .set_live_target_file_size(&table, target.max(2))
+            .await;
+    }
+
+    /// Checks completed cleanup evidence against object storage and live metadata.
+    async fn assert_completed_cleanup_evidence(fixture: &Fixture) {
+        let evidence: serde_json::Value = sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3 AND strategy='snapshot_expiry' AND state='succeeded' ORDER BY updated_at DESC LIMIT 1")
+            .bind(fixture.tenant.as_uuid()).bind(&fixture.binding.logical_namespace).bind(&fixture.binding.table_name)
+            .fetch_one(fixture.operator_pool.pool()).await.expect("maintenance evidence");
+        let candidates = evidence["cleanup_candidates"]
+            .as_array()
+            .expect("candidates");
+        assert!(!candidates.is_empty());
+        assert_eq!(
+            evidence["deleted_candidate_count"].as_u64(),
+            Some(candidates.len() as u64)
+        );
+        let paths = candidates
+            .iter()
+            .map(|candidate| candidate["path"].as_str().expect("path").to_owned())
+            .collect::<Vec<_>>();
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        for path in &paths {
+            assert!(
+                fixture.staging.stat(path).await.is_err(),
+                "still exists: {path}"
+            );
+        }
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("table");
+        let current = table.metadata_location().expect("metadata location");
+        assert!(paths.iter().all(|path| !current.ends_with(path)));
+    }
+
+    /// Proves a later Reset-backed destructive pass remains available after takeover.
+    async fn assert_later_destructive_maintenance(fixture: &Fixture, resource: &str) {
+        let orphan = deterministic_output_path_for_test(
+            &fixture.binding.object_prefix,
+            uuid::Uuid::now_v7(),
+            0,
+        );
+        fixture
+            .staging
+            .write(&orphan, Buffer::from(vec![1_u8]))
+            .await
+            .expect("orphan");
+        let operation_id = uuid::Uuid::now_v7();
+        let prepared = operation_event(
+            "forge.file_compact.prepared",
+            resource,
+            reset_detail_for_output(
+                operation_id,
+                resource,
+                ForgeCompactionPhase::Prepared,
+                &orphan,
+            ),
+        );
+        append_operation(fixture, ForgeOperationFamily::StagingFold, &prepared, true).await;
+        let reset = operation_event(
+            "forge.file_compact.reset",
+            resource,
+            reset_detail_for_output(operation_id, resource, ForgeCompactionPhase::Reset, &orphan),
+        );
+        append_operation(fixture, ForgeOperationFamily::StagingFold, &reset, false).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        fixture
+            .forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("later maintenance");
+        assert!(fixture.staging.stat(&orphan).await.is_err());
+    }
+
+    /// Proves nonmatching task evidence stops takeover before destructive progress.
+    async fn assert_mismatched_takeover_fails_closed(
+        fixture: &Fixture,
+        task_id: uuid::Uuid,
+        stop: &CancellationToken,
+    ) -> serde_json::Value {
+        let original: serde_json::Value =
+            sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("evidence");
+        let candidate = original["cleanup_candidates"][0]["path"]
+            .as_str()
+            .expect("candidate")
+            .to_owned();
+        sqlx::query("UPDATE vala.forge_tasks SET evidence=jsonb_set(jsonb_set(evidence,'{cleanup_candidates}','[]'::jsonb),'{deleted_candidate_count}','0'::jsonb) WHERE task_id=$1")
+            .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("mismatch");
+        let worker = ForgeWorker::new(Arc::clone(&fixture.forge), ForgeWorkerConfig::default())
+            .expect("worker");
+        worker
+            .execute_one_for_test(stop)
+            .await
+            .expect_err("mismatch must fail");
+        let unchanged: (String, i64, String) = sqlx::query_as("SELECT state,(evidence->>'deleted_candidate_count')::bigint,o.phase FROM vala.forge_tasks t CROSS JOIN vala.forge_operation_state o WHERE t.task_id=$1 AND o.family='snapshot_expire'")
+            .bind(task_id).fetch_one(fixture.operator_pool.pool()).await.expect("state");
+        assert_eq!(unchanged, ("prepared".to_owned(), 0, "prepared".to_owned()));
+        assert!(fixture.staging.stat(&candidate).await.is_ok());
+        original
+    }
+
+    /// Production scheduling persists exact ordered cleanup evidence before deleting it.
+    #[tokio::test]
+    async fn scheduled_maintenance_deletes_only_evidenced_expired_objects() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                max_concurrent_reads: 2,
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        fixture.schedule_and_execute().await;
+        fixture.seed_files_at(100, 4, true).await;
+        fixture.schedule_and_execute().await;
+        make_current_files_right_sized(&fixture).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        )
+        .expect("maintenance identity");
+        let tasks = ForgeTasks::new();
+        tasks
+            .upsert_periodic(&fixture.operator_pool, fixture.tenant, &identity)
+            .await
+            .expect("periodic maintenance demand");
+        let stop = CancellationToken::new();
+        let scheduled =
+            ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+                .expect("maintenance scheduler")
+                .schedule_once(&stop)
+                .await
+                .expect("maintenance schedule");
+        assert_eq!(scheduled.tasks_enqueued, 1, "maintenance: {scheduled:?}");
+        fixture.worker.fail_after_maintenance_prepared_for_test();
+        fixture
+            .worker
+            .execute_one_for_test(&stop)
+            .await
+            .expect_err("injected post-Prepared crash");
+        let prepared_task: uuid::Uuid = sqlx::query_scalar(
+            "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' \
+             WHERE data_tenant_id=$1 AND strategy='snapshot_expiry' AND state='prepared' RETURNING task_id",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("expired Prepared maintenance claim");
+        let original_evidence =
+            assert_mismatched_takeover_fails_closed(&fixture, prepared_task, &stop).await;
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET evidence=$2,claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(prepared_task)
+        .bind(original_evidence)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("restore exact cleanup evidence");
+        let takeover = ForgeWorker::new(Arc::clone(&fixture.forge), ForgeWorkerConfig::default())
+            .expect("takeover worker");
+        assert!(
+            takeover
+                .execute_one_for_test(&stop)
+                .await
+                .expect("Prepared takeover")
+        );
+        let task_state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(prepared_task)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("reconciled task");
+        assert_eq!(task_state, "succeeded");
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
+        );
+        let expiry_state: (String, i64) = sqlx::query_as(
+            "SELECT phase,(SELECT count(*) FROM vala.audit_outbox WHERE operation LIKE 'forge.snapshot_expire.%') \
+             FROM vala.forge_operation_state WHERE resource=$1 AND family='snapshot_expire'",
+        )
+        .bind(&resource)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("reconciled expiry projection");
+        assert_eq!(expiry_state, ("recovered".to_owned(), 2));
+        assert_completed_cleanup_evidence(&fixture).await;
+
+        assert_later_destructive_maintenance(&fixture, &resource).await;
     }
 
     /// Proves a catalog registration drives planning and every later maintenance stage without staging history.
@@ -1592,6 +1906,8 @@ mod pg_tests {
     async fn scheduler_forwards_plan_base_snapshot_to_live_replacement() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
                 max_concurrent_reads: 2,
                 max_bins_per_tick: 1,
                 ..ForgeConfig::default()

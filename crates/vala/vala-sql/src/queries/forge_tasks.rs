@@ -516,6 +516,42 @@ impl ForgeTasks {
         .await
     }
 
+    /// Advances one Prepared cleanup cursor after a completed bounded delete batch.
+    ///
+    /// # Errors
+    /// Returns conflict unless the exact Prepared attempt owns evidence whose
+    /// current cursor equals `expected`, or SQL errors while updating it.
+    ///
+    /// # Cancellation
+    /// The caller-owned transaction rolls back the cursor update.
+    pub async fn advance_cleanup_cursor(
+        &self,
+        conn: &mut TenantConn<'_>,
+        task_id: Uuid,
+        attempt: Uuid,
+        owner: Uuid,
+        expected: u32,
+        next: u32,
+    ) -> Result<(), SqlError> {
+        if next <= expected {
+            return Err(SqlError::Conflict {
+                detail: "Forge cleanup cursor must advance".to_owned(),
+            });
+        }
+        let changed = sqlx::query("UPDATE vala.forge_tasks SET evidence=jsonb_set(evidence,'{deleted_candidate_count}',to_jsonb($5::bigint),false),updated_at=statement_timestamp() WHERE task_id=$1 AND state='prepared' AND attempt_id=$2 AND claimed_by=$3 AND (evidence->>'deleted_candidate_count')::bigint=$4 AND jsonb_array_length(evidence->'cleanup_candidates') >= $5")
+            .bind(task_id)
+            .bind(attempt)
+            .bind(owner)
+            .bind(i64::from(expected))
+            .bind(i64::from(next))
+            .execute(&mut **conn.transaction())
+            .await
+            .map_err(SqlError::from)?
+            .rows_affected();
+        exact_one(changed, "advance cleanup cursor")?;
+        Ok(())
+    }
+
     /// Atomically applies a lifecycle-significant terminal state and audit row.
     ///
     /// # Errors

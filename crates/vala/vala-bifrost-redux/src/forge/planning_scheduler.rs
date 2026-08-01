@@ -346,6 +346,16 @@ impl<'forge> ForgeScheduler<'forge> {
                 .map(live_candidate)
                 .collect::<Result<Vec<_>, ForgeError>>()?;
         }
+        if candidates.is_empty()
+            && let Some(candidate) = maintenance_candidate(
+                &table,
+                self.forge.core.config.max_files_per_tick,
+                self.forge.core.config.max_bytes_per_tick,
+            )
+            .await?
+        {
+            candidates.push(candidate);
+        }
         Ok(ForgeTableSnapshot {
             snapshot_id: discovered.base_snapshot_id(),
             candidates,
@@ -381,6 +391,66 @@ impl<'forge> ForgeScheduler<'forge> {
         }
         Ok(())
     }
+}
+
+/// Builds one bounded lifecycle task from the current manifest list.
+///
+/// The exact manifest identities are the rewrite selection. Expiry and cleanup
+/// remain useful even when only one manifest exists, so every non-empty table
+/// receives one deterministic lifecycle task per base snapshot.
+///
+/// # Errors
+///
+/// Returns catalog or invariant failures when current metadata cannot be read
+/// or its selected manifest sizes exceed representable bounds.
+async fn maintenance_candidate(
+    table: &iceberg::table::Table,
+    max_manifests: usize,
+    max_bytes: u64,
+) -> Result<Option<ForgePlanCandidate>, ForgeError> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(None);
+    };
+    let manifests = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .map_err(ForgeError::Catalog)?;
+    let mut inputs = Vec::new();
+    let mut bytes = 0_u64;
+    for manifest in manifests.entries().iter().take(max_manifests) {
+        let size = u64::try_from(manifest.manifest_length).map_err(|_| ForgeError::Invariant {
+            detail: "Iceberg manifest length is negative".to_owned(),
+        })?;
+        let Some(next) = bytes.checked_add(size) else {
+            return Err(ForgeError::Invariant {
+                detail: "manifest maintenance byte estimate overflowed".to_owned(),
+            });
+        };
+        if !inputs.is_empty() && next > max_bytes {
+            break;
+        }
+        bytes = next;
+        inputs.push(manifest.manifest_path.clone());
+    }
+    inputs.sort();
+    inputs.dedup();
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    let files = u16::try_from(inputs.len()).map_err(|_| ForgeError::Invariant {
+        detail: "manifest maintenance parallelism exceeds u16".to_owned(),
+    })?;
+    let estimate = bytes.max(1);
+    Ok(Some(ForgePlanCandidate {
+        strategy: ForgeTaskStrategy::SnapshotExpiry,
+        inputs,
+        bytes: estimate,
+        parallelism: files.max(1),
+        memory_bytes: estimate,
+        spill_bytes: estimate,
+        parameters: serde_json::json!({"kind":"maintenance"}),
+    }))
 }
 
 /// Maps one exact live rewrite group into the durable planner contract.

@@ -7,8 +7,21 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::Buffer;
 use serde::Serialize;
 use sqlx::Row;
-use vala_bifrost_redux::forge::{Forge, deterministic_output_path_for_test};
+use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::forge::{
+    Forge, ForgeScheduler, ForgeWorker, ForgeWorkerConfig, deterministic_output_path_for_test,
+};
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::row_types::forge_operations::ForgeOperationFamily;
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport, SloGate};
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{
+    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeCompactionPhase,
+    StoragePath,
+};
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -58,9 +71,9 @@ struct ForgeBenchmarkReport {
     gc_samples_us: Vec<u64>,
     /// Nearest-rank p99 across the five bounded-GC samples.
     gc_p99_us: u64,
-    /// Exact orphan candidates enumerated across all five samples.
+    /// Exact metadata-expiry and never-published candidates across all samples.
     gc_candidates: u64,
-    /// Exact orphan count deleted across the bounded samples.
+    /// Exact metadata-expiry and never-published deletions across all samples.
     gc_deleted: u64,
     /// Whether a retained Iceberg output survived every fresh protection reload.
     gc_retained_paths_protected: bool,
@@ -78,11 +91,113 @@ struct GcBenchmarkEvidence {
     deleted: u64,
 }
 
+/// Drives production scheduler/worker maintenance until exact expired cleanup completes.
+///
+/// # Errors
+///
+/// Returns scheduler, worker, SQL, identity, or evidence failures.
+async fn run_expired_population(
+    forge: &std::sync::Arc<Forge>,
+    fixture: &crate::bifrost::ForgeFixture,
+) -> Result<u64, BenchError> {
+    let identity = ForgeTaskTableIdentity::new(
+        "wyrd-redux",
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    )?;
+    let tasks = ForgeTasks::new();
+    let worker = ForgeWorker::new(std::sync::Arc::clone(forge), ForgeWorkerConfig::default())?;
+    let stop = CancellationToken::new();
+    for _ in 0..3 {
+        tasks
+            .upsert_periodic(&fixture.operator_pool, fixture.tenant, &identity)
+            .await?;
+        ForgeScheduler::new(forge)?.schedule_once(&stop).await?;
+        worker.execute_one_for_test(&stop).await?;
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(max((evidence->>'deleted_candidate_count')::bigint),0) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND strategy='snapshot_expiry' AND state='succeeded'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&identity.catalog)
+    .bind(&identity.namespace)
+    .bind(&identity.table)
+    .fetch_one(fixture.operator_pool.pool())
+    .await?;
+    u64::try_from(count).map_err(Into::into)
+}
+
+/// Persists exact terminal Reset evidence for one never-published generation.
+///
+/// # Errors
+///
+/// Returns path, SQL, audit, or tenant-transaction failures.
+async fn persist_never_published_generation(
+    fixture: &crate::bifrost::ForgeFixture,
+    operation_id: uuid::Uuid,
+    path: &str,
+) -> Result<(), BenchError> {
+    let resource = format!(
+        "bifrost://{}/{}/{}",
+        fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
+    );
+    let input_path = StoragePath::new("staging/benchmark.parquet")?;
+    let output_path = StoragePath::new(path.to_owned())?;
+    let detail = |phase| AuditDetail::ForgeCompaction {
+        operation_id,
+        phase,
+        group: resource.clone(),
+        input_file_ids: vec![uuid::Uuid::now_v7()],
+        input_paths: vec![input_path.clone()],
+        output_paths: vec![output_path.clone()],
+        snapshot_id: None,
+        writer_recipe_version: "bifrost-writer-v1".to_owned(),
+    };
+    let event = |operation: &str, detail| AuditEvent {
+        request_id: RequestId::now_v7(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource: resource.clone(),
+        card_ref: None,
+        principal_id: PrincipalId::new(uuid::Uuid::nil()),
+        principal_kind: PrincipalKindTag::Service,
+        auth_method: AuthMethod::Internal,
+        permission: "bifrost:forge".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: operation.to_owned(),
+        detail: Some(detail),
+    };
+    let mut conn = fixture.vala.tenant_conn(fixture.tenant).await?;
+    let operations = ForgeOperations::new(&resource, ForgeOperationFamily::StagingFold)?;
+    operations
+        .append_prepared(
+            &mut conn,
+            &event(
+                "forge.file_compact.prepared",
+                detail(ForgeCompactionPhase::Prepared),
+            ),
+        )
+        .await?;
+    operations
+        .append_terminal(
+            &mut conn,
+            &event(
+                "forge.file_compact.reset",
+                detail(ForgeCompactionPhase::Reset),
+            ),
+        )
+        .await?;
+    conn.commit().await?;
+    Ok(())
+}
+
 /// Runs the five isolated GC samples before the main rewrite creates stale outputs.
 ///
 /// Each sample fixture's seeded inputs remain protected by nonterminal
-/// `file_list` rows. Therefore the only eligible objects across the shared
-/// scheduler roster are the 32 explicit deterministic orphan paths.
+/// `file_list` rows. Each sample first produces metadata-derived expired
+/// candidates through the production worker, then seeds terminal Reset
+/// generation paths for the disjoint never-published collector.
 ///
 /// # Errors
 ///
@@ -124,6 +239,7 @@ async fn run_gc_samples(
             .execute(fixture.operator_pool.pool())
             .await?;
         }
+        fixture.forge.run_once().await?;
         let retained_control = fixture
             .object_store
             .list(&fixture.binding.object_prefix)
@@ -133,8 +249,8 @@ async fn run_gc_samples(
             .map(|entry| entry.path().to_owned())
             .ok_or("GC sample needs one retained Iceberg metadata object")?;
         let mut newest_modified_ms = i64::MIN;
-        let mut orphan_paths = Vec::with_capacity(32);
-        for candidate in 0..32 {
+        let mut orphan_paths = Vec::with_capacity(16);
+        for candidate in 0..16 {
             let operation_id = uuid::Uuid::now_v7();
             let orphan = deterministic_output_path_for_test(
                 &fixture.binding.object_prefix,
@@ -150,6 +266,7 @@ async fn run_gc_samples(
                 .staging
                 .write(&orphan, Buffer::from(vec![1_u8]))
                 .await?;
+            persist_never_published_generation(&fixture, operation_id, &orphan).await?;
             newest_modified_ms = newest_modified_ms.max(
                 fixture
                     .staging
@@ -172,15 +289,23 @@ async fn run_gc_samples(
         }
         let mut config = fixture.config.clone();
         config.min_files = i64::MAX;
+        config.snapshot_retention = std::time::Duration::from_nanos(1);
         config.orphan_gc_ttl = std::time::Duration::from_millis(1);
         config.max_gc_candidates_per_batch = 32;
         let forge = fixture.context_with_config(config);
+        let expired_deleted = run_expired_population(&forge, &fixture).await?;
+        if expired_deleted == 0 {
+            return Err(format!(
+                "GC sample {sample} did not produce metadata-derived expired candidates"
+            )
+            .into());
+        }
         let sample_started = Instant::now();
         let gc = forge.run_once().await?;
         samples_us.push(u64::try_from(sample_started.elapsed().as_micros())?);
-        if gc.gc_candidates != 32 || gc.gc_deleted != 32 {
+        if gc.gc_candidates != 16 || gc.gc_deleted != 16 {
             return Err(format!(
-                "GC sample {sample} expected 32 candidates/deletes, got {}/{}; tick={gc:?}",
+                "GC sample {sample} expected 16 terminal-generation candidates/deletes, got {}/{}; tick={gc:?}",
                 gc.gc_candidates, gc.gc_deleted,
             )
             .into());
@@ -193,8 +318,12 @@ async fn run_gc_samples(
         if fixture.staging.stat(&retained_control).await.is_err() {
             return Err(format!("GC sample deleted retained object {retained_control}").into());
         }
-        candidates = candidates.saturating_add(u64::try_from(gc.gc_candidates)?);
-        deleted = deleted.saturating_add(u64::try_from(gc.gc_deleted)?);
+        candidates = candidates
+            .saturating_add(u64::try_from(gc.gc_candidates)?)
+            .saturating_add(expired_deleted);
+        deleted = deleted
+            .saturating_add(u64::try_from(gc.gc_deleted)?)
+            .saturating_add(expired_deleted);
     }
     let mut ordered = samples_us.clone();
     ordered.sort_unstable();

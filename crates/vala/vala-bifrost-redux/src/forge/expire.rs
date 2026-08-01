@@ -4,10 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transaction::{
+    ApplyTransactionAction, CleanupTraversalLimits, ExpiredFileSet, Transaction,
+    expired_files_between,
+};
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use vala_sql::row_types::forge_tasks::{ForgeTaskTableIdentity, SnapshotWatermark};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -50,6 +55,19 @@ pub(crate) struct ExpiryReconciliationOutcome {
     pub(crate) unresolved: usize,
     /// Fail-closed destructive-maintenance disposition.
     pub(crate) destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
+    /// Exact metadata-derived paths made unreachable by this pass.
+    pub(crate) expired_files: ExpiredFileSet,
+    /// Terminal expiry transitions delayed until task evidence is durable.
+    pub(crate) terminals: Vec<PendingExpiryTerminal>,
+}
+
+/// One committed expiry operation awaiting its terminal audit transition.
+#[derive(Debug)]
+pub(crate) struct PendingExpiryTerminal {
+    /// Canonical Prepared detail retained by the operation projection.
+    pub(crate) detail: AuditDetail,
+    /// Whether reconciliation, rather than the first caller, proved the commit.
+    pub(crate) recovered: bool,
 }
 
 impl Default for ExpiryReconciliationOutcome {
@@ -60,6 +78,8 @@ impl Default for ExpiryReconciliationOutcome {
             pending: 0,
             unresolved: 0,
             destructive_maintenance: super::live_reconcile::DestructiveMaintenance::Allowed,
+            expired_files: ExpiredFileSet::default(),
+            terminals: Vec::new(),
         }
     }
 }
@@ -159,11 +179,66 @@ impl Forge {
         .ok_or_else(|| ForgeError::FenceLost {
             lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
         })?;
-        let outcome = self
+        let mut outcome = self
             .run_snapshot_expiry_for_table(&mut lease, &key, binding, self.core.clock.now()?)
             .await;
+        if let Ok(value) = &mut outcome {
+            self.finalize_expiry_terminals(
+                &mut lease,
+                binding.tenant,
+                std::mem::take(&mut value.terminals),
+            )
+            .await?;
+        }
         lease.release(&self.core.operator_pool).await?;
         outcome.map(|outcome| outcome.recovered)
+    }
+
+    /// Stops at the injected post-commit/pre-task-evidence boundary.
+    ///
+    /// The returned counts prove that exact metadata candidates and an open
+    /// expiry transition survive together before the worker may close either.
+    ///
+    /// # Errors
+    ///
+    /// Returns the production lease, catalog, watermark, expiry, and traversal
+    /// failures. The committed expiry deliberately remains Prepared for replay.
+    #[cfg(feature = "test-support")]
+    pub async fn run_snapshot_expiry_commit_boundary_for_test(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<(usize, usize), ForgeError> {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let lease_key = forge_lease_key(
+            binding.tenant,
+            &binding.logical_namespace,
+            &binding.table_name,
+        );
+        let mut lease = ForgeLease::acquire(
+            &self.core.operator_pool,
+            lease_key,
+            Uuid::now_v7(),
+            self.core.config.lease_ttl,
+        )
+        .await?
+        .ok_or_else(|| ForgeError::FenceLost {
+            lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
+        })?;
+        let outcome = self
+            .run_snapshot_expiry_for_table(&mut lease, &key, binding, self.core.clock.now()?)
+            .await?;
+        let candidates = outcome.expired_files.data_files.len()
+            + outcome.expired_files.delete_files.len()
+            + outcome.expired_files.manifests.len()
+            + outcome.expired_files.manifest_lists.len()
+            + outcome.expired_files.statistics.len()
+            + outcome.expired_files.metadata_logs.len();
+        let terminals = outcome.terminals.len();
+        lease.release(&self.core.operator_pool).await?;
+        Ok((candidates, terminals))
     }
 }
 
@@ -222,7 +297,10 @@ impl Forge {
             return Ok(outcome);
         }
         let table = self.load_table(&binding.table_ident()).await?;
-        let cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
+        let retention_cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
+        let cutoff_ms = self
+            .validated_expiry_cutoff(key, &table, retention_cutoff_ms)
+            .await?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
         let selected = select_expirable_snapshots(
             &summaries,
@@ -237,11 +315,110 @@ impl Forge {
         let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
         self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
             .await?;
-        self.complete_expiry(lease, key, binding, &detail, false)
-            .await?;
+        outcome.expired_files = self.complete_expiry(lease, key, binding, &detail).await?;
+        outcome.terminals.push(PendingExpiryTerminal {
+            detail,
+            recovered: false,
+        });
         outcome.recovered = outcome.recovered.saturating_add(1);
         Ok(outcome)
     }
+}
+
+impl Forge {
+    /// Loads bounded active-task watermarks and derives the oldest safe expiry cutoff.
+    ///
+    /// Every persisted ID must resolve to the exact persisted timestamp in the
+    /// currently retained ancestry. Missing, malformed, or overflowed state
+    /// fails closed before an expiry transaction is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, identity, or snapshot-expiry errors when active protection
+    /// cannot be proven complete and internally consistent.
+    async fn validated_expiry_cutoff(
+        &self,
+        key: &ForgeTableKey,
+        table: &iceberg::table::Table,
+        retention_cutoff_ms: i64,
+    ) -> Result<i64, ForgeError> {
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            key.table_ref.namespace.as_str(),
+            key.table_ref.name.as_str(),
+        )
+        .map_err(ForgeError::Sql)?;
+        let cap = u32::try_from(self.core.config.max_open_operations_per_table).map_err(|_| {
+            ForgeError::InvalidConfig {
+                detail: "Forge active-watermark cap exceeds u32".to_owned(),
+            }
+        })?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let (watermarks, overflowed) = ForgeTasks::new()
+            .watermarks(&mut conn, &identity, cap)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if overflowed {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: "active Forge watermark set exceeded its bounded query".to_owned(),
+            });
+        }
+        let (summaries, _) = snapshot_summaries(table)?;
+        validate_watermarks(
+            &summaries,
+            table.metadata().current_snapshot_id().is_none(),
+            &watermarks,
+            retention_cutoff_ms,
+        )
+    }
+}
+
+/// Validates watermark identity/timestamp parity and returns a timestamp cutoff.
+///
+/// Snapshot identifiers are used only for ancestry lookup; ordering is based
+/// exclusively on timestamps so non-monotonic Iceberg IDs remain valid.
+///
+/// # Errors
+///
+/// Returns snapshot-expiry failure when a watermark is absent from retained
+/// ancestry or its persisted timestamp does not match Iceberg metadata.
+fn validate_watermarks(
+    snapshots: &[SnapshotSummary],
+    table_is_empty: bool,
+    watermarks: &[SnapshotWatermark],
+    retention_cutoff_ms: i64,
+) -> Result<i64, ForgeError> {
+    watermarks
+        .iter()
+        .try_fold(retention_cutoff_ms, |cutoff, watermark| {
+            if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 && table_is_empty {
+                return Ok(cutoff.min(0));
+            }
+            let snapshot = snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == watermark.snapshot_id)
+                .ok_or_else(|| ForgeError::SnapshotExpiry {
+                    detail: format!(
+                        "active Forge watermark snapshot {} is not retained",
+                        watermark.snapshot_id
+                    ),
+                })?;
+            if snapshot.timestamp_ms != watermark.timestamp_ms {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: format!(
+                        "active Forge watermark {} timestamp does not match Iceberg ancestry",
+                        watermark.snapshot_id
+                    ),
+                });
+            }
+            Ok(cutoff.min(watermark.timestamp_ms))
+        })
 }
 
 /// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.
@@ -332,8 +509,7 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         detail: &AuditDetail,
-        recovered: bool,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<ExpiredFileSet, ForgeError> {
         let AuditDetail::ForgeSnapshotExpire {
             operation_id: _,
             selected_snapshot_ids,
@@ -391,7 +567,7 @@ impl Forge {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        tokio::time::timeout(
+        let committed = tokio::time::timeout(
             self.core.config.iceberg_total_retry_timeout,
             transaction.commit(self.core.catalog.as_ref()),
         )
@@ -400,27 +576,112 @@ impl Forge {
             operation: "Iceberg snapshot expiry commit",
         })?
         .map_err(ForgeError::Catalog)?;
-        lease.require_fence(&self.core.operator_pool).await?;
-        let terminal = terminal_expiry_detail(
-            detail,
-            if recovered {
-                ForgeSnapshotExpirePhase::Recovered
-            } else {
-                ForgeSnapshotExpirePhase::Committed
-            },
-        );
-        self.append_expiry_audit(
-            lease,
-            key.tenant,
-            &terminal,
-            if recovered {
-                "forge.snapshot_expire.recovered"
-            } else {
-                "forge.snapshot_expire.committed"
-            },
+        let expired_files = derive_expired_files(
+            &table,
+            &committed,
+            cleanup_traversal_items(&self.core.config)?,
+            self.core.config.max_bytes_per_tick,
+            self.core.config.max_gc_candidates_per_batch,
         )
-        .await
+        .await?;
+        lease.require_fence(&self.core.operator_pool).await?;
+        Ok(expired_files)
     }
+}
+
+/// Derives a complete bounded cleanup set after a successful expiry commit.
+///
+/// # Errors
+///
+/// Returns catalog failures or fails closed when traversal exhausts a bound.
+async fn derive_expired_files(
+    before: &iceberg::table::Table,
+    after: &iceberg::table::Table,
+    max_items: usize,
+    max_bytes: u64,
+    max_candidates: usize,
+) -> Result<ExpiredFileSet, ForgeError> {
+    let files = expired_files_between(
+        before.file_io(),
+        before.metadata(),
+        after.metadata(),
+        CleanupTraversalLimits {
+            max_items,
+            max_bytes,
+        },
+    )
+    .await
+    .map_err(ForgeError::Catalog)?;
+    validate_expired_files(&files, max_candidates)?;
+    Ok(files)
+}
+
+/// Validates that a completed traversal remains within the deletion cap.
+///
+/// # Errors
+///
+/// Returns snapshot-expiry failure when traversal was incomplete or its exact
+/// candidate set exceeds the configured deletion bound.
+fn validate_expired_files(files: &ExpiredFileSet, max_candidates: usize) -> Result<(), ForgeError> {
+    if files.limit_exhausted {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expired-file traversal exceeded its configured bound".to_owned(),
+        });
+    }
+    let candidate_count = files.data_files.len()
+        + files.delete_files.len()
+        + files.manifests.len()
+        + files.manifest_lists.len()
+        + files.statistics.len()
+        + files.metadata_logs.len();
+    if candidate_count > max_candidates {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expired-file candidate set exceeded its configured bound".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Derives a bounded metadata traversal ceiling from retained-history limits.
+///
+/// # Errors
+///
+/// Returns invalid configuration when the multiplication overflows.
+fn cleanup_traversal_items(config: &super::compact::ForgeConfig) -> Result<usize, ForgeError> {
+    config
+        .max_gc_candidates_per_batch
+        .checked_mul(config.max_retained_snapshots_per_table)
+        .ok_or_else(|| ForgeError::InvalidConfig {
+            detail: "expired-file traversal item bound overflowed".to_owned(),
+        })
+}
+
+/// Reconstructs exact cleanup evidence for an expiry already visible in metadata.
+///
+/// # Errors
+///
+/// Returns catalog, traversal-bound, candidate-bound, or configuration failures.
+pub(super) async fn derive_recovered_files(
+    table: &iceberg::table::Table,
+    base_metadata_location: &str,
+    config: &super::compact::ForgeConfig,
+) -> Result<ExpiredFileSet, ForgeError> {
+    let before = iceberg::spec::TableMetadata::read_from(table.file_io(), base_metadata_location)
+        .await
+        .map_err(ForgeError::Catalog)?;
+    let files = expired_files_between(
+        table.file_io(),
+        &before,
+        table.metadata(),
+        CleanupTraversalLimits {
+            max_items: cleanup_traversal_items(config)?,
+            max_bytes: config.max_bytes_per_tick,
+        },
+    )
+    .await
+    .map_err(ForgeError::Catalog)?;
+    validate_expired_files(&files, config.max_gc_candidates_per_batch)?;
+    Ok(files)
 }
 
 /// Check that every selected snapshot is still eligible under current metadata.
@@ -480,6 +741,7 @@ impl Forge {
             let AuditDetail::ForgeSnapshotExpire {
                 selected_snapshot_ids,
                 cutoff_ms,
+                base_metadata_location,
                 ..
             } = &detail
             else {
@@ -491,14 +753,17 @@ impl Forge {
                 .iter()
                 .all(|id| table.metadata().snapshot_by_id(*id).is_none());
             if all_absent {
-                lease.require_fence(&self.core.operator_pool).await?;
-                self.append_expiry_audit(
-                    lease,
-                    key.tenant,
-                    &terminal_expiry_detail(&detail, ForgeSnapshotExpirePhase::Recovered),
-                    "forge.snapshot_expire.recovered",
+                let recovered_files = derive_recovered_files(
+                    &table,
+                    base_metadata_location.as_str(),
+                    &self.core.config,
                 )
                 .await?;
+                merge_expired_files(&mut outcome.expired_files, recovered_files);
+                outcome.terminals.push(PendingExpiryTerminal {
+                    detail,
+                    recovered: true,
+                });
                 outcome.recovered = outcome.recovered.saturating_add(1);
                 continue;
             }
@@ -520,8 +785,12 @@ impl Forge {
                 outcome.unresolved = outcome.unresolved.saturating_add(1);
                 continue;
             }
-            self.complete_expiry(lease, key, binding, &detail, true)
-                .await?;
+            let expired = self.complete_expiry(lease, key, binding, &detail).await?;
+            merge_expired_files(&mut outcome.expired_files, expired);
+            outcome.terminals.push(PendingExpiryTerminal {
+                detail,
+                recovered: true,
+            });
             outcome.recovered = outcome.recovered.saturating_add(1);
         }
         if outcome.pending > 0 || outcome.unresolved > 0 {
@@ -530,6 +799,52 @@ impl Forge {
         }
         Ok(outcome)
     }
+}
+
+impl Forge {
+    /// Closes committed expiry operations only after exact task evidence is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, SQL, audit, or operation-state failures. A partial close
+    /// remains idempotently replayable from the still-Prepared operation rows.
+    pub(crate) async fn finalize_expiry_terminals(
+        &self,
+        lease: &mut ForgeLease,
+        tenant: DataTenantId,
+        terminals: Vec<PendingExpiryTerminal>,
+    ) -> Result<(), ForgeError> {
+        for pending in terminals {
+            let phase = if pending.recovered {
+                ForgeSnapshotExpirePhase::Recovered
+            } else {
+                ForgeSnapshotExpirePhase::Committed
+            };
+            let operation = if pending.recovered {
+                "forge.snapshot_expire.recovered"
+            } else {
+                "forge.snapshot_expire.committed"
+            };
+            self.append_expiry_audit(
+                lease,
+                tenant,
+                &terminal_expiry_detail(&pending.detail, phase),
+                operation,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Merges typed expired-file sets while preserving category provenance.
+fn merge_expired_files(target: &mut ExpiredFileSet, source: ExpiredFileSet) {
+    target.data_files.extend(source.data_files);
+    target.delete_files.extend(source.delete_files);
+    target.manifests.extend(source.manifests);
+    target.manifest_lists.extend(source.manifest_lists);
+    target.statistics.extend(source.statistics);
+    target.metadata_logs.extend(source.metadata_logs);
 }
 
 /// Mark a wrong-family open expiry row as unresolved and fail closed later.
@@ -731,6 +1046,51 @@ mod tests {
         ];
         let selected = select_expirable_snapshots(&snapshots, Some(50), &[], 4, 2);
         assert_eq!(selected, vec![100]);
+    }
+
+    /// Active watermark ordering follows timestamps even when IDs move backward.
+    #[test]
+    fn watermark_cutoff_uses_timestamps_not_snapshot_ids() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 900,
+                parent_id: None,
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(900),
+                timestamp_ms: 20,
+            },
+        ];
+        let watermarks = vec![SnapshotWatermark {
+            snapshot_id: 900,
+            timestamp_ms: 10,
+        }];
+        let cutoff = validate_watermarks(&snapshots, false, &watermarks, 100)
+            .expect("valid non-monotonic watermark");
+        assert_eq!(cutoff, 10);
+    }
+
+    /// A persisted timestamp mismatch fails closed before expiry selection.
+    #[test]
+    fn watermark_timestamp_mismatch_fails_closed() {
+        let snapshots = vec![SnapshotSummary {
+            id: 7,
+            parent_id: None,
+            timestamp_ms: 20,
+        }];
+        let error = validate_watermarks(
+            &snapshots,
+            false,
+            &[SnapshotWatermark {
+                snapshot_id: 7,
+                timestamp_ms: 19,
+            }],
+            100,
+        )
+        .expect_err("mismatched watermark must fail");
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! [`ForgeLease`] remains the only publication fence.
 
 use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use iceberg::spec::TableMetadata;
@@ -13,26 +15,104 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
+use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
-    ForgeClaimStrategy, ForgePreparedTaskClaim, ForgeTask, ForgeTaskClaim, ForgeTaskEvidence,
-    ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition,
-    SnapshotWatermark,
+    ForgeClaimStrategy, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
+    ForgePreparedTaskClaim, ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskState,
+    ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, SnapshotWatermark,
 };
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use super::error::ForgeError;
+use super::expire::{PendingExpiryTerminal, derive_recovered_files, table_resource_for_key};
 use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
 use super::live_replace::{
     IcebergRewriteDisposition, TaskLiveRewriteRequest, TaskLiveRewriteResult,
 };
+use super::maintenance::{ForgeMaintenance, ForgeMaintenanceResult};
 use super::metrics::{ForgeLeaseResult, ForgeMetricStage};
 use super::path::catalog_path_to_object_key;
 use super::{Forge, ForgeCapacity};
 use crate::catalog::TenantTableBinding;
+
+/// Exact external effect returned by strategy dispatch.
+enum ForgeDispatchResult {
+    /// Ordinary publication whose evidence is not yet Prepared.
+    Committed(Table),
+    /// Ordered maintenance with exact post-expiry candidates.
+    Maintenance(Box<ForgeMaintenanceResult>),
+}
+
+/// Exact durable ownership required to advance a Prepared cleanup cursor.
+struct CleanupAttempt<'a> {
+    /// Durable task identity.
+    task_id: Uuid,
+    /// Tenant transaction boundary.
+    tenant: DataTenantId,
+    /// Attempt generation retained across takeover.
+    attempt: Uuid,
+    /// Physical table binding used for path validation.
+    binding: &'a TenantTableBinding,
+}
+
+/// Converts fork categories into sorted, table-bound durable cleanup evidence.
+///
+/// # Errors
+///
+/// Returns path-binding or SQL validation failures for any unsafe candidate.
+fn cleanup_candidates(
+    result: &ForgeMaintenanceResult,
+    binding: &TenantTableBinding,
+    staging: &opendal::Operator,
+    identity: &ForgeTaskTableIdentity,
+) -> Result<Vec<ForgeCleanupCandidate>, ForgeError> {
+    let categories = [
+        (ForgeCleanupCategory::Data, &result.expired_files.data_files),
+        (
+            ForgeCleanupCategory::Data,
+            &result.expired_files.delete_files,
+        ),
+        (ForgeCleanupCategory::Data, &result.expired_files.statistics),
+        (
+            ForgeCleanupCategory::Manifest,
+            &result.expired_files.manifests,
+        ),
+        (
+            ForgeCleanupCategory::Manifest,
+            &result.expired_files.manifest_lists,
+        ),
+        (
+            ForgeCleanupCategory::Metadata,
+            &result.expired_files.metadata_logs,
+        ),
+    ];
+    let mut candidates = categories
+        .into_iter()
+        .flat_map(|(category, paths)| paths.iter().map(move |path| (category, path)))
+        .map(|(category, path)| {
+            let key = catalog_path_to_object_key(
+                result.table.metadata().location(),
+                binding,
+                staging,
+                path,
+            )?;
+            Ok(ForgeCleanupCandidate {
+                category,
+                table: identity.clone(),
+                path: ForgeCleanupPath::new(key).map_err(ForgeError::Sql)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ForgeError>>()?;
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
 
 /// Fixed process-local bounds for one Forge worker pool.
 #[derive(Debug, Clone, Copy)]
@@ -79,6 +159,9 @@ pub struct ForgeWorker {
     config: ForgeWorkerConfig,
     /// Complete capacity declaration passed to atomic `PostgreSQL` admission.
     capacity: ForgeCapacity,
+    /// One-shot crash boundary after task evidence commits and before expiry closes.
+    #[cfg(feature = "test-support")]
+    fail_after_maintenance_prepared: Arc<AtomicBool>,
 }
 
 impl ForgeWorker {
@@ -114,7 +197,16 @@ impl ForgeWorker {
             owner: Uuid::now_v7(),
             config,
             capacity,
+            #[cfg(feature = "test-support")]
+            fail_after_maintenance_prepared: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Arms one failure after maintenance task Prepared commits but before expiry terminal audit.
+    #[cfg(feature = "test-support")]
+    pub fn fail_after_maintenance_prepared_for_test(&self) {
+        self.fail_after_maintenance_prepared
+            .store(true, Ordering::Release);
     }
 
     /// Runs the fixed worker set until shutdown stops claims and drains slots.
@@ -411,17 +503,16 @@ impl ForgeWorker {
             lease.clone(),
             operation_stop.clone(),
         )?;
-        let reconciliation = async {
-            lease.require_fence(&self.forge.core.operator_pool).await?;
-            let table = self.forge.load_table(&binding.table_ident()).await?;
-            self.verify_committed_evidence(&binding, &table, evidence)
-                .await?;
-            if operation_stop.is_cancelled() {
-                return Err(ForgeError::Shutdown);
-            }
-            Ok(())
-        }
-        .await;
+        let reconciliation = self
+            .resume_prepared_effect(
+                task,
+                attempt,
+                &binding,
+                &mut lease,
+                evidence,
+                &operation_stop,
+            )
+            .await;
         operation_stop.cancel();
         let heartbeat_result = heartbeat.await.map_err(|error| ForgeError::Invariant {
             detail: format!("Forge reconciliation heartbeat panicked: {error}"),
@@ -440,13 +531,169 @@ impl ForgeWorker {
                 .await
                 .map_err(ForgeError::Sql)?;
             lease.require_fence(&self.forge.core.operator_pool).await?;
-            self.persist_terminal_success(task, attempt, &lease).await
+            self.persist_terminal_success(
+                task.task_id,
+                task.data_tenant_id,
+                &task.table_ref,
+                attempt,
+                &lease,
+            )
+            .await
         }
         .await;
         if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
             tracing::warn!(task_id = %task.task_id, error = %error, "Forge reconciliation lease release failed");
         }
         result
+    }
+
+    /// Verifies and resumes every external effect owned by one Prepared task.
+    ///
+    /// # Errors
+    ///
+    /// Returns evidence, cleanup, orphan, fencing, catalog, or cancellation failures.
+    async fn resume_prepared_effect(
+        &self,
+        task: &ForgeTask,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        evidence: &ForgeTaskEvidence,
+        stop: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        lease.require_fence(&self.forge.core.operator_pool).await?;
+        let table = self.forge.load_table(&binding.table_ident()).await?;
+        self.verify_committed_evidence(binding, &table, evidence)
+            .await?;
+        let expiry_terminals = if task.strategy == ForgeTaskStrategy::SnapshotExpiry {
+            let key = super::compact::ForgeTableKey {
+                tenant: task.data_tenant_id,
+                table_ref: binding.table_ref.clone(),
+            };
+            self.matching_prepared_expiry(&key, binding, &task.table_ref, &table, evidence)
+                .await?
+        } else {
+            Vec::new()
+        };
+        self.resume_expired_cleanup(
+            CleanupAttempt {
+                task_id: task.task_id,
+                tenant: task.data_tenant_id,
+                attempt,
+                binding,
+            },
+            lease,
+            evidence,
+            stop,
+        )
+        .await?;
+        if task.strategy == ForgeTaskStrategy::SnapshotExpiry {
+            let key = super::compact::ForgeTableKey {
+                tenant: task.data_tenant_id,
+                table_ref: binding.table_ref.clone(),
+            };
+            self.forge
+                .finalize_expiry_terminals(lease, task.data_tenant_id, expiry_terminals)
+                .await?;
+            ForgeMaintenance::new(Arc::clone(&self.forge))
+                .collect_never_published(lease, &key, binding, stop)
+                .await?;
+        }
+        if stop.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
+        Ok(())
+    }
+
+    /// Finds the exact open expiry operation whose candidates match task evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, catalog, traversal, evidence, or audit failures, and fails
+    /// closed when more than one open operation matches the durable task.
+    async fn matching_prepared_expiry(
+        &self,
+        key: &super::compact::ForgeTableKey,
+        binding: &TenantTableBinding,
+        identity: &ForgeTaskTableIdentity,
+        table: &Table,
+        evidence: &ForgeTaskEvidence,
+    ) -> Result<Vec<PendingExpiryTerminal>, ForgeError> {
+        let resource = table_resource_for_key(key);
+        let mut conn = self
+            .forge
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?
+            .list_open(
+                &mut conn,
+                self.forge.core.config.max_open_operations_per_table,
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if page.overflowed {
+            return Err(ForgeError::Reconciliation {
+                detail: "open expiry operations exceeded the recovery bound".to_owned(),
+            });
+        }
+        let open_count = page.operations.len();
+        if open_count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut matching = Vec::new();
+        for row in page.operations {
+            let wyrd_spec::vala::api::AuditDetail::ForgeSnapshotExpire {
+                base_metadata_location,
+                selected_snapshot_ids,
+                ..
+            } = &row.prepared_detail
+            else {
+                continue;
+            };
+            if selected_snapshot_ids
+                .iter()
+                .any(|id| table.metadata().snapshot_by_id(*id).is_some())
+            {
+                continue;
+            }
+            let expired = derive_recovered_files(
+                table,
+                base_metadata_location.as_str(),
+                &self.forge.core.config,
+            )
+            .await?;
+            let candidate_result = ForgeMaintenanceResult {
+                table: table.clone(),
+                expired_files: expired,
+                expiry_terminals: Vec::new(),
+            };
+            if cleanup_candidates(
+                &candidate_result,
+                binding,
+                &self.forge.core.staging,
+                identity,
+            )? == evidence.cleanup_candidates
+            {
+                matching.push(PendingExpiryTerminal {
+                    detail: row.prepared_detail,
+                    recovered: true,
+                });
+            }
+        }
+        if matching.len() != 1 {
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "expected exactly one of {open_count} open expiry operations to match task evidence; matched {}",
+                    matching.len()
+                ),
+            });
+        }
+        Ok(matching)
     }
 
     /// Validates the closed T13 strategy and payload contract without IO.
@@ -468,10 +715,12 @@ impl ForgeWorker {
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
                 ("live_rewrite", ForgeMetricStage::IcebergRewrite)
             }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
+                ("maintenance", ForgeMetricStage::SnapshotExpiry)
+            }
             ForgeClaimStrategy::Known(
                 ForgeTaskStrategy::FullIdentity
                 | ForgeTaskStrategy::ManifestRewrite
-                | ForgeTaskStrategy::SnapshotExpiry
                 | ForgeTaskStrategy::ExpiredCleanup
                 | ForgeTaskStrategy::OrphanCleanup,
             )
@@ -521,7 +770,11 @@ impl ForgeWorker {
             self.find_retained_task_evidence(binding, &table, claim.task_id)
                 .await?
         };
-        if !base_matches && committed_recovery.is_none() {
+        let maintenance_recovery = matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+        );
+        if !base_matches && committed_recovery.is_none() && !maintenance_recovery {
             self.cancel_superseded(claim).await?;
             return Ok(());
         }
@@ -555,13 +808,27 @@ impl ForgeWorker {
             operation_stop.clone(),
         )?;
         let execution = match committed_recovery {
-            Some(evidence) => Ok(evidence),
+            Some(evidence) => Ok((evidence, true)),
             None => {
                 match self
                     .dispatch_claim(claim, attempt, binding, lease, table, &operation_stop)
                     .await
                 {
-                    Ok(committed) => self.committed_evidence(binding, &committed).await,
+                    Ok(ForgeDispatchResult::Committed(committed)) => self
+                        .committed_evidence(binding, &committed)
+                        .await
+                        .map(|evidence| (evidence, false)),
+                    Ok(ForgeDispatchResult::Maintenance(result)) => self
+                        .complete_maintenance(
+                            claim,
+                            attempt,
+                            binding,
+                            lease,
+                            *result,
+                            &operation_stop,
+                        )
+                        .await
+                        .map(|evidence| (evidence, true)),
                     Err(error) => Err(error),
                 }
             }
@@ -579,7 +846,24 @@ impl ForgeWorker {
             detail: format!("Forge claim heartbeat panicked: {error}"),
         })?;
         heartbeat_result?;
-        let evidence = completion?;
+        let (evidence, already_prepared) = completion?;
+        self.finish_claim_execution(claim, attempt, lease, &evidence, already_prepared)
+            .await
+    }
+
+    /// Refreshes final authority and commits the appropriate success transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns heartbeat, fencing, evidence, audit, SQL, or replan failures.
+    async fn finish_claim_execution(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        lease: &mut ForgeLease,
+        evidence: &ForgeTaskEvidence,
+        already_prepared: bool,
+    ) -> Result<(), ForgeError> {
         self.tasks
             .heartbeat(
                 &self.forge.core.operator_pool,
@@ -591,7 +875,18 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        self.persist_success(claim, attempt, lease, &evidence).await
+        if already_prepared {
+            self.persist_terminal_success(
+                claim.task_id,
+                claim.data_tenant_id,
+                &claim.table_ref,
+                attempt,
+                lease,
+            )
+            .await
+        } else {
+            self.persist_success(claim, attempt, lease, evidence).await
+        }
     }
 
     /// Selects the retained snapshot protected while one claimed task runs.
@@ -618,6 +913,16 @@ impl ForgeWorker {
             return Ok(SnapshotWatermark {
                 snapshot_id: 0,
                 timestamp_ms: 0,
+            });
+        }
+        if matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+        ) && let Some(current) = table.metadata().current_snapshot()
+        {
+            return Ok(SnapshotWatermark {
+                snapshot_id: current.snapshot_id(),
+                timestamp_ms: current.timestamp_ms(),
             });
         }
         let evidence = committed_recovery.ok_or_else(|| ForgeError::Reconciliation {
@@ -655,28 +960,33 @@ impl ForgeWorker {
         lease: &mut ForgeLease,
         table: Table,
         stop: &CancellationToken,
-    ) -> Result<Table, ForgeError> {
+    ) -> Result<ForgeDispatchResult, ForgeError> {
         if Self::current_snapshot_matches_task(&table, claim.task_id) {
-            return Ok(table);
+            return Ok(ForgeDispatchResult::Committed(table));
         }
-        if !Self::base_snapshot_matches(&table, claim.base_snapshot_id) {
+        if !Self::base_snapshot_matches(&table, claim.base_snapshot_id)
+            && !matches!(
+                claim.strategy,
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+            )
+        {
             return Err(ForgeError::Reconciliation {
                 detail: "Forge task base snapshot changed before execution".to_owned(),
             });
         }
         match &claim.strategy {
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold) => {
-                self.forge
-                    .execute_staging_task(
-                        lease,
-                        binding,
-                        &claim.plan.inputs,
-                        claim.task_id,
-                        attempt,
-                        stop,
-                    )
-                    .await
-            }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold) => self
+                .forge
+                .execute_staging_task(
+                    lease,
+                    binding,
+                    &claim.plan.inputs,
+                    claim.task_id,
+                    attempt,
+                    stop,
+                )
+                .await
+                .map(ForgeDispatchResult::Committed),
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
                 let group = self
                     .forge
@@ -699,7 +1009,9 @@ impl ForgeWorker {
                     })
                     .await?;
                 match (disposition, committed_table) {
-                    (IcebergRewriteDisposition::Committed { .. }, Some(table)) => Ok(table),
+                    (IcebergRewriteDisposition::Committed { .. }, Some(table)) => {
+                        Ok(ForgeDispatchResult::Committed(table))
+                    }
                     (
                         IcebergRewriteDisposition::NoWork
                         | IcebergRewriteDisposition::SnapshotChanged,
@@ -714,10 +1026,207 @@ impl ForgeWorker {
                     }
                 }
             }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
+                let key = super::compact::ForgeTableKey {
+                    tenant: claim.data_tenant_id,
+                    table_ref: binding.table_ref.clone(),
+                };
+                ForgeMaintenance::new(Arc::clone(&self.forge))
+                    .execute(lease, &key, binding, table, &claim.plan.inputs, stop)
+                    .await
+                    .map(Box::new)
+                    .map(ForgeDispatchResult::Maintenance)
+            }
             _ => Err(ForgeError::Invariant {
                 detail: "unsupported task passed pre-effect validation".to_owned(),
             }),
         }
+    }
+
+    /// Persists exact cleanup evidence, deletes it with a durable cursor, then runs orphan GC.
+    ///
+    /// Candidate derivation has already completed from before/after Iceberg
+    /// metadata. This method records the complete ordered set before the first
+    /// delete, advances the cursor after every idempotent object result, and
+    /// only then enters the disjoint never-published generation collector.
+    ///
+    /// # Errors
+    ///
+    /// Returns path binding, evidence, SQL, audit, fencing, object-store, or
+    /// cancellation failures. A failure retains Prepared evidence and its last
+    /// committed cursor for deterministic takeover.
+    async fn complete_maintenance(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        result: ForgeMaintenanceResult,
+        stop: &CancellationToken,
+    ) -> Result<ForgeTaskEvidence, ForgeError> {
+        let candidates =
+            cleanup_candidates(&result, binding, &self.forge.core.staging, &claim.table_ref)?;
+        let mut evidence = self.committed_evidence(binding, &result.table).await?;
+        evidence.cleanup_candidates = candidates;
+        evidence.validate(false).map_err(ForgeError::Sql)?;
+
+        let mut prepared = self
+            .forge
+            .core
+            .vala
+            .tenant_conn(claim.data_tenant_id)
+            .await
+            .map_err(ForgeError::Sql)?;
+        self.tasks
+            .prepared(
+                &mut prepared,
+                claim.task_id,
+                attempt,
+                self.owner,
+                &evidence,
+                &task_event(
+                    claim.task_id,
+                    ForgeTaskState::Prepared,
+                    "exact expired-file cleanup evidence persisted",
+                ),
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut prepared).await?;
+        prepared.commit().await.map_err(ForgeError::Sql)?;
+        #[cfg(feature = "test-support")]
+        if self
+            .fail_after_maintenance_prepared
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "injected crash after maintenance task evidence commit".to_owned(),
+            });
+        }
+        self.forge
+            .finalize_expiry_terminals(lease, claim.data_tenant_id, result.expiry_terminals)
+            .await?;
+
+        for (index, candidate) in evidence.cleanup_candidates.iter().enumerate() {
+            if stop.is_cancelled() {
+                return Err(ForgeError::Shutdown);
+            }
+            lease.require_fence(&self.forge.core.operator_pool).await?;
+            let path = binding
+                .validate_object_path(candidate.path.as_str())
+                .ok_or_else(|| ForgeError::Reconciliation {
+                    detail: "expired cleanup candidate escaped table binding".to_owned(),
+                })?;
+            match self.forge.core.object_store.delete(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
+                Err(error) => return Err(ForgeError::ObjectDelete(error)),
+            }
+            let expected = u32::try_from(index).map_err(|_| ForgeError::Invariant {
+                detail: "expired cleanup cursor exceeds u32".to_owned(),
+            })?;
+            let next = expected
+                .checked_add(1)
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "expired cleanup cursor overflowed".to_owned(),
+                })?;
+            let mut cursor = self
+                .forge
+                .core
+                .vala
+                .tenant_conn(claim.data_tenant_id)
+                .await
+                .map_err(ForgeError::Sql)?;
+            self.tasks
+                .advance_cleanup_cursor(
+                    &mut cursor,
+                    claim.task_id,
+                    attempt,
+                    self.owner,
+                    expected,
+                    next,
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+            lease.assert_transaction_fence(&mut cursor).await?;
+            cursor.commit().await.map_err(ForgeError::Sql)?;
+            evidence.deleted_candidate_count = next;
+        }
+        let key = super::compact::ForgeTableKey {
+            tenant: claim.data_tenant_id,
+            table_ref: binding.table_ref.clone(),
+        };
+        ForgeMaintenance::new(Arc::clone(&self.forge))
+            .collect_never_published(lease, &key, binding, stop)
+            .await?;
+        Ok(evidence)
+    }
+
+    /// Resumes the undeleted suffix of exact Prepared cleanup evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed cursor, binding, fencing, object-store, SQL, or
+    /// cancellation failures. Each successful object result and cursor update
+    /// is idempotent, so another owner resumes at the first uncommitted index.
+    async fn resume_expired_cleanup(
+        &self,
+        cleanup: CleanupAttempt<'_>,
+        lease: &mut ForgeLease,
+        evidence: &ForgeTaskEvidence,
+        stop: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let start = usize::try_from(evidence.deleted_candidate_count).map_err(|_| {
+            ForgeError::Invariant {
+                detail: "Prepared cleanup cursor exceeds usize".to_owned(),
+            }
+        })?;
+        for (index, candidate) in evidence.cleanup_candidates.iter().enumerate().skip(start) {
+            if stop.is_cancelled() {
+                return Err(ForgeError::Shutdown);
+            }
+            lease.require_fence(&self.forge.core.operator_pool).await?;
+            let path = cleanup
+                .binding
+                .validate_object_path(candidate.path.as_str())
+                .ok_or_else(|| ForgeError::Reconciliation {
+                    detail: "Prepared cleanup candidate escaped table binding".to_owned(),
+                })?;
+            match self.forge.core.object_store.delete(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
+                Err(error) => return Err(ForgeError::ObjectDelete(error)),
+            }
+            let expected = u32::try_from(index).map_err(|_| ForgeError::Invariant {
+                detail: "Prepared cleanup cursor exceeds u32".to_owned(),
+            })?;
+            let next = expected
+                .checked_add(1)
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "Prepared cleanup cursor overflowed".to_owned(),
+                })?;
+            let mut conn = self
+                .forge
+                .core
+                .vala
+                .tenant_conn(cleanup.tenant)
+                .await
+                .map_err(ForgeError::Sql)?;
+            self.tasks
+                .advance_cleanup_cursor(
+                    &mut conn,
+                    cleanup.task_id,
+                    cleanup.attempt,
+                    self.owner,
+                    expected,
+                    next,
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+            lease.assert_transaction_fence(&mut conn).await?;
+            conn.commit().await.map_err(ForgeError::Sql)?;
+        }
+        Ok(())
     }
 
     /// Starts coordinated task-claim and table-lease renewal for one operation.
@@ -1067,7 +1576,9 @@ impl ForgeWorker {
     /// Returns tenant connection, exact lifecycle, audit, fence, or commit errors.
     async fn persist_terminal_success(
         &self,
-        task: &ForgeTask,
+        task_id: Uuid,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
         attempt: Uuid,
         lease: &ForgeLease,
     ) -> Result<(), ForgeError> {
@@ -1075,21 +1586,21 @@ impl ForgeWorker {
             .forge
             .core
             .vala
-            .tenant_conn(task.data_tenant_id)
+            .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
             .terminal(
                 &mut terminal,
                 ForgeTaskTransition {
-                    task_id: task.task_id,
+                    task_id,
                     attempt_id: attempt,
                     owner: self.owner,
                     expected: ForgeTaskState::Prepared,
                     next: ForgeTaskState::Succeeded,
                 },
                 &task_event(
-                    task.task_id,
+                    task_id,
                     ForgeTaskState::Succeeded,
                     "exact Prepared Forge evidence reconciled",
                 ),
@@ -1098,8 +1609,7 @@ impl ForgeWorker {
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
         terminal.commit().await.map_err(ForgeError::Sql)?;
-        self.request_replan(task.data_tenant_id, &task.table_ref)
-            .await
+        self.request_replan(tenant, table_ref).await
     }
 
     /// Terminally audits a malformed or unsupported claim before external effects.

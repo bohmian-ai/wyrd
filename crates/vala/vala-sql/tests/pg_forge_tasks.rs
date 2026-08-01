@@ -673,6 +673,46 @@ mod pg_tests {
             ForgeTaskTransitionOutcome::AlreadyApplied
         );
         prepared_conn.commit().await.expect("commit prepared");
+        {
+            let mut cursor_rollback = TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .expect("cursor rollback");
+            tasks
+                .advance_cleanup_cursor(&mut cursor_rollback, id, attempt, owner, 0, 1)
+                .await
+                .expect("advance rollback cursor");
+        }
+        let mut cursor_commit = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("cursor commit");
+        assert!(
+            tasks
+                .advance_cleanup_cursor(&mut cursor_commit, id, attempt, owner, 1, 2)
+                .await
+                .is_err(),
+            "a stale expected cursor fails closed"
+        );
+        tasks
+            .advance_cleanup_cursor(&mut cursor_commit, id, attempt, owner, 0, 1)
+            .await
+            .expect("advance committed cursor");
+        cursor_commit.commit().await.expect("commit cursor");
+        let mut cursor_verify = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("cursor verify");
+        let cursor_page = tasks
+            .status(&mut cursor_verify, 10)
+            .await
+            .expect("cursor status");
+        assert_eq!(
+            cursor_page.tasks[0]
+                .evidence
+                .as_ref()
+                .expect("Prepared evidence")
+                .deleted_candidate_count,
+            1
+        );
+        cursor_verify.commit().await.expect("commit cursor verify");
         let terminal = ForgeTaskTransition {
             task_id: id,
             attempt_id: attempt,

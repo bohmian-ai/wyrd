@@ -8,6 +8,7 @@ use opendal::raw::Timestamp;
 use opendal::{EntryMode, ErrorKind};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::TenantConn;
 use vala_sql::queries::file_list::list_nonterminal_file_paths;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::row_types::forge_operations::{
@@ -110,6 +111,8 @@ pub(crate) struct MaintenanceProtection {
     pub(crate) live_set: ProtectedLiveSet,
     /// Fail-closed permission derived from every open operation family.
     pub(crate) destructive_maintenance: DestructiveMaintenance,
+    /// Exact output paths whose operation durably Reset without publication.
+    never_published: BTreeSet<String>,
     /// The table lease's single captured maintenance time.
     pub(crate) now: DateTime<Utc>,
     /// Inclusive last-modified cutoff derived once from `now`.
@@ -143,6 +146,27 @@ pub(crate) enum GcEligibility {
 }
 
 impl MaintenanceProtection {
+    /// Constructs one complete protection snapshot from bounded durable evidence.
+    fn new(
+        live_set: ProtectedLiveSet,
+        blocked: bool,
+        never_published: BTreeSet<String>,
+        now: DateTime<Utc>,
+        object_age_cutoff: Timestamp,
+    ) -> Self {
+        Self {
+            live_set,
+            destructive_maintenance: if blocked {
+                DestructiveMaintenance::Blocked
+            } else {
+                DestructiveMaintenance::Allowed
+            },
+            never_published,
+            now,
+            object_age_cutoff,
+        }
+    }
+
     /// Applies the single closed eligibility truth used before prepare and delete.
     #[must_use]
     pub(crate) fn gc_eligibility(
@@ -160,6 +184,9 @@ impl MaintenanceProtection {
         if self.destructive_maintenance == DestructiveMaintenance::Blocked
             || self.live_set.contains(&normalized)
         {
+            return GcEligibility::Protected;
+        }
+        if !self.never_published.contains(&normalized) {
             return GcEligibility::Protected;
         }
         let ObjectEvidence::Present(metadata) = evidence else {
@@ -612,6 +639,10 @@ impl Forge {
         let resource = table_resource_for_key(key);
         let cap = self.core.config.max_open_operations_per_table;
         let mut blocked = false;
+        let (never_published, reset_overflowed) = self
+            .load_never_published_generations(&mut conn, &resource, &table_location, binding, cap)
+            .await?;
+        blocked |= reset_overflowed;
         for family in [
             ForgeOperationFamily::IcebergRewrite,
             ForgeOperationFamily::SnapshotExpire,
@@ -664,16 +695,53 @@ impl Forge {
         require_running(table_context.stop)?;
 
         let object_age_cutoff = self.gc_object_age_cutoff(table_context.now)?;
-        Ok(MaintenanceProtection {
-            live_set: live,
-            destructive_maintenance: if blocked {
-                DestructiveMaintenance::Blocked
-            } else {
-                DestructiveMaintenance::Allowed
-            },
-            now: table_context.now,
+        Ok(MaintenanceProtection::new(
+            live,
+            blocked,
+            never_published,
+            table_context.now,
             object_age_cutoff,
-        })
+        ))
+    }
+
+    /// Loads bounded terminal Reset outputs as exact no-resurrection evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, operation-state, or table-binding failures. Overflow is
+    /// returned explicitly so the caller blocks all destructive maintenance.
+    async fn load_never_published_generations(
+        &self,
+        conn: &mut TenantConn<'_>,
+        resource: &str,
+        table_location: &str,
+        binding: &TenantTableBinding,
+        cap: usize,
+    ) -> Result<(BTreeSet<String>, bool), ForgeError> {
+        let mut paths = BTreeSet::new();
+        let mut overflowed = false;
+        for family in [
+            ForgeOperationFamily::StagingFold,
+            ForgeOperationFamily::IcebergRewrite,
+        ] {
+            let page = ForgeOperations::new(resource, family)
+                .map_err(ForgeError::Sql)?
+                .list_reset(conn, cap)
+                .await
+                .map_err(ForgeError::Sql)?;
+            overflowed |= page.overflowed;
+            for row in page.operations {
+                for path in operation_output_paths(&row.prepared_detail) {
+                    paths.insert(catalog_path_to_object_key(
+                        table_location,
+                        binding,
+                        &self.core.staging,
+                        path.as_str(),
+                    )?);
+                }
+            }
+        }
+        Ok((paths, overflowed))
     }
 
     /// Traverses every retained Iceberg object for one validated table.
@@ -1229,6 +1297,7 @@ mod tests {
             )
         };
         let old_path = forge_path(Uuid::now_v7());
+        let unproven_path = forge_path(Uuid::now_v7());
         let young_path = forge_path(Uuid::now_v7());
         let protected_path = forge_path(Uuid::now_v7());
         let mut live = ProtectedLiveSet::default();
@@ -1236,6 +1305,7 @@ mod tests {
         let protection = MaintenanceProtection {
             live_set: live,
             destructive_maintenance: DestructiveMaintenance::Allowed,
+            never_published: BTreeSet::from([old_path.clone(), young_path.clone()]),
             now: DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time"),
             object_age_cutoff: cutoff,
         };
@@ -1246,6 +1316,15 @@ mod tests {
         assert_eq!(
             protection.gc_eligibility(&binding, &old_path, ObjectEvidence::Present(&old_metadata)),
             GcEligibility::Eligible
+        );
+        assert_eq!(
+            protection.gc_eligibility(
+                &binding,
+                &unproven_path,
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::Protected,
+            "UUIDv7 name and age do not substitute for terminal Reset evidence"
         );
         assert_eq!(
             protection.gc_eligibility(

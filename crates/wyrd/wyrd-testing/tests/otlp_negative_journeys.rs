@@ -24,7 +24,7 @@
 //! (`IngestError::IngestBusy → Code::ResourceExhausted` with
 //! `WYRD_VALA_429_INGEST_BUSY`).
 //!
-//! Both tests boot a `start_bound` server (PgFixture), so the fast family lane
+//! All tests boot a `start_bound` server (PgFixture), so the fast family lane
 //! skips them via `--skip pg_tests`; `mise run test:e2e` (Postgres up) runs the
 //! whole crate.
 
@@ -256,7 +256,7 @@ mod pg_tests {
         srv.shutdown().await.expect("shutdown");
     }
 
-    // ── Journey 2: malformed request body ────────────────────────────────────
+    // ── Journey 2: malformed HTTP body and valid-empty gRPC control ───────────
 
     /// gRPC: an empty, valid logs export is accepted without rejected records.
     /// The generated tonic client serializes typed requests and cannot inject a

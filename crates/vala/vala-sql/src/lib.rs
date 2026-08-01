@@ -251,10 +251,12 @@ mod tests {
     }
 
     #[test]
+    /// Verifies tenant query owners do not accept raw pools or transaction handles.
     fn tenant_scoped_query_stubs_do_not_take_raw_pool_executors() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let forbidden = rust_files_under(&crate_dir.join("src/queries"))
             .into_iter()
+            .filter(|path| !is_operator_query_module(path))
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query file is readable");
                 let checked = without_line_comments(&body);
@@ -274,10 +276,12 @@ mod tests {
     }
 
     #[test]
+    /// Verifies tenant query owners never issue transaction-control SQL themselves.
     fn tenant_scoped_query_modules_do_not_issue_transaction_control_sql() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let forbidden = rust_files_under(&crate_dir.join("src/queries"))
             .into_iter()
+            .filter(|path| !is_operator_query_module(path))
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query source is readable");
                 let checked = without_line_comments(&body).to_ascii_uppercase();
@@ -291,6 +295,33 @@ mod tests {
         assert!(
             forbidden.is_empty(),
             "tenant-scoped Vala query modules must rely on TenantConn, not raw transaction SQL: {forbidden:?}"
+        );
+    }
+
+    #[test]
+    /// Verifies the dedicated operator query module contains only bounded recovery.
+    fn operator_scoped_query_exception_is_explicit_and_bounded() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = crate_dir.join(OPERATOR_QUERY_MODULE);
+        let source = fs::read_to_string(path).expect("operator query source is readable");
+        assert!(!source.contains("TenantConn"));
+        assert_eq!(
+            source
+                .matches("pub async fn recover_shared_scopes(")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("fn ").count(), 1);
+        assert!(source.contains("operator: &OperatorPool"));
+        assert!(source.contains("operator.begin()"));
+        assert!(source.contains("if locked.len() != 3"));
+        assert!(source.contains("DELETE FROM vala.oracle_admission_leases"));
+        assert!(source.contains("GROUP BY query_class"));
+        assert_eq!(
+            source
+                .matches("UPDATE vala.oracle_admission_accounting")
+                .count(),
+            1
         );
     }
 
@@ -386,6 +417,14 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Repository-relative operator-only query module excluded from tenant audits.
+    const OPERATOR_QUERY_MODULE: &str = "src/queries/oracle_admission_operator.rs";
+
+    /// Identifies the dedicated operator query module for source-audit filtering.
+    fn is_operator_query_module(path: &Path) -> bool {
+        path.ends_with(OPERATOR_QUERY_MODULE)
     }
 
     fn production_source(source: &str) -> &str {

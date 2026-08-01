@@ -39,6 +39,7 @@ use iceberg::io::FileIO;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::NamedTempFile;
+use tracing::Instrument;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, QueryClass};
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
@@ -558,7 +559,7 @@ impl ExecutionPlan for TenantTripwireExec {
                         "event_class" => "tenant_row"
                     )
                     .increment(1);
-                    let _audit_span = tracing::info_span!(
+                    let audit_span = tracing::info_span!(
                         "bifrost.oracle.audit",
                         audit_kind = "security_violation",
                         event_class = "tenant_row"
@@ -575,6 +576,7 @@ impl ExecutionPlan for TenantTripwireExec {
                                 phase: BifrostSecurityPhase::Source,
                             },
                         )
+                        .instrument(audit_span)
                         .await;
                     metrics::histogram!(
                         "bifrost_oracle_audit_seconds",

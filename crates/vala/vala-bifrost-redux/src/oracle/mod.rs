@@ -79,7 +79,6 @@ pub const DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
 pub const INTERACTIVE_SCAN_LIMIT_SECONDS: f64 = 10.0;
 /// Bytes per second used by the normative classification estimate.
 pub const ESTIMATED_SCAN_BYTES_PER_SECOND: f64 = 1_073_741_824.0;
-
 /// Authenticated caller context used by the engine before a server adapter
 /// adds transport-specific metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1541,23 +1540,32 @@ impl Oracle {
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(BifrostError::QueryTimeout)?;
+        let audit_span = tracing::info_span!(
+            "bifrost.oracle.audit",
+            audit_kind = "read_decision",
+            query_class = query_class_label(input.query_class)
+        );
         let audit_started = Instant::now();
-        let decision = read_decision(
-            input.context,
-            &input.request.sql,
-            input.cuts,
-            input.request.visibility,
-            input.query_class,
-            input.retry_ordinal,
-            input.deadline,
-        )?;
-        let result = tokio::time::timeout(
-            remaining,
-            self.audit.append_read_decision(input.context, decision),
-        )
-        .await
-        .map_err(|_| BifrostError::QueryTimeout)
-        .and_then(|result| result);
+        let result = async {
+            let decision = read_decision(
+                input.context,
+                &input.request.sql,
+                input.cuts,
+                input.request.visibility,
+                input.query_class,
+                input.retry_ordinal,
+                input.deadline,
+            )?;
+            tokio::time::timeout(
+                remaining,
+                self.audit.append_read_decision(input.context, decision),
+            )
+            .await
+            .map_err(|_| BifrostError::QueryTimeout)
+            .and_then(|result| result)
+        }
+        .instrument(audit_span)
+        .await;
         let outcome = if result.is_ok() { "success" } else { "failed" };
         metrics::histogram!(
             "bifrost_oracle_audit_seconds",
@@ -1803,6 +1811,7 @@ impl Oracle {
                 maintenance.abort();
             }
         }
+        self.admission.drain_lease_releases(deadline).await;
     }
 
     /// Lowers one complete SQL statement against exact pinned table providers.
@@ -2364,6 +2373,71 @@ pub struct OracleAdmission {
     config: OracleConfig,
     /// Bounded tenant scopes queued for periodic authoritative repair.
     tenant_reconcile_queue: Arc<Mutex<TenantReconcileQueue>>,
+    /// Bounded durable leases queued when a public query stream is dropped.
+    lease_release_queue: Arc<Mutex<LeaseReleaseQueue>>,
+}
+
+/// Durable admission lease awaiting asynchronous cleanup by the admission owner.
+struct PendingLeaseRelease {
+    /// Tenant whose transaction contains the lease row.
+    data_tenant_id: DataTenantId,
+    /// Query identity used by the fenced release mutation.
+    query_id: QueryId,
+    /// Leader fence that originally admitted the query.
+    leader: RoleFence,
+}
+
+/// FIFO for lease releases initiated from synchronous `Drop` paths.
+///
+/// The map is naturally bounded by admitted guards: each active query identity
+/// contributes at most one pending release, while the queue preserves FIFO
+/// maintenance order and deduplicates retries.
+#[derive(Default)]
+struct LeaseReleaseQueue {
+    /// Pending release requests in insertion order.
+    order: VecDeque<QueryId>,
+    /// Query-keyed requests preventing duplicate cleanup entries.
+    pending: HashMap<QueryId, PendingLeaseRelease>,
+}
+
+impl LeaseReleaseQueue {
+    /// Enqueues one release request without performing durable IO.
+    ///
+    /// Returns `false` when the query is already pending; this preserves one
+    /// cleanup entry per admitted lease without imposing an arbitrary cap.
+    fn enqueue(&mut self, release: PendingLeaseRelease) -> bool {
+        if self.pending.contains_key(&release.query_id) {
+            return false;
+        }
+        self.order.push_back(release.query_id);
+        self.pending.insert(release.query_id, release);
+        true
+    }
+
+    /// Takes at most `limit` requests for one maintenance tick.
+    fn take(&mut self, limit: usize) -> Vec<PendingLeaseRelease> {
+        let mut releases = Vec::with_capacity(self.order.len().min(limit));
+        while releases.len() < limit {
+            let Some(query_id) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(release) = self.pending.remove(&query_id) {
+                releases.push(release);
+            }
+        }
+        releases
+    }
+
+    /// Restores failed requests at the FIFO head in their original order.
+    fn requeue(&mut self, releases: impl IntoIterator<Item = PendingLeaseRelease>) {
+        let releases = releases.into_iter().collect::<Vec<_>>();
+        for release in releases.into_iter().rev() {
+            let query_id = release.query_id;
+            if self.pending.insert(query_id, release).is_none() {
+                self.order.push_front(query_id);
+            }
+        }
+    }
 }
 
 /// Bounded deduplicated tenant scopes repaired by admission maintenance.
@@ -2737,6 +2811,86 @@ impl OracleAdmission {
             local_role,
             config,
             tenant_reconcile_queue: Arc::new(Mutex::new(TenantReconcileQueue::default())),
+            lease_release_queue: Arc::new(Mutex::new(LeaseReleaseQueue::default())),
+        }
+    }
+
+    /// Queues one dropped stream's durable lease for lifecycle-owned cleanup.
+    fn enqueue_lease_release(&self, release: PendingLeaseRelease) {
+        if let Ok(mut queue) = self.lease_release_queue.lock() {
+            if !queue.enqueue(release) {
+                tracing::debug!("Oracle dropped-lease cleanup request was already pending");
+            }
+        } else {
+            tracing::error!(
+                "Oracle dropped-lease cleanup queue lock poisoned; lease expiry remains authoritative"
+            );
+            metrics::counter!(
+                "bifrost_oracle_lease_release_queue_total",
+                "outcome" => "queue_poisoned"
+            )
+            .increment(1);
+        }
+    }
+
+    /// Drains queued dropped-stream leases before Oracle shutdown completes.
+    ///
+    /// The deadline prevents shutdown from hanging on a degraded database. A
+    /// failed or unfinished release is restored to the queue so
+    /// lease expiry remains the explicit crash-safe fallback rather than a
+    /// silently discarded cleanup request.
+    async fn drain_lease_releases(&self, deadline: Instant) {
+        loop {
+            let releases = self
+                .lease_release_queue
+                .lock()
+                .map(|mut queue| queue.take(64))
+                .unwrap_or_default();
+            if releases.is_empty() {
+                return;
+            }
+            let mut pending = VecDeque::from(releases);
+            while let Some(release) = pending.pop_front() {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    pending.push_front(release);
+                    if let Ok(mut queue) = self.lease_release_queue.lock() {
+                        queue.requeue(pending);
+                    }
+                    return;
+                };
+                match tokio::time::timeout(
+                    remaining,
+                    self.release_lease(release.data_tenant_id, release.query_id, &release.leader),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        metrics::counter!(
+                            "bifrost_oracle_lease_release_queue_total",
+                            "outcome" => "released"
+                        )
+                        .increment(1);
+                    }
+                    Ok(Err(error)) => {
+                        pending.push_front(release);
+                        if let Ok(mut queue) = self.lease_release_queue.lock() {
+                            queue.requeue(pending);
+                        }
+                        tracing::error!(error = %error, "Oracle shutdown lease cleanup failed; requests requeued");
+                        return;
+                    }
+                    Err(_) => {
+                        pending.push_front(release);
+                        if let Ok(mut queue) = self.lease_release_queue.lock() {
+                            queue.requeue(pending);
+                        }
+                        tracing::error!(
+                            "Oracle shutdown lease cleanup timed out; requests requeued"
+                        );
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -2756,6 +2910,7 @@ impl OracleAdmission {
             })?;
         let admission = Arc::clone(self);
         let queue = Arc::clone(&self.tenant_reconcile_queue);
+        let lease_release_queue = Arc::clone(&self.lease_release_queue);
         let maintenance_interval = self.config.maintenance_interval;
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
         let task = runtime.spawn(async move {
@@ -2775,6 +2930,34 @@ impl OracleAdmission {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = interval.tick() => {
+                        let releases = lease_release_queue
+                            .lock()
+                            .map(|mut queue| queue.take(64))
+                            .unwrap_or_default();
+                        for release in releases {
+                            match admission
+                                .release_lease(
+                                    release.data_tenant_id,
+                                    release.query_id,
+                                    &release.leader,
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    metrics::counter!(
+                                        "bifrost_oracle_lease_release_queue_total",
+                                        "outcome" => "released"
+                                    )
+                                    .increment(1);
+                                }
+                                Err(error) => {
+                                    if let Ok(mut queue) = lease_release_queue.lock() {
+                                        queue.requeue(std::iter::once(release));
+                                    }
+                                    tracing::error!(error = %error, "Oracle dropped-lease cleanup failed; request requeued");
+                                }
+                            }
+                        }
                         let scopes = queue
                             .lock()
                             .map(|mut queue| queue.take(64))
@@ -2919,6 +3102,7 @@ impl OracleAdmission {
                     cancellation,
                     renewal_terminal,
                     renewal: Some(renewal),
+                    release_pending: true,
                 })
             }
         }
@@ -2970,14 +3154,16 @@ struct AdmittedQueryGuard {
     renewal_terminal: Arc<Mutex<Option<QueryTerminalErrorCode>>>,
     /// Renewal task aborted when the stream completes or drops.
     renewal: Option<JoinHandle<()>>,
+    /// Whether explicit awaited release still owns durable cleanup.
+    release_pending: bool,
 }
 
 impl Drop for AdmittedQueryGuard {
-    /// Releases only synchronous local capacity.
+    /// Releases local capacity and queues bounded durable cleanup.
     ///
-    /// Durable lease release belongs to [`Self::release`], which is awaited by
-    /// the owning query stream. Drop cannot spawn detached cleanup because a
-    /// runtime may already be shutting down.
+    /// Drop never spawns a task or performs remote IO. The retained admission
+    /// owner drains this request from its lifecycle maintenance task, while
+    /// the explicit stream cancellation path continues to await [`Self::release`].
     fn drop(&mut self) {
         self.cancellation.cancel();
         if let Some(renewal) = self.renewal.take() {
@@ -2985,6 +3171,17 @@ impl Drop for AdmittedQueryGuard {
         }
         self.running.take();
         self.slot_telemetry.take();
+        if self.release_pending {
+            self.release_pending = false;
+            self.admission.enqueue_lease_release(PendingLeaseRelease {
+                data_tenant_id: self.data_tenant_id,
+                query_id: self.query_id,
+                leader: RoleFence {
+                    node_id: self.leader.node_id,
+                    fencing_token: self.leader.fencing_token,
+                },
+            });
+        }
     }
 }
 
@@ -3008,6 +3205,8 @@ impl AdmittedQueryGuard {
             .await;
         if let Err(error) = result {
             tracing::error!(error = %error, "Oracle admission cleanup failed");
+        } else {
+            self.release_pending = false;
         }
     }
 }
@@ -4403,6 +4602,40 @@ mod tests {
             queue.enqueue(tenants[0], QueryClass::Analytical),
             TenantReconcileInsert::Queued
         );
+    }
+
+    /// Pending lease cleanup has no arbitrary cap and deduplicates one query identity.
+    #[test]
+    fn oracle_lease_release_queue_retains_distinct_entries() {
+        let mut queue = LeaseReleaseQueue::default();
+        let tenant = DataTenantId::new_v7();
+        let leader = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+        let mut query_ids = Vec::new();
+        for _ in 0..300 {
+            let query_id = QueryId::new(uuid::Uuid::now_v7());
+            query_ids.push(query_id);
+            assert!(queue.enqueue(PendingLeaseRelease {
+                data_tenant_id: tenant,
+                query_id,
+                leader: RoleFence {
+                    node_id: leader,
+                    fencing_token: 1,
+                },
+            }));
+        }
+        assert_eq!(queue.order.len(), 300);
+        assert_eq!(queue.pending.len(), 300);
+        assert!(!queue.enqueue(PendingLeaseRelease {
+            data_tenant_id: tenant,
+            query_id: query_ids[0],
+            leader: RoleFence {
+                node_id: leader,
+                fencing_token: 1,
+            },
+        }));
+        assert_eq!(queue.take(usize::MAX).len(), 300);
+        assert!(queue.order.is_empty());
+        assert!(queue.pending.is_empty());
     }
 
     /// Barrier-controlled transport probe used by the real dispatcher fan-out proof.

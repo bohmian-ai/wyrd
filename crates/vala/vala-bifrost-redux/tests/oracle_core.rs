@@ -2117,6 +2117,21 @@ fn assert_telemetry_spans(captured: &[CapturedSpan]) {
             "missing production span {name}: {captured:?}"
         );
     }
+    let audit_span = captured
+        .iter()
+        .find(|span| {
+            span.name == "bifrost.oracle.audit"
+                && span.fields.get("audit_kind").map(String::as_str) == Some("read_decision")
+        })
+        .expect("read-decision audit span");
+    assert_eq!(
+        audit_span.fields.get("audit_kind").map(String::as_str),
+        Some("read_decision")
+    );
+    assert_eq!(
+        audit_span.fields.get("query_class").map(String::as_str),
+        Some("analytical")
+    );
 }
 
 /// A missing pinned file triggers exactly one whole-cut pre-byte retry.
@@ -2765,18 +2780,12 @@ async fn oracle_lease_renewal_and_stream_drop_release() {
     let active = active_lease_count(&fixture).await;
     assert_eq!(active, 1);
     drop(stream);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let active = active_lease_count(&fixture).await;
-            if active == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("drop releases durable lease");
     oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
+        .shutdown(Instant::now() + Duration::from_secs(2))
         .await;
+    assert_eq!(
+        active_lease_count(&fixture).await,
+        0,
+        "shutdown drains the dropped stream's durable lease"
+    );
 }

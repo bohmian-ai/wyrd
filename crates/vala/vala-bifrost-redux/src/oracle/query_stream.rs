@@ -69,7 +69,9 @@ impl OracleQueryStream {
             let mut row_count = 0_u64;
             yield Ok(QueryStreamFrame::Schema(schema_frame));
             loop {
-                let event = if let Some(value) = next.take() {
+                let event = if lease_cancellation.is_cancelled() {
+                    QueryStreamEvent::Failed(super::renewal_terminal_code(&renewal_terminal))
+                } else if let Some(value) = next.take() {
                     QueryStreamEvent::Batch(Some(value))
                 } else {
                     super::next_query_stream_event(

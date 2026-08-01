@@ -43,8 +43,12 @@ for token in "${forbidden[@]}"; do
   fi
 done
 
+# The system owner is valid only for deployment-wide control-plane identity,
+# membership, and Scribe registry operations. It remains forbidden in Oracle
+# table/query paths, table implementations, and benchmarks.
+system_owner_control_paths='crates/vala/vala-bifrost-redux/src/(lib\.rs|cluster/mod\.rs|gate/auth\.rs|scribe/registry\.rs):[0-9]+:'
 if rg -n -F 'DataTenantId::SYSTEM_OWNER' crates/vala/vala-bifrost-redux/src crates/wyrd/wyrd-testing/benches \
-  | rg -v 'crates/vala/vala-bifrost-redux/src/lib\.rs:[0-9]+:' >/dev/null; then
+  | rg -v "$system_owner_control_paths" >/dev/null; then
   echo "Redux single-table model violation: sentinel data tenant" >&2
   exit 1
 fi

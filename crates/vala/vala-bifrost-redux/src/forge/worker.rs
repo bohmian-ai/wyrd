@@ -50,6 +50,16 @@ enum ForgeDispatchResult {
     Maintenance(Box<ForgeMaintenanceResult>),
 }
 
+/// Durable task state accompanying exact committed evidence.
+enum ForgeExecutionEvidenceState {
+    /// A normal strategy execution returned evidence while its task is Running.
+    Fresh,
+    /// An accepted external commit was discovered while its task is Running.
+    RecoveredCommit,
+    /// Maintenance already persisted the task's Prepared evidence transaction.
+    Prepared,
+}
+
 /// Exact durable ownership required to advance a Prepared cleanup cursor.
 struct CleanupAttempt<'a> {
     /// Durable task identity.
@@ -129,10 +139,16 @@ pub struct ForgeWorkerConfig {
 /// scheduling, claim ownership, publication, or terminal transitions.
 #[derive(Clone, Default)]
 pub struct ForgeWorkerCompletionObserver {
+    /// Number of supervised execution attempts observed after their durable path returned.
+    attempts: Arc<AtomicUsize>,
+    /// Errors returned by supervised execution attempts in observation order.
+    returned_errors: Arc<Mutex<Vec<String>>>,
     /// Number of successful task executions observed after their durable path returned.
     completed: Arc<AtomicUsize>,
     /// Stable production worker identities that completed each observed task.
     completed_workers: Arc<Mutex<Vec<Uuid>>>,
+    /// Durable task identities completed in the same order as observed workers.
+    completed_tasks: Arc<Mutex<Vec<Uuid>>>,
     /// Strategies completed in the same order as the observed workers.
     completed_strategies: Arc<Mutex<Vec<ForgeClaimStrategy>>>,
     /// Wakeup used by deterministic role-topology journeys.
@@ -155,6 +171,18 @@ pub struct ForgeWorkerCompletionObserver {
     /// Wakeup for topology tests waiting for the durable claim to be abandoned.
     #[cfg(feature = "test-support")]
     abandoned_ready: Arc<tokio::sync::Notify>,
+    /// One-shot passive barrier after the next supervised attempt returns.
+    #[cfg(feature = "test-support")]
+    pause_after_next_attempt: Arc<AtomicBool>,
+    /// Whether a returned attempt is currently held at the passive barrier.
+    #[cfg(feature = "test-support")]
+    attempt_paused: Arc<AtomicBool>,
+    /// Wakeup for tests waiting until the returned attempt is held.
+    #[cfg(feature = "test-support")]
+    attempt_pause_ready: Arc<tokio::sync::Notify>,
+    /// Release for the one returned attempt held by the passive barrier.
+    #[cfg(feature = "test-support")]
+    attempt_pause_release: Arc<tokio::sync::Notify>,
 }
 
 /// Test-only barriers that pin the observer's race-sensitive wait boundary.
@@ -193,6 +221,27 @@ impl ForgeWorkerCompletionObserver {
         self.completed.load(Ordering::Acquire)
     }
 
+    /// Return the number of supervised execution attempts that have returned.
+    ///
+    /// Unlike [`Self::completed`], this includes failed and cancelled attempts.
+    /// It is passive lifecycle evidence for deterministic failure-boundary tests.
+    #[must_use]
+    pub fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::Acquire)
+    }
+
+    /// Return errors observed after supervised execution attempts returned.
+    ///
+    /// Successful attempts do not add an entry, so this remains passive
+    /// diagnostic evidence rather than a second completion ledger.
+    #[must_use]
+    pub fn returned_errors(&self) -> Vec<String> {
+        self.returned_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Return the stable worker identities that completed observed tasks.
     ///
     /// The sequence preserves completion order and may contain repeated owners
@@ -200,6 +249,15 @@ impl ForgeWorkerCompletionObserver {
     #[must_use]
     pub fn completed_workers(&self) -> Vec<Uuid> {
         self.completed_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Return durable task identities in supervised completion order.
+    #[must_use]
+    pub fn completed_tasks(&self) -> Vec<Uuid> {
+        self.completed_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -230,6 +288,49 @@ impl ForgeWorkerCompletionObserver {
             }
             notified.await;
         }
+    }
+
+    /// Wait until at least `expected` supervised execution attempts have returned.
+    ///
+    /// Callers own any timeout. Notification registration precedes the atomic
+    /// read so an attempt return cannot be lost at the wait boundary.
+    pub async fn wait_for_attempts_at_least(&self, expected: usize) {
+        loop {
+            let notified = self.ready.notified();
+            if self.attempts() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Hold the next supervised attempt after its production execution returns.
+    ///
+    /// The barrier is passive: claim, execution, durable transitions, and the
+    /// returned result are unchanged. Tests use it only to stop the worker
+    /// before its next claim after observing a failure boundary.
+    #[cfg(feature = "test-support")]
+    pub fn hold_after_next_attempt_for_test(&self) {
+        self.attempt_paused.store(false, Ordering::Release);
+        self.pause_after_next_attempt.store(true, Ordering::Release);
+    }
+
+    /// Wait until the armed returned-attempt barrier is holding the worker.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_held_attempt_for_test(&self) {
+        loop {
+            let notified = self.attempt_pause_ready.notified();
+            if self.attempt_paused.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the worker held after its returned production attempt.
+    #[cfg(feature = "test-support")]
+    pub fn release_held_attempt_for_test(&self) {
+        self.attempt_pause_release.notify_one();
     }
 
     /// Wait until successful tasks have been completed by `expected` distinct workers.
@@ -372,17 +473,45 @@ impl ForgeWorkerCompletionObserver {
     }
 
     /// Record one successful production worker execution after its durable path returns.
-    pub(crate) fn record(&self, worker: Uuid, strategy: ForgeClaimStrategy) {
+    pub(crate) fn record(&self, worker: Uuid, task_id: Uuid, strategy: ForgeClaimStrategy) {
         self.completed_workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(worker);
+        self.completed_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(task_id);
         self.completed_strategies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(strategy);
         self.completed.fetch_add(1, Ordering::AcqRel);
         self.ready.notify_waiters();
+    }
+
+    /// Record that one supervised execution path returned to its worker loop.
+    fn record_attempt(&self, error: Option<&ForgeError>) {
+        if let Some(error) = error {
+            self.returned_errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(error.to_string());
+        }
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        self.ready.notify_waiters();
+    }
+
+    /// Pause once after an armed supervised attempt has fully returned.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_attempt_for_test(&self) {
+        if !self.pause_after_next_attempt.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.attempt_paused.store(true, Ordering::Release);
+        self.attempt_pause_ready.notify_waiters();
+        self.attempt_pause_release.notified().await;
+        self.attempt_paused.store(false, Ordering::Release);
     }
 
     /// Observe one persisted claim and pause execution until all configured roles participate.
@@ -605,9 +734,14 @@ impl ForgeWorker {
                 .await
                 .map_err(ForgeError::Sql)?
             {
+                let task_id = prepared.task.task_id;
                 let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
-                match self.reconcile_prepared(prepared, &shutdown).await {
-                    Ok(()) => self.record_completion(strategy),
+                let result = self.reconcile_prepared(prepared, &shutdown).await;
+                self.record_attempt(result.as_ref().err());
+                #[cfg(feature = "test-support")]
+                self.pause_after_attempt_for_test().await;
+                match result {
+                    Ok(()) => self.record_completion(task_id, strategy),
                     Err(error) => {
                         tracing::warn!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
                     }
@@ -626,6 +760,7 @@ impl ForgeWorker {
                 }
                 continue;
             };
+            let task_id = claim.task_id;
             #[cfg(feature = "test-support")]
             if let Some(observer) = &self.completion_observer {
                 observer.pause_after_claim_for_test().await;
@@ -634,8 +769,12 @@ impl ForgeWorker {
                 }
             }
             let strategy = claim.strategy.clone();
-            match self.execute_claim(claim, &shutdown).await {
-                Ok(()) => self.record_completion(strategy),
+            let result = self.execute_claim(claim, &shutdown).await;
+            self.record_attempt(result.as_ref().err());
+            #[cfg(feature = "test-support")]
+            self.pause_after_attempt_for_test().await;
+            match result {
+                Ok(()) => self.record_completion(task_id, strategy),
                 Err(error) => {
                     tracing::warn!(worker = %self.owner, error = %error, "Forge task execution stopped; durable state retained for recovery");
                 }
@@ -647,9 +786,24 @@ impl ForgeWorker {
     ///
     /// This is deliberately called after the full durable execution path
     /// returns, so test observation cannot acknowledge or alter a task.
-    fn record_completion(&self, strategy: ForgeClaimStrategy) {
+    fn record_completion(&self, task_id: Uuid, strategy: ForgeClaimStrategy) {
         if let Some(observer) = &self.completion_observer {
-            observer.record(self.owner, strategy);
+            observer.record(self.owner, task_id, strategy);
+        }
+    }
+
+    /// Publish one passive observer event after any supervised attempt returns.
+    fn record_attempt(&self, error: Option<&ForgeError>) {
+        if let Some(observer) = &self.completion_observer {
+            observer.record_attempt(error);
+        }
+    }
+
+    /// Apply the observer's one-shot passive returned-attempt barrier.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_attempt_for_test(&self) {
+        if let Some(observer) = &self.completion_observer {
+            observer.pause_after_attempt_for_test().await;
         }
     }
 
@@ -1229,7 +1383,7 @@ impl ForgeWorker {
             operation_stop.clone(),
         )?;
         let execution = match committed_recovery {
-            Some(evidence) => Ok((evidence, true)),
+            Some(evidence) => Ok((evidence, ForgeExecutionEvidenceState::RecoveredCommit)),
             None => {
                 match self
                     .dispatch_claim(claim, attempt, binding, lease, table, &operation_stop)
@@ -1238,7 +1392,7 @@ impl ForgeWorker {
                     Ok(ForgeDispatchResult::Committed(committed)) => self
                         .committed_evidence(binding, &committed)
                         .await
-                        .map(|evidence| (evidence, false)),
+                        .map(|evidence| (evidence, ForgeExecutionEvidenceState::Fresh)),
                     Ok(ForgeDispatchResult::Maintenance(result)) => self
                         .complete_maintenance(
                             claim,
@@ -1249,7 +1403,7 @@ impl ForgeWorker {
                             &operation_stop,
                         )
                         .await
-                        .map(|evidence| (evidence, true)),
+                        .map(|evidence| (evidence, ForgeExecutionEvidenceState::Prepared)),
                     Err(error) => Err(error),
                 }
             }
@@ -1267,8 +1421,8 @@ impl ForgeWorker {
             detail: format!("Forge claim heartbeat panicked: {error}"),
         })?;
         heartbeat_result?;
-        let (evidence, already_prepared) = completion?;
-        self.finish_claim_execution(claim, attempt, lease, &evidence, already_prepared)
+        let (evidence, state) = completion?;
+        self.finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await
     }
 
@@ -1283,7 +1437,7 @@ impl ForgeWorker {
         attempt: Uuid,
         lease: &mut ForgeLease,
         evidence: &ForgeTaskEvidence,
-        already_prepared: bool,
+        state: ForgeExecutionEvidenceState,
     ) -> Result<(), ForgeError> {
         self.tasks
             .heartbeat(
@@ -1296,36 +1450,41 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        if already_prepared {
-            if matches!(
+        if matches!(state, ForgeExecutionEvidenceState::RecoveredCommit)
+            && matches!(
                 claim.strategy,
                 ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold)
-            ) {
-                let snapshot_id =
-                    evidence
-                        .committed_snapshot_id
-                        .ok_or_else(|| ForgeError::Reconciliation {
-                            detail: "recovered staging task has no committed snapshot".to_owned(),
-                        })?;
-                let binding = task_table_binding(
-                    claim.data_tenant_id,
-                    claim.execution_tenant_id,
-                    &claim.table_ref,
-                )?;
-                self.forge
-                    .stamp_recovered_staging_task(lease, &binding, &claim.plan.inputs, snapshot_id)
-                    .await?;
-            }
-            self.persist_terminal_success(
-                claim.task_id,
-                claim.data_tenant_id,
-                &claim.table_ref,
-                attempt,
-                lease,
             )
-            .await
-        } else {
-            self.persist_success(claim, attempt, lease, evidence).await
+        {
+            let snapshot_id =
+                evidence
+                    .committed_snapshot_id
+                    .ok_or_else(|| ForgeError::Reconciliation {
+                        detail: "recovered staging task has no committed snapshot".to_owned(),
+                    })?;
+            let binding = task_table_binding(
+                claim.data_tenant_id,
+                claim.execution_tenant_id,
+                &claim.table_ref,
+            )?;
+            self.forge
+                .stamp_recovered_staging_task(lease, &binding, &claim.plan.inputs, snapshot_id)
+                .await?;
+        }
+        match state {
+            ForgeExecutionEvidenceState::Fresh | ForgeExecutionEvidenceState::RecoveredCommit => {
+                self.persist_success(claim, attempt, lease, evidence).await
+            }
+            ForgeExecutionEvidenceState::Prepared => {
+                self.persist_terminal_success(
+                    claim.task_id,
+                    claim.data_tenant_id,
+                    &claim.table_ref,
+                    attempt,
+                    lease,
+                )
+                .await
+            }
         }
     }
 
@@ -1475,6 +1634,15 @@ impl ForgeWorker {
                     tenant: claim.data_tenant_id,
                     table_ref: binding.table_ref.clone(),
                 };
+                self.forge
+                    .reconcile_live_replacements(
+                        lease,
+                        &key,
+                        binding,
+                        stop,
+                        self.forge.core.clock.now()?,
+                    )
+                    .await?;
                 ForgeMaintenance::new(Arc::clone(&self.forge))
                     .execute(lease, &key, binding, table, &claim.plan.inputs, stop)
                     .await
@@ -2292,6 +2460,7 @@ mod tests {
         let observer = ForgeWorkerCompletionObserver::new();
         observer.record(
             Uuid::now_v7(),
+            Uuid::now_v7(),
             ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold),
         );
         observer.wait_for_at_least(1).await;
@@ -2311,6 +2480,7 @@ mod tests {
         });
         registered.wait().await;
         observer.record(
+            Uuid::now_v7(),
             Uuid::now_v7(),
             ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold),
         );

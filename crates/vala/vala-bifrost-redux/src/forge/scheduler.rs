@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::error::ForgeError;
 use super::{Forge, ForgeScheduler, ForgeTickOutcome};
@@ -22,6 +23,9 @@ pub struct ForgeSchedulerTrigger {
     completed: Arc<AtomicUsize>,
     /// Wakeup for deterministic test waits on completed passes.
     completed_ready: Arc<tokio::sync::Notify>,
+    /// Optional stable scheduler owner shared across reconstructed test supervisors.
+    #[cfg(feature = "test-support")]
+    owner: Arc<std::sync::Mutex<Option<Uuid>>>,
 }
 
 impl ForgeSchedulerTrigger {
@@ -29,6 +33,30 @@ impl ForgeSchedulerTrigger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a trigger whose real supervisor renews one stable test lease owner.
+    ///
+    /// This preserves production scheduling and supervision while allowing a
+    /// restart fixture to reconstruct its Forge graph before the prior lease TTL.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_owner_for_test(owner: Uuid) -> Self {
+        let trigger = Self::default();
+        *trigger
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owner);
+        trigger
+    }
+
+    /// Return the stable fixture owner selected for this supervised scheduler.
+    #[cfg(feature = "test-support")]
+    fn owner_for_test(&self) -> Option<Uuid> {
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Request one pass from the production scheduler loop.
@@ -80,6 +108,17 @@ impl Forge {
     /// and retained as durable demand for later retry.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), ForgeError> {
         let _guard = self.acquire_run_guard()?;
+        #[cfg(feature = "test-support")]
+        let scheduler = match self
+            .core
+            .scheduler_trigger
+            .as_ref()
+            .and_then(ForgeSchedulerTrigger::owner_for_test)
+        {
+            Some(owner) => ForgeScheduler::with_owner_for_test(self, owner)?,
+            None => ForgeScheduler::new(self)?,
+        };
+        #[cfg(not(feature = "test-support"))]
         let scheduler = ForgeScheduler::new(self)?;
         let interval = self.core.maintenance_interval;
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);

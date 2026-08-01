@@ -489,6 +489,51 @@ impl Forge {
         .map(|protection| protection.live_set)
     }
 
+    /// Classify one path through the complete production GC eligibility proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, manifest, SQL, operation-state, path, clock, object
+    /// metadata, or cancellation failures from the production protection path.
+    #[cfg(feature = "test-support")]
+    pub async fn gc_eligibility_for_test(
+        &self,
+        binding: &TenantTableBinding,
+        path: &str,
+    ) -> Result<String, ForgeError> {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let stop = CancellationToken::new();
+        let staging = BTreeSet::new();
+        let live = BTreeSet::new();
+        let table = GcTableContext {
+            key: &key,
+            binding,
+            now: self.core.clock.now()?,
+            stop: &stop,
+            staging_protected_paths: &staging,
+            live_protected_paths: &live,
+        };
+        let protection = self
+            .load_maintenance_protection(ProtectionRequest {
+                table: &table,
+                current_gc_detail: None,
+            })
+            .await?;
+        let metadata = self
+            .core
+            .object_store
+            .stat(path)
+            .await
+            .map_err(ForgeError::ObjectDelete)?;
+        Ok(format!(
+            "{:?}",
+            protection.gc_eligibility(binding, path, ObjectEvidence::Present(&metadata))
+        ))
+    }
+
     /// Runs one table-scoped orphan collection pass for integration fixtures.
     ///
     /// # Errors
@@ -1210,6 +1255,47 @@ impl Forge {
     #[must_use]
     pub fn known_iceberg_object_for_test(path: &str) -> bool {
         is_never_published_forge_generation(path)
+    }
+
+    /// Load the exact terminal Reset generation set used by production GC.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, tenant-connection, operation-state, or path-normalization
+    /// failures from the production protection loader.
+    #[cfg(feature = "test-support")]
+    pub async fn reset_generation_paths_for_test(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<Vec<String>, ForgeError> {
+        let table = self.load_table(&binding.table_ident()).await?;
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let resource = table_resource_for_key(&key);
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let (paths, overflowed) = self
+            .load_never_published_generations(
+                &mut conn,
+                &resource,
+                table.metadata().location(),
+                binding,
+                self.core.config.max_open_operations_per_table,
+            )
+            .await?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if overflowed {
+            return Err(ForgeError::Reconciliation {
+                detail: "Reset generation test query overflowed".to_owned(),
+            });
+        }
+        Ok(paths.into_iter().collect())
     }
 
     fn gc_operation_id(key: &ForgeTableKey, candidates: &[String]) -> Uuid {

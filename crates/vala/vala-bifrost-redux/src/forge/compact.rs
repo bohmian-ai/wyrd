@@ -1729,6 +1729,39 @@ impl Forge {
             .await
     }
 
+    /// Drive the production staging-fold transition writer from integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lease, SQL, transition, audit, fence, and commit errors
+    /// as the production staging-fold transition path.
+    #[cfg(feature = "test-support")]
+    pub async fn append_compaction_transition_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        partition_day: NaiveDate,
+        detail: AuditDetail,
+        operation: &str,
+    ) -> Result<(), ForgeError> {
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        lease.require_fence(&self.core.operator_pool).await?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        self.append_system_audit(&mut conn, &key, operation, detail)
+            .await?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
+    }
+
     /// Convert a prepared compaction detail into a terminal audit phase.
     fn terminal_detail(
         detail: &AuditDetail,

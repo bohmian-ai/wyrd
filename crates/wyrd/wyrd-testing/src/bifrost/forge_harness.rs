@@ -267,6 +267,8 @@ pub struct CommitUncertaintyCatalog {
     fail_after_next_commit: AtomicBool,
     uncertainty_active: AtomicBool,
     pause_after_commit: AtomicBool,
+    /// Whether to pause only after a commit removes retained snapshots.
+    pause_after_snapshot_removal: AtomicBool,
     commit_reached: AtomicBool,
     reject_after_commit: AtomicBool,
     commit_ready: tokio::sync::Notify,
@@ -343,6 +345,7 @@ impl CommitUncertaintyCatalog {
             fail_after_next_commit: AtomicBool::new(false),
             uncertainty_active: AtomicBool::new(false),
             pause_after_commit: AtomicBool::new(false),
+            pause_after_snapshot_removal: AtomicBool::new(false),
             commit_reached: AtomicBool::new(false),
             reject_after_commit: AtomicBool::new(false),
             commit_ready: tokio::sync::Notify::new(),
@@ -370,7 +373,24 @@ impl CommitUncertaintyCatalog {
         self.commit_reached.store(false, Ordering::Release);
         self.reject_after_commit.store(false, Ordering::Release);
         self.after_commit_dropped.store(false, Ordering::Release);
+        self.pause_after_snapshot_removal
+            .store(false, Ordering::Release);
         self.pause_after_commit.store(true, Ordering::Release);
+    }
+
+    /// Pause after a catalog commit semantically removes at least one snapshot.
+    ///
+    /// The wrapper compares retained snapshot IDs immediately before and after
+    /// the delegated update. Earlier manifest rewrites therefore pass through,
+    /// while the actual snapshot-expiry commit is held after acceptance.
+    pub fn pause_after_snapshot_removal(&self) {
+        self.update_attempts.store(0, Ordering::Release);
+        self.commit_reached.store(false, Ordering::Release);
+        self.reject_after_commit.store(false, Ordering::Release);
+        self.after_commit_dropped.store(false, Ordering::Release);
+        self.pause_after_commit.store(false, Ordering::Release);
+        self.pause_after_snapshot_removal
+            .store(true, Ordering::Release);
     }
 
     /// Wait until the real catalog commit has completed and the wrapper is
@@ -542,8 +562,35 @@ impl Catalog for CommitUncertaintyCatalog {
                 .with_retryable(false));
             }
         }
+        let observe_snapshot_removal = self.pause_after_snapshot_removal.load(Ordering::Acquire);
+        let snapshots_before = if observe_snapshot_removal {
+            Some(
+                self.inner
+                    .load_table(commit.identifier())
+                    .await?
+                    .metadata()
+                    .snapshots()
+                    .map(|snapshot| snapshot.snapshot_id())
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        } else {
+            None
+        };
         let table = self.inner.update_table(commit).await?;
-        if self.pause_after_commit.swap(false, Ordering::AcqRel) {
+        let removed_snapshot = snapshots_before.is_some_and(|before| {
+            let after = table
+                .metadata()
+                .snapshots()
+                .map(|snapshot| snapshot.snapshot_id())
+                .collect::<std::collections::BTreeSet<_>>();
+            before.difference(&after).next().is_some()
+        });
+        let pause_after_commit = self.pause_after_commit.swap(false, Ordering::AcqRel)
+            || (removed_snapshot
+                && self
+                    .pause_after_snapshot_removal
+                    .swap(false, Ordering::AcqRel));
+        if pause_after_commit {
             let mut drop_ack = PausedCatalogCallDropAck::new(
                 &self.after_commit_dropped,
                 &self.after_commit_drop_ready,
@@ -686,6 +733,8 @@ pub struct ForgeObjectStoreControl {
     list_release: tokio::sync::Notify,
     /// Counts delegated delete attempts.
     delete_count: AtomicUsize,
+    /// Exact paths supplied to delegated deletes in call order.
+    delete_paths: Mutex<Vec<String>>,
     /// Selects one one-based delete call for injected failure.
     fail_delete_at: AtomicUsize,
     /// One-shot arm flag for the next delegated delete.
@@ -698,6 +747,14 @@ pub struct ForgeObjectStoreControl {
     delete_ready: tokio::sync::Notify,
     /// Releases the armed delete after its deterministic interleaving.
     delete_release: tokio::sync::Notify,
+    /// One exact object path paused after its real delete returns.
+    pause_after_delete_path: Mutex<Option<String>>,
+    /// Signals that the armed real delete completed successfully.
+    delete_completed: AtomicBool,
+    /// Wakes tests waiting at the post-delete cancellation boundary.
+    delete_completed_ready: tokio::sync::Notify,
+    /// Releases the armed post-delete boundary back to Forge.
+    delete_completed_release: tokio::sync::Notify,
 }
 
 impl ForgeObjectStoreControl {
@@ -717,12 +774,17 @@ impl ForgeObjectStoreControl {
             list_ready: tokio::sync::Notify::new(),
             list_release: tokio::sync::Notify::new(),
             delete_count: AtomicUsize::new(0),
+            delete_paths: Mutex::new(Vec::new()),
             fail_delete_at: AtomicUsize::new(0),
             pause_next_delete: AtomicBool::new(false),
             delete_reached: AtomicBool::new(false),
             reject_delete: AtomicBool::new(false),
             delete_ready: tokio::sync::Notify::new(),
             delete_release: tokio::sync::Notify::new(),
+            pause_after_delete_path: Mutex::new(None),
+            delete_completed: AtomicBool::new(false),
+            delete_completed_ready: tokio::sync::Notify::new(),
+            delete_completed_release: tokio::sync::Notify::new(),
         })
     }
 
@@ -805,6 +867,31 @@ impl ForgeObjectStoreControl {
         self.delete_release.notify_one();
     }
 
+    /// Pause after the exact real delete succeeds but before Forge observes its return.
+    pub fn pause_after_delete_for_path(&self, path: &str) {
+        self.delete_completed.store(false, Ordering::Release);
+        *self
+            .pause_after_delete_path
+            .lock()
+            .expect("Forge post-delete path lock must not be poisoned") = Some(path.to_owned());
+    }
+
+    /// Wait until the armed real delete has completed successfully.
+    pub async fn wait_for_completed_delete(&self) {
+        loop {
+            let notified = self.delete_completed_ready.notified();
+            if self.delete_completed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Resume Forge after the armed real delete has completed.
+    pub fn release_completed_delete(&self) {
+        self.delete_completed_release.notify_one();
+    }
+
     /// Reject the paused delete as a stale-worker effect and resume it.
     pub fn reject_paused_delete(&self) {
         self.reject_delete.store(true, Ordering::Release);
@@ -815,6 +902,15 @@ impl ForgeObjectStoreControl {
     #[must_use]
     pub fn delete_calls(&self) -> usize {
         self.delete_count.load(Ordering::Acquire)
+    }
+
+    /// Return the exact paths supplied to real deletes in call order.
+    #[must_use]
+    pub fn delete_paths(&self) -> Vec<String> {
+        self.delete_paths
+            .lock()
+            .expect("Forge delete-path lock must not be poisoned")
+            .clone()
     }
 }
 
@@ -873,6 +969,10 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
 
     async fn delete(&self, path: &str) -> opendal::Result<()> {
         let call = self.delete_count.fetch_add(1, Ordering::AcqRel) + 1;
+        self.delete_paths
+            .lock()
+            .expect("Forge delete-path lock must not be poisoned")
+            .push(path.to_owned());
         if call == self.fail_delete_at.load(Ordering::Acquire) {
             return Err(ObjectStoreError::new(
                 ObjectStoreErrorKind::Unexpected,
@@ -890,7 +990,25 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
                 ));
             }
         }
-        self.inner.delete(path).await
+        self.inner.delete(path).await?;
+        let pause_after_delete = {
+            let mut target = self
+                .pause_after_delete_path
+                .lock()
+                .expect("Forge post-delete path lock must not be poisoned");
+            if target.as_deref() == Some(path) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        if pause_after_delete {
+            self.delete_completed.store(true, Ordering::Release);
+            self.delete_completed_ready.notify_waiters();
+            self.delete_completed_release.notified().await;
+        }
+        Ok(())
     }
 }
 
@@ -928,6 +1046,34 @@ impl ForgeFixture {
             },
         )
         .map(|(forge, _publisher, _probe)| forge)
+        .expect("validated Forge fixture config")
+    }
+
+    /// Build a worker-observed Forge graph with explicit catalog and object-store seams.
+    ///
+    /// The returned publisher owns the matching production hint inbox. The
+    /// observer remains passive; planning and execution still belong to the
+    /// production `Forge::run` and `ForgeWorker::run` supervisors.
+    #[must_use]
+    pub fn context_with_worker_supervision(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        completion_observer: ForgeWorkerCompletionObserver,
+        scheduler_trigger: ForgeSchedulerTrigger,
+    ) -> (Arc<Forge>, StagingFilePublisher) {
+        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+            config,
+            catalog,
+            object_store,
+            None,
+            ForgeFixtureSupervision {
+                completion_observer: Some(completion_observer),
+                scheduler_trigger: Some(scheduler_trigger),
+            },
+        )
+        .map(|(forge, publisher, _probe)| (forge, publisher))
         .expect("validated Forge fixture config")
     }
 

@@ -11,6 +11,7 @@ use sqlx::Row;
 use thiserror::Error;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::tail_rpc::TonicTailReadTransport;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
@@ -18,6 +19,8 @@ use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_dev_fixtures::pg::PgFixture;
+#[cfg(test)]
+use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_server::app::metrics::install_recorder;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
@@ -28,7 +31,8 @@ use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::Bootstrap;
 use crate::server::{
-    WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError, test_catalog, test_redux_catalog,
+    WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError, provision_oracle_peer_credentials,
+    test_catalog, test_redux_catalog,
 };
 
 /// Supported role topology for a Bifrost cluster journey.
@@ -502,6 +506,8 @@ pub struct WyrdTestCluster {
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
     telemetry: OracleTelemetryCapture,
+    /// Valid SYSTEM_OWNER Service credential retained across node restarts.
+    oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
 }
 
 impl WyrdTestCluster {
@@ -597,6 +603,8 @@ impl WyrdTestCluster {
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let catalog: Arc<WyrdCatalog> = test_catalog(&fixture, &storage).await?;
         let redux_catalog: Arc<BifrostCatalog> = test_redux_catalog(&fixture, &storage).await?;
+        let oracle_peer_credentials =
+            provision_oracle_peer_credentials(Arc::clone(&fixture)).await?;
         let topology = classify_topology(&spec);
         let mut nodes = BTreeMap::new();
         for node in spec.nodes {
@@ -638,6 +646,7 @@ impl WyrdTestCluster {
             scribe_admission,
             faults: OracleFaultController::default(),
             telemetry: process.capture.clone(),
+            oracle_peer_credentials,
         };
         let node_ids = cluster.nodes.keys().copied().collect::<Vec<_>>();
         for node_id in node_ids {
@@ -663,6 +672,7 @@ impl WyrdTestCluster {
                 resources.spill_root.as_ref().map(Arc::clone),
             )
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
+            .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
             .with_telemetry(Arc::clone(&process_telemetry()?.guard));
         if let Some(admission) = self.scribe_admission {
             builder = builder.with_scribe_admission_for_test(admission);
@@ -1172,8 +1182,39 @@ mod tests {
         cluster.stop_node(node_id).await.expect("node stops");
         assert!(cluster.server_by_node(node_id).is_none());
         cluster.restart_node(node_id).await.expect("node restarts");
-        assert!(cluster.server_by_node(node_id).is_some());
+        let server = cluster.server_by_node(node_id).expect("node is running");
         assert_eq!(cluster.wal_dirs().next(), Some(wal_root.as_path()));
+        let mut system_conn = cluster
+            .fixture
+            .tenant_conn_for(DataTenantId::SYSTEM_OWNER)
+            .await
+            .expect("system tenant connection");
+        let assigned: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT r.name, r.permissions FROM wyrd.auth_service_accounts sa \
+             JOIN wyrd.auth_service_account_roles sar ON sar.data_tenant_id = sa.data_tenant_id AND sar.service_account_id = sa.id \
+             JOIN wyrd.auth_roles r ON r.data_tenant_id = sar.data_tenant_id AND r.id = sar.role_id \
+             WHERE sa.name = 'bifrost-oracle-peer' ORDER BY r.name",
+        )
+        .fetch_all(&mut **system_conn.transaction())
+        .await
+        .expect("Oracle peer role reads");
+        drop(system_conn);
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, "bifrost_oracle_peer");
+        let stored_permissions: Vec<Permission> =
+            serde_json::from_value(assigned[0].1.clone()).expect("permissions decode");
+        let expected = vec![Permission::bifrost_oracle_peer_invoke()];
+        assert_eq!(stored_permissions, expected);
+        let bearer = cluster
+            .oracle_peer_credentials
+            .bearer(false)
+            .await
+            .expect("Oracle credential exchanges");
+        let effective = server
+            .oracle_peer_permissions_for_test(bearer)
+            .await
+            .expect("Oracle bearer verifies");
+        assert_eq!(effective, PermissionSet::from_iter(expected));
         cluster.shutdown().await.expect("cluster shuts down");
     }
 

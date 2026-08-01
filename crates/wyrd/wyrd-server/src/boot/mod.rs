@@ -19,8 +19,8 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
-    LocalOraclePeerTransport, OraclePeerTransportDirectory, OraclePeerWorker,
-    PEER_PROTOCOL_VERSION, ReservationRegistry, TonicOraclePeerTransport,
+    LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTransportDirectory,
+    OraclePeerWorker, PEER_PROTOCOL_VERSION, ReservationRegistry, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
 use vala_bifrost_redux::oracle::{
@@ -602,6 +602,8 @@ pub async fn build_state(
         cluster: Arc::clone(&bifrost_parts.cluster_registry),
         node_id: bifrost_parts.node_id,
         advertise_addr: &config.bifrost.oracle.advertise_addr,
+        #[cfg(feature = "test-support")]
+        peer_credentials: None,
     }
     .build()
     .await?;
@@ -804,6 +806,9 @@ struct OracleRoleBuilder<'a> {
     node_id: ClusterNodeId,
     /// Bound endpoint published in cluster membership.
     advertise_addr: &'a str,
+    /// Optional test-harness credential owner replacing environment discovery.
+    #[cfg(feature = "test-support")]
+    peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
 }
 
 impl<'a> OracleRoleBuilder<'a> {
@@ -820,6 +825,8 @@ impl<'a> OracleRoleBuilder<'a> {
             cluster,
             node_id,
             advertise_addr,
+            #[cfg(feature = "test-support")]
+                peer_credentials: injected_peer_credentials,
         } = self;
         if !config.bifrost.roles.contains(&BifrostRuntimeRole::Oracle) {
             return Ok(state);
@@ -883,12 +890,19 @@ impl<'a> OracleRoleBuilder<'a> {
             .into_iter()
             .map(|lease| (lease.key.node_id, lease.address.clone()))
             .collect::<HashMap<_, _>>();
-        let peer_credentials =
+        #[cfg(feature = "test-support")]
+        let peer_credentials: Arc<dyn OraclePeerCredentials> = match injected_peer_credentials {
+            Some(credentials) => credentials,
+            None => Arc::new(
+                ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?,
+            ),
+        };
+        #[cfg(not(feature = "test-support"))]
+        let peer_credentials: Arc<dyn OraclePeerCredentials> =
             Arc::new(ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?);
-        let initial_bearer = peer_credentials
-            .initialize()
-            .await
-            .map_err(ServerBootError::OraclePeer)?;
+        let initial_bearer = peer_credentials.bearer(false).await.map_err(|_| {
+            ServerBootError::OraclePeer("Oracle peer credential exchange failed".to_owned())
+        })?;
         let verifier =
             state.auth.token_verifier.as_ref().ok_or_else(|| {
                 ServerBootError::OraclePeer("auth backend not configured".to_owned())
@@ -1091,6 +1105,38 @@ pub async fn attach_test_oracle_runtime_for_node_at(
         cluster,
         node_id,
         advertise_addr: &advertise_addr,
+        peer_credentials: None,
+    }
+    .build()
+    .await
+}
+
+/// Attach a test Oracle role with a harness-owned refreshing Service credential.
+///
+/// # Errors
+///
+/// Returns the same signing, credential, registration, admission, and readiness
+/// failures as [`attach_test_oracle_runtime_for_node_at`].
+#[cfg(feature = "test-support")]
+pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
+    state: AppState,
+    node_id: wyrd_spec::vala::api::NodeId,
+    signing_key: secrecy::SecretString,
+    advertise_addr: String,
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
+) -> Result<AppState, ServerBootError> {
+    let node_id = ClusterNodeId::new(node_id.as_uuid());
+    let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
+    let mut config = crate::config::WyrdServerConfig::default();
+    config.auth.signing_key = Some(signing_key.clone());
+    OracleRoleBuilder {
+        state,
+        config: &config,
+        signing_key: &signing_key,
+        cluster,
+        node_id,
+        advertise_addr: &advertise_addr,
+        peer_credentials: Some(peer_credentials),
     }
     .build()
     .await
@@ -1583,6 +1629,7 @@ mod pg_tests {
                 cluster: Arc::clone(&cluster),
                 node_id,
                 advertise_addr: "127.0.0.1:9443",
+                peer_credentials: None,
             }
             .build()
             .await
@@ -1641,6 +1688,7 @@ mod pg_tests {
                 cluster: Arc::clone(&cluster),
                 node_id,
                 advertise_addr: "127.0.0.1:9443",
+                peer_credentials: None,
             }
             .build()
             .await

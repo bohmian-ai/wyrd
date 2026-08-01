@@ -24,11 +24,12 @@ use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
+use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
-use wyrd_auth::exchange_api_key::TokenExchangeSettings;
+use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
 use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -42,7 +43,9 @@ use wyrd_auth_verify::{
 };
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
+#[cfg(test)]
+use wyrd_runtime::PermissionSet;
+use wyrd_runtime::{Permission, PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
@@ -59,6 +62,47 @@ use wyrd_telemetry::TelemetryGuard;
 #[derive(Debug)]
 struct TestForgeObjectStore {
     operator: Arc<Operator>,
+}
+
+/// Harness-owned credential that exchanges one persisted Service API key.
+struct TestOraclePeerCredentials {
+    /// Shared real Postgres fixture containing the credential record.
+    fixture: Arc<PgFixture>,
+    /// Durable API key retained only for the cluster lifetime.
+    api_key: SecretString,
+    /// Production exchange service used for each access-token acquisition.
+    exchange: ExchangeApiKey,
+}
+
+impl std::fmt::Debug for TestOraclePeerCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestOraclePeerCredentials")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl OraclePeerCredentials for TestOraclePeerCredentials {
+    /// Exchange the retained API key through the production auth service.
+    async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
+        let mut conn = self
+            .fixture
+            .tenant_conn_for(DataTenantId::SYSTEM_OWNER)
+            .await
+            .map_err(|_| DispatchError::Terminal)?;
+        let exchanged = self
+            .exchange
+            .execute(
+                &mut conn,
+                self.api_key.clone(),
+                &RequestId::now_v7().to_string(),
+            )
+            .await
+            .map_err(|_| DispatchError::Terminal)?;
+        conn.commit().await.map_err(|_| DispatchError::Terminal)?;
+        Ok(exchanged.access_token.expose_secret().to_owned())
+    }
 }
 
 impl TestForgeObjectStore {
@@ -109,13 +153,16 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_service_account,
-    insert_user, revoke_role_from_service_account, revoke_role_from_user, role_by_name,
-    trusted_issuer_by_url, workload_binding_by_subject,
+    grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_role,
+    insert_service_account, insert_user, revoke_role_from_service_account, revoke_role_from_user,
+    role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_storage::{BackendConfig, StorageSettings};
 
 use crate::time::ClockHandle;
+
+/// Dedicated least-privilege role assigned to the test Oracle Service.
+const ORACLE_PEER_ROLE: &str = "bifrost_oracle_peer";
 
 /// Wyrd server test harness supporting in-process and real-socket modes.
 pub struct WyrdTestServer {
@@ -180,6 +227,8 @@ pub struct WyrdTestServerBuilder {
     telemetry: Option<Arc<TelemetryGuard>>,
     /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
     bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    /// Optional cluster-scoped Oracle peer credential injected by the harness.
+    oracle_peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -210,6 +259,7 @@ impl Default for WyrdTestServerBuilder {
             oracle_spill_root: None,
             telemetry: None,
             bind_addrs: None,
+            oracle_peer_credentials: None,
         }
     }
 }
@@ -1035,6 +1085,25 @@ impl WyrdTestServer {
         &self.inner.fixture
     }
 
+    /// Verify one Oracle peer bearer and return its effective permission set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an auth error when the bearer is invalid, expired, or not bound
+    /// to the reserved system tenant.
+    #[cfg(test)]
+    pub(crate) async fn oracle_peer_permissions_for_test(
+        &self,
+        bearer: String,
+    ) -> Result<PermissionSet, WyrdTestServerError> {
+        self.inner
+            .verifier
+            .verify(&SecretString::from(bearer), &DataTenantId::SYSTEM_OWNER)
+            .await
+            .map(|verified| verified.principal.effective_permissions.clone())
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
+    }
+
     /// Bind an already-constructed server to OS-assigned HTTP and gRPC ports.
     pub(crate) async fn bind(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
         // Inject a known shutdown token so the harness can stop the real server;
@@ -1280,6 +1349,16 @@ impl WyrdTestServerBuilder {
         grpc: std::net::SocketAddr,
     ) -> Self {
         self.bind_addrs = Some((http, grpc));
+        self
+    }
+
+    /// Inject the cluster-owned Oracle peer credential without process globals.
+    #[must_use]
+    pub(crate) fn with_oracle_peer_credentials(
+        mut self,
+        credentials: Arc<dyn OraclePeerCredentials>,
+    ) -> Self {
+        self.oracle_peer_credentials = Some(credentials);
         self
     }
 
@@ -1584,7 +1663,12 @@ impl WyrdTestServerBuilder {
             state = state.with_telemetry(telemetry);
         }
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle) {
-            state = wyrd_server::boot::attach_test_oracle_runtime_for_node_at(
+            let credentials = self.oracle_peer_credentials.ok_or_else(|| {
+                WyrdTestServerError::Start(
+                    "Oracle-enabled test server requires a peer credential".to_owned(),
+                )
+            })?;
+            state = wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials(
                 state,
                 node_id,
                 SecretString::from(crate::keys::private_key_pem().to_owned()),
@@ -1592,6 +1676,7 @@ impl WyrdTestServerBuilder {
                     || "http://127.0.0.1:0".to_owned(),
                     |(_, grpc)| format!("http://{grpc}"),
                 ),
+                credentials,
             )
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -1713,6 +1798,97 @@ async fn grant_role(
                 .map_err(sql)
         }
     }
+}
+
+/// Provision the cluster-scoped SYSTEM_OWNER Service credential used by Oracle peers.
+///
+/// The returned owner retains the API key only in memory and exchanges it
+/// through [`ExchangeApiKey`] whenever a node boots or refreshes.
+///
+/// # Errors
+///
+/// Returns an error when role seeding, principal/key persistence, hashing, or
+/// issuing-key construction fails.
+pub(crate) async fn provision_oracle_peer_credentials(
+    fixture: Arc<PgFixture>,
+) -> Result<Arc<dyn OraclePeerCredentials>, WyrdTestServerError> {
+    let tenant_id = DataTenantId::SYSTEM_OWNER;
+    let creator_id = fixture_admin_id(tenant_id);
+    let principal_id = Uuid::now_v7();
+    let service_ref = card_ref(CardKind::Service, "bifrost-oracle-peer")?;
+    let api_key = WyrdApiKey::generate(tenant_id);
+    let raw = api_key.secret.clone();
+    let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
+        .await
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
+    seed_builtin_roles_for_tenant(&mut conn, tenant_id)
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    let permissions = vec![Permission::bifrost_oracle_peer_invoke()];
+    let permissions_json = serde_json::to_value(&permissions)
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    insert_role(
+        &mut conn,
+        Uuid::now_v7(),
+        ORACLE_PEER_ROLE,
+        &permissions_json,
+        false,
+    )
+    .await
+    .map_err(sql)?;
+    let email = format!("fixture-admin-{}@test.wyrd", creator_id.simple());
+    insert_user(&mut conn, creator_id, Some(&email), "password", None)
+        .await
+        .map_err(sql)?;
+    seed_machine_card(&mut conn, &service_ref, creator_id).await?;
+    insert_service_account(
+        &mut conn,
+        principal_id,
+        "service",
+        &service_ref,
+        "bifrost-oracle-peer",
+        None,
+        creator_id,
+    )
+    .await
+    .map_err(sql)?;
+    insert_api_key(
+        &mut conn,
+        Uuid::now_v7(),
+        principal_id,
+        &api_key.prefix,
+        &key_hash,
+        creator_id,
+        chrono::Utc::now() + chrono::Duration::days(1),
+    )
+    .await
+    .map_err(sql)?;
+    grant_role(
+        &mut conn,
+        principal_id,
+        PrincipalTable::ServiceAccount,
+        ORACLE_PEER_ROLE,
+    )
+    .await?;
+    conn.commit().await.map_err(sql)?;
+    let issuing_key = Arc::new(
+        IssuingKey::from_ed_pem(
+            crate::keys::private_key_pem(),
+            Kid::new("test").expect("static kid is valid"),
+            "wyrd",
+        )
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+    );
+    Ok(Arc::new(TestOraclePeerCredentials {
+        fixture,
+        api_key: api_key.secret,
+        exchange: ExchangeApiKey {
+            issuing_key,
+            settings: TokenExchangeSettings::default(),
+        },
+    }))
 }
 
 async fn lookup_role_id(

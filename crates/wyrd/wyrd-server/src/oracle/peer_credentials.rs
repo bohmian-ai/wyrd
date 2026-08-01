@@ -29,13 +29,23 @@ impl ServerOraclePeerCredentials {
     /// # Errors
     /// Returns a redacted message when the key is absent or middleware setup fails.
     pub fn from_env() -> Result<Self, String> {
-        let api_key = std::env::var("WYRD_BIFROST_ORACLE_PEER_API_KEY")
-            .ok()
+        Self::from_configured_key(
+            std::env::var("WYRD_BIFROST_ORACLE_PEER_API_KEY").ok(),
+            &ClientConfig::from_env(),
+        )
+    }
+
+    /// Builds credentials from one resolved production key value.
+    ///
+    /// # Errors
+    /// Returns a redacted message when the value is absent, blank, or cannot
+    /// initialize the shared auth middleware.
+    fn from_configured_key(api_key: Option<String>, config: &ClientConfig) -> Result<Self, String> {
+        let api_key = api_key
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "WYRD_BIFROST_ORACLE_PEER_API_KEY is required".to_owned())?;
-        let config = ClientConfig::from_env();
         let auth = AuthMiddleware::new(
-            &config,
+            config,
             ResolvedCredential::ApiKey(SecretString::from(api_key)),
         )
         .map_err(|_| "Oracle peer credential middleware initialization failed".to_owned())?;
@@ -65,5 +75,33 @@ impl OraclePeerCredentials for ServerOraclePeerCredentials {
         }
         .map_err(|_| DispatchError::Terminal)?;
         Ok(token.expose().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerOraclePeerCredentials;
+    use wyrd_client::config::ClientConfig;
+
+    /// Production configuration fails closed when the peer key is missing.
+    #[test]
+    fn configured_key_rejects_missing_value() {
+        let error =
+            ServerOraclePeerCredentials::from_configured_key(None, &ClientConfig::default())
+                .expect_err("missing key is rejected");
+
+        assert_eq!(error, "WYRD_BIFROST_ORACLE_PEER_API_KEY is required");
+    }
+
+    /// Production configuration fails closed when the peer key is blank.
+    #[test]
+    fn configured_key_rejects_blank_value() {
+        let error = ServerOraclePeerCredentials::from_configured_key(
+            Some("   ".to_owned()),
+            &ClientConfig::default(),
+        )
+        .expect_err("blank key is rejected");
+
+        assert_eq!(error, "WYRD_BIFROST_ORACLE_PEER_API_KEY is required");
     }
 }

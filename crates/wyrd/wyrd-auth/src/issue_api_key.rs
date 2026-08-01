@@ -200,8 +200,11 @@ impl WyrdApiKey {
             return Err(WyrdApiKeyParseError);
         }
         let tenant_uuid = Uuid::parse_str(tenant).map_err(|_| WyrdApiKeyParseError)?;
-        let tenant_id =
-            wyrd_spec::DataTenantId::try_from(tenant_uuid).map_err(|_| WyrdApiKeyParseError)?;
+        let tenant_id = if tenant_uuid.is_nil() {
+            wyrd_spec::DataTenantId::SYSTEM_OWNER
+        } else {
+            wyrd_spec::DataTenantId::try_from(tenant_uuid).map_err(|_| WyrdApiKeyParseError)?
+        };
         Ok(Self {
             tenant_id,
             prefix: format!("wyrd_sk_{tenant}_{visible}"),
@@ -263,6 +266,17 @@ mod tests {
         let tenant = wyrd_spec::DataTenantId::new_v7();
         let key = WyrdApiKey::generate(tenant);
         let parsed = WyrdApiKey::parse(key.secret.expose_secret()).expect("key parses");
+
+        assert_eq!(parsed.tenant_id, tenant);
+        assert_eq!(parsed.prefix, key.prefix);
+    }
+
+    /// Platform Service keys preserve the reserved `SYSTEM_OWNER` identity.
+    #[test]
+    fn generated_system_owner_api_key_parses_tenant_and_prefix() {
+        let tenant = wyrd_spec::DataTenantId::SYSTEM_OWNER;
+        let key = WyrdApiKey::generate(tenant);
+        let parsed = WyrdApiKey::parse(key.secret.expose_secret()).expect("system key parses");
 
         assert_eq!(parsed.tenant_id, tenant);
         assert_eq!(parsed.prefix, key.prefix);

@@ -1,6 +1,8 @@
 mod pg_tests {
     //! Real-Postgres lifecycle, fencing, audit, and isolation proofs for Forge tasks.
 
+    use std::time::Duration as StdDuration;
+
     use chrono::{Duration, Utc};
     use sqlx::{PgPool, types::Uuid};
     use vala_sql::TenantConn;
@@ -1230,6 +1232,17 @@ mod pg_tests {
             .await
             .expect("lease")
             .expect("fence");
+        tasks
+            .renew_scheduler(owner, fence, StdDuration::from_secs(30))
+            .await
+            .expect("renew exact scheduler generation");
+        let generation_after_renewal: i64 = sqlx::query_scalar(
+            "SELECT fencing_token FROM vala.forge_scheduler_state WHERE singleton",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("read renewed scheduler generation");
+        assert_eq!(generation_after_renewal, fence);
         let (listed, overflowed) = tasks
             .planning_demands(owner, fence, 1)
             .await
@@ -1756,12 +1769,27 @@ mod pg_tests {
             "acknowledging the current generation advances to the other tenant within bound two"
         );
         sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second'").execute(&admin).await.expect("expire");
+        assert!(
+            tasks.planning_demands(owner, fence, 1).await.is_err(),
+            "expired leadership cannot appear as a live empty demand page"
+        );
+        assert!(
+            tasks
+                .renew_scheduler(owner, fence, StdDuration::from_secs(30))
+                .await
+                .is_err(),
+            "expired leadership cannot be renewed"
+        );
         let successor = Uuid::now_v7();
         let successor_fence = tasks
             .acquire_scheduler(successor, 30)
             .await
             .expect("takeover")
             .expect("fence");
+        assert!(
+            tasks.planning_demands(owner, fence, 1).await.is_err(),
+            "replaced leadership remains stale"
+        );
         let resumed = tasks
             .planning_demands(successor, successor_fence, 1)
             .await

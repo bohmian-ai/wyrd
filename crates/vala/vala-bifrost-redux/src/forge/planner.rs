@@ -5,6 +5,7 @@ use vala_sql::row_types::forge_tasks::{
     FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy,
 };
 
+use super::ForgeConfig;
 use super::error::ForgeError;
 
 /// Every hard ceiling used to classify exact Forge plans.
@@ -42,6 +43,40 @@ impl ForgeCapacity {
             });
         }
         Ok(self)
+    }
+}
+
+impl TryFrom<&ForgeConfig> for ForgeCapacity {
+    /// Configuration validation failure returned when capacity cannot be represented.
+    type Error = ForgeError;
+
+    /// Converts every configured planning and admission ceiling into its durable domain.
+    ///
+    /// The conversion is the single capacity construction path shared by the
+    /// scheduler and worker, so neither consumer can omit or reinterpret a field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when a count exceeds its durable
+    /// integer domain or any capacity relationship is invalid.
+    fn try_from(config: &ForgeConfig) -> Result<Self, Self::Error> {
+        Self {
+            max_files: u32::try_from(config.max_files_per_tick).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "Forge file capacity exceeds u32".to_owned(),
+                }
+            })?,
+            max_bytes: config.max_bytes_per_tick,
+            max_parallelism: u16::try_from(config.max_concurrent_reads).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "Forge parallelism exceeds u16".to_owned(),
+                }
+            })?,
+            max_memory_bytes: config.max_memory_bytes,
+            max_spill_bytes: config.spill_limit_bytes,
+            max_large_task_bytes: config.max_large_task_bytes,
+        }
+        .validate()
     }
 }
 
@@ -118,14 +153,20 @@ impl PlannedForgeTask {
 }
 
 /// Stateful owner of deterministic plan construction.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ForgePlanner;
+#[derive(Debug, Clone, Copy)]
+pub struct ForgePlanner {
+    /// Validated ceilings used for every plan produced by this owner.
+    capacity: ForgeCapacity,
+}
 
 impl ForgePlanner {
-    /// Constructs the one process-independent planner owner.
+    /// Constructs the one process-independent planner owner from validated capacity.
+    ///
+    /// Callers construct `capacity` through [`ForgeCapacity::try_from`] so all
+    /// planning operations share the same checked ceiling relationships.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub const fn new(capacity: ForgeCapacity) -> Self {
+        Self { capacity }
     }
 
     /// Plans every candidate from one stable snapshot and assigns one capacity outcome.
@@ -135,21 +176,24 @@ impl ForgePlanner {
     pub fn plan_table(
         &self,
         snapshot: &ForgeTableSnapshot,
-        capacity: &ForgeCapacity,
     ) -> Result<Vec<PlannedForgeTask>, ForgeError> {
-        capacity.validate()?;
         snapshot
             .candidates
             .iter()
-            .map(|candidate| Self::plan_candidate(snapshot.snapshot_id, candidate, capacity))
+            .map(|candidate| self.plan_candidate(snapshot.snapshot_id, candidate))
             .collect()
     }
 
     /// Builds and hashes one exact candidate without performing IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error when candidate identity, estimates, or
+    /// canonical payload encoding cannot produce a durable plan.
     fn plan_candidate(
+        &self,
         snapshot_id: i64,
         candidate: &ForgePlanCandidate,
-        capacity: &ForgeCapacity,
     ) -> Result<PlannedForgeTask, ForgeError> {
         let files = u32::try_from(candidate.inputs.len()).map_err(|_| ForgeError::Invariant {
             detail: "Forge plan input count exceeds u32".to_owned(),
@@ -166,18 +210,18 @@ impl ForgePlanner {
                     .to_owned(),
             });
         }
-        let ordinary = files <= capacity.max_files
-            && candidate.bytes <= capacity.max_bytes
-            && candidate.parallelism <= capacity.max_parallelism
-            && candidate.memory_bytes <= capacity.max_memory_bytes
-            && candidate.spill_bytes <= capacity.max_spill_bytes;
+        let ordinary = files <= self.capacity.max_files
+            && candidate.bytes <= self.capacity.max_bytes
+            && candidate.parallelism <= self.capacity.max_parallelism
+            && candidate.memory_bytes <= self.capacity.max_memory_bytes
+            && candidate.spill_bytes <= self.capacity.max_spill_bytes;
         let capacity_outcome = if ordinary {
             ForgePlanCapacity::Ordinary
-        } else if files <= capacity.max_files
-            && candidate.bytes <= capacity.max_large_task_bytes
-            && candidate.parallelism <= capacity.max_parallelism
-            && candidate.memory_bytes <= capacity.max_memory_bytes
-            && candidate.spill_bytes <= capacity.max_spill_bytes
+        } else if files == 1
+            && candidate.bytes <= self.capacity.max_large_task_bytes
+            && candidate.parallelism <= self.capacity.max_parallelism
+            && candidate.memory_bytes <= self.capacity.max_memory_bytes
+            && candidate.spill_bytes <= self.capacity.max_spill_bytes
         {
             ForgePlanCapacity::LargeSingleton
         } else {
@@ -208,7 +252,7 @@ impl ForgePlanner {
                 parallelism: candidate.parallelism,
                 memory_bytes: candidate.memory_bytes,
                 spill_bytes: candidate.spill_bytes,
-                large_ceiling_bytes: capacity.max_large_task_bytes,
+                large_ceiling_bytes: self.capacity.max_large_task_bytes,
             },
             capacity: capacity_outcome,
         })
@@ -247,7 +291,7 @@ mod tests {
     /// Every capacity dimension independently controls the sole outcome.
     #[test]
     fn planner_classifies_all_capacity_dimensions_and_singleton_lane() {
-        let owner = ForgePlanner::new();
+        let owner = ForgePlanner::new(capacity());
         for mutate in [
             |c: &mut ForgePlanCandidate| {
                 c.inputs = (0..5).map(|i| format!("{i}.parquet")).collect();
@@ -260,63 +304,87 @@ mod tests {
             let mut value = candidate();
             mutate(&mut value);
             let tasks = owner
-                .plan_table(
-                    &ForgeTableSnapshot {
-                        snapshot_id: 7,
-                        candidates: vec![value],
-                    },
-                    &capacity(),
-                )
+                .plan_table(&ForgeTableSnapshot {
+                    snapshot_id: 7,
+                    candidates: vec![value],
+                })
                 .expect("valid plan");
             assert_eq!(tasks[0].capacity, ForgePlanCapacity::Unschedulable);
         }
         let mut large = candidate();
-        large.inputs = vec!["a.parquet".to_owned(), "b.parquet".to_owned()];
         large.bytes = 150;
         let tasks = owner
-            .plan_table(
-                &ForgeTableSnapshot {
-                    snapshot_id: 7,
-                    candidates: vec![large],
-                },
-                &capacity(),
-            )
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 7,
+                candidates: vec![large],
+            })
             .expect("large plan");
         assert_eq!(tasks[0].capacity, ForgePlanCapacity::LargeSingleton);
+
+        let mut multi_file_overflow = candidate();
+        multi_file_overflow.inputs = vec!["a.parquet".to_owned(), "b.parquet".to_owned()];
+        multi_file_overflow.bytes = 150;
+        let tasks = owner
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 7,
+                candidates: vec![multi_file_overflow],
+            })
+            .expect("multi-file overflow plan");
+        assert_eq!(tasks[0].capacity, ForgePlanCapacity::Unschedulable);
+    }
+
+    /// Configuration conversion copies every field and rejects invalid relationships.
+    #[test]
+    fn capacity_conversion_is_field_complete_and_validated() {
+        let mut config = ForgeConfig::default();
+        config.max_files_per_tick = 17;
+        config.max_bytes_per_tick = 101;
+        config.max_concurrent_reads = 3;
+        config.max_memory_bytes = 103;
+        config.spill_limit_bytes = 107;
+        config.max_large_task_bytes = 109;
+        assert_eq!(
+            ForgeCapacity::try_from(&config).expect("valid capacity"),
+            ForgeCapacity {
+                max_files: 17,
+                max_bytes: 101,
+                max_parallelism: 3,
+                max_memory_bytes: 103,
+                max_spill_bytes: 107,
+                max_large_task_bytes: 109,
+            }
+        );
+
+        config.max_large_task_bytes = 100;
+        assert!(matches!(
+            ForgeCapacity::try_from(&config),
+            Err(ForgeError::InvalidConfig { .. })
+        ));
     }
 
     /// Stable snapshots yield stable hashes while replanning a new snapshot changes identity.
     #[test]
     fn canonical_plan_hash_is_stable_and_snapshot_is_exact() {
-        let planner = ForgePlanner::new();
+        let planner = ForgePlanner::new(capacity());
         let first = planner
-            .plan_table(
-                &ForgeTableSnapshot {
-                    snapshot_id: 7,
-                    candidates: vec![candidate()],
-                },
-                &capacity(),
-            )
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 7,
+                candidates: vec![candidate()],
+            })
             .expect("first");
         let replay = planner
-            .plan_table(
-                &ForgeTableSnapshot {
-                    snapshot_id: 7,
-                    candidates: vec![candidate()],
-                },
-                &capacity(),
-            )
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 7,
+                candidates: vec![candidate()],
+            })
             .expect("replay");
         assert_eq!(first[0].plan_hash, replay[0].plan_hash);
         assert_eq!(first[0].base_snapshot_id, 7);
         let replanned = planner
-            .plan_table(
-                &ForgeTableSnapshot {
-                    snapshot_id: 8,
-                    candidates: vec![candidate()],
-                },
-                &capacity(),
-            )
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 8,
+                candidates: vec![candidate()],
+            })
             .expect("snapshot replan");
         assert_ne!(first[0].base_snapshot_id, replanned[0].base_snapshot_id);
         assert_eq!(

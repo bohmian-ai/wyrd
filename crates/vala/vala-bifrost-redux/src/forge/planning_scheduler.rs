@@ -1,6 +1,10 @@
 //! Durable demand scheduling without rewrite or Iceberg commit execution.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "test-support")]
+use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -59,12 +63,30 @@ pub struct ForgeScheduler<'forge> {
     planner: ForgePlanner,
     /// Durable task and demand owner.
     tasks: ForgeTasks,
-    /// Complete hard capacity declaration.
-    capacity: ForgeCapacity,
     /// Stable scheduler lease owner for this process.
     owner: Uuid,
     /// Bounded demand page size.
     demand_cap: u32,
+    /// Deterministic pause before the post-roster renewal in scheduler tests.
+    #[cfg(feature = "test-support")]
+    renewal_gate: Arc<SchedulerRenewalGate>,
+    /// Complete-only publication count observed by scheduler tests.
+    #[cfg(feature = "test-support")]
+    complete_publications: Arc<AtomicUsize>,
+}
+
+/// Deterministic coordination around the post-roster scheduler renewal.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct SchedulerRenewalGate {
+    /// Arms exactly one pause before demand discovery.
+    armed: AtomicBool,
+    /// Records that the pass is currently stopped at the renewal boundary.
+    paused: AtomicBool,
+    /// Signals that the scheduling pass reached the renewal boundary.
+    reached: tokio::sync::Notify,
+    /// Releases the paused pass after the test changes durable leadership.
+    release: tokio::sync::Notify,
 }
 
 impl<'forge> ForgeScheduler<'forge> {
@@ -91,31 +113,45 @@ impl<'forge> ForgeScheduler<'forge> {
     /// Returns invalid configuration when derived capacity is not positive.
     fn with_owner(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
         let config = &forge.core.config;
-        let capacity = ForgeCapacity {
-            max_files: u32::try_from(config.max_files_per_tick).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "Forge file capacity exceeds u32".to_owned(),
-                }
-            })?,
-            max_bytes: config.max_bytes_per_tick,
-            max_parallelism: u16::try_from(config.max_concurrent_reads).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "Forge parallelism exceeds u16".to_owned(),
-                }
-            })?,
-            max_memory_bytes: config.max_memory_bytes,
-            max_spill_bytes: config.spill_limit_bytes,
-            max_large_task_bytes: config.max_large_task_bytes,
-        }
-        .validate()?;
+        let capacity = ForgeCapacity::try_from(config)?;
         Ok(Self {
             forge,
-            planner: ForgePlanner::new(),
+            planner: ForgePlanner::new(capacity),
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
-            capacity,
             owner,
             demand_cap: u32::try_from(config.max_hints_per_wake).unwrap_or(u32::MAX),
+            #[cfg(feature = "test-support")]
+            renewal_gate: Arc::new(SchedulerRenewalGate::default()),
+            #[cfg(feature = "test-support")]
+            complete_publications: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Arms a deterministic pause before demand discovery for a fence-loss test.
+    #[cfg(feature = "test-support")]
+    pub fn pause_before_demand_renewal_for_test(&self) {
+        self.renewal_gate.armed.store(true, Ordering::Release);
+    }
+
+    /// Waits until a scheduling pass reaches the armed renewal boundary.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_demand_renewal_pause_for_test(&self) {
+        while !self.renewal_gate.paused.load(Ordering::Acquire) {
+            self.renewal_gate.reached.notified().await;
+        }
+    }
+
+    /// Releases one scheduling pass paused before exact fence renewal.
+    #[cfg(feature = "test-support")]
+    pub fn release_demand_renewal_pause_for_test(&self) {
+        self.renewal_gate.release.notify_one();
+    }
+
+    /// Returns complete-only status and telemetry publications by this scheduler.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn complete_publications_for_test(&self) -> usize {
+        self.complete_publications.load(Ordering::Acquire)
     }
 
     /// Durably records an advisory Scribe hint without planning or executing it.
@@ -154,16 +190,25 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     /// Returns scheduler lease, roster, catalog, planning, or durable SQL errors.
     /// Planning and cancellation failures retain the observed demand generation.
+    ///
+    /// # Cancellation
+    ///
+    /// Caller cancellation stops before the next bounded roster or demand unit.
+    /// Fence loss returns immediately without later enqueue, status, or metrics.
     pub async fn schedule_once(
         &self,
         stop: &CancellationToken,
     ) -> Result<ForgeScheduleOutcome, ForgeError> {
         let started = std::time::Instant::now();
         let fence = self.acquire_fence().await?;
+        self.renew_fence(fence).await?;
         let mut outcome = ForgeScheduleOutcome {
-            incomplete: self.repair_roster(stop).await?,
+            incomplete: self.repair_roster(stop, fence).await?,
             ..ForgeScheduleOutcome::default()
         };
+        #[cfg(feature = "test-support")]
+        self.pause_before_demand_renewal_if_armed().await;
+        self.renew_fence(fence).await?;
         let (demands, overflowed) = self
             .tasks
             .planning_demands(self.owner, fence, self.demand_cap)
@@ -177,6 +222,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 outcome.incomplete = true;
                 break;
             }
+            self.renew_fence(fence).await?;
             match self.plan_demand(&demand, fence).await {
                 Ok(planned) => {
                     outcome.tasks_enqueued = outcome
@@ -208,13 +254,29 @@ impl<'forge> ForgeScheduler<'forge> {
             .min()
             .zip(admitted_by_tenant.values().max())
             .map_or(0, |(minimum, maximum)| maximum.saturating_sub(*minimum));
-        self.publish_status(&mut outcome).await?;
+        self.renew_fence(fence).await?;
+        self.publish_status(&mut outcome, fence).await?;
         metrics::counter!("bifrost_forge_scheduling_total", "result" => if outcome.incomplete { "incomplete" } else { "complete" }).increment(1);
         metrics::counter!("bifrost_forge_unschedulable_total")
             .increment(outcome.unschedulable as u64);
         metrics::histogram!("bifrost_forge_scheduling_duration_seconds")
             .record(started.elapsed().as_secs_f64());
+        #[cfg(feature = "test-support")]
+        if !outcome.incomplete {
+            self.complete_publications.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(outcome)
+    }
+
+    /// Pauses once at the deterministic post-roster renewal boundary when armed.
+    #[cfg(feature = "test-support")]
+    async fn pause_before_demand_renewal_if_armed(&self) {
+        if self.renewal_gate.armed.swap(false, Ordering::AcqRel) {
+            self.renewal_gate.paused.store(true, Ordering::Release);
+            self.renewal_gate.reached.notify_waiters();
+            self.renewal_gate.release.notified().await;
+            self.renewal_gate.paused.store(false, Ordering::Release);
+        }
     }
 
     /// Acquires the singleton planning fence for this scheduler owner.
@@ -238,6 +300,24 @@ impl<'forge> ForgeScheduler<'forge> {
             })
     }
 
+    /// Renews the exact scheduler generation without minting a replacement token.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid configuration when the lease does not fit the SQL domain,
+    /// or a stale-fence/SQL error when this owner no longer holds the generation.
+    ///
+    /// # Cancellation
+    ///
+    /// The single renewal statement either extends the exact generation or
+    /// returns without durable partial progress.
+    async fn renew_fence(&self, fence: i64) -> Result<(), ForgeError> {
+        self.tasks
+            .renew_scheduler(self.owner, fence, self.forge.core.config.lease_ttl)
+            .await
+            .map_err(ForgeError::Sql)
+    }
+
     /// Repairs periodic demand from the authoritative registered-table roster.
     ///
     /// The returned flag is true when discovery was partial or cancellation
@@ -246,12 +326,17 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     ///
     /// Returns roster, identity, or SQL errors without acknowledging demand.
-    async fn repair_roster(&self, stop: &CancellationToken) -> Result<bool, ForgeError> {
+    async fn repair_roster(
+        &self,
+        stop: &CancellationToken,
+        fence: i64,
+    ) -> Result<bool, ForgeError> {
         let (tables, failures) = self.forge.discover_tables().await?;
         for key in tables {
             if stop.is_cancelled() {
                 return Ok(true);
             }
+            self.renew_fence(fence).await?;
             let identity = ForgeTaskTableIdentity::new(
                 "wyrd-redux",
                 key.table_ref.namespace.as_str(),
@@ -278,7 +363,7 @@ impl<'forge> ForgeScheduler<'forge> {
         fence: i64,
     ) -> Result<DemandPlanningResult, ForgeError> {
         let snapshot = self.discover_snapshot(demand).await?;
-        let planned = self.planner.plan_table(&snapshot, &self.capacity)?;
+        let planned = self.planner.plan_table(&snapshot)?;
         let mut executable = Vec::new();
         let mut unschedulable = Vec::new();
         for task in planned.into_iter().take(1) {
@@ -288,7 +373,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 table_ref: demand.table_ref.clone(),
                 strategy: task.strategy,
                 lane: if terminal {
-                    ForgeTaskLane::LargeSingleton
+                    ForgeTaskLane::Ordinary
                 } else {
                     task.lane()?
                 },
@@ -360,12 +445,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 .collect::<Result<Vec<_>, ForgeError>>()?;
         }
         if candidates.is_empty()
-            && let Some(candidate) = maintenance_candidate(
-                &table,
-                self.forge.core.config.max_files_per_tick,
-                self.forge.core.config.max_bytes_per_tick,
-            )
-            .await?
+            && let Some(candidate) = self.maintenance_candidate(&table).await?
         {
             candidates.push(candidate);
         }
@@ -375,12 +455,89 @@ impl<'forge> ForgeScheduler<'forge> {
         })
     }
 
+    /// Builds one bounded lifecycle task from the current manifest list.
+    ///
+    /// The scheduler owns this catalog IO because selection uses its validated
+    /// process configuration and participates in one fenced planning pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog or invariant failures when current metadata cannot be
+    /// read or selected manifest sizes exceed representable bounds.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation during the catalog read produces no durable scheduler state.
+    async fn maintenance_candidate(
+        &self,
+        table: &iceberg::table::Table,
+    ) -> Result<Option<ForgePlanCandidate>, ForgeError> {
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(None);
+        };
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let mut inputs = Vec::new();
+        let mut bytes = 0_u64;
+        for manifest in manifests
+            .entries()
+            .iter()
+            .take(self.forge.core.config.max_files_per_tick)
+        {
+            let size =
+                u64::try_from(manifest.manifest_length).map_err(|_| ForgeError::Invariant {
+                    detail: "Iceberg manifest length is negative".to_owned(),
+                })?;
+            let Some(next) = bytes.checked_add(size) else {
+                return Err(ForgeError::Invariant {
+                    detail: "manifest maintenance byte estimate overflowed".to_owned(),
+                });
+            };
+            if !inputs.is_empty() && next > self.forge.core.config.max_bytes_per_tick {
+                break;
+            }
+            bytes = next;
+            inputs.push(manifest.manifest_path.clone());
+        }
+        inputs.sort();
+        inputs.dedup();
+        if inputs.is_empty() {
+            return Ok(None);
+        }
+        let files = u16::try_from(inputs.len()).map_err(|_| ForgeError::Invariant {
+            detail: "manifest maintenance parallelism exceeds u16".to_owned(),
+        })?;
+        let estimate = bytes.max(1);
+        Ok(Some(ForgePlanCandidate {
+            strategy: ForgeTaskStrategy::SnapshotExpiry,
+            inputs,
+            bytes: estimate,
+            parallelism: files.max(1),
+            memory_bytes: estimate,
+            spill_bytes: estimate,
+            parameters: serde_json::json!({"kind":"maintenance"}),
+        }))
+    }
+
     /// Publishes complete-only planning backlog gauges.
     ///
     /// # Errors
     ///
     /// Returns SQL errors while reading the bounded durable status page.
-    async fn publish_status(&self, outcome: &mut ForgeScheduleOutcome) -> Result<(), ForgeError> {
+    /// Fence loss after the read suppresses every complete-only gauge update.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation during status or renewal IO produces no durable write and
+    /// publishes no authoritative gauge update.
+    async fn publish_status(
+        &self,
+        outcome: &mut ForgeScheduleOutcome,
+        fence: i64,
+    ) -> Result<(), ForgeError> {
         if outcome.incomplete || outcome.demands_acknowledged != outcome.demands_seen {
             return Ok(());
         }
@@ -389,6 +546,7 @@ impl<'forge> ForgeScheduler<'forge> {
             .planning_status(self.demand_cap)
             .await
             .map_err(ForgeError::Sql)?;
+        self.renew_fence(fence).await?;
         if should_publish_gauges(outcome, overflowed) {
             metrics::gauge!("bifrost_forge_planning_backlog").set(exact_gauge(backlog));
             let age = oldest.map_or(0.0, |time| {
@@ -408,66 +566,6 @@ impl<'forge> ForgeScheduler<'forge> {
         }
         Ok(())
     }
-}
-
-/// Builds one bounded lifecycle task from the current manifest list.
-///
-/// The exact manifest identities are the rewrite selection. Expiry and cleanup
-/// remain useful even when only one manifest exists, so every non-empty table
-/// receives one deterministic lifecycle task per base snapshot.
-///
-/// # Errors
-///
-/// Returns catalog or invariant failures when current metadata cannot be read
-/// or its selected manifest sizes exceed representable bounds.
-async fn maintenance_candidate(
-    table: &iceberg::table::Table,
-    max_manifests: usize,
-    max_bytes: u64,
-) -> Result<Option<ForgePlanCandidate>, ForgeError> {
-    let Some(snapshot) = table.metadata().current_snapshot() else {
-        return Ok(None);
-    };
-    let manifests = table
-        .manifest_list_reader(snapshot)
-        .load()
-        .await
-        .map_err(ForgeError::Catalog)?;
-    let mut inputs = Vec::new();
-    let mut bytes = 0_u64;
-    for manifest in manifests.entries().iter().take(max_manifests) {
-        let size = u64::try_from(manifest.manifest_length).map_err(|_| ForgeError::Invariant {
-            detail: "Iceberg manifest length is negative".to_owned(),
-        })?;
-        let Some(next) = bytes.checked_add(size) else {
-            return Err(ForgeError::Invariant {
-                detail: "manifest maintenance byte estimate overflowed".to_owned(),
-            });
-        };
-        if !inputs.is_empty() && next > max_bytes {
-            break;
-        }
-        bytes = next;
-        inputs.push(manifest.manifest_path.clone());
-    }
-    inputs.sort();
-    inputs.dedup();
-    if inputs.is_empty() {
-        return Ok(None);
-    }
-    let files = u16::try_from(inputs.len()).map_err(|_| ForgeError::Invariant {
-        detail: "manifest maintenance parallelism exceeds u16".to_owned(),
-    })?;
-    let estimate = bytes.max(1);
-    Ok(Some(ForgePlanCandidate {
-        strategy: ForgeTaskStrategy::SnapshotExpiry,
-        inputs,
-        bytes: estimate,
-        parallelism: files.max(1),
-        memory_bytes: estimate,
-        spill_bytes: estimate,
-        parameters: serde_json::json!({"kind":"maintenance"}),
-    }))
 }
 
 /// Maps one exact live rewrite group into the durable planner contract.

@@ -645,23 +645,7 @@ impl ForgeWorker {
     pub fn new(forge: Arc<Forge>, config: ForgeWorkerConfig) -> Result<Self, ForgeError> {
         let config = config.validate()?;
         let limits = &forge.core.config;
-        let capacity = ForgeCapacity {
-            max_files: u32::try_from(limits.max_files_per_tick).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "Forge worker file capacity exceeds u32".to_owned(),
-                }
-            })?,
-            max_bytes: limits.max_bytes_per_tick,
-            max_parallelism: u16::try_from(limits.max_concurrent_reads).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "Forge worker parallelism exceeds u16".to_owned(),
-                }
-            })?,
-            max_memory_bytes: limits.max_memory_bytes,
-            max_spill_bytes: limits.spill_limit_bytes,
-            max_large_task_bytes: limits.max_large_task_bytes,
-        }
-        .validate()?;
+        let capacity = ForgeCapacity::try_from(limits)?;
         Ok(Self {
             completion_observer: forge.core.completion_observer.clone(),
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),

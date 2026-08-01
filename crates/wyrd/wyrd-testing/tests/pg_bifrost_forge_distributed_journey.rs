@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use secrecy::SecretString;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::forge::{ForgeScheduler, ForgeWorker, ForgeWorkerConfig};
+use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use vala_sql::queries::forge_tasks::ForgeTasks;
-use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, ForgeTaskTableIdentity};
+use vala_sql::row_types::forge_tasks::{ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity};
 use wyrd_server::config::ForgeProcessRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, SyncQueryRequest};
@@ -559,20 +560,107 @@ async fn dedicated_roles_terminalize_unschedulable_work() {
         max_large_task_bytes: i64::MAX as u64,
         ..vala_bifrost_redux::forge::ForgeConfig::default()
     };
-    let cluster =
-        WyrdTestCluster::start_with_dedicated_forge_workers_with_config_for_test(large_config)
-            .await
-            .expect("large-lane cluster");
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers_with_config_for_test(
+        large_config.clone(),
+    )
+    .await
+    .expect("large-lane cluster");
     let server = cluster.server(0).expect("scheduler server");
-    let completion = cluster
-        .forge_completion_observer()
-        .expect("large-lane completion observer");
     let scenario = Scenario {
         name: "large-lane",
         pods: 1,
         tenants: 2,
     };
     let tenants = provision_tenants(server, scenario).await;
+    let fixture = seed_forge_group(server, "large_singleton").await;
+    let bootstrap = fixture.context_with_config(vala_bifrost_redux::forge::ForgeConfig::default());
+    ForgeScheduler::new(&bootstrap)
+        .expect("bootstrap scheduler")
+        .record_hint(StagingFileCommitted::new(
+            fixture.binding.clone(),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture day"),
+        ))
+        .await
+        .expect("record bootstrap ingest hint");
+    bootstrap.run_once().await.expect("schedule bootstrap fold");
+    let bootstrap_stop = CancellationToken::new();
+    let bootstrap_worker = ForgeWorker::new(
+        bootstrap,
+        ForgeWorkerConfig {
+            worker_concurrency: 1,
+            ..ForgeWorkerConfig::default()
+        },
+    )
+    .expect("bootstrap worker");
+    let bootstrap_task = tokio::spawn(bootstrap_worker.run(bootstrap_stop.clone()));
+    let mut bootstrap_completed = false;
+    for _ in 0..200 {
+        let completed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='large_singleton' AND strategy='staging_fold' AND state='succeeded')",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(
+            server
+                .state()
+                .postgres
+                .operator_pool()
+                .expect("operator pool")
+                .pool(),
+        )
+        .await
+        .expect("observe bootstrap fold");
+        if completed {
+            bootstrap_completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    bootstrap_stop.cancel();
+    bootstrap_task
+        .await
+        .expect("join bootstrap worker")
+        .expect("stop bootstrap worker");
+    assert!(
+        bootstrap_completed,
+        "bootstrap fold must create one snapshot"
+    );
+    sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second' WHERE singleton")
+        .execute(
+            server
+                .state()
+                .postgres
+                .operator_pool()
+                .expect("operator pool")
+                .pool(),
+        )
+        .await
+        .expect("release bootstrap scheduler lease");
+    assert_eq!(
+        server
+            .forge_publisher()
+            .try_publish(StagingFileCommitted::new(
+                fixture.binding.clone(),
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture day"),
+            )),
+        StagingPublishOutcome::Published,
+        "production scheduler hint channel must accept the maintenance discovery signal"
+    );
+    trigger_supervised_scheduler(server, scenario).await;
+    let (large_lane, estimated_files): (String, i64) =
+        sqlx::query_as("SELECT lane, estimated_files FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='large_singleton' AND strategy='snapshot_expiry' ORDER BY created_at DESC LIMIT 1")
+            .bind(fixture.tenant.as_uuid())
+            .fetch_one(
+                server
+                    .state()
+                    .postgres
+                    .operator_pool()
+                    .expect("operator pool")
+                    .pool(),
+            )
+            .await
+            .expect("observe durable one-input large task");
+    assert_eq!(large_lane, ForgeTaskLane::LargeSingleton.as_str());
+    assert_eq!(estimated_files, 1);
     for cycle in 0..WRITE_CYCLES {
         write_cycle(std::slice::from_ref(server), &tenants, cycle, scenario).await;
         for tenant in &tenants {
@@ -586,10 +674,10 @@ async fn dedicated_roles_terminalize_unschedulable_work() {
         .forge_clock()
         .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
         .expect("age large files");
-    completion.hold_after_claims_for_test(1);
+    trigger_supervised_scheduler(server, scenario).await;
     trigger_supervised_scheduler(server, scenario).await;
     let tasks: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT strategy, lane, state FROM vala.forge_tasks WHERE data_tenant_id = ANY($1) ORDER BY data_tenant_id, strategy",
+        "SELECT strategy, lane, state FROM vala.forge_tasks WHERE data_tenant_id = ANY($1) AND table_name='spans' AND strategy='staging_fold' ORDER BY data_tenant_id, strategy",
     )
     .bind(tenants.iter().map(|tenant| tenant.id.as_uuid()).collect::<Vec<_>>())
     .fetch_all(
@@ -603,94 +691,14 @@ async fn dedicated_roles_terminalize_unschedulable_work() {
     .await
     .expect("large singleton task states");
     assert!(
-        tasks.len() >= tenants.len()
+        !tasks.is_empty()
             && tasks
                 .iter()
                 .all(|(strategy, lane, state)| strategy == "staging_fold"
-                    && lane == "large_singleton"
-                    && (state == "ready" || state == "claimed" || state == "running"))
-            && tasks.iter().any(|(_, _, state)| state == "ready"),
-        "planner must retain a ready multi-input large task while the supervised worker claims one: {tasks:?}"
+                    && lane == "ordinary"
+                    && state == "unschedulable"),
+        "multi-input overflow must be terminally unschedulable even when its bytes fit the large ceiling: {tasks:?}"
     );
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        completion.wait_for_claims_for_test(),
-    )
-    .await
-    .expect("one worker claimed a cluster-exclusive large task");
-    let (active_large, ready_large): (i64, i64) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE lane = 'large_singleton' AND state IN ('claimed', 'running', 'prepared')), count(*) FILTER (WHERE lane = 'large_singleton' AND state = 'ready') FROM vala.forge_tasks WHERE data_tenant_id = ANY($1)",
-    )
-    .bind(tenants.iter().map(|tenant| tenant.id.as_uuid()).collect::<Vec<_>>())
-    .fetch_one(
-        server
-            .state()
-            .postgres
-            .operator_pool()
-            .expect("operator pool")
-            .pool(),
-    )
-    .await
-    .expect("cluster-exclusive large task state");
-    assert_eq!(active_large, 1, "one large task may be active cluster-wide");
-    assert!(
-        ready_large >= 1,
-        "another large task must wait for the cluster lane"
-    );
-    let active_tenant_id: uuid::Uuid = sqlx::query_scalar(
-        "SELECT data_tenant_id FROM vala.forge_tasks WHERE lane = 'large_singleton' AND state IN ('claimed', 'running', 'prepared')",
-    )
-    .fetch_one(
-        server
-            .state()
-            .postgres
-            .operator_pool()
-            .expect("operator pool")
-            .pool(),
-    )
-    .await
-    .expect("active large task tenant");
-    let active_tenant = tenants
-        .iter()
-        .find(|tenant| tenant.id.as_uuid() == active_tenant_id)
-        .expect("active task belongs to a fixture tenant");
-    let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.traces", "spans")
-        .expect("canonical traces task identity");
-    let operator_pool = server
-        .state()
-        .postgres
-        .operator_pool()
-        .expect("operator pool");
-    ForgeTasks::new(operator_pool.clone())
-        .upsert_periodic(active_tenant.id, &identity)
-        .await
-        .expect("enqueue same-table periodic demand");
-    trigger_supervised_scheduler(server, scenario).await;
-    let active_same_table: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND namespace_name = 'vala.traces' AND table_name = 'spans' AND state IN ('claimed', 'running', 'prepared')",
-    )
-    .bind(active_tenant.id.as_uuid())
-    .fetch_one(
-        server
-            .state()
-            .postgres
-            .operator_pool()
-            .expect("operator pool")
-            .pool(),
-    )
-    .await
-    .expect("same-table active publication count");
-    assert_eq!(
-        active_same_table, 1,
-        "same-table planning must not create an overlapping real-worker publication"
-    );
-    completion.release_claims_for_test();
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        completion.wait_for_strategy_at_least(ForgeTaskStrategy::StagingFold, tenants.len()),
-    )
-    .await
-    .expect("supervised workers completed the serialized large tasks");
     cluster.shutdown().await.expect("large cluster shutdown");
 
     let unschedulable_config = vala_bifrost_redux::forge::ForgeConfig {
@@ -722,13 +730,108 @@ async fn dedicated_roles_terminalize_unschedulable_work() {
         .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
         .expect("age unschedulable files");
     trigger_supervised_scheduler(server, scenario).await;
-    let (state, audits): (String, i64) = sqlx::query_as("SELECT state, (SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation='forge.task.unschedulable') FROM vala.forge_tasks WHERE data_tenant_id=$1 AND strategy='staging_fold'").bind(tenants[0].id.as_uuid()).fetch_one(server.state().postgres.operator_pool().expect("operator pool").pool()).await.expect("unschedulable terminal");
+    let mut conn = server
+        .state()
+        .postgres
+        .tenant_conn(tenants[0].id)
+        .await
+        .expect("unschedulable tenant connection");
+    let (state, audits): (String, i64) = sqlx::query_as("SELECT state, (SELECT count(*) FROM vala.audit_outbox WHERE operation='forge.task.unschedulable') FROM vala.forge_tasks WHERE strategy='staging_fold'").fetch_one(&mut **conn.transaction()).await.expect("unschedulable terminal");
+    conn.commit()
+        .await
+        .expect("commit unschedulable observation");
     assert_eq!(state, "unschedulable");
     assert_eq!(audits, 1);
     cluster
         .shutdown()
         .await
         .expect("unschedulable cluster shutdown");
+}
+
+/// Proves `schedule_once` stops before demand effects when exact renewal is lost.
+///
+/// # Panics
+///
+/// Panics when the deterministic renewal boundary is not reached, exact lease
+/// expiry fails, or any enqueue, acknowledgement, cursor, status, or complete
+/// telemetry effect occurs after leadership loss.
+#[tokio::test]
+#[ignore = "gated journey: real scheduler renewal-loss boundary"]
+async fn scheduler_renewal_loss_stops_every_later_effect() {
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers()
+        .await
+        .expect("renewal-loss cluster");
+    let server = cluster.server(0).expect("scheduler server");
+    let scenario = Scenario {
+        name: "renewal-loss",
+        pods: 1,
+        tenants: 1,
+    };
+    let tenants = provision_tenants(server, scenario).await;
+    let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.traces", "spans")
+        .expect("renewal-loss identity");
+    ForgeTasks::new(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .clone(),
+    )
+    .upsert_periodic(tenants[0].id, &identity)
+    .await
+    .expect("renewal-loss demand");
+    let owner = uuid::Uuid::now_v7();
+    let scheduler = ForgeScheduler::with_owner_for_test(
+        server.state().forge().expect("server-owned Forge"),
+        owner,
+    )
+    .expect("renewal-loss scheduler");
+    scheduler.pause_before_demand_renewal_for_test();
+    let stop = CancellationToken::new();
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
+    let (result, evidence) = tokio::join!(scheduler.schedule_once(&stop), async {
+        scheduler.wait_for_demand_renewal_pause_for_test().await;
+        let before: (i64, i64, Option<uuid::Uuid>) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM vala.forge_tasks), (SELECT count(*) FROM vala.forge_planning_demands), last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1",
+            )
+            .bind(owner)
+            .fetch_one(operator_pool.pool())
+            .await
+            .expect("pre-loss scheduler evidence");
+        let expired = sqlx::query(
+                "UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 millisecond' WHERE singleton AND owner=$1",
+            )
+            .bind(owner)
+            .execute(operator_pool.pool())
+            .await
+            .expect("expire exact scheduler owner")
+            .rows_affected();
+        assert_eq!(expired, 1);
+        scheduler.release_demand_renewal_pause_for_test();
+        before
+    });
+    assert!(result.is_err(), "renewal loss must fail schedule_once");
+    let after: (i64, i64, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM vala.forge_tasks), (SELECT count(*) FROM vala.forge_planning_demands), last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+    )
+    .fetch_one(operator_pool.pool())
+    .await
+    .expect("post-loss scheduler evidence");
+    assert_eq!(
+        after, evidence,
+        "loss must suppress every later durable effect"
+    );
+    assert_eq!(
+        scheduler.complete_publications_for_test(),
+        0,
+        "loss must suppress complete status and telemetry publication"
+    );
+    cluster.shutdown().await.expect("renewal-loss shutdown");
 }
 
 /// Drive independent tenant tasks through one supervised production role topology.
@@ -791,7 +894,7 @@ async fn run_supervised_role_fixture(
         usize::try_from(queued).expect("nonnegative queued count") >= worker_count,
         "{name} constrained tenant must remain inside the measured eligible set"
     );
-    assert_scheduler_takeover_preserves_fairness_bound(server, scenario).await;
+    assert_scheduler_takeover_preserves_fairness_bound(server, &tenants, scenario).await;
     tokio::time::timeout(
         Duration::from_secs(10),
         completion.wait_for_claims_for_test(),
@@ -955,10 +1058,53 @@ async fn assert_claim_barrier_shape(server: &WyrdTestServer, expected: usize, sc
 /// the durable scheduler fence/cursor no longer describes a bounded tenant ring.
 async fn assert_scheduler_takeover_preserves_fairness_bound(
     server: &WyrdTestServer,
+    tenants: &[TenantWriter],
     scenario: Scenario,
 ) {
-    let first_owner: uuid::Uuid = sqlx::query_scalar(
-        "SELECT owner FROM vala.forge_scheduler_state WHERE singleton AND owner IS NOT NULL",
+    let tasks = ForgeTasks::new(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .clone(),
+    );
+    let table = ForgeTaskTableIdentity::new("wyrd-redux", "vala.traces", "spans")
+        .expect("fairness table identity");
+    for tenant in tenants {
+        tasks
+            .upsert_periodic(tenant.id, &table)
+            .await
+            .expect("seed eligible fairness demand");
+    }
+    let eligible_tenants: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT data_tenant_id) FROM vala.forge_planning_demands",
+    )
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("measure exact eligible tenant count");
+    let fairness_bound = usize::try_from(eligible_tenants).expect("nonnegative eligible tenants");
+    assert_eq!(
+        fairness_bound,
+        tenants.len(),
+        "{} exact fairness bound must include every role-fixture tenant",
+        scenario.name
+    );
+    let hot_tenant = tenants[0].id;
+    let constrained_tenant = tenants[tenants.len() - 1].id;
+    let (first_owner, first_fence, cursor_before_takeover): (
+        uuid::Uuid,
+        i64,
+        Option<uuid::Uuid>,
+    ) = sqlx::query_as(
+        "SELECT owner, fencing_token, last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner IS NOT NULL",
     )
     .fetch_one(
         server
@@ -988,7 +1134,50 @@ async fn assert_scheduler_takeover_preserves_fairness_bound(
         expired, first_owner,
         "only the first scheduler lease may expire"
     );
-    trigger_supervised_scheduler(server, scenario).await;
+    let mut selections = Vec::with_capacity(fairness_bound);
+    let mut constrained_considered = false;
+    for _ in 0..fairness_bound {
+        trigger_supervised_scheduler(server, scenario).await;
+        let selected: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+        )
+        .fetch_one(
+            server
+                .state()
+                .postgres
+                .operator_pool()
+                .expect("operator pool")
+                .pool(),
+        )
+        .await
+        .expect("observe production scheduler cursor");
+        let selected = selected.expect("complete scheduler pass advances cursor");
+        selections.push(selected);
+        constrained_considered = !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4)",
+        )
+        .bind(constrained_tenant.as_uuid())
+        .bind(&table.catalog)
+        .bind(&table.namespace)
+        .bind(&table.table)
+        .fetch_one(
+            server
+                .state()
+                .postgres
+                .operator_pool()
+                .expect("operator pool")
+                .pool(),
+        )
+        .await
+        .expect("observe constrained demand acknowledgement");
+        tasks
+            .upsert_periodic(hot_tenant, &table)
+            .await
+            .expect("keep hot tenant eligible");
+        if constrained_considered {
+            break;
+        }
+    }
     let (fencing_token, cursor): (i64, Option<uuid::Uuid>) = sqlx::query_as(
         "SELECT fencing_token, last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
     )
@@ -1002,14 +1191,63 @@ async fn assert_scheduler_takeover_preserves_fairness_bound(
     )
     .await
     .expect("takeover scheduler state");
-    assert!(
-        fencing_token >= 2,
-        "{} scheduler takeover did not fence",
+    assert_eq!(
+        fencing_token,
+        first_fence + 1,
+        "{} takeover must mint exactly one successor generation",
         scenario.name
     );
     assert!(
         cursor.is_some(),
         "{} scheduler takeover lost fair cursor",
+        scenario.name
+    );
+    assert!(
+        constrained_considered,
+        "{} constrained tenant was not considered within exact N={fairness_bound} passes: {selections:?}",
+        scenario.name
+    );
+    assert!(
+        cursor_before_takeover.is_some(),
+        "{} takeover fixture must begin from a continued cursor",
+        scenario.name
+    );
+    let prior_cursor = cursor_before_takeover.expect("continued cursor checked above");
+    let mut eligible = tenants
+        .iter()
+        .map(|tenant| tenant.id.as_uuid())
+        .collect::<Vec<_>>();
+    eligible.sort_unstable();
+    let expected_final = eligible
+        .iter()
+        .copied()
+        .filter(|tenant| *tenant <= prior_cursor)
+        .next_back()
+        .or_else(|| eligible.last().copied())
+        .expect("non-empty eligible ring");
+    assert_eq!(
+        cursor,
+        Some(expected_final),
+        "{} takeover must retain the prior cursor and continue strict-after through the exact ring",
+        scenario.name
+    );
+    let hot_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1)",
+    )
+    .bind(hot_tenant.as_uuid())
+    .fetch_one(
+        server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool")
+            .pool(),
+    )
+    .await
+    .expect("observe hot tenant eligibility");
+    assert!(
+        hot_pending,
+        "{} hot tenant stopped being eligible",
         scenario.name
     );
 }

@@ -6,6 +6,8 @@
 
 // raw-query grep allowlist: Forge task tables post-date the sqlx offline cache and remain confined to OperatorPool/TenantConn.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::{AssertSqlSafe, types::Uuid};
 use wyrd_spec::DataTenantId;
@@ -114,7 +116,8 @@ impl ForgeTasks {
     /// Lists a bounded tenant-ring page and returns each observed CAS generation.
     ///
     /// # Errors
-    /// Returns conflict for a zero bound and fails closed on malformed rows.
+    /// Returns conflict for a zero bound or stale exact scheduler fence and
+    /// fails closed on malformed rows.
     ///
     /// # Cancellation
     /// This read has no durable partial progress.
@@ -131,6 +134,13 @@ impl ForgeTasks {
         }
         let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation FROM ranked d CROSS JOIN scheduler s WHERE d.tenant_rank=1 ORDER BY (s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
             .bind(owner).bind(scheduler_fence).bind(i64::from(cap) + 1).fetch_all(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp())")
+            .bind(owner).bind(scheduler_fence).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        if !live {
+            return Err(SqlError::Conflict {
+                detail: "Forge scheduler fence is stale".to_owned(),
+            });
+        }
         let overflowed = rows.len() > cap as usize;
         let demands = rows
             .into_iter()
@@ -279,6 +289,40 @@ impl ForgeTasks {
             });
         }
         sqlx::query_scalar("UPDATE vala.forge_scheduler_state SET owner=$1,fencing_token=fencing_token+1,expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() WHERE singleton AND (expires_at IS NULL OR expires_at<statement_timestamp() OR owner=$1) RETURNING fencing_token").bind(owner).bind(i64::from(lease_seconds)).fetch_optional(self.operator_pool.pool()).await.map_err(SqlError::from)
+    }
+
+    /// Renews one live exact scheduler owner and token without changing its generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns conflict for a zero or unrepresentable lease and when the exact
+    /// owner/token is expired or replaced, plus SQL errors from the update.
+    ///
+    /// # Cancellation
+    ///
+    /// The single update either extends the exact generation or has no effect.
+    pub async fn renew_scheduler(
+        &self,
+        owner: Uuid,
+        scheduler_fence: i64,
+        lease: Duration,
+    ) -> Result<(), SqlError> {
+        let lease_millis = i64::try_from(lease.as_millis()).map_err(|_| SqlError::Conflict {
+            detail: "scheduler lease exceeds PostgreSQL millisecond range".to_owned(),
+        })?;
+        if lease_millis == 0 {
+            return Err(SqlError::Conflict {
+                detail: "scheduler lease must be positive".to_owned(),
+            });
+        }
+        let changed = sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()+($3*interval '1 millisecond'),updated_at=statement_timestamp() WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()")
+            .bind(owner).bind(scheduler_fence).bind(lease_millis).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        if changed != 1 {
+            return Err(SqlError::Conflict {
+                detail: "Forge scheduler fence is stale".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Idempotently enqueues a validated plan and returns its stable task ID.

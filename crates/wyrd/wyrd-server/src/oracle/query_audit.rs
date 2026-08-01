@@ -186,6 +186,7 @@ mod tests {
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::logical_expr::LogicalPlanBuilder;
     use vala_bifrost_redux::cluster::ClusterRegistry;
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::oracle::{
         Oracle, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
         QueryOptions, TailTransportDirectory,
@@ -225,15 +226,12 @@ mod tests {
         }
     }
 
-    /// Builds one internally authenticated query context for audit fault tests.
+    /// Builds one internally authenticated query context for the supplied tenant.
     ///
     /// # Panics
     ///
-    /// Panics if the static principal and tenant unexpectedly diverge.
-    fn context() -> AuthorizedQueryContext {
-        let tenant = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
-            .parse()
-            .expect("static tenant");
+    /// Panics if the principal and tenant cannot form a valid query context.
+    fn context_for(tenant: wyrd_spec::DataTenantId) -> AuthorizedQueryContext {
         let principal = Principal::new(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
@@ -250,6 +248,20 @@ mod tests {
             Permission::bifrost_query_read().to_string(),
         )
         .expect("matching tenant context")
+    }
+
+    /// Builds one internally authenticated query context for unit-only audit tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the static tenant literal cannot be parsed or cannot form a
+    /// valid authenticated context.
+    fn context() -> AuthorizedQueryContext {
+        context_for(
+            "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
+                .parse()
+                .expect("static tenant"),
+        )
     }
 
     /// Builds a bounded structured detail for transaction fault tests.
@@ -300,7 +312,7 @@ mod tests {
         let oracle = Oracle::new(OracleBuildConfig {
             catalog: crate::test_support::test_redux_catalog().await,
             admission_leases: OracleAdmissionLeases::new(vala.clone()),
-            operator_pool: vala_sql::OperatorPool::from(vala.pool().clone()),
+            operator_pool: crate::test_support::test_operator_pool().await,
             vala,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
@@ -327,13 +339,11 @@ mod tests {
             },
         })
         .expect("Oracle");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !oracle.is_ready() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("Oracle startup reconciliation");
+        oracle
+            .await_startup()
+            .await
+            .expect("Oracle startup reconciliation");
+        assert!(oracle.is_ready(), "Oracle must be ready after startup");
         (oracle, cluster, role)
     }
 
@@ -363,17 +373,32 @@ mod tests {
         wyrd_runtime::runtime().block_on(async {
             for failure in [OracleAuditStoreError::Append, OracleAuditStoreError::Commit] {
                 let (oracle, cluster, role) = oracle_with_failure(failure).await;
+                let tenant = crate::test_support::test_tenant().await;
+                let table = vala_bifrost_redux::catalog::TableRef::new(
+                    BifrostNamespace::Datasets,
+                    "oracle_audit_fixture",
+                );
+                crate::test_support::test_redux_catalog()
+                    .await
+                    .register_dataset(
+                        tenant,
+                        table.clone(),
+                        vec![Field::new("value", DataType::Int64, false)],
+                        None,
+                    )
+                    .await
+                    .expect("register audit fixture");
                 let source =
                     provider_as_source(Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
                         Field::new("value", DataType::Int64, false),
                     ])))));
-                let plan = LogicalPlanBuilder::scan("fixture", source, None)
+                let plan = LogicalPlanBuilder::scan(table.fqn(), source, None)
                     .expect("fixture scan")
                     .build()
                     .expect("bound empty read plan");
                 let result = oracle
                     .query_plan(
-                        context(),
+                        context_for(tenant),
                         plan,
                         QueryOptions {
                             visibility: VisibilityMode::PublishedOnly,

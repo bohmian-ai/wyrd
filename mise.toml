@@ -52,7 +52,12 @@ run = "cargo build --workspace --all-features --all-targets"
 
 [tasks."test:wyrd"]
 hide = true
-description = "Run wyrd family tests (unit tests only — pg_tests skipped without docker); package list in scripts/test-families.sh"
+description = "Run wyrd family tests inside an isolated Postgres lifecycle; package list in scripts/test-families.sh"
+run = "scripts/postgres/with-test-postgres.sh -- mise run test:wyrd:inner"
+
+[tasks."test:wyrd:inner"]
+hide = true
+description = "Run wyrd family tests with the lifecycle already provisioned; package list in scripts/test-families.sh"
 run = "bash scripts/run-family-tests.sh wyrd"
 
 [tasks."test:skald"]
@@ -1408,5 +1413,5 @@ run = "bash scripts/postgres/test-roles.sh"
 
 [tasks."test:postgres:inventory"]
 hide = true
-description = "Validate the TOML-aware database task lifecycle inventory"
-run = "python3 scripts/postgres/check-inventory.py"
+description = "Validate the TOML-aware database task lifecycle inventory and regression fixture"
+run = "python3 scripts/postgres/check-inventory.py && python3 scripts/postgres/check-inventory.py --negative-test"

@@ -413,6 +413,8 @@ struct ProcessTelemetry {
 
 /// One telemetry installation per test process.
 static PROCESS_TELEMETRY: OnceLock<ProcessTelemetry> = OnceLock::new();
+/// Serializes the check-and-install window for process telemetry.
+static PROCESS_TELEMETRY_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Install or borrow the process production telemetry stack.
 ///
@@ -421,6 +423,12 @@ static PROCESS_TELEMETRY: OnceLock<ProcessTelemetry> = OnceLock::new();
 /// Returns [`ClusterError::Telemetry`] if either process-global recorder or
 /// subscriber was installed by an unrelated owner first.
 fn process_telemetry() -> Result<&'static ProcessTelemetry, ClusterError> {
+    if let Some(telemetry) = PROCESS_TELEMETRY.get() {
+        return Ok(telemetry);
+    }
+    let _init_guard = PROCESS_TELEMETRY_INIT
+        .lock()
+        .map_err(|_| ClusterError::Telemetry("process telemetry lock poisoned".to_owned()))?;
     if let Some(telemetry) = PROCESS_TELEMETRY.get() {
         return Ok(telemetry);
     }

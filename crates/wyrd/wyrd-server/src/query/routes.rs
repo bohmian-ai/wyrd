@@ -206,10 +206,11 @@ mod tests {
             }),
         ];
         let frames = futures_util::stream::iter(expected.clone().into_iter().map(Ok));
-        let response = query_stream_response(OracleQueryStream {
-            schema_fingerprint: "abcd".to_owned(),
-            frames: Box::pin(frames),
-        });
+        let response = query_stream_response(OracleQueryStream::test_new(
+            "abcd".to_owned(),
+            Box::pin(frames),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE),
             Some(
@@ -283,12 +284,13 @@ mod tests {
                 error: None,
             }),
         ];
-        let bytes = query_stream_response(OracleQueryStream {
-            schema_fingerprint: "abcd".to_owned(),
-            frames: Box::pin(futures_util::stream::iter(
+        let bytes = query_stream_response(OracleQueryStream::test_new(
+            "abcd".to_owned(),
+            Box::pin(futures_util::stream::iter(
                 expected.clone().into_iter().map(Ok),
             )),
-        })
+            tokio_util::sync::CancellationToken::new(),
+        ))
         .into_body()
         .collect()
         .await
@@ -362,10 +364,11 @@ mod tests {
             })),
             Ok(terminal.clone()),
         ]);
-        let bytes = query_stream_response(OracleQueryStream {
-            schema_fingerprint: "abcd".to_owned(),
-            frames: Box::pin(frames),
-        })
+        let bytes = query_stream_response(OracleQueryStream::test_new(
+            "abcd".to_owned(),
+            Box::pin(frames),
+            tokio_util::sync::CancellationToken::new(),
+        ))
         .into_body()
         .collect()
         .await
@@ -404,10 +407,11 @@ mod tests {
             }));
             std::future::pending::<()>().await;
         };
-        let response = query_stream_response(OracleQueryStream {
-            schema_fingerprint: "abcd".to_owned(),
-            frames: Box::pin(frames),
-        });
+        let response = query_stream_response(OracleQueryStream::test_new(
+            "abcd".to_owned(),
+            Box::pin(frames),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         let mut body = response.into_body();
         let _first = body.frame().await.expect("first body frame");
         drop(body);

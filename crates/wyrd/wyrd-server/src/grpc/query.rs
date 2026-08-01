@@ -176,10 +176,11 @@ mod tests {
 
     /// Wraps logical frames in the retained Oracle stream contract.
     fn oracle_stream(frames: Vec<QueryStreamFrame>) -> OracleQueryStream {
-        OracleQueryStream {
-            schema_fingerprint: "abcd".to_owned(),
-            frames: Box::pin(futures_util::stream::iter(frames.into_iter().map(Ok))),
-        }
+        OracleQueryStream::test_new(
+            "abcd".to_owned(),
+            Box::pin(futures_util::stream::iter(frames.into_iter().map(Ok))),
+            tokio_util::sync::CancellationToken::new(),
+        )
     }
 
     /// Collects the protobuf frames emitted by the HTTP adapter.
@@ -340,10 +341,11 @@ mod tests {
             yield Ok(schema_frame());
             std::future::pending::<()>().await;
         };
-        let mut stream = query_stream_response(OracleQueryStream {
-            schema_fingerprint: "abcd".to_owned(),
-            frames: Box::pin(frames),
-        })
+        let mut stream = query_stream_response(OracleQueryStream::test_new(
+            "abcd".to_owned(),
+            Box::pin(frames),
+            tokio_util::sync::CancellationToken::new(),
+        ))
         .into_inner();
         let _first = stream.next().await.expect("schema frame");
         drop(stream);

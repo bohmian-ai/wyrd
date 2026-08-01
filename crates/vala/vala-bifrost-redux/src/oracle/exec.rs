@@ -1622,7 +1622,42 @@ impl SourceTier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oracle::{BifrostQueryReadDecision, OracleSlotManager};
     use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, Int32Array, Int64Array, StringArray};
+    use async_trait::async_trait;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::physical_plan::union::UnionExec;
+    use wyrd_runtime::Principal;
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::AuthMethod;
+
+    /// In-memory audit sink used only to inspect physical plan structure.
+    struct NoopAudit;
+
+    #[async_trait]
+    impl OracleAudit for NoopAudit {
+        /// Accepts a read-decision event without persisting it in this plan test.
+        async fn append_read_decision(
+            &self,
+            _context: &AuthorizedQueryContext,
+            _decision: BifrostQueryReadDecision,
+        ) -> Result<(), BifrostError> {
+            Ok(())
+        }
+
+        /// Accepts a security-violation event without persisting it in this plan test.
+        async fn append_security_violation(
+            &self,
+            _context: VerifiedSecurityContext,
+            _violation: BifrostSecurityViolation,
+        ) -> Result<(), BifrostError> {
+            Ok(())
+        }
+    }
 
     /// Builds one source-tagged physical row for exact reconciliation tests.
     fn tagged_batch(batch_id: [u8; 16], ordinal: i32, value: i64, tier: SourceTier) -> RecordBatch {
@@ -1721,6 +1756,74 @@ mod tests {
                 Some(position)
             );
         }
+    }
+
+    /// Keeps tenant tripwire and reconciliation below a global sort operator.
+    #[test]
+    fn source_invariants_remain_below_global_operator() {
+        let batch = tagged_batch([7_u8; 16], 0, 41, SourceTier::Iceberg);
+        let source: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&vec![batch]),
+            tagged_batch([0_u8; 16], 0, 0, SourceTier::Iceberg).schema(),
+            None,
+        )
+        .expect("source batch schema");
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_runtime::PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::default(),
+        };
+        let context = AuthorizedQueryContext::try_new(
+            principal,
+            tenant,
+            RequestId::now_v7(),
+            None,
+            AuthMethod::Internal,
+            "bifrost_query:read",
+        )
+        .expect("query context");
+        let source_union =
+            UnionExec::try_new(vec![Arc::clone(&source), source]).expect("source union");
+        let tripwire = Arc::new(
+            TenantTripwireExec::new(
+                source_union,
+                context,
+                "vala.traces.spans".to_owned(),
+                Arc::new(NoopAudit),
+            )
+            .expect("tripwire plan"),
+        );
+        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let memory = OracleMemoryResources {
+            governor: crate::scribe::memory::BifrostMemoryGovernor::new(512 * 1024 * 1024)
+                .expect("memory governor"),
+            reconciliation_limit_bytes: 1024 * 1024,
+        };
+        let reconciled = Arc::new(
+            ReconcileExec::new_with_telemetry(tripwire, memory, telemetry, QueryClass::Interactive)
+                .expect("reconcile plan"),
+        );
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("value", 3)),
+            arrow::compute::SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )])
+        .expect("sort ordering");
+        let global = SortExec::new(ordering, reconciled.clone());
+        assert_eq!(global.children()[0].name(), "ReconcileExec");
+        assert_eq!(
+            global.children()[0].children()[0].name(),
+            "TenantTripwireExec"
+        );
+        assert_eq!(
+            global.children()[0].children()[0].children()[0].name(),
+            "UnionExec"
+        );
     }
 
     /// Reconciliation spills at its query ceiling and still yields exact rows.

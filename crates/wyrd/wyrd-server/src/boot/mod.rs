@@ -812,12 +812,26 @@ struct OracleRoleBuilder<'a> {
 }
 
 impl<'a> OracleRoleBuilder<'a> {
-    /// Builds, reconciles, activates, and publishes one Oracle role.
+    /// Constructs one fenced Oracle role without starting or publishing it.
+    async fn build(self) -> Result<AppState, ServerBootError> {
+        if !self
+            .config
+            .bifrost
+            .roles
+            .contains(&BifrostRuntimeRole::Oracle)
+        {
+            return Ok(self.state);
+        }
+        let built = self.construct().await?;
+        built.start_reconcile_activate_publish().await
+    }
+
+    /// Constructs one Oracle role and retains its reserved fence.
     ///
     /// # Errors
-    /// Returns [`ServerBootError::OraclePeer`] when any security, dependency,
-    /// durable-role, reconciliation, activation, or publication stage fails.
-    async fn build(self) -> Result<AppState, ServerBootError> {
+    /// Returns [`ServerBootError::OraclePeer`] when security, dependency, or
+    /// durable-role construction fails.
+    async fn construct(self) -> Result<BuiltOracleRole, ServerBootError> {
         let Self {
             state,
             config,
@@ -828,9 +842,6 @@ impl<'a> OracleRoleBuilder<'a> {
             #[cfg(feature = "test-support")]
                 peer_credentials: injected_peer_credentials,
         } = self;
-        if !config.bifrost.roles.contains(&BifrostRuntimeRole::Oracle) {
-            return Ok(state);
-        }
         let security_audit = Arc::new(
             PostgresPeerSecurityAudit::try_new(&state.postgres)
                 .await
@@ -998,6 +1009,44 @@ impl<'a> OracleRoleBuilder<'a> {
                 return Err(ServerBootError::OraclePeer(error.to_string()));
             }
         };
+        Ok(BuiltOracleRole {
+            state,
+            oracle,
+            role,
+            peer,
+            cluster,
+        })
+    }
+}
+
+/// Fully constructed Oracle role waiting for lifecycle publication.
+struct BuiltOracleRole {
+    /// Server state retained until the query runtime is published.
+    state: AppState,
+    /// Oracle engine awaiting startup reconciliation.
+    oracle: Arc<Oracle>,
+    /// Reserved cluster role fence.
+    role: RegisteredRole,
+    /// Peer runtime attached after role activation.
+    peer: Arc<OraclePeerRuntime>,
+    /// Cluster owner used for activation and snapshot publication.
+    cluster: Arc<ClusterRegistry>,
+}
+
+impl BuiltOracleRole {
+    /// Starts reconciliation, activates the role, and publishes query access.
+    ///
+    /// # Errors
+    /// Returns [`ServerBootError::OraclePeer`] when startup reconciliation,
+    /// activation, snapshot refresh, or readiness publication fails.
+    async fn start_reconcile_activate_publish(self) -> Result<AppState, ServerBootError> {
+        let Self {
+            state,
+            oracle,
+            role,
+            peer,
+            cluster,
+        } = self;
         match tokio::time::timeout(ORACLE_STARTUP_TIMEOUT, oracle.await_startup()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {

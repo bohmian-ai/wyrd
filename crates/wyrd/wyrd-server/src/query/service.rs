@@ -170,7 +170,14 @@ async fn collect_bounded(
     let mut schema_seen = false;
     let mut terminal_seen = false;
     while let Some(frame) = stream.frames.next().await {
-        match frame.map_err(WyrdError::from)? {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                stream.cancel().await;
+                return Err(WyrdError::from(error));
+            }
+        };
+        match frame {
             QueryStreamFrame::Schema(_) if !schema_seen && batches.is_empty() => {
                 schema_seen = true;
             }
@@ -178,25 +185,45 @@ async fn collect_bounded(
                 if rows >= row_ceiling {
                     continue;
                 }
-                encoded_bytes = encoded_bytes
-                    .checked_add(batch.arrow_ipc_batch.len())
-                    .ok_or_else(floor::result_too_large)?;
+                encoded_bytes = match encoded_bytes.checked_add(batch.arrow_ipc_batch.len()) {
+                    Some(bytes) => bytes,
+                    None => {
+                        stream.cancel().await;
+                        return Err(floor::result_too_large());
+                    }
+                };
                 if encoded_bytes > floor::MAX_SYNC_RESULT_BYTES {
+                    stream.cancel().await;
                     return Err(floor::result_too_large());
                 }
-                let reader = StreamReader::try_new(Cursor::new(batch.arrow_ipc_batch), None)
-                    .map_err(|error| WyrdError::Internal {
-                        message: "failed to decode Oracle Arrow batch".to_owned(),
-                        details: serde_json::json!({ "detail": error.to_string() }),
-                    })?;
+                let reader = match StreamReader::try_new(Cursor::new(batch.arrow_ipc_batch), None) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        stream.cancel().await;
+                        return Err(WyrdError::Internal {
+                            message: "failed to decode Oracle Arrow batch".to_owned(),
+                            details: serde_json::json!({ "detail": error.to_string() }),
+                        });
+                    }
+                };
                 for decoded in reader {
-                    let decoded = decoded.map_err(|error| WyrdError::Internal {
-                        message: "failed to decode Oracle Arrow batch".to_owned(),
-                        details: serde_json::json!({ "detail": error.to_string() }),
-                    })?;
-                    rows = rows
-                        .checked_add(decoded.num_rows())
-                        .ok_or_else(floor::result_too_large)?;
+                    let decoded = match decoded {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            stream.cancel().await;
+                            return Err(WyrdError::Internal {
+                                message: "failed to decode Oracle Arrow batch".to_owned(),
+                                details: serde_json::json!({ "detail": error.to_string() }),
+                            });
+                        }
+                    };
+                    rows = match rows.checked_add(decoded.num_rows()) {
+                        Some(rows) => rows,
+                        None => {
+                            stream.cancel().await;
+                            return Err(floor::result_too_large());
+                        }
+                    };
                     batches.push(decoded);
                     if rows >= row_ceiling {
                         break;
@@ -206,10 +233,15 @@ async fn collect_bounded(
             QueryStreamFrame::Terminal(terminal) if schema_seen && !terminal_seen => {
                 terminal_seen = true;
                 if terminal.outcome == QueryTerminalOutcome::Failed {
-                    return Err(wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into());
+                    let error = terminal.error.as_ref().map_or(
+                        wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+                        |error| terminal_error_to_bifrost(error.code),
+                    );
+                    return Err(error.into());
                 }
             }
             _ => {
+                stream.cancel().await;
                 return Err(wyrd_spec::vala::error::BifrostError::QueryStreamProtocol.into());
             }
         }
@@ -218,11 +250,40 @@ async fn collect_bounded(
         }
     }
     if !terminal_seen {
+        stream.cancel().await;
         return Err(wyrd_spec::vala::error::BifrostError::QueryStreamIncomplete.into());
     }
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let has_more = rows > limit;
     Ok((truncate_batches(batches, limit), has_more))
+}
+
+/// Preserves the stable terminal error catalog across typed query adapters.
+fn terminal_error_to_bifrost(
+    code: wyrd_spec::vala::api::QueryTerminalErrorCode,
+) -> wyrd_spec::vala::error::BifrostError {
+    use wyrd_spec::vala::api::QueryTerminalErrorCode;
+    use wyrd_spec::vala::error::BifrostError;
+
+    match code {
+        QueryTerminalErrorCode::QueryTimeout => BifrostError::QueryTimeout,
+        QueryTerminalErrorCode::QueryVisibilityUnavailable => {
+            BifrostError::QueryVisibilityUnavailable
+        }
+        QueryTerminalErrorCode::QueryTenantInvariant => BifrostError::QueryTenantInvariant,
+        QueryTerminalErrorCode::QueryReconciliationInvariant => {
+            BifrostError::QueryReconciliationInvariant
+        }
+        QueryTerminalErrorCode::QueryPeerSecurity => BifrostError::QueryPeerSecurity,
+        QueryTerminalErrorCode::QueryAuditUnavailable => BifrostError::QueryAuditUnavailable,
+        QueryTerminalErrorCode::CatalogUnreachable => BifrostError::CatalogUnreachable {
+            detail: "Oracle typed query catalog unavailable".to_owned(),
+        },
+        QueryTerminalErrorCode::StorageUnreachable => BifrostError::StorageUnreachable {
+            detail: "Oracle typed query storage unavailable".to_owned(),
+        },
+        QueryTerminalErrorCode::QueryExecutionFailed => BifrostError::QueryExecutionFailed,
+    }
 }
 
 /// Truncates already bounded batches without copying their Arrow buffers.
@@ -248,13 +309,39 @@ fn truncate_batches(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch>
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::{Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
+    use wyrd_spec::vala::api::{
+        FreshnessPolicy, QueryBatchFrame, QuerySchemaFrame, QueryStreamFrame, VisibilityMode,
+    };
 
     use super::*;
+
+    /// Synthetic owner probe for admission release and fenced-tail cleanup.
+    #[derive(Default)]
+    struct CollectorOwnerProbe {
+        /// Number of local slots retained by the owner.
+        slots_in_use: AtomicUsize,
+        /// Whether durable release completed before collection returned.
+        release_complete: AtomicBool,
+        /// Whether fenced tail state completed release.
+        fence_released: AtomicBool,
+    }
+
+    impl CollectorOwnerProbe {
+        /// Releases local slots and marks durable/fenced cleanup complete.
+        async fn release(&self) {
+            tokio::task::yield_now().await;
+            self.slots_in_use.store(0, Ordering::Release);
+            self.fence_released.store(true, Ordering::Release);
+            self.release_complete.store(true, Ordering::Release);
+        }
+    }
 
     /// Builds one caller with the requested effective permissions.
     ///
@@ -373,5 +460,78 @@ mod tests {
                 "removed async query-job owner returned: {relative}"
             );
         }
+    }
+
+    /// Proves every pre-terminal collector failure actively cancels its stream.
+    #[test]
+    fn collector_failures_cancel_stream_cleanup() {
+        wyrd_runtime::runtime().block_on(async {
+            let cases = [
+                (
+                    "oversized",
+                    vec![
+                        Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                            schema_fingerprint: "test".to_owned(),
+                            arrow_ipc_schema: Vec::new(),
+                        })),
+                        Ok(QueryStreamFrame::Batch(QueryBatchFrame {
+                            arrow_ipc_batch: vec![0; floor::MAX_SYNC_RESULT_BYTES + 1],
+                        })),
+                    ],
+                ),
+                (
+                    "malformed",
+                    vec![
+                        Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                            schema_fingerprint: "test".to_owned(),
+                            arrow_ipc_schema: Vec::new(),
+                        })),
+                        Ok(QueryStreamFrame::Batch(QueryBatchFrame {
+                            arrow_ipc_batch: vec![1, 2, 3],
+                        })),
+                    ],
+                ),
+                (
+                    "protocol",
+                    vec![Ok(QueryStreamFrame::Batch(QueryBatchFrame {
+                        arrow_ipc_batch: vec![1],
+                    }))],
+                ),
+                (
+                    "incomplete",
+                    vec![Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                        schema_fingerprint: "test".to_owned(),
+                        arrow_ipc_schema: Vec::new(),
+                    }))],
+                ),
+            ];
+            for (name, frames) in cases {
+                let cancellation = CancellationToken::new();
+                let owner = Arc::new(CollectorOwnerProbe {
+                    slots_in_use: AtomicUsize::new(1),
+                    ..CollectorOwnerProbe::default()
+                });
+                let owner_for_stream = Arc::clone(&owner);
+                let frames = async_stream::stream! {
+                    for frame in frames {
+                        yield frame;
+                    }
+                    owner_for_stream.release().await;
+                };
+                let stream = OracleQueryStream::test_new(
+                    "test".to_owned(),
+                    Box::pin(frames),
+                    cancellation.clone(),
+                );
+                assert!(
+                    collect_bounded(stream, 100).await.is_err(),
+                    "{name} must fail"
+                );
+                assert!(cancellation.is_cancelled(), "{name} must cancel cleanup");
+                assert_eq!(owner.slots_in_use.load(Ordering::Acquire), 0);
+                assert!(owner.release_complete.load(Ordering::Acquire));
+                assert!(owner.fence_released.load(Ordering::Acquire));
+            }
+        });
     }
 }

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Int32Array, Int64Array,
+    StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
@@ -34,6 +34,13 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
+use wyrd_tonic::otlp::trace::v1::{
+    ResourceSpans, ScopeSpans, Span as OtlpSpan, Status as OtlpStatus, span, status::StatusCode,
+};
+use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
 use wyrd_tonic::tonic::Request;
 use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
 use wyrd_tonic::wyrd::v1::{QueryTracesRequest, QueryWindow};
@@ -433,38 +440,325 @@ async fn typed_vala_route_uses_oracle_cut() {
         .expose()
         .to_owned();
     let channel = connection.channel();
+    let trace = typed_route_trace();
+    let mut otlp = TraceServiceClient::new(channel.clone());
+    otlp.export(with_access_token(Request::new(trace.clone()), &token))
+        .await
+        .expect("sealed typed-route trace export");
+    server.flush_bifrost().await.expect("flush sealed trace");
+    otlp.export(with_access_token(Request::new(trace), &token))
+        .await
+        .expect("hot typed-route trace export");
     let mut typed = ValaQueryServiceClient::new(channel);
     let response = typed
-        .query_traces({
-            let mut request = Request::new(QueryTracesRequest {
+        .query_traces(with_access_token(
+            Request::new(QueryTracesRequest {
                 window: Some(QueryWindow {
                     since: String::new(),
                     until: String::new(),
                     limit: 100,
                     page_token: String::new(),
                 }),
-                service: String::new(),
+                service: "typed-route".to_owned(),
                 min_duration_ms: 0,
                 status: String::new(),
-                name: String::new(),
-            });
-            request.metadata_mut().insert(
-                "authorization",
-                format!("Bearer {token}").parse().expect("token"),
-            );
-            request
-        })
+                name: "typed-cut-span".to_owned(),
+            }),
+            &token,
+        ))
         .await
         .expect("typed Vala route succeeds");
-    assert!(response.into_inner().rows.is_empty());
+    let typed_row = response
+        .into_inner()
+        .rows
+        .into_iter()
+        .next()
+        .expect("typed route returns one trace summary");
+    assert_eq!(typed_row.trace_id, "11".repeat(16));
+    assert_eq!(typed_row.root_name, "typed-cut-span");
+    assert_eq!(typed_row.service, "typed-route");
+    assert_eq!(typed_row.span_count, 1);
+    assert!(!typed_row.error);
+    let owner = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("typed-route owner pool");
+    let audit_baseline: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.security_violation'",
+    )
+    .bind(cluster.data_tenant_id().as_uuid())
+    .fetch_one(&owner)
+    .await
+    .expect("typed audit baseline");
+    let sql_identity = query_trace_identity_value(&reader)
+        .await
+        .expect("SQL Oracle identity/value query succeeds");
+    assert_eq!(
+        sql_identity,
+        vec![(
+            "11".repeat(16),
+            "22".repeat(8),
+            "typed-cut-span".to_owned(),
+            "typed-route".to_owned(),
+        )]
+    );
     let (rows, outcome, error) =
-        query_statement(&reader, "SELECT * FROM vala.traces.spans".to_owned())
+        query_statement(
+            &reader,
+            "SELECT * FROM vala.traces.spans WHERE service_name = 'typed-route' AND name = 'typed-cut-span'"
+                .to_owned(),
+        )
             .await
             .expect("SQL Oracle cut succeeds");
-    assert_eq!(rows, 0);
+    assert_eq!(rows, 1);
     assert_eq!(outcome, QueryTerminalOutcome::Success);
     assert!(error.is_none());
+
+    let foreign_tenant = cluster
+        .add_tenant("typed-route-foreign")
+        .await
+        .expect("foreign tenant");
+    seed_foreign_trace_row(&cluster, cluster.data_tenant_id(), foreign_tenant)
+        .await
+        .expect("foreign trace fixture");
+    let typed_error = typed
+        .query_traces(with_access_token(
+            Request::new(QueryTracesRequest {
+                window: Some(QueryWindow {
+                    since: String::new(),
+                    until: String::new(),
+                    limit: 100,
+                    page_token: String::new(),
+                }),
+                service: "typed-route".to_owned(),
+                min_duration_ms: 0,
+                status: String::new(),
+                name: "typed-cut-span".to_owned(),
+            }),
+            &token,
+        ))
+        .await;
+    let typed_error = typed_error.expect_err("foreign tenant must fail typed query closed");
+    assert_eq!(typed_error.code(), wyrd_tonic::tonic::Code::Internal);
+    assert_eq!(typed_error.message(), "query tenant invariant violated");
+    let (sql_rows, sql_outcome, sql_error) = query_statement(
+        &reader,
+        "SELECT * FROM vala.traces.spans WHERE service_name = 'typed-route' AND name = 'typed-cut-span'"
+            .to_owned(),
+    )
+    .await
+    .expect("foreign SQL terminal");
+    assert_eq!(sql_rows, 0);
+    assert_eq!(sql_outcome, QueryTerminalOutcome::Failed);
+    assert_eq!(
+        sql_error,
+        Some(QueryTerminalErrorCode::QueryTenantInvariant)
+    );
+    let security_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.security_violation'",
+    )
+    .bind(cluster.data_tenant_id().as_uuid())
+    .fetch_one(&owner)
+    .await
+    .expect("typed security audit");
+    assert_eq!(
+        security_audits - audit_baseline,
+        2,
+        "typed and SQL tripwires each append exactly one durable audit"
+    );
     cluster.shutdown().await.expect("shutdown cluster");
+}
+
+/// Builds one deterministic OTLP span reused across sealed and hot writes.
+fn typed_route_trace() -> ExportTraceServiceRequest {
+    let span = OtlpSpan {
+        trace_id: vec![0x11; 16],
+        span_id: vec![0x22; 8],
+        parent_span_id: Vec::new(),
+        trace_state: String::new(),
+        flags: 0,
+        name: "typed-cut-span".to_owned(),
+        kind: span::SpanKind::Server as i32,
+        start_time_unix_nano: 1_700_000_000_000_000_000,
+        end_time_unix_nano: 1_700_000_000_050_000_000,
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        events: Vec::new(),
+        dropped_events_count: 0,
+        links: Vec::new(),
+        dropped_links_count: 0,
+        status: Some(OtlpStatus {
+            message: String::new(),
+            code: StatusCode::Ok as i32,
+        }),
+    };
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(OtlpResource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_owned(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("typed-route".to_owned())),
+                    }),
+                }],
+                dropped_attributes_count: 0,
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![span],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Adds the OTLP access-token metadata expected by the Gate collector.
+fn with_access_token<T>(mut request: Request<T>, token: &str) -> Request<T> {
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        format!("Bearer {token}").parse().expect("token metadata"),
+    );
+    request
+}
+
+/// Persists one foreign-tenant trace row beneath the built-in spans table.
+async fn seed_foreign_trace_row(
+    cluster: &WyrdTestCluster,
+    owner: DataTenantId,
+    foreign: DataTenantId,
+) -> Result<(), JourneyError> {
+    let binding =
+        TenantTableBinding::resolve((owner, TableRef::new(BifrostNamespace::Traces, "spans")))?;
+    let user_fields = vec![
+        Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+        Field::new("span_id", DataType::FixedSizeBinary(8), false),
+        Field::new("parent_span_id", DataType::FixedSizeBinary(8), true),
+        Field::new("flags", DataType::Int64, false),
+        Field::new("trace_state", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new(
+            "start_time",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new(
+            "end_time",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("duration_ms", DataType::Int64, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("attributes", DataType::Utf8, true),
+        Field::new("dropped_attributes_count", DataType::Int64, false),
+        Field::new("dropped_events_count", DataType::Int64, false),
+        Field::new("dropped_links_count", DataType::Int64, false),
+        Field::new("scope_name", DataType::Utf8, true),
+        Field::new("scope_version", DataType::Utf8, true),
+        Field::new("service_name", DataType::Utf8, false),
+    ];
+    let schema = Arc::new(Schema::new(with_managed_columns(user_fields)));
+    let mut trace_id = FixedSizeBinaryBuilder::with_capacity(1, 16);
+    trace_id.append_value([0x31; 16])?;
+    let mut span_id = FixedSizeBinaryBuilder::with_capacity(1, 8);
+    span_id.append_value([0x41; 8])?;
+    let mut parent_span_id = FixedSizeBinaryBuilder::with_capacity(1, 8);
+    parent_span_id.append_null();
+    let mut batch_id = FixedSizeBinaryBuilder::with_capacity(1, 16);
+    batch_id.append_value(uuid::Uuid::now_v7().as_bytes())?;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(trace_id.finish()),
+            Arc::new(span_id.finish()),
+            Arc::new(parent_span_id.finish()),
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec!["typed-cut-span"])),
+            Arc::new(StringArray::from(vec!["SERVER"])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_700_000_000_000_000_i64])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_700_000_000_050_000_i64])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(Int64Array::from(vec![50])),
+            Arc::new(StringArray::from(vec!["OK"])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec!["typed-route"])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])),
+            Arc::new(StringArray::from(vec![RequestId::now_v7().to_string()])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_700_000_000_050_000_i64])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_700_000_000_050_001_i64])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(batch_id.finish()),
+            Arc::new(Int32Array::from(vec![0])),
+            Arc::new(StringArray::from(vec![foreign.to_string()])),
+        ],
+    )?;
+    let mut parquet = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut parquet, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    let path = format!("{}/typed-route-foreign.parquet", binding.object_prefix);
+    cluster
+        .storage_operator()
+        .write(&path, Buffer::from(parquet.clone()))
+        .await?;
+    let event = AuditEvent::new(
+        RequestId::now_v7(),
+        None,
+        "oracle.journey.typed_foreign_row".to_owned(),
+        "bifrost.oracle.journey".to_owned(),
+        None,
+        PrincipalId::new(uuid::Uuid::now_v7()),
+        PrincipalKindTag::User,
+        AuthMethod::Internal,
+        "bifrost_query:read".to_owned(),
+        AuditDecision::Allow,
+        AuditResult::Success,
+        "typed foreign tripwire fixture".to_owned(),
+    );
+    let mut conn = cluster.pg_fixture().tenant_conn_for(owner).await?;
+    insert_and_audit(
+        &mut conn,
+        &FileListInsert {
+            id: uuid::Uuid::now_v7(),
+            data_tenant_id: owner,
+            namespace: &binding.logical_namespace,
+            table_name: &binding.table_name,
+            file_path: &path,
+            file_size: i64::try_from(parquet.len())?,
+            row_count: 1,
+            min_event_time: Utc::now(),
+            max_event_time: Utc::now(),
+            partition_day: NaiveDate::from_ymd_opt(2023, 11, 14).ok_or("invalid fixture day")?,
+            node_id: uuid::Uuid::now_v7(),
+            writer_epoch: 1,
+            wal_lsn_min: 9_101,
+            wal_lsn_max: 9_101,
+        },
+        &[event],
+    )
+    .await?;
+    conn.commit().await?;
+    Ok(())
 }
 
 /// Assert production recorder labels and production-pipeline spans for a real query.
@@ -918,6 +1212,57 @@ async fn query_statement(
         terminal.outcome,
         terminal.error.as_ref().map(|error| error.code),
     ))
+}
+
+/// Read the returned trace identity and user-visible values through SQL.
+///
+/// # Errors
+///
+/// Returns client, protocol, Arrow, or terminal errors when the query cannot
+/// be drained or its typed columns do not match the trace contract.
+async fn query_trace_identity_value(
+    client: &WyrdClient,
+) -> Result<Vec<(String, String, String, String)>, JourneyError> {
+    let mut stream = QueryClient::new(client)
+        .query(&BifrostQueryRequest {
+            sql: "SELECT trace_id, span_id, name, service_name FROM vala.traces.spans WHERE service_name = 'typed-route' AND name = 'typed-cut-span'".to_owned(),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        })
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        let trace_ids = batch
+            .column_by_name("trace_id")
+            .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .ok_or("trace_id column has unexpected Arrow type")?;
+        let span_ids = batch
+            .column_by_name("span_id")
+            .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .ok_or("span_id column has unexpected Arrow type")?;
+        let names = batch
+            .column_by_name("name")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or("name column has unexpected Arrow type")?;
+        let services = batch
+            .column_by_name("service_name")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or("service_name column has unexpected Arrow type")?;
+        for row in 0..batch.num_rows() {
+            rows.push((
+                hex::encode(trace_ids.value(row)),
+                hex::encode(span_ids.value(row)),
+                names.value(row).to_owned(),
+                services.value(row).to_owned(),
+            ));
+        }
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    if terminal.outcome != QueryTerminalOutcome::Success {
+        return Err(format!("identity query failed: {:?}", terminal.error).into());
+    }
+    Ok(rows)
 }
 
 /// Persist one foreign-tenant physical row beneath the production provider union.

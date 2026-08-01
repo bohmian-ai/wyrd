@@ -12,6 +12,7 @@ CREATE TABLE vala.forge_tasks (
     plan jsonb NOT NULL,
     plan_hash bytea NOT NULL CHECK (octet_length(plan_hash) = 32),
     estimated_files bigint NOT NULL CHECK (estimated_files > 0),
+    CHECK (lane <> 'large_singleton' OR estimated_files = 1),
     estimated_bytes bigint NOT NULL CHECK (estimated_bytes > 0),
     estimated_parallelism integer NOT NULL CHECK (estimated_parallelism > 0),
     estimated_memory_bytes bigint NOT NULL CHECK (estimated_memory_bytes > 0),

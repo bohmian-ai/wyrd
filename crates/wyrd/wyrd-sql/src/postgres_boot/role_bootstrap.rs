@@ -64,6 +64,24 @@ ALTER ROLE {catalog_app_role} WITH LOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER PASS
 REVOKE ALL PRIVILEGES ON DATABASE {database} FROM {migrator_role}, {app_role}, {admin_role}, {catalog_role}, {catalog_app_role};
 REVOKE {migrator_role}, {app_role}, {admin_role}, {catalog_app_role} FROM {migrator_role}, {app_role}, {admin_role}, {catalog_role}, {catalog_app_role};
 
+DO $$
+DECLARE membership record;
+BEGIN
+    FOR membership IN
+        SELECT parent.rolname AS parent_name, member.rolname AS member_name
+        FROM pg_auth_members memberships
+        JOIN pg_roles parent ON parent.oid = memberships.roleid
+        JOIN pg_roles member ON member.oid = memberships.member
+        WHERE member.rolname IN ('wyrd_migrator', 'wyrd_app', 'wyrd_platform_admin', 'wyrd_catalog_app')
+          AND NOT (
+              parent.rolname = 'wyrd_catalog'
+              AND member.rolname IN ('wyrd_migrator', 'wyrd_catalog_app')
+          )
+    LOOP
+        EXECUTE format('REVOKE %I FROM %I', membership.parent_name, membership.member_name);
+    END LOOP;
+END $$;
+
 GRANT CONNECT ON DATABASE {database} TO {migrator_role}, {app_role}, {admin_role}, {catalog_app_role};
 GRANT CREATE ON DATABASE {database} TO {migrator_role};
 "#,
@@ -81,10 +99,16 @@ GRANT CREATE ON DATABASE {database} TO {migrator_role};
     )
 }
 
+/// Quotes one PostgreSQL string literal used by generated role DDL.
+///
+/// # Panics
+///
+/// Panics in debug builds when the value contains a NUL byte, which PostgreSQL
+/// string literals cannot represent.
 fn sql_literal(value: &str) -> String {
     debug_assert!(
-        value.chars().all(|c| c.is_ascii_alphanumeric()),
-        "sql_literal received non-alphanumeric input; generated passwords must be alphanumeric"
+        !value.contains('\0'),
+        "sql_literal received a NUL byte that PostgreSQL cannot represent"
     );
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -187,6 +211,107 @@ mod tests {
                 EXTERNAL_ROLE_BOOTSTRAP.contains(shape),
                 "external bootstrap missing {shape}"
             );
+        }
+    }
+
+    /// Live PostgreSQL proofs for embedded managed-role repair.
+    mod pg_tests {
+        use sqlx::{Connection, PgConnection};
+
+        use super::*;
+
+        /// Exercises embedded role repair against an effective unexpected
+        /// BYPASSRLS membership and proves the exact declared parent set remains.
+        ///
+        /// # Panics
+        /// Panics when the repository-managed PostgreSQL fixture is unavailable or
+        /// embedded repair leaves unexpected role authority.
+        #[tokio::test]
+        async fn embedded_bootstrap_removes_unexpected_bypassrls_parent_live() {
+            let admin_url = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")
+                .expect("repository SQL lane provides the admin DSN");
+            let current_app_url = std::env::var("WYRD_DATABASE_URL")
+                .expect("repository SQL lane provides the application DSN");
+            let mut admin = PgConnection::connect(&admin_url)
+                .await
+                .expect("connect fixture admin");
+            sqlx::raw_sql(
+            "DROP ROLE IF EXISTS wyrd_embedded_operator_fixture; CREATE ROLE wyrd_embedded_operator_fixture NOLOGIN BYPASSRLS; GRANT wyrd_embedded_operator_fixture TO wyrd_app",
+        )
+        .execute(&mut admin)
+        .await
+        .expect("install unexpected membership");
+            let effective_before: bool = sqlx::query_scalar(
+                "SELECT pg_has_role('wyrd_app','wyrd_embedded_operator_fixture','member')",
+            )
+            .fetch_one(&mut admin)
+            .await
+            .expect("membership before repair");
+            assert!(effective_before);
+
+            let admin_dsn = url::Url::parse(&admin_url).expect("parse fixture admin DSN");
+            let app_dsn = url::Url::parse(&current_app_url).expect("parse fixture app DSN");
+            let credentials = EmbeddedRoleCredentials {
+                superuser: SecretString::from(
+                    admin_dsn
+                        .password()
+                        .expect("fixture admin DSN has a password"),
+                ),
+                migrator: SecretString::from(
+                    std::env::var("WYRD_DATABASE_MIGRATOR_PASSWORD")
+                        .expect("repository SQL lane provides the migrator password"),
+                ),
+                app: SecretString::from(
+                    app_dsn.password().expect("fixture app DSN has a password"),
+                ),
+                platform_admin: SecretString::from(
+                    std::env::var("WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD")
+                        .expect("repository SQL lane provides the platform admin password"),
+                ),
+                catalog_app: SecretString::from(
+                    std::env::var("WYRD_DATABASE_CATALOG_APP_PASSWORD")
+                        .expect("repository SQL lane provides the catalog app password"),
+                ),
+            };
+            sqlx::raw_sql(sqlx::AssertSqlSafe(role_bootstrap_sql(&credentials)))
+                .execute(&mut admin)
+                .await
+                .expect("execute embedded role repair");
+
+            let effective_after: bool = sqlx::query_scalar(
+                "SELECT pg_has_role('wyrd_app','wyrd_embedded_operator_fixture','member')",
+            )
+            .fetch_one(&mut admin)
+            .await
+            .expect("membership after repair");
+            assert!(!effective_after);
+            let memberships: Vec<(String, String)> = sqlx::query_as(
+            "SELECT parent.rolname,member.rolname FROM pg_auth_members memberships JOIN pg_roles parent ON parent.oid=memberships.roleid JOIN pg_roles member ON member.oid=memberships.member WHERE member.rolname IN ('wyrd_migrator','wyrd_app','wyrd_platform_admin','wyrd_catalog_app') ORDER BY parent.rolname,member.rolname",
+        )
+        .fetch_all(&mut admin)
+        .await
+        .expect("exact managed memberships");
+            assert_eq!(
+                memberships,
+                vec![
+                    ("wyrd_catalog".to_owned(), "wyrd_catalog_app".to_owned()),
+                    ("wyrd_catalog".to_owned(), "wyrd_migrator".to_owned()),
+                ]
+            );
+            let mut app = PgConnection::connect(&current_app_url)
+                .await
+                .expect("connect repaired app");
+            assert!(
+                sqlx::query("SET ROLE wyrd_embedded_operator_fixture")
+                    .execute(&mut app)
+                    .await
+                    .is_err()
+            );
+            app.close().await.expect("close app connection");
+            sqlx::query("DROP ROLE wyrd_embedded_operator_fixture")
+                .execute(&mut admin)
+                .await
+                .expect("drop fixture role");
         }
     }
 }

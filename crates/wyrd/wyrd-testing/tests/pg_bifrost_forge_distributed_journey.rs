@@ -656,16 +656,13 @@ async fn dedicated_roles_terminalize_unschedulable_work() {
         .expect("active task belongs to a fixture tenant");
     let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.traces", "spans")
         .expect("canonical traces task identity");
-    ForgeTasks::new()
-        .upsert_periodic(
-            &server
-                .state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool"),
-            active_tenant.id,
-            &identity,
-        )
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
+    ForgeTasks::new(operator_pool.clone())
+        .upsert_periodic(active_tenant.id, &identity)
         .await
         .expect("enqueue same-table periodic demand");
     trigger_supervised_scheduler(server, scenario).await;

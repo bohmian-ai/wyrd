@@ -55,8 +55,8 @@ VALA_OPERATOR_ALLOWLIST = {
 }
 
 # Cohesive owners that intentionally expose both cross-tenant OperatorPool
-# coordination and TenantConn lifecycle/audit methods. Every public async
-# method must still take one of those two sanctioned boundaries.
+# coordination and TenantConn lifecycle/audit methods. Operator workflows may
+# use a dependency-owning handle; tenant workflows still take TenantConn.
 VALA_MIXED_EXECUTOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/forge_tasks.rs",
 }
@@ -274,14 +274,18 @@ def check_vala_query_modules(failures: list[str]) -> None:
             continue
 
         if relative in VALA_MIXED_EXECUTOR_ALLOWLIST:
+            owns_operator_pool = re.search(
+                r"struct\s+ForgeTasks\s*\{[^}]*OperatorPool", code, re.DOTALL
+            ) is not None
             for fn_name, params in public_async_fns(code):
                 if (
                     "OperatorPool" not in params
                     and "TenantConn<'_" not in params
                     and "TenantConn < '_" not in params
+                    and not (owns_operator_pool and "&self" in params)
                 ):
                     failures.append(
-                        f"{relative}: mixed-executor public async fn {fn_name} must take OperatorPool or &mut TenantConn<'_>"
+                        f"{relative}: mixed-executor public async fn {fn_name} must use an OperatorPool-owning self or take OperatorPool/TenantConn"
                     )
             continue
 

@@ -359,7 +359,7 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let (watermarks, overflowed) = ForgeTasks::new()
+        let (watermarks, overflowed) = ForgeTasks::new(self.core.operator_pool.clone())
             .watermarks(&mut conn, &identity, cap)
             .await
             .map_err(ForgeError::Sql)?;

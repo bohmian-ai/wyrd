@@ -1750,9 +1750,9 @@ mod pg_tests {
             &fixture.binding.table_name,
         )
         .expect("maintenance identity");
-        let tasks = ForgeTasks::new();
+        let tasks = ForgeTasks::new(fixture.operator_pool.clone());
         tasks
-            .upsert_periodic(&fixture.operator_pool, fixture.tenant, &identity)
+            .upsert_periodic(fixture.tenant, &identity)
             .await
             .expect("periodic maintenance demand");
         let stop = CancellationToken::new();
@@ -2088,10 +2088,7 @@ mod pg_tests {
         hash: u8,
     ) {
         let task_id = tasks
-            .enqueue(
-                &fixture.operator_pool,
-                &fixture.durable_task(strategy, plan, hash),
-            )
+            .enqueue(&fixture.durable_task(strategy, plan, hash))
             .await
             .expect("validation task enqueue");
         let claim = fixture
@@ -2125,7 +2122,7 @@ mod pg_tests {
     async fn worker_rejects_reserved_and_malformed_tasks_before_effect() {
         let fixture =
             Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
-        let tasks = ForgeTasks::new();
+        let tasks = ForgeTasks::new(fixture.operator_pool.clone());
         for (strategy, plan, hash) in [
             (
                 ForgeTaskStrategy::FullIdentity,
@@ -2180,22 +2177,19 @@ mod pg_tests {
     /// valid successor execution differs from the worker contract.
     #[tokio::test]
     async fn worker_quarantines_unknown_strategy_and_continues_slot() {
-        let tasks = ForgeTasks::new();
         let unknown_fixture =
             Fixture::new_with_config(ForgeConfig::default(), true, 2, 16 * 1024 * 1024).await;
+        let tasks = ForgeTasks::new(unknown_fixture.operator_pool.clone());
         let unknown_id = tasks
-            .enqueue(
-                &unknown_fixture.operator_pool,
-                &unknown_fixture.durable_task(
-                    ForgeTaskStrategy::StagingFold,
-                    ForgeTaskPlan {
-                        version: FORGE_TASK_PAYLOAD_VERSION,
-                        inputs: vec!["data/unknown.parquet".to_owned()],
-                        parameters: serde_json::json!({"kind":"staging_fold"}),
-                    },
-                    204,
-                ),
-            )
+            .enqueue(&unknown_fixture.durable_task(
+                ForgeTaskStrategy::StagingFold,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["data/unknown.parquet".to_owned()],
+                    parameters: serde_json::json!({"kind":"staging_fold"}),
+                },
+                204,
+            ))
             .await
             .expect("unknown task seed");
         let admin = unknown_fixture
@@ -2281,20 +2275,17 @@ mod pg_tests {
     async fn worker_rejects_claim_tenant_mismatch_before_every_effect() {
         let fixture =
             Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
-        let tasks = ForgeTasks::new();
+        let tasks = ForgeTasks::new(fixture.operator_pool.clone());
         let task_id = tasks
-            .enqueue(
-                &fixture.operator_pool,
-                &fixture.durable_task(
-                    ForgeTaskStrategy::StagingFold,
-                    ForgeTaskPlan {
-                        version: FORGE_TASK_PAYLOAD_VERSION,
-                        inputs: vec!["data/tenant-mismatch.parquet".to_owned()],
-                        parameters: serde_json::json!({"kind":"staging_fold"}),
-                    },
-                    205,
-                ),
-            )
+            .enqueue(&fixture.durable_task(
+                ForgeTaskStrategy::StagingFold,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["data/tenant-mismatch.parquet".to_owned()],
+                    parameters: serde_json::json!({"kind":"staging_fold"}),
+                },
+                205,
+            ))
             .await
             .expect("tenant mismatch seed");
         let mut claim = fixture
@@ -2343,19 +2334,16 @@ mod pg_tests {
     async fn worker_rejects_invalid_claim_identity_before_every_effect() {
         let fixture =
             Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
-        let task_id = ForgeTasks::new()
-            .enqueue(
-                &fixture.operator_pool,
-                &fixture.durable_task(
-                    ForgeTaskStrategy::StagingFold,
-                    ForgeTaskPlan {
-                        version: FORGE_TASK_PAYLOAD_VERSION,
-                        inputs: vec!["data/invalid-identity.parquet".to_owned()],
-                        parameters: serde_json::json!({"kind":"staging_fold"}),
-                    },
-                    206,
-                ),
-            )
+        let task_id = ForgeTasks::new(fixture.operator_pool.clone())
+            .enqueue(&fixture.durable_task(
+                ForgeTaskStrategy::StagingFold,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["data/invalid-identity.parquet".to_owned()],
+                    parameters: serde_json::json!({"kind":"staging_fold"}),
+                },
+                206,
+            ))
             .await
             .expect("invalid identity seed");
         let claim = fixture
@@ -2597,37 +2585,34 @@ mod pg_tests {
         .fetch_all(fixture.operator_pool.pool())
         .await
         .expect("concurrent exact inputs");
-        ForgeTasks::new()
-            .enqueue(
-                &fixture.operator_pool,
-                &NewForgeTask {
-                    data_tenant_id: fixture.tenant,
-                    table_ref: ForgeTaskTableIdentity::new(
-                        "wyrd-redux",
-                        &binding.logical_namespace,
-                        &binding.table_name,
-                    )
-                    .expect("concurrent task identity"),
-                    strategy: ForgeTaskStrategy::StagingFold,
-                    lane: ForgeTaskLane::Ordinary,
-                    base_snapshot_id: 0,
-                    plan: ForgeTaskPlan {
-                        version: FORGE_TASK_PAYLOAD_VERSION,
-                        inputs,
-                        parameters: serde_json::json!({"kind":"staging_fold"}),
-                    },
-                    plan_hash: [hash; 32],
-                    estimates: ForgeTaskEstimates {
-                        files: 2,
-                        bytes: 200,
-                        parallelism: 1,
-                        memory_bytes: 200,
-                        spill_bytes: 200,
-                        large_ceiling_bytes: 1_000,
-                    },
-                    ready_at: chrono::Utc::now(),
+        ForgeTasks::new(fixture.operator_pool.clone())
+            .enqueue(&NewForgeTask {
+                data_tenant_id: fixture.tenant,
+                table_ref: ForgeTaskTableIdentity::new(
+                    "wyrd-redux",
+                    &binding.logical_namespace,
+                    &binding.table_name,
+                )
+                .expect("concurrent task identity"),
+                strategy: ForgeTaskStrategy::StagingFold,
+                lane: ForgeTaskLane::Ordinary,
+                base_snapshot_id: 0,
+                plan: ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs,
+                    parameters: serde_json::json!({"kind":"staging_fold"}),
                 },
-            )
+                plan_hash: [hash; 32],
+                estimates: ForgeTaskEstimates {
+                    files: 2,
+                    bytes: 200,
+                    parallelism: 1,
+                    memory_bytes: 200,
+                    spill_bytes: 200,
+                    large_ceiling_bytes: 1_000,
+                },
+                ready_at: chrono::Utc::now(),
+            })
             .await
             .expect("concurrent exact task");
     }

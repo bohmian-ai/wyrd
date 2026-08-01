@@ -664,8 +664,8 @@ impl ForgeWorker {
         .validate()?;
         Ok(Self {
             completion_observer: forge.core.completion_observer.clone(),
+            tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
             forge,
-            tasks: ForgeTasks::new(),
             owner: Uuid::now_v7(),
             config,
             capacity,
@@ -718,19 +718,12 @@ impl ForgeWorker {
                 return Ok(());
             }
             self.tasks
-                .reclaim_expired(
-                    &self.forge.core.operator_pool,
-                    claim_limits.max_active_per_tenant,
-                )
+                .reclaim_expired(claim_limits.max_active_per_tenant)
                 .await
                 .map_err(ForgeError::Sql)?;
             if let Some(prepared) = self
                 .tasks
-                .claim_prepared_for_reconciliation(
-                    &self.forge.core.operator_pool,
-                    self.owner,
-                    claim_limits.lease_seconds,
-                )
+                .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
                 .await
                 .map_err(ForgeError::Sql)?
             {
@@ -750,7 +743,7 @@ impl ForgeWorker {
             }
             let claim = self
                 .tasks
-                .claim_fair(&self.forge.core.operator_pool, self.owner, claim_limits)
+                .claim_fair(self.owner, claim_limits)
                 .await
                 .map_err(ForgeError::Sql)?;
             let Some(claim) = claim else {
@@ -823,16 +816,12 @@ impl ForgeWorker {
     ) -> Result<bool, ForgeError> {
         let limits = self.claim_limits()?;
         self.tasks
-            .reclaim_expired(&self.forge.core.operator_pool, limits.max_active_per_tenant)
+            .reclaim_expired(limits.max_active_per_tenant)
             .await
             .map_err(ForgeError::Sql)?;
         if let Some(prepared) = self
             .tasks
-            .claim_prepared_for_reconciliation(
-                &self.forge.core.operator_pool,
-                self.owner,
-                limits.lease_seconds,
-            )
+            .claim_prepared_for_reconciliation(self.owner, limits.lease_seconds)
             .await
             .map_err(ForgeError::Sql)?
         {
@@ -841,7 +830,7 @@ impl ForgeWorker {
         }
         let claim = self
             .tasks
-            .claim_fair(&self.forge.core.operator_pool, self.owner, limits)
+            .claim_fair(self.owner, limits)
             .await
             .map_err(ForgeError::Sql)?;
         let Some(claim) = claim else {
@@ -864,7 +853,7 @@ impl ForgeWorker {
     pub async fn claim_for_test(&self) -> Result<Option<ForgeTaskClaim>, ForgeError> {
         let limits = self.claim_limits()?;
         self.tasks
-            .claim_fair(&self.forge.core.operator_pool, self.owner, limits)
+            .claim_fair(self.owner, limits)
             .await
             .map_err(ForgeError::Sql)
     }
@@ -1082,7 +1071,6 @@ impl ForgeWorker {
             reconciliation?;
             self.tasks
                 .heartbeat(
-                    &self.forge.core.operator_pool,
                     task.task_id,
                     attempt,
                     self.owner,
@@ -1355,18 +1343,11 @@ impl ForgeWorker {
         }
         let watermark = Self::execution_watermark(&table, claim, committed_recovery.as_ref())?;
         self.tasks
-            .start(
-                &self.forge.core.operator_pool,
-                claim.task_id,
-                attempt,
-                self.owner,
-                watermark,
-            )
+            .start(claim.task_id, attempt, self.owner, watermark)
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
             .heartbeat(
-                &self.forge.core.operator_pool,
                 claim.task_id,
                 attempt,
                 self.owner,
@@ -1441,7 +1422,6 @@ impl ForgeWorker {
     ) -> Result<(), ForgeError> {
         self.tasks
             .heartbeat(
-                &self.forge.core.operator_pool,
                 claim.task_id,
                 attempt,
                 self.owner,
@@ -1920,7 +1900,7 @@ impl ForgeWorker {
             })?;
         let interval =
             (self.forge.core.config.lease_ttl / 3).min(self.forge.core.maintenance_interval);
-        let tasks = self.tasks;
+        let tasks = self.tasks.clone();
         let operator_pool = self.forge.core.operator_pool.clone();
         let owner = self.owner;
         Ok(tokio::spawn(async move {
@@ -1932,7 +1912,7 @@ impl ForgeWorker {
                     biased;
                     () = stop.cancelled() => return Ok(()),
                     _ = ticker.tick() => {
-                        if let Err(error) = tasks.heartbeat(&operator_pool, task_id, attempt, owner, lease_seconds).await {
+                        if let Err(error) = tasks.heartbeat(task_id, attempt, owner, lease_seconds).await {
                             stop.cancel();
                             return Err(ForgeError::Sql(error));
                         }
@@ -2352,7 +2332,7 @@ impl ForgeWorker {
     /// Returns SQL errors when the durable periodic demand cannot be advanced.
     async fn request_replan(
         &self,
-        data_tenant_id: wyrd_spec::DataTenantId,
+        data_tenant_id: DataTenantId,
         table_ref: &ForgeTaskTableIdentity,
     ) -> Result<(), ForgeError> {
         let table = ForgeTaskTableIdentity::new(
@@ -2362,7 +2342,7 @@ impl ForgeWorker {
         )
         .map_err(ForgeError::Sql)?;
         self.tasks
-            .upsert_periodic(&self.forge.core.operator_pool, data_tenant_id, &table)
+            .upsert_periodic(data_tenant_id, &table)
             .await
             .map(|_| ())
             .map_err(ForgeError::Sql)

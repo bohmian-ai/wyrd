@@ -111,7 +111,7 @@ impl<'forge> ForgeScheduler<'forge> {
         Ok(Self {
             forge,
             planner: ForgePlanner::new(),
-            tasks: ForgeTasks::new(),
+            tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
             capacity,
             owner,
             demand_cap: u32::try_from(config.max_hints_per_wake).unwrap_or(u32::MAX),
@@ -166,12 +166,7 @@ impl<'forge> ForgeScheduler<'forge> {
         };
         let (demands, overflowed) = self
             .tasks
-            .planning_demands(
-                &self.forge.core.operator_pool,
-                self.owner,
-                fence,
-                self.demand_cap,
-            )
+            .planning_demands(self.owner, fence, self.demand_cap)
             .await
             .map_err(ForgeError::Sql)?;
         outcome.incomplete |= overflowed;
@@ -235,7 +230,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 }
             })?;
         self.tasks
-            .acquire_scheduler(&self.forge.core.operator_pool, self.owner, lease_seconds)
+            .acquire_scheduler(self.owner, lease_seconds)
             .await
             .map_err(ForgeError::Sql)?
             .ok_or_else(|| ForgeError::FenceLost {
@@ -264,7 +259,7 @@ impl<'forge> ForgeScheduler<'forge> {
             )
             .map_err(ForgeError::Sql)?;
             self.tasks
-                .upsert_periodic(&self.forge.core.operator_pool, key.tenant, &identity)
+                .upsert_periodic(key.tenant, &identity)
                 .await
                 .map_err(ForgeError::Sql)?;
         }
@@ -315,7 +310,6 @@ impl<'forge> ForgeScheduler<'forge> {
             acknowledged: self
                 .tasks
                 .enqueue_and_acknowledge(
-                    &self.forge.core.operator_pool,
                     self.owner,
                     fence,
                     demand,
@@ -392,7 +386,7 @@ impl<'forge> ForgeScheduler<'forge> {
         }
         let (backlog, oldest, overflowed) = self
             .tasks
-            .planning_status(&self.forge.core.operator_pool, self.demand_cap)
+            .planning_status(self.demand_cap)
             .await
             .map_err(ForgeError::Sql)?;
         if should_publish_gauges(outcome, overflowed) {

@@ -27,6 +27,24 @@ ALTER ROLE wyrd_catalog_app WITH LOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER PASSWO
 REVOKE ALL PRIVILEGES ON DATABASE wyrd FROM wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app;
 REVOKE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog_app FROM wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app;
 
+DO $$
+DECLARE membership record;
+BEGIN
+    FOR membership IN
+        SELECT parent.rolname AS parent_name, member.rolname AS member_name
+        FROM pg_auth_members memberships
+        JOIN pg_roles parent ON parent.oid = memberships.roleid
+        JOIN pg_roles member ON member.oid = memberships.member
+        WHERE member.rolname IN ('wyrd_migrator', 'wyrd_app', 'wyrd_platform_admin', 'wyrd_catalog_app')
+          AND NOT (
+              parent.rolname = 'wyrd_catalog'
+              AND member.rolname IN ('wyrd_migrator', 'wyrd_catalog_app')
+          )
+    LOOP
+        EXECUTE format('REVOKE %I FROM %I', membership.parent_name, membership.member_name);
+    END LOOP;
+END $$;
+
 GRANT CONNECT ON DATABASE wyrd TO wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog_app;
 GRANT CREATE ON DATABASE wyrd TO wyrd_migrator;
 

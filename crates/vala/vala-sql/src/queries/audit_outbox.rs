@@ -9,6 +9,8 @@
 // raw-query grep allowlist: audit outbox tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
+use sqlx::{PgConnection, Postgres, Transaction};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditEvent, AuditResult, AuthMethod, audit_detail_canonical_json,
 };
@@ -30,16 +32,55 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     append_audit_connection(conn.transaction(), event).await
 }
 
-/// Appends one hash-chained audit row on an already tenant-bound transaction connection.
+/// Tenant-bound audit capability for a trusted operator transaction.
 ///
-/// This private-crate seam lets an operator-owned coordination transaction bind
-/// an explicit tenant with the established transaction-local GUC and preserve
-/// atomic task, audit, and demand acknowledgement.
+/// This capability is intentionally crate-private and exposes only canonical
+/// audit append. It cannot be used as a general SQL executor or masquerade as
+/// a tenant connection.
+pub(crate) struct OperatorAudit<'transaction, 'connection> {
+    /// Verified tenant on whose behalf Forge is appending audit evidence.
+    tenant: DataTenantId,
+    /// Operator transaction shared with the fenced Forge planning workflow.
+    transaction: &'transaction mut Transaction<'connection, Postgres>,
+}
+
+impl<'transaction, 'connection> OperatorAudit<'transaction, 'connection> {
+    /// Binds canonical audit append to one already verified tenant.
+    pub(crate) fn new(
+        tenant: DataTenantId,
+        transaction: &'transaction mut Transaction<'connection, Postgres>,
+    ) -> Self {
+        Self {
+            tenant,
+            transaction,
+        }
+    }
+
+    /// Appends one canonical hash-chained event for the bound tenant.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when tenant binding, chain locking, hashing
+    /// persistence, or row insertion fails.
+    ///
+    /// # Cancellation
+    /// Cancellation leaves the enclosing operator transaction uncommitted, so
+    /// its owner can roll back the Forge mutation and audit append together.
+    pub(crate) async fn append(&mut self, event: &AuditEvent) -> Result<i64, SqlError> {
+        sqlx::query(wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
+            .bind(self.tenant.to_string())
+            .execute(&mut **self.transaction)
+            .await
+            .map_err(SqlError::from)?;
+        append_audit_connection(&mut **self.transaction, event).await
+    }
+}
+
+/// Implements canonical audit encoding for an already tenant-bound connection.
 ///
 /// # Errors
 /// Returns [`SqlError`] when chain locking, hashing persistence, or RLS fails.
-pub(crate) async fn append_audit_connection(
-    conn: &mut sqlx::PgConnection,
+async fn append_audit_connection(
+    conn: &mut PgConnection,
     event: &AuditEvent,
 ) -> Result<i64, SqlError> {
     sqlx::query(

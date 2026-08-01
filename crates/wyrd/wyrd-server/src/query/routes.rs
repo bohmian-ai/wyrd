@@ -56,11 +56,18 @@ pub(crate) async fn sync_query(
     caller: Caller,
     Json(body): Json<BifrostQueryRequest>,
 ) -> Response {
-    let result = match service::stream_query(state, caller, body).await {
+    let result = match service::stream_query(state.clone(), caller, body).await {
         Ok(result) => result,
         Err(error) => return query_error_response(error),
     };
-    query_stream_response(result)
+    #[cfg(feature = "test-support")]
+    let fault = state
+        .query_stream_fault
+        .as_ref()
+        .and_then(|controller| controller.claim());
+    #[cfg(not(feature = "test-support"))]
+    let fault = None;
+    query_stream_response_with_fault(result, fault)
 }
 
 /// Converts an admitted Oracle stream into the stable HTTP frame transport.
@@ -74,6 +81,72 @@ pub(crate) async fn sync_query(
 /// Frame encoding and late Oracle errors surface as body-stream IO failures;
 /// response construction failures return the stable internal problem response.
 pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
+    query_stream_response_with_fault(result, None)
+}
+
+/// Converts an admitted Oracle stream into HTTP frames, optionally truncating
+/// one test-tier response after its schema or first batch.
+///
+/// The truncation is claimed atomically before the body starts and is never
+/// represented on the public request or response contract. Dropping the body
+/// still drops the original Oracle frame stream and its admission guards.
+#[cfg(feature = "test-support")]
+fn query_stream_response_with_fault(
+    result: OracleQueryStream,
+    fault: Option<crate::state::QueryStreamFault>,
+) -> Response {
+    let schema_fingerprint = result.schema_fingerprint.clone();
+    let mut stream = Some(result);
+    let body = Body::from_stream(async_stream::stream! {
+        let mut emitted = 0_u8;
+        while let Some(frame) = match stream.as_mut() {
+            Some(query) => query.frames.next().await,
+            None => None,
+        } {
+            let frame = match frame {
+                Ok(frame) => FrameEncoder::encode(
+                    &wyrd_tonic::wyrd::v1::QueryStreamFrame::from(frame),
+                )
+                .map(Bytes::from)
+                .map_err(|error| io::Error::other(error.to_string())),
+                Err(error) => Err(io::Error::other(error.to_string())),
+            };
+            yield frame;
+            emitted = emitted.saturating_add(1);
+            match fault {
+                Some(crate::state::QueryStreamFault::EofAfterSchema) if emitted >= 1 => {
+                    if let Some(query) = stream.take() {
+                        query.cancel().await;
+                    }
+                    return;
+                }
+                Some(crate::state::QueryStreamFault::EofAfterBatch) if emitted >= 2 => {
+                    if let Some(query) = stream.take() {
+                        query.cancel().await;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    match Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, QUERY_STREAM_CONTENT_TYPE)
+        .header("x-wyrd-schema-fingerprint", schema_fingerprint)
+        .body(body)
+    {
+        Ok(response) => response,
+        Err(error) => query_error_response(WyrdError::Internal {
+            message: "failed to build query response".to_owned(),
+            details: serde_json::json!({ "detail": error.to_string() }),
+        }),
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn query_stream_response_with_fault(result: OracleQueryStream, _fault: Option<()>) -> Response {
     let schema_fingerprint = result.schema_fingerprint;
     let mut frames = result.frames;
     let body = Body::from_stream(async_stream::stream! {
@@ -89,7 +162,6 @@ pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
             yield frame;
         }
     });
-
     match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, QUERY_STREAM_CONTENT_TYPE)

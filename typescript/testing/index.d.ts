@@ -9,6 +9,35 @@ export declare class NativeWyrdTestServer {
   /** Returns the registered table used by the TypeScript Oracle journey. */
   get tableFqn(): string
   /**
+   * Seed rows through the real gRPC ingest and Scribe flush paths.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or registration,
+   * encoding, ingest, or flushing fails.
+   */
+  seedBifrostRows(table: string, rows: Array<number>): Array<number>
+  /**
+   * Mint an authenticated token without `bifrost_query:read`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or token issuance fails.
+   */
+  queryDeniedToken(): string
+  /**
+   * Return the durable read-decision audit count for the fixture tenant.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the audit query fails.
+   */
+  bifrostReadDecisionCount(): number
+  /** Truncate the next query after its schema frame. */
+  failNextQueryAfterSchema(): void
+  /** Truncate the next query after its first batch frame. */
+  failNextQueryAfterBatch(): void
+  /**
    * Gracefully shuts down the in-process server once.
    *
    * # Errors

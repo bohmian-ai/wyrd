@@ -742,7 +742,12 @@ impl WyrdTestCluster {
     /// Returns a database or conversion error when a typed control-plane row
     /// cannot be read safely.
     pub async fn oracle_inspection(&self) -> Result<OracleInspection, ClusterError> {
-        let pool = self.fixture.operator_pool().pool();
+        let owner = self
+            .fixture
+            .superuser_pool()
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        let pool = &owner;
         let rows = sqlx::query(
             "SELECT node_id, role, fencing_token, ready FROM vala.cluster_nodes \
              ORDER BY node_id, role",
@@ -786,13 +791,8 @@ impl WyrdTestCluster {
         .fetch_one(pool)
         .await
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let owner = self
-            .fixture
-            .superuser_pool()
-            .await
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM vala.audit_outbox")
-            .fetch_one(&owner)
+            .fetch_one(pool)
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         Ok(OracleInspection {

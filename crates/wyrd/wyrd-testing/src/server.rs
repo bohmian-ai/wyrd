@@ -5,6 +5,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
@@ -29,6 +33,7 @@ use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
+use vala_sdk::{BifrostGrpcTransport, IngestTransport};
 use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -41,6 +46,9 @@ use wyrd_auth_oidc::JwksCache;
 use wyrd_auth_verify::{
     Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
 };
+use wyrd_client::WyrdClient;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 #[cfg(test)]
@@ -53,6 +61,7 @@ use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAud
 use wyrd_server::config::{BifrostRuntimeRole, IssuerEntry, ServeMode, WorkloadBindingEntry};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::BifrostIngestRuntime;
+use wyrd_server::state::{QueryStreamFault, QueryStreamFaultController};
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
@@ -188,6 +197,8 @@ struct WyrdTestServerInner {
     issuing_key: Arc<IssuingKey>,
     api_key: SecretString,
     forge_publisher: StagingFilePublisher,
+    /// Atomic one-shot query truncation controls for language journeys.
+    query_stream_fault: QueryStreamFaultController,
 }
 
 enum Mode {
@@ -401,6 +412,106 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
+    /// Seed deterministic rows through the public gRPC ingest and Scribe flush paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service credential, Arrow IPC encoding, gRPC
+    /// ingest, or durable flush cannot complete.
+    pub async fn seed_bifrost_rows(
+        &self,
+        table: &str,
+        rows: &[i64],
+    ) -> Result<Vec<i64>, WyrdTestServerError> {
+        let bootstrap = self
+            .bootstrap_service(
+                &format!("bifrost-seed-{}", Uuid::now_v7().simple()),
+                &["admin"],
+            )
+            .await?;
+        let api_key = bootstrap
+            .api_key()
+            .ok_or_else(|| WyrdTestServerError::Auth("seed requires a service key".to_owned()))?
+            .clone();
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::clone(&schema),
+            vec![std::sync::Arc::new(Int64Array::from(rows.to_vec()))],
+        )
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let mut ipc = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut ipc, schema.as_ref())
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        writer
+            .write(&batch)
+            .and_then(|()| writer.finish())
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let client = WyrdClient::with_config(ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: self
+                    .grpc_url()
+                    .ok_or_else(|| WyrdTestServerError::Start("missing gRPC URL".to_owned()))?,
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: self
+                    .base_url()
+                    .ok_or_else(|| WyrdTestServerError::Start("missing HTTP URL".to_owned()))?
+                    .to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key),
+            ..ClientConfig::default()
+        })
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        BifrostGrpcTransport::connect(&client)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
+            .insert_batch(table, Uuid::now_v7().into_bytes(), ipc)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        self.flush_bifrost().await?;
+        Ok(rows.to_vec())
+    }
+
+    /// Mint an authenticated token that intentionally lacks query-read permission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication error when the viewer service cannot be
+    /// bootstrapped or its API key cannot be exchanged.
+    pub async fn query_denied_token(&self) -> Result<String, WyrdTestServerError> {
+        let bootstrap = self
+            .bootstrap_service(
+                &format!("bifrost-denied-{}", Uuid::now_v7().simple()),
+                &["reader"],
+            )
+            .await?;
+        let api_key = bootstrap.api_key().ok_or_else(|| {
+            WyrdTestServerError::Auth("denied token requires a service key".to_owned())
+        })?;
+        self.exchange_api_key(api_key).await
+    }
+
+    /// Schedule EOF for the next query after its schema frame.
+    pub fn fail_next_query_after_schema(&self) {
+        self.inner
+            .query_stream_fault
+            .set_next(QueryStreamFault::EofAfterSchema);
+    }
+
+    /// Schedule EOF for the next query after its first batch frame.
+    pub fn fail_next_query_after_batch(&self) {
+        self.inner
+            .query_stream_fault
+            .set_next(QueryStreamFault::EofAfterBatch);
+    }
+
     /// Flush the server-owned Scribe through a specific tenant's seal path.
     ///
     /// # Errors
@@ -423,17 +534,17 @@ impl WyrdTestServer {
     /// rejection occurs before Oracle planning or durable read accounting.
     ///
     /// # Errors
-    /// Returns an error when the tenant transaction or audit query fails.
+    /// Returns an error when the fixture's superuser pool cannot be acquired
+    /// or the tenant-scoped audit query fails.
     pub async fn bifrost_read_decision_count(&self) -> Result<i64, WyrdTestServerError> {
-        let mut conn = self.tenant_conn().await?;
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision'",
         )
         .bind(self.data_tenant_id().as_uuid())
-        .fetch_one(&mut **conn.transaction())
+        .fetch_one(&pool)
         .await
         .map_err(sql)?;
-        conn.commit().await.map_err(sql)?;
         Ok(count)
     }
 
@@ -1666,10 +1777,12 @@ impl WyrdTestServerBuilder {
                 None,
             ))
         });
+        let query_stream_fault = QueryStreamFaultController::default();
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_bifrost_redux(Arc::clone(&bifrost_redux))
             .with_bifrost_memory_pool(bifrost_memory, query_memory)
             .with_bifrost_roles(self.bifrost_roles.clone())
+            .with_query_stream_fault(query_stream_fault.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
@@ -1751,6 +1864,7 @@ impl WyrdTestServerBuilder {
                 issuing_key,
                 api_key: SecretString::from(String::new()),
                 forge_publisher,
+                query_stream_fault,
             },
             mode: Mode::InProcess,
             shutdown_token: None,

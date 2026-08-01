@@ -20,7 +20,7 @@ pub struct NativeWyrdTestServer {
     base_url: String,
     /// Admin access token minted through the real auth route.
     token: String,
-    /// Registered empty table reached by the public query journey.
+    /// Registered table reached by the public query journey.
     table_fqn: String,
 }
 
@@ -42,6 +42,92 @@ impl NativeWyrdTestServer {
     #[napi(getter)]
     pub fn table_fqn(&self) -> String {
         self.table_fqn.clone()
+    }
+
+    /// Seed rows through the real gRPC ingest and Scribe flush paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or registration,
+    /// encoding, ingest, or flushing fails.
+    #[napi]
+    pub fn seed_bifrost_rows(&self, table: String, rows: Vec<i64>) -> napi::Result<Vec<i64>> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.seed_bifrost_rows(&table, &rows))
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
+    }
+
+    /// Mint an authenticated token without `bifrost_query:read`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or token issuance fails.
+    #[napi]
+    pub fn query_denied_token(&self) -> napi::Result<String> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.query_denied_token())
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
+    }
+
+    /// Return the durable read-decision audit count for the fixture tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or the audit query fails.
+    #[napi]
+    pub fn bifrost_read_decision_count(&self) -> napi::Result<i64> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.bifrost_read_decision_count())
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
+    }
+
+    /// Truncate the next query after its schema frame.
+    #[napi]
+    pub fn fail_next_query_after_schema(&self) -> napi::Result<()> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        server.fail_next_query_after_schema();
+        Ok(())
+    }
+
+    /// Truncate the next query after its first batch frame.
+    #[napi]
+    pub fn fail_next_query_after_batch(&self) -> napi::Result<()> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        server.fail_next_query_after_batch();
+        Ok(())
     }
 
     /// Gracefully shuts down the in-process server once.

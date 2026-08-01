@@ -230,6 +230,62 @@ impl WyrdTestServer {
             .block_on(prepare_oracle_query_fixture(srv))
             .map_err(wyrd_error_to_py_err)
     }
+
+    /// Truncate the next query after its schema frame in the real server.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the context manager is inactive.
+    fn fail_next_query_after_schema(&self) -> PyResult<()> {
+        self.server
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))?
+            .fail_next_query_after_schema();
+        Ok(())
+    }
+
+    /// Truncate the next query after its first batch frame in the real server.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the context manager is inactive.
+    fn fail_next_query_after_batch(&self) -> PyResult<()> {
+        self.server
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))?
+            .fail_next_query_after_batch();
+        Ok(())
+    }
+
+    /// Mint an authenticated token lacking `bifrost_query:read`.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or token
+    /// issuance fails.
+    fn query_denied_token(&self) -> PyResult<String> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
+        })?;
+        wyrd_runtime::runtime()
+            .block_on(server.query_denied_token())
+            .map_err(|error| wyrd_error_to_py_err(error.into()))
+    }
+
+    /// Return the fixture tenant's durable Oracle read-decision count.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or the audit
+    /// query fails.
+    fn bifrost_read_decision_count(&self) -> PyResult<i64> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
+        })?;
+        wyrd_runtime::runtime()
+            .block_on(server.bifrost_read_decision_count())
+            .map_err(|error| wyrd_error_to_py_err(error.into()))
+    }
 }
 
 /// Builds the Python query journey's real ingest-to-sealed prerequisite.
@@ -242,7 +298,10 @@ async fn prepare_oracle_query_fixture(
     srv: &crate::server::WyrdTestServer,
 ) -> Result<(String, String), wyrd_spec::error::WyrdError> {
     let bootstrap = srv
-        .bootstrap_service("python-oracle-query", &["admin"])
+        .bootstrap_service(
+            &format!("python-oracle-query-{}", uuid::Uuid::now_v7().simple()),
+            &["admin"],
+        )
         .await
         .map_err(wyrd_spec::error::WyrdError::from)?;
     let api_key = bootstrap

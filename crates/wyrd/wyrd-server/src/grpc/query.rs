@@ -2,7 +2,7 @@
 
 use std::pin::Pin;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 use wyrd_spec::error::WyrdError;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::bifrost_query_service_server::{
@@ -16,6 +16,49 @@ use crate::components::auth::Caller;
 /// Owned server-streaming gRPC frame transport returned by the query service.
 pub(crate) type QueryGrpcStream =
     Pin<Box<dyn Stream<Item = Result<proto::QueryStreamFrame, Status>> + Send + 'static>>;
+
+/// Owns one Oracle stream and drains it asynchronously when gRPC drops early.
+struct QueryGrpcStreamOwner {
+    /// Oracle stream whose admission and renewal guards must be cancelled.
+    query: Option<vala_bifrost_redux::oracle::OracleQueryStream>,
+}
+
+impl Stream for QueryGrpcStreamOwner {
+    type Item = Result<proto::QueryStreamFrame, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let Some(query) = self.query.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        match query.frames.as_mut().poll_next(context) {
+            std::task::Poll::Ready(None) => {
+                self.query.take();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(frame)) => std::task::Poll::Ready(Some(
+                frame
+                    .map(proto::QueryStreamFrame::from)
+                    .map_err(WyrdError::from)
+                    .map_err(query_status),
+            )),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for QueryGrpcStreamOwner {
+    fn drop(&mut self) {
+        let Some(query) = self.query.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            query.cancel().await;
+        });
+    }
+}
 
 /// Public query service backed by the process-retained Oracle runtime.
 pub struct BifrostQueryGrpc {
@@ -94,17 +137,12 @@ impl BifrostQueryService for BifrostQueryGrpc {
 pub(crate) fn query_stream_response(
     result: vala_bifrost_redux::oracle::OracleQueryStream,
 ) -> Response<QueryGrpcStream> {
-    let mut frames = result.frames;
-    let output = async_stream::stream! {
-        while let Some(frame) = frames.next().await {
-            yield frame
-                .map(proto::QueryStreamFrame::from)
-                .map_err(WyrdError::from)
-                .map_err(query_status);
-        }
+    let schema_fingerprint = result.schema_fingerprint.clone();
+    let output = QueryGrpcStreamOwner {
+        query: Some(result),
     };
     let mut response = Response::new(Box::pin(output) as QueryGrpcStream);
-    if let Ok(value) = result.schema_fingerprint.parse() {
+    if let Ok(value) = schema_fingerprint.parse() {
         response
             .metadata_mut()
             .insert("x-wyrd-schema-fingerprint", value);

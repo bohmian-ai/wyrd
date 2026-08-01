@@ -25,6 +25,7 @@ use vala_sdk::{BifrostGrpcTransport, IngestTransport, QueryClient, ValaSdkError}
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -34,6 +35,7 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
 use wyrd_tonic::otlp::trace::v1::{
@@ -41,7 +43,11 @@ use wyrd_tonic::otlp::trace::v1::{
 };
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
+use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::Request;
+use wyrd_tonic::tonic::metadata::MetadataValue;
+use wyrd_tonic::wyrd::v1 as proto;
+use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
 use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
 use wyrd_tonic::wyrd::v1::{QueryTracesRequest, QueryWindow};
 
@@ -196,6 +202,136 @@ async fn pg_bifrost_oracle_distributed_journey() {
     )
     .await
     .expect("J4 distributed journey");
+}
+
+/// Proves public gRPC query frames match the HTTP stream for one seeded table.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn public_grpc_matches_http_frames() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("gRPC parity cluster");
+    let server = cluster.server(0).expect("gRPC parity server");
+    let table = unique_table("oracle_grpc_parity");
+    register_table(server, cluster.data_tenant_id(), &table)
+        .await
+        .expect("register parity table");
+    let client = client(server, "grpc-parity").await.expect("parity client");
+    ingest(&client, &format!("vala.bifrost.{table}"), &[11, 22])
+        .await
+        .expect("parity ingest");
+    server.flush_bifrost().await.expect("parity flush");
+    let request = BifrostQueryRequest {
+        sql: format!("SELECT id, value FROM vala.bifrost.{table} ORDER BY id"),
+        visibility: VisibilityMode::PublishedOnly,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: None,
+    };
+    let http = http_query_frames(server.base_url().expect("HTTP URL"), &client, &request)
+        .await
+        .expect("HTTP frames");
+    let grpc = grpc_query_frames(&client, &request)
+        .await
+        .expect("gRPC frames");
+    assert_eq!(http, grpc, "HTTP and gRPC logical frames must be identical");
+    let terminal = http
+        .iter()
+        .find_map(|frame| match frame.frame.as_ref() {
+            Some(proto::query_stream_frame::Frame::Terminal(terminal)) => Some(terminal),
+            _ => None,
+        })
+        .expect("parity terminal");
+    assert_eq!(terminal.row_count, 2);
+    assert_eq!(
+        terminal.outcome,
+        proto::QueryTerminalOutcome::Success as i32
+    );
+    assert_eq!(terminal.source_completion.len(), 2);
+    cluster.shutdown().await.expect("parity shutdown");
+}
+
+/// Proves a real Gate without Oracle returns typed gRPC UNAVAILABLE before planning.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn public_grpc_without_oracle_is_unavailable() {
+    let spec = BifrostClusterSpec {
+        nodes: vec![wyrd_testing::bifrost::BifrostNodeSpec {
+            node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
+            roles: [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Forge]
+                .into_iter()
+                .collect(),
+            oracle: None,
+        }],
+    };
+    let cluster = WyrdTestCluster::start_spec(spec)
+        .await
+        .expect("no-Oracle cluster");
+    let server = cluster.server(0).expect("no-Oracle server");
+    let table = unique_table("oracle_unavailable");
+    register_table(server, cluster.data_tenant_id(), &table)
+        .await
+        .expect("register unavailable table");
+    let client = client(server, "grpc-unavailable").await.expect("client");
+    let before = server
+        .bifrost_read_decision_count()
+        .await
+        .expect("read-decision count");
+    let code = grpc_query_status(
+        &client,
+        &BifrostQueryRequest {
+            sql: format!("SELECT * FROM vala.bifrost.{table}"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        },
+    )
+    .await
+    .expect("missing Oracle status");
+    assert_eq!(code, Code::Unavailable);
+    let after = server
+        .bifrost_read_decision_count()
+        .await
+        .expect("read-decision count after denial");
+    assert_eq!(before, after);
+    cluster.shutdown().await.expect("unavailable shutdown");
+}
+
+/// Proves dropping a public gRPC stream releases Oracle admission resources.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn public_grpc_drop_releases_query_resources() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("drop cluster");
+    let server = cluster.server(0).expect("drop server");
+    let table = unique_table("oracle_grpc_drop");
+    register_table(server, cluster.data_tenant_id(), &table)
+        .await
+        .expect("register drop table");
+    let client = client(server, "grpc-drop").await.expect("drop client");
+    ingest(&client, &format!("vala.bifrost.{table}"), &[1, 2])
+        .await
+        .expect("drop ingest");
+    server.flush_bifrost().await.expect("drop flush");
+    let request = BifrostQueryRequest {
+        sql: format!("SELECT id, value FROM vala.bifrost.{table} ORDER BY id"),
+        visibility: VisibilityMode::PublishedOnly,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: None,
+    };
+    let mut stream = grpc_query_stream(&client, &request)
+        .await
+        .expect("drop stream");
+    assert!(stream.message().await.expect("schema result").is_some());
+    assert!(stream.message().await.expect("batch result").is_some());
+    drop(stream);
+    wait_for_oracle_cleanup(&cluster)
+        .await
+        .expect("drop cleanup");
+    let inspection = cluster.oracle_inspection().await.expect("drop inspection");
+    assert_eq!(inspection.active_leases, 0);
+    assert_eq!(inspection.slots_in_use, 0);
+    cluster.shutdown().await.expect("drop shutdown");
 }
 
 /// J5 proves tenant tripwire, durable audit, admission cleanup, and audit refusal.
@@ -1164,6 +1300,99 @@ async fn client_for_tenant(
         api_key: Some(api_key),
         ..ClientConfig::default()
     })?)
+}
+
+/// Collect one HTTP query response into canonical protobuf frames.
+///
+/// # Errors
+///
+/// Returns a transport, status, framing, or protobuf error when the HTTP
+/// stream cannot be decoded to the public frame contract.
+async fn http_query_frames(
+    base_url: &str,
+    client: &WyrdClient,
+    request: &BifrostQueryRequest,
+) -> Result<Vec<proto::QueryStreamFrame>, JourneyError> {
+    let bearer = client.auth().bearer().await?;
+    let base_url = base_url.trim_end_matches('/');
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/query"))
+        .header("x-wyrd-access-token", format!("Bearer {}", bearer.expose()))
+        .json(request)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP query failed with {}", response.status()).into());
+    }
+    let body = response.bytes().await?;
+    let mut decoder = FrameDecoder::new(32 * 1024 * 1024);
+    let frames = decoder.push::<proto::QueryStreamFrame>(&body)?;
+    decoder.finish()?;
+    Ok(frames)
+}
+
+/// Open one authenticated public gRPC query stream.
+///
+/// # Errors
+///
+/// Returns a connection, metadata, request validation, or typed tonic status
+/// error before the first stream frame.
+async fn grpc_query_stream(
+    client: &WyrdClient,
+    request: &BifrostQueryRequest,
+) -> Result<wyrd_tonic::tonic::codec::Streaming<proto::QueryStreamFrame>, JourneyError> {
+    let connection = client.connect_grpc().await?;
+    let bearer = connection.auth().bearer().await?;
+    let mut rpc = BifrostQueryServiceClient::new(connection.channel());
+    let mut rpc_request =
+        wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request.clone()));
+    rpc_request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        MetadataValue::try_from(format!("Bearer {}", bearer.expose()))?,
+    );
+    Ok(rpc.query(rpc_request).await?.into_inner())
+}
+
+/// Collect one public gRPC query response into canonical protobuf frames.
+///
+/// # Errors
+///
+/// Returns a connection, typed tonic status, or stream decode error.
+async fn grpc_query_frames(
+    client: &WyrdClient,
+    request: &BifrostQueryRequest,
+) -> Result<Vec<proto::QueryStreamFrame>, JourneyError> {
+    let mut stream = grpc_query_stream(client, request).await?;
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.message().await? {
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
+/// Return the typed status from a query that should fail before its first frame.
+///
+/// # Errors
+///
+/// Returns setup errors or an error when the server unexpectedly accepts the
+/// query and opens a stream.
+async fn grpc_query_status(
+    client: &WyrdClient,
+    request: &BifrostQueryRequest,
+) -> Result<Code, JourneyError> {
+    let connection = client.connect_grpc().await?;
+    let bearer = connection.auth().bearer().await?;
+    let mut rpc = BifrostQueryServiceClient::new(connection.channel());
+    let mut rpc_request =
+        wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request.clone()));
+    rpc_request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        MetadataValue::try_from(format!("Bearer {}", bearer.expose()))?,
+    );
+    match rpc.query(rpc_request).await {
+        Ok(_) => Err("query unexpectedly returned a stream".into()),
+        Err(status) => Ok(status.code()),
+    }
 }
 
 /// Send one Arrow IPC batch through the public authenticated Gate transport.

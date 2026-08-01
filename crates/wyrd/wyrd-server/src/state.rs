@@ -443,6 +443,41 @@ pub struct LimitsConfig {
     pub concurrency: usize,
 }
 
+/// One-shot truncation requested by test-tier language journeys.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryStreamFault {
+    /// End the next query immediately after its schema frame.
+    EofAfterSchema = 1,
+    /// End the next query immediately after its first batch frame.
+    EofAfterBatch = 2,
+}
+
+/// Atomic next-query fault controller owned by a test server instance.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default, Clone)]
+pub struct QueryStreamFaultController {
+    next: Arc<AtomicU8>,
+}
+
+#[cfg(feature = "test-support")]
+impl QueryStreamFaultController {
+    /// Schedule one truncation and replace any previously scheduled fault.
+    pub fn set_next(&self, fault: QueryStreamFault) {
+        self.next.store(fault as u8, Ordering::Release);
+    }
+
+    /// Claim and clear the one-shot fault atomically.
+    #[must_use]
+    pub fn claim(&self) -> Option<QueryStreamFault> {
+        match self.next.swap(0, Ordering::AcqRel) {
+            1 => Some(QueryStreamFault::EofAfterSchema),
+            2 => Some(QueryStreamFault::EofAfterBatch),
+            _ => None,
+        }
+    }
+}
+
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
@@ -508,6 +543,9 @@ pub struct AppState {
     pub eval_runs: EvalRuns,
     /// Audit sink for eval run open/complete events.
     pub eval_audit: Arc<dyn EvalAuditWriter>,
+    /// Optional deterministic stream truncation controller for test servers.
+    #[cfg(feature = "test-support")]
+    pub query_stream_fault: Option<QueryStreamFaultController>,
 }
 
 impl AppState {
@@ -544,6 +582,8 @@ impl AppState {
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             eval_runs: new_run_map(),
             eval_audit: Arc::new(TracingEvalAuditWriter),
+            #[cfg(feature = "test-support")]
+            query_stream_fault: None,
         }
     }
 
@@ -551,6 +591,14 @@ impl AppState {
     #[must_use]
     pub fn with_eval_audit(mut self, eval_audit: Arc<dyn EvalAuditWriter>) -> Self {
         self.eval_audit = eval_audit;
+        self
+    }
+
+    /// Attach a test-tier one-shot query stream fault controller.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_query_stream_fault(mut self, controller: QueryStreamFaultController) -> Self {
+        self.query_stream_fault = Some(controller);
         self
     }
 

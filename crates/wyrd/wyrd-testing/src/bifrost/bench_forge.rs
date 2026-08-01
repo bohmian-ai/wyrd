@@ -288,10 +288,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         ..TelemetryConfig::default()
     })?;
     let capture = ForgeTelemetryCapture::new(runtime.prometheus(), traces);
-    let checkpoint = capture.checkpoint()?;
     let fixture =
         StandaloneForgeFixture::start_topology("bifrost_bench_forge", scenario.tenants).await?;
-    let sampler = capture.begin_gauge_sampling(&checkpoint).await?;
     let forge_fixture = fixture.fixture();
     for tenant_fixture in fixture.fixtures() {
         for sequence in 0_i64..8 {
@@ -302,6 +300,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     }
     let completion_observer = ForgeWorkerCompletionObserver::new();
     let scheduler_trigger = ForgeSchedulerTrigger::new();
+    let checkpoint = capture.checkpoint()?;
+    let sampler = capture.begin_gauge_sampling(&checkpoint).await?;
     let forge = forge_fixture.context_with_supervision(
         forge_fixture.config.clone(),
         completion_observer.clone(),

@@ -91,8 +91,8 @@ jq -s -e '
 single_worker_rate="$(jq -r '.maintenance.throughput_mib_per_sec' "$report_root/forge-multi-tenant-single-node.json")"
 three_worker_rate="$(jq -r '.maintenance.throughput_mib_per_sec' "$report_root/forge-multi-tenant-multi-node.json")"
 jq -en --argjson single "$single_worker_rate" --argjson three "$three_worker_rate" \
-  '$single > 0 and $three > 0 and ($three / $single) >= 0.5' >/dev/null || {
-  echo "three-worker production counter rate regressed below half the controlled one-worker rate" >&2
+  '$three > $single' >/dev/null || {
+  echo "three-worker production counter rate did not exceed the controlled one-worker rate" >&2
   exit 1
 }
 

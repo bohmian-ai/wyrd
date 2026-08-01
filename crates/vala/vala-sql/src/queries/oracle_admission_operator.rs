@@ -1,4 +1,7 @@
 //! Deployment-wide Oracle admission recovery owned by the operator pool.
+//!
+//! Dynamic query is intentional: startup recovery aggregates runtime lease
+//! classes across tenants and is compiled without a live SQLx schema cache.
 
 use chrono::{DateTime, Utc};
 use wyrd_spec::DataTenantId;

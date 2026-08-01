@@ -63,6 +63,8 @@ pub struct ForgeConfig {
     pub max_files_per_tick: usize,
     /// Maximum input bytes processed by one tick.
     pub max_bytes_per_tick: u64,
+    /// Maximum peak memory estimate admitted for either Forge execution lane.
+    pub max_memory_bytes: u64,
     /// Hard ceiling for one oversized singleton admitted outside the ordinary byte lane.
     pub max_large_task_bytes: u64,
     /// Maximum bins committed by one tick.
@@ -107,6 +109,7 @@ impl Default for ForgeConfig {
             max_files_per_bin: 256,
             max_files_per_tick: 1_024,
             max_bytes_per_tick: 2 * 512 * 1024 * 1024,
+            max_memory_bytes: 4 * 512 * 1024 * 1024,
             max_large_task_bytes: 4 * 512 * 1024 * 1024,
             max_bins_per_tick: 64,
             lease_ttl: Duration::from_mins(15),
@@ -141,6 +144,7 @@ impl ForgeConfig {
             || self.max_files_per_bin < 2
             || self.max_files_per_tick == 0
             || self.max_bytes_per_tick == 0
+            || self.max_memory_bytes == 0
             || self.max_large_task_bytes == 0
             || self.max_bins_per_tick == 0
             || self.lease_ttl.is_zero()
@@ -1880,6 +1884,16 @@ mod tests {
         let mut invalid_snapshots = config;
         invalid_snapshots.max_retained_snapshots_per_table = 0;
         assert!(invalid_snapshots.validate().is_err());
+    }
+
+    /// Forge rejects a zero planner memory ceiling before composing scheduler or workers.
+    #[test]
+    fn forge_config_rejects_zero_memory_capacity() {
+        let config = ForgeConfig {
+            max_memory_bytes: 0,
+            ..ForgeConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     /// The staging seam consumes the right-size policy's selected groups.

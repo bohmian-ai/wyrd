@@ -186,7 +186,7 @@ impl ForgeWorker {
                     detail: "Forge worker parallelism exceeds u16".to_owned(),
                 }
             })?,
-            max_memory_bytes: limits.max_bytes_per_tick,
+            max_memory_bytes: limits.max_memory_bytes,
             max_spill_bytes: limits.spill_limit_bytes,
             max_large_task_bytes: limits.max_large_task_bytes,
         }

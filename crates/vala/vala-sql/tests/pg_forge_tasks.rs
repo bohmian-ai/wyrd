@@ -380,13 +380,13 @@ mod pg_tests {
             .seed_additional_tenant_with_uuid(tenant_b, "forge-second")
             .await
             .expect("seed tenant");
-        tasks
-            .enqueue(
-                op,
-                &task(tenant_a, "large-a", ForgeTaskLane::LargeSingleton, 2),
-            )
-            .await
-            .expect("a");
+        let mut multi_input_large = task(tenant_a, "large-a", ForgeTaskLane::LargeSingleton, 2);
+        multi_input_large
+            .plan
+            .inputs
+            .push("data/large-z.parquet".to_owned());
+        multi_input_large.estimates.files = 2;
+        tasks.enqueue(op, &multi_input_large).await.expect("a");
         tasks
             .enqueue(
                 op,

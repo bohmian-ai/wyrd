@@ -98,7 +98,7 @@ impl<'forge> ForgeScheduler<'forge> {
                     detail: "Forge parallelism exceeds u16".to_owned(),
                 }
             })?,
-            max_memory_bytes: config.max_bytes_per_tick,
+            max_memory_bytes: config.max_memory_bytes,
             max_spill_bytes: config.spill_limit_bytes,
             max_large_task_bytes: config.max_large_task_bytes,
         }

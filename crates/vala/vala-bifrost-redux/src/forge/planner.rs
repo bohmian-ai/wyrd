@@ -78,7 +78,7 @@ pub struct ForgeTableSnapshot {
 pub enum ForgePlanCapacity {
     /// The plan fits every ordinary ceiling.
     Ordinary,
-    /// A single file fits only the cluster-fenced large lane.
+    /// One task fits every non-byte ceiling and requires the cluster-fenced large lane.
     LargeSingleton,
     /// The plan exceeds at least one non-relaxable ceiling.
     Unschedulable,
@@ -173,7 +173,7 @@ impl ForgePlanner {
             && candidate.spill_bytes <= capacity.max_spill_bytes;
         let capacity_outcome = if ordinary {
             ForgePlanCapacity::Ordinary
-        } else if files == 1
+        } else if files <= capacity.max_files
             && candidate.bytes <= capacity.max_large_task_bytes
             && candidate.parallelism <= capacity.max_parallelism
             && candidate.memory_bytes <= capacity.max_memory_bytes
@@ -271,6 +271,7 @@ mod tests {
             assert_eq!(tasks[0].capacity, ForgePlanCapacity::Unschedulable);
         }
         let mut large = candidate();
+        large.inputs = vec!["a.parquet".to_owned(), "b.parquet".to_owned()];
         large.bytes = 150;
         let tasks = owner
             .plan_table(

@@ -1928,12 +1928,18 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    /// Parse TOML from a string without performing any file I/O.
-    fn from_toml_str(s: &str) -> Result<WyrdServerConfig, ConfigError> {
-        toml::from_str::<WyrdServerConfig>(s).map_err(|source| ConfigError::ParseToml {
-            path: PathBuf::from("<test-string>"),
-            source,
-        })
+    /// Parse a TOML test fixture and explicitly allow an unapproved development Oracle profile.
+    ///
+    /// Production validation is unchanged; callers testing Oracle activation policy must build
+    /// an explicit production configuration and calibration profile instead.
+    fn from_toml_str_with_dev_oracle_opt_in(s: &str) -> Result<WyrdServerConfig, ConfigError> {
+        let mut config =
+            toml::from_str::<WyrdServerConfig>(s).map_err(|source| ConfigError::ParseToml {
+                path: PathBuf::from("<test-string>"),
+                source,
+            })?;
+        config.bifrost.oracle.allow_unapproved_profile = true;
+        Ok(config)
     }
 
     // ── 1. Default config validates ───────────────────────────────────────────
@@ -1962,8 +1968,8 @@ mod tests {
                 ],
             ),
         ] {
-            let config =
-                from_toml_str(&format!("[bifrost]\n{source}")).expect("closed role set parses");
+            let config = from_toml_str_with_dev_oracle_opt_in(&format!("[bifrost]\n{source}"))
+                .expect("closed role set parses");
             assert_eq!(
                 config.bifrost.roles,
                 expected.into_iter().collect::<BTreeSet<_>>()
@@ -1991,7 +1997,9 @@ mod tests {
     fn bifrost_role_env_overrides_toml() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         temp_env::with_vars([("WYRD_BIFROST_ROLES", Some("oracle"))], || {
-            let mut config = from_toml_str("[bifrost]\nroles = [\"scribe\"]").expect("TOML parses");
+            let mut config =
+                from_toml_str_with_dev_oracle_opt_in("[bifrost]\nroles = [\"scribe\"]")
+                    .expect("TOML parses");
             config
                 .apply_env_overrides()
                 .expect("closed environment role parses");
@@ -2160,7 +2168,7 @@ minimum_slots = 2
         let toml = r#"
             port = 9090
         "#;
-        let err = from_toml_str(toml).expect_err("unknown field must fail");
+        let err = from_toml_str_with_dev_oracle_opt_in(toml).expect_err("unknown field must fail");
         assert!(
             matches!(err, ConfigError::ParseToml { .. }),
             "expected ParseToml, got {err:?}"
@@ -2194,6 +2202,7 @@ minimum_slots = 2
             ],
             || {
                 let mut cfg = WyrdServerConfig::default();
+                cfg.bifrost.oracle.allow_unapproved_profile = true;
                 cfg.apply_env_overrides().expect("apply succeeds");
                 let err = cfg.validate().expect_err("collision must fail");
                 assert!(
@@ -2214,7 +2223,7 @@ minimum_slots = 2
             bind = "127.0.0.1:50051"
             reflection_enabled = true
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
             matches!(err, ConfigError::Invalid { .. }),
@@ -2231,7 +2240,7 @@ minimum_slots = 2
             [auth]
             allow_preview = true
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
             matches!(err, ConfigError::Invalid { .. }),
@@ -2247,7 +2256,7 @@ minimum_slots = 2
             [shutdown]
             drain_ms = 999999
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
             matches!(err, ConfigError::Invalid { .. }),
@@ -2277,7 +2286,7 @@ minimum_slots = 2
             [readiness]
             tick_ms = 10
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
             matches!(err, ConfigError::Invalid { .. }),
@@ -2376,7 +2385,7 @@ minimum_slots = 2
             principal_kind = "human"
             claim_mapping = { subject = "sub", email = "email", groups = "realm_access.roles" }
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         assert_eq!(cfg.trusted_issuers.len(), 1);
         let entry = &cfg.trusted_issuers[0];
         assert_eq!(entry.issuer, "https://idp.example.com/realms/acme");
@@ -2404,7 +2413,7 @@ minimum_slots = 2
             space = "prod"
             version = "1.0.0"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         assert_eq!(cfg.workload_bindings.len(), 1);
         let binding = &cfg.workload_bindings[0];
         assert_eq!(binding.issuer, "https://idp.example.com");
@@ -2428,7 +2437,7 @@ minimum_slots = 2
             client_auth = "public"
             unknown_field = "oops"
         "#;
-        let err = from_toml_str(toml).expect_err("unknown field must fail");
+        let err = from_toml_str_with_dev_oracle_opt_in(toml).expect_err("unknown field must fail");
         assert!(
             matches!(err, ConfigError::ParseToml { .. }),
             "expected ParseToml, got {err:?}"
@@ -2449,7 +2458,7 @@ minimum_slots = 2
             version = "1.0.0"
             extra_field = "bad"
         "#;
-        let err = from_toml_str(toml).expect_err("unknown field must fail");
+        let err = from_toml_str_with_dev_oracle_opt_in(toml).expect_err("unknown field must fail");
         assert!(
             matches!(err, ConfigError::ParseToml { .. }),
             "expected ParseToml, got {err:?}"
@@ -2476,7 +2485,7 @@ minimum_slots = 2
                     {auth_str}
                 "#
             );
-            let cfg = from_toml_str(&toml)
+            let cfg = from_toml_str_with_dev_oracle_opt_in(&toml)
                 .unwrap_or_else(|e| panic!("{label} variant must parse: {e:?}"));
             assert_eq!(cfg.trusted_issuers.len(), 1, "{label}");
         }
@@ -2497,7 +2506,7 @@ minimum_slots = 2
                     principal_kind = "{kind}"
                 "#
             );
-            let cfg = from_toml_str(&toml)
+            let cfg = from_toml_str_with_dev_oracle_opt_in(&toml)
                 .unwrap_or_else(|e| panic!("principal_kind = {kind:?} must parse: {e:?}"));
             assert_eq!(cfg.trusted_issuers.len(), 1);
         }
@@ -2514,7 +2523,7 @@ minimum_slots = 2
             expected_audience = "wyrd"
             client_auth = "public"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty issuer must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("issuer")),
@@ -2533,7 +2542,7 @@ minimum_slots = 2
             expected_audience = "wyrd"
             client_auth = "public"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty client_id must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("client_id")),
@@ -2552,7 +2561,7 @@ minimum_slots = 2
             expected_audience = ""
             client_auth = "public"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg
             .validate()
             .expect_err("empty expected_audience must fail");
@@ -2573,7 +2582,7 @@ minimum_slots = 2
             expected_audience = "wyrd"
             client_auth = { secret_post = "" }
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty secret must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("client_auth")),
@@ -2594,7 +2603,7 @@ minimum_slots = 2
             space = "prod"
             version = "1.0.0"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty binding issuer must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("issuer")),
@@ -2615,7 +2624,7 @@ minimum_slots = 2
             space = "prod"
             version = "1.0.0"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty subject must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("subject")),
@@ -2636,7 +2645,7 @@ minimum_slots = 2
             space = "prod"
             version = ""
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty version must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("version")),
@@ -2655,7 +2664,7 @@ minimum_slots = 2
             expected_audience = "wyrd"
             client_auth = { secret_post = "super-secret-value" }
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let debug = format!("{cfg:?}");
         assert!(
             !debug.contains("super-secret-value"),
@@ -2674,7 +2683,7 @@ minimum_slots = 2
             expected_audience = "wyrd"
             client_auth = "public"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("missing tenant_slug must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("tenant_slug")),
@@ -2695,7 +2704,7 @@ minimum_slots = 2
             space = "prod"
             version = "1.0.0"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("missing tenant_slug must fail");
         assert!(
             matches!(err, ConfigError::Invalid { ref message } if message.contains("tenant_slug")),
@@ -2717,7 +2726,7 @@ minimum_slots = 2
             expected_audience = "wyrd"
             client_auth = "public"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         cfg.validate().expect("tenant_slug present must validate");
         assert_eq!(
             cfg.auth.tenant_slug.as_ref().map(TenantSlug::as_str),
@@ -2833,7 +2842,7 @@ minimum_slots = 2
             [metrics]
             bind = "0.0.0.0:8080"
         "#;
-        let cfg = from_toml_str(toml).expect("parses ok");
+        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg
             .validate()
             .expect_err("metrics-HTTP collision must fail");

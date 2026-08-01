@@ -174,9 +174,6 @@ pub(crate) fn query_status(error: WyrdError) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use vala_bifrost_redux::oracle::OracleQueryStream;
@@ -362,34 +359,45 @@ mod tests {
     /// Proves dropping a gRPC stream releases the retained Oracle frame owner.
     #[tokio::test]
     async fn grpc_query_stream_drop_propagates_cancellation() {
-        /// Marks when the synthetic Oracle stream is dropped.
-        struct DropSignal(Arc<AtomicBool>);
+        /// Sends the owner-release signal only when the synthetic source drops.
+        struct ReleaseSignal {
+            /// One-shot completion observed by the test after source drop.
+            sender: Option<tokio::sync::oneshot::Sender<()>>,
+        }
 
-        impl Drop for DropSignal {
-            /// Records cancellation at the Oracle stream ownership boundary.
+        impl Drop for ReleaseSignal {
+            /// Completes the bounded test assertion at source-owner drop.
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
+                if let Some(sender) = self.sender.take() {
+                    let _ = sender.send(());
+                }
             }
         }
 
-        let dropped = Arc::new(AtomicBool::new(false));
-        let stream_dropped = Arc::clone(&dropped);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let source_cancellation = cancellation.clone();
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
         let frames = async_stream::stream! {
-            let _signal = DropSignal(stream_dropped);
+            let _release = ReleaseSignal {
+                sender: Some(release_sender),
+            };
             yield Ok(schema_frame());
-            std::future::pending::<()>().await;
+            source_cancellation.cancelled().await;
         };
         let mut stream = query_stream_response(OracleQueryStream::test_new(
             "abcd".to_owned(),
             Box::pin(frames),
-            tokio_util::sync::CancellationToken::new(),
+            cancellation.clone(),
         ))
         .into_inner();
         let _first = stream.next().await.expect("schema frame");
         drop(stream);
-        assert!(
-            dropped.load(Ordering::Acquire),
-            "gRPC cancellation must drop Oracle stream guards"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation.cancelled())
+            .await
+            .expect("gRPC drop signals Oracle cancellation");
+        tokio::time::timeout(std::time::Duration::from_secs(1), release_receiver)
+            .await
+            .expect("synthetic source observes cancellation and releases owner")
+            .expect("source release signal remains connected");
     }
 }

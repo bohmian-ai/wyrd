@@ -351,6 +351,19 @@ a user-observable behavior — especially a negative flow — down to a unit tes
 may stay unit-only when driving it end-to-end is materially harder and the
 behavior has no cross-boundary state (record the reason).
 
+### Runtime Ownership Of Tests
+
+- Rust tests cover functions, structs, and workflows whose execution requires
+  only the Rust runtime.
+- Behavior that requires a Python interpreter lifetime belongs in Python tests.
+  Do not initialize or emulate a Python lifetime inside Rust tests.
+- Behavior that requires a TypeScript or Node.js lifetime belongs in
+  TypeScript tests. Do not link, initialize, or emulate a Node/N-API lifetime
+  inside Rust tests.
+- Native binding crates may receive Rust-only compile and static checks, but
+  lifetime-dependent behavior must be loaded and exercised through the owning
+  language runtime.
+
 ### Verification Scope
 
 Run verification for the code you changed. `mise run pre-pr` is the aggregate

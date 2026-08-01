@@ -9,7 +9,8 @@
 #
 # WHAT IT CHECKS:
 #   - no crate appears in more than one family lane (dedup)
-#   - every workspace crate except py-wyrd and wyrd-rust-examples is in a lane
+#   - every workspace crate except language bindings with dedicated gates is in
+#     a Rust family lane
 #   - no lane references a crate absent from the workspace (stale entries)
 set -eu
 
@@ -34,7 +35,7 @@ workspace_members=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
 import json, sys
 data = json.load(sys.stdin)
 print('\n'.join(sorted(p['name'] for p in data['packages'])))
-" | grep -Ev '^(py-wyrd|wyrd-rust-examples)$')
+" | grep -Ev '^(py-wyrd|wyrd-node|wyrd-node-testing|wyrd-rust-examples)$')
 
 missing=$(comm -23 <(echo "$workspace_members") <(echo "$combined"))
 if [ -n "$missing" ]; then
@@ -49,6 +50,17 @@ if [ -n "$phantom" ]; then
   echo "$phantom"
   exit 1
 fi
+
+# N-API cdylibs link against symbols supplied by Node and therefore cannot be
+# executed as ordinary Rust lib-test binaries. Their compile/type/unit coverage
+# must remain explicit in the aggregate gate instead of being silently exempt.
+pre_pr_body=$(sed -n '/^\[tasks\."pre-pr"\]/,/^\[tasks\./p' "$REPO_ROOT/mise.toml")
+for task in ts:napi:check ts:typecheck ts:test:unit; do
+  if ! printf '%s\n' "$pre_pr_body" | grep -F "\"$task\"" >/dev/null; then
+    echo "FAIL: pre-pr is missing required N-API/TypeScript gate: $task"
+    exit 1
+  fi
+done
 
 total=$(echo "$combined" | wc -l | tr -d ' ')
 echo "OK: all $total workspace crates are assigned to exactly one family lane."

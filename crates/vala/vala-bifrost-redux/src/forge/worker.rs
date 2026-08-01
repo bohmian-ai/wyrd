@@ -565,6 +565,17 @@ impl ForgeWorker {
         let table = self.forge.load_table(&binding.table_ident()).await?;
         self.verify_committed_evidence(binding, &table, evidence)
             .await?;
+        if task.strategy == ForgeTaskStrategy::StagingFold {
+            let snapshot_id =
+                evidence
+                    .committed_snapshot_id
+                    .ok_or_else(|| ForgeError::Reconciliation {
+                        detail: "recovered staging task has no committed snapshot".to_owned(),
+                    })?;
+            self.forge
+                .stamp_recovered_staging_task(lease, binding, &task.plan.inputs, snapshot_id)
+                .await?;
+        }
         let expiry_terminals = if task.strategy == ForgeTaskStrategy::SnapshotExpiry {
             let key = super::compact::ForgeTableKey {
                 tenant: task.data_tenant_id,
@@ -876,6 +887,25 @@ impl ForgeWorker {
             .map_err(ForgeError::Sql)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
         if already_prepared {
+            if matches!(
+                claim.strategy,
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold)
+            ) {
+                let snapshot_id =
+                    evidence
+                        .committed_snapshot_id
+                        .ok_or_else(|| ForgeError::Reconciliation {
+                            detail: "recovered staging task has no committed snapshot".to_owned(),
+                        })?;
+                let binding = task_table_binding(
+                    claim.data_tenant_id,
+                    claim.execution_tenant_id,
+                    &claim.table_ref,
+                )?;
+                self.forge
+                    .stamp_recovered_staging_task(lease, &binding, &claim.plan.inputs, snapshot_id)
+                    .await?;
+            }
             self.persist_terminal_success(
                 claim.task_id,
                 claim.data_tenant_id,

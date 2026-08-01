@@ -728,6 +728,174 @@ impl Forge {
         };
         Ok((key, RewriteBin { files, total_bytes }))
     }
+
+    /// Finalizes the exact staging projection after task-tagged commit recovery.
+    ///
+    /// The persisted task input paths remain authoritative. Recovery accepts
+    /// only compacted rows from that exact set, requires one partition day,
+    /// and transitions the one matching prepared compaction operation. A
+    /// replay after the projection and audit transaction committed is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, identity, exact-set, operation-state, audit, or fence
+    /// errors. Missing, cross-partition, differently stamped, or ambiguously
+    /// prepared inputs fail closed without changing durable state.
+    pub(super) async fn stamp_recovered_staging_task(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        inputs: &[String],
+        snapshot_id: i64,
+    ) -> Result<(), ForgeError> {
+        if inputs.is_empty() || inputs.len() > self.core.config.max_files_per_bin {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovered staging task must contain one bounded non-empty bin".to_owned(),
+            });
+        }
+        let rows = sqlx::query(
+            r"SELECT id,file_path,partition_day,committed_snapshot_id
+                 FROM vala.file_list
+                WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3
+                  AND file_path=ANY($4) AND compacted
+                ORDER BY partition_day,id",
+        )
+        .bind(binding.tenant.as_uuid())
+        .bind(&binding.logical_namespace)
+        .bind(&binding.table_name)
+        .bind(inputs)
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if rows.len() != inputs.len() {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovered staging task inputs do not match the exact compacted set"
+                    .to_owned(),
+            });
+        }
+        let mut partition_day = None;
+        let mut file_ids = Vec::with_capacity(rows.len());
+        let mut actual_paths = BTreeSet::new();
+        let mut already_stamped = true;
+        for row in rows {
+            let day: NaiveDate =
+                row.try_get("partition_day")
+                    .map_err(|error| ForgeError::Reconciliation {
+                        detail: error.to_string(),
+                    })?;
+            if partition_day
+                .replace(day)
+                .is_some_and(|current| current != day)
+            {
+                return Err(ForgeError::Reconciliation {
+                    detail: "recovered staging task crosses a partition day".to_owned(),
+                });
+            }
+            file_ids.push(
+                row.try_get("id")
+                    .map_err(|error| ForgeError::Reconciliation {
+                        detail: error.to_string(),
+                    })?,
+            );
+            actual_paths.insert(row.try_get::<String, _>("file_path").map_err(|error| {
+                ForgeError::Reconciliation {
+                    detail: error.to_string(),
+                }
+            })?);
+            let committed: Option<i64> = row.try_get("committed_snapshot_id").map_err(|error| {
+                ForgeError::Reconciliation {
+                    detail: error.to_string(),
+                }
+            })?;
+            match committed {
+                Some(id) if id == snapshot_id => {}
+                None => already_stamped = false,
+                Some(_) => {
+                    return Err(ForgeError::Reconciliation {
+                        detail: "recovered staging input is stamped to another snapshot".to_owned(),
+                    });
+                }
+            }
+        }
+        let planned_paths = inputs.iter().cloned().collect::<BTreeSet<_>>();
+        if actual_paths != planned_paths {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovered staging task path set changed".to_owned(),
+            });
+        }
+        if already_stamped {
+            return Ok(());
+        }
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day: partition_day.ok_or_else(|| ForgeError::Reconciliation {
+                detail: "recovered staging task lost its partition day".to_owned(),
+            })?,
+        };
+        let detail = self
+            .prepared_staging_detail(binding.tenant, &key, &planned_paths)
+            .await?;
+        self.stamp_reconciled(lease, &key, &file_ids, &detail, snapshot_id)
+            .await
+    }
+
+    /// Resolve the one open staging operation matching an exact recovered path set.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL or reconciliation errors when bounded operation evidence is
+    /// malformed, overflowed, absent, or ambiguous.
+    async fn prepared_staging_detail(
+        &self,
+        tenant: DataTenantId,
+        key: &ForgeGroupKey,
+        planned_paths: &BTreeSet<String>,
+    ) -> Result<AuditDetail, ForgeError> {
+        let resource = key.audit_resource();
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = ForgeOperations::new(&resource, ForgeOperationFamily::StagingFold)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if page.overflowed {
+            return Err(ForgeError::Reconciliation {
+                detail: "open staging operations exceeded the recovery bound".to_owned(),
+            });
+        }
+        let matching = page
+            .operations
+            .into_iter()
+            .filter(|operation| match &operation.prepared_detail {
+                AuditDetail::ForgeCompaction { input_paths, .. } => input_paths
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>()
+                    .eq(planned_paths),
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "expected exactly one prepared staging operation for recovered inputs; matched {}",
+                    matching.len()
+                ),
+            });
+        }
+        Ok(matching
+            .into_iter()
+            .next()
+            .expect("exactly one matching prepared staging operation was validated")
+            .prepared_detail)
+    }
 }
 
 /// Map durable staging facts into the live-file policy without reusing its
@@ -994,7 +1162,7 @@ impl Forge {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        let commit = transaction.commit(self.core.catalog.as_ref());
+        let commit = transaction.commit_once(self.core.catalog.as_ref());
         tokio::pin!(commit);
         let response = tokio::select! {
             response = tokio::time::timeout(
@@ -1006,19 +1174,27 @@ impl Forge {
         let committed_table = match response {
             Ok(Ok(committed_table)) => committed_table,
             Ok(Err(error)) => {
-                if !Self::is_retryable(&error) {
-                    if lease.require_fence(&self.core.operator_pool).await.is_ok() {
-                        self.reset_inputs(lease, key, bin, &rewrite.files, operation_id)
-                            .await?;
-                    } else {
-                        tracing::warn!(
-                            lease_key = %lease.lease_key,
-                            operation_id = %operation_id,
-                            "definite Iceberg failure could not be reset after fence loss"
-                        );
+                if Self::is_retryable(&error)
+                    && let Some(recovered) = self
+                        .recover_uncertain_staging_commit(binding, task_identity)
+                        .await?
+                {
+                    recovered
+                } else {
+                    if !Self::is_retryable(&error) {
+                        if lease.require_fence(&self.core.operator_pool).await.is_ok() {
+                            self.reset_inputs(lease, key, bin, &rewrite.files, operation_id)
+                                .await?;
+                        } else {
+                            tracing::warn!(
+                                lease_key = %lease.lease_key,
+                                operation_id = %operation_id,
+                                "definite Iceberg failure could not be reset after fence loss"
+                            );
+                        }
                     }
+                    return Err(ForgeError::Catalog(error));
                 }
-                return Err(ForgeError::Catalog(error));
             }
             Err(_) => {
                 return Err(ForgeError::Timeout {
@@ -1035,6 +1211,41 @@ impl Forge {
         self.stamp_committed(lease, key, bin, &rewrite.files, operation_id, snapshot_id)
             .await?;
         Ok(committed_table)
+    }
+
+    /// Reload an accepted staging commit after its catalog response was uncertain.
+    ///
+    /// Recovery accepts only the current snapshot tagged with both the exact
+    /// durable task and attempt identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog errors when the table cannot be reloaded.
+    async fn recover_uncertain_staging_commit(
+        &self,
+        binding: &TenantTableBinding,
+        task_identity: Option<(Uuid, Uuid)>,
+    ) -> Result<Option<iceberg::table::Table>, ForgeError> {
+        let Some((task_id, attempt_id)) = task_identity else {
+            return Ok(None);
+        };
+        let recovered = self.load_table(&binding.table_ident()).await?;
+        let matches = recovered
+            .metadata()
+            .current_snapshot()
+            .is_some_and(|snapshot| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get("forge.task_id")
+                    == Some(&task_id.to_string())
+                    && snapshot
+                        .summary()
+                        .additional_properties
+                        .get("forge.task_attempt")
+                        == Some(&attempt_id.to_string())
+            });
+        Ok(matches.then_some(recovered))
     }
 
     /// Return whether Iceberg classified an error as safe to retry.

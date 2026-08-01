@@ -66,6 +66,7 @@ wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
 wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
 wyrd-testing = { path = "crates/wyrd/wyrd-testing", version = "0.0.1" }
 wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.0.1" }
+wyrd-tls = { path = "crates/shared/wyrd-tls", version = "0.0.1" }
 wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
@@ -73,7 +74,8 @@ async-trait = "0.1"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls-no-provider", "gzip", "brotli", "stream", "blocking"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 axum = "0.8"
 http = "1"
 serde = { version = "1", features = ["derive"] }
@@ -132,7 +134,7 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 jsonwebtoken = "9"
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "macros", "migrate", "chrono", "uuid", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "macros", "migrate", "chrono", "uuid", "json"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "catch-panic"] }
 tracing = "0.1"
@@ -140,16 +142,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 paste = "1"
 time = "0.3"
 ulid = "1"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
 arrow = "58"
 arrow-array = "58"
 arrow-schema = "58"
 statrs = "0.18"
 jsonpath-rust = "0.7"
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.32"
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono", "py-clone"] }
 toml = "0.8"
 shellexpand = "3"
@@ -159,19 +161,21 @@ arc-swap = "1.7"
 # Client-safe baseline (no `transport`/`server` → no axum). `wyrd-tonic` adds the
 # client `channel`/`tls` features and gates `tonic/server` behind its `server`
 # feature. Only `wyrd-tonic` may depend on tonic (check:no-tonic-outside-wyrd-tonic).
-tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
-tonic-health = "0.12"
-tonic-reflection = "0.12"
-tonic-types = "0.12"
-tonic-build = "0.12"
-prost = "0.13"
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-health = "0.14"
+tonic-reflection = "0.14"
+tonic-types = "0.14"
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
 napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3"
 napi-build = "2"
 
 # Cloud SDKs are server-tier only.
-aws-sdk-s3 = "=1.75.0"
-aws-config = { version = "1", features = ["sso", "behavior-version-latest"] }
+aws-sdk-s3 = { version = "=1.75.0", default-features = false, features = ["sigv4a", "rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
 aws-types = "1"
 gcloud-storage = { version = "1", features = ["auth"] }
 gcloud-auth = "1"

@@ -1454,6 +1454,7 @@ mod tests {
                 ),
             ],
             dropped_attributes_count: 0,
+            entity_refs: Vec::new(),
         }
     }
 
@@ -2001,6 +2002,7 @@ mod tests {
             flags: 1,
             trace_id: (1u8..=16).collect(),
             span_id: (1u8..=8).collect(),
+            event_name: String::new(),
         }
     }
 

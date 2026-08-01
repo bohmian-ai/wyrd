@@ -37,6 +37,7 @@ tokio-stream = "0.1"
 uuid = { workspace = true, features = ["v7"] }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
+wyrd-tls = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 

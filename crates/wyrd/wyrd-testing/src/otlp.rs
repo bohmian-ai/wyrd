@@ -204,6 +204,7 @@ impl RandomTraceGenerator {
                     ),
                 ],
                 dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
             }),
             scope_spans: vec![ScopeSpans {
                 scope: Some(InstrumentationScope {

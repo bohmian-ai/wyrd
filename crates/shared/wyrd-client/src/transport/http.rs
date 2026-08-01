@@ -92,17 +92,7 @@ impl HttpTransport {
     /// Returns [`WyrdClientError::TransportDown`] when the underlying
     /// `reqwest::Client` cannot be constructed.
     pub fn new(config: &HttpConfig, auth: Arc<AuthMiddleware>) -> Result<Self, WyrdClientError> {
-        let mut builder =
-            reqwest::Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if config.compression {
-            builder = builder.gzip(true);
-        }
-        let client = builder
-            .build()
-            .map_err(|err| WyrdClientError::TransportDown {
-                transport: "http".to_owned(),
-                message: format!("failed to build HTTP client: {err}"),
-            })?;
+        let client = build_http_client(config)?;
         Ok(Self {
             client,
             auth,
@@ -610,6 +600,30 @@ impl HttpTransport {
     }
 }
 
+/// Builds the shared Reqwest client after installing Wyrd's process TLS provider.
+///
+/// # Errors
+///
+/// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+/// already owns the process or Reqwest rejects the client configuration.
+///
+fn build_http_client(config: &HttpConfig) -> Result<reqwest::Client, WyrdClientError> {
+    wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
+        transport: "http".to_owned(),
+        message: error.to_string(),
+    })?;
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_millis(config.timeout_ms));
+    if config.compression {
+        builder = builder.gzip(true);
+    }
+    builder
+        .build()
+        .map_err(|err| WyrdClientError::TransportDown {
+            transport: "http".to_owned(),
+            message: format!("failed to build HTTP client: {err}"),
+        })
+}
+
 /// Serialize an optional body to JSON bytes.
 fn serialize_body<S: Serialize>(body: Option<&S>) -> Result<Option<Vec<u8>>, WyrdError> {
     body.map(serde_json::to_vec)
@@ -676,4 +690,19 @@ fn split_origin(url: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((scheme, authority))
+}
+
+#[cfg(test)]
+mod tls_tests {
+    /// Reqwest builds an HTTPS request before any tonic/server initialization.
+    #[test]
+    fn https_client_initializes_provider_standalone() {
+        let client = super::build_http_client(&crate::transport::config::HttpConfig::default())
+            .expect("standalone HTTPS client builds");
+        client
+            .get("https://localhost/health")
+            .build()
+            .expect("HTTPS request builds");
+        wyrd_tls::install_crypto_provider().expect("HTTP boundary retained AWS-LC ownership");
+    }
 }

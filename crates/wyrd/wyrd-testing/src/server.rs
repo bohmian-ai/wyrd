@@ -181,6 +181,8 @@ pub struct WyrdTestServer {
     serve_handle: Option<JoinHandle<Result<(), wyrd_server::BootExit>>>,
     /// Optional fixed HTTP/gRPC addresses reserved by a multi-node harness.
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    /// Optional TLS material applied when this in-process server binds.
+    requested_oracle_peer_tls: Option<TestOraclePeerTls>,
 }
 
 struct WyrdTestServerInner {
@@ -240,6 +242,21 @@ pub struct WyrdTestServerBuilder {
     bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// Optional cluster-scoped Oracle peer credential injected by the harness.
     oracle_peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
+    /// Optional production-shaped Oracle server identity and peer trust paths.
+    oracle_peer_tls: Option<TestOraclePeerTls>,
+}
+
+/// Test-only file paths for a shared Oracle TLS identity and trust root.
+#[derive(Clone)]
+pub(crate) struct TestOraclePeerTls {
+    /// Server certificate chain PEM path.
+    pub(crate) certificate_path: std::path::PathBuf,
+    /// Server private-key PEM path.
+    pub(crate) private_key_path: std::path::PathBuf,
+    /// Peer CA certificate PEM path.
+    pub(crate) ca_path: std::path::PathBuf,
+    /// Certificate DNS identity expected by clients.
+    pub(crate) server_name: String,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -271,6 +288,7 @@ impl Default for WyrdTestServerBuilder {
             telemetry: None,
             bind_addrs: None,
             oracle_peer_credentials: None,
+            oracle_peer_tls: None,
         }
     }
 }
@@ -589,7 +607,11 @@ impl WyrdTestServer {
     #[must_use]
     pub fn grpc_url(&self) -> Option<String> {
         match &self.mode {
-            Mode::Bound { grpc_addr, .. } => Some(format!("http://{grpc_addr}")),
+            Mode::Bound { grpc_addr, .. } => Some(if self.requested_oracle_peer_tls.is_some() {
+                format!("https://localhost:{}", grpc_addr.port())
+            } else {
+                format!("http://{grpc_addr}")
+            }),
             Mode::InProcess => None,
         }
     }
@@ -1255,6 +1277,10 @@ impl WyrdTestServer {
         let mut config = WyrdServerConfig::default();
         config.http.bind = http_bind;
         config.grpc.bind = grpc_bind;
+        if let Some(tls) = &self.requested_oracle_peer_tls {
+            config.grpc.certificate_chain_path = Some(tls.certificate_path.clone());
+            config.grpc.private_key_path = Some(tls.private_key_path.clone());
+        }
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
 
@@ -1493,6 +1519,13 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Enable TLS on the bound gRPC listener and Oracle peer transport.
+    #[must_use]
+    pub(crate) fn with_oracle_peer_tls(mut self, tls: TestOraclePeerTls) -> Self {
+        self.oracle_peer_tls = Some(tls);
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -1555,8 +1588,10 @@ impl WyrdTestServerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error when fixture resources, authentication state, Forge,
-    /// Scribe, or the application router cannot be constructed.
+    /// Returns an error when another Rustls provider already owns the process,
+    /// or fixture resources, authentication state, Forge, Scribe, or the
+    /// application router cannot be constructed. Cancellation may leave
+    /// fixture-owned database setup committed, but no server task is retained.
     pub(crate) async fn start_with_resources(
         self,
         fixture: Arc<PgFixture>,
@@ -1565,6 +1600,8 @@ impl WyrdTestServerBuilder {
         bifrost_redux: Arc<BifrostCatalog>,
         storage_root: Option<Arc<tempfile::TempDir>>,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        wyrd_tls::install_crypto_provider()
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         // Keep one governor and one DataFusion pool in this graph. Forge and
         // AppState must observe the same pool so query and rewrite admission
         // share accounting rather than silently creating independent budgets.
@@ -1807,17 +1844,37 @@ impl WyrdTestServerBuilder {
                     "Oracle-enabled test server requires a peer credential".to_owned(),
                 )
             })?;
-            state = wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials(
-                state,
-                node_id,
-                SecretString::from(crate::keys::private_key_pem().to_owned()),
-                self.bind_addrs.map_or_else(
-                    || "http://127.0.0.1:0".to_owned(),
-                    |(_, grpc)| format!("http://{grpc}"),
-                ),
-                credentials,
-            )
-            .await
+            let advertise_addr = self.bind_addrs.map_or_else(
+                || "http://127.0.0.1:0".to_owned(),
+                |(_, grpc)| {
+                    if self.oracle_peer_tls.is_some() {
+                        format!("https://localhost:{}", grpc.port())
+                    } else {
+                        format!("http://{grpc}")
+                    }
+                },
+            );
+            state = if let Some(tls) = &self.oracle_peer_tls {
+                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
+                    state,
+                    node_id,
+                    SecretString::from(crate::keys::private_key_pem().to_owned()),
+                    advertise_addr,
+                    credentials,
+                    tls.ca_path.clone(),
+                    tls.server_name.clone(),
+                )
+                .await
+            } else {
+                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials(
+                    state,
+                    node_id,
+                    SecretString::from(crate::keys::private_key_pem().to_owned()),
+                    advertise_addr,
+                    credentials,
+                )
+                .await
+            }
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         }
         let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
@@ -1870,6 +1927,7 @@ impl WyrdTestServerBuilder {
             shutdown_token: None,
             serve_handle: None,
             requested_bind: self.bind_addrs,
+            requested_oracle_peer_tls: self.oracle_peer_tls,
         })
     }
 
@@ -1887,14 +1945,27 @@ impl WyrdTestServerBuilder {
     /// addresses, so there is no bind-then-rebind race.
     ///
     /// # Errors
-    /// Returns an error when startup or socket binding fails.
+    /// Returns an error when another Rustls provider already owns the process,
+    /// startup fails, or socket binding fails. Cancellation may leave fixture
+    /// database setup committed, while bound sockets close when owned state is
+    /// dropped.
     pub async fn start_bound(self) -> Result<WyrdTestServer, WyrdTestServerError> {
         let srv = self.start_in_process().await?;
         srv.bind().await
     }
 }
 
+/// Poll a bound test server until its HTTP health endpoint reports readiness.
+///
+/// # Errors
+///
+/// Returns [`WyrdTestServerError::Start`] when another Rustls provider already
+/// owns the process, or [`WyrdTestServerError::Bind`] when the server does not
+/// become ready within the bounded retry window. Cancellation stops polling
+/// without stopping the independently owned server task.
 async fn wait_for_ready(base_url: &str) -> Result<(), WyrdTestServerError> {
+    wyrd_tls::install_crypto_provider()
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
     let client = reqwest::Client::new();
     let url = format!("{base_url}/healthz");
     for attempt in 0..30u32 {

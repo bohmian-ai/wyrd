@@ -46,6 +46,12 @@ pub(crate) fn private_key_pem() -> SecretString {
     )
 }
 
+/// Return the deterministic Oracle peer signing key used by real test servers.
+#[must_use]
+pub fn oracle_peer_signing_key_pem() -> SecretString {
+    private_key_pem()
+}
+
 pub(crate) fn public_key_pem() -> &'static str {
     PUBLIC_KEY_PEM.get_or_init(|| {
         verifying_key()

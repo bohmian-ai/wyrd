@@ -53,8 +53,10 @@ impl GrpcConnection {
     /// (500). The divergence is intentional and documented in both modules.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when the endpoint URI is
-    /// invalid or the dial fails (DNS, TCP, or TLS) on all attempts.
+    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+    /// already owns the process, the endpoint URI is invalid, or the dial fails
+    /// (DNS, TCP, or TLS) on all attempts. Cancellation stops retries and drops
+    /// the in-progress channel without retaining a connection.
     pub async fn connect(
         config: &GrpcConfig,
         auth: Arc<AuthMiddleware>,
@@ -128,7 +130,17 @@ impl GrpcConnection {
 ///
 /// Kept separate so the retry loop in [`GrpcConnection::connect`] can reuse
 /// it without repeating validation logic.
+///
+/// # Errors
+///
+/// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+/// already owns the process, the endpoint URI is invalid, or its TLS
+/// configuration cannot be constructed.
 fn build_endpoint(config: &GrpcConfig) -> Result<Endpoint, WyrdClientError> {
+    wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
+        transport: "grpc".to_owned(),
+        message: error.to_string(),
+    })?;
     let endpoint = Endpoint::from_shared(config.endpoint.clone()).map_err(|err| {
         WyrdClientError::TransportDown {
             transport: "grpc".to_owned(),

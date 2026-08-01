@@ -122,8 +122,10 @@ impl Default for PoolConfig {
 /// Build a Postgres pool with the supplied role-specific config.
 ///
 /// # Errors
-/// Returns [`sqlx::Error`] when the DSN cannot be parsed or SQLx cannot
-/// connect.
+/// Returns [`sqlx::Error::Configuration`] when another Rustls provider already
+/// owns the process or the DSN cannot be parsed. Other [`sqlx::Error`] variants
+/// report pool construction or connection failures. Cancellation may leave
+/// connections opened by SQLx for the pool to close during drop.
 pub async fn build_pool(database_url: &str, config: PoolConfig) -> Result<PgPool, sqlx::Error> {
     connect_pool(database_url, config).await
 }
@@ -131,8 +133,9 @@ pub async fn build_pool(database_url: &str, config: PoolConfig) -> Result<PgPool
 /// Build the runtime `wyrd_app` pool from `WYRD_DB_*` tuning.
 ///
 /// # Errors
-/// Returns [`sqlx::Error`] when the DSN cannot be parsed or SQLx cannot
-/// connect.
+/// Returns [`sqlx::Error::Configuration`] when another Rustls provider already
+/// owns the process or the DSN cannot be parsed. Other [`sqlx::Error`] variants
+/// report pool construction or connection failures.
 pub async fn build_app_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     build_pool(database_url, PoolConfig::app_from_env()).await
 }
@@ -140,8 +143,9 @@ pub async fn build_app_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
 /// Build the boot-only `wyrd_migrator` pool from `WYRD_DB_*_MIGRATOR` tuning.
 ///
 /// # Errors
-/// Returns [`sqlx::Error`] when the DSN cannot be parsed or SQLx cannot
-/// connect.
+/// Returns [`sqlx::Error::Configuration`] when another Rustls provider already
+/// owns the process or the DSN cannot be parsed. Other [`sqlx::Error`] variants
+/// report pool construction or connection failures.
 pub async fn build_migrator_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     build_pool(database_url, PoolConfig::migrator_from_env()).await
 }
@@ -150,16 +154,30 @@ pub async fn build_migrator_pool(database_url: &str) -> Result<PgPool, sqlx::Err
 /// `WYRD_DB_*_PLATFORM_ADMIN` tuning.
 ///
 /// # Errors
-/// Returns [`sqlx::Error`] when the DSN cannot be parsed or SQLx cannot
-/// connect.
+/// Returns [`sqlx::Error::Configuration`] when another Rustls provider already
+/// owns the process or the DSN cannot be parsed. Other [`sqlx::Error`] variants
+/// report pool construction or connection failures.
 pub async fn build_platform_admin_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     build_pool(database_url, PoolConfig::platform_admin_from_env()).await
 }
 
+/// Connect a role-configured Postgres pool after claiming Wyrd's TLS provider.
+///
+/// The provider is installed before SQLx parses or connects the DSN, ensuring
+/// every TLS-capable pool observes the same process-wide crypto implementation.
+///
+/// # Errors
+///
+/// Returns [`sqlx::Error::Configuration`] when another Rustls provider already
+/// owns the process or the DSN cannot be parsed. Other [`sqlx::Error`] variants
+/// report pool construction or connection failures. Cancellation may leave
+/// connections opened by SQLx for the pool to close during drop.
 pub(crate) async fn connect_pool(
     database_url: &str,
     config: PoolConfig,
 ) -> Result<PgPool, sqlx::Error> {
+    wyrd_tls::install_crypto_provider()
+        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
     let options = PgConnectOptions::from_str(database_url)?
         .statement_cache_capacity(config.statement_cache_capacity);
 
@@ -277,6 +295,31 @@ mod tests {
                 test_before_acquire: true,
             }
         );
+    }
+
+    /// SQLx reaches its TLS connection path before any tonic/server initialization.
+    #[tokio::test]
+    async fn sql_tls_path_initializes_provider_standalone() {
+        let config = PoolConfig {
+            max_connections: 1,
+            min_connections: 0,
+            acquire_timeout: Duration::from_millis(50),
+            idle_timeout: None,
+            max_lifetime: None,
+            statement_cache_capacity: 0,
+            test_before_acquire: false,
+        };
+        let error = super::connect_pool(
+            "postgres://wyrd:wyrd@127.0.0.1:1/wyrd?sslmode=require",
+            config,
+        )
+        .await
+        .expect_err("closed local port rejects after TLS provider initialization");
+        assert!(matches!(
+            error,
+            sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut
+        ));
+        wyrd_tls::install_crypto_provider().expect("SQL boundary retained AWS-LC ownership");
     }
 
     #[test]

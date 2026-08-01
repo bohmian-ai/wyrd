@@ -32,8 +32,13 @@ fn cloud_disabled(backend: &BackendConfig) -> StorageError {
 /// Build the active backend signer.
 ///
 /// # Errors
-/// Returns a storage error when SDK construction or boot probing fails.
+/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
+/// already owns the process. Other storage errors report backend SDK
+/// construction or boot-probe failures. Cancellation can interrupt a remote
+/// probe without constructing a signer; it makes no durable storage changes.
+///
 pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, StorageError> {
+    wyrd_tls::install_crypto_provider()?;
     #[cfg(not(feature = "cloud"))]
     std::future::ready(()).await;
     match backend {
@@ -77,8 +82,12 @@ fn finish_op<B: opendal::Builder>(
 /// Build the opendal `Operator` for the selected backend.
 ///
 /// # Errors
-/// Returns a storage error when operator construction fails.
+/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
+/// already owns the process. Other storage errors report disabled backends or
+/// operator construction failures.
+///
 pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError> {
+    wyrd_tls::install_crypto_provider()?;
     match backend {
         BackendConfig::Local { root } => {
             finish_op(local::fs_service(root), StorageBackendKind::Local)

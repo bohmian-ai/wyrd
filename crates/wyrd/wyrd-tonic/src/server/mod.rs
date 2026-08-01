@@ -10,8 +10,8 @@ use arc_swap::ArcSwap;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::server::{Router as TonicRouter, TcpIncoming};
-use tonic::transport::Server;
+use tonic::transport::server::Router as TonicRouter;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
 use tracing::warn;
@@ -38,6 +38,9 @@ const HEALTH_CONSUMER_INTERVAL: Duration = Duration::from_secs(1);
 /// Errors raised by the gRPC server scaffold.
 #[derive(Debug, thiserror::Error)]
 pub enum GrpcError {
+    /// Process-wide Rustls provider ownership conflicts with Wyrd.
+    #[error(transparent)]
+    CryptoProvider(#[from] wyrd_tls::InstallError),
     /// Bind or serve failure from the tonic transport layer.
     #[error("gRPC transport failed")]
     Transport(#[from] tonic::transport::Error),
@@ -57,9 +60,12 @@ pub enum GrpcError {
 }
 
 /// Inputs to [`build_grpc_router`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GrpcRouterConfig {
+    /// Whether reflection is exposed on the listener.
     pub reflection_enabled: bool,
+    /// Optional PEM identity applied before any service is mounted.
+    pub tls_identity: Option<Identity>,
 }
 
 /// Build and return the configured tonic router.
@@ -77,6 +83,12 @@ pub struct GrpcRouterConfig {
 /// No `.layer(...)` is composed here — doing so changes the server's stacked
 /// type and breaks the `TonicRouter` return type. The auth interceptor seat
 /// is wired via `InterceptedService::new` on each mounted service.
+///
+/// # Errors
+///
+/// Returns [`GrpcError::CryptoProvider`] when another Rustls provider already
+/// owns the process, [`GrpcError::Transport`] when tonic rejects the TLS
+/// identity, or [`GrpcError::Reflection`] when reflection cannot be built.
 pub fn build_grpc_router<H, I>(
     health_service: HealthServer<H>,
     interceptor: I,
@@ -86,7 +98,13 @@ where
     H: Health,
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
 {
+    wyrd_tls::install_crypto_provider()?;
     let mut server = Server::builder();
+    if let Some(identity) = cfg.tls_identity {
+        server = server
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .map_err(GrpcError::Transport)?;
+    }
     let health = InterceptedService::new(health_service, interceptor.clone());
 
     let router = if cfg.reflection_enabled {
@@ -142,8 +160,7 @@ pub async fn serve_grpc_with_listener(
     listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), GrpcError> {
-    let incoming = TcpIncoming::from_listener(listener, true, None)
-        .map_err(|e| GrpcError::IncomingSetup(e.to_string()))?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     router
         .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
         .await
@@ -177,7 +194,7 @@ pub async fn publish_initial_health<S: HealthSnapshot>(
 #[tracing::instrument(skip(snapshot, reporter, shutdown))]
 pub async fn drive_health_status<S: HealthSnapshot>(
     snapshot: Arc<ArcSwap<S>>,
-    mut reporter: HealthReporter,
+    reporter: HealthReporter,
     shutdown: CancellationToken,
 ) {
     let mut last_ok: Option<bool> = Some(snapshot.load().all_ok());
@@ -237,6 +254,7 @@ mod tests {
             NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         );
         assert!(result.is_ok());
@@ -251,6 +269,7 @@ mod tests {
             NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: true,
+                tls_identity: None,
             },
         );
         assert!(result.is_ok());

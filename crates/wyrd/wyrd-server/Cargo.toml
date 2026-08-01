@@ -71,8 +71,8 @@ wyrd-spec = { workspace = true, features = ["server"] }
 wyrd-semver = { workspace = true }
 wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-storage = { workspace = true }
+wyrd-tls = { workspace = true }
 ed25519-dalek = { workspace = true }
-prost = { workspace = true }
 utoipa = { workspace = true }
 
 [dev-dependencies]

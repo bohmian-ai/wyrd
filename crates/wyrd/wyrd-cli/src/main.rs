@@ -15,8 +15,16 @@ use clap::Parser;
 use crate::cli::{Cli, Command};
 use crate::error::WyrdCliError;
 
+/// Initialize process-wide infrastructure and run one parsed CLI command.
+///
+/// TLS-provider conflicts and command errors are rendered to standard error and
+/// returned as a failing process exit code.
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    if let Err(error) = wyrd_tls::install_crypto_provider() {
+        eprintln!("Wyrd TLS initialization failed: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

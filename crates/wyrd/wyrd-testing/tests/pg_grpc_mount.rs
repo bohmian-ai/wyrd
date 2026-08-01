@@ -128,6 +128,7 @@ mod pg_tests {
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         );
         assert!(

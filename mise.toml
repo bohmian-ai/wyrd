@@ -1176,6 +1176,11 @@ hide = true
 description = "Reject tonic-family dep declarations outside wyrd-tonic + workspace pins"
 run = "bash scripts/checks/no-tonic-outside-wyrd-tonic.sh"
 
+[tasks."check:rustls-provider"]
+hide = true
+description = "Require AWS-LC-only Rustls and reject direct Reqwest 0.12 edges"
+run = "bash scripts/checks/rustls-provider.sh"
+
 [tasks."check:no-testing-in-prod-deps"]
 hide = true
 description = "Reject normal production dependencies on test-tier wyrd-testing or wyrd-bench crates"

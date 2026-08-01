@@ -19,7 +19,7 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
-    LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTransportDirectory,
+    LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTls, OraclePeerTransportDirectory,
     OraclePeerWorker, PEER_PROTOCOL_VERSION, ReservationRegistry, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
@@ -899,8 +899,13 @@ impl<'a> OracleRoleBuilder<'a> {
             .snapshot()
             .live_oracles()
             .into_iter()
+            .filter(|lease| lease.key.node_id != node_id)
             .map(|lease| (lease.key.node_id, lease.address.clone()))
             .collect::<HashMap<_, _>>();
+        validate_remote_oracle_addresses(
+            config.deployment_profile,
+            addresses.values().map(String::as_str),
+        )?;
         #[cfg(feature = "test-support")]
         let peer_credentials: Arc<dyn OraclePeerCredentials> = match injected_peer_credentials {
             Some(credentials) => credentials,
@@ -940,10 +945,27 @@ impl<'a> OracleRoleBuilder<'a> {
                 "Oracle peer credential lacks platform service authority".to_owned(),
             ));
         }
-        let remote_transport = Arc::new(TonicOraclePeerTransport::with_credentials(
-            addresses,
-            peer_credentials,
-        ));
+        let remote_transport = if let (Some(ca_path), Some(server_name)) = (
+            &config.bifrost.oracle.peer_ca_certificate_path,
+            &config.bifrost.oracle.peer_server_name,
+        ) {
+            let ca_certificate_pem = std::fs::read(ca_path).map_err(|_| {
+                ServerBootError::OraclePeer(format!(
+                    "failed to read Oracle peer CA certificate {}",
+                    ca_path.display()
+                ))
+            })?;
+            Arc::new(TonicOraclePeerTransport::with_credentials_and_tls(
+                addresses,
+                peer_credentials,
+                OraclePeerTls::new(ca_certificate_pem, server_name.clone()),
+            ))
+        } else {
+            Arc::new(TonicOraclePeerTransport::with_credentials(
+                addresses,
+                peer_credentials,
+            ))
+        };
         let reconciliation_limit_bytes = memory_budget
             .checked_div(4)
             .filter(|limit| *limit > 0)
@@ -1017,6 +1039,27 @@ impl<'a> OracleRoleBuilder<'a> {
             cluster,
         })
     }
+}
+
+/// Rejects plaintext live remote Oracle membership before runtime publication.
+///
+/// # Errors
+/// Returns [`ServerBootError::OraclePeer`] when production membership contains
+/// any remote address without the `https://` scheme.
+fn validate_remote_oracle_addresses<'a>(
+    profile: crate::config::DeploymentProfile,
+    addresses: impl Iterator<Item = &'a str>,
+) -> Result<(), ServerBootError> {
+    if profile.is_production()
+        && let Some(address) = addresses
+            .into_iter()
+            .find(|address| !address.starts_with("https://"))
+    {
+        return Err(ServerBootError::OraclePeer(format!(
+            "live remote Oracle membership address must use https://: {address}"
+        )));
+    }
+    Ok(())
 }
 
 /// Fully constructed Oracle role waiting for lifecycle publication.
@@ -1178,6 +1221,40 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
     let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
+    OracleRoleBuilder {
+        state,
+        config: &config,
+        signing_key: &signing_key,
+        cluster,
+        node_id,
+        advertise_addr: &advertise_addr,
+        peer_credentials: Some(peer_credentials),
+    }
+    .build()
+    .await
+}
+
+/// Attach a test Oracle role with real server TLS and CA/DNS-authenticated peers.
+///
+/// # Errors
+/// Returns the same boot, credential, membership, and TLS configuration failures
+/// as production Oracle attachment.
+#[cfg(feature = "test-support")]
+pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
+    state: AppState,
+    node_id: wyrd_spec::vala::api::NodeId,
+    signing_key: secrecy::SecretString,
+    advertise_addr: String,
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
+    ca_path: std::path::PathBuf,
+    server_name: String,
+) -> Result<AppState, ServerBootError> {
+    let node_id = ClusterNodeId::new(node_id.as_uuid());
+    let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
+    let mut config = crate::config::WyrdServerConfig::default();
+    config.auth.signing_key = Some(signing_key.clone());
+    config.bifrost.oracle.peer_ca_certificate_path = Some(ca_path);
+    config.bifrost.oracle.peer_server_name = Some(server_name);
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1411,6 +1488,21 @@ pub fn spawn_maintenance_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Production boot rejects a plaintext address discovered from live membership.
+    #[test]
+    fn production_boot_rejects_http_live_remote_oracle_member() {
+        let addresses = HashMap::from([(
+            NodeId::new(uuid::Uuid::now_v7()),
+            "http://oracle-remote.internal:50052".to_owned(),
+        )]);
+        let error = validate_remote_oracle_addresses(
+            crate::config::DeploymentProfile::Production,
+            addresses.values().map(String::as_str),
+        )
+        .expect_err("plaintext live membership must fail before publication");
+        assert!(error.to_string().contains("must use https://"));
+    }
 
     fn implicit_tenant() -> DataTenantId {
         "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"

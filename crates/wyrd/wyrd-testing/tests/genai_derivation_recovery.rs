@@ -38,6 +38,7 @@ mod pg_tests {
                 resource: Some(OtlpResource {
                     attributes: vec![kv("service.name", "genai-recovery-journey")],
                     dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
                 }),
                 scope_spans: vec![ScopeSpans {
                     scope: None,

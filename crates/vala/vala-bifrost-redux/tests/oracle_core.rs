@@ -84,7 +84,7 @@ impl PeerTicketVerifier for DeterministicTestVerifier {
         expected_worker_fence: u64,
         _now: chrono::DateTime<Utc>,
     ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
-        use prost::Message as _;
+        use wyrd_tonic::prost::Message as _;
 
         if ticket.key_id != "test" || ticket.signature != ticket.claims_bytes {
             return Err(PeerSecurityError::InvalidSignature);

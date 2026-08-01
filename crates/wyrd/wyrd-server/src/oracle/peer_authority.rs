@@ -3,7 +3,6 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use prost::Message;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
@@ -16,6 +15,7 @@ use vala_bifrost_redux::oracle::peer::{
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{BifrostSecurityViolationKind, NodeId, SignedPeerTicket};
+use wyrd_tonic::prost::Message;
 
 /// Domain separator preventing peer signatures from crossing protocol boundaries.
 const DOMAIN: &[u8] = b"wyrd.oracle.peer.v1\0";
@@ -103,8 +103,7 @@ impl OraclePeerAuthority {
     /// Returns [`PeerSecurityError::Encoding`] when claims cannot be encoded.
     pub fn mint(&self, claims: &PeerTicketClaims) -> Result<SignedPeerTicket, PeerSecurityError> {
         let mut claims_bytes = Vec::new();
-        prost::Message::encode(claims, &mut claims_bytes)
-            .map_err(|_| PeerSecurityError::Encoding)?;
+        Message::encode(claims, &mut claims_bytes).map_err(|_| PeerSecurityError::Encoding)?;
         let signature = self
             .signing
             .sign(&signing_input(&self.key_id, &claims_bytes));

@@ -195,12 +195,23 @@ impl AuthorizationCodeExchange {
     }
 }
 
+/// Discover an issuer using Wyrd's process-owned TLS implementation.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
+/// already owns the process, the issuer URL is invalid, or discovery fails.
+/// Cancellation interrupts the request without persisting callback state.
 async fn discover_provider(trusted: &TrustedIssuer) -> Result<OidcProvider, WyrdError> {
     let issuer_url =
         url::Url::parse(trusted.issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
             message: "trusted issuer URL could not be parsed".to_owned(),
             details: serde_json::json!({}),
         })?;
+    wyrd_tls::install_crypto_provider().map_err(|_| WyrdError::DiscoveryUnavailable {
+        message: "OIDC TLS provider initialization failed".to_owned(),
+        details: serde_json::json!({}),
+    })?;
     OidcProvider::discover(issuer_url, reqwest::Client::new())
         .await
         .map_err(|error| {
@@ -212,6 +223,19 @@ async fn discover_provider(trusted: &TrustedIssuer) -> Result<OidcProvider, Wyrd
         })
 }
 
+/// Exchange one validated authorization code for an issuer ID token.
+///
+/// The request includes the configured client authentication material and the
+/// callback's PKCE verifier; no token is persisted by this helper.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
+/// already owns the process or discovery omitted the token endpoint. Returns
+/// the callback's structured authentication errors when request construction,
+/// transport, response parsing, or token validation fails. Cancellation can
+/// leave the remote exchange outcome unknown, but this helper makes no local
+/// durable progress.
 async fn exchange_code_for_id_token(
     provider: &OidcProvider,
     trusted: &TrustedIssuer,
@@ -225,6 +249,10 @@ async fn exchange_code_for_id_token(
         });
     };
 
+    wyrd_tls::install_crypto_provider().map_err(|_| WyrdError::DiscoveryUnavailable {
+        message: "OIDC TLS provider initialization failed".to_owned(),
+        details: serde_json::json!({}),
+    })?;
     let client = reqwest::Client::new();
     let mut request = client.post(token_endpoint);
     let mut form = vec![

@@ -31,8 +31,8 @@ use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::Bootstrap;
 use crate::server::{
-    WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError, provision_oracle_peer_credentials,
-    test_catalog, test_redux_catalog,
+    TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
+    provision_oracle_peer_credentials, test_catalog, test_redux_catalog,
 };
 
 /// Supported role topology for a Bifrost cluster journey.
@@ -114,6 +114,12 @@ impl BifrostClusterSpec {
     #[must_use]
     pub fn one_mixed() -> Self {
         Self::mixed(1)
+    }
+
+    /// Construct two mixed nodes for direct peer-transport journeys.
+    #[must_use]
+    pub fn two_mixed() -> Self {
+        Self::mixed(2)
     }
 
     /// Construct three mixed nodes.
@@ -516,9 +522,48 @@ pub struct WyrdTestCluster {
     telemetry: OracleTelemetryCapture,
     /// Valid SYSTEM_OWNER Service credential retained across node restarts.
     oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
+    /// Optional retained TLS fixture directory and paths for real peer transport.
+    oracle_peer_tls: Option<(Arc<tempfile::TempDir>, TestOraclePeerTls)>,
 }
 
 impl WyrdTestCluster {
+    /// Connect to one real Oracle server through the cluster's configured TLS trust.
+    ///
+    /// # Errors
+    /// Returns a resource error when TLS is disabled, the node is absent, or
+    /// certificate/DNS-authenticated channel establishment fails.
+    pub async fn oracle_peer_channel(
+        &self,
+        index: usize,
+    ) -> Result<wyrd_tonic::tonic::transport::Channel, ClusterError> {
+        let (_, tls) = self
+            .oracle_peer_tls
+            .as_ref()
+            .ok_or_else(|| ClusterError::Resource("Oracle peer TLS is not enabled".to_owned()))?;
+        let address = self
+            .server(index)
+            .and_then(WyrdTestServer::grpc_url)
+            .ok_or_else(|| ClusterError::Resource("Oracle peer endpoint is absent".to_owned()))?;
+        let ca = std::fs::read(&tls.ca_path)
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        wyrd_tonic::transport::authenticated_tls_endpoint(address, &ca, tls.server_name.clone())
+            .map_err(|error| ClusterError::Resource(error.to_string()))?
+            .connect()
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))
+    }
+
+    /// Return the cluster-owned least-privilege Oracle Service bearer.
+    ///
+    /// # Errors
+    /// Returns a resource error when token exchange fails.
+    pub async fn oracle_peer_bearer(&self, force_refresh: bool) -> Result<String, ClusterError> {
+        self.oracle_peer_credentials
+            .bearer(force_refresh)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))
+    }
+
     /// Start a legacy named topology over shared real dependencies.
     ///
     /// # Errors
@@ -538,7 +583,18 @@ impl WyrdTestCluster {
     /// installation failure, or node bind failure. Nodes already started are
     /// shut down before the error returns.
     pub async fn start_spec(spec: BifrostClusterSpec) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None).await
+        Self::start_spec_with_options(spec, Duration::ZERO, None, false).await
+    }
+
+    /// Start real Wyrd servers whose Oracle membership and gRPC listeners use TLS.
+    ///
+    /// # Errors
+    /// Returns the same topology, resource, TLS-fixture, or server boot errors as
+    /// [`Self::start_spec`].
+    pub async fn start_spec_with_oracle_peer_tls(
+        spec: BifrostClusterSpec,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_options(spec, Duration::ZERO, None, true).await
     }
 
     /// Start a named topology with an explicit WAL fsync delay.
@@ -552,7 +608,7 @@ impl WyrdTestCluster {
         wal_sync_delay: Duration,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(topology.spec(), wal_sync_delay, None).await
+        Self::start_spec_with_options(topology.spec(), wal_sync_delay, None, false).await
     }
 
     /// Start a named topology with deterministic Scribe admission bounds.
@@ -566,7 +622,7 @@ impl WyrdTestCluster {
         admission: AdmissionConfig,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(topology.spec(), Duration::ZERO, Some(admission)).await
+        Self::start_spec_with_options(topology.spec(), Duration::ZERO, Some(admission), false).await
     }
 
     /// Build shared dependencies, retained roots, and every node slot.
@@ -574,6 +630,7 @@ impl WyrdTestCluster {
         spec: BifrostClusterSpec,
         wal_sync_delay: Duration,
         scribe_admission: Option<AdmissionConfig>,
+        enable_oracle_peer_tls: bool,
     ) -> Result<Self, ClusterError> {
         spec.validate()?;
         let process = process_telemetry()?;
@@ -613,6 +670,37 @@ impl WyrdTestCluster {
         let redux_catalog: Arc<BifrostCatalog> = test_redux_catalog(&fixture, &storage).await?;
         let oracle_peer_credentials =
             provision_oracle_peer_credentials(Arc::clone(&fixture)).await?;
+        let oracle_peer_tls = if enable_oracle_peer_tls {
+            let root = Arc::new(
+                tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
+            );
+            let certificate_path = root.path().join("oracle-peer-cert.pem");
+            let private_key_path = root.path().join("oracle-peer-key.pem");
+            let ca_path = root.path().join("oracle-peer-ca.pem");
+            std::fs::write(
+                &certificate_path,
+                include_bytes!("fixtures/oracle-peer-cert.pem"),
+            )
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            std::fs::write(
+                &private_key_path,
+                include_bytes!("fixtures/oracle-peer-key.pem"),
+            )
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            std::fs::write(&ca_path, include_bytes!("fixtures/oracle-peer-ca.pem"))
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            Some((
+                root,
+                TestOraclePeerTls {
+                    certificate_path,
+                    private_key_path,
+                    ca_path,
+                    server_name: "localhost".to_owned(),
+                },
+            ))
+        } else {
+            None
+        };
         let topology = classify_topology(&spec);
         let mut nodes = BTreeMap::new();
         for node in spec.nodes {
@@ -655,6 +743,7 @@ impl WyrdTestCluster {
             faults: OracleFaultController::default(),
             telemetry: process.capture.clone(),
             oracle_peer_credentials,
+            oracle_peer_tls,
         };
         let node_ids = cluster.nodes.keys().copied().collect::<Vec<_>>();
         for node_id in node_ids {
@@ -684,6 +773,9 @@ impl WyrdTestCluster {
             .with_telemetry(Arc::clone(&process_telemetry()?.guard));
         if let Some(admission) = self.scribe_admission {
             builder = builder.with_scribe_admission_for_test(admission);
+        }
+        if let Some((_, tls)) = &self.oracle_peer_tls {
+            builder = builder.with_oracle_peer_tls(tls.clone());
         }
         Ok(builder
             .start_with_resources(

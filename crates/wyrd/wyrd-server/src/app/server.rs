@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
+use wyrd_tonic::tonic::transport::Identity;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
@@ -28,6 +30,35 @@ use crate::grpc::{
 use crate::state::AppState;
 
 type BoxWorker = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Boot-loaded gRPC identity whose private key remains redacted until tonic consumes it.
+struct GrpcIdentityMaterial {
+    /// Public certificate-chain PEM bytes.
+    certificate: Vec<u8>,
+    /// Private-key PEM retained in a redacting secret owner.
+    private_key: SecretString,
+}
+
+impl std::fmt::Debug for GrpcIdentityMaterial {
+    /// Formats only the public certificate size and never exposes key material.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrpcIdentityMaterial")
+            .field("certificate_bytes", &self.certificate.len())
+            .field("private_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl GrpcIdentityMaterial {
+    /// Moves the public certificate and an explicitly exposed key into tonic's identity boundary.
+    fn into_identity(self) -> Identity {
+        Identity::from_pem(
+            self.certificate,
+            self.private_key.expose_secret().as_bytes(),
+        )
+    }
+}
 
 /// Composable server: seeds core HTTP/gRPC + workers from `AppState`, accepts
 /// enterprise extensions, and drives a supervised lifecycle.
@@ -71,11 +102,44 @@ impl WyrdServer {
         // Store this reporter in state so readiness drives THIS health service.
         let state = state.with_grpc_health(reporter.clone());
 
+        let tls_identity = match (
+            &config.grpc.certificate_chain_path,
+            &config.grpc.private_key_path,
+        ) {
+            (Some(certificate_path), Some(key_path)) => {
+                let certificate = std::fs::read(certificate_path).map_err(|_| {
+                    ServerBootError::OraclePeer(format!(
+                        "failed to read gRPC certificate chain {}",
+                        certificate_path.display()
+                    ))
+                })?;
+                let key = std::fs::read_to_string(key_path).map_err(|_| {
+                    ServerBootError::OraclePeer(format!(
+                        "failed to read gRPC private key {}",
+                        key_path.display()
+                    ))
+                })?;
+                Some(
+                    GrpcIdentityMaterial {
+                        certificate,
+                        private_key: SecretString::from(key),
+                    }
+                    .into_identity(),
+                )
+            }
+            (None, None) => None,
+            _ => {
+                return Err(ServerBootError::OraclePeer(
+                    "gRPC TLS certificate and private key must be configured together".to_owned(),
+                ));
+            }
+        };
         let grpc_router = build_app_grpc(
             &state,
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: config.grpc.reflection_enabled,
+                tls_identity,
             },
         )?;
         let http_router = crate::http::build_router(state.clone());
@@ -194,8 +258,12 @@ impl WyrdServer {
     /// never-run server never touches the global recorder.
     ///
     /// # Errors
-    /// Returns [`BootExit::Other`] on listener bind failure.
+    /// Returns [`BootExit::Other`] when another Rustls provider already owns the
+    /// process, listener binding fails, or configured gRPC identity material
+    /// cannot be loaded. Cancellation may leave already-bound listeners open
+    /// until the returned future and its owned server state are dropped.
     pub async fn bind(self, mode: ServeMode) -> Result<BoundServer, BootExit> {
+        wyrd_tls::install_crypto_provider().map_err(|error| BootExit::Other(Box::new(error)))?;
         let (http_listener, http_addr) = if mode.serves_http() {
             let bind = self.config.http.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
@@ -478,6 +546,18 @@ mod pg_tests {
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
     use crate::state::BifrostIngestRuntime;
+
+    /// Private gRPC key material is absent from diagnostic formatting.
+    #[test]
+    fn grpc_identity_material_debug_redacts_private_key() {
+        let material = GrpcIdentityMaterial {
+            certificate: b"public certificate".to_vec(),
+            private_key: SecretString::from("private-key-sentinel"),
+        };
+        let debug = format!("{material:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("private-key-sentinel"));
+    }
 
     async fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());

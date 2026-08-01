@@ -37,6 +37,7 @@ wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-sql = { workspace = true }
+wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }

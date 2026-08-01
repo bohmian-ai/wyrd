@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -11,6 +10,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::SignedPeerTicket;
+use wyrd_tonic::prost::Message;
 
 /// Typed claims signed for one worker attempt.
 #[derive(Clone, PartialEq, Message)]

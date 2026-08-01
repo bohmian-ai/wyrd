@@ -4,11 +4,11 @@
 
 fn main() {
     use opentelemetry::global;
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use opentelemetry_stdout::SpanExporter;
 
     let exporter = SpanExporter::default();
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter)
         .build();
     global::set_tracer_provider(provider);

@@ -87,6 +87,7 @@ mod pg_tests {
             flags: 1,
             trace_id: trace_id.to_vec(),
             span_id: span_id.to_vec(),
+            event_name: String::new(),
         };
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -96,6 +97,7 @@ mod pg_tests {
                         any_value::Value::StringValue("checkout".to_owned()),
                     )],
                     dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: None,

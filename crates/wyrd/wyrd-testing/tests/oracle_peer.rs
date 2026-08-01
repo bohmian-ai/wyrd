@@ -18,7 +18,7 @@ use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::oracle::OracleSlotManager;
 use vala_bifrost_redux::oracle::dispatcher::{
     DispatchCandidate, DispatchContext, DispatchError, FragmentDispatcher,
-    LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTransport,
+    LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTls, OraclePeerTransport,
     OraclePeerTransportDirectory, OraclePeerWorker, PEER_PROTOCOL_VERSION, ReservationRegistry,
     TonicOraclePeerTransport, WorkerExecution,
 };
@@ -27,6 +27,24 @@ use vala_bifrost_redux::oracle::dispatcher::{
 struct RefreshProbeCredentials {
     /// Number of forced refreshes requested after `Unauthenticated`.
     forced: AtomicUsize,
+}
+
+/// Credential probe proving transport trust fails before bearer acquisition.
+struct BearerCallProbe {
+    /// Total bearer requests observed by the probe.
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl OraclePeerCredentials for BearerCallProbe {
+    /// Records any forbidden bearer acquisition.
+    ///
+    /// # Errors
+    /// This deterministic probe never fails.
+    async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("must-not-be-read".to_owned())
+    }
 }
 
 #[async_trait::async_trait]
@@ -111,6 +129,7 @@ use wyrd_spec::vala::api::{
     ExecuteFragmentRequest, NodeId, OracleCapabilitiesV1, PendingNodeReservation, QueryClass,
     QueryId, ReleaseNodeSlotsRequest, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse,
 };
+use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::{Bootstrap, WyrdTestEnv};
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
@@ -125,6 +144,26 @@ use wyrd_tonic::wyrd::v1::{
 
 /// Fixed PKCS#8 test authority shared by all three independent roles.
 const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+
+/// Self-signed localhost certificate used only by the private peer TLS journey.
+const PEER_TLS_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBejCCASygAwIBAgIUJeVIuSWVQLAAGvPJqorJ35AzIGowBQYDK2VwMBcxFTAT\nBgNVBAMMDFd5cmQgVGVzdCBDQTAeFw0yNjA4MDEyMjI3MzNaFw0zNjA3MjkyMjI3\nMzNaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDAqMAUGAytlcAMhAMQ7zYZh/326Ow2l\n47We9Ry2DX+dsle7/7KJ3xuOyV+go4GMMIGJMBQGA1UdEQQNMAuCCWxvY2FsaG9z\ndDAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEF\nBQcDATAdBgNVHQ4EFgQUpKZ9RXjCNCa7WdnZ/RbnQTjeeIswHwYDVR0jBBgwFoAU\nffiXuERzxz/wUzFHryjCu9kawNcwBQYDK2VwA0EAIAItrDZanEwE2rY8ZC8oXu2l\n3YuscufK/YpVoroZxjer7ANpKL2nf+Q7DdnVThHx7ZY0rHNr28P2+db0u/P6Aw==\n-----END CERTIFICATE-----\n";
+
+/// Test certificate authority that signs [`PEER_TLS_CERTIFICATE_PEM`].
+const PEER_TLS_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBUzCCAQWgAwIBAgIUIvBol5vUTE7Ep82M4nwyeiqWtfowBQYDK2VwMBcxFTAT\nBgNVBAMMDFd5cmQgVGVzdCBDQTAeFw0yNjA4MDEyMjI3MzNaFw0zNjA3MjkyMjI3\nMzNaMBcxFTATBgNVBAMMDFd5cmQgVGVzdCBDQTAqMAUGAytlcAMhAFLeEdcicBoj\nHvTVoGMRRX++lXDHJs/oSbiUsUFj3cJSo2MwYTAdBgNVHQ4EFgQUffiXuERzxz/w\nUzFHryjCu9kawNcwHwYDVR0jBBgwFoAUffiXuERzxz/wUzFHryjCu9kawNcwDwYD\nVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwBQYDK2VwA0EAZYpU+nqGryWC\n585mnbRAKnwY4b3MC9fjOfbc/ImO5Kt71Bazy1SKjAvdlGM01ayDZZM6nV7leZc6\nHYBI3uvWBA==\n-----END CERTIFICATE-----\n";
+
+/// Private key paired with [`PEER_TLS_CERTIFICATE_PEM`] for test serving only.
+const PEER_TLS_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICZy1zJGs9jdufNpelf5EbzDgCAnMIslxtG6IvMvz3P1\n-----END PRIVATE KEY-----\n";
+
+/// Independent test CA that does not authenticate the localhost peer certificate.
+const UNTRUSTED_PEER_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBUzCCAQWgAwIBAgIUHH+ijx5UL3SHgI2fsI6qAXbExe0wBQYDK2VwMBQxEjAQ\nBgNVBAMMCW90aGVyaG9zdDAeFw0yNjA4MDEyMjIxMzdaFw0zNjA3MjkyMjIxMzda\nMBQxEjAQBgNVBAMMCW90aGVyaG9zdDAqMAUGAytlcAMhAPFN5MLyjXXFjohd5jvz\nbtiVpdxlVrdM/pJUlDG1D+1jo2kwZzAdBgNVHQ4EFgQUVM7sCG+JzrB0mqm0nEh2\nj94cTaMwHwYDVR0jBBgwFoAUVM7sCG+JzrB0mqm0nEh2j94cTaMwDwYDVR0TAQH/\nBAUwAwEB/zAUBgNVHREEDTALgglvdGhlcmhvc3QwBQYDK2VwA0EAXHVKQb5GNjQ8\nQ6n7fd8aojlerlNHClCipU/9+5W0UEbsOte5Zx4YdtX25dOmg9DqCqODoVmoMDnb\nOEYUyRxkCQ==\n-----END CERTIFICATE-----\n";
+
+/// Attach one peer bearer to any generated tonic request.
+fn attach_peer_bearer<T>(request: &mut Request<T>, token: &str) {
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        format!("Bearer {token}").parse().expect("bearer metadata"),
+    );
+}
 
 /// Counts security-audit calls so valid completion can prove it emitted none.
 #[derive(Default)]
@@ -323,6 +362,60 @@ async fn start_peer(
             .expect("peer server");
     });
     tokio::task::yield_now().await;
+    RunningPeer {
+        address,
+        reservations,
+        shutdown,
+        task,
+    }
+}
+
+/// Binds one CA-authenticated generated tonic peer for production transport proofs.
+async fn start_tls_peer(
+    node: NodeId,
+    fence: u64,
+    authority: Arc<OraclePeerAuthority>,
+    security_audit: Arc<dyn PeerSecurityAudit>,
+) -> RunningPeer {
+    wyrd_tls::install_crypto_provider().expect("test installs Wyrd TLS provider");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("peer listener");
+    let address = listener.local_addr().expect("peer address");
+    let reservations = Arc::new(ReservationRegistry::new(
+        Arc::new(OracleSlotManager::new(8, 1)),
+        8,
+    ));
+    let verifier: Arc<dyn PeerTicketVerifier> = authority;
+    let worker = Arc::new(OraclePeerWorker::new(
+        node,
+        fence,
+        verifier,
+        security_audit,
+        Arc::clone(&reservations),
+        SealedFragmentExecutor::default(),
+    ));
+    let shutdown = CancellationToken::new();
+    let shutdown_task = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let router = wyrd_tonic::tonic::transport::Server::builder()
+            .tls_config(
+                wyrd_tonic::tonic::transport::ServerTlsConfig::new().identity(
+                    wyrd_tonic::tonic::transport::Identity::from_pem(
+                        PEER_TLS_CERTIFICATE_PEM,
+                        PEER_TLS_PRIVATE_KEY_PEM,
+                    ),
+                ),
+            )
+            .expect("peer TLS identity")
+            .add_service(OraclePeerServiceServer::new(PeerTestService {
+                worker,
+                fault: PeerFault::None,
+            }));
+        wyrd_tonic::server::serve_grpc_with_listener(router, listener, shutdown_task)
+            .await
+            .expect("peer server");
+    });
     RunningPeer {
         address,
         reservations,
@@ -978,19 +1071,30 @@ async fn oracle_peer_rejects_corrupted_and_missing_footer_attempts() {
 /// Production tonic transport force-refreshes once after an unauthenticated stale bearer.
 #[tokio::test]
 async fn oracle_peer_tonic_stale_bearer_refreshes_exactly_once() {
-    let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = socket.local_addr().expect("address");
-    drop(socket);
+    wyrd_tls::install_crypto_provider().expect("test installs Wyrd TLS provider");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = listener.local_addr().expect("address");
     let calls = Arc::new(AtomicUsize::new(0));
     let shutdown = CancellationToken::new();
     let server_shutdown = shutdown.clone();
     let server_calls = Arc::clone(&calls);
     let server = tokio::spawn(async move {
-        wyrd_tonic::tonic::transport::Server::builder()
+        let router = wyrd_tonic::tonic::transport::Server::builder()
+            .tls_config(
+                wyrd_tonic::tonic::transport::ServerTlsConfig::new().identity(
+                    wyrd_tonic::tonic::transport::Identity::from_pem(
+                        PEER_TLS_CERTIFICATE_PEM,
+                        PEER_TLS_PRIVATE_KEY_PEM,
+                    ),
+                ),
+            )
+            .expect("peer TLS identity")
             .add_service(OraclePeerServiceServer::new(RefreshProbeService {
                 calls: server_calls,
-            }))
-            .serve_with_shutdown(address, server_shutdown.cancelled_owned())
+            }));
+        wyrd_tonic::server::serve_grpc_with_listener(router, listener, server_shutdown)
             .await
             .expect("server");
     });
@@ -999,9 +1103,10 @@ async fn oracle_peer_tonic_stale_bearer_refreshes_exactly_once() {
     let credentials = Arc::new(RefreshProbeCredentials {
         forced: AtomicUsize::new(0),
     });
-    let transport = TonicOraclePeerTransport::with_credentials(
-        HashMap::from([(worker, format!("http://{address}"))]),
+    let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+        HashMap::from([(worker, format!("https://{address}"))]),
         credentials.clone(),
+        OraclePeerTls::new(PEER_TLS_CA_PEM.as_bytes().to_vec(), "localhost".to_owned()),
     );
     let response = transport
         .reserve(
@@ -1022,6 +1127,331 @@ async fn oracle_peer_tonic_stale_bearer_refreshes_exactly_once() {
     assert_eq!(credentials.forced.load(Ordering::SeqCst), 1);
     shutdown.cancel();
     server.await.expect("server joins");
+}
+
+/// TLS-enabled peer transport rejects plaintext before requesting a bearer.
+#[tokio::test]
+async fn oracle_peer_tls_rejects_plaintext_before_bearer() {
+    let worker = NodeId::new(uuid::Uuid::now_v7());
+    let credentials = Arc::new(BearerCallProbe {
+        calls: AtomicUsize::new(0),
+    });
+    let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+        HashMap::from([(worker, "http://127.0.0.1:9".to_owned())]),
+        credentials.clone(),
+        OraclePeerTls::new(
+            b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n".to_vec(),
+            "oracle.test".to_owned(),
+        ),
+    );
+    let error = transport
+        .reserve(
+            worker,
+            ReserveNodeSlotsRequest {
+                query_id: QueryId::new(uuid::Uuid::now_v7()),
+                leader_node_id: NodeId::new(uuid::Uuid::now_v7()),
+                leader_fencing_token: 1,
+                query_class: QueryClass::Interactive,
+                slot_units: 1,
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(1),
+            },
+        )
+        .await
+        .expect_err("plaintext endpoint must fail closed");
+    assert!(matches!(error, DispatchError::Terminal));
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+}
+
+/// Untrusted authorities and DNS mismatches fail before bearer acquisition or handler dispatch.
+#[tokio::test]
+async fn oracle_peer_tls_rejects_untrusted_certificate_and_name_before_bearer() {
+    wyrd_tls::install_crypto_provider().expect("test installs Wyrd TLS provider");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = listener.local_addr().expect("address");
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
+    let server_calls = Arc::clone(&handler_calls);
+    let server = tokio::spawn(async move {
+        let router = wyrd_tonic::tonic::transport::Server::builder()
+            .tls_config(
+                wyrd_tonic::tonic::transport::ServerTlsConfig::new().identity(
+                    wyrd_tonic::tonic::transport::Identity::from_pem(
+                        PEER_TLS_CERTIFICATE_PEM,
+                        PEER_TLS_PRIVATE_KEY_PEM,
+                    ),
+                ),
+            )
+            .expect("peer TLS identity")
+            .add_service(OraclePeerServiceServer::new(RefreshProbeService {
+                calls: server_calls,
+            }));
+        wyrd_tonic::server::serve_grpc_with_listener(router, listener, server_shutdown)
+            .await
+            .expect("server");
+    });
+    tokio::task::yield_now().await;
+
+    for (ca, server_name) in [
+        (UNTRUSTED_PEER_CA_PEM, "localhost"),
+        (PEER_TLS_CA_PEM, "not-localhost.test"),
+    ] {
+        let worker = NodeId::new(uuid::Uuid::now_v7());
+        let credentials = Arc::new(BearerCallProbe {
+            calls: AtomicUsize::new(0),
+        });
+        let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+            HashMap::from([(worker, format!("https://{address}"))]),
+            credentials.clone(),
+            OraclePeerTls::new(ca.as_bytes().to_vec(), server_name.to_owned()),
+        );
+        transport
+            .reserve(
+                worker,
+                ReserveNodeSlotsRequest {
+                    query_id: QueryId::new(uuid::Uuid::now_v7()),
+                    leader_node_id: NodeId::new(uuid::Uuid::now_v7()),
+                    leader_fencing_token: 1,
+                    query_class: QueryClass::Interactive,
+                    slot_units: 1,
+                    expires_at: chrono::Utc::now() + chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .expect_err("TLS authentication must fail closed");
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+    }
+
+    shutdown.cancel();
+    server.await.expect("server joins");
+}
+
+/// A trusted TLS peer completes reserve, signed execution, stream validation, and release.
+#[tokio::test]
+async fn oracle_peer_tls_dispatches_and_releases_over_trusted_channel() {
+    let audit = Arc::new(RecordingPeerAudit::default());
+    let security_audit: Arc<dyn PeerSecurityAudit> = audit.clone();
+    let authority = Arc::new(
+        OraclePeerAuthority::from_pem(
+            &SecretString::from(PRIVATE_KEY_PEM),
+            Arc::clone(&security_audit),
+        )
+        .expect("peer authority"),
+    );
+    let leader = NodeId::new(uuid::Uuid::now_v7());
+    let worker = NodeId::new(uuid::Uuid::now_v7());
+    let fence = 91;
+    let peer = start_tls_peer(
+        worker,
+        fence,
+        Arc::clone(&authority),
+        Arc::clone(&security_audit),
+    )
+    .await;
+    let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+        HashMap::from([(worker, format!("https://{}", peer.address))]),
+        Arc::new(RefreshProbeCredentials {
+            forced: AtomicUsize::new(0),
+        }),
+        OraclePeerTls::new(PEER_TLS_CA_PEM.as_bytes().to_vec(), "localhost".to_owned()),
+    );
+    let dispatcher = FragmentDispatcher::new(
+        authority.clone(),
+        transport_directory(leader, authority, security_audit, transport),
+    );
+    let file = NamedTempFile::new().expect("parquet temp");
+    let result = dispatcher
+        .execute(
+            &context(leader),
+            fragment(&file),
+            &[DispatchCandidate {
+                node_id: worker,
+                worker_fence: fence,
+            }],
+        )
+        .await
+        .expect("trusted TLS dispatch succeeds");
+    result
+        .batches
+        .collect::<Result<Vec<_>, _>>()
+        .expect("trusted attempt stream validates");
+    assert_eq!(peer.reservations.cleanup_expired(chrono::Utc::now()), 0);
+    assert_eq!(*audit.calls.lock().expect("audit mutex"), 0);
+    peer.stop().await;
+}
+
+/// Two real Wyrd servers preserve peer authorization, fencing, execution, and cleanup over TLS.
+#[tokio::test]
+async fn oracle_peer_two_wyrd_server_tls_journey() {
+    let cluster = WyrdTestCluster::start_spec_with_oracle_peer_tls(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("two-node TLS cluster starts");
+    let target = cluster.server(0).expect("target Wyrd server");
+    let peer = target
+        .state()
+        .oracle_peer
+        .as_ref()
+        .expect("target Oracle peer runtime")
+        .clone();
+    let lease = peer
+        .cluster()
+        .snapshot()
+        .live_oracles()
+        .into_iter()
+        .find(|lease| lease.key.node_id == cluster.ready_query_nodes()[0])
+        .expect("target live Oracle lease")
+        .clone();
+    let security_audit: Arc<dyn PeerSecurityAudit> = peer.security_audit();
+    let authority = OraclePeerAuthority::from_pem(
+        &wyrd_testing::keys::oracle_peer_signing_key_pem(),
+        security_audit,
+    )
+    .expect("matching peer authority");
+    let bearer = cluster
+        .oracle_peer_bearer(false)
+        .await
+        .expect("least-privilege peer bearer");
+    let mut client = OraclePeerServiceClient::new(
+        cluster
+            .oracle_peer_channel(0)
+            .await
+            .expect("CA/DNS-authenticated channel"),
+    );
+    let request = |fence| ReserveNodeSlotsRequest {
+        query_id: QueryId::new(uuid::Uuid::now_v7()),
+        leader_node_id: lease.key.node_id,
+        leader_fencing_token: fence,
+        query_class: QueryClass::Interactive,
+        slot_units: 1,
+        expires_at: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+    let mut stale_bearer = Request::new(ProtoReserveNodeSlotsRequest::from(request(
+        lease.fencing_token,
+    )));
+    attach_peer_bearer(&mut stale_bearer, "stale-peer-bearer");
+    assert_eq!(
+        client
+            .reserve_slots(stale_bearer)
+            .await
+            .expect_err("stale bearer denied under TLS")
+            .code(),
+        wyrd_tonic::tonic::Code::Unauthenticated
+    );
+    let mut stale_fence = Request::new(ProtoReserveNodeSlotsRequest::from(request(
+        lease.fencing_token.saturating_add(1),
+    )));
+    attach_peer_bearer(&mut stale_fence, &bearer);
+    assert_eq!(
+        client
+            .reserve_slots(stale_fence)
+            .await
+            .expect_err("stale fence denied under TLS")
+            .code(),
+        wyrd_tonic::tonic::Code::PermissionDenied
+    );
+
+    let mut dispatch_context = context(lease.key.node_id);
+    dispatch_context.leader_fence = lease.fencing_token;
+    dispatch_context.tenant_id = target.data_tenant_id().as_uuid();
+    let mut reserve = Request::new(ProtoReserveNodeSlotsRequest::from(
+        ReserveNodeSlotsRequest {
+            query_id: dispatch_context.query_id,
+            leader_node_id: dispatch_context.leader_node_id,
+            leader_fencing_token: lease.fencing_token,
+            query_class: dispatch_context.query_class,
+            slot_units: dispatch_context.slot_units,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(5),
+        },
+    ));
+    attach_peer_bearer(&mut reserve, &bearer);
+    let pending = match ReserveNodeSlotsResponse::try_from(
+        client
+            .reserve_slots(reserve)
+            .await
+            .expect("TLS reserve")
+            .into_inner(),
+    )
+    .expect("reserve response")
+    {
+        ReserveNodeSlotsResponse::Pending(pending) => pending,
+        other => panic!("expected pending reservation, got {other:?}"),
+    };
+    let file = NamedTempFile::new().expect("fragment file");
+    let mut sealed = fragment(&file);
+    let object_path = format!("oracle-peer/{}.parquet", uuid::Uuid::now_v7());
+    target
+        .state()
+        .storage
+        .operator()
+        .write(
+            &object_path,
+            std::fs::read(file.path()).expect("fragment bytes"),
+        )
+        .await
+        .expect("fragment uploaded to shared storage");
+    let warehouse = match target.state().storage.backend_config() {
+        wyrd_storage::BackendConfig::Local { root } => format!("file://{}", root.display()),
+        other => panic!("TLS peer journey requires local storage, got {other:?}"),
+    };
+    sealed.files[0].location = format!("{warehouse}/{object_path}");
+    sealed.binding = format!("{warehouse}/oracle-peer");
+    sealed.fragment_id = sealed.digest();
+    let mut execute = Request::new(ProtoExecuteFragmentRequest::from(execute_request(
+        &authority,
+        &dispatch_context,
+        lease.key.node_id,
+        lease.fencing_token,
+        &pending,
+        &sealed,
+    )));
+    attach_peer_bearer(&mut execute, &bearer);
+    let mut frames = client
+        .execute_fragment(execute)
+        .await
+        .expect("TLS execute")
+        .into_inner();
+    while frames.message().await.expect("worker frame").is_some() {}
+    assert_eq!(peer.worker().pending_reservations(), 0);
+
+    let release_query = QueryId::new(uuid::Uuid::now_v7());
+    let mut reserve_for_release = Request::new(ProtoReserveNodeSlotsRequest::from(
+        ReserveNodeSlotsRequest {
+            query_id: release_query,
+            leader_node_id: lease.key.node_id,
+            leader_fencing_token: lease.fencing_token,
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(5),
+        },
+    ));
+    attach_peer_bearer(&mut reserve_for_release, &bearer);
+    let pending = match ReserveNodeSlotsResponse::try_from(
+        client
+            .reserve_slots(reserve_for_release)
+            .await
+            .expect("TLS reserve before explicit release")
+            .into_inner(),
+    )
+    .expect("release reservation response")
+    {
+        ReserveNodeSlotsResponse::Pending(pending) => pending,
+        other => panic!("expected releasable reservation, got {other:?}"),
+    };
+    let mut release = Request::new(ProtoReleaseNodeSlotsRequest::from(
+        ReleaseNodeSlotsRequest {
+            reservation_id: pending.reservation_id,
+            query_id: release_query,
+            leader_node_id: lease.key.node_id,
+            leader_fencing_token: lease.fencing_token,
+        },
+    ));
+    attach_peer_bearer(&mut release, &bearer);
+    client.release_slots(release).await.expect("TLS release");
+    assert_eq!(peer.worker().pending_reservations(), 0);
+    cluster.shutdown().await.expect("TLS cluster shutdown");
 }
 
 /// Production tonic authentication, SQL membership, audit, and capacity gate reserve mutation.

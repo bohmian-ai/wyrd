@@ -44,6 +44,7 @@ wyrd-error-derive = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-sql = { workspace = true, features = ["embedded-postgres"] }
+wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -29,7 +29,7 @@ wyrd-spec = { workspace = true }
 async-trait = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
-opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+opentelemetry-stdout = { version = "0.31", features = ["trace"] }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

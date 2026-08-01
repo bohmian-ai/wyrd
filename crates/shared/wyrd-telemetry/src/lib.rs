@@ -60,7 +60,7 @@ pub enum OtlpProtocol {
 #[derive(Debug)]
 pub struct TelemetryGuard {
     config: TelemetryConfig,
-    tracer_provider: Option<opentelemetry_sdk::trace::TracerProvider>,
+    tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
 
 /// Read-only representation of one finished production-pipeline span.
@@ -80,7 +80,7 @@ pub struct CapturedSpan {
 #[derive(Debug, Clone, Default)]
 pub struct TestTraceCapture {
     /// Shared finished-span storage populated by the in-memory exporter.
-    spans: Arc<Mutex<Vec<opentelemetry_sdk::export::trace::SpanData>>>,
+    spans: Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -133,32 +133,26 @@ impl TestTraceCapture {
 #[derive(Debug, Clone)]
 struct CaptureExporter {
     /// Shared destination exposed through [`TestTraceCapture`].
-    spans: Arc<Mutex<Vec<opentelemetry_sdk::export::trace::SpanData>>>,
+    spans: Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
 }
 
 #[cfg(feature = "test-support")]
-impl opentelemetry_sdk::export::trace::SpanExporter for CaptureExporter {
+impl opentelemetry_sdk::trace::SpanExporter for CaptureExporter {
     /// Append one completed SDK export batch without network IO.
-    fn export(
-        &mut self,
-        batch: Vec<opentelemetry_sdk::export::trace::SpanData>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = opentelemetry_sdk::export::trace::ExportResult>
-                + Send
-                + 'static,
-        >,
-    > {
+    async fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
         let spans = Arc::clone(&self.spans);
-        Box::pin(async move {
-            spans
-                .lock()
-                .map_err(|_| {
-                    opentelemetry::trace::TraceError::Other("trace capture lock poisoned".into())
-                })?
-                .extend(batch);
-            Ok(())
-        })
+        spans
+            .lock()
+            .map_err(|_| {
+                opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                    "trace capture lock poisoned".to_owned(),
+                )
+            })?
+            .extend(batch);
+        Ok(())
     }
 }
 
@@ -174,12 +168,10 @@ impl TelemetryGuard {
     /// When an OTLP exporter is wired, this blocks until all buffered spans are
     /// flushed. Otherwise it is a no-op.
     pub fn force_flush(&self) {
-        if let Some(provider) = &self.tracer_provider {
-            for result in provider.force_flush() {
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, "OTLP force_flush error");
-                }
-            }
+        if let Some(provider) = &self.tracer_provider
+            && let Err(error) = provider.force_flush()
+        {
+            tracing::warn!(error = %error, "OTLP force_flush error");
         }
     }
 
@@ -232,8 +224,9 @@ pub fn init_test_only_no_global(config: TelemetryConfig) -> TelemetryGuard {
 /// a no-op OTel provider so the OTel pipeline is always wired.
 ///
 /// # Errors
-/// Returns an error if a global subscriber was already installed, or if the
-/// OTLP exporter fails to build.
+/// Returns an error if another Rustls provider already owns the process, a
+/// global subscriber was already installed, or the OTLP exporter fails to
+/// build.
 pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -244,8 +237,8 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
 
     let (provider, tracer_provider) = if let Some(endpoint) = config.endpoint.as_deref() {
         let exporter = build_otlp_exporter(&config, endpoint)?;
-        let p = opentelemetry_sdk::trace::TracerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        let p = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
             .with_sampler(sampler)
             .with_resource(resource)
             .build();
@@ -298,7 +291,7 @@ pub fn init_test_capture(
     let exporter = CaptureExporter {
         spans: Arc::clone(&capture.spans),
     };
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(exporter)
         .with_sampler(telemetry_sampler(&config))
         .with_resource(telemetry_resource(&config))
@@ -325,10 +318,12 @@ pub fn init_test_capture(
 /// Build the process resource shared by production and test exporters.
 fn telemetry_resource(config: &TelemetryConfig) -> opentelemetry_sdk::Resource {
     let service_name = config.service_name.as_deref().unwrap_or("wyrd").to_owned();
-    opentelemetry_sdk::Resource::new(vec![
-        opentelemetry::KeyValue::new("service.name", service_name),
-        opentelemetry::KeyValue::new("service.instance.id", ulid::Ulid::new().to_string()),
-    ])
+    opentelemetry_sdk::Resource::builder_empty()
+        .with_attributes([
+            opentelemetry::KeyValue::new("service.name", service_name),
+            opentelemetry::KeyValue::new("service.instance.id", ulid::Ulid::new().to_string()),
+        ])
+        .build()
 }
 
 /// Select the production sampler from the configured ratio.
@@ -339,12 +334,22 @@ fn telemetry_sampler(config: &TelemetryConfig) -> opentelemetry_sdk::trace::Samp
     )
 }
 
+/// Build the configured OTLP span exporter after claiming Wyrd's TLS provider.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when another Rustls provider already owns
+/// the process or the selected OTLP exporter rejects its configuration.
 fn build_otlp_exporter(
     config: &TelemetryConfig,
     endpoint: &str,
 ) -> Result<opentelemetry_otlp::SpanExporter, WyrdError> {
     use opentelemetry_otlp::WithExportConfig;
 
+    wyrd_tls::install_crypto_provider().map_err(|error| WyrdError::Internal {
+        message: "telemetry TLS provider initialization failed".to_owned(),
+        details: serde_json::json!({ "cause": error.to_string() }),
+    })?;
     let timeout = std::time::Duration::from_millis(config.export_timeout_ms.unwrap_or(30_000));
     match config.protocol {
         OtlpProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
@@ -365,5 +370,26 @@ fn build_otlp_exporter(
                 "protocol": "http_protobuf"
             }),
         }),
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    /// The upgraded SDK pipeline exports completed spans with preserved attributes.
+    #[test]
+    fn capture_pipeline_preserves_span_semantics() {
+        let (guard, capture) = super::init_test_capture(super::TelemetryConfig::default())
+            .expect("test telemetry pipeline initializes");
+        let checkpoint = capture.checkpoint();
+        tracing::info_span!("telemetry.compatibility", component = "wyrd").in_scope(|| {});
+        guard.force_flush();
+        let spans = capture.finished_since(checkpoint);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "telemetry.compatibility");
+        assert_eq!(
+            spans[0].attributes.get("component"),
+            Some(&"wyrd".to_owned())
+        );
+        guard.shutdown();
     }
 }

@@ -318,6 +318,7 @@ mod pg_tests {
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         )
         .expect("gRPC router builds with token verifier");
@@ -354,6 +355,7 @@ mod pg_tests {
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         )
         .expect("gRPC router builds with token verifier");
@@ -395,6 +397,7 @@ mod pg_tests {
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         )
         .expect("gRPC router builds with token verifier");
@@ -436,6 +439,7 @@ mod pg_tests {
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         )
         .expect("gRPC router builds with token verifier");
@@ -527,6 +531,7 @@ mod pg_tests {
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         )
         .expect("gRPC router builds with token verifier");

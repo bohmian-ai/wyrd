@@ -197,6 +197,12 @@ pub struct OracleRuntimeConfig {
     /// Private peer advertisement address.
     #[serde(default = "default_oracle_advertise_addr")]
     pub advertise_addr: String,
+    /// CA certificate used to authenticate remote Oracle gRPC servers.
+    #[serde(default)]
+    pub peer_ca_certificate_path: Option<PathBuf>,
+    /// DNS name expected on every remote Oracle server certificate.
+    #[serde(default)]
+    pub peer_server_name: Option<String>,
     /// CPU budget used for admission calibration.
     #[serde(default = "default_oracle_cpu_cores")]
     pub cpu_cores: f64,
@@ -254,6 +260,8 @@ impl Default for OracleRuntimeConfig {
     fn default() -> Self {
         Self {
             advertise_addr: default_oracle_advertise_addr(),
+            peer_ca_certificate_path: None,
+            peer_server_name: None,
             cpu_cores: default_oracle_cpu_cores(),
             memory_limit_bytes: None,
             spill_limit_bytes: default_oracle_spill_limit_bytes(),
@@ -839,6 +847,12 @@ pub struct GrpcConfig {
     /// Whether to expose gRPC server reflection.
     #[serde(default)]
     pub reflection_enabled: bool,
+    /// PEM certificate chain served by the gRPC listener.
+    #[serde(default)]
+    pub certificate_chain_path: Option<PathBuf>,
+    /// PEM private key paired with `certificate_chain_path`.
+    #[serde(default)]
+    pub private_key_path: Option<PathBuf>,
 }
 
 /// Database connection pool configuration.
@@ -1122,6 +1136,8 @@ impl Default for GrpcConfig {
         Self {
             bind: default_grpc_bind(),
             reflection_enabled: false,
+            certificate_chain_path: None,
+            private_key_path: None,
         }
     }
 }
@@ -1298,6 +1314,18 @@ impl WyrdServerConfig {
         // grpc.reflection_enabled
         if let Some(val) = env_opt("WYRD_GRPC_REFLECTION")? {
             self.grpc.reflection_enabled = parse_flag(&val, "WYRD_GRPC_REFLECTION")?;
+        }
+        if let Some(val) = env_opt("WYRD_GRPC_CERTIFICATE_CHAIN_FILE")? {
+            self.grpc.certificate_chain_path = Some(PathBuf::from(val));
+        }
+        if let Some(val) = env_opt("WYRD_GRPC_PRIVATE_KEY_FILE")? {
+            self.grpc.private_key_path = Some(PathBuf::from(val));
+        }
+        if let Some(val) = env_opt("WYRD_ORACLE_PEER_CA_FILE")? {
+            self.bifrost.oracle.peer_ca_certificate_path = Some(PathBuf::from(val));
+        }
+        if let Some(val) = env_opt("WYRD_ORACLE_PEER_SERVER_NAME")? {
+            self.bifrost.oracle.peer_server_name = Some(val);
         }
 
         // telemetry.endpoint
@@ -1503,6 +1531,22 @@ impl WyrdServerConfig {
             .map_err(|message| ConfigError::Invalid { message })?;
         self.validate_oracle_calibration()?;
 
+        if self.grpc.certificate_chain_path.is_some() != self.grpc.private_key_path.is_some() {
+            return Err(ConfigError::Invalid {
+                message:
+                    "grpc certificate_chain_path and private_key_path must be configured together"
+                        .to_owned(),
+            });
+        }
+        if self.bifrost.oracle.peer_ca_certificate_path.is_some()
+            != self.bifrost.oracle.peer_server_name.is_some()
+        {
+            return Err(ConfigError::Invalid {
+                message: "bifrost.oracle peer_ca_certificate_path and peer_server_name must be configured together"
+                    .to_owned(),
+            });
+        }
+
         // 1. HTTP and gRPC bind addresses must differ.
         if self.http.bind == self.grpc.bind {
             return Err(ConfigError::BindCollision {
@@ -1618,6 +1662,32 @@ impl WyrdServerConfig {
                 return Err(ConfigError::Invalid {
                     message: "auth.allow_preview must be false in production profile".to_string(),
                 });
+            }
+            if self.bifrost.roles.contains(&BifrostRuntimeRole::Oracle) {
+                match (
+                    &self.grpc.certificate_chain_path,
+                    &self.grpc.private_key_path,
+                    &self.bifrost.oracle.peer_ca_certificate_path,
+                    &self.bifrost.oracle.peer_server_name,
+                ) {
+                    (Some(certificate), Some(key), Some(ca), Some(server_name))
+                        if !certificate.as_os_str().is_empty()
+                            && !key.as_os_str().is_empty()
+                            && !ca.as_os_str().is_empty()
+                            && !server_name.trim().is_empty() => {}
+                    _ => {
+                        return Err(ConfigError::Invalid {
+                            message: "production Oracle requires grpc certificate_chain_path/private_key_path and bifrost.oracle peer_ca_certificate_path/peer_server_name".to_owned(),
+                        });
+                    }
+                }
+                if !self.bifrost.oracle.advertise_addr.starts_with("https://") {
+                    return Err(ConfigError::Invalid {
+                        message:
+                            "production Oracle bifrost.oracle.advertise_addr must use https://"
+                                .to_owned(),
+                    });
+                }
             }
         }
 
@@ -2092,6 +2162,11 @@ minimum_slots = 2
             ..WyrdServerConfig::default()
         };
         config.bifrost.oracle.calibration_profile = path.clone();
+        config.grpc.certificate_chain_path = Some(directory.path().join("server.pem"));
+        config.grpc.private_key_path = Some(directory.path().join("server-key.pem"));
+        config.bifrost.oracle.peer_ca_certificate_path = Some(directory.path().join("ca.pem"));
+        config.bifrost.oracle.peer_server_name = Some("oracle.test".to_owned());
+        config.bifrost.oracle.advertise_addr = "https://oracle.test:50052".to_owned();
         assert!(config.validate().is_err());
 
         std::fs::write(&path, complete_oracle_calibration("approved"))
@@ -2099,6 +2174,33 @@ minimum_slots = 2
         config
             .validate()
             .expect("approved production calibration validates");
+    }
+
+    /// Proves production Oracle TLS configuration is complete and HTTPS-only.
+    #[test]
+    fn oracle_production_requires_complete_tls() {
+        let directory = tempfile::tempdir().expect("calibration temp directory");
+        let calibration = directory.path().join("oracle-calibration.toml");
+        std::fs::write(&calibration, complete_oracle_calibration("approved"))
+            .expect("approved profile writes");
+        let mut config = WyrdServerConfig {
+            deployment_profile: DeploymentProfile::Production,
+            ..WyrdServerConfig::default()
+        };
+        config.bifrost.oracle.calibration_profile = calibration;
+        assert!(config.validate().is_err());
+
+        config.grpc.certificate_chain_path = Some(directory.path().join("server.pem"));
+        assert!(config.validate().is_err());
+        config.grpc.private_key_path = Some(directory.path().join("server-key.pem"));
+        config.bifrost.oracle.peer_ca_certificate_path = Some(directory.path().join("ca.pem"));
+        assert!(config.validate().is_err());
+        config.bifrost.oracle.peer_server_name = Some("oracle.test".to_owned());
+        assert!(config.validate().is_err());
+        config.bifrost.oracle.advertise_addr = "https://oracle.test:50052".to_owned();
+        config
+            .validate()
+            .expect("complete production Oracle TLS configuration validates");
     }
 
     /// Proves status alone cannot activate Oracle without benchmark evidence.

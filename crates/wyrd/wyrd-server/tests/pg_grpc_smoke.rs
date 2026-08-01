@@ -53,6 +53,7 @@ mod pg_tests {
             NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         );
         assert!(
@@ -69,6 +70,7 @@ mod pg_tests {
             NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: true,
+                tls_identity: None,
             },
         );
         assert!(
@@ -200,6 +202,7 @@ mod pg_tests {
             NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         )
         .expect("router builds");

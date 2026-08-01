@@ -46,13 +46,16 @@ const JWKS_FETCH_TIMEOUT_SECS: u64 = 5;
 /// means the tenant federates no issuers), so federated tokens can be exchanged.
 ///
 /// # Errors
-/// Returns [`ServerBootError::SigningKey`] when the PEM cannot be loaded as an
-/// Ed25519 signing key or its public key cannot be derived.
+/// Returns [`ServerBootError::OraclePeer`] when another Rustls provider already
+/// owns the process. Returns [`ServerBootError::SigningKey`] when the PEM cannot
+/// be loaded as an Ed25519 signing key or its public key cannot be derived.
 pub fn build_auth_handles(
     signing_key: &SecretString,
     pool: &PgPool,
     issuer_resolver: Arc<PgIssuerResolver>,
 ) -> Result<(Arc<IssuingKey>, Arc<WyrdTokenVerifier>), ServerBootError> {
+    wyrd_tls::install_crypto_provider()
+        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
     let kid = Kid::new(WYRD_SIGNING_KID).expect("static signing kid is valid");
     let issuing_key = IssuingKey::from_ed_pem(signing_key.clone(), kid.clone(), WYRD_ISSUER)
         .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;

@@ -26,6 +26,7 @@ uuid = { workspace = true, features = ["v7"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-tls = { workspace = true }
 
 [dependencies.pg-embed]
 workspace = true

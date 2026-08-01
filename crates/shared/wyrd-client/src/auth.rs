@@ -112,8 +112,9 @@ impl AuthMiddleware {
     /// restarts.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when the underlying `reqwest`
-    /// client cannot be constructed.
+    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+    /// already owns the process or the underlying Reqwest client cannot be
+    /// constructed.
     pub fn new(
         config: &ClientConfig,
         credential: ResolvedCredential,
@@ -129,11 +130,21 @@ impl AuthMiddleware {
     /// Construct from a resolved cache path. `new` resolves the production
     /// `~/.config/wyrd/token_cache.json`; tests inject a unique path so they
     /// never touch the process environment (and stay parallel-safe).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+    /// already owns the process or the authentication HTTP client cannot be
+    /// built.
     fn build(
         config: &ClientConfig,
         credential: ResolvedCredential,
         cache_path: Option<PathBuf>,
     ) -> Result<Arc<Self>, WyrdClientError> {
+        wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
+            transport: "http".to_owned(),
+            message: error.to_string(),
+        })?;
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.http.timeout_ms))
             .build()

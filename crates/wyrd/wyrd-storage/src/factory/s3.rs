@@ -27,8 +27,13 @@ pub(crate) fn s3_service(cfg: &S3Config) -> services::S3 {
 /// Build the S3 signer from the AWS default credential chain.
 ///
 /// # Errors
-/// Returns an error when the SDK probe cannot access the configured bucket.
+/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
+/// already owns the process. Other storage errors report failure to load AWS
+/// credentials or access the configured bucket. Cancellation can leave the
+/// read-only bucket probe outcome unknown but makes no durable storage changes.
+///
 pub async fn build_signer(config: &S3Config) -> Result<S3Signer, StorageError> {
+    wyrd_tls::install_crypto_provider()?;
     let shared = aws_config::defaults(BehaviorVersion::latest()).load().await;
     let mut builder = Builder::from(&shared);
     if let Some(region) = &config.region {
@@ -65,11 +70,15 @@ pub async fn build_signer(config: &S3Config) -> Result<S3Signer, StorageError> {
 /// in production.
 ///
 /// # Errors
-/// Infallible today; returns `Result` for symmetry with the GCS/Azure emulator
-/// signer builders.
+/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
+/// already owns the process. The remaining construction is infallible today;
+/// `Result` is retained for symmetry with the GCS/Azure emulator builders.
+///
 #[cfg(any(test, feature = "emulator"))]
 pub fn build_emulator_signer(bucket: &str, endpoint: &str) -> Result<S3Signer, StorageError> {
     use aws_sdk_s3::config::{Builder, Credentials, Region};
+
+    wyrd_tls::install_crypto_provider()?;
 
     let access =
         std::env::var("WYRD_S3_EMULATOR_ACCESS_KEY").unwrap_or_else(|_| "wyrd-test-key".to_owned());
@@ -84,4 +93,14 @@ pub fn build_emulator_signer(bucket: &str, endpoint: &str) -> Result<S3Signer, S
         .credentials_provider(Credentials::new(access, secret, None, None, "static"))
         .build();
     Ok(S3Signer::new(Client::from_conf(conf), bucket.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    /// AWS client construction succeeds after the storage boundary installs AWS-LC.
+    #[test]
+    fn emulator_client_constructs_with_workspace_provider() {
+        super::build_emulator_signer("test-bucket", "http://127.0.0.1:9000")
+            .expect("AWS emulator client constructs");
+    }
 }

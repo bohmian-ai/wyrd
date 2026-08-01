@@ -492,13 +492,31 @@ async fn acquire_conn<'a>(
         .map_err(sql_unavailable)
 }
 
-/// Build a reqwest client with SSRF mitigations: 10 s timeout, no redirect-following.
-fn discovery_client() -> reqwest::Client {
+/// Build a Reqwest client with SSRF mitigations and Wyrd-owned TLS.
+///
+/// The client uses a ten-second timeout and never follows redirects.
+///
+/// # Errors
+///
+/// Returns [`WyrdErrorResponse`] when another Rustls provider already owns the
+/// process or Reqwest rejects the client configuration.
+fn discovery_client() -> Result<reqwest::Client, WyrdErrorResponse> {
+    wyrd_tls::install_crypto_provider().map_err(|_| {
+        WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+            message: "discovery TLS provider initialization failed".to_owned(),
+            details: serde_json::json!({ "field": "issuer" }),
+        })
+    })?;
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("discovery client config is valid")
+        .map_err(|_| {
+            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+                message: "discovery client could not be constructed".to_owned(),
+                details: serde_json::json!({ "field": "issuer" }),
+            })
+        })
 }
 
 /// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4 form so a
@@ -589,10 +607,21 @@ async fn resolve_and_screen(
 /// Build a discovery client pinned to the pre-screened addresses so the fetch
 /// connects to a validated IP and cannot be re-pointed at an internal address by
 /// a DNS-rebinding answer between the screen and the connect.
+///
+/// # Errors
+///
+/// Returns [`WyrdErrorResponse`] when another Rustls provider already owns the
+/// process or Reqwest rejects the pinned client configuration.
 fn pinned_discovery_client(
     host: &str,
     addrs: &[SocketAddr],
 ) -> Result<reqwest::Client, WyrdErrorResponse> {
+    wyrd_tls::install_crypto_provider().map_err(|_| {
+        WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+            message: "discovery TLS provider initialization failed".to_owned(),
+            details: serde_json::json!({ "field": "issuer" }),
+        })
+    })?;
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -634,13 +663,13 @@ async fn discover_jwks_uri(
             if is_blocked_addr(IpAddr::V4(addr), deployment_profile) {
                 return Err(blocked_issuer_error());
             }
-            discovery_client()
+            discovery_client()?
         }
         Some(url::Host::Ipv6(addr)) => {
             if is_blocked_addr(IpAddr::V6(addr), deployment_profile) {
                 return Err(blocked_issuer_error());
             }
-            discovery_client()
+            discovery_client()?
         }
         Some(url::Host::Domain(domain)) => {
             let port = url.port_or_known_default().unwrap_or(443);

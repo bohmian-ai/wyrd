@@ -146,8 +146,12 @@ impl SqlStore {
     /// This does not run migrations.
     ///
     /// # Errors
-    /// Returns [`SqlError::Connect`] when the database connection fails.
+    /// Returns [`SqlError::Connect`] when another Rustls provider already owns
+    /// the process or the database connection fails. Cancellation may leave
+    /// connections opened by SQLx for the pool to close during drop.
     pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, SqlError> {
+        wyrd_tls::install_crypto_provider()
+            .map_err(|error| SqlError::Connect(sqlx::Error::Configuration(Box::new(error))))?;
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)
@@ -161,8 +165,10 @@ impl SqlStore {
     /// This does not run migrations.
     ///
     /// # Errors
-    /// Returns [`SqlError::Connect`] when the DSN cannot be parsed or the
-    /// database connection fails.
+    /// Returns [`SqlError::Connect`] when another Rustls provider already owns
+    /// the process, the DSN cannot be parsed, or the database connection fails.
+    /// Cancellation may leave connections opened by SQLx for the pool to close
+    /// during drop.
     pub async fn connect_with(database_url: &str, config: PoolConfig) -> Result<Self, SqlError> {
         let pool = pool::connect_pool(database_url, config)
             .await

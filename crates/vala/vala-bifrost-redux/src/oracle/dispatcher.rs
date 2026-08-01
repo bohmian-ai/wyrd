@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{Stream, StreamExt};
-use prost::Message;
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
@@ -18,8 +17,9 @@ use wyrd_spec::vala::api::{
     PendingNodeReservation, QueryClass, QueryId, ReleaseNodeSlotsRequest, ReservationId,
     ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse, WorkerAttemptFrame,
 };
+use wyrd_tonic::prost::Message;
 use wyrd_tonic::tonic::metadata::MetadataValue;
-use wyrd_tonic::tonic::transport::{Channel, Endpoint};
+use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::tonic::{Request, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
@@ -730,6 +730,28 @@ pub struct TonicOraclePeerTransport {
     addresses: HashMap<NodeId, String>,
     /// Optional authenticated service credential attached to private calls.
     credentials: Arc<dyn OraclePeerCredentials>,
+    /// Optional immutable CA and DNS identity; absent only for local development tests.
+    tls: Option<OraclePeerTls>,
+}
+
+/// Immutable trust material for authenticating remote Oracle peers.
+#[derive(Clone)]
+pub struct OraclePeerTls {
+    /// PEM-encoded CA certificate accepted for peer servers.
+    ca_certificate_pem: Vec<u8>,
+    /// DNS name required on the authenticated peer certificate.
+    server_name: String,
+}
+
+impl OraclePeerTls {
+    /// Creates one immutable peer trust policy from boot-loaded PEM bytes.
+    #[must_use]
+    pub fn new(ca_certificate_pem: Vec<u8>, server_name: String) -> Self {
+        Self {
+            ca_certificate_pem,
+            server_name,
+        }
+    }
 }
 
 /// Supplies short-lived authorization for private Oracle peer RPCs.
@@ -783,6 +805,7 @@ impl TonicOraclePeerTransport {
             credentials: Arc::new(StaticOraclePeerCredentials::new(
                 secrecy::SecretString::from(bearer.to_owned()),
             )),
+            tls: None,
         })
     }
 
@@ -795,6 +818,21 @@ impl TonicOraclePeerTransport {
         Self {
             addresses,
             credentials,
+            tls: None,
+        }
+    }
+
+    /// Creates a production transport with CA-authenticated TLS.
+    #[must_use]
+    pub fn with_credentials_and_tls(
+        addresses: HashMap<NodeId, String>,
+        credentials: Arc<dyn OraclePeerCredentials>,
+        tls: OraclePeerTls,
+    ) -> Self {
+        Self {
+            addresses,
+            credentials,
+            tls: Some(tls),
         }
     }
 
@@ -810,8 +848,20 @@ impl TonicOraclePeerTransport {
             .addresses
             .get(&worker)
             .ok_or(DispatchError::Retryable)?;
-        let endpoint =
-            Endpoint::from_shared(address.clone()).map_err(|_| DispatchError::Retryable)?;
+        if self.tls.is_some() && !address.starts_with("https://") {
+            return Err(DispatchError::Terminal);
+        }
+        let endpoint = if let Some(tls) = &self.tls {
+            wyrd_tonic::transport::authenticated_tls_endpoint(
+                address.clone(),
+                &tls.ca_certificate_pem,
+                tls.server_name.clone(),
+            )
+            .map_err(|_| DispatchError::Terminal)?
+        } else {
+            wyrd_tonic::transport::plaintext_endpoint(address.clone())
+                .map_err(|_| DispatchError::Retryable)?
+        };
         let channel = endpoint
             .connect()
             .await

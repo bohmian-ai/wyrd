@@ -50,6 +50,9 @@ pub enum ConfigParseError {
 /// Top-level error returned by storage operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// Process-wide Rustls provider ownership conflicts with Wyrd.
+    #[error(transparent)]
+    CryptoProvider(#[from] wyrd_tls::InstallError),
     /// Tenant path validation failed.
     #[error("tenant path mismatch: {0}")]
     TenantPathMismatch(String),
@@ -278,6 +281,9 @@ impl LocalError {
 impl From<StorageError> for WyrdStorageError {
     fn from(error: StorageError) -> Self {
         match error {
+            StorageError::CryptoProvider(error) => Self::Backend {
+                detail: error.to_string(),
+            },
             StorageError::TenantPathMismatch(detail) => Self::TenantPathMismatch { detail },
             StorageError::ArtifactTooLarge { actual, limit } => {
                 Self::ArtifactTooLarge { actual, limit }

@@ -29,15 +29,25 @@ for report in "${reports[@]}"; do
   jq -e '
     .envelope.scenario.lane == "forge"
     and (.maintenance.throughput_mib_per_sec | type == "number")
+    and (.maintenance.throughput_mib_per_sec > 0)
     and (.maintenance.task_latency_p99_us | type == "number")
+    and (.maintenance.task_latency_p99_us > 0)
     and (.maintenance.backlog_age_us | type == "number")
+    and (.maintenance.backlog_age_us >= 0)
     and (.maintenance.peak_parent_memory | type == "number")
+    and (.maintenance.peak_parent_memory > 0)
     and (.maintenance.spill_bytes | type == "number")
+    and (.maintenance.spill_bytes >= 0)
     and (.maintenance.lease_contention | type == "number")
+    and (.maintenance.lease_contention >= 0)
     and (.maintenance.fence_lost | type == "number")
+    and (.maintenance.fence_lost >= 0)
     and (.maintenance.snapshot_changed | type == "number")
+    and (.maintenance.snapshot_changed >= 0)
     and (.maintenance.fairness_lag_tasks | type == "number")
+    and (.maintenance.fairness_lag_tasks >= 0)
     and (.maintenance.cleanup_delay_us | type == "number")
+    and (.maintenance.cleanup_delay_us > 0)
     and (.maintenance.role_topology | type == "object")
     and (.maintenance.role_topology | length > 0)
     and ([.maintenance.role_topology[] |
@@ -53,6 +63,38 @@ for report in "${reports[@]}"; do
     exit 1
   }
 done
+
+# These assertions consume reports emitted by the real production recorder and
+# supervised owners. Scenario configuration validates topology; it never
+# supplies a report value.
+jq -s -e '
+  all(.[];
+  if .envelope.scenario.pods == 1 then
+    (.maintenance.role_topology | keys) == ["all"]
+    and .maintenance.role_topology.all.max_active == 1
+    and .maintenance.role_topology.all.final_active == 1
+    and .maintenance.role_topology.all.starts == 1
+  else
+    (.maintenance.role_topology | keys) == ["forge_worker", "server"]
+    and .maintenance.role_topology.server.max_active == 1
+    and .maintenance.role_topology.server.final_active == 1
+    and .maintenance.role_topology.server.starts == 1
+    and .maintenance.role_topology.forge_worker.max_active == .envelope.scenario.pods
+    and .maintenance.role_topology.forge_worker.final_active == .envelope.scenario.pods
+    and .maintenance.role_topology.forge_worker.starts == (.envelope.scenario.pods + 1)
+  end)
+' "${reports[@]}" >/dev/null || {
+  echo "Forge production role replacement evidence does not match executed topology" >&2
+  exit 1
+}
+
+single_worker_rate="$(jq -r '.maintenance.throughput_mib_per_sec' "$report_root/forge-multi-tenant-single-node.json")"
+three_worker_rate="$(jq -r '.maintenance.throughput_mib_per_sec' "$report_root/forge-multi-tenant-multi-node.json")"
+jq -en --argjson single "$single_worker_rate" --argjson three "$three_worker_rate" \
+  '$single > 0 and $three > 0 and ($three / $single) >= 0.5' >/dev/null || {
+  echo "three-worker production counter rate regressed below half the controlled one-worker rate" >&2
+  exit 1
+}
 
 for report in "${query_reports[@]}"; do
   if [[ ! -s "$report" ]]; then

@@ -83,7 +83,7 @@ impl fmt::Debug for ForgeRewritePipeline {
 
 /// Immutable inputs for one deterministic rewrite operation.
 pub(crate) struct RewriteRequest<'a> {
-    /// Unique UUIDv7 generation for this concrete execution attempt's paths.
+    /// Unique `UUIDv7` generation for this concrete execution attempt's paths.
     pub(crate) attempt_generation: ForgeAttemptGeneration,
     /// Validated tenant/table object-storage binding.
     pub(crate) binding: &'a TenantTableBinding,
@@ -105,7 +105,7 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) target_file_size_bytes: u64,
 }
 
-/// UUIDv7 identity that prevents a later attempt from reusing terminal output paths.
+/// `UUIDv7` identity that prevents a later attempt from reusing terminal output paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ForgeAttemptGeneration(Uuid);
 
@@ -114,6 +114,16 @@ impl ForgeAttemptGeneration {
     #[must_use]
     pub(crate) fn now_v7() -> Self {
         Self(Uuid::now_v7())
+    }
+
+    /// Reuses the durable task attempt as the immutable output generation.
+    ///
+    /// The claim transaction creates a fresh `UUIDv7` for every attempt. Passing
+    /// that identity through the rewrite boundary prevents a later retry from
+    /// publishing or reclaiming an earlier attempt's output paths.
+    #[must_use]
+    pub(crate) const fn from_attempt(value: Uuid) -> Self {
+        Self(value)
     }
 
     /// Wrap an explicit generation for deterministic test assertions.

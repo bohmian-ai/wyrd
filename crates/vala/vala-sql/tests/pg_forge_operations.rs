@@ -2301,7 +2301,6 @@ mod pg_tests {
             let fair_explain = format!("EXPLAIN (FORMAT TEXT) {FAIR_CLAIM_SQL}");
             let fair_plan =
                 sqlx::query_scalar::<sqlx::Postgres, String>(sqlx::AssertSqlSafe(fair_explain))
-                    .bind(0_i64)
                     .bind(Uuid::now_v7())
                     .bind(4_i64)
                     .bind(Uuid::now_v7())

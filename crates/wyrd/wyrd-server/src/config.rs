@@ -130,6 +130,43 @@ pub enum ServeMode {
     Grpc,
 }
 
+/// Server-internal process composition for Bifrost maintenance placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum ForgeProcessRole {
+    /// Serve APIs, schedule Forge work, and run one embedded worker pool.
+    #[default]
+    All,
+    /// Serve APIs and participate in scheduling without executing tasks.
+    Server,
+    /// Execute Forge tasks without opening a public Wyrd API socket.
+    ForgeWorker,
+}
+
+/// Private Forge worker placement and process-local capacity configuration.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeRuntimeConfig {
+    /// Fixed number of executors in an `all` or `forge-worker` process.
+    #[serde(default = "default_forge_worker_concurrency")]
+    pub worker_concurrency: usize,
+}
+
+impl Default for ForgeRuntimeConfig {
+    /// Uses one executor for embedded and development deployments.
+    fn default() -> Self {
+        Self {
+            worker_concurrency: default_forge_worker_concurrency(),
+        }
+    }
+}
+
+/// Returns the bounded default executor count.
+fn default_forge_worker_concurrency() -> usize {
+    1
+}
+
 impl ServeMode {
     /// True when this mode binds the HTTP listener.
     #[must_use]
@@ -305,6 +342,9 @@ pub struct WyrdServerConfig {
     /// Active deployment profile.
     #[serde(default)]
     pub deployment_profile: DeploymentProfile,
+    /// Internal process role; defaults to the complete embedded topology.
+    #[serde(default)]
+    pub role: ForgeProcessRole,
     /// HTTP server bind configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -329,6 +369,9 @@ pub struct WyrdServerConfig {
     /// Bounded Scribe runtime and queue configuration.
     #[serde(default)]
     pub scribe: ScribeRuntimeConfig,
+    /// Forge worker pool sizing for roles that execute tasks.
+    #[serde(default)]
+    pub forge: ForgeRuntimeConfig,
     /// Prometheus metrics server configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -748,6 +791,29 @@ impl WyrdServerConfig {
     /// Unset variables are silently skipped. Empty variables produce
     /// [`ConfigError::EmptyEnvVar`].
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
+        if let Some(val) = env_opt("WYRD_ROLES")? {
+            self.role = match val.as_str() {
+                "all" => ForgeProcessRole::All,
+                "server" => ForgeProcessRole::Server,
+                "forge-worker" => ForgeProcessRole::ForgeWorker,
+                _ => {
+                    return Err(ConfigError::BadEnvVar {
+                        key: "WYRD_ROLES".to_owned(),
+                        message: format!(
+                            "expected 'all', 'server', or 'forge-worker', got {val:?}"
+                        ),
+                    });
+                }
+            };
+        }
+        if let Some(val) = env_opt("WYRD_FORGE_WORKER_CONCURRENCY")? {
+            self.forge.worker_concurrency =
+                val.parse::<usize>()
+                    .map_err(|error| ConfigError::BadEnvVar {
+                        key: "WYRD_FORGE_WORKER_CONCURRENCY".to_owned(),
+                        message: error.to_string(),
+                    })?;
+        }
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -970,6 +1036,11 @@ impl WyrdServerConfig {
         self.scribe
             .validate()
             .map_err(|message| ConfigError::Invalid { message })?;
+        if self.forge.worker_concurrency == 0 {
+            return Err(ConfigError::Invalid {
+                message: "forge.worker_concurrency must be positive".to_owned(),
+            });
+        }
 
         // 1. HTTP and gRPC bind addresses must differ.
         if self.http.bind == self.grpc.bind {
@@ -2069,5 +2140,40 @@ mod tests {
         assert!(!ServeMode::Http.serves_grpc());
         assert!(!ServeMode::Grpc.serves_http());
         assert!(ServeMode::Grpc.serves_grpc());
+    }
+
+    /// Internal role and bounded worker settings deserialize without adding a
+    /// public transport contract.
+    #[test]
+    fn forge_process_role_and_worker_bounds_parse() {
+        let cfg = from_toml_str(
+            r#"
+                role = "forge-worker"
+                [forge]
+                worker_concurrency = 3
+            "#,
+        )
+        .expect("Forge role parses");
+        assert_eq!(cfg.role, ForgeProcessRole::ForgeWorker);
+        assert_eq!(cfg.forge.worker_concurrency, 3);
+        cfg.validate().expect("positive Forge bounds validate");
+
+        let invalid = from_toml_str(
+            r#"
+                role = "all"
+                [forge]
+                worker_concurrency = 0
+            "#,
+        )
+        .expect("zero remains a parse-time value");
+        assert!(invalid.validate().is_err());
+    }
+
+    /// The default embedded topology contains exactly one bounded executor.
+    #[test]
+    fn forge_process_defaults_to_embedded_single_worker() {
+        let cfg = WyrdServerConfig::default();
+        assert_eq!(cfg.role, ForgeProcessRole::All);
+        assert_eq!(cfg.forge.worker_concurrency, 1);
     }
 }

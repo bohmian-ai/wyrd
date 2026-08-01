@@ -23,7 +23,7 @@ use crate::namespaces::BifrostNamespace;
 use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
-use super::lease::ForgeLease;
+use super::lease::{ForgeLease, forge_lease_key};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -48,8 +48,6 @@ pub(crate) struct ExpiryReconciliationOutcome {
     pub(crate) pending: usize,
     /// Prepared selections no longer safe to replay.
     pub(crate) unresolved: usize,
-    /// Whether the open-state query exceeded its explicit cap.
-    pub(crate) overflowed: bool,
     /// Fail-closed destructive-maintenance disposition.
     pub(crate) destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
 }
@@ -61,7 +59,6 @@ impl Default for ExpiryReconciliationOutcome {
             recovered: 0,
             pending: 0,
             unresolved: 0,
-            overflowed: false,
             destructive_maintenance: super::live_reconcile::DestructiveMaintenance::Allowed,
         }
     }
@@ -130,6 +127,43 @@ impl Forge {
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
         self.run_snapshot_expiry_for_table_inner(lease, key, binding, now)
             .await
+    }
+
+    /// Runs one table-scoped snapshot-expiry pass for integration fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, catalog, SQL, audit, or reconciliation failures from the
+    /// unchanged production expiry owner.
+    #[cfg(feature = "test-support")]
+    pub async fn run_snapshot_expiry_for_test(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<usize, ForgeError> {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let lease_key = forge_lease_key(
+            binding.tenant,
+            &binding.logical_namespace,
+            &binding.table_name,
+        );
+        let mut lease = ForgeLease::acquire(
+            &self.core.operator_pool,
+            lease_key,
+            Uuid::now_v7(),
+            self.core.config.lease_ttl,
+        )
+        .await?
+        .ok_or_else(|| ForgeError::FenceLost {
+            lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
+        })?;
+        let outcome = self
+            .run_snapshot_expiry_for_table(&mut lease, &key, binding, self.core.clock.now()?)
+            .await;
+        lease.release(&self.core.operator_pool).await?;
+        outcome.map(|outcome| outcome.recovered)
     }
 }
 
@@ -435,10 +469,7 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        let mut outcome = ExpiryReconciliationOutcome {
-            overflowed: page.overflowed,
-            ..ExpiryReconciliationOutcome::default()
-        };
+        let mut outcome = ExpiryReconciliationOutcome::default();
         if page.overflowed {
             outcome.destructive_maintenance =
                 super::live_reconcile::DestructiveMaintenance::Blocked;

@@ -3,7 +3,7 @@ mod pg_tests {
 
     use chrono::{Duration, Utc};
     use sqlx::{PgPool, types::Uuid};
-    use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
+    use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
     use vala_sql::row_types::forge_tasks::{
         FORGE_TASK_PAYLOAD_VERSION, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
         ForgeTaskEstimates, ForgeTaskEvidence, ForgeTaskLane, ForgeTaskPlan, ForgeTaskState,
@@ -98,6 +98,153 @@ mod pg_tests {
         }
     }
 
+    /// Proves worker admission is independent of scheduler leadership and only
+    /// advances its durable cursor after a successful fitting claim.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or cursor assertions fail.
+    #[tokio::test]
+    async fn worker_claim_cursor_is_independent_and_success_only() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new();
+        let op = fixture.operator_pool();
+        let owner = Uuid::now_v7();
+        let tenant = fixture.data_tenant_id();
+        let initial: (Option<Uuid>,) = sqlx::query_as(
+            "SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("initial worker cursor");
+        assert_eq!(initial.0, None);
+        assert!(
+            tasks
+                .claim_fair(op, owner, limits(1))
+                .await
+                .expect("empty claim")
+                .is_none()
+        );
+        let empty: (Option<Uuid>,) = sqlx::query_as(
+            "SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("empty worker cursor");
+        assert_eq!(empty.0, None);
+
+        tasks
+            .enqueue(
+                op,
+                &task(tenant, "worker-only", ForgeTaskLane::Ordinary, 91),
+            )
+            .await
+            .expect("enqueue worker-only task");
+        let mut no_fit = limits(1);
+        no_fit.max_bytes = 1;
+        assert!(
+            tasks
+                .claim_fair(op, owner, no_fit)
+                .await
+                .expect("no-fit claim")
+                .is_none()
+        );
+        let unchanged: (Option<Uuid>,) = sqlx::query_as(
+            "SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("no-fit worker cursor");
+        assert_eq!(unchanged.0, None);
+
+        let claim = tasks
+            .claim_fair(op, owner, limits(1))
+            .await
+            .expect("independent claim")
+            .expect("worker claims without scheduler lease");
+        assert_eq!(claim.execution_tenant_id, tenant);
+        assert_eq!(claim.data_tenant_id, tenant);
+        let advanced: (Option<Uuid>,) = sqlx::query_as(
+            "SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("advanced worker cursor");
+        assert_eq!(advanced.0, Some(tenant.as_uuid()));
+    }
+
+    /// Superseded cancellation is terminal, audited, lane-releasing, and repairable.
+    ///
+    /// # Panics
+    /// Panics when rollback, exact cancellation, demand repair, or reclaim
+    /// invariants fail against PostgreSQL.
+    #[tokio::test]
+    async fn superseded_cancellation_is_atomic_terminal_progress() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new();
+        let op = fixture.operator_pool();
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let task_id = tasks
+            .enqueue(
+                op,
+                &task(tenant, "superseded", ForgeTaskLane::LargeSingleton, 92),
+            )
+            .await
+            .expect("enqueue superseded task");
+        let claim = tasks
+            .claim_fair(op, owner, limits(1))
+            .await
+            .expect("claim query")
+            .expect("claimed task");
+        assert_eq!(claim.task_id, task_id);
+
+        {
+            let mut rollback = TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .expect("rollback tenant connection");
+            tasks
+                .cancel_superseded(
+                    &mut rollback,
+                    &claim,
+                    &event("forge.task.cancelled", task_id),
+                )
+                .await
+                .expect("rollback cancellation");
+        }
+        let rolled_back: (String, Option<Uuid>, i64, i64) = sqlx::query_as(
+            "SELECT t.state,l.task_id,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox) FROM vala.forge_tasks t CROSS JOIN vala.forge_large_lane_lease l WHERE t.task_id=$1 AND l.singleton",
+        )
+        .bind(task_id)
+        .fetch_one(&admin)
+        .await
+        .expect("rolled-back cancellation state");
+        assert_eq!(rolled_back.0, "claimed");
+        assert_eq!(rolled_back.1, Some(task_id));
+        assert_eq!((rolled_back.2, rolled_back.3), (0, 0));
+
+        let mut commit = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("commit tenant connection");
+        tasks
+            .cancel_superseded(&mut commit, &claim, &event("forge.task.cancelled", task_id))
+            .await
+            .expect("commit cancellation");
+        commit
+            .commit()
+            .await
+            .expect("commit superseded cancellation");
+        let terminal: (String, Option<Uuid>, Option<Uuid>, Option<Uuid>, i64, i64) =
+            sqlx::query_as(
+                "SELECT t.state,t.attempt_id,t.claimed_by,l.task_id,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox WHERE operation='forge.task.cancelled') FROM vala.forge_tasks t CROSS JOIN vala.forge_large_lane_lease l WHERE t.task_id=$1 AND l.singleton",
+            )
+            .bind(task_id)
+            .fetch_one(&admin)
+            .await
+            .expect("committed cancellation state");
+        assert_eq!(terminal, ("cancelled".to_owned(), None, None, None, 1, 1));
+        assert_eq!(tasks.reclaim_expired(op, 10).await.expect("reclaim"), 0);
+    }
+
     /// Claims and starts one task with a caller-selected watermark.
     ///
     /// # Panics
@@ -107,11 +254,10 @@ mod pg_tests {
         op: &OperatorPool,
         task_id: Uuid,
         owner: Uuid,
-        fence: i64,
         watermark: SnapshotWatermark,
     ) -> (Uuid, DataTenantId) {
         let claim = tasks
-            .claim_fair(op, owner, fence, limits(4))
+            .claim_fair(op, owner, limits(4))
             .await
             .expect("claim")
             .expect("claimed task");
@@ -146,15 +292,15 @@ mod pg_tests {
                 .expect("duplicate")
         );
         let owner = Uuid::now_v7();
-        let fence = tasks
+        let _fence = tasks
             .acquire_scheduler(op, owner, 30)
             .await
             .expect("scheduler")
             .expect("fence");
         let claim_limits = limits(1);
         let (left, right) = tokio::join!(
-            tasks.claim_fair(op, owner, fence, claim_limits),
-            tasks.claim_fair(op, owner, fence, claim_limits)
+            tasks.claim_fair(op, owner, claim_limits),
+            tasks.claim_fair(op, owner, claim_limits)
         );
         let claims = [left.expect("left"), right.expect("right")];
         assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
@@ -199,7 +345,7 @@ mod pg_tests {
             .expect("oversized enqueue");
         assert!(
             tasks
-                .claim_fair(op, owner, fence, limits(2))
+                .claim_fair(op, owner, limits(2))
                 .await
                 .expect("capacity claim")
                 .is_none(),
@@ -249,7 +395,7 @@ mod pg_tests {
             .await
             .expect("b");
         let leader = Uuid::now_v7();
-        let fence = tasks
+        let _fence = tasks
             .acquire_scheduler(op, leader, 30)
             .await
             .expect("leader")
@@ -259,8 +405,8 @@ mod pg_tests {
             ..limits(1)
         };
         let (left, right) = tokio::join!(
-            tasks.claim_fair(op, leader, fence, claim_limits),
-            tasks.claim_fair(op, leader, fence, claim_limits)
+            tasks.claim_fair(op, leader, claim_limits),
+            tasks.claim_fair(op, leader, claim_limits)
         );
         let claims = [left.expect("left"), right.expect("right")];
         assert_eq!(
@@ -277,7 +423,7 @@ mod pg_tests {
         tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
         assert!(
             tasks
-                .claim_fair(op, leader, fence, claim_limits)
+                .claim_fair(op, leader, claim_limits)
                 .await
                 .expect("post-renew claim")
                 .is_none(),
@@ -316,13 +462,13 @@ mod pg_tests {
             "reclaim releases the exact large-lane generation atomically"
         );
         let successor = Uuid::now_v7();
-        let successor_fence = tasks
+        let _successor_fence = tasks
             .acquire_scheduler(op, successor, 30)
             .await
             .expect("successor")
             .expect("takeover fence");
         let second = tasks
-            .claim_fair(op, successor, successor_fence, claim_limits)
+            .claim_fair(op, successor, claim_limits)
             .await
             .expect("successor claim")
             .expect("next tenant");
@@ -351,7 +497,7 @@ mod pg_tests {
             .expect("enqueue");
         sqlx::query("UPDATE vala.forge_tasks SET plan=jsonb_set(plan,'{version}','99'::jsonb) WHERE task_id=$1").bind(task_id).execute(&admin).await.expect("corrupt plan");
         let owner = Uuid::now_v7();
-        let fence = tasks
+        let _fence = tasks
             .acquire_scheduler(op, owner, 30)
             .await
             .expect("scheduler")
@@ -364,7 +510,7 @@ mod pg_tests {
         .expect("scheduler before");
         let large_before: LargeLeaseSnapshot = sqlx::query_as("SELECT task_id,attempt_id,owner,fencing_token,expires_at FROM vala.forge_large_lane_lease WHERE singleton").fetch_one(&admin).await.expect("large before");
         assert!(
-            tasks.claim_fair(op, owner, fence, limits(1)).await.is_err(),
+            tasks.claim_fair(op, owner, limits(1)).await.is_err(),
             "unknown persisted plan fails claim conversion"
         );
         let task_after: (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
@@ -411,7 +557,7 @@ mod pg_tests {
             .await
             .expect("enqueue");
         let owner = Uuid::now_v7();
-        let fence = tasks
+        let _fence = tasks
             .acquire_scheduler(op, owner, 30)
             .await
             .expect("scheduler")
@@ -421,7 +567,6 @@ mod pg_tests {
             op,
             id,
             owner,
-            fence,
             SnapshotWatermark {
                 snapshot_id: 50,
                 timestamp_ms: 500,
@@ -605,6 +750,99 @@ mod pg_tests {
         );
     }
 
+    /// Prepared takeover preserves the committing generation and exact evidence.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or takeover invariants fail.
+    #[tokio::test]
+    async fn prepared_reconciliation_takeover_is_at_most_once() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new();
+        let op = fixture.operator_pool();
+        let tenant = fixture.data_tenant_id();
+        let original_owner = Uuid::now_v7();
+        let task_id = tasks
+            .enqueue(
+                op,
+                &task(tenant, "prepared-takeover", ForgeTaskLane::Ordinary, 73),
+            )
+            .await
+            .expect("enqueue");
+        let claimed = tasks
+            .claim_fair(op, original_owner, limits(1))
+            .await
+            .expect("claim")
+            .expect("task");
+        assert_eq!(claimed.task_id, task_id);
+        let attempt = claimed.attempt_id.expect("attempt");
+        tasks
+            .start(
+                op,
+                task_id,
+                attempt,
+                original_owner,
+                SnapshotWatermark {
+                    snapshot_id: 73,
+                    timestamp_ms: 73,
+                },
+            )
+            .await
+            .expect("start");
+        let evidence = ForgeTaskEvidence {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            committed_snapshot_id: Some(730),
+            committed_metadata_location: Some("metadata/v730.json".to_owned()),
+            committed_metadata_digest: Some(format!("sha256:{}", "7".repeat(64))),
+            cleanup_candidates: Vec::new(),
+            deleted_candidate_count: 0,
+        };
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        tasks
+            .prepared(
+                &mut conn,
+                task_id,
+                attempt,
+                original_owner,
+                &evidence,
+                &event("forge.task.prepared", task_id),
+            )
+            .await
+            .expect("Prepared transition");
+        conn.commit().await.expect("commit Prepared");
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(&admin)
+        .await
+        .expect("expire Prepared owner");
+
+        let successor_a = Uuid::now_v7();
+        let successor_b = Uuid::now_v7();
+        let (takeover_a, takeover_b) = tokio::join!(
+            tasks.claim_prepared_for_reconciliation(op, successor_a, 30),
+            tasks.claim_prepared_for_reconciliation(op, successor_b, 30),
+        );
+        let taken = [
+            takeover_a.expect("takeover A"),
+            takeover_b.expect("takeover B"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        assert_eq!(taken.len(), 1, "Prepared takeover is at most once");
+        assert_eq!(taken[0].task_id, task_id);
+        assert_eq!(taken[0].attempt_id, Some(attempt));
+        assert_eq!(taken[0].state, ForgeTaskState::Prepared);
+        assert_eq!(taken[0].evidence, Some(evidence));
+        assert!(matches!(
+            taken[0].claimed_by,
+            Some(owner) if owner == successor_a || owner == successor_b
+        ));
+    }
+
     /// Proves bounded watermark/status failure modes, pruning safety, RLS, and grants.
     ///
     /// # Panics
@@ -634,13 +872,13 @@ mod pg_tests {
             .await
             .expect("terminal enqueue");
         let owner = Uuid::now_v7();
-        let fence = tasks
+        let _fence = tasks
             .acquire_scheduler(op, owner, 30)
             .await
             .expect("scheduler")
             .expect("fence");
         let first = tasks
-            .claim_fair(op, owner, fence, limits(4))
+            .claim_fair(op, owner, limits(4))
             .await
             .expect("claim")
             .expect("claim");
@@ -789,9 +1027,27 @@ mod pg_tests {
             .execute(&admin)
             .await
             .expect("corrupt tenant");
+        let cursor_before: Option<Uuid> = sqlx::query_scalar(
+            "SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("cursor before malformed tenant claim");
         assert!(
-            tasks.claim_fair(op, owner, fence, limits(4)).await.is_err(),
+            tasks.claim_fair(op, owner, limits(4)).await.is_err(),
             "persisted invalid tenant fails before returning claim"
+        );
+        let rollback: (String, Option<Uuid>, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+            "SELECT state,attempt_id,claimed_by,(SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton) FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(invalid_id)
+        .fetch_one(&admin)
+        .await
+        .expect("malformed tenant claim rollback");
+        assert_eq!(
+            rollback,
+            ("ready".to_owned(), None, None, cursor_before),
+            "claim decoding failure rolls back task ownership and cursor"
         );
     }
 
@@ -870,8 +1126,10 @@ mod pg_tests {
                     owner,
                     fence,
                     &captured,
-                    std::slice::from_ref(&exact),
-                    &[],
+                    ForgeEnqueueBatch {
+                        executable: std::slice::from_ref(&exact),
+                        unschedulable: &[],
+                    },
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
@@ -897,8 +1155,10 @@ mod pg_tests {
                     owner,
                     fence,
                     &retryable[0],
-                    &[],
-                    std::slice::from_ref(&stale_terminal),
+                    ForgeEnqueueBatch {
+                        executable: &[],
+                        unschedulable: std::slice::from_ref(&stale_terminal),
+                    },
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
@@ -921,8 +1181,10 @@ mod pg_tests {
                     successor,
                     successor_fence,
                     &retryable[0],
-                    std::slice::from_ref(&exact),
-                    &[],
+                    ForgeEnqueueBatch {
+                        executable: std::slice::from_ref(&exact),
+                        unschedulable: &[],
+                    },
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
@@ -954,8 +1216,10 @@ mod pg_tests {
                     successor,
                     successor_fence,
                     &terminal_demand,
-                    &[],
-                    std::slice::from_ref(&terminal),
+                    ForgeEnqueueBatch {
+                        executable: &[],
+                        unschedulable: std::slice::from_ref(&terminal),
+                    },
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
@@ -1091,10 +1355,17 @@ mod pg_tests {
             .expect("concurrent newer generation");
         assert!(
             !tasks
-                .enqueue_and_acknowledge(op, owner, fence, &first, &[], &[], |id| event(
-                    "forge.task.unschedulable",
-                    id
-                ))
+                .enqueue_and_acknowledge(
+                    op,
+                    owner,
+                    fence,
+                    &first,
+                    ForgeEnqueueBatch {
+                        executable: &[],
+                        unschedulable: &[],
+                    },
+                    |id| event("forge.task.unschedulable", id),
+                )
                 .await
                 .expect("CAS mismatch")
         );

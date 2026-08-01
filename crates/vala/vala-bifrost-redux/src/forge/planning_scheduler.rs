@@ -1,11 +1,12 @@
 //! Durable demand scheduling without rewrite or Iceberg commit execution.
 
 use chrono::Utc;
+use num_traits::ToPrimitive;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
-    ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    ForgePlanningDemand, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -34,6 +35,17 @@ pub struct ForgeScheduleOutcome {
     pub incomplete: bool,
 }
 
+/// Local accounting returned after one durable demand generation is handled.
+#[derive(Debug, Default, Clone, Copy)]
+struct DemandPlanningResult {
+    /// Tasks passed to the atomic enqueue transaction.
+    tasks_enqueued: usize,
+    /// Tasks terminalized because no configured lane can execute them.
+    unschedulable: usize,
+    /// Whether the exact observed demand generation was acknowledged.
+    acknowledged: bool,
+}
+
 /// Concrete owner of fenced durable Forge planning and demand convergence.
 pub struct ForgeScheduler<'forge> {
     /// Forge dependency owner used only for catalog reads and deterministic discovery.
@@ -56,6 +68,23 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     /// Returns invalid configuration when derived capacity is not positive.
     pub fn new(forge: &'forge Forge) -> Result<Self, ForgeError> {
+        Self::with_owner(forge, Uuid::now_v7())
+    }
+
+    /// Constructs a scheduler with a stable fixture owner across bounded passes.
+    ///
+    /// # Errors
+    /// Returns invalid configuration when derived capacity is not positive.
+    #[cfg(feature = "test-support")]
+    pub fn with_owner_for_test(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
+        Self::with_owner(forge, owner)
+    }
+
+    /// Constructs the scheduler dependency graph for one explicit lease owner.
+    ///
+    /// # Errors
+    /// Returns invalid configuration when derived capacity is not positive.
+    fn with_owner(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
         let config = &forge.core.config;
         let capacity = ForgeCapacity {
             max_files: u32::try_from(config.max_files_per_tick).map_err(|_| {
@@ -79,7 +108,7 @@ impl<'forge> ForgeScheduler<'forge> {
             planner: ForgePlanner::new(),
             tasks: ForgeTasks::new(),
             capacity,
-            owner: Uuid::now_v7(),
+            owner,
             demand_cap: u32::try_from(config.max_hints_per_wake).unwrap_or(u32::MAX),
         })
     }
@@ -114,8 +143,8 @@ impl<'forge> ForgeScheduler<'forge> {
 
     /// Repairs lost hints from the authoritative roster and plans one bounded demand page.
     ///
-    /// This method performs metadata reads and PostgreSQL writes only. It never
-    /// invokes DataFusion, rewrites objects, or commits an Iceberg transaction.
+    /// This method performs metadata reads and `PostgreSQL` writes only. It never
+    /// invokes `DataFusion`, rewrites objects, or commits an Iceberg transaction.
     ///
     /// # Errors
     /// Returns scheduler lease, roster, catalog, planning, or durable SQL errors.
@@ -125,41 +154,11 @@ impl<'forge> ForgeScheduler<'forge> {
         stop: &CancellationToken,
     ) -> Result<ForgeScheduleOutcome, ForgeError> {
         let started = std::time::Instant::now();
-        let lease_seconds =
-            u32::try_from(self.forge.core.config.lease_ttl.as_secs()).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "scheduler lease TTL exceeds u32 seconds".to_owned(),
-                }
-            })?;
-        let fence = self
-            .tasks
-            .acquire_scheduler(&self.forge.core.operator_pool, self.owner, lease_seconds)
-            .await
-            .map_err(ForgeError::Sql)?
-            .ok_or_else(|| ForgeError::FenceLost {
-                lease_key: "forge:scheduler:v1".to_owned(),
-            })?;
-        let (tables, failures) = self.forge.discover_tables().await?;
+        let fence = self.acquire_fence().await?;
         let mut outcome = ForgeScheduleOutcome {
-            incomplete: failures > 0,
+            incomplete: self.repair_roster(stop).await?,
             ..ForgeScheduleOutcome::default()
         };
-        for key in tables {
-            if stop.is_cancelled() {
-                outcome.incomplete = true;
-                return Ok(outcome);
-            }
-            let identity = ForgeTaskTableIdentity::new(
-                "wyrd-redux",
-                key.table_ref.namespace.as_str(),
-                key.table_ref.name,
-            )
-            .map_err(ForgeError::Sql)?;
-            self.tasks
-                .upsert_periodic(&self.forge.core.operator_pool, key.tenant, &identity)
-                .await
-                .map_err(ForgeError::Sql)?;
-        }
         let (demands, overflowed) = self
             .tasks
             .planning_demands(
@@ -177,179 +176,25 @@ impl<'forge> ForgeScheduler<'forge> {
                 outcome.incomplete = true;
                 break;
             }
-            let demand_result: Result<(), ForgeError> = async {
-                let binding = task_table_binding(
-                    demand.data_tenant_id,
-                    demand.data_tenant_id,
-                    &demand.table_ref,
-                )?;
-                let table = self.forge.load_table(&binding.table_ident()).await?;
-                let mut tenant_conn = self
-                    .forge
-                    .core
-                    .vala
-                    .tenant_conn(demand.data_tenant_id)
-                    .await
-                    .map_err(ForgeError::Sql)?;
-                let staged = vala_sql::queries::file_list::list_nonterminal_files(
-                    &mut tenant_conn,
-                    &demand.table_ref.namespace,
-                    &demand.table_ref.table,
-                )
-                .await
-                .map_err(ForgeError::Sql)?;
-                tenant_conn.commit().await.map_err(ForgeError::Sql)?;
-                let discovered = self
-                    .forge
-                    .discover_live_rewrites(
-                        &binding,
-                        &table,
-                        self.forge.core.clock.now()?.date_naive(),
-                    )
-                    .await?;
-                let mut candidates = Vec::new();
-                if !staged.is_empty() {
-                    let bytes = staged
-                        .iter()
-                        .try_fold(0_u64, |total, (_, size)| total.checked_add(*size))
-                        .ok_or_else(|| ForgeError::Invariant {
-                            detail: "Forge staging bytes overflow".to_owned(),
-                        })?;
-                    candidates.push(ForgePlanCandidate {
-                        strategy: ForgeTaskStrategy::StagingFold,
-                        inputs: staged.into_iter().map(|(path, _)| path).collect(),
-                        bytes,
-                        parallelism: 1,
-                        memory_bytes: bytes,
-                        spill_bytes: bytes,
-                        parameters: serde_json::json!({"kind":"staging_fold"}),
-                    });
+            match self.plan_demand(&demand, fence).await {
+                Ok(planned) => {
+                    outcome.tasks_enqueued = outcome
+                        .tasks_enqueued
+                        .saturating_add(planned.tasks_enqueued);
+                    outcome.unschedulable =
+                        outcome.unschedulable.saturating_add(planned.unschedulable);
+                    outcome.demands_acknowledged = outcome
+                        .demands_acknowledged
+                        .saturating_add(usize::from(planned.acknowledged));
+                    outcome.incomplete |= !planned.acknowledged;
                 }
-                candidates.extend(
-                    discovered
-                        .groups()
-                        .iter()
-                        .map(|group| {
-                            let mut inputs = group
-                                .files()
-                                .iter()
-                                .map(|file| file.catalog_path().to_owned())
-                                .collect::<Vec<_>>();
-                            inputs.sort();
-                            inputs.dedup();
-                            let bytes = group
-                                .files()
-                                .iter()
-                                .try_fold(0_u64, |total, file| {
-                                    total.checked_add(file.file_size_bytes())
-                                })
-                                .ok_or_else(|| ForgeError::Invariant {
-                                    detail: "Forge group bytes overflow".to_owned(),
-                                })?;
-                            Ok(ForgePlanCandidate {
-                                strategy: ForgeTaskStrategy::SmallFiles,
-                                parallelism: u16::try_from(group.files().len()).map_err(|_| {
-                                    ForgeError::Invariant {
-                                        detail: "Forge planned parallelism exceeds u16".to_owned(),
-                                    }
-                                })?,
-                                memory_bytes: bytes,
-                                spill_bytes: bytes,
-                                inputs,
-                                bytes,
-                                parameters: serde_json::json!({"kind":"live_rewrite"}),
-                            })
-                        })
-                        .collect::<Result<Vec<_>, ForgeError>>()?,
-                );
-                let planned = self.planner.plan_table(
-                    &ForgeTableSnapshot {
-                        snapshot_id: discovered.base_snapshot_id(),
-                        candidates,
-                    },
-                    &self.capacity,
-                )?;
-                outcome.unschedulable = outcome.unschedulable.saturating_add(
-                    planned
-                        .iter()
-                        .filter(|task| task.capacity == ForgePlanCapacity::Unschedulable)
-                        .count(),
-                );
-                let mut executable = Vec::new();
-                let mut unschedulable = Vec::new();
-                for task in planned {
-                    let terminal = task.capacity == ForgePlanCapacity::Unschedulable;
-                    let durable = NewForgeTask {
-                        data_tenant_id: demand.data_tenant_id,
-                        table_ref: demand.table_ref.clone(),
-                        strategy: task.strategy,
-                        lane: if terminal {
-                            ForgeTaskLane::LargeSingleton
-                        } else {
-                            task.lane()?
-                        },
-                        base_snapshot_id: task.base_snapshot_id,
-                        plan: task.plan,
-                        plan_hash: task.plan_hash,
-                        estimates: task.estimates,
-                        ready_at: Utc::now(),
-                    };
-                    if terminal {
-                        unschedulable.push(durable);
-                    } else {
-                        executable.push(durable);
-                    }
-                }
-                outcome.tasks_enqueued = outcome
-                    .tasks_enqueued
-                    .saturating_add(executable.len())
-                    .saturating_add(unschedulable.len());
-                if self
-                    .tasks
-                    .enqueue_and_acknowledge(
-                        &self.forge.core.operator_pool,
-                        self.owner,
-                        fence,
-                        &demand,
-                        &executable,
-                        &unschedulable,
-                        unschedulable_event,
-                    )
-                    .await
-                    .map_err(ForgeError::Sql)?
-                {
-                    outcome.demands_acknowledged = outcome.demands_acknowledged.saturating_add(1);
-                } else {
+                Err(error) => {
                     outcome.incomplete = true;
+                    tracing::warn!(data_tenant_id = %demand.data_tenant_id, table = %demand.table_ref.table, error = %error, "Forge demand planning failed; retaining demand and continuing tenant page");
                 }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = demand_result {
-                outcome.incomplete = true;
-                tracing::warn!(data_tenant_id = %demand.data_tenant_id, table = %demand.table_ref.table, error = %error, "Forge demand planning failed; retaining demand and continuing tenant page");
             }
         }
-        if !outcome.incomplete && outcome.demands_acknowledged == outcome.demands_seen {
-            let (backlog, oldest, overflowed) = self
-                .tasks
-                .planning_status(&self.forge.core.operator_pool, self.demand_cap)
-                .await
-                .map_err(ForgeError::Sql)?;
-            if !should_publish_gauges(&outcome, overflowed) {
-                outcome.incomplete = true;
-            } else {
-                metrics::gauge!("bifrost_forge_planning_backlog").set(backlog as f64);
-                let age = oldest.map_or(0.0, |time| {
-                    Utc::now()
-                        .signed_duration_since(time)
-                        .to_std()
-                        .unwrap_or_default()
-                        .as_secs_f64()
-                });
-                metrics::gauge!("bifrost_forge_oldest_planning_demand_seconds").set(age);
-            }
-        }
+        self.publish_status(&mut outcome).await?;
         metrics::counter!("bifrost_forge_scheduling_total", "result" => if outcome.incomplete { "incomplete" } else { "complete" }).increment(1);
         metrics::counter!("bifrost_forge_unschedulable_total")
             .increment(outcome.unschedulable as u64);
@@ -357,6 +202,233 @@ impl<'forge> ForgeScheduler<'forge> {
             .record(started.elapsed().as_secs_f64());
         Ok(outcome)
     }
+
+    /// Acquires the singleton planning fence for this scheduler owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid configuration, SQL, or fence-loss errors.
+    async fn acquire_fence(&self) -> Result<i64, ForgeError> {
+        let lease_seconds =
+            u32::try_from(self.forge.core.config.lease_ttl.as_secs()).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "scheduler lease TTL exceeds u32 seconds".to_owned(),
+                }
+            })?;
+        self.tasks
+            .acquire_scheduler(&self.forge.core.operator_pool, self.owner, lease_seconds)
+            .await
+            .map_err(ForgeError::Sql)?
+            .ok_or_else(|| ForgeError::FenceLost {
+                lease_key: "forge:scheduler:v1".to_owned(),
+            })
+    }
+
+    /// Repairs periodic demand from the authoritative registered-table roster.
+    ///
+    /// The returned flag is true when discovery was partial or cancellation
+    /// interrupted the roster before every table was upserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns roster, identity, or SQL errors without acknowledging demand.
+    async fn repair_roster(&self, stop: &CancellationToken) -> Result<bool, ForgeError> {
+        let (tables, failures) = self.forge.discover_tables().await?;
+        for key in tables {
+            if stop.is_cancelled() {
+                return Ok(true);
+            }
+            let identity = ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                key.table_ref.namespace.as_str(),
+                key.table_ref.name,
+            )
+            .map_err(ForgeError::Sql)?;
+            self.tasks
+                .upsert_periodic(&self.forge.core.operator_pool, key.tenant, &identity)
+                .await
+                .map_err(ForgeError::Sql)?;
+        }
+        Ok(failures > 0)
+    }
+
+    /// Plans and atomically acknowledges one exact demand generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns identity, catalog, discovery, planning, lane, or SQL errors. A
+    /// failure leaves the demand generation available to a later scheduler.
+    async fn plan_demand(
+        &self,
+        demand: &ForgePlanningDemand,
+        fence: i64,
+    ) -> Result<DemandPlanningResult, ForgeError> {
+        let snapshot = self.discover_snapshot(demand).await?;
+        let planned = self.planner.plan_table(&snapshot, &self.capacity)?;
+        let mut executable = Vec::new();
+        let mut unschedulable = Vec::new();
+        for task in planned.into_iter().take(1) {
+            let terminal = task.capacity == ForgePlanCapacity::Unschedulable;
+            let durable = NewForgeTask {
+                data_tenant_id: demand.data_tenant_id,
+                table_ref: demand.table_ref.clone(),
+                strategy: task.strategy,
+                lane: if terminal {
+                    ForgeTaskLane::LargeSingleton
+                } else {
+                    task.lane()?
+                },
+                base_snapshot_id: task.base_snapshot_id,
+                plan: task.plan,
+                plan_hash: task.plan_hash,
+                estimates: task.estimates,
+                ready_at: Utc::now(),
+            };
+            if terminal {
+                unschedulable.push(durable);
+            } else {
+                executable.push(durable);
+            }
+        }
+        let result = DemandPlanningResult {
+            tasks_enqueued: executable.len().saturating_add(unschedulable.len()),
+            unschedulable: unschedulable.len(),
+            acknowledged: self
+                .tasks
+                .enqueue_and_acknowledge(
+                    &self.forge.core.operator_pool,
+                    self.owner,
+                    fence,
+                    demand,
+                    ForgeEnqueueBatch {
+                        executable: &executable,
+                        unschedulable: &unschedulable,
+                    },
+                    unschedulable_event,
+                )
+                .await
+                .map_err(ForgeError::Sql)?,
+        };
+        Ok(result)
+    }
+
+    /// Reconstructs the deterministic task candidates for one current table snapshot.
+    ///
+    /// Staging work retains priority. Live candidates are materialized only
+    /// when no staging fold is ready, preserving one mutation per base snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns identity, clock, catalog, discovery, or candidate-bound errors.
+    async fn discover_snapshot(
+        &self,
+        demand: &ForgePlanningDemand,
+    ) -> Result<ForgeTableSnapshot, ForgeError> {
+        let binding = task_table_binding(
+            demand.data_tenant_id,
+            demand.data_tenant_id,
+            &demand.table_ref,
+        )?;
+        let table = self.forge.load_table(&binding.table_ident()).await?;
+        let current_day = self.forge.core.clock.now()?.date_naive();
+        let discovered = self
+            .forge
+            .discover_live_rewrites(&binding, &table, current_day)
+            .await?;
+        let mut candidates = self
+            .forge
+            .discover_staging_task_candidates(&binding, current_day)
+            .await?;
+        if candidates.is_empty() {
+            candidates = discovered
+                .groups()
+                .iter()
+                .map(live_candidate)
+                .collect::<Result<Vec<_>, ForgeError>>()?;
+        }
+        Ok(ForgeTableSnapshot {
+            snapshot_id: discovered.base_snapshot_id(),
+            candidates,
+        })
+    }
+
+    /// Publishes complete-only planning backlog gauges.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL errors while reading the bounded durable status page.
+    async fn publish_status(&self, outcome: &mut ForgeScheduleOutcome) -> Result<(), ForgeError> {
+        if outcome.incomplete || outcome.demands_acknowledged != outcome.demands_seen {
+            return Ok(());
+        }
+        let (backlog, oldest, overflowed) = self
+            .tasks
+            .planning_status(&self.forge.core.operator_pool, self.demand_cap)
+            .await
+            .map_err(ForgeError::Sql)?;
+        if should_publish_gauges(outcome, overflowed) {
+            metrics::gauge!("bifrost_forge_planning_backlog").set(exact_gauge(backlog));
+            let age = oldest.map_or(0.0, |time| {
+                Utc::now()
+                    .signed_duration_since(time)
+                    .to_std()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+            });
+            metrics::gauge!("bifrost_forge_oldest_planning_demand_seconds").set(age);
+        } else {
+            outcome.incomplete = true;
+        }
+        Ok(())
+    }
+}
+
+/// Maps one exact live rewrite group into the durable planner contract.
+///
+/// # Errors
+///
+/// Returns invariant errors when byte or parallelism estimates exceed their
+/// typed bounds.
+fn live_candidate(
+    group: &super::right_size::IcebergRewriteGroup,
+) -> Result<ForgePlanCandidate, ForgeError> {
+    let mut inputs = group
+        .files()
+        .iter()
+        .map(|file| file.catalog_path().to_owned())
+        .collect::<Vec<_>>();
+    inputs.sort();
+    inputs.dedup();
+    let bytes = group
+        .files()
+        .iter()
+        .try_fold(0_u64, |total, file| {
+            total.checked_add(file.file_size_bytes())
+        })
+        .ok_or_else(|| ForgeError::Invariant {
+            detail: "Forge group bytes overflow".to_owned(),
+        })?;
+    Ok(ForgePlanCandidate {
+        strategy: ForgeTaskStrategy::SmallFiles,
+        parallelism: u16::try_from(group.files().len()).map_err(|_| ForgeError::Invariant {
+            detail: "Forge planned parallelism exceeds u16".to_owned(),
+        })?,
+        memory_bytes: bytes,
+        spill_bytes: bytes,
+        inputs,
+        bytes,
+        parameters: serde_json::json!({"kind":"live_rewrite"}),
+    })
+}
+
+/// Converts a durable backlog count into an exact, monotonic gauge value.
+#[must_use]
+fn exact_gauge(value: u64) -> f64 {
+    const MAX_EXACT_GAUGE_INTEGER: u64 = 1_u64 << 53;
+    value
+        .min(MAX_EXACT_GAUGE_INTEGER)
+        .to_f64()
+        .unwrap_or(9_007_199_254_740_992.0)
 }
 
 /// Returns whether one status observation may replace authoritative gauges.

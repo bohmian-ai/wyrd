@@ -141,13 +141,12 @@ impl ForgePlanner {
         snapshot
             .candidates
             .iter()
-            .map(|candidate| self.plan_candidate(snapshot.snapshot_id, candidate, capacity))
+            .map(|candidate| Self::plan_candidate(snapshot.snapshot_id, candidate, capacity))
             .collect()
     }
 
     /// Builds and hashes one exact candidate without performing IO.
     fn plan_candidate(
-        &self,
         snapshot_id: i64,
         candidate: &ForgePlanCandidate,
         capacity: &ForgeCapacity,
@@ -248,10 +247,10 @@ mod tests {
     /// Every capacity dimension independently controls the sole outcome.
     #[test]
     fn planner_classifies_all_capacity_dimensions_and_singleton_lane() {
-        let planner = ForgePlanner::new();
+        let owner = ForgePlanner::new();
         for mutate in [
             |c: &mut ForgePlanCandidate| {
-                c.inputs = (0..5).map(|i| format!("{i}.parquet")).collect()
+                c.inputs = (0..5).map(|i| format!("{i}.parquet")).collect();
             },
             |c: &mut ForgePlanCandidate| c.bytes = 201,
             |c: &mut ForgePlanCandidate| c.parallelism = 3,
@@ -260,7 +259,7 @@ mod tests {
         ] {
             let mut value = candidate();
             mutate(&mut value);
-            let planned = planner
+            let tasks = owner
                 .plan_table(
                     &ForgeTableSnapshot {
                         snapshot_id: 7,
@@ -269,11 +268,11 @@ mod tests {
                     &capacity(),
                 )
                 .expect("valid plan");
-            assert_eq!(planned[0].capacity, ForgePlanCapacity::Unschedulable);
+            assert_eq!(tasks[0].capacity, ForgePlanCapacity::Unschedulable);
         }
         let mut large = candidate();
         large.bytes = 150;
-        let planned = planner
+        let tasks = owner
             .plan_table(
                 &ForgeTableSnapshot {
                     snapshot_id: 7,
@@ -282,7 +281,7 @@ mod tests {
                 &capacity(),
             )
             .expect("large plan");
-        assert_eq!(planned[0].capacity, ForgePlanCapacity::LargeSingleton);
+        assert_eq!(tasks[0].capacity, ForgePlanCapacity::LargeSingleton);
     }
 
     /// Stable snapshots yield stable hashes while replanning a new snapshot changes identity.

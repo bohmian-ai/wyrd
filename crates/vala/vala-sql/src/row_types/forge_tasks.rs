@@ -624,6 +624,39 @@ impl FromStr for ForgeTaskStrategy {
     }
 }
 
+/// Claim-boundary strategy decoded from an independently persisted raw tag.
+///
+/// Scheduler and enqueue contracts remain closed over [`ForgeTaskStrategy`].
+/// Only claimed rows can carry an unknown value so workers can quarantine
+/// corrupted or forward-incompatible data without rolling back the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgeClaimStrategy {
+    /// A strategy recognized by this worker version.
+    Known(ForgeTaskStrategy),
+    /// An unrecognized raw SQL value retained for terminal audit.
+    Unknown(String),
+}
+
+impl ForgeClaimStrategy {
+    /// Decodes a raw SQL value without discarding an unknown tag.
+    #[must_use]
+    pub fn from_raw(value: String) -> Self {
+        match value.parse() {
+            Ok(strategy) => Self::Known(strategy),
+            Err(_) => Self::Unknown(value),
+        }
+    }
+
+    /// Returns the exact raw value represented by this claim boundary.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Known(strategy) => strategy.as_str(),
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
 /// Scheduler capacity lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeTaskLane {
@@ -677,7 +710,7 @@ pub enum ForgeTaskState {
     Unschedulable,
     /// Permanently failed.
     Failed,
-    /// Cancelled by an operator.
+    /// Superseded before external effects or explicitly cancelled by an operator.
     Cancelled,
 }
 impl ForgeTaskState {
@@ -803,7 +836,7 @@ pub struct ForgeTask {
     pub data_tenant_id: DataTenantId,
     /// Validated table identity.
     pub table_ref: ForgeTaskTableIdentity,
-    /// Maintenance strategy.
+    /// Closed maintenance strategy.
     pub strategy: ForgeTaskStrategy,
     /// Capacity lane.
     pub lane: ForgeTaskLane,
@@ -833,8 +866,68 @@ pub struct ForgeTask {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Result returned to a worker after a successful claim.
-pub type ForgeTaskClaim = ForgeTask;
+/// One atomic Ready/Retryable claim with a raw-preserving strategy boundary.
+///
+/// The context tenant is projected from the locked claim candidate while the
+/// task tenant is decoded from the durable task row. Worker validation must
+/// compare both before acquiring a table lease or touching external storage.
+#[derive(Debug, Clone)]
+pub struct ForgeTaskClaim {
+    /// Tenant selected by the claim transaction for worker execution.
+    pub execution_tenant_id: DataTenantId,
+    /// Stable task identifier.
+    pub task_id: Uuid,
+    /// Tenant isolation identity decoded from the task row.
+    pub data_tenant_id: DataTenantId,
+    /// Validated table identity.
+    pub table_ref: ForgeTaskTableIdentity,
+    /// Raw-preserving claim-only strategy.
+    pub strategy: ForgeClaimStrategy,
+    /// Capacity lane.
+    pub lane: ForgeTaskLane,
+    /// Snapshot on which planning was based.
+    pub base_snapshot_id: i64,
+    /// Versioned exact plan.
+    pub plan: ForgeTaskPlan,
+    /// Positive admission estimates.
+    pub estimates: ForgeTaskEstimates,
+    /// Durable state after atomic claim.
+    pub state: ForgeTaskState,
+    /// Current attempt identity.
+    pub attempt_id: Option<Uuid>,
+    /// Claim owner.
+    pub claimed_by: Option<Uuid>,
+    /// Claim deadline.
+    pub claim_expires_at: Option<DateTime<Utc>>,
+    /// Active GC watermark.
+    pub watermark: Option<SnapshotWatermark>,
+    /// Publication or cleanup evidence.
+    pub evidence: Option<ForgeTaskEvidence>,
+    /// Next eligibility time.
+    pub ready_at: DateTime<Utc>,
+    /// Creation time.
+    pub created_at: DateTime<Utc>,
+    /// Last mutation time.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One expired Prepared task claimed through the closed canonical decoder.
+#[derive(Debug, Clone)]
+pub struct ForgePreparedTaskClaim {
+    /// Tenant selected by the Prepared takeover transaction.
+    pub execution_tenant_id: DataTenantId,
+    /// Fully validated Prepared task assigned to the reconciler.
+    pub task: ForgeTask,
+}
+
+impl std::ops::Deref for ForgePreparedTaskClaim {
+    type Target = ForgeTask;
+
+    /// Projects canonical Prepared task fields while retaining execution context.
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
 
 /// Exact identity and state pair for one lifecycle mutation.
 #[derive(Debug, Clone, Copy)]
@@ -928,6 +1021,93 @@ pub(crate) struct ForgeTaskSqlRow {
     ready_at: DateTime<Utc>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+/// Private SQL decoder for a claim candidate and its durable task projection.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct ForgeTaskClaimSqlRow {
+    /// Tenant independently projected from the locked candidate CTE.
+    execution_tenant_id: Uuid,
+    /// Complete durable task row returned by the claimed update.
+    #[sqlx(flatten)]
+    task: ForgeTaskSqlRow,
+}
+
+/// Private SQL decoder for a Prepared takeover using the closed task contract.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct ForgePreparedTaskClaimSqlRow {
+    /// Tenant independently projected from the locked Prepared candidate.
+    execution_tenant_id: Uuid,
+    /// Complete durable task row returned by the takeover update.
+    #[sqlx(flatten)]
+    task: ForgeTaskSqlRow,
+}
+
+impl TryFrom<ForgeTaskClaimSqlRow> for ForgeTaskClaim {
+    type Error = SqlError;
+
+    /// Validates the execution tenant and durable task without conflating them.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InvariantViolation`] when either the execution
+    /// tenant or task projection is malformed.
+    fn try_from(mut row: ForgeTaskClaimSqlRow) -> Result<Self, Self::Error> {
+        let execution_tenant_id =
+            DataTenantId::try_from(row.execution_tenant_id).map_err(|_| {
+                SqlError::InvariantViolation {
+                    detail: "Forge claim contains invalid execution tenant identity".to_owned(),
+                }
+            })?;
+        let strategy = ForgeClaimStrategy::from_raw(row.task.strategy.clone());
+        row.task.strategy = match &strategy {
+            ForgeClaimStrategy::Known(value) => value.as_str().to_owned(),
+            ForgeClaimStrategy::Unknown(_) => ForgeTaskStrategy::StagingFold.as_str().to_owned(),
+        };
+        let task: ForgeTask = row.task.try_into()?;
+        Ok(Self {
+            execution_tenant_id,
+            task_id: task.task_id,
+            data_tenant_id: task.data_tenant_id,
+            table_ref: task.table_ref,
+            strategy,
+            lane: task.lane,
+            base_snapshot_id: task.base_snapshot_id,
+            plan: task.plan,
+            estimates: task.estimates,
+            state: task.state,
+            attempt_id: task.attempt_id,
+            claimed_by: task.claimed_by,
+            claim_expires_at: task.claim_expires_at,
+            watermark: task.watermark,
+            evidence: task.evidence,
+            ready_at: task.ready_at,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+        })
+    }
+}
+
+impl TryFrom<ForgePreparedTaskClaimSqlRow> for ForgePreparedTaskClaim {
+    type Error = SqlError;
+
+    /// Validates the Prepared execution tenant and closed durable task.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InvariantViolation`] when the execution tenant or
+    /// canonical task projection is malformed, including an unknown strategy.
+    fn try_from(row: ForgePreparedTaskClaimSqlRow) -> Result<Self, Self::Error> {
+        let execution_tenant_id =
+            DataTenantId::try_from(row.execution_tenant_id).map_err(|_| {
+                SqlError::InvariantViolation {
+                    detail: "Forge Prepared claim contains invalid execution tenant identity"
+                        .to_owned(),
+                }
+            })?;
+        Ok(Self {
+            execution_tenant_id,
+            task: row.task.try_into()?,
+        })
+    }
 }
 
 impl TryFrom<ForgeTaskSqlRow> for ForgeTask {

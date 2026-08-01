@@ -13,8 +13,8 @@ use super::Forge;
 use super::error::ForgeError;
 use super::path::catalog_path_to_object_key;
 use super::right_size::{
-    ForgeRightSizePolicy, IcebergCandidateFile, IcebergConvergence, IcebergTablePlan,
-    validate_supported_layout,
+    ForgeRightSizePolicy, IcebergCandidateFile, IcebergConvergence, IcebergRewriteGroup,
+    IcebergRewriteReason, IcebergTablePlan, validate_supported_layout,
 };
 use crate::catalog::TenantTableBinding;
 
@@ -81,6 +81,66 @@ impl Forge {
             snapshot.snapshot_id(),
             current_day,
         ))
+    }
+
+    /// Reconstructs one exact durable live-rewrite input set from its base snapshot.
+    ///
+    /// This path does not rerun usefulness grouping with a later wall-clock day.
+    /// The durable input paths are authoritative, while current-snapshot
+    /// manifests prove that every file remains live and shares one physical
+    /// schema, partition specification, day, and sort recipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog or invariant errors when inputs are missing, duplicated,
+    /// unsafe, or no longer form one compatible rewrite group.
+    pub(super) async fn discover_exact_live_group(
+        &self,
+        binding: &TenantTableBinding,
+        table: &Table,
+        inputs: &[String],
+    ) -> Result<IcebergRewriteGroup, ForgeError> {
+        let snapshot =
+            table
+                .metadata()
+                .current_snapshot()
+                .ok_or_else(|| ForgeError::Reconciliation {
+                    detail: "exact live rewrite has no current snapshot".to_owned(),
+                })?;
+        let candidates = self.live_candidates(binding, table, snapshot).await?;
+        let planned = inputs.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if planned.len() != inputs.len() {
+            return Err(ForgeError::Invariant {
+                detail: "exact live rewrite inputs contain duplicates".to_owned(),
+            });
+        }
+        let files = candidates
+            .into_iter()
+            .filter(|file| planned.contains(file.catalog_path.as_str()))
+            .collect::<Vec<_>>();
+        if files.len() != inputs.len() {
+            return Err(ForgeError::Reconciliation {
+                detail: "exact live rewrite inputs changed before execution".to_owned(),
+            });
+        }
+        let first = files.first().ok_or_else(|| ForgeError::Invariant {
+            detail: "exact live rewrite input set is empty".to_owned(),
+        })?;
+        if files.iter().any(|file| {
+            file.schema_id != first.schema_id
+                || file.partition_spec_id != first.partition_spec_id
+                || file.partition_day != first.partition_day
+                || file.sort_order_id != first.sort_order_id
+                || file.writer_recipe_version != first.writer_recipe_version
+        }) {
+            return Err(ForgeError::Reconciliation {
+                detail: "exact live rewrite inputs no longer share one physical group".to_owned(),
+            });
+        }
+        Ok(IcebergRewriteGroup {
+            files,
+            reason: IcebergRewriteReason::Undersized,
+        })
     }
 
     /// Load one current-snapshot rewrite plan for catalog integration tests.

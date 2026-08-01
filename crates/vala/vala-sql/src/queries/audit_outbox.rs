@@ -27,7 +27,7 @@ use crate::row_types::audit_outbox::AuditOutboxRow;
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
-    append_audit_connection(&mut **conn.transaction(), event).await
+    append_audit_connection(conn.transaction(), event).await
 }
 
 /// Appends one hash-chained audit row on an already tenant-bound transaction connection.

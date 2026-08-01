@@ -29,6 +29,7 @@ mod planning_scheduler;
 pub(crate) mod rewrite;
 pub(crate) mod right_size;
 mod scheduler;
+mod worker;
 
 pub use clock::ForgeClock;
 #[cfg(feature = "test-support")]
@@ -43,6 +44,7 @@ pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 pub use rewrite::ForgeRewriteRuntime;
 #[cfg(feature = "test-support")]
 pub use rewrite::deterministic_output_path_for_test;
+pub use worker::{ForgeWorker, ForgeWorkerConfig};
 
 #[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};
@@ -89,8 +91,6 @@ pub struct Forge {
     hints: tokio::sync::Mutex<crate::maintenance::StagingFileInbox>,
     /// Rejects a second directly supervised scheduler loop.
     running: AtomicBool,
-    /// Bounded terminal candidate registry retained for worker execution primitives.
-    terminal_work: tokio::sync::Mutex<compact::ForgeTerminalWorkRegistry>,
 }
 
 /// Immutable dependency graph shared by one Forge owner.
@@ -161,7 +161,6 @@ impl Forge {
             core: Arc::new(core),
             hints: tokio::sync::Mutex::new(build.hints),
             running: AtomicBool::new(false),
-            terminal_work: tokio::sync::Mutex::new(compact::ForgeTerminalWorkRegistry::default()),
         })
     }
 
@@ -189,13 +188,12 @@ mod iceberg_maintenance_contract_tests {
     async fn assert_owned_fork_function_signatures(
         catalog: &dyn Catalog,
         table: &Table,
-        file_io: &FileIO,
-        before: &TableMetadata,
-        after: &TableMetadata,
-        rewrite_selection: ManifestRewriteSelection,
-        rewrite_limits: ManifestRewriteLimits,
+        metadata: (&FileIO, &TableMetadata, &TableMetadata),
+        rewrite: (ManifestRewriteSelection, ManifestRewriteLimits),
         cleanup_limits: CleanupTraversalLimits,
     ) {
+        let (file_io, before, after) = metadata;
+        let (rewrite_selection, rewrite_limits) = rewrite;
         let _: Result<ManifestRewriteResult> =
             rewrite_manifests(catalog, table, rewrite_selection, rewrite_limits).await;
         let _: Result<ExpiredFileSet> =

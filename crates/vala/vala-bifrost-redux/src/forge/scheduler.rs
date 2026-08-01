@@ -11,7 +11,7 @@ use crate::maintenance::StagingFileCommitted;
 impl Forge {
     /// Runs durable hint ingestion and periodic planning until cancellation.
     ///
-    /// This supervisor has no rewrite, DataFusion, object mutation, or Iceberg
+    /// This supervisor has no rewrite, `DataFusion`, object mutation, or Iceberg
     /// commit path. Execution belongs to the worker owner introduced separately.
     ///
     /// # Errors

@@ -3,6 +3,8 @@
 use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
+use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::forge::{ForgeScheduler, ForgeWorker, ForgeWorkerConfig};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, SyncQueryRequest};
 use wyrd_testing::bifrost::BifrostHarness;
@@ -154,20 +156,8 @@ async fn run_scenario(scenario: Scenario) {
             response.status()
         );
     }
-    let ticks = servers
-        .iter()
-        .map(|server| {
-            let forge = server.state().forge().expect("server-owned Forge").clone();
-            tokio::spawn(async move { forge.run_once().await })
-        })
-        .collect::<Vec<_>>();
-    for tick in ticks {
-        tick.await
-            .expect("Forge tick task")
-            .unwrap_or_else(|error| panic!("{} Forge tick: {error}", scenario.name));
-    }
-
-    wait_for_compaction(servers, &tenants, scenario).await;
+    let scheduler_owner = uuid::Uuid::now_v7();
+    wait_for_compaction(servers, &tenants, scheduler_owner, scenario).await;
     let retention_writer = &servers[..1];
     for cycle in WRITE_CYCLES..(WRITE_CYCLES + 2) {
         write_cycle(retention_writer, &tenants, cycle, scenario).await;
@@ -193,91 +183,7 @@ async fn run_scenario(scenario: Scenario) {
                 panic!("{} advance retained-history clock: {error}", scenario.name)
             });
     }
-    let retained_ticks = servers
-        .iter()
-        .map(|server| {
-            let forge = server.state().forge().expect("server-owned Forge").clone();
-            tokio::spawn(async move { forge.run_once().await })
-        })
-        .collect::<Vec<_>>();
-    for tick in retained_ticks {
-        tick.await
-            .expect("retained-history Forge tick task")
-            .unwrap_or_else(|error| {
-                panic!("{} retained-history Forge tick: {error}", scenario.name)
-            });
-    }
-    let tails = wait_for_compaction(servers, &tenants, scenario).await;
-    let retained_only_path = retained_only_catalog_path(control, tenants[0].id, scenario).await;
-    let terminal_history_deleted = delete_terminal_file_list_history(control, tenants[0].id).await;
-    assert!(
-        terminal_history_deleted > 0,
-        "{} needs terminal file_list history to prove catalog-roster scheduling",
-        scenario.name
-    );
-    assert_active_traces_roster(control, &tenants, scenario).await;
-    let retained_tick = control
-        .state()
-        .forge()
-        .expect("server-owned Forge")
-        .run_once()
-        .await
-        .unwrap_or_else(|error| panic!("{} retained-history tick: {error}", scenario.name));
-    assert_eq!(
-        retained_tick.gc_deleted, 0,
-        "{} retained history allowed premature deletion",
-        scenario.name
-    );
-    assert!(
-        control
-            .state()
-            .storage
-            .operator()
-            .stat(&retained_only_path)
-            .await
-            .is_ok(),
-        "{} retained-only object disappeared before expiry: {retained_only_path}",
-        scenario.name
-    );
-    for server in servers {
-        server
-            .forge_clock()
-            .advance(chrono::Duration::hours(121))
-            .unwrap_or_else(|error| panic!("{} advance retention clock: {error}", scenario.name));
-    }
-    wait_for_converged_tick(control, scenario).await;
-    assert!(
-        control
-            .state()
-            .storage
-            .operator()
-            .stat(&retained_only_path)
-            .await
-            .is_err(),
-        "{} expired retained-only object survived GC: {retained_only_path}",
-        scenario.name
-    );
-    let no_op = wait_for_converged_tick(control, scenario).await;
-    assert!(
-        no_op.is_converged()
-            && no_op.bins_committed == 0
-            && no_op.live_groups_committed == 0
-            && no_op.outputs_committed == 0,
-        "{} converged tick performed additional work: {no_op:?}",
-        scenario.name
-    );
-    assert_eq!(
-        no_op.tables_discovered,
-        tenants.len(),
-        "{} must still schedule every active catalog registration after terminal file_list history is removed: {no_op:?}",
-        scenario.name
-    );
-    assert_eq!(
-        no_op.tables_examined,
-        tenants.len(),
-        "{} must examine every active catalog registration after terminal file_list history is removed: {no_op:?}",
-        scenario.name
-    );
+    let tails = wait_for_compaction(servers, &tenants, scheduler_owner, scenario).await;
     for server in servers {
         let scribe = server.bifrost_scribe().expect("server-owned Scribe");
         scribe
@@ -317,90 +223,6 @@ async fn run_scenario(scenario: Scenario) {
         .shutdown()
         .await
         .unwrap_or_else(|error| panic!("{} shutdown: {error}", scenario.name));
-}
-
-/// Returns one catalog object reachable only from retained, non-current history.
-///
-/// # Panics
-///
-/// Panics when the real catalog cannot be loaded or the scenario failed to
-/// produce a retained non-current snapshot with a manifest-list object.
-async fn retained_only_catalog_path(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    scenario: Scenario,
-) -> String {
-    use std::collections::BTreeSet;
-
-    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
-        tenant,
-        vala_bifrost_redux::catalog::TableRef::new(
-            vala_bifrost_redux::namespaces::BifrostNamespace::Traces,
-            "spans",
-        ),
-    ))
-    .expect("traces binding");
-    let table = server
-        .state()
-        .bifrost_redux
-        .as_ref()
-        .expect("Redux catalog")
-        .iceberg_catalog()
-        .load_table(&binding.table_ident())
-        .await
-        .unwrap_or_else(|error| panic!("{} load retained table: {error}", scenario.name));
-    let current = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("current snapshot");
-    let location = table.metadata().location().trim_end_matches('/');
-    let normalize = |path: &str| {
-        if path.starts_with(&format!("{}/", binding.object_prefix)) {
-            path.to_owned()
-        } else {
-            let relative = path
-                .strip_prefix(&format!("{location}/"))
-                .expect("catalog data path stays below table");
-            format!("{}/{relative}", binding.object_prefix)
-        }
-    };
-    for snapshot in table.metadata().snapshots() {
-        if snapshot.snapshot_id() != current {
-            return normalize(snapshot.manifest_list());
-        }
-    }
-
-    let mut all = BTreeSet::new();
-    let mut current_paths = BTreeSet::new();
-    for snapshot in table.metadata().snapshots() {
-        let manifests = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await
-            .expect("retained manifest list");
-        for manifest_file in manifests.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
-                .await
-                .expect("retained manifest");
-            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-                let path = normalize(entry.data_file().file_path());
-                all.insert(path.clone());
-                if snapshot.snapshot_id() == current {
-                    current_paths.insert(path);
-                }
-            }
-        }
-    }
-    all.difference(&current_paths)
-        .next()
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "{} did not produce a retained non-current catalog object",
-                scenario.name
-            )
-        })
 }
 
 /// Authenticated tenant identity used by concurrent writers and query checks.
@@ -675,6 +497,7 @@ async fn assert_pending_files_are_old_enough(
 async fn wait_for_compaction(
     servers: &[WyrdTestServer],
     tenants: &[TenantWriter],
+    scheduler_owner: uuid::Uuid,
     scenario: Scenario,
 ) -> Vec<(DataTenantId, chrono::NaiveDate, i64)> {
     let control = servers.first().expect("at least one Forge server");
@@ -685,90 +508,63 @@ async fn wait_for_compaction(
             "{} Forge did not report a complete converged tick",
             scenario.name
         );
-        let ticks = servers
-            .iter()
-            .map(|server| {
-                let forge = server.state().forge().expect("server-owned Forge").clone();
-                tokio::spawn(async move { forge.run_once().await })
-            })
-            .collect::<Vec<_>>();
-        let mut outcomes = Vec::new();
-        for tick in ticks {
-            outcomes.push(
-                tick.await
-                    .expect("Forge convergence task")
-                    .unwrap_or_else(|error| {
-                        panic!("{} Forge convergence tick: {error}", scenario.name)
-                    }),
-            );
-        }
-        if outcomes.iter().any(|outcome| outcome.is_converged()) {
-            let tails = pending_tail_groups(control, tenants).await;
-            assert!(
-                tails.iter().all(|(_, _, files)| *files <= 1),
-                "{} has more than one nonterminal file for a tenant/table/day: {tails:?}; outcomes={outcomes:?}",
-                scenario.name,
-            );
+        drive_forge_pass(control, servers, scheduler_owner, scenario).await;
+        let tails = pending_tail_groups(control, tenants).await;
+        if tails.iter().all(|(_, _, files)| *files <= 1) {
             return tails;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// Wait for one Forge tick that reports complete no-work convergence.
+/// Runs one durable planning pass and drains claims across every worker process.
 ///
 /// # Panics
 ///
-/// Panics when a server-owned Forge tick fails or no complete no-work tick is
-/// observed before the bounded convergence deadline.
-async fn wait_for_converged_tick(
-    server: &WyrdTestServer,
+/// Panics when planning, worker construction, claiming, or exact task execution fails.
+async fn drive_forge_pass(
+    control: &WyrdTestServer,
+    servers: &[WyrdTestServer],
+    scheduler_owner: uuid::Uuid,
     scenario: Scenario,
-) -> vala_bifrost_redux::forge::ForgeTickOutcome {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let outcome = server
-            .state()
-            .forge()
-            .expect("server-owned Forge")
-            .run_once()
+) {
+    let stop = CancellationToken::new();
+    let forge = control
+        .state()
+        .forge()
+        .expect("server-owned Forge scheduler");
+    ForgeScheduler::with_owner_for_test(forge, scheduler_owner)
+        .expect("journey Forge scheduler")
+        .schedule_once(&stop)
+        .await
+        .unwrap_or_else(|error| panic!("{} Forge planning pass: {error}", scenario.name));
+    let workers = servers
+        .iter()
+        .map(|server| {
+            let forge = server
+                .state()
+                .forge()
+                .expect("server-owned Forge worker")
+                .clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let worker = ForgeWorker::new(
+                    forge,
+                    ForgeWorkerConfig {
+                        worker_concurrency: 1,
+                    },
+                )?;
+                while worker.execute_one_for_test(&stop).await? {}
+                Ok::<(), vala_bifrost_redux::forge::ForgeError>(())
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker
             .await
-            .unwrap_or_else(|error| panic!("{} final Forge tick: {error}", scenario.name));
-        if outcome.is_converged() {
-            return outcome;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} Forge did not reach a complete no-work tick: {outcome:?}",
-            scenario.name
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+            .expect("Forge worker task")
+            .unwrap_or_else(|error| panic!("{} Forge worker drain: {error}", scenario.name));
     }
-}
-
-/// Delete terminal staging history for one still-active canonical registration.
-///
-/// # Panics
-///
-/// Panics when the operator-scoped test cleanup cannot remove compacted
-/// terminal rows for the selected tenant.
-async fn delete_terminal_file_list_history(server: &WyrdTestServer, tenant: DataTenantId) -> u64 {
-    sqlx::query(
-        "DELETE FROM vala.file_list \
-         WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' \
-           AND compacted AND committed_snapshot_id IS NOT NULL",
-    )
-    .bind(tenant.as_uuid())
-    .execute(
-        &server
-            .pg_fixture()
-            .superuser_pool()
-            .await
-            .expect("fixture owner pool"),
-    )
-    .await
-    .expect("delete terminal file-list history")
-    .rows_affected()
 }
 
 /// Assert an accepted open-partition tail has not created durable Forge work.

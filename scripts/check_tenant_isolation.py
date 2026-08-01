@@ -70,6 +70,7 @@ VALA_NON_RLS_CONTROL_TABLES = {
     "vala.maintenance_leases",
     "vala.cluster_nodes",  # cluster-level node registry, not tenant data
     "vala.forge_scheduler_state",  # singleton cross-tenant scheduler fence
+    "vala.forge_worker_claim_state",  # singleton cross-tenant worker fairness cursor
     "vala.forge_large_lane_lease",  # singleton cluster-wide large-task fence
 }
 

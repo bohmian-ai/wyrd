@@ -27,7 +27,7 @@ use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
-use super::lease::ForgeLease;
+use super::lease::{ForgeLease, forge_lease_key};
 use super::live_reconcile::DestructiveMaintenance;
 use super::path::{catalog_path_to_object_key, validate_table_location};
 
@@ -461,6 +461,55 @@ impl Forge {
         .await
         .map(|protection| protection.live_set)
     }
+
+    /// Runs one table-scoped orphan collection pass for integration fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, catalog, object-store, SQL, audit, or live-set failures
+    /// from the unchanged production GC owner.
+    #[cfg(feature = "test-support")]
+    pub async fn run_orphan_gc_for_test(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<usize, ForgeError> {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let lease_key = forge_lease_key(
+            binding.tenant,
+            &binding.logical_namespace,
+            &binding.table_name,
+        );
+        let mut lease = ForgeLease::acquire(
+            &self.core.operator_pool,
+            lease_key,
+            Uuid::now_v7(),
+            self.core.config.lease_ttl,
+        )
+        .await?
+        .ok_or_else(|| ForgeError::FenceLost {
+            lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
+        })?;
+        let staging = BTreeSet::new();
+        let live = BTreeSet::new();
+        let outcome = self
+            .run_orphan_gc_for_table(
+                &mut lease,
+                &key,
+                binding,
+                self.core.clock.now()?,
+                &CancellationToken::new(),
+                GcProtectedPaths {
+                    staging: &staging,
+                    live: &live,
+                },
+            )
+            .await?;
+        lease.release(&self.core.operator_pool).await?;
+        Ok(outcome.deleted)
+    }
 }
 
 impl Forge {
@@ -517,10 +566,6 @@ pub(crate) struct OrphanGcOutcome {
     pub(crate) skipped: usize,
     /// Open prepared operations left pending after bounded reconciliation.
     pub(crate) pending: usize,
-    /// Operations whose external result could not be proven.
-    pub(crate) unresolved: usize,
-    /// Whether the bounded open-state query observed more than the configured cap.
-    pub(crate) overflowed: bool,
 }
 
 /// Build protection from every retained Iceberg object and every open workflow.
@@ -891,10 +936,7 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        let mut outcome = OrphanGcOutcome {
-            overflowed: page.overflowed,
-            ..OrphanGcOutcome::default()
-        };
+        let mut outcome = OrphanGcOutcome::default();
         if page.overflowed {
             outcome.pending = self
                 .core

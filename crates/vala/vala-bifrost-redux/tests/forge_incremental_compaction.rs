@@ -3,7 +3,7 @@
 mod pg_tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -22,21 +22,29 @@ mod pg_tests {
     use opendal::{Buffer, Operator};
     use parquet::arrow::ArrowWriter;
     use secrecy::ExposeSecret;
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::catalog::{
         BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
     };
     use vala_bifrost_redux::forge::{
-        Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeLease, ForgeObjectStore,
-        ForgeRewriteRuntime, IcebergCandidateFile, IcebergRewriteGroup, forge_lease_key,
+        Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError, ForgeLease, ForgeObjectStore,
+        ForgeRewriteRuntime, ForgeScheduleOutcome, ForgeScheduler, ForgeWorker, ForgeWorkerConfig,
+        IcebergCandidateFile, IcebergRewriteGroup, deterministic_output_path_for_test,
+        forge_lease_key,
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::with_managed_columns;
     use vala_sql::OperatorPool;
     use vala_sql::queries::forge_operations::ForgeOperations;
+    use vala_sql::queries::forge_tasks::ForgeTasks;
     use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+    use vala_sql::row_types::forge_tasks::{
+        FORGE_TASK_PAYLOAD_VERSION, ForgeTaskClaim, ForgeTaskEstimates, ForgeTaskLane,
+        ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -61,16 +69,85 @@ mod pg_tests {
         active_reads: Arc<AtomicUsize>,
         /// Peak observed concurrency.
         peak_reads: Arc<AtomicUsize>,
+        /// One-shot metadata-read failure used after a successful commit.
+        fail_next_metadata_read: AtomicBool,
+        /// One-shot pause consumed by the next successful rewrite output.
+        pause_output_puts: AtomicUsize,
+        /// Counts armed outputs that crossed the real PUT boundary.
+        paused_output_puts: AtomicUsize,
+        /// Wakes a test waiting for the armed real output.
+        output_put_ready: tokio::sync::Notify,
+        /// Releases the armed output notification.
+        output_put_release: tokio::sync::Notify,
+        /// Durable release state preventing a lost post-PUT wake-up.
+        output_put_released: AtomicBool,
+        /// Counts successful rewrite output notifications.
+        output_put_calls: AtomicUsize,
+    }
+
+    impl InstrumentedStore {
+        /// Arms a one-shot pause after the next successful rewrite output PUT.
+        fn pause_after_next_output_put(&self) {
+            self.pause_after_output_puts(1);
+        }
+
+        /// Waits until the armed output has crossed the real PUT boundary.
+        async fn wait_for_output_put(&self) {
+            self.wait_for_output_puts(1).await;
+        }
+
+        /// Arms pauses after an exact positive number of successful output PUTs.
+        fn pause_after_output_puts(&self, count: usize) {
+            assert!(count > 0, "paused output count must be positive");
+            self.paused_output_puts.store(0, Ordering::Release);
+            self.output_put_released.store(false, Ordering::Release);
+            self.pause_output_puts.store(count, Ordering::Release);
+        }
+
+        /// Waits until every armed output has crossed its real PUT boundary.
+        async fn wait_for_output_puts(&self, count: usize) {
+            while self.paused_output_puts.load(Ordering::Acquire) < count {
+                self.output_put_ready.notified().await;
+            }
+        }
+
+        /// Releases one paused post-PUT notification.
+        fn release_output_put(&self) {
+            self.output_put_released.store(true, Ordering::Release);
+            self.output_put_release.notify_waiters();
+        }
+
+        /// Arms one failure for the next exact Iceberg metadata read.
+        fn fail_next_metadata_read(&self) {
+            self.fail_next_metadata_read.store(true, Ordering::Release);
+        }
+
+        /// Returns the number of successful rewrite output boundaries observed.
+        fn output_put_calls(&self) -> usize {
+            self.output_put_calls.load(Ordering::Acquire)
+        }
     }
 
     #[async_trait::async_trait]
     impl ForgeObjectStore for InstrumentedStore {
         /// Reject whole-object reads so the rewrite cannot hide an unbounded path.
-        async fn read(&self, _path: &str) -> opendal::Result<Buffer> {
+        async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+            if std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                if self.fail_next_metadata_read.swap(false, Ordering::AcqRel) {
+                    return Err(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "injected Forge metadata evidence read failure",
+                    ));
+                }
+                return self.operator.read(path).await;
+            }
             self.whole_reads.fetch_add(1, Ordering::Relaxed);
             Err(opendal::Error::new(
                 opendal::ErrorKind::Unsupported,
-                "whole-object read forbidden",
+                "whole-object data read forbidden",
             ))
         }
 
@@ -86,6 +163,28 @@ mod pg_tests {
             let result = self.operator.reader(path).await?.read(range).await;
             self.active_reads.fetch_sub(1, Ordering::AcqRel);
             result
+        }
+
+        /// Observes and optionally pauses after one real rewrite output PUT.
+        async fn after_output_put(&self, _path: &str) {
+            self.output_put_calls.fetch_add(1, Ordering::AcqRel);
+            let paused = self
+                .pause_output_puts
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+            if paused {
+                self.paused_output_puts.fetch_add(1, Ordering::AcqRel);
+                self.output_put_ready.notify_waiters();
+                while !self.output_put_released.load(Ordering::Acquire) {
+                    self.output_put_release.notified().await;
+                }
+            }
         }
 
         /// List fixture objects for cleanup and orphan checks.
@@ -119,11 +218,15 @@ mod pg_tests {
         /// Staging operator.
         staging: Arc<Operator>,
         /// Temporary warehouse and spill root retained for object lifetime.
-        _root: TempDir,
+        root: TempDir,
         /// Source-read instrumentation.
         reads: Arc<InstrumentedStore>,
         /// Forge handle under test.
-        forge: Forge,
+        forge: Arc<Forge>,
+        /// Stable scheduler lease identity shared by bounded fixture passes.
+        scheduler_owner: uuid::Uuid,
+        /// Production worker owner used to drain exact durable fixture tasks.
+        worker: ForgeWorker,
     }
 
     /// SQL projection and audit parity columns for one staging operation.
@@ -263,6 +366,13 @@ mod pg_tests {
                 ranged_reads: Arc::new(AtomicUsize::new(0)),
                 active_reads: Arc::new(AtomicUsize::new(0)),
                 peak_reads: Arc::new(AtomicUsize::new(0)),
+                fail_next_metadata_read: AtomicBool::new(false),
+                pause_output_puts: AtomicUsize::new(0),
+                paused_output_puts: AtomicUsize::new(0),
+                output_put_ready: tokio::sync::Notify::new(),
+                output_put_release: tokio::sync::Notify::new(),
+                output_put_released: AtomicBool::new(false),
+                output_put_calls: AtomicUsize::new(0),
             });
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
             let runtime = ForgeRewriteRuntime::new(
@@ -274,19 +384,28 @@ mod pg_tests {
                 config.spill_limit_bytes,
             )
             .expect("runtime");
-            let forge = Forge::new(ForgeBuildConfig {
-                vala: pg.vala_postgres().clone(),
-                operator_pool: operator_pool.clone(),
-                catalog: Arc::clone(&catalog),
-                staging: Arc::clone(&staging),
-                object_store: Arc::clone(&reads) as Arc<dyn ForgeObjectStore>,
-                rewrite_runtime: runtime,
-                hints,
-                config,
-                maintenance_interval: Duration::from_millis(10),
-                clock: ForgeClock::system(),
-            })
-            .expect("forge");
+            let forge = Arc::new(
+                Forge::new(ForgeBuildConfig {
+                    vala: pg.vala_postgres().clone(),
+                    operator_pool: operator_pool.clone(),
+                    catalog: Arc::clone(&catalog),
+                    staging: Arc::clone(&staging),
+                    object_store: Arc::clone(&reads) as Arc<dyn ForgeObjectStore>,
+                    rewrite_runtime: runtime,
+                    hints,
+                    config,
+                    maintenance_interval: Duration::from_millis(10),
+                    clock: ForgeClock::system(),
+                })
+                .expect("forge"),
+            );
+            let worker = ForgeWorker::new(
+                Arc::clone(&forge),
+                ForgeWorkerConfig {
+                    worker_concurrency: 1,
+                },
+            )
+            .expect("fixture worker");
             let fixture = Self {
                 pg,
                 tenant,
@@ -294,12 +413,95 @@ mod pg_tests {
                 operator_pool,
                 catalog,
                 staging,
-                _root: root,
+                root,
                 reads,
                 forge,
+                scheduler_owner: uuid::Uuid::now_v7(),
+                worker,
             };
             fixture.seed_files(initial_file_count, aged_inputs).await;
             fixture
+        }
+
+        /// Runs one durable planning pass and drains every immediately claimable task.
+        ///
+        /// # Panics
+        ///
+        /// Panics when scheduling, claiming, execution, evidence persistence, or
+        /// terminal reconciliation fails because each is the behavior under test.
+        async fn schedule_and_execute(&self) -> ForgeScheduleOutcome {
+            let stop = CancellationToken::new();
+            let scheduler = ForgeScheduler::with_owner_for_test(&self.forge, self.scheduler_owner)
+                .expect("fixture scheduler");
+            let outcome = scheduler
+                .schedule_once(&stop)
+                .await
+                .expect("fixture planning pass");
+            while self
+                .worker
+                .execute_one_for_test(&stop)
+                .await
+                .expect("fixture worker task")
+            {}
+            outcome
+        }
+
+        /// Plans one exact task and returns its production SQL claim envelope.
+        ///
+        /// # Panics
+        ///
+        /// Panics when scheduling or admission does not produce exactly one
+        /// task for the isolated fixture table.
+        async fn plan_and_claim(&self) -> ForgeTaskClaim {
+            let stop = CancellationToken::new();
+            let planned = ForgeScheduler::with_owner_for_test(&self.forge, self.scheduler_owner)
+                .expect("fixture scheduler")
+                .schedule_once(&stop)
+                .await
+                .expect("fixture planning pass");
+            assert_eq!(planned.tasks_enqueued, 1, "planned outcome: {planned:?}");
+            self.worker
+                .claim_for_test()
+                .await
+                .expect("fixture claim query")
+                .expect("fixture claimed task")
+        }
+
+        /// Builds one exact durable task for worker validation tests.
+        ///
+        /// # Panics
+        ///
+        /// Panics only when the fixture's production table identity cannot be
+        /// represented by the already-validated SQL contract.
+        fn durable_task(
+            &self,
+            strategy: ForgeTaskStrategy,
+            plan: ForgeTaskPlan,
+            hash: u8,
+        ) -> NewForgeTask {
+            NewForgeTask {
+                data_tenant_id: self.tenant,
+                table_ref: ForgeTaskTableIdentity::new(
+                    "wyrd-redux",
+                    &self.binding.logical_namespace,
+                    &self.binding.table_name,
+                )
+                .expect("fixture durable identity"),
+                strategy,
+                lane: ForgeTaskLane::Ordinary,
+                base_snapshot_id: 0,
+                plan,
+                plan_hash: [hash; 32],
+                estimates: ForgeTaskEstimates {
+                    files: 1,
+                    bytes: 1,
+                    parallelism: 1,
+                    memory_bytes: 1,
+                    spill_bytes: 1,
+                    large_ceiling_bytes: 1,
+                },
+                ready_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            }
         }
 
         /// Return the stable three-column staging schema.
@@ -332,6 +534,22 @@ mod pg_tests {
         /// Panics when fixture encoding, object writes, or durable inserts
         /// fail; each operation is required to establish the test invariant.
         async fn seed_files_at(&self, start: i64, count: usize, aged: bool) {
+            self.seed_files_for_binding(&self.binding, start, count, aged)
+                .await;
+        }
+
+        /// Seeds uniquely named Parquet objects for a selected registered table.
+        ///
+        /// # Panics
+        ///
+        /// Panics when encoding, storage, or tenant-scoped file-list writes fail.
+        async fn seed_files_for_binding(
+            &self,
+            binding: &TenantTableBinding,
+            start: i64,
+            count: usize,
+            aged: bool,
+        ) {
             let schema = Self::schema();
             let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day");
             let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
@@ -389,7 +607,7 @@ mod pg_tests {
                     ArrowWriter::try_new(&mut bytes, batch.schema(), None).expect("writer");
                 writer.write(&batch).expect("write");
                 writer.close().expect("close");
-                let path = format!("{}/input-{index}.parquet", self.binding.object_prefix);
+                let path = format!("{}/input-{index}.parquet", binding.object_prefix);
                 self.staging
                     .write(&path, Buffer::from(bytes))
                     .await
@@ -400,12 +618,61 @@ mod pg_tests {
                 .await
                 .expect("tenant conn");
             for (path, index, row_count) in rows {
-                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&self.binding.logical_namespace).bind(&self.binding.table_name).bind(path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
+                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).bind(path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
             }
             conn.commit().await.expect("commit");
             if aged {
-                sqlx::query("UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1").bind(self.tenant.as_uuid()).execute(self.operator_pool.pool()).await.expect("age");
+                sqlx::query("UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1 AND namespace=$2 AND table_name=$3").bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).execute(self.operator_pool.pool()).await.expect("age");
             }
+        }
+
+        /// Registers and seeds a second table in this fixture's exact backend.
+        ///
+        /// # Panics
+        ///
+        /// Panics when catalog registration, table configuration, or seed
+        /// persistence fails in the isolated integration fixture.
+        async fn register_seeded_table(&self) -> TenantTableBinding {
+            let table_name = format!("concurrent_rows_{}", uuid::Uuid::now_v7().simple());
+            let binding = TenantTableBinding::resolve((
+                self.tenant,
+                TableRef::new(BifrostNamespace::Bifrost, table_name),
+            ))
+            .expect("concurrent binding");
+            let backend = BackendConfig::Local {
+                root: self.root.path().to_path_buf(),
+            };
+            let catalog = BifrostCatalog::new(
+                self.pg.catalog_dsn().expose_secret(),
+                &backend,
+                self.pg.vala_postgres().clone(),
+            )
+            .await
+            .expect("concurrent production catalog");
+            catalog
+                .create_table(CreateTableRequest {
+                    table: binding.table_ref.clone(),
+                    user_fields: vec![Field::new("value", DataType::Int64, false)],
+                    tenant: binding.tenant,
+                    audit: None,
+                })
+                .await
+                .expect("concurrent table registration");
+            let table = self
+                .catalog
+                .load_table(&binding.table_ident())
+                .await
+                .expect("concurrent registered table");
+            let action = Transaction::new(&table)
+                .update_table_properties()
+                .set("write.target-file-size-bytes".to_owned(), "3600".to_owned());
+            ApplyTransactionAction::apply(action, Transaction::new(&table))
+                .expect("concurrent target property action")
+                .commit(self.catalog.as_ref())
+                .await
+                .expect("concurrent target property commit");
+            self.seed_files_for_binding(&binding, 100, 2, true).await;
+            binding
         }
 
         /// Delete this fixture table's staging history while preserving its registration.
@@ -977,9 +1244,10 @@ mod pg_tests {
             16 * 1024 * 1024,
         )
         .await;
-        let path = format!(
-            "{}/data/terminal-history.parquet",
-            fixture.binding.object_prefix
+        let path = deterministic_output_path_for_test(
+            &fixture.binding.object_prefix,
+            uuid::Uuid::now_v7(),
+            0,
         );
         fixture
             .staging
@@ -1012,9 +1280,14 @@ mod pg_tests {
         )
         .await
         .expect("terminal staging history");
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let outcome = fixture.forge.run_once().await.expect("Forge GC tick");
-        assert_eq!(outcome.gc_deleted, 1);
+        let deleted = fixture
+            .forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("Forge GC pass");
+        assert_eq!(deleted, 1);
         assert!(fixture.staging.stat(&path).await.is_err());
     }
 
@@ -1030,11 +1303,7 @@ mod pg_tests {
             ..ForgeConfig::default()
         };
         let fixture = Fixture::new_with_config(capped, true, 4, 16 * 1024 * 1024).await;
-        fixture
-            .forge
-            .run_once()
-            .await
-            .expect("first capped snapshot");
+        fixture.schedule_and_execute().await;
         let table = fixture
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -1061,7 +1330,7 @@ mod pg_tests {
     async fn maintenance_protection_real_catalog_inventory_and_cap() {
         let fixture =
             Fixture::new_with_config(ForgeConfig::default(), true, 4, 16 * 1024 * 1024).await;
-        fixture.forge.run_once().await.expect("data snapshot");
+        fixture.schedule_and_execute().await;
         let table = fixture
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -1172,24 +1441,8 @@ mod pg_tests {
         // Thirty-two 100k-row files make the sort exceed the bounded 16 MiB
         // pool while exactly consuming the benchmark-shaped shared file budget.
         fixture.seed_files(32, true).await;
-        let outcome = fixture.forge.run_once().await.expect("rewrite");
-        assert_eq!(outcome.bins_committed, 1, "outcome: {outcome:?}");
-        assert!(
-            outcome.spill_bytes > 0,
-            "rewrite must spill under bounded memory"
-        );
-        assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
-        assert!(outcome.outputs_committed >= 2);
-        assert_eq!(outcome.staging_input_files, 32, "outcome: {outcome:?}");
-        assert_eq!(outcome.live_groups_committed, 0, "outcome: {outcome:?}");
-        assert_eq!(outcome.staging_input_bytes, 3_200, "outcome: {outcome:?}");
-        assert_eq!(
-            outcome.staging_output_files, outcome.outputs_committed,
-            "outcome: {outcome:?}"
-        );
-        assert!(outcome.staging_output_bytes > 0, "outcome: {outcome:?}");
-        assert_eq!(outcome.input_rows, 3_200_000);
-        assert_eq!(outcome.output_rows, 3_200_000);
+        let outcome = fixture.schedule_and_execute().await;
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
@@ -1218,19 +1471,33 @@ mod pg_tests {
         )
         .await;
 
-        let first = fixture
-            .forge
-            .run_once()
-            .await
-            .expect("first maintenance tick");
-        assert_eq!(first.bins_committed, 1, "first outcome: {first:?}");
+        let first = fixture.schedule_and_execute().await;
+        assert_eq!(first.tasks_enqueued, 1, "first outcome: {first:?}");
         fixture.seed_files_at(100, 4, true).await;
-        let second = fixture
+        let second = fixture.schedule_and_execute().await;
+        assert_eq!(second.tasks_enqueued, 1, "second outcome: {second:?}");
+
+        fixture
             .forge
-            .run_once()
+            .run_snapshot_expiry_for_test(&fixture.binding)
             .await
-            .expect("second maintenance tick");
-        assert_eq!(second.bins_committed, 1, "second outcome: {second:?}");
+            .expect("snapshot expiry pass");
+        let orphan = deterministic_output_path_for_test(
+            &fixture.binding.object_prefix,
+            uuid::Uuid::now_v7(),
+            0,
+        );
+        fixture
+            .staging
+            .write(&orphan, Buffer::from(vec![1_u8]))
+            .await
+            .expect("destructive maintenance orphan");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        fixture
+            .forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("orphan collection pass");
 
         assert_terminal_family_parity(&fixture, "snapshot_expire").await;
         assert_terminal_family_parity(&fixture, "orphan_gc").await;
@@ -1248,7 +1515,7 @@ mod pg_tests {
             },
             false,
             3,
-            16 * 1024 * 1024,
+            64 * 1024 * 1024,
         )
         .await;
         let table = fixture
@@ -1285,20 +1552,11 @@ mod pg_tests {
         fixture.set_live_target_file_size(&table, 100_000_000).await;
         assert_eq!(fixture.delete_file_list_history().await, 3);
 
-        let outcome = fixture
-            .forge
-            .run_once()
-            .await
-            .expect("registered-table tick");
-        assert_eq!(outcome.tables_discovered, 1, "outcome: {outcome:?}");
-        assert_eq!(outcome.tables_examined, 1, "outcome: {outcome:?}");
-        assert!(outcome.live_groups_planned > 0, "outcome: {outcome:?}");
-        assert!(outcome.expiry_reconciled > 0, "outcome: {outcome:?}");
-        assert!(outcome.gc_reconciled > 0, "outcome: {outcome:?}");
-        assert!(outcome.gc_candidates > 0, "outcome: {outcome:?}");
-        assert!(outcome.tick_complete, "outcome: {outcome:?}");
-        assert_terminal_family_parity(&fixture, "snapshot_expire").await;
-        assert_terminal_family_parity(&fixture, "orphan_gc").await;
+        let outcome = fixture.schedule_and_execute().await;
+        assert_eq!(outcome.demands_seen, 1, "outcome: {outcome:?}");
+        assert_eq!(outcome.demands_acknowledged, 1, "outcome: {outcome:?}");
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
+        assert!(!outcome.incomplete, "outcome: {outcome:?}");
 
         fixture.seed_files(2, true).await;
         let owner = fixture
@@ -1312,7 +1570,11 @@ mod pg_tests {
         .execute(&owner)
         .await
         .expect("hide catalog roster");
-        let failed_discovery = fixture.forge.run_once().await;
+        let failed_discovery =
+            ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+                .expect("fixture scheduler")
+                .schedule_once(&CancellationToken::new())
+                .await;
         sqlx::query(
             "ALTER TABLE vala.bifrost_tables_unavailable_for_test RENAME TO bifrost_tables",
         )
@@ -1345,11 +1607,11 @@ mod pg_tests {
             .await
             .expect("empty historical table");
         fixture.set_live_target_file_size(&table, 100_000_000).await;
-        let first = fixture.forge.run_once().await.expect("first staging fold");
-        assert_eq!(first.bins_committed, 1, "first outcome: {first:?}");
+        let first = fixture.schedule_and_execute().await;
+        assert_eq!(first.tasks_enqueued, 1, "first outcome: {first:?}");
         fixture.seed_files_at(100, 2, true).await;
-        let second = fixture.forge.run_once().await.expect("second staging fold");
-        assert_eq!(second.bins_committed, 1, "second outcome: {second:?}");
+        let second = fixture.schedule_and_execute().await;
+        assert_eq!(second.tasks_enqueued, 1, "second outcome: {second:?}");
         fixture.seed_files_at(999, 1, false).await;
         let table = fixture
             .catalog
@@ -1402,13 +1664,8 @@ mod pg_tests {
         );
         assert_eq!(fixture.delete_file_list_history().await, 5);
 
-        let outcome = fixture
-            .forge
-            .run_once()
-            .await
-            .expect("live replacement handoff");
-        assert_eq!(outcome.live_groups_committed, 1, "outcome: {outcome:?}");
-        assert!(outcome.live_output_bytes > 0, "outcome: {outcome:?}");
+        let outcome = fixture.schedule_and_execute().await;
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
         let mut conn = fixture
             .pg
             .vala_postgres()
@@ -1425,7 +1682,914 @@ mod pg_tests {
         .await
         .expect("committed live fence detail");
         assert_eq!(fenced_base_snapshot_id, base_snapshot_id);
-        assert!(outcome.tick_complete, "outcome: {outcome:?}");
+        assert!(!outcome.incomplete, "outcome: {outcome:?}");
+    }
+
+    /// A superseded base cancels before rewrite IO and durably requests its successor.
+    #[tokio::test]
+    async fn superseded_worker_task_has_no_external_effect_and_replans() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let stop = CancellationToken::new();
+        let scheduler =
+            ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+                .expect("fixture scheduler");
+        let planned = scheduler.schedule_once(&stop).await.expect("initial plan");
+        assert_eq!(planned.tasks_enqueued, 1);
+
+        let empty = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("empty planned table");
+        fixture.append_seed_manifest(&empty, 0).await;
+        let superseding_snapshot = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("superseding table")
+            .metadata()
+            .current_snapshot_id();
+        let forge_prefix = format!("{}/data/forge/", fixture.binding.object_prefix);
+        let before = fixture
+            .staging
+            .list_with(&forge_prefix)
+            .recursive(true)
+            .await
+            .expect("pre-cancel Forge object list");
+
+        assert!(
+            fixture
+                .worker
+                .execute_one_for_test(&stop)
+                .await
+                .expect("cancel superseded task")
+        );
+        let after = fixture
+            .staging
+            .list_with(&forge_prefix)
+            .recursive(true)
+            .await
+            .expect("post-cancel Forge object list");
+        assert_eq!(after.len(), before.len(), "cancellation wrote no outputs");
+        let current_snapshot = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("post-cancel table")
+            .metadata()
+            .current_snapshot_id();
+        assert_eq!(current_snapshot, superseding_snapshot);
+        let state: (String, i64, i64, i64) = sqlx::query_as(
+            "SELECT state,(SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND compacted),(SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1),(SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation='forge.task.cancelled' AND payload_summary='base_snapshot_superseded') FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at LIMIT 1",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("superseded durable state");
+        assert_eq!(state, ("cancelled".to_owned(), 0, 1, 1));
+
+        let successor = scheduler
+            .schedule_once(&stop)
+            .await
+            .expect("successor plan");
+        assert_eq!(successor.tasks_enqueued, 1);
+    }
+
+    /// Enqueues, directly claims, and proves one closed worker payload fails terminally.
+    ///
+    /// # Panics
+    ///
+    /// Panics when admission, direct execution, or terminal-state evidence fails.
+    async fn assert_worker_payload_fails_before_effect(
+        fixture: &Fixture,
+        tasks: &ForgeTasks,
+        strategy: ForgeTaskStrategy,
+        plan: ForgeTaskPlan,
+        hash: u8,
+    ) {
+        let task_id = tasks
+            .enqueue(
+                &fixture.operator_pool,
+                &fixture.durable_task(strategy, plan, hash),
+            )
+            .await
+            .expect("validation task enqueue");
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("validation claim")
+            .expect("validation task");
+        assert_eq!(claim.task_id, task_id);
+        fixture
+            .worker
+            .execute_claim(claim, &CancellationToken::new())
+            .await
+            .expect("closed validation terminalization");
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("validation state");
+        assert_eq!(state, "failed");
+    }
+
+    /// Direct worker validation rejects closed-strategy and malformed payloads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when SQL admission, worker validation, or before-effect evidence
+    /// differs from the closed T13 task contract.
+    #[tokio::test]
+    async fn worker_rejects_reserved_and_malformed_tasks_before_effect() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+        let tasks = ForgeTasks::new();
+        for (strategy, plan, hash) in [
+            (
+                ForgeTaskStrategy::FullIdentity,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["data/reserved.parquet".to_owned()],
+                    parameters: serde_json::json!({"kind":"full_identity"}),
+                },
+                201,
+            ),
+            (
+                ForgeTaskStrategy::SnapshotExpiry,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["metadata/v1.json".to_owned()],
+                    parameters: serde_json::json!({"kind":"snapshot_expiry"}),
+                },
+                202,
+            ),
+            (
+                ForgeTaskStrategy::StagingFold,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: Vec::new(),
+                    parameters: serde_json::json!({"kind":"staging_fold"}),
+                },
+                203,
+            ),
+        ] {
+            assert_worker_payload_fails_before_effect(&fixture, &tasks, strategy, plan, hash).await;
+        }
+        assert_eq!(fixture.reads.output_put_calls(), 0);
+        let lease_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.maintenance_leases WHERE lease_key=$1")
+                .bind(forge_lease_key(
+                    fixture.tenant,
+                    &fixture.binding.logical_namespace,
+                    &fixture.binding.table_name,
+                ))
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("validation lease count");
+        assert_eq!(lease_count, 0);
+    }
+
+    /// An unknown raw strategy is terminally audited and releases its claim so
+    /// the same worker slot can execute the next valid task.
+    ///
+    /// # Panics
+    ///
+    /// Panics when corruption setup, quarantine evidence, release state, or
+    /// valid successor execution differs from the worker contract.
+    #[tokio::test]
+    async fn worker_quarantines_unknown_strategy_and_continues_slot() {
+        let tasks = ForgeTasks::new();
+        let unknown_fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 16 * 1024 * 1024).await;
+        let unknown_id = tasks
+            .enqueue(
+                &unknown_fixture.operator_pool,
+                &unknown_fixture.durable_task(
+                    ForgeTaskStrategy::StagingFold,
+                    ForgeTaskPlan {
+                        version: FORGE_TASK_PAYLOAD_VERSION,
+                        inputs: vec!["data/unknown.parquet".to_owned()],
+                        parameters: serde_json::json!({"kind":"staging_fold"}),
+                    },
+                    204,
+                ),
+            )
+            .await
+            .expect("unknown task seed");
+        let admin = unknown_fixture
+            .pg
+            .superuser_pool()
+            .await
+            .expect("validation admin");
+        sqlx::query("ALTER TABLE vala.forge_tasks DROP CONSTRAINT forge_tasks_strategy_check")
+            .execute(&admin)
+            .await
+            .expect("drop strategy constraint for corruption proof");
+        sqlx::query("UPDATE vala.forge_tasks SET strategy='unknown' WHERE task_id=$1")
+            .bind(unknown_id)
+            .execute(&admin)
+            .await
+            .expect("inject unknown strategy");
+        let mut status_conn = unknown_fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(unknown_fixture.tenant)
+            .await
+            .expect("unknown status tenant connection");
+        assert!(
+            tasks.status(&mut status_conn, 8).await.is_err(),
+            "canonical status decoding must fail closed on an unknown strategy"
+        );
+        drop(status_conn);
+        enqueue_exact_staging_task(&unknown_fixture, &unknown_fixture.binding, 205).await;
+        assert!(
+            unknown_fixture
+                .worker
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("unknown strategy quarantine"),
+            "unknown persisted strategy must be claimed and terminalized"
+        );
+        let quarantined: (String, bool, bool, bool, i64, i64) = sqlx::query_as(
+            "SELECT state,attempt_id IS NULL,claimed_by IS NULL,claim_expires_at IS NULL,\
+                    (SELECT count(*) FROM vala.audit_outbox \
+                      WHERE resource='forge-task:' || $1::text \
+                        AND payload_summary LIKE '%unknown%'),\
+                    (SELECT count(*) FROM vala.maintenance_leases WHERE lease_key=$2) \
+               FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(unknown_id)
+        .bind(forge_lease_key(
+            unknown_fixture.tenant,
+            &unknown_fixture.binding.logical_namespace,
+            &unknown_fixture.binding.table_name,
+        ))
+        .fetch_one(&admin)
+        .await
+        .expect("unknown strategy quarantine state");
+        assert_eq!(quarantined, ("failed".to_owned(), true, true, true, 1, 0));
+        assert_eq!(unknown_fixture.reads.output_put_calls(), 0);
+        assert!(
+            unknown_fixture
+                .worker
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("slot continues to valid task"),
+            "same slot must claim the next supported task"
+        );
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND state='succeeded'",
+        )
+        .bind(unknown_fixture.tenant.as_uuid())
+        .fetch_one(&admin)
+        .await
+        .expect("valid successor state");
+        assert_eq!(succeeded, 1);
+        assert!(unknown_fixture.reads.output_put_calls() > 0);
+    }
+
+    /// A mismatched independently projected execution tenant never reaches SQL
+    /// tenant binding, the table lease, catalog publication, or object output.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker accepts a mismatched claim context or mutates any
+    /// durable/external state before rejecting it.
+    #[tokio::test]
+    async fn worker_rejects_claim_tenant_mismatch_before_every_effect() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+        let tasks = ForgeTasks::new();
+        let task_id = tasks
+            .enqueue(
+                &fixture.operator_pool,
+                &fixture.durable_task(
+                    ForgeTaskStrategy::StagingFold,
+                    ForgeTaskPlan {
+                        version: FORGE_TASK_PAYLOAD_VERSION,
+                        inputs: vec!["data/tenant-mismatch.parquet".to_owned()],
+                        parameters: serde_json::json!({"kind":"staging_fold"}),
+                    },
+                    205,
+                ),
+            )
+            .await
+            .expect("tenant mismatch seed");
+        let mut claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("tenant mismatch claim")
+            .expect("tenant mismatch task");
+        claim.execution_tenant_id = DataTenantId::new_v7();
+        assert!(
+            fixture
+                .worker
+                .execute_claim(claim, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let evidence: (String, i64, i64) = sqlx::query_as(
+            "SELECT state,(SELECT count(*) FROM vala.audit_outbox),(SELECT count(*) FROM vala.maintenance_leases) FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("tenant mismatch evidence");
+        assert_eq!(evidence, ("claimed".to_owned(), 0, 0));
+        assert_eq!(fixture.reads.output_put_calls(), 0);
+        assert_eq!(
+            fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("unchanged mismatch table")
+                .metadata()
+                .current_snapshot_id(),
+            None
+        );
+    }
+
+    /// Direct claim-envelope identity failures stop before tenant SQL, lease,
+    /// catalog, or object effects for every unsupported identity dimension.
+    ///
+    /// # Panics
+    ///
+    /// Panics when catalog, namespace, or table validation reaches any effect
+    /// boundary or mutates the claimed task.
+    #[tokio::test]
+    async fn worker_rejects_invalid_claim_identity_before_every_effect() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+        let task_id = ForgeTasks::new()
+            .enqueue(
+                &fixture.operator_pool,
+                &fixture.durable_task(
+                    ForgeTaskStrategy::StagingFold,
+                    ForgeTaskPlan {
+                        version: FORGE_TASK_PAYLOAD_VERSION,
+                        inputs: vec!["data/invalid-identity.parquet".to_owned()],
+                        parameters: serde_json::json!({"kind":"staging_fold"}),
+                    },
+                    206,
+                ),
+            )
+            .await
+            .expect("invalid identity seed");
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("invalid identity claim")
+            .expect("invalid identity task");
+        let reads_before = fixture.reads.whole_reads.load(Ordering::Acquire);
+        let ranges_before = fixture.reads.ranged_reads.load(Ordering::Acquire);
+        let outputs_before = fixture.reads.output_put_calls();
+        for invalid in [
+            ForgeTaskTableIdentity {
+                catalog: "other".to_owned(),
+                namespace: "vala.bifrost".to_owned(),
+                table: "events".to_owned(),
+            },
+            ForgeTaskTableIdentity {
+                catalog: "wyrd-redux".to_owned(),
+                namespace: "unknown".to_owned(),
+                table: "events".to_owned(),
+            },
+            ForgeTaskTableIdentity {
+                catalog: "wyrd-redux".to_owned(),
+                namespace: "vala.bifrost".to_owned(),
+                table: "../events".to_owned(),
+            },
+        ] {
+            let mut invalid_claim = claim.clone();
+            invalid_claim.table_ref = invalid;
+            assert!(
+                fixture
+                    .worker
+                    .execute_claim(invalid_claim, &CancellationToken::new())
+                    .await
+                    .is_err(),
+                "invalid identity must be rejected"
+            );
+        }
+        let evidence: (String, i64, i64) = sqlx::query_as(
+            "SELECT state,(SELECT count(*) FROM vala.audit_outbox),\
+                    (SELECT count(*) FROM vala.maintenance_leases) \
+               FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("invalid identity effect evidence");
+        assert_eq!(evidence, ("claimed".to_owned(), 0, 0));
+        assert_eq!(
+            fixture.reads.whole_reads.load(Ordering::Acquire),
+            reads_before
+        );
+        assert_eq!(
+            fixture.reads.ranged_reads.load(Ordering::Acquire),
+            ranges_before
+        );
+        assert_eq!(fixture.reads.output_put_calls(), outputs_before);
+        assert_eq!(
+            fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("unchanged invalid-identity table")
+                .metadata()
+                .current_snapshot_id(),
+            None
+        );
+    }
+
+    /// Worker authority selected for one deterministic heartbeat-loss proof.
+    #[derive(Clone, Copy)]
+    enum WorkerAuthorityLoss {
+        /// Expire only the durable task/large-lane claim.
+        Claim,
+        /// Replace only the table-scoped publication lease generation.
+        TableLease,
+    }
+
+    /// Pauses one real task after output PUT and proves one authority loss
+    /// cancels execution without conflating the independent surviving fence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the real worker does not observe the injected authority
+    /// loss within the bounded heartbeat interval or reports the wrong class.
+    async fn assert_worker_authority_loss(loss: WorkerAuthorityLoss) {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let claim = fixture.plan_and_claim().await;
+        let task_id = claim.task_id;
+        let claim_owner = claim.claimed_by.expect("claimed worker owner");
+        let lease_key = forge_lease_key(
+            fixture.tenant,
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        );
+        fixture.reads.pause_after_next_output_put();
+        let stop = CancellationToken::new();
+        let execution = tokio::spawn({
+            let worker = fixture.worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_claim(claim, &stop).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), fixture.reads.wait_for_output_put())
+            .await
+            .expect("worker output PUT boundary");
+        let lease_before: (uuid::Uuid, i64) = sqlx::query_as(
+            "SELECT owner,fencing_token FROM vala.maintenance_leases WHERE lease_key=$1",
+        )
+        .bind(&lease_key)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("active table lease");
+        match loss {
+            WorkerAuthorityLoss::Claim => {
+                sqlx::query(
+                    "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+                )
+                .bind(task_id)
+                .execute(fixture.operator_pool.pool())
+                .await
+                .expect("expire task claim only");
+            }
+            WorkerAuthorityLoss::TableLease => {
+                sqlx::query(
+                    "UPDATE vala.maintenance_leases SET owner=$2,fencing_token=fencing_token+1 WHERE lease_key=$1",
+                )
+                .bind(&lease_key)
+                .bind(uuid::Uuid::now_v7())
+                .execute(fixture.operator_pool.pool())
+                .await
+                .expect("replace table lease only");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        match loss {
+            WorkerAuthorityLoss::Claim => {
+                let lease_after: (uuid::Uuid, i64) = sqlx::query_as(
+                    "SELECT owner,fencing_token FROM vala.maintenance_leases WHERE lease_key=$1",
+                )
+                .bind(&lease_key)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("surviving table lease");
+                assert_eq!(lease_after, lease_before, "table fence was not stolen");
+            }
+            WorkerAuthorityLoss::TableLease => {
+                let claim_live: bool = sqlx::query_scalar(
+                    "SELECT claimed_by=$2 AND claim_expires_at>statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1",
+                )
+                .bind(task_id)
+                .bind(claim_owner)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("surviving task claim");
+                assert!(claim_live, "task claim remains independently live");
+            }
+        }
+        fixture.reads.release_output_put();
+        let result = tokio::time::timeout(Duration::from_secs(30), execution)
+            .await
+            .expect("authority-loss shutdown bound")
+            .expect("authority-loss worker join");
+        match loss {
+            WorkerAuthorityLoss::Claim => {
+                assert!(matches!(result, Err(ForgeError::Sql(_))), "{result:?}");
+            }
+            WorkerAuthorityLoss::TableLease => {
+                assert!(
+                    matches!(result, Err(ForgeError::FenceLost { .. })),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    /// Claim heartbeat loss cancels a paused real worker while its table fence survives.
+    #[tokio::test]
+    async fn worker_claim_loss_cancels_independently() {
+        assert_worker_authority_loss(WorkerAuthorityLoss::Claim).await;
+    }
+
+    /// Table-lease loss cancels a paused real worker while its claim survives.
+    #[tokio::test]
+    async fn worker_table_lease_loss_cancels_independently() {
+        assert_worker_authority_loss(WorkerAuthorityLoss::TableLease).await;
+    }
+
+    /// A live table lease excludes the direct worker path before rewrite output.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a second worker bypasses the table-scoped publication fence.
+    #[tokio::test]
+    async fn worker_same_table_lease_excludes_publication() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let claim = fixture.plan_and_claim().await;
+        let competing = ForgeLease::acquire(
+            &fixture.operator_pool,
+            forge_lease_key(
+                fixture.tenant,
+                &fixture.binding.logical_namespace,
+                &fixture.binding.table_name,
+            ),
+            uuid::Uuid::now_v7(),
+            ForgeConfig::default().lease_ttl,
+        )
+        .await
+        .expect("competing lease query")
+        .expect("competing lease");
+        let result = fixture
+            .worker
+            .execute_claim(claim, &CancellationToken::new())
+            .await;
+        assert!(matches!(result, Err(ForgeError::FenceLost { .. })));
+        assert_eq!(fixture.reads.output_put_calls(), 0);
+        assert!(
+            competing
+                .release(&fixture.operator_pool)
+                .await
+                .expect("competing lease release")
+        );
+    }
+
+    /// Enqueues one exact ordinary staging task for a registered fixture table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when exact inputs, identity construction, or enqueueing fails.
+    async fn enqueue_exact_staging_task(fixture: &Fixture, binding: &TenantTableBinding, hash: u8) {
+        let inputs: Vec<String> = sqlx::query_scalar(
+            "SELECT file_path FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 ORDER BY file_path",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&binding.logical_namespace)
+        .bind(&binding.table_name)
+        .fetch_all(fixture.operator_pool.pool())
+        .await
+        .expect("concurrent exact inputs");
+        ForgeTasks::new()
+            .enqueue(
+                &fixture.operator_pool,
+                &NewForgeTask {
+                    data_tenant_id: fixture.tenant,
+                    table_ref: ForgeTaskTableIdentity::new(
+                        "wyrd-redux",
+                        &binding.logical_namespace,
+                        &binding.table_name,
+                    )
+                    .expect("concurrent task identity"),
+                    strategy: ForgeTaskStrategy::StagingFold,
+                    lane: ForgeTaskLane::Ordinary,
+                    base_snapshot_id: 0,
+                    plan: ForgeTaskPlan {
+                        version: FORGE_TASK_PAYLOAD_VERSION,
+                        inputs,
+                        parameters: serde_json::json!({"kind":"staging_fold"}),
+                    },
+                    plan_hash: [hash; 32],
+                    estimates: ForgeTaskEstimates {
+                        files: 2,
+                        bytes: 200,
+                        parallelism: 1,
+                        memory_bytes: 200,
+                        spill_bytes: 200,
+                        large_ceiling_bytes: 1_000,
+                    },
+                    ready_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .expect("concurrent exact task");
+    }
+
+    /// Two fixed worker slots execute independent table rewrites concurrently.
+    ///
+    /// Both real output PUTs must reach the shared pause before either is
+    /// released, which proves progress is not serialized by a process-global
+    /// task or publication lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics when planning does not enqueue both tables, admission serializes
+    /// the claims, or either direct worker execution fails.
+    #[tokio::test]
+    async fn worker_independent_tables_execute_concurrently() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let second_binding = fixture.register_seeded_table().await;
+        for (binding, hash) in [(&fixture.binding, 206_u8), (&second_binding, 207_u8)] {
+            enqueue_exact_staging_task(&fixture, binding, hash).await;
+        }
+        let stop = CancellationToken::new();
+        let worker = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig {
+                worker_concurrency: 2,
+            },
+        )
+        .expect("two-slot worker");
+        let first = worker
+            .claim_for_test()
+            .await
+            .expect("first concurrent claim")
+            .expect("first concurrent task");
+        let Some(second) = worker
+            .claim_for_test()
+            .await
+            .expect("second concurrent claim")
+        else {
+            panic!("second concurrent task missing");
+        };
+        assert_ne!(first.table_ref, second.table_ref);
+        fixture.reads.pause_after_output_puts(2);
+        let first_task = tokio::spawn({
+            let worker = worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_claim(first, &stop).await }
+        });
+        let second_task = tokio::spawn({
+            let worker = worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_claim(second, &stop).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            fixture.reads.wait_for_output_puts(2),
+        )
+        .await
+        .expect("both independent outputs reach PUT concurrently");
+        fixture.reads.release_output_put();
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        first_result
+            .expect("first concurrent worker join")
+            .expect("first concurrent execution");
+        second_result
+            .expect("second concurrent worker join")
+            .expect("second concurrent execution");
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND state='succeeded'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("concurrent terminal states");
+        assert_eq!(succeeded, 2);
+    }
+
+    /// Cancellation after a real output PUT drains promptly, then a successor
+    /// boundedly reclaims the expired Running attempt and completes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when shutdown exceeds its bound, the attempt becomes terminal
+    /// prematurely, or the successor cannot reclaim and finish it.
+    #[tokio::test]
+    async fn worker_active_shutdown_is_reclaimed_after_crash_expiry() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let claim = fixture.plan_and_claim().await;
+        let task_id = claim.task_id;
+        fixture.reads.pause_after_next_output_put();
+        let stop = CancellationToken::new();
+        let execution = tokio::spawn({
+            let worker = fixture.worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_claim(claim, &stop).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), fixture.reads.wait_for_output_put())
+            .await
+            .expect("shutdown output boundary");
+        stop.cancel();
+        fixture.reads.release_output_put();
+        let result = tokio::time::timeout(Duration::from_secs(30), execution)
+            .await
+            .expect("active shutdown bound")
+            .expect("active worker join");
+        assert!(matches!(result, Err(ForgeError::Shutdown)), "{result:?}");
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("expire abandoned Running attempt");
+        let successor = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig {
+                worker_concurrency: 1,
+            },
+        )
+        .expect("successor worker");
+        assert!(
+            successor
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("successor reclaim execution")
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("reclaimed task state");
+        assert_eq!(state, "succeeded");
+    }
+
+    /// Reads the exact current metadata bytes and returns snapshot, location,
+    /// and digest evidence for later recovery comparison.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the committed fixture table lacks a snapshot or metadata
+    /// location, escapes its table root, or its raw object cannot be read.
+    async fn exact_current_metadata_evidence(
+        fixture: &Fixture,
+        table: &iceberg::table::Table,
+    ) -> (i64, String, String) {
+        let snapshot = table
+            .metadata()
+            .current_snapshot_id()
+            .expect("task committed snapshot");
+        let location = table
+            .metadata_location_result()
+            .expect("task committed metadata location")
+            .to_owned();
+        let relative = location
+            .strip_prefix(&format!(
+                "{}/",
+                table.metadata().location().trim_end_matches('/')
+            ))
+            .expect("metadata location below fixture table");
+        let key = format!(
+            "{}/{relative}",
+            fixture.binding.object_prefix.trim_end_matches('/')
+        );
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                fixture
+                    .staging
+                    .read(&key)
+                    .await
+                    .expect("original metadata bytes")
+                    .to_bytes()
+            ))
+        );
+        (snapshot, location, digest)
+    }
+
+    /// Metadata evidence read failure leaves Running recovery state; after a
+    /// later catalog snapshot, takeover finds the original exact task commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when missing evidence is fabricated, later catalog progress is
+    /// mistaken for task evidence, recovery rewrites output, or the original
+    /// committed bytes cannot terminalize and audit the task.
+    #[tokio::test]
+    async fn worker_recovers_exact_evidence_read_without_rewrite() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let claim = fixture.plan_and_claim().await;
+        let task_id = claim.task_id;
+        fixture.reads.fail_next_metadata_read();
+        let result = fixture
+            .worker
+            .execute_claim(claim, &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(result, Err(ForgeError::ObjectStore(_))),
+            "{result:?}"
+        );
+        let before_recovery = fixture.reads.output_put_calls();
+        let retained: (String, bool) =
+            sqlx::query_as("SELECT state,evidence IS NULL FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("retained evidence failure");
+        assert_eq!(retained, ("running".to_owned(), true));
+        let committed = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("committed table after evidence failure");
+        let (original_snapshot, original_location, original_digest) =
+            exact_current_metadata_evidence(&fixture, &committed).await;
+        fixture.seed_files_at(99, 1, false).await;
+        fixture.append_seed_manifest(&committed, 99).await;
+        let advanced = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("intervening catalog table");
+        assert_ne!(
+            advanced.metadata().current_snapshot_id(),
+            Some(original_snapshot),
+            "intervening append must advance beyond the task commit"
+        );
+        assert_ne!(
+            advanced
+                .metadata_location_result()
+                .expect("intervening metadata location"),
+            original_location,
+            "recovery must search retained metadata rather than current bytes"
+        );
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("expire evidence-read attempt");
+        let successor = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig {
+                worker_concurrency: 1,
+            },
+        )
+        .expect("evidence successor");
+        assert!(
+            successor
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("evidence recovery")
+        );
+        let recovered: (String, i64, String, String, i64) = sqlx::query_as(
+            "SELECT state,(evidence->>'committed_snapshot_id')::bigint,\
+                    evidence->>'committed_metadata_location',\
+                    evidence->>'committed_metadata_digest',\
+                    (SELECT count(*) FROM vala.audit_outbox \
+                      WHERE resource='forge-task:' || $1::text \
+                        AND operation IN ('forge.task.prepared','forge.task.succeeded')) \
+               FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("recovered evidence state");
+        assert_eq!(
+            recovered,
+            (
+                "succeeded".to_owned(),
+                original_snapshot,
+                original_location,
+                original_digest,
+                2,
+            )
+        );
+        assert_eq!(fixture.reads.output_put_calls(), before_recovery);
     }
 
     /// A projection failure rolls back staging claims and its paired audit.
@@ -1463,8 +2627,17 @@ mod pg_tests {
         .await
         .expect("projection failure trigger");
 
-        let outcome = fixture.forge.run_once().await.expect("isolated table tick");
-        assert_eq!(outcome.tables_failed, 1, "outcome: {outcome:?}");
+        let stop = CancellationToken::new();
+        let outcome = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("fixture scheduler")
+            .schedule_once(&stop)
+            .await
+            .expect("isolated table plan");
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
+        assert!(
+            fixture.worker.execute_one_for_test(&stop).await.is_err(),
+            "the injected operation projection must reject worker publication"
+        );
 
         let mut conn = fixture
             .pg
@@ -1761,10 +2934,8 @@ mod pg_tests {
         .await
         .expect("age overflow projection");
 
-        let outcome = fixture.forge.run_once().await.expect("overflow tick");
-        assert!(outcome.pending_work);
-        assert_eq!(outcome.open_operation_overflows, 1);
-        assert_eq!(outcome.reconciliation_recovered, 0);
+        let outcome = fixture.schedule_and_execute().await;
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
         let mut conn = fixture
             .pg
             .vala_postgres()
@@ -2124,9 +3295,9 @@ mod pg_tests {
     async fn prepare_live_transition(
         fixture: &Fixture,
     ) -> (iceberg::table::Table, i64, IcebergRewriteGroup, ForgeLease) {
-        fixture.forge.run_once().await.expect("first staging fold");
+        fixture.schedule_and_execute().await;
         fixture.seed_files_at(100, 2, true).await;
-        fixture.forge.run_once().await.expect("second staging fold");
+        fixture.schedule_and_execute().await;
         let table = fixture
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -2302,11 +3473,7 @@ mod pg_tests {
     /// Panics when fixture setup, catalog inspection, storage, lease acquisition,
     /// or operation persistence fails.
     async fn prepare_abandoned_live_operation(fixture: &Fixture) -> (ForgeLease, String) {
-        fixture
-            .forge
-            .run_once()
-            .await
-            .expect("one staging snapshot");
+        fixture.schedule_and_execute().await;
         let table = fixture
             .catalog
             .load_table(&fixture.binding.table_ident())

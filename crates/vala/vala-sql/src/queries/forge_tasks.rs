@@ -12,16 +12,18 @@ use wyrd_spec::vala::api::AuditEvent;
 
 use crate::queries::audit_outbox::append_audit;
 use crate::row_types::forge_tasks::{
-    ForgePlanningDemand, ForgePlanningDemandSqlRow, ForgeTask, ForgeTaskEvidence, ForgeTaskPage,
-    ForgeTaskSqlRow, ForgeTaskState, ForgeTaskTableIdentity, ForgeTaskTransition,
-    ForgeTaskTransitionOutcome, NewForgeTask, SnapshotWatermark,
+    ForgePlanningDemand, ForgePlanningDemandSqlRow, ForgePreparedTaskClaim,
+    ForgePreparedTaskClaimSqlRow, ForgeTask, ForgeTaskClaim, ForgeTaskClaimSqlRow,
+    ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow, ForgeTaskState, ForgeTaskTableIdentity,
+    ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask, SnapshotWatermark,
 };
 use crate::{OperatorPool, SqlError, TenantConn};
 
 const TASK_PROJECTION: &str = "task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,ready_at,created_at,updated_at";
+const CLAIM_TASK_PROJECTION: &str = "t.task_id,t.data_tenant_id,t.catalog_name,t.namespace_name,t.table_name,t.strategy,t.lane,t.base_snapshot_id,t.plan,t.estimated_files,t.estimated_bytes,t.estimated_parallelism,t.estimated_memory_bytes,t.estimated_spill_bytes,t.large_task_ceiling_bytes,t.state,t.attempt_id,t.claimed_by,t.claim_expires_at,t.watermark_snapshot_id,t.watermark_timestamp_ms,t.evidence,t.ready_at,t.created_at,t.updated_at";
 
 /// Exact PostgreSQL-16 fair-claim statement used by production and scale-plan proof.
-pub const FAIR_CLAIM_SQL: &str = r#"WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND fencing_token=$1 AND owner=$2 AND expires_at>statement_timestamp() FOR UPDATE), eligible_tenants AS MATERIALIZED (SELECT t.data_tenant_id FROM vala.forge_tasks t CROSS JOIN scheduler s WHERE t.state IN ('ready','retryable') AND t.ready_at<=statement_timestamp() AND (SELECT count(*) FROM vala.forge_tasks active WHERE active.data_tenant_id=t.data_tenant_id AND active.state IN ('claimed','running','prepared')) < $3 AND (((t.lane='ordinary') AND t.estimated_files<=$6 AND t.estimated_bytes<=$7) OR ((t.lane='large_singleton') AND t.estimated_files=1 AND t.estimated_bytes<=LEAST(t.large_task_ceiling_bytes,$11))) AND t.estimated_parallelism<=$8 AND t.estimated_memory_bytes<=$9 AND t.estimated_spill_bytes<=$10 GROUP BY t.data_tenant_id,s.last_tenant_id ORDER BY (t.data_tenant_id>s.last_tenant_id) DESC,t.data_tenant_id LIMIT 1), candidate AS MATERIALIZED (SELECT t.task_id,t.data_tenant_id,t.lane FROM vala.forge_tasks t JOIN eligible_tenants e USING(data_tenant_id) WHERE t.state IN ('ready','retryable') AND t.ready_at<=statement_timestamp() AND (((t.lane='ordinary') AND t.estimated_files<=$6 AND t.estimated_bytes<=$7) OR ((t.lane='large_singleton') AND t.estimated_files=1 AND t.estimated_bytes<=LEAST(t.large_task_ceiling_bytes,$11))) AND t.estimated_parallelism<=$8 AND t.estimated_memory_bytes<=$9 AND t.estimated_spill_bytes<=$10 ORDER BY t.ready_at,t.task_id FOR UPDATE OF t SKIP LOCKED LIMIT 1), large_lock AS MATERIALIZED (UPDATE vala.forge_large_lane_lease l SET task_id=c.task_id,owner=$2,attempt_id=$4,fencing_token=l.fencing_token+1,expires_at=statement_timestamp()+($5*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE l.singleton AND c.lane='large_singleton' AND (l.task_id IS NULL OR l.expires_at<statement_timestamp()) RETURNING l.task_id), claimed AS (UPDATE vala.forge_tasks t SET state='claimed',attempt_id=$4,claimed_by=$2,claim_expires_at=statement_timestamp()+($5*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id AND (c.lane='ordinary' OR EXISTS(SELECT 1 FROM large_lock)) RETURNING t.*), cursor_update AS (UPDATE vala.forge_scheduler_state s SET last_tenant_id=c.data_tenant_id,updated_at=statement_timestamp() FROM candidate c WHERE EXISTS(SELECT 1 FROM claimed) RETURNING s.singleton) SELECT task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,ready_at,created_at,updated_at FROM claimed"#;
+pub const FAIR_CLAIM_SQL: &str = r#"WITH cursor AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton FOR UPDATE), eligible_tenants AS MATERIALIZED (SELECT t.data_tenant_id FROM vala.forge_tasks t CROSS JOIN cursor c WHERE t.state IN ('ready','retryable') AND t.ready_at<=statement_timestamp() AND (SELECT count(*) FROM vala.forge_tasks active WHERE active.data_tenant_id=t.data_tenant_id AND active.state IN ('claimed','running','prepared')) < $2 AND (((t.lane='ordinary') AND t.estimated_files<=$5 AND t.estimated_bytes<=$6) OR ((t.lane='large_singleton') AND t.estimated_files=1 AND t.estimated_bytes<=LEAST(t.large_task_ceiling_bytes,$10))) AND t.estimated_parallelism<=$7 AND t.estimated_memory_bytes<=$8 AND t.estimated_spill_bytes<=$9 GROUP BY t.data_tenant_id,c.last_tenant_id ORDER BY (c.last_tenant_id IS NULL OR t.data_tenant_id>c.last_tenant_id) DESC,t.data_tenant_id LIMIT 1), candidate AS MATERIALIZED (SELECT t.task_id,t.data_tenant_id,e.data_tenant_id AS execution_tenant_id,t.lane FROM vala.forge_tasks t JOIN eligible_tenants e USING(data_tenant_id) WHERE t.state IN ('ready','retryable') AND t.ready_at<=statement_timestamp() AND (((t.lane='ordinary') AND t.estimated_files<=$5 AND t.estimated_bytes<=$6) OR ((t.lane='large_singleton') AND t.estimated_files=1 AND t.estimated_bytes<=LEAST(t.large_task_ceiling_bytes,$10))) AND t.estimated_parallelism<=$7 AND t.estimated_memory_bytes<=$8 AND t.estimated_spill_bytes<=$9 ORDER BY t.ready_at,t.task_id FOR UPDATE OF t SKIP LOCKED LIMIT 1), large_lock AS MATERIALIZED (UPDATE vala.forge_large_lane_lease l SET task_id=c.task_id,owner=$1,attempt_id=$3,fencing_token=l.fencing_token+1,expires_at=statement_timestamp()+($4*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE l.singleton AND c.lane='large_singleton' AND (l.task_id IS NULL OR l.expires_at<statement_timestamp()) RETURNING l.task_id), claimed AS (UPDATE vala.forge_tasks t SET state='claimed',attempt_id=$3,claimed_by=$1,claim_expires_at=statement_timestamp()+($4*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id AND (c.lane='ordinary' OR EXISTS(SELECT 1 FROM large_lock)) RETURNING t.*), cursor_update AS (UPDATE vala.forge_worker_claim_state s SET last_tenant_id=c.data_tenant_id,updated_at=statement_timestamp() FROM candidate c WHERE EXISTS(SELECT 1 FROM claimed) RETURNING s.singleton) SELECT c.execution_tenant_id,t.task_id,t.data_tenant_id,t.catalog_name,t.namespace_name,t.table_name,t.strategy,t.lane,t.base_snapshot_id,t.plan,t.estimated_files,t.estimated_bytes,t.estimated_parallelism,t.estimated_memory_bytes,t.estimated_spill_bytes,t.large_task_ceiling_bytes,t.state,t.attempt_id,t.claimed_by,t.claim_expires_at,t.watermark_snapshot_id,t.watermark_timestamp_ms,t.evidence,t.ready_at,t.created_at,t.updated_at FROM claimed t JOIN candidate c USING(task_id)"#;
 
 /// Claim limits enforced atomically by PostgreSQL.
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +44,15 @@ pub struct ForgeClaimLimits {
     pub max_spill_bytes: u64,
     /// Maximum singleton large-lane bytes.
     pub max_large_task_bytes: u64,
+}
+
+/// Exact executable and terminal planning outputs persisted in one transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct ForgeEnqueueBatch<'tasks> {
+    /// Capacity-admitted tasks that become Ready.
+    pub executable: &'tasks [NewForgeTask],
+    /// Tasks that exceed every capacity lane and become Unschedulable.
+    pub unschedulable: &'tasks [NewForgeTask],
 }
 
 /// Concrete owner of durable Forge task SQL workflows.
@@ -144,16 +155,20 @@ impl ForgeTasks {
         owner: Uuid,
         scheduler_fence: i64,
         demand: &ForgePlanningDemand,
-        tasks: &[NewForgeTask],
-        unschedulable: &[NewForgeTask],
+        batch: ForgeEnqueueBatch<'_>,
         unschedulable_event: F,
     ) -> Result<bool, SqlError>
     where
         F: Fn(Uuid) -> AuditEvent,
     {
-        if tasks.iter().chain(unschedulable).any(|task| {
-            task.data_tenant_id != demand.data_tenant_id || task.table_ref != demand.table_ref
-        }) {
+        if batch
+            .executable
+            .iter()
+            .chain(batch.unschedulable)
+            .any(|task| {
+                task.data_tenant_id != demand.data_tenant_id || task.table_ref != demand.table_ref
+            })
+        {
             return Err(SqlError::Conflict {
                 detail: "planned task does not match Forge demand binding".to_owned(),
             });
@@ -171,14 +186,14 @@ impl ForgeTasks {
             .execute(&mut *tx)
             .await
             .map_err(SqlError::from)?;
-        for task in tasks {
+        for task in batch.executable {
             task.plan.validate(false)?;
             task.estimates.validate()?;
             let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
             sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'ready',$17) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING")
                 .bind(Uuid::now_v7()).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.lane.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(i32::from(task.estimates.parallelism)).bind(i64::try_from(task.estimates.memory_bytes).map_err(|_|SqlError::Conflict{detail:"memory estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.spill_bytes).map_err(|_|SqlError::Conflict{detail:"spill estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.large_ceiling_bytes).map_err(|_|SqlError::Conflict{detail:"large ceiling overflow".to_owned()})?).bind(task.ready_at).execute(&mut *tx).await.map_err(SqlError::from)?;
         }
-        for task in unschedulable {
+        for task in batch.unschedulable {
             task.plan.validate(false)?;
             task.estimates.validate()?;
             let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
@@ -295,9 +310,8 @@ impl ForgeTasks {
         &self,
         op: &OperatorPool,
         owner: Uuid,
-        scheduler_fence: i64,
         limits: ForgeClaimLimits,
-    ) -> Result<Option<ForgeTask>, SqlError> {
+    ) -> Result<Option<ForgeTaskClaim>, SqlError> {
         if limits.max_active_per_tenant == 0
             || limits.lease_seconds == 0
             || limits.max_files == 0
@@ -313,8 +327,7 @@ impl ForgeTasks {
         }
         let attempt = Uuid::now_v7();
         let mut tx = op.pool().begin().await.map_err(SqlError::from)?;
-        let row = sqlx::query_as::<_, ForgeTaskSqlRow>(FAIR_CLAIM_SQL)
-            .bind(scheduler_fence)
+        let row = sqlx::query_as::<_, ForgeTaskClaimSqlRow>(FAIR_CLAIM_SQL)
             .bind(owner)
             .bind(i64::from(limits.max_active_per_tenant))
             .bind(attempt)
@@ -341,6 +354,44 @@ impl ForgeTasks {
                     detail: "claim large limit overflow".to_owned(),
                 })?,
             )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(SqlError::from)?;
+        let task = row.map(TryInto::try_into).transpose()?;
+        tx.commit().await.map_err(SqlError::from)?;
+        Ok(task)
+    }
+
+    /// Takes over one expired Prepared attempt without changing its generation.
+    ///
+    /// Prepared evidence belongs to the committing attempt, so recovery keeps
+    /// that attempt UUID while assigning a new compute owner. A large-lane task
+    /// reacquires its singleton capacity lease in the same transaction.
+    ///
+    /// # Errors
+    /// Returns conflict for a zero lease, invariant errors for malformed rows,
+    /// and SQL errors when the atomic takeover cannot complete.
+    ///
+    /// # Cancellation
+    /// Cancellation rolls back both task ownership and large-lane acquisition.
+    pub async fn claim_prepared_for_reconciliation(
+        &self,
+        op: &OperatorPool,
+        owner: Uuid,
+        lease_seconds: u32,
+    ) -> Result<Option<ForgePreparedTaskClaim>, SqlError> {
+        if lease_seconds == 0 {
+            return Err(SqlError::Conflict {
+                detail: "Forge reconciliation lease must be positive".to_owned(),
+            });
+        }
+        let sql = format!(
+            "WITH candidate AS MATERIALIZED (SELECT task_id,data_tenant_id,lane,attempt_id FROM vala.forge_tasks WHERE state='prepared' AND claim_expires_at<statement_timestamp() AND attempt_id IS NOT NULL ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT 1), large_lock AS MATERIALIZED (UPDATE vala.forge_large_lane_lease l SET task_id=c.task_id,owner=$1,attempt_id=c.attempt_id,fencing_token=l.fencing_token+1,expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE l.singleton AND c.lane='large_singleton' AND (l.expires_at IS NULL OR l.expires_at<statement_timestamp()) RETURNING l.task_id), claimed AS (UPDATE vala.forge_tasks t SET claimed_by=$1,claim_expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id AND (c.lane='ordinary' OR EXISTS(SELECT 1 FROM large_lock)) RETURNING t.*) SELECT c.data_tenant_id AS execution_tenant_id,{CLAIM_TASK_PROJECTION} FROM claimed t JOIN candidate c USING(task_id)"
+        );
+        let mut tx = op.pool().begin().await.map_err(SqlError::from)?;
+        let row = sqlx::query_as::<_, ForgePreparedTaskClaimSqlRow>(AssertSqlSafe(sql))
+            .bind(owner)
+            .bind(i64::from(lease_seconds))
             .fetch_optional(&mut *tx)
             .await
             .map_err(SqlError::from)?;
@@ -485,6 +536,56 @@ impl ForgeTasks {
         }
         validate_audit_event(event, transition.task_id, transition.next)?;
         self.audited_transition(conn, transition, None, event).await
+    }
+
+    /// Atomically cancels a superseded claimed attempt and requests a fresh plan.
+    ///
+    /// The audited terminal transition releases the exact attempt and matching
+    /// large-lane reservation before the same tenant transaction advances the
+    /// periodic demand generation.
+    ///
+    /// # Errors
+    /// Returns conflict unless the transition is an exact Claimed-to-Cancelled
+    /// transition for the supplied tenant/table, or returns SQL/audit errors.
+    ///
+    /// # Cancellation
+    /// Caller-owned rollback removes the cancellation, audit, lane release, and
+    /// successor demand together.
+    pub async fn cancel_superseded(
+        &self,
+        conn: &mut TenantConn<'_>,
+        task: &ForgeTaskClaim,
+        event: &AuditEvent,
+    ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
+        if task.data_tenant_id != conn.data_tenant_id()
+            || task.state != ForgeTaskState::Claimed
+            || task.attempt_id.is_none()
+            || task.claimed_by.is_none()
+        {
+            return Err(SqlError::Conflict {
+                detail: "superseded Forge task does not match claimed tenant attempt".to_owned(),
+            });
+        }
+        let transition = ForgeTaskTransition {
+            task_id: task.task_id,
+            attempt_id: task.attempt_id.expect("claimed attempt checked above"),
+            owner: task.claimed_by.expect("claimed owner checked above"),
+            expected: ForgeTaskState::Claimed,
+            next: ForgeTaskState::Cancelled,
+        };
+        validate_audit_event(event, task.task_id, ForgeTaskState::Cancelled)?;
+        let outcome = self
+            .audited_transition(conn, transition, None, event)
+            .await?;
+        sqlx::query_scalar::<_, i64>("INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'periodic') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1 RETURNING generation")
+            .bind(task.data_tenant_id.as_uuid())
+            .bind(&task.table_ref.catalog)
+            .bind(&task.table_ref.namespace)
+            .bind(&task.table_ref.table)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .map_err(SqlError::from)?;
+        Ok(outcome)
     }
 
     /// Atomically terminalizes unclaimed work that exceeds every capacity lane.

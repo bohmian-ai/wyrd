@@ -29,9 +29,13 @@ set -e
 # 4. Predecessor names
 ! rg -n --no-heading -e 'opsml|scouter' crates/wyrd/wyrd-server/src/ crates/wyrd/wyrd-auth/src/
 
-# 5. Plan docs: predecessor names allowed only in audit + verification files
-! rg -n --no-heading -e 'opsml|scouter' .dev/plan/foundations/07-server-skeleton \
-    --glob '!11-parity-audit.md' --glob '!10-verification.md'
+# 5. Local plan docs, when present: predecessor names are allowed only in audit
+#    and verification files. `.dev/` is intentionally ignored and is not
+#    available in every clean worktree, so its absence is not an audit error.
+if [[ -d .dev/plan/foundations/07-server-skeleton ]]; then
+    ! rg -n --no-heading -e 'opsml|scouter' .dev/plan/foundations/07-server-skeleton \
+        --glob '!11-parity-audit.md' --glob '!10-verification.md'
+fi
 
 # 6. Predecessor domain nouns
 ! rg -n --no-heading -e '\b(SubAgent|Skill|RecoveryCode|ScouterApiClient)\b' \

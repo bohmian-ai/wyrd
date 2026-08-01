@@ -29,6 +29,15 @@ require_lane_runner() {
   local runner="$3"
   local task_body
   task_body="$(sed -n "/^\[tasks\.\"$lane\"\]/,/^\[tasks\./p" "$manifest")"
+  if printf '%s\n' "$task_body" | rg -n -F -- "$runner" >/dev/null; then
+    return 0
+  fi
+
+  local inner_lane="${lane}:inner"
+  if ! printf '%s\n' "$task_body" | rg -n -F -- "mise run $inner_lane" >/dev/null; then
+    return 1
+  fi
+  task_body="$(sed -n "/^\[tasks\.\"$inner_lane\"\]/,/^\[tasks\./p" "$manifest")"
   printf '%s\n' "$task_body" | rg -n -F -- "$runner" >/dev/null
 }
 
@@ -96,6 +105,15 @@ fixture="$fixture_dir/mise.toml"
 printf '%s\n' '[tasks."bench:bifrost:scribe:slo"]' 'run = "echo registered but no workload"' > "$fixture"
 if require_lane_runner "$fixture" "bench:bifrost:scribe:slo" "--bench bench_bifrost_scribe"; then
   echo "benchmark registration checker negative self-test fixture unexpectedly passed" >&2
+  exit 1
+fi
+printf '%s\n' \
+  '[tasks."bench:bifrost:scribe:slo"]' \
+  'run = "mise run bench:bifrost:scribe:slo:inner"' \
+  '[tasks."bench:bifrost:scribe:slo:inner"]' \
+  'run = "cargo bench --bench bench_bifrost_scribe"' > "$fixture"
+if ! require_lane_runner "$fixture" "bench:bifrost:scribe:slo" "--bench bench_bifrost_scribe"; then
+  echo "benchmark registration checker wrapped-runner self-test failed" >&2
   exit 1
 fi
 

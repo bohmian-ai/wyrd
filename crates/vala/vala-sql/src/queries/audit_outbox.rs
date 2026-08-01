@@ -71,7 +71,7 @@ impl<'transaction, 'connection> OperatorAudit<'transaction, 'connection> {
             .execute(&mut **self.transaction)
             .await
             .map_err(SqlError::from)?;
-        append_audit_connection(&mut **self.transaction, event).await
+        append_audit_connection(self.transaction, event).await
     }
 }
 

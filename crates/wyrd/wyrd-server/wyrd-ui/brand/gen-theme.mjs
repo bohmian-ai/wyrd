@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Generates brand/theme.css, .claude/skills/wyrd-ui/references/wyrd-theme.css, and
-// .codex/skills/wyrd-ui/references/wyrd-theme.css from brand/palette.json (the
+// .agents/skills/wyrd-ui/references/wyrd-theme.css from brand/palette.json (the
 // canonical token source).
 // Usage:
 //   node brand/gen-theme.mjs           regenerate every output target
@@ -13,7 +13,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const palettePath = join(here, 'palette.json');
 const themePath = join(here, 'theme.css');
 const claudePath = join(here, '../../../../../.claude/skills/wyrd-ui/references/wyrd-theme.css');
-const codexPath = join(here, '../../../../../.codex/skills/wyrd-ui/references/wyrd-theme.css');
+const agentsPath = join(here, '../../../../../.agents/skills/wyrd-ui/references/wyrd-theme.css');
 const docsPath = join(here, '../../../../../docs/src/styles/wyrd-tokens.css');
 
 const palette = JSON.parse(readFileSync(palettePath, 'utf8'));
@@ -119,7 +119,7 @@ function docsFontsBlock() {
   return `:root {\n${lines.join('\n')}\n}`;
 }
 
-// The .codex skill ships a full Skeleton theme keyed on [data-theme='wyrd'].
+// The repository agent skill ships a full Skeleton theme keyed on [data-theme='wyrd'].
 // codexBlock emits the SAME canonical tokens as modeBlock, but under the
 // Codex harness's theme-light/theme-dark selectors. Fonts are emitted here too
 // so the ported utilities below can reference var(--font-*) without redefining
@@ -315,7 +315,7 @@ const docsOut = [
 const targets = [
   { path: themePath, content: themeOut },
   { path: claudePath, content: claudeOut },
-  { path: codexPath, content: codexOut },
+  { path: agentsPath, content: codexOut },
   { path: docsPath, content: docsOut },
 ];
 

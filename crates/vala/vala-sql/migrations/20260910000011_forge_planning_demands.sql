@@ -24,4 +24,4 @@ CREATE INDEX forge_planning_demands_ring
 GRANT SELECT, INSERT, UPDATE ON vala.forge_planning_demands TO wyrd_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON vala.forge_planning_demands TO wyrd_platform_admin;
 GRANT SELECT, INSERT, UPDATE ON vala.audit_chain_head TO wyrd_platform_admin;
-GRANT SELECT, INSERT ON vala.audit_outbox TO wyrd_platform_admin;
+GRANT INSERT ON vala.audit_outbox TO wyrd_platform_admin;

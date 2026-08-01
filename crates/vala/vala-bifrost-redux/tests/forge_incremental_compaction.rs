@@ -552,6 +552,7 @@ mod pg_tests {
             let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
                 .expect("time")
                 .timestamp_micros();
+            let principal_id = PrincipalId::new(uuid::Uuid::nil()).to_string();
             let mut rows = Vec::new();
             for index in 0..count {
                 let index = start
@@ -573,7 +574,10 @@ mod pg_tests {
                         )),
                         Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
                         Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
-                        Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
+                        Arc::new(StringArray::from(vec![
+                            principal_id.as_str();
+                            row_count_usize
+                        ])),
                         Arc::new(StringArray::from(vec!["request"; row_count_usize])),
                         Arc::new(
                             TimestampMicrosecondArray::from(
@@ -706,8 +710,8 @@ mod pg_tests {
             iceberg::spec::DataFileFormat::Parquet
         );
         assert!(data_file.file_size_in_bytes() > 0);
-        let expected = (1..=9).collect();
-        let expected_bounds = [1, 5, 6, 7, 8, 9].into_iter().collect();
+        let expected = (1..=10).collect();
+        let expected_bounds = [1, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
         assert_eq!(
             data_file
                 .value_counts()
@@ -756,8 +760,8 @@ mod pg_tests {
         );
         assert_eq!(
             data_file.null_value_counts().values().copied().sum::<u64>(),
-            data_file.record_count() * 3,
-            "the production schema carries three nullable correlation columns"
+            data_file.record_count() * 2,
+            "the production schema carries two nullable correlation columns"
         );
         assert!(data_file.nan_value_counts().is_empty());
         let offsets = data_file.split_offsets().expect("Parquet split offsets");

@@ -1806,12 +1806,18 @@ mod pg_tests {
             "bifrost://{}/{}/{}",
             fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
         );
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("reconciled expiry tenant connection");
         let expiry_state: (String, i64) = sqlx::query_as(
             "SELECT phase,(SELECT count(*) FROM vala.audit_outbox WHERE operation LIKE 'forge.snapshot_expire.%') \
              FROM vala.forge_operation_state WHERE resource=$1 AND family='snapshot_expire'",
         )
         .bind(&resource)
-        .fetch_one(fixture.operator_pool.pool())
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("reconciled expiry projection");
         assert_eq!(expiry_state, ("recovered".to_owned(), 2));
@@ -2059,11 +2065,17 @@ mod pg_tests {
             .metadata()
             .current_snapshot_id();
         assert_eq!(current_snapshot, superseding_snapshot);
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("superseded state tenant connection");
         let state: (String, i64, i64, i64) = sqlx::query_as(
             "SELECT state,(SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND compacted),(SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1),(SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation='forge.task.cancelled' AND payload_summary='base_snapshot_superseded') FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at LIMIT 1",
         )
         .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.operator_pool.pool())
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("superseded durable state");
         assert_eq!(state, ("cancelled".to_owned(), 0, 1, 1));
@@ -2302,14 +2314,25 @@ mod pg_tests {
                 .await
                 .is_err()
         );
-        let evidence: (String, i64, i64) = sqlx::query_as(
-            "SELECT state,(SELECT count(*) FROM vala.audit_outbox),(SELECT count(*) FROM vala.maintenance_leases) FROM vala.forge_tasks WHERE task_id=$1",
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("tenant mismatch evidence connection");
+        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("tenant mismatch audit evidence");
+        let evidence: (String, i64) = sqlx::query_as(
+            "SELECT state,(SELECT count(*) FROM vala.maintenance_leases) FROM vala.forge_tasks WHERE task_id=$1",
         )
         .bind(task_id)
         .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("tenant mismatch evidence");
-        assert_eq!(evidence, ("claimed".to_owned(), 0, 0));
+        assert_eq!(evidence, ("claimed".to_owned(), 0));
+        assert_eq!(audit_count, 0);
         assert_eq!(fixture.reads.output_put_calls(), 0);
         assert_eq!(
             fixture
@@ -2383,16 +2406,26 @@ mod pg_tests {
                 "invalid identity must be rejected"
             );
         }
-        let evidence: (String, i64, i64) = sqlx::query_as(
-            "SELECT state,(SELECT count(*) FROM vala.audit_outbox),\
-                    (SELECT count(*) FROM vala.maintenance_leases) \
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("invalid identity evidence connection");
+        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("invalid identity audit evidence");
+        let evidence: (String, i64) = sqlx::query_as(
+            "SELECT state,(SELECT count(*) FROM vala.maintenance_leases) \
                FROM vala.forge_tasks WHERE task_id=$1",
         )
         .bind(task_id)
         .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("invalid identity effect evidence");
-        assert_eq!(evidence, ("claimed".to_owned(), 0, 0));
+        assert_eq!(evidence, ("claimed".to_owned(), 0));
+        assert_eq!(audit_count, 0);
         assert_eq!(
             fixture.reads.whole_reads.load(Ordering::Acquire),
             reads_before
@@ -2870,6 +2903,12 @@ mod pg_tests {
                 .await
                 .expect("evidence recovery")
         );
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("recovered evidence tenant connection");
         let recovered: (String, i64, String, String, i64) = sqlx::query_as(
             "SELECT state,(evidence->>'committed_snapshot_id')::bigint,\
                     evidence->>'committed_metadata_location',\
@@ -2880,7 +2919,7 @@ mod pg_tests {
                FROM vala.forge_tasks WHERE task_id=$1",
         )
         .bind(task_id)
-        .fetch_one(fixture.operator_pool.pool())
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("recovered evidence state");
         assert_eq!(

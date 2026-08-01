@@ -52,6 +52,20 @@ impl NativeWyrdTestServer {
     /// encoding, ingest, or flushing fails.
     #[napi]
     pub fn seed_bifrost_rows(&self, table: String, rows: Vec<i64>) -> napi::Result<Vec<i64>> {
+        let result = self.seed_bifrost_rows_borrowed(&table, &rows);
+        drop(table);
+        drop(rows);
+        result
+    }
+
+    /// Delegates the N-API-owned inputs without extending their ownership into
+    /// the Rust harness call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness lock is poisoned, the server is
+    /// already closed, or registration, encoding, ingest, or flushing fails.
+    fn seed_bifrost_rows_borrowed(&self, table: &str, rows: &[i64]) -> napi::Result<Vec<i64>> {
         let guard = self
             .server
             .lock()
@@ -60,7 +74,7 @@ impl NativeWyrdTestServer {
             .as_ref()
             .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
         wyrd_runtime::runtime()
-            .block_on(server.seed_bifrost_rows(&table, &rows))
+            .block_on(server.seed_bifrost_rows(table, rows))
             .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
@@ -159,7 +173,7 @@ impl NativeWyrdTestServer {
 /// exchange, or URL discovery fails.
 #[napi]
 pub fn start_test_server() -> napi::Result<NativeWyrdTestServer> {
-    wyrd_runtime::runtime().block_on(start_test_server_async())
+    wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async()))
 }
 
 /// Starts the bound harness inside Wyrd's shared runtime.
@@ -168,7 +182,7 @@ pub fn start_test_server() -> napi::Result<NativeWyrdTestServer> {
 ///
 /// Returns a napi error when any server setup step fails.
 async fn start_test_server_async() -> napi::Result<NativeWyrdTestServer> {
-    let server = WyrdTestServer::start_bound()
+    let server = Box::pin(WyrdTestServer::start_bound())
         .await
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
     let table_name = "typescript_oracle_query";

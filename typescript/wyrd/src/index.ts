@@ -1,10 +1,16 @@
 import { tableFromIPC, type RecordBatch } from "apache-arrow";
+import { createRequire } from "node:module";
 
-import {
-  NativeBifrostQueryClient,
-  type NativeBifrostQueryStream,
-  type NativeQueryRequest,
-} from "../index.js";
+import type {
+  NativeBifrostQueryStream,
+  NativeQueryRequest,
+  NativeQueryStep,
+} from "../index.cjs";
+
+const require = createRequire(import.meta.url);
+const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
+const { NativeBifrostQueryClient } = nativeBinding;
+type NativeBifrostQueryClient = import("../index.cjs").NativeBifrostQueryClient;
 
 export type VisibilityMode = "published_only" | "fused";
 export type FreshnessPolicy = "strict" | "allow_degraded";
@@ -100,6 +106,14 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
   );
 }
 
+async function closeNative(native: NativeBifrostQueryStream): Promise<void> {
+  try {
+    await native.close();
+  } catch {
+    // Preserve the original projection error; native cleanup is best effort.
+  }
+}
+
 export class BifrostQueryStream
   implements AsyncIterableIterator<RecordBatch>
 {
@@ -123,16 +137,31 @@ export class BifrostQueryStream
     if (this.#done) {
       return { done: true, value: undefined };
     }
-    const step = await this.#native.next();
+    let step: NativeQueryStep;
+    try {
+      step = await this.#native.next();
+    } catch (error) {
+      this.#done = true;
+      await closeNative(this.#native);
+      throw error;
+    }
     const error = projectedError(step);
     if (error !== undefined) {
       this.#done = true;
       throw error;
     }
     if (step.ipc !== null && step.ipc !== undefined) {
-      const batch = tableFromIPC(step.ipc).batches[0];
+      let batch: RecordBatch | undefined;
+      try {
+        batch = tableFromIPC(step.ipc).batches[0];
+      } catch (error) {
+        this.#done = true;
+        await closeNative(this.#native);
+        throw error;
+      }
       if (batch === undefined) {
-        await this.#native.close();
+        this.#done = true;
+        await closeNative(this.#native);
         throw new WyrdError(
           "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
           502,
@@ -143,14 +172,21 @@ export class BifrostQueryStream
       return { done: false, value: batch };
     }
     if (step.terminalJson === null || step.terminalJson === undefined) {
-      await this.#native.close();
+      this.#done = true;
+      await closeNative(this.#native);
       throw new IncompleteQueryStreamError(
         502,
         "Query stream incomplete",
         "query stream ended without terminal metadata",
       );
     }
-    this.#terminal = JSON.parse(step.terminalJson) as QueryTerminal;
+    try {
+      this.#terminal = JSON.parse(step.terminalJson) as QueryTerminal;
+    } catch (error) {
+      this.#done = true;
+      await closeNative(this.#native);
+      throw error;
+    }
     this.#done = true;
     return { done: true, value: undefined };
   }

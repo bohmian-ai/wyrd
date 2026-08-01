@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use arrow::record_batch::RecordBatch;
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use secrecy::SecretString;
@@ -14,6 +15,103 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+
+/// Rust-owned stream implementation used by the native owner.
+enum NativeStreamOwner {
+    /// Production Vala stream.
+    Production(Box<QueryResultStream>),
+    #[cfg(test)]
+    /// Injectable owner used only by deterministic native-owner tests.
+    Test(TestStreamOwner),
+}
+
+impl NativeStreamOwner {
+    /// Polls one decoded batch or terminal state from the underlying owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the owner's protocol, Arrow, transport, terminal, or
+    /// incomplete-stream error without changing its retained terminal state.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the production future abandons the in-flight response poll;
+    /// the caller still owns cleanup of the stream slot.
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
+        match self {
+            Self::Production(stream) => stream.next_batch().await,
+            #[cfg(test)]
+            Self::Test(stream) => stream.next_batch(),
+        }
+    }
+
+    /// Returns terminal metadata retained by the underlying owner.
+    fn terminal(&self) -> Option<&wyrd_spec::vala::api::QueryTerminalFrame> {
+        match self {
+            Self::Production(stream) => stream.terminal(),
+            #[cfg(test)]
+            Self::Test(stream) => stream.terminal(),
+        }
+    }
+}
+
+#[cfg(test)]
+/// Deterministic stream owner used to exercise native cleanup branches.
+struct TestStreamOwner {
+    /// Results returned by successive native polls.
+    next: std::collections::VecDeque<Result<Option<RecordBatch>, ValaSdkError>>,
+    /// Terminal metadata exposed while projecting a failed or successful end.
+    terminal: Option<wyrd_spec::vala::api::QueryTerminalFrame>,
+    /// Sentinel set when the native owner drops this stream.
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+    /// Counts calls into the injected owner so closed polls prove no re-entry.
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl TestStreamOwner {
+    /// Creates an owner with injected poll results and terminal metadata.
+    fn new(
+        next: std::collections::VecDeque<Result<Option<RecordBatch>, ValaSdkError>>,
+        terminal: Option<wyrd_spec::vala::api::QueryTerminalFrame>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            next,
+            terminal,
+            dropped,
+            polls,
+        }
+    }
+
+    /// Returns the next injected result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the injected error, or [`ValaSdkError::IncompleteQueryStream`]
+    /// after all injected results have been consumed.
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.next
+            .pop_front()
+            .unwrap_or(Err(ValaSdkError::IncompleteQueryStream))
+    }
+
+    /// Returns injected terminal metadata.
+    fn terminal(&self) -> Option<&wyrd_spec::vala::api::QueryTerminalFrame> {
+        self.terminal.as_ref()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStreamOwner {
+    /// Marks the sentinel before the native method returns its error.
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// JavaScript query request projected onto the pure Wyrd contract.
 #[napi(object)]
@@ -202,7 +300,18 @@ impl NativeBifrostQueryStream {
     /// Wraps one Rust-owned query stream for napi iteration.
     fn new(stream: QueryResultStream) -> Self {
         Self {
-            stream: Arc::new(AsyncMutex::new(Some(stream))),
+            stream: Arc::new(AsyncMutex::new(Some(NativeStreamOwner::Production(
+                Box::new(stream),
+            )))),
+            terminal_json: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    /// Wraps an injectable owner for deterministic native cleanup tests.
+    fn new_for_test(owner: TestStreamOwner) -> Self {
+        Self {
+            stream: Arc::new(AsyncMutex::new(Some(NativeStreamOwner::Test(owner)))),
             terminal_json: Arc::new(Mutex::new(None)),
         }
     }
@@ -212,7 +321,7 @@ impl NativeBifrostQueryStream {
 #[napi]
 pub struct NativeBifrostQueryStream {
     /// Mutable Rust query stream serialized across JavaScript `next` calls.
-    stream: Arc<AsyncMutex<Option<QueryResultStream>>>,
+    stream: Arc<AsyncMutex<Option<NativeStreamOwner>>>,
     /// Validated serialized terminal retained after the Rust stream is released.
     terminal_json: Arc<Mutex<Option<String>>>,
 }
@@ -232,28 +341,40 @@ impl NativeBifrostQueryStream {
             .as_mut()
             .ok_or_else(|| napi::Error::from_reason("query stream is closed".to_owned()))?;
         match stream.next_batch().await {
-            Ok(Some(batch)) => Ok(NativeQueryStep {
-                ipc: Some(Buffer::from(encode_batch(&batch)?)),
-                terminal_json: None,
-                error_code: None,
-                error_status: None,
-                error_title: None,
-                error_detail: None,
-                error_remediation: None,
-            }),
+            Ok(Some(batch)) => match encode_batch(&batch) {
+                Ok(ipc) => Ok(NativeQueryStep {
+                    ipc: Some(Buffer::from(ipc)),
+                    terminal_json: None,
+                    error_code: None,
+                    error_status: None,
+                    error_title: None,
+                    error_detail: None,
+                    error_remediation: None,
+                }),
+                Err(error) => {
+                    *stream_slot = None;
+                    Err(error)
+                }
+            },
             Ok(None) => {
-                let terminal = serde_json::to_string(
-                    stream
-                        .terminal()
-                        .ok_or_else(|| sdk_error(&ValaSdkError::IncompleteQueryStream))?,
-                )
-                .map_err(napi_error)?;
+                let terminal = if let Some(terminal) = stream.terminal() {
+                    match serde_json::to_string(terminal) {
+                        Ok(terminal) => terminal,
+                        Err(error) => {
+                            *stream_slot = None;
+                            return Err(napi_error(error));
+                        }
+                    }
+                } else {
+                    *stream_slot = None;
+                    return Err(sdk_error(&ValaSdkError::IncompleteQueryStream));
+                };
+                *stream_slot = None;
                 *self
                     .terminal_json
                     .lock()
                     .map_err(|_| napi::Error::from_reason("terminal lock poisoned".to_owned()))? =
                     Some(terminal.clone());
-                *stream_slot = None;
                 Ok(NativeQueryStep {
                     ipc: None,
                     terminal_json: Some(terminal),
@@ -265,8 +386,14 @@ impl NativeBifrostQueryStream {
                 })
             }
             Err(error) => {
-                if let Some(terminal) = stream.terminal() {
-                    let terminal = serde_json::to_string(terminal).map_err(napi_error)?;
+                let terminal = stream
+                    .terminal()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(napi_error);
+                *stream_slot = None;
+                let terminal = terminal?;
+                if let Some(terminal) = terminal {
                     *self.terminal_json.lock().map_err(|_| {
                         napi::Error::from_reason("terminal lock poisoned".to_owned())
                     })? = Some(terminal);
@@ -358,7 +485,12 @@ fn napi_error(error: impl std::fmt::Display) -> napi::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use wyrd_spec::error::WyrdError;
+    use wyrd_spec::vala::api::{
+        QueryErrorDetail, QueryFreshness, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
+        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+    };
     use wyrd_spec::vala::error::BifrostError;
 
     use super::*;
@@ -405,5 +537,188 @@ mod tests {
                 detail: "query request failed validation".to_owned(),
             },
         )));
+    }
+
+    /// Failed terminals retain diagnostics and drop their native owner before return.
+    #[tokio::test]
+    async fn native_owner_failed_terminal_drops_before_error_and_closes() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminal = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            freshness: QueryFreshness::Complete,
+            row_count: 0,
+            warnings: Vec::new(),
+            source_completion: vec![
+                SourceCompletion {
+                    source: QuerySource::Iceberg,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::HotSealed,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+            ],
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: Some(QueryErrorDetail::new("native sentinel failure").expect("detail")),
+            }),
+        };
+        let owner = NativeBifrostQueryStream::new_for_test(TestStreamOwner::new(
+            std::collections::VecDeque::from([Err(ValaSdkError::FailedTerminal {
+                terminal: terminal.clone(),
+            })]),
+            Some(terminal),
+            Arc::clone(&dropped),
+            Arc::clone(&polls),
+        ));
+        let step = owner.next().await.expect("failed terminal is projected");
+        assert_eq!(
+            step.error_code.as_deref(),
+            Some("WYRD_VALA_500_QUERY_EXECUTION_FAILED")
+        );
+        assert!(step.error_detail.is_some());
+        assert!(
+            owner
+                .terminal_json()
+                .expect("terminal lock remains healthy")
+                .expect("terminal diagnostics retained")
+                .contains("native sentinel failure")
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let Err(closed) = owner.next().await else {
+            panic!("second poll unexpectedly yielded a step")
+        };
+        assert!(closed.reason.contains("query stream is closed"));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Protocol, Arrow, EOF, and source errors all release ownership before projection.
+    #[tokio::test]
+    async fn native_owner_projection_errors_drop_before_error_and_close() {
+        for (name, result) in [
+            (
+                "protocol",
+                Err(ValaSdkError::Protocol("malformed".to_owned())),
+            ),
+            (
+                "arrow",
+                Err(ValaSdkError::Arrow("malformed Arrow".to_owned())),
+            ),
+        ] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let owner = NativeBifrostQueryStream::new_for_test(TestStreamOwner::new(
+                std::collections::VecDeque::from([result]),
+                None,
+                Arc::clone(&dropped),
+                Arc::clone(&polls),
+            ));
+            let step = owner.next().await.expect("structured projection error");
+            assert_eq!(
+                step.error_code.as_deref(),
+                Some("WYRD_VALA_502_QUERY_STREAM_PROTOCOL"),
+                "{name} is coded"
+            );
+            assert!(dropped.load(Ordering::SeqCst), "{name} owner dropped");
+            assert_eq!(polls.load(Ordering::SeqCst), 1, "{name} polled once");
+            assert!(owner.next().await.is_err(), "{name} second poll closes");
+            assert_eq!(polls.load(Ordering::SeqCst), 1, "{name} does not re-poll");
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = NativeBifrostQueryStream::new_for_test(TestStreamOwner::new(
+            std::collections::VecDeque::from([Ok(None)]),
+            None,
+            Arc::clone(&dropped),
+            Arc::clone(&polls),
+        ));
+        let Err(error) = owner.next().await else {
+            panic!("EOF without terminal unexpectedly succeeded")
+        };
+        assert!(
+            error
+                .reason
+                .contains("WYRD_VALA_502_QUERY_STREAM_INCOMPLETE")
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(owner.next().await.is_err(), "EOF second poll closes");
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A source transport error is projected with its code after owner cleanup.
+    #[tokio::test]
+    async fn native_owner_transport_error_drops_before_error_and_closes() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = NativeBifrostQueryStream::new_for_test(TestStreamOwner::new(
+            std::collections::VecDeque::from([Err(ValaSdkError::Transport(
+                WyrdError::ServiceUnavailable {
+                    message: "body transport failed".to_owned(),
+                    details: serde_json::json!({}),
+                },
+            ))]),
+            None,
+            Arc::clone(&dropped),
+            Arc::clone(&polls),
+        ));
+        let step = owner.next().await.expect("transport error is structured");
+        assert_eq!(
+            step.error_code.as_deref(),
+            Some("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(
+            owner.next().await.is_err(),
+            "second transport poll is closed"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Poisoned terminal metadata storage still releases the stream before failure.
+    #[tokio::test]
+    async fn native_owner_terminal_lock_failure_drops_before_error_and_closes() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = NativeBifrostQueryStream::new_for_test(TestStreamOwner::new(
+            std::collections::VecDeque::from([Ok(None)]),
+            Some(QueryTerminalFrame {
+                outcome: QueryTerminalOutcome::Success,
+                freshness: QueryFreshness::Complete,
+                row_count: 0,
+                warnings: Vec::new(),
+                source_completion: vec![
+                    SourceCompletion {
+                        source: QuerySource::Iceberg,
+                        outcome: SourceCompletionOutcome::Complete,
+                    },
+                    SourceCompletion {
+                        source: QuerySource::HotSealed,
+                        outcome: SourceCompletionOutcome::Complete,
+                    },
+                ],
+                error: None,
+            }),
+            Arc::clone(&dropped),
+            Arc::clone(&polls),
+        ));
+        let terminal_lock = Arc::clone(&owner.terminal_json);
+        std::thread::spawn(move || {
+            let _guard = terminal_lock.lock().expect("terminal lock acquires");
+            panic!("poison terminal lock for owner test");
+        })
+        .join()
+        .expect_err("poisoning thread panics");
+        let Err(error) = owner.next().await else {
+            panic!("terminal lock failure unexpectedly yielded a step")
+        };
+        assert!(error.reason.contains("terminal lock poisoned"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(owner.next().await.is_err(), "second poll is closed");
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 }

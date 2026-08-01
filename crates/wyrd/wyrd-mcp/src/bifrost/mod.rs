@@ -602,8 +602,8 @@ mod bifrost_tools {
     use wyrd_spec::vala::error::BifrostError;
 
     use crate::bifrost::{
-        McpQueryLimits, bifrost_error_catalog, bifrost_permissions, register_bifrost_tools,
-        requested_limits,
+        McpQueryLimits, bifrost_error_catalog, bifrost_permissions, parse_freshness,
+        parse_visibility, register_bifrost_tools, requested_limits,
     };
 
     fn dummy_client() -> WyrdClient {
@@ -648,6 +648,27 @@ mod bifrost_tools {
         let actual = requested_limits(&json!({}), configured).expect("defaults are valid");
         assert_eq!(actual.max_rows, configured.default_max_rows);
         assert_eq!(actual.max_encoded_bytes, configured.default_max_bytes);
+    }
+
+    /// Omitted MCP policy matches every other first-class client boundary.
+    #[test]
+    fn bifrost_query_uses_published_strict_defaults_and_explicit_opt_in() {
+        assert_eq!(
+            parse_visibility(None).expect("visibility default is valid"),
+            wyrd_spec::vala::api::VisibilityMode::PublishedOnly
+        );
+        assert_eq!(
+            parse_freshness(None).expect("freshness default is valid"),
+            wyrd_spec::vala::api::FreshnessPolicy::Strict
+        );
+        assert_eq!(
+            parse_visibility(Some(&json!("fused"))).expect("fused is explicit"),
+            wyrd_spec::vala::api::VisibilityMode::Fused
+        );
+        assert_eq!(
+            parse_freshness(Some(&json!("allow_degraded"))).expect("degraded is explicit"),
+            wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded
+        );
     }
 
     #[test]

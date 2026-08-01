@@ -6,7 +6,7 @@ import {
   BifrostQueryStream,
   IncompleteQueryStreamError,
   WyrdError,
-} from "../../src/index.js";
+} from "@wyrd/sdk";
 
 describe("BifrostQueryStream", () => {
   it("yields Apache Arrow batches and retains the validated terminal", async () => {
@@ -57,8 +57,10 @@ describe("BifrostQueryStream", () => {
   });
 
   it("raises a structured incomplete-stream error without parsing messages", async () => {
+    let polls = 0;
     const native = {
       async next() {
+        polls += 1;
         return {
           ipc: undefined,
           terminalJson: undefined,
@@ -75,10 +77,74 @@ describe("BifrostQueryStream", () => {
     await expect(stream.next()).rejects.toBeInstanceOf(
       IncompleteQueryStreamError,
     );
+    await expect(stream.next()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
+    expect(polls).toBe(1);
+  });
+
+  it("closes native ownership before propagating Arrow decode failures", async () => {
+    let closed = false;
+    const native = {
+      async next() {
+        return { ipc: Buffer.from("not-arrow"), terminalJson: undefined };
+      },
+      async close() {
+        closed = true;
+        throw new Error("cleanup failed");
+      },
+      terminalJson: null,
+    };
+    const stream = new BifrostQueryStream(native);
+    await expect(stream.next()).rejects.toThrow();
+    expect(closed).toBe(true);
+    await expect(stream.next()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
   });
 });
 
 describe("BifrostClient", () => {
+  it("serializes published-only and strict defaults while preserving opt-ins", async () => {
+    const requests: unknown[] = [];
+    const stream = {
+      async next() {
+        return { ipc: undefined, terminalJson: undefined };
+      },
+      async close() {},
+      terminalJson: null,
+    };
+    const native = {
+      async query(request: unknown) {
+        requests.push(request);
+        return { takeStream: () => stream };
+      },
+    };
+    const client = new BifrostClient(native as never);
+    await client.query({ sql: "SELECT 1" });
+    await client.query({
+      sql: "SELECT 1",
+      visibility: "fused",
+      freshness: "allow_degraded",
+    });
+    expect(requests).toEqual([
+      {
+        sql: "SELECT 1",
+        visibility: "published_only",
+        freshness: "strict",
+        deadlineMs: undefined,
+      },
+      {
+        sql: "SELECT 1",
+        visibility: "fused",
+        freshness: "allow_degraded",
+        deadlineMs: undefined,
+      },
+    ]);
+  });
+
   it.each([
     {
       boundary: "Gate",

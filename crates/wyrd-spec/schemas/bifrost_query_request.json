@@ -19,7 +19,7 @@
     },
     "freshness": {
       "description": "Required freshness behavior.",
-      "default": "allow_degraded",
+      "default": "strict",
       "allOf": [
         {
           "$ref": "#/definitions/FreshnessPolicy"

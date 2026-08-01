@@ -251,7 +251,7 @@ fn output_error(error: impl std::fmt::Display) -> WyrdCliError {
 mod tests {
     use clap::{Parser, Subcommand};
 
-    use super::{QueryCommand, QueryFreshness, QueryOutputFormat, QueryVisibility};
+    use super::{QueryCommand, QueryFreshness, QueryOutputFormat, QueryVisibility, request};
 
     /// Minimal parser that exercises the public query command arguments.
     #[derive(Debug, Parser)]
@@ -302,5 +302,53 @@ mod tests {
         assert_eq!(command.visibility, QueryVisibility::PublishedOnly);
         assert_eq!(command.freshness, QueryFreshness::Strict);
         assert_eq!(command.format, QueryOutputFormat::Jsonl);
+    }
+
+    /// The CLI request projection serializes the shared published/strict defaults.
+    #[test]
+    fn query_request_defaults_match_shared_client_contract() {
+        let command = QueryCommand {
+            server: Some("http://localhost".to_owned()),
+            token: Some("token".to_owned()),
+            sql: Some("SELECT 1".to_owned()),
+            file: None,
+            visibility: QueryVisibility::PublishedOnly,
+            freshness: QueryFreshness::Strict,
+            format: QueryOutputFormat::Jsonl,
+        };
+        let request = request(&command).expect("request projection succeeds");
+        assert_eq!(
+            serde_json::to_value(&request).expect("request serializes"),
+            serde_json::json!({
+                "sql": "SELECT 1",
+                "visibility": "published_only",
+                "freshness": "strict",
+                "deadline_ms": null
+            })
+        );
+    }
+
+    /// Explicit CLI policy flags remain opt-ins in the wire request.
+    #[test]
+    fn query_request_explicit_opt_ins_are_preserved() {
+        let command = QueryCommand {
+            server: Some("http://localhost".to_owned()),
+            token: Some("token".to_owned()),
+            sql: Some("SELECT 1".to_owned()),
+            file: None,
+            visibility: QueryVisibility::Fused,
+            freshness: QueryFreshness::AllowDegraded,
+            format: QueryOutputFormat::Jsonl,
+        };
+        let request = request(&command).expect("request projection succeeds");
+        assert_eq!(
+            serde_json::to_value(&request).expect("request serializes"),
+            serde_json::json!({
+                "sql": "SELECT 1",
+                "visibility": "fused",
+                "freshness": "allow_degraded",
+                "deadline_ms": null
+            })
+        );
     }
 }

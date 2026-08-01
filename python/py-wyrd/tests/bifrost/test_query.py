@@ -1,6 +1,7 @@
 """Public Python Bifrost query projection tests."""
 
 import asyncio
+import inspect
 import json
 
 import pyarrow
@@ -35,6 +36,45 @@ class _NativeStream:
 def test_bifrost_query_public_imports_are_available() -> None:
     assert BifrostQueryClient.__module__ == "wyrd.bifrost"
     assert BifrostQueryStream.__module__ == "wyrd.bifrost"
+
+
+def test_bifrost_query_defaults_match_shared_client_contract() -> None:
+    parameters = inspect.signature(BifrostQueryClient.query).parameters
+    assert parameters["visibility"].default == "published_only"
+    assert parameters["freshness"].default == "strict"
+
+
+def test_bifrost_query_forwards_defaults_and_explicit_opt_ins() -> None:
+    calls: list[tuple[str, str, str, int | None]] = []
+
+    class NativeClient:
+        def query(
+            self,
+            sql: str,
+            visibility: str,
+            freshness: str,
+            deadline_ms: int | None,
+        ) -> _NativeStream:
+            calls.append((sql, visibility, freshness, deadline_ms))
+            return _NativeStream([], {"outcome": "success", "row_count": 0})
+
+    client = object.__new__(BifrostQueryClient)
+    client._native = NativeClient()
+
+    async def run() -> None:
+        await client.query("SELECT 1")
+        await client.query(
+            "SELECT 1",
+            visibility="fused",
+            freshness="allow_degraded",
+            deadline_ms=250,
+        )
+
+    asyncio.run(run())
+    assert calls == [
+        ("SELECT 1", "published_only", "strict", None),
+        ("SELECT 1", "fused", "allow_degraded", 250),
+    ]
 
 
 def test_bifrost_query_async_iterator_yields_pyarrow_and_terminal() -> None:
@@ -75,4 +115,26 @@ def test_bifrost_query_aclose_drops_native_stream() -> None:
         await BifrostQueryStream(native).aclose()
 
     asyncio.run(close())
+    assert native.closed
+
+
+def test_bifrost_query_decode_failure_closes_native_without_masking_error() -> None:
+    native = _NativeStream([b"not-arrow"], None)
+
+    def failing_close() -> None:
+        native.closed = True
+        raise RuntimeError("cleanup failed")
+
+    native.close = failing_close  # type: ignore[method-assign]
+
+    async def consume() -> None:
+        stream = BifrostQueryStream(native)
+        await stream.__anext__()
+
+    try:
+        asyncio.run(consume())
+    except Exception as error:  # noqa: BLE001 - assert decode error survives cleanup
+        assert isinstance(error, pyarrow.ArrowException)
+    else:
+        raise AssertionError("invalid IPC must raise a decode error")
     assert native.closed

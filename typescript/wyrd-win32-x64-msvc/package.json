@@ -1,0 +1,17 @@
+{
+  "name": "@wyrd/sdk-win32-x64-msvc",
+  "version": "0.0.1",
+  "description": "Native napi addon for @wyrd/sdk-win32-x64-msvc.",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "./wyrd.win32-x64-msvc.node",
+  "files": [
+    "wyrd.win32-x64-msvc.node",
+    "package.json"
+  ]
+}

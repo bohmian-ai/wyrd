@@ -3,22 +3,40 @@
   "version": "0.0.1",
   "private": false,
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "index.cjs",
+    "index.d.ts",
+    "index.d.cts",
+    "package.json"
+  ],
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "napi": {
-    "name": "wyrd",
-    "triples": {
-      "defaults": true
-    }
+    "binaryName": "wyrd",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "optionalDependencies": {
+    "@wyrd/sdk-darwin-arm64": "0.0.1",
+    "@wyrd/sdk-darwin-x64": "0.0.1",
+    "@wyrd/sdk-linux-arm64-gnu": "0.0.1",
+    "@wyrd/sdk-linux-x64-gnu": "0.0.1",
+    "@wyrd/sdk-win32-x64-msvc": "0.0.1"
   },
   "dependencies": {
     "apache-arrow": "21.1.0"
-  },
-  "devDependencies": {
-    "@wyrd/testing": "workspace:*"
   }
 }
-

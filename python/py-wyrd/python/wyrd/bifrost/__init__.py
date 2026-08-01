@@ -23,23 +23,52 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
     def __init__(self, native_stream: Any) -> None:
         self._native = native_stream
         self._terminal: dict[str, Any] | None = None
+        self._done = False
 
     def __aiter__(self) -> BifrostQueryStream:
         return self
 
     async def __anext__(self) -> pyarrow.RecordBatch:
+        if self._done:
+            raise StopAsyncIteration
         try:
             payload = await asyncio.to_thread(self._native.next_ipc)
         except asyncio.CancelledError:
+            self._done = True
             await asyncio.shield(asyncio.to_thread(self._native.close))
+            raise
+        except Exception:
+            self._done = True
+            try:
+                await asyncio.to_thread(self._native.close)
+            except Exception:
+                pass
             raise
         if payload is None:
             terminal_json = self._native.terminal_json
             if terminal_json is None:
+                self._done = True
                 raise IncompleteQueryStreamError("query completed without terminal metadata")
-            self._terminal = json.loads(terminal_json)
+            try:
+                self._terminal = json.loads(terminal_json)
+            except Exception:
+                self._done = True
+                try:
+                    await asyncio.to_thread(self._native.close)
+                except Exception:
+                    pass
+                raise
+            self._done = True
             raise StopAsyncIteration
-        return pyarrow.ipc.open_stream(payload).read_next_batch()
+        try:
+            return pyarrow.ipc.open_stream(payload).read_next_batch()
+        except Exception:
+            self._done = True
+            try:
+                await asyncio.to_thread(self._native.close)
+            except Exception:
+                pass
+            raise
 
     @property
     def terminal(self) -> dict[str, Any] | None:
@@ -50,6 +79,7 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
     async def aclose(self) -> None:
         """Cancel the query by dropping its Rust-owned HTTP response stream."""
 
+        self._done = True
         await asyncio.to_thread(self._native.close)
 
 
@@ -64,8 +94,8 @@ class BifrostQueryClient:
         self,
         sql: str,
         *,
-        visibility: str = "fused",
-        freshness: str = "allow_degraded",
+        visibility: str = "published_only",
+        freshness: str = "strict",
         deadline_ms: int | None = None,
     ) -> BifrostQueryStream:
         """Start one authenticated Oracle query without blocking the event loop."""

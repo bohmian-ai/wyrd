@@ -65,8 +65,8 @@ class BifrostQueryClient:
         self,
         sql: str,
         *,
-        visibility: str = "fused",
-        freshness: str = "allow_degraded",
+        visibility: str = "published_only",
+        freshness: str = "strict",
         deadline_ms: int | None = None,
     ) -> BifrostQueryStream:
         """Start one authenticated terminal-safe query."""

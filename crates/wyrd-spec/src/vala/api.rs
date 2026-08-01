@@ -954,17 +954,22 @@ pub enum VisibilityMode {
 }
 
 /// Behavior when a requested live source cannot complete.
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FreshnessPolicy {
     /// Fail when every requested source cannot complete.
     Strict,
     /// Retain a bounded degraded result when live data is unavailable.
-    #[default]
     AllowDegraded,
+}
+
+impl Default for FreshnessPolicy {
+    /// Uses strict freshness so omitted client policy never hides an
+    /// unavailable live source.
+    fn default() -> Self {
+        Self::Strict
+    }
 }
 
 /// Public synchronous Oracle query request.
@@ -1414,7 +1419,7 @@ mod query_terminal_tests {
         assert!(failed.validate_emitted_rows(2).is_err());
     }
 
-    /// Query requests default to degraded freshness and reject empty/zero input.
+    /// Query requests default to strict freshness and reject empty/zero input.
     #[test]
     fn query_request_defaults_and_validation_are_closed() {
         let request: BifrostQueryRequest = serde_json::from_value(serde_json::json!({
@@ -1423,7 +1428,7 @@ mod query_terminal_tests {
             "deadline_ms": null
         }))
         .expect("request deserializes");
-        assert_eq!(request.freshness, FreshnessPolicy::AllowDegraded);
+        assert_eq!(request.freshness, FreshnessPolicy::Strict);
         request.validate().expect("defaulted request validates");
 
         let invalid = BifrostQueryRequest {
@@ -1433,6 +1438,26 @@ mod query_terminal_tests {
             deadline_ms: Some(0),
         };
         assert!(invalid.validate().is_err());
+    }
+
+    /// Explicit fused/degraded policy survives request serialization unchanged.
+    #[test]
+    fn query_request_explicit_opt_ins_are_serialized() {
+        let request = BifrostQueryRequest {
+            sql: "SELECT 1".into(),
+            visibility: VisibilityMode::Fused,
+            freshness: FreshnessPolicy::AllowDegraded,
+            deadline_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_value(request).expect("request serializes"),
+            serde_json::json!({
+                "sql": "SELECT 1",
+                "visibility": "fused",
+                "freshness": "allow_degraded",
+                "deadline_ms": null
+            })
+        );
     }
 
     /// Failed terminals still obey settled freshness and source consistency.

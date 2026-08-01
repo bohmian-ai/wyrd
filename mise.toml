@@ -1038,7 +1038,7 @@ run = "pnpm install --frozen-lockfile"
 description = "Build the public @wyrd/sdk napi addon (crates/bindings/wyrd-node) + emit index.d.ts into typescript/wyrd (slice 13a)"
 depends = ["ts:install"]
 dir = "typescript/wyrd"
-run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node/Cargo.toml --output-dir . --package-json-path package.json"
+run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
 
 [tasks."ts:build:testing"]
 description = "Build the private @wyrd/testing napi harness addon (crates/bindings/wyrd-node-testing) into typescript/testing; feeds the integration lane only (slice 13a)"
@@ -1051,6 +1051,11 @@ description = "Fail if the public @wyrd/sdk napi-generated index.d.ts is not com
 depends = ["ts:build"]
 dir = "typescript/wyrd"
 run = "git diff --exit-code -- index.d.ts || { echo 'napi .d.ts drift - run mise run ts:build and commit typescript/wyrd/index.d.ts'; exit 1; }"
+
+[tasks."ts:pack:check"]
+description = "Pack the compiled @wyrd/sdk and current-host napi addon, then import the installed package from a clean ESM project"
+depends = ["ts:build"]
+run = "node scripts/check_ts_package.mjs"
 
 [tasks."ts:typecheck"]
 description = "Typecheck @wyrd/sdk incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"

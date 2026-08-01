@@ -1,7 +1,7 @@
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
-import { WyrdClient } from "../../src/index.js";
+import { WyrdClient } from "@wyrd/sdk";
 
 describe("Oracle query journey", () => {
   it("uses the public SDK against an in-process Wyrd server", async () => {

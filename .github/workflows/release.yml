@@ -273,6 +273,99 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 
+  # ── TypeScript SDK + napi platform addons ────────────────────────────────
+
+  build-typescript:
+    name: typescript - ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: linux-x64-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: linux-arm64-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            package: darwin-x64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            package: darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: win32-x64-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - run: pnpm install --frozen-lockfile
+        working-directory: typescript
+
+      - name: Build napi addon for the exact release target
+        working-directory: typescript/wyrd
+        shell: bash
+        run: |
+          rm -f index.js wyrd.*.node
+          pnpm exec napi build --release --target ${{ matrix.target }} --manifest-path ../../crates/bindings/wyrd-node/Cargo.toml --output-dir . --package-json-path package.json
+          test -f index.js && mv index.js index.generated.cjs
+          cp index.d.ts index.d.cts
+          pnpm exec tsc -p tsconfig.build.json
+
+      - name: Stage and pack addon and root facade
+        shell: bash
+        run: |
+          mkdir -p dist/addon
+          cp typescript/wyrd-${{ matrix.package }}/package.json dist/addon/package.json
+          addon=$(find typescript/wyrd -maxdepth 1 -name 'wyrd.*.node' -print -quit)
+          test -n "$addon"
+          cp "$addon" "dist/addon/wyrd.${{ matrix.package }}.node"
+          npm pack --pack-destination "$PWD/dist" --json --prefix dist/addon
+          npm pack --pack-destination "$PWD/dist" --json --prefix typescript/wyrd
+          test -f "dist/wyrd-sdk-0.0.1.tgz"
+          test -f "dist/wyrd-sdk-${{ matrix.package }}-0.0.1.tgz"
+
+      - name: Install and smoke-test native package
+        shell: bash
+        run: |
+          smoke=$(mktemp -d)
+          trap 'rm -rf "$smoke"' EXIT
+          printf '{"type":"module","private":true}\n' > "$smoke/package.json"
+          root_tgz=$(realpath "dist/wyrd-sdk-0.0.1.tgz")
+          addon_tgz=$(realpath "dist/wyrd-sdk-${{ matrix.package }}-0.0.1.tgz")
+          # Omit the other platform optional dependencies; install the exact
+          # addon built on this runner explicitly below.
+          npm install --ignore-scripts --no-audit --no-fund --omit=optional \
+            --package-lock=false "$root_tgz" --prefix "$smoke"
+          npm install --ignore-scripts --no-audit --no-fund --package-lock=false \
+            "$addon_tgz" --prefix "$smoke"
+          (cd "$smoke" && node --input-type=module -e '
+            import { WyrdClient } from "@wyrd/sdk";
+            const client = new WyrdClient("http://127.0.0.1:1", "release-smoke-token");
+            if (!(client instanceof WyrdClient)) throw new Error("WyrdClient construction failed");
+          ')
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: typescript-${{ matrix.package }}
+          path: dist/*.tgz
+          retention-days: 1
+
   # ── Server binary + Docker ─────────────────────────────────────────────────
 
   build-ui:

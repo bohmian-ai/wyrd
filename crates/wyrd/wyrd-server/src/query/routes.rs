@@ -80,6 +80,7 @@ pub(crate) async fn sync_query(
 ///
 /// Frame encoding and late Oracle errors surface as body-stream IO failures;
 /// response construction failures return the stable internal problem response.
+#[cfg(test)]
 pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
     query_stream_response_with_fault(result, None)
 }

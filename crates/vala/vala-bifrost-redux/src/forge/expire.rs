@@ -8,6 +8,7 @@ use iceberg::transaction::{
     ApplyTransactionAction, CleanupTraversalLimits, ExpiredFileSet, Transaction,
     expired_files_between,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::ForgeTasks;
@@ -138,14 +139,20 @@ impl Forge {
     /// # Errors
     ///
     /// Returns lease, catalog, SQL, audit, or reconciliation failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops before the next effect. If it races the catalog
+    /// commit, the Prepared operation remains open and reconciliation is required.
     pub(super) async fn run_snapshot_expiry_for_table(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
+        stop: &CancellationToken,
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
-        self.run_snapshot_expiry_for_table_inner(lease, key, binding, now)
+        self.run_snapshot_expiry_for_table_inner(lease, key, binding, now, stop)
             .await
     }
 
@@ -180,7 +187,13 @@ impl Forge {
             lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
         })?;
         let mut outcome = self
-            .run_snapshot_expiry_for_table(&mut lease, &key, binding, self.core.clock.now()?)
+            .run_snapshot_expiry_for_table(
+                &mut lease,
+                &key,
+                binding,
+                self.core.clock.now()?,
+                &CancellationToken::new(),
+            )
             .await;
         if let Ok(value) = &mut outcome {
             self.finalize_expiry_terminals(
@@ -228,7 +241,13 @@ impl Forge {
             lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
         })?;
         let outcome = self
-            .run_snapshot_expiry_for_table(&mut lease, &key, binding, self.core.clock.now()?)
+            .run_snapshot_expiry_for_table(
+                &mut lease,
+                &key,
+                binding,
+                self.core.clock.now()?,
+                &CancellationToken::new(),
+            )
             .await?;
         let candidates = outcome.expired_files.data_files.len()
             + outcome.expired_files.delete_files.len()
@@ -282,20 +301,30 @@ impl Forge {
     /// Reconcile prepared snapshot-expiry audits, then expire eligible snapshots.
     ///
     /// Current and reference heads, plus their retained ancestry, are protected by
-    /// [`select_expirable_snapshots`]. Iceberg metadata is reloaded before the
-    /// commit so a stale prepared selection cannot delete a newly protected head.
+    /// [`select_expirable_snapshots`]. Recovery of an accepted Prepared operation
+    /// ends the pass so a successor never submits a second expiry effect from the
+    /// same metadata load. New selections reload metadata before commit.
     async fn run_snapshot_expiry_for_table_inner(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
+        stop: &CancellationToken,
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
-        let mut outcome = self.reconcile_expiry(lease, key, binding, now).await?;
+        require_running(stop)?;
+        let mut outcome = self
+            .reconcile_expiry(lease, key, binding, now, stop)
+            .await?;
+        if outcome.recovered > 0 {
+            return Ok(outcome);
+        }
         if outcome.destructive_maintenance == super::live_reconcile::DestructiveMaintenance::Blocked
         {
             return Ok(outcome);
         }
+        require_running(stop)?;
+        lease.require_fence(&self.core.operator_pool).await?;
         let table = self.load_table(&binding.table_ident()).await?;
         let retention_cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
         let cutoff_ms = self
@@ -313,9 +342,14 @@ impl Forge {
             return Ok(outcome);
         }
         let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
+        require_running(stop)?;
+        lease.require_fence(&self.core.operator_pool).await?;
         self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
             .await?;
-        outcome.expired_files = self.complete_expiry(lease, key, binding, &detail).await?;
+        require_running(stop)?;
+        outcome.expired_files = self
+            .complete_expiry(lease, key, binding, &detail, stop)
+            .await?;
         outcome.terminals.push(PendingExpiryTerminal {
             detail,
             recovered: false,
@@ -369,12 +403,14 @@ impl Forge {
                 detail: "active Forge watermark set exceeded its bounded query".to_owned(),
             });
         }
-        let (summaries, _) = snapshot_summaries(table)?;
+        let (summaries, ref_heads) = snapshot_summaries(table)?;
         validate_watermarks(
             &summaries,
-            table.metadata().current_snapshot_id().is_none(),
+            table.metadata().current_snapshot_id(),
+            &ref_heads,
             &watermarks,
             retention_cutoff_ms,
+            self.core.config.max_retained_snapshots_per_table,
         )
     }
 }
@@ -387,28 +423,88 @@ impl Forge {
 /// # Errors
 ///
 /// Returns snapshot-expiry failure when a watermark is absent from retained
-/// ancestry or its persisted timestamp does not match Iceberg metadata.
+/// ancestry, the ancestry graph is malformed or over its bound, or its
+/// persisted timestamp does not match Iceberg metadata.
 fn validate_watermarks(
     snapshots: &[SnapshotSummary],
-    table_is_empty: bool,
+    current_snapshot_id: Option<i64>,
+    ref_heads: &[i64],
     watermarks: &[SnapshotWatermark],
     retention_cutoff_ms: i64,
+    traversal_limit: usize,
 ) -> Result<i64, ForgeError> {
+    let by_id = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.id, *snapshot))
+        .collect::<HashMap<_, _>>();
+    let mut heads = ref_heads.iter().copied().collect::<HashSet<_>>();
+    if let Some(current) = current_snapshot_id {
+        heads.insert(current);
+    }
+    let table_is_empty = snapshots.is_empty() && heads.is_empty();
+    if table_is_empty {
+        return watermarks
+            .iter()
+            .try_fold(retention_cutoff_ms, |cutoff, watermark| {
+                if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 {
+                    Ok(cutoff.min(0))
+                } else {
+                    Err(ForgeError::SnapshotExpiry {
+                        detail: "non-sentinel watermark protects an empty Iceberg table".to_owned(),
+                    })
+                }
+            });
+    }
+    if watermarks
+        .iter()
+        .any(|watermark| watermark.snapshot_id == 0 || watermark.timestamp_ms == 0)
+    {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "sentinel watermark is invalid for a non-empty Iceberg table".to_owned(),
+        });
+    }
+    let mut reachable = HashSet::new();
+    for head in heads {
+        let mut path = HashSet::new();
+        let mut cursor = Some(head);
+        while let Some(id) = cursor {
+            if !path.insert(id) {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: format!("Iceberg snapshot ancestry contains a cycle at {id}"),
+                });
+            }
+            if reachable.len() >= traversal_limit && !reachable.contains(&id) {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: "Iceberg snapshot ancestry exceeded its traversal bound".to_owned(),
+                });
+            }
+            reachable.insert(id);
+            let snapshot = by_id.get(&id).ok_or_else(|| ForgeError::SnapshotExpiry {
+                detail: format!("Iceberg snapshot ancestry is missing snapshot {id}"),
+            })?;
+            cursor = snapshot.parent_id;
+        }
+    }
     watermarks
         .iter()
         .try_fold(retention_cutoff_ms, |cutoff, watermark| {
-            if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 && table_is_empty {
-                return Ok(cutoff.min(0));
-            }
-            let snapshot = snapshots
-                .iter()
-                .find(|snapshot| snapshot.id == watermark.snapshot_id)
-                .ok_or_else(|| ForgeError::SnapshotExpiry {
+            let snapshot =
+                by_id
+                    .get(&watermark.snapshot_id)
+                    .ok_or_else(|| ForgeError::SnapshotExpiry {
+                        detail: format!(
+                            "active Forge watermark snapshot {} is not retained",
+                            watermark.snapshot_id
+                        ),
+                    })?;
+            if !reachable.contains(&watermark.snapshot_id) {
+                return Err(ForgeError::SnapshotExpiry {
                     detail: format!(
-                        "active Forge watermark snapshot {} is not retained",
+                        "active Forge watermark snapshot {} is detached from approved heads",
                         watermark.snapshot_id
                     ),
-                })?;
+                });
+            }
             if snapshot.timestamp_ms != watermark.timestamp_ms {
                 return Err(ForgeError::SnapshotExpiry {
                     detail: format!(
@@ -419,6 +515,19 @@ fn validate_watermarks(
             }
             Ok(cutoff.min(watermark.timestamp_ms))
         })
+}
+
+/// Rejects entry into a new expiry effect after operation authority is cancelled.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Shutdown`] when the shared claim/lease/shutdown token is cancelled.
+fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
+    if stop.is_cancelled() {
+        Err(ForgeError::Shutdown)
+    } else {
+        Ok(())
+    }
 }
 
 /// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.
@@ -434,7 +543,12 @@ fn expiry_cutoff_ms(now: DateTime<Utc>, retention: Duration) -> Result<i64, Forg
         })
 }
 
-/// Extract snapshot timestamps, parent links, and metadata reference heads.
+/// Extract snapshot timestamps, parent links, and every metadata reference head.
+///
+/// # Errors
+///
+/// Returns snapshot-expiry failure when metadata serialization fails or any
+/// named reference does not carry a resolvable snapshot head.
 fn snapshot_summaries(
     table: &iceberg::table::Table,
 ) -> Result<(Vec<SnapshotSummary>, Vec<i64>), ForgeError> {
@@ -456,14 +570,19 @@ fn snapshot_summaries(
         .and_then(serde_json::Value::as_object)
         .map(|refs| {
             refs.values()
-                .filter_map(|value| {
+                .map(|value| {
                     value
                         .get("snapshot-id")
                         .or_else(|| value.get("snapshot_id"))
                         .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| ForgeError::SnapshotExpiry {
+                            detail: "Iceberg metadata reference has no resolvable snapshot head"
+                                .to_owned(),
+                        })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, ForgeError>>()
         })
+        .transpose()?
         .unwrap_or_default();
     Ok((summaries, ref_heads))
 }
@@ -499,16 +618,26 @@ fn expiry_detail(
 }
 
 /// Commit an expiry selection after rechecking metadata and the lease fence.
-///
-/// `recovered` selects the terminal audit phase used when completing a
-/// prepared operation left by an earlier Forge process.
 impl Forge {
+    /// Submits the canonical expiry transaction while preserving uncertain acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, lease, catalog, traversal, or reconciliation failures.
+    /// Timeout or cancellation after submission returns reconciliation-required
+    /// and deliberately leaves the caller's Prepared operation open.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation is raced against the in-flight catalog commit. The future's
+    /// cancellation is never treated as proof that the remote commit was rejected.
     async fn complete_expiry(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         detail: &AuditDetail,
+        stop: &CancellationToken,
     ) -> Result<ExpiredFileSet, ForgeError> {
         let AuditDetail::ForgeSnapshotExpire {
             operation_id: _,
@@ -567,15 +696,38 @@ impl Forge {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        let committed = tokio::time::timeout(
-            self.core.config.iceberg_total_retry_timeout,
-            transaction.commit(self.core.catalog.as_ref()),
-        )
-        .await
-        .map_err(|_| ForgeError::Timeout {
-            operation: "Iceberg snapshot expiry commit",
-        })?
-        .map_err(ForgeError::Catalog)?;
+        require_running(stop)?;
+        let commit = transaction.commit(self.core.catalog.as_ref());
+        tokio::pin!(commit);
+        let committed = tokio::select! {
+            response = tokio::time::timeout(
+                self.core.config.iceberg_total_retry_timeout,
+                &mut commit,
+            ) => match response {
+                Ok(Ok(table)) => table,
+                Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
+                Err(_) => return Err(ForgeError::Reconciliation {
+                    detail: "Iceberg snapshot expiry commit timed out with unknown acceptance"
+                        .to_owned(),
+                }),
+            },
+            () = stop.cancelled() => return Err(ForgeError::Reconciliation {
+                detail: "Iceberg snapshot expiry commit was cancelled with unknown acceptance"
+                    .to_owned(),
+            }),
+        };
+        #[cfg(feature = "test-support")]
+        if self
+            .core
+            .maintenance_controls
+            .pause_expiry_accepted(stop)
+            .await
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "Iceberg snapshot expiry commit was accepted before cancellation"
+                    .to_owned(),
+            });
+        }
         let expired_files = derive_expired_files(
             &table,
             &committed,
@@ -716,6 +868,7 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
+        stop: &CancellationToken,
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
         let resource = table_resource_for_key(key);
         let mut conn = self
@@ -748,6 +901,8 @@ impl Forge {
                 record_malformed_expiry(&mut outcome);
                 continue;
             };
+            require_running(stop)?;
+            lease.require_fence(&self.core.operator_pool).await?;
             let table = self.load_table(&binding.table_ident()).await?;
             let all_absent = selected_snapshot_ids
                 .iter()
@@ -785,7 +940,9 @@ impl Forge {
                 outcome.unresolved = outcome.unresolved.saturating_add(1);
                 continue;
             }
-            let expired = self.complete_expiry(lease, key, binding, &detail).await?;
+            let expired = self
+                .complete_expiry(lease, key, binding, &detail, stop)
+                .await?;
             merge_expired_files(&mut outcome.expired_files, expired);
             outcome.terminals.push(PendingExpiryTerminal {
                 detail,
@@ -1067,7 +1224,7 @@ mod tests {
             snapshot_id: 900,
             timestamp_ms: 10,
         }];
-        let cutoff = validate_watermarks(&snapshots, false, &watermarks, 100)
+        let cutoff = validate_watermarks(&snapshots, Some(2), &[], &watermarks, 100, 2)
             .expect("valid non-monotonic watermark");
         assert_eq!(cutoff, 10);
     }
@@ -1082,17 +1239,20 @@ mod tests {
         }];
         let error = validate_watermarks(
             &snapshots,
-            false,
+            Some(7),
+            &[],
             &[SnapshotWatermark {
                 snapshot_id: 7,
                 timestamp_ms: 19,
             }],
             100,
+            1,
         )
         .expect_err("mismatched watermark must fail");
         assert!(error.to_string().contains("does not match"));
     }
 
+    /// Stable expiry identities bind an exact ordered selection and cutoff.
     #[test]
     fn maintenance_operation_id_is_stable_for_sorted_targets() {
         let key = ForgeTableKey {
@@ -1102,5 +1262,126 @@ mod tests {
         let left = expiry_operation_id(&key, 10, &[3, 8]);
         let right = expiry_operation_id(&key, 10, &[3, 8]);
         assert_eq!(left, right);
+    }
+
+    /// A timestamp-correct sibling cannot authorize expiry from another branch.
+    #[test]
+    fn detached_sibling_watermark_fails_closed() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 1,
+                parent_id: None,
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(1),
+                timestamp_ms: 20,
+            },
+            SnapshotSummary {
+                id: 3,
+                parent_id: Some(1),
+                timestamp_ms: 30,
+            },
+        ];
+        let error = validate_watermarks(
+            &snapshots,
+            Some(2),
+            &[],
+            &[SnapshotWatermark {
+                snapshot_id: 3,
+                timestamp_ms: 30,
+            }],
+            100,
+            3,
+        )
+        .expect_err("detached sibling must fail");
+        assert!(error.to_string().contains("detached"));
+    }
+
+    /// An approved head with a missing parent fails before any watermark can authorize expiry.
+    #[test]
+    fn missing_parent_fails_closed() {
+        let snapshots = vec![SnapshotSummary {
+            id: 2,
+            parent_id: Some(1),
+            timestamp_ms: 20,
+        }];
+        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 100, 2)
+            .expect_err("missing parent must fail");
+        assert!(error.to_string().contains("missing snapshot 1"));
+    }
+
+    /// Cyclic ancestry is rejected even when the watermark timestamp is exact.
+    #[test]
+    fn cycle_fails_closed() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 1,
+                parent_id: Some(2),
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(1),
+                timestamp_ms: 20,
+            },
+        ];
+        let error = validate_watermarks(
+            &snapshots,
+            Some(2),
+            &[],
+            &[SnapshotWatermark {
+                snapshot_id: 1,
+                timestamp_ms: 10,
+            }],
+            100,
+            2,
+        )
+        .expect_err("cycle must fail");
+        assert!(error.to_string().contains("cycle"));
+    }
+
+    /// Sentinel watermarks are reserved for tables without snapshots or references.
+    #[test]
+    fn sentinel_on_non_empty_table_fails_closed() {
+        let snapshots = vec![SnapshotSummary {
+            id: 1,
+            parent_id: None,
+            timestamp_ms: 10,
+        }];
+        let error = validate_watermarks(
+            &snapshots,
+            Some(1),
+            &[],
+            &[SnapshotWatermark {
+                snapshot_id: 0,
+                timestamp_ms: 0,
+            }],
+            100,
+            1,
+        )
+        .expect_err("sentinel must fail for a non-empty table");
+        assert!(error.to_string().contains("sentinel"));
+    }
+
+    /// Traversal stops at the configured retained-history ceiling.
+    #[test]
+    fn ancestry_traversal_overflow_fails_closed() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 1,
+                parent_id: None,
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(1),
+                timestamp_ms: 20,
+            },
+        ];
+        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 100, 1)
+            .expect_err("ancestry beyond the bound must fail");
+        assert!(error.to_string().contains("traversal bound"));
     }
 }

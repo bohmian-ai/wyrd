@@ -56,6 +56,8 @@ pub use live_reconcile::LiveReconciliationTestOutcome;
 #[cfg(feature = "test-support")]
 pub use live_replace::IcebergRewriteDisposition;
 #[cfg(feature = "test-support")]
+pub use maintenance::MaintenanceTestControls;
+#[cfg(feature = "test-support")]
 pub use orphan_gc::current_gc_gate_for_test;
 #[cfg(feature = "test-support")]
 pub use right_size::{IcebergCandidateFile, IcebergRewriteGroup, IcebergTablePlan};
@@ -128,6 +130,9 @@ pub(crate) struct ForgeCore {
     scheduler_trigger: Option<ForgeSchedulerTrigger>,
     /// Fixed-cardinality operational metric handles registered at construction.
     telemetry: Arc<ForgeTelemetry>,
+    /// Deterministic maintenance boundaries used only by integration tests.
+    #[cfg(feature = "test-support")]
+    maintenance_controls: maintenance::MaintenanceTestControls,
 }
 
 impl Forge {
@@ -170,6 +175,8 @@ impl Forge {
             completion_observer: build.completion_observer,
             scheduler_trigger: build.scheduler_trigger,
             telemetry: build.telemetry,
+            #[cfg(feature = "test-support")]
+            maintenance_controls: maintenance::MaintenanceTestControls::default(),
         };
         debug_assert!(core.rewrite.uses_staging(&core.staging));
         Ok(Self {
@@ -184,6 +191,13 @@ impl Forge {
     #[must_use]
     pub fn clock_for_test(&self) -> ForgeClock {
         self.core.clock.clone()
+    }
+
+    /// Returns deterministic controls for manifest and expiry commit boundaries.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn maintenance_controls_for_test(&self) -> MaintenanceTestControls {
+        self.core.maintenance_controls.clone()
     }
 }
 

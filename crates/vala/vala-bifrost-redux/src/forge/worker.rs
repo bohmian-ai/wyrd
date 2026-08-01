@@ -1678,6 +1678,12 @@ impl ForgeWorker {
     ///
     /// Returns path binding, evidence, SQL, audit, fencing, object-store, or
     /// cancellation failures while retaining the last durable cleanup cursor.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops before the next durable or object-store effect.
+    /// A delete racing cancellation may already be accepted; its idempotent
+    /// candidate remains behind the durable cursor for successor replay.
     async fn complete_maintenance_inner(
         &self,
         claim: &ForgeTaskClaim,
@@ -1687,12 +1693,16 @@ impl ForgeWorker {
         result: ForgeMaintenanceResult,
         stop: &CancellationToken,
     ) -> Result<ForgeTaskEvidence, ForgeError> {
+        require_running(stop)?;
+        lease.require_fence(&self.forge.core.operator_pool).await?;
         let candidates =
             cleanup_candidates(&result, binding, &self.forge.core.staging, &claim.table_ref)?;
         let mut evidence = self.committed_evidence(binding, &result.table).await?;
         evidence.cleanup_candidates = candidates;
         evidence.validate(false).map_err(ForgeError::Sql)?;
 
+        require_running(stop)?;
+        lease.require_fence(&self.forge.core.operator_pool).await?;
         let mut prepared = self
             .forge
             .core
@@ -1726,6 +1736,8 @@ impl ForgeWorker {
                 detail: "injected crash after maintenance task evidence commit".to_owned(),
             });
         }
+        require_running(stop)?;
+        lease.require_fence(&self.forge.core.operator_pool).await?;
         self.forge
             .finalize_expiry_terminals(lease, claim.data_tenant_id, result.expiry_terminals)
             .await?;
@@ -1740,7 +1752,13 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Reconciliation {
                     detail: "expired cleanup candidate escaped table binding".to_owned(),
                 })?;
-            match self.forge.core.object_store.delete(&path).await {
+            let deletion = self.forge.core.object_store.delete(&path);
+            tokio::pin!(deletion);
+            let deletion = tokio::select! {
+                result = &mut deletion => result,
+                () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            };
+            match deletion {
                 Ok(()) => {}
                 Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
@@ -1753,6 +1771,8 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "expired cleanup cursor overflowed".to_owned(),
                 })?;
+            require_running(stop)?;
+            lease.require_fence(&self.forge.core.operator_pool).await?;
             let mut cursor = self
                 .forge
                 .core
@@ -1800,6 +1820,11 @@ impl ForgeWorker {
     /// Returns malformed cursor, binding, fencing, object-store, SQL, or
     /// cancellation failures. Each successful object result and cursor update
     /// is idempotent, so another owner resumes at the first uncommitted index.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops before the next delete or cursor transition. A
+    /// remotely accepted delete without a cursor advance is replayed safely.
     async fn resume_expired_cleanup(
         &self,
         cleanup: CleanupAttempt<'_>,
@@ -1823,7 +1848,13 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Reconciliation {
                     detail: "Prepared cleanup candidate escaped table binding".to_owned(),
                 })?;
-            match self.forge.core.object_store.delete(&path).await {
+            let deletion = self.forge.core.object_store.delete(&path);
+            tokio::pin!(deletion);
+            let deletion = tokio::select! {
+                result = &mut deletion => result,
+                () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            };
+            match deletion {
                 Ok(()) => {}
                 Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
@@ -1836,6 +1867,8 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "Prepared cleanup cursor overflowed".to_owned(),
                 })?;
+            require_running(stop)?;
+            lease.require_fence(&self.forge.core.operator_pool).await?;
             let mut conn = self
                 .forge
                 .core
@@ -2370,6 +2403,19 @@ impl ForgeWorker {
             max_spill_bytes: self.capacity.max_spill_bytes,
             max_large_task_bytes: self.capacity.max_large_task_bytes,
         })
+    }
+}
+
+/// Rejects a new worker maintenance effect after shared authority is cancelled.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Shutdown`] after claim loss, table-lease loss, or process shutdown.
+fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
+    if stop.is_cancelled() {
+        Err(ForgeError::Shutdown)
+    } else {
+        Ok(())
     }
 }
 

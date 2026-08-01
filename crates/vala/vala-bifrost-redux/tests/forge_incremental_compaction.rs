@@ -1,8 +1,10 @@
 //! Integration proof for bounded Forge rewrites and Iceberg metadata.
 
 mod pg_tests {
+    use std::collections::HashMap;
+    use std::str::FromStr;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
@@ -12,12 +14,12 @@ mod pg_tests {
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::memory_pool::GreedyMemoryPool;
-    use iceberg::Catalog;
     use iceberg::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, NullOrder,
-        PrimitiveType, SortDirection, StatisticsFile, Struct, Transform, Type,
+        PrimitiveType, SortDirection, StatisticsFile, Struct, TableMetadata, Transform, Type,
     };
     use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
+    use iceberg::{Catalog, MetadataLocation};
     use opendal::services::Fs;
     use opendal::{Buffer, Operator};
     use parquet::arrow::ArrowWriter;
@@ -83,6 +85,8 @@ mod pg_tests {
         output_put_released: AtomicBool,
         /// Counts successful rewrite output notifications.
         output_put_calls: AtomicUsize,
+        /// Per-path cleanup delete attempts observed through the production store seam.
+        delete_attempts: Mutex<HashMap<String, usize>>,
     }
 
     impl InstrumentedStore {
@@ -125,6 +129,25 @@ mod pg_tests {
         /// Returns the number of successful rewrite output boundaries observed.
         fn output_put_calls(&self) -> usize {
             self.output_put_calls.load(Ordering::Acquire)
+        }
+
+        /// Returns the exact number of delete attempts observed for one object path.
+        fn delete_attempts_for(&self, path: &str) -> usize {
+            self.delete_attempts
+                .lock()
+                .expect("delete-attempt ledger lock")
+                .get(path)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        /// Returns the total cleanup delete attempts observed across all paths.
+        fn total_delete_attempts(&self) -> usize {
+            self.delete_attempts
+                .lock()
+                .expect("delete-attempt ledger lock")
+                .values()
+                .sum()
         }
     }
 
@@ -199,6 +222,13 @@ mod pg_tests {
 
         /// Delete one rewrite-owned object.
         async fn delete(&self, path: &str) -> opendal::Result<()> {
+            {
+                let mut attempts = self
+                    .delete_attempts
+                    .lock()
+                    .expect("delete-attempt ledger lock");
+                *attempts.entry(path.to_owned()).or_default() += 1;
+            }
             self.operator.delete(path).await
         }
     }
@@ -373,6 +403,7 @@ mod pg_tests {
                 output_put_release: tokio::sync::Notify::new(),
                 output_put_released: AtomicBool::new(false),
                 output_put_calls: AtomicUsize::new(0),
+                delete_attempts: Mutex::new(HashMap::new()),
             });
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
             let runtime = ForgeRewriteRuntime::new(
@@ -447,6 +478,75 @@ mod pg_tests {
                 .expect("fixture worker task")
             {}
             outcome
+        }
+
+        /// Persists a metadata version whose prior snapshot is detached from every ref.
+        ///
+        /// This fixture-only mutation removes the current snapshot's parent link,
+        /// writes the resulting valid Iceberg metadata file, and atomically advances
+        /// the SQL catalog pointer. The returned snapshot ID remains present in the
+        /// persisted snapshot map but is unreachable from every named reference.
+        async fn persist_detached_prior_snapshot(&self) -> (i64, i64) {
+            let table = self
+                .catalog
+                .load_table(&self.binding.table_ident())
+                .await
+                .expect("table with snapshot history");
+            let current = table
+                .metadata()
+                .current_snapshot()
+                .expect("current snapshot");
+            let detached_id = current.parent_snapshot_id().expect("prior snapshot");
+            let detached_timestamp = table
+                .metadata()
+                .snapshot_by_id(detached_id)
+                .expect("retained prior snapshot")
+                .timestamp_ms();
+            let current_id = current.snapshot_id();
+            let mut metadata_json =
+                serde_json::to_value(table.metadata()).expect("serialize fixture Iceberg metadata");
+            let snapshots = metadata_json["snapshots"]
+                .as_array_mut()
+                .expect("snapshot array");
+            let current_json = snapshots
+                .iter_mut()
+                .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(current_id))
+                .expect("serialized current snapshot");
+            current_json
+                .as_object_mut()
+                .expect("snapshot object")
+                .remove("parent-snapshot-id");
+            let detached_metadata: TableMetadata =
+                serde_json::from_value(metadata_json).expect("valid detached Iceberg metadata");
+            let old_location = table
+                .metadata_location()
+                .expect("current metadata location");
+            let new_location = MetadataLocation::from_str(old_location)
+                .expect("parsed metadata location")
+                .with_next_version();
+            detached_metadata
+                .write_to(table.file_io(), &new_location)
+                .await
+                .expect("persist detached metadata");
+            let catalog_pool = sqlx::PgPool::connect(self.pg.catalog_dsn().expose_secret())
+                .await
+                .expect("catalog test connection");
+            let ident = self.binding.table_ident();
+            let updated = sqlx::query(
+                "UPDATE iceberg_tables SET metadata_location=$1,previous_metadata_location=$2 \
+                 WHERE catalog_name='wyrd-redux' AND table_namespace=$3 AND table_name=$4 \
+                   AND metadata_location=$2",
+            )
+            .bind(new_location.to_string())
+            .bind(old_location)
+            .bind(ident.namespace().join("."))
+            .bind(ident.name())
+            .execute(&catalog_pool)
+            .await
+            .expect("advance fixture catalog metadata")
+            .rows_affected();
+            assert_eq!(updated, 1, "fixture metadata pointer must advance once");
+            (detached_id, detached_timestamp)
         }
 
         /// Plans one exact task and returns its production SQL claim envelope.
@@ -1618,6 +1718,337 @@ mod pg_tests {
         fixture
             .set_live_target_file_size(&table, target.max(2))
             .await;
+    }
+
+    /// Builds two committed snapshots and claims the resulting periodic maintenance task.
+    async fn prepare_maintenance_claim(fixture: &Fixture) -> ForgeTaskClaim {
+        fixture.schedule_and_execute().await;
+        fixture.seed_files_at(100, 4, true).await;
+        fixture.schedule_and_execute().await;
+        make_current_files_right_sized(fixture).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        )
+        .expect("maintenance identity");
+        ForgeTasks::new(fixture.operator_pool.clone())
+            .upsert_periodic(fixture.tenant, &identity)
+            .await
+            .expect("periodic maintenance demand");
+        fixture.plan_and_claim().await
+    }
+
+    /// Authority loss injected at a maintenance catalog boundary.
+    #[derive(Clone, Copy)]
+    enum MaintenanceAuthorityLoss {
+        /// Expire the durable task claim and let its heartbeat cancel work.
+        Claim,
+        /// Replace the table lease generation and let its heartbeat cancel work.
+        TableLease,
+        /// Cancel the worker shutdown token directly.
+        Shutdown,
+    }
+
+    /// Exercises one deterministic maintenance boundary under every cancellation source.
+    async fn assert_maintenance_boundary_loss(expiry_submission: bool) {
+        for loss in [
+            MaintenanceAuthorityLoss::Claim,
+            MaintenanceAuthorityLoss::TableLease,
+            MaintenanceAuthorityLoss::Shutdown,
+        ] {
+            let fixture = Fixture::new_with_config(
+                ForgeConfig {
+                    snapshot_retention: Duration::from_nanos(1),
+                    orphan_gc_ttl: Duration::from_nanos(1),
+                    ..ForgeConfig::default()
+                },
+                true,
+                4,
+                16 * 1024 * 1024,
+            )
+            .await;
+            let claim = prepare_maintenance_claim(&fixture).await;
+            let task_id = claim.task_id;
+            let table_before = fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("pre-cancellation maintenance table");
+            let metadata_before = table_before
+                .metadata_location()
+                .expect("pre-cancellation metadata location")
+                .to_owned();
+            let snapshot_before = table_before.metadata().current_snapshot_id();
+            let output_puts_before = fixture.reads.output_put_calls();
+            let deletes_before = fixture.reads.total_delete_attempts();
+            let controls = fixture.forge.maintenance_controls_for_test();
+            if expiry_submission {
+                controls.arm_expiry_submission();
+            } else {
+                controls.arm_manifest_submission();
+            }
+            let stop = CancellationToken::new();
+            let execution = tokio::spawn({
+                let worker = fixture.worker.clone();
+                let stop = stop.clone();
+                async move { worker.execute_claim(claim, &stop).await }
+            });
+            let arrival = async {
+                if expiry_submission {
+                    controls.wait_expiry_submission().await;
+                } else {
+                    controls.wait_manifest_submission().await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(30), arrival)
+                .await
+                .expect("maintenance catalog boundary");
+            match loss {
+                MaintenanceAuthorityLoss::Claim => {
+                    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+                        .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("expire maintenance claim");
+                }
+                MaintenanceAuthorityLoss::TableLease => {
+                    sqlx::query("UPDATE vala.maintenance_leases SET owner=$2,fencing_token=fencing_token+1 WHERE lease_key=$1")
+                        .bind(forge_lease_key(fixture.tenant, &fixture.binding.logical_namespace, &fixture.binding.table_name))
+                        .bind(uuid::Uuid::now_v7()).execute(fixture.operator_pool.pool()).await.expect("steal maintenance lease");
+                }
+                MaintenanceAuthorityLoss::Shutdown => stop.cancel(),
+            }
+            let result = tokio::time::timeout(Duration::from_secs(30), execution)
+                .await
+                .expect("maintenance cancellation bound")
+                .expect("maintenance worker join");
+            assert!(result.is_err(), "authority loss must stop maintenance");
+            let (states, audits) =
+                family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.")
+                    .await;
+            assert_eq!(states, 0);
+            assert_eq!(audits, 0);
+            let evidence: Option<serde_json::Value> =
+                sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
+                    .bind(task_id)
+                    .fetch_one(fixture.operator_pool.pool())
+                    .await
+                    .expect("cancelled maintenance evidence");
+            assert!(
+                evidence
+                    .as_ref()
+                    .and_then(|value| value.get("cleanup_candidates"))
+                    .is_none()
+            );
+            let table_after = fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("post-cancellation maintenance table");
+            assert_eq!(
+                table_after.metadata_location(),
+                Some(metadata_before.as_str()),
+                "catalog metadata changed across the cancellation boundary"
+            );
+            assert_eq!(
+                table_after.metadata().current_snapshot_id(),
+                snapshot_before,
+                "current snapshot changed across the cancellation boundary"
+            );
+            assert_eq!(fixture.reads.output_put_calls(), output_puts_before);
+            assert_eq!(fixture.reads.total_delete_attempts(), deletes_before);
+        }
+    }
+
+    /// Manifest submission stops before expiry under claim, lease, and shutdown loss.
+    #[tokio::test]
+    async fn maintenance_manifest_submission_cancellation_matrix_is_effect_ordered() {
+        assert_maintenance_boundary_loss(false).await;
+    }
+
+    /// Expiry submission preserves only its Prepared evidence under every cancellation source.
+    #[tokio::test]
+    async fn maintenance_expiry_submission_cancellation_matrix_is_effect_ordered() {
+        assert_maintenance_boundary_loss(true).await;
+    }
+
+    /// An accepted expiry cancelled before response processing is recovered exactly once.
+    #[tokio::test]
+    async fn maintenance_accepted_then_cancel_recovers_without_duplicate_catalog_effect() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let claim = prepare_maintenance_claim(&fixture).await;
+        let task_id = claim.task_id;
+        let controls = fixture.forge.maintenance_controls_for_test();
+        controls.arm_expiry_accepted();
+        let stop = CancellationToken::new();
+        let execution = tokio::spawn({
+            let worker = fixture.worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_claim(claim, &stop).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), controls.wait_expiry_accepted())
+            .await
+            .expect("accepted expiry response");
+        let accepted_location = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("accepted expiry table")
+            .metadata_location()
+            .expect("accepted metadata location")
+            .to_owned();
+        stop.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(30), execution)
+            .await
+            .expect("accepted cancellation bound")
+            .expect("accepted cancellation join");
+        assert!(matches!(result, Err(ForgeError::Reconciliation { .. })));
+        let (states, audits) =
+            family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.").await;
+        assert_eq!((states, audits), (1, 1));
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+            .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("expire accepted task claim");
+        let successor = ForgeWorker::new(Arc::clone(&fixture.forge), ForgeWorkerConfig::default())
+            .expect("successor worker");
+        assert!(
+            successor
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("accepted expiry recovery")
+        );
+        let recovered_location = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("recovered expiry table")
+            .metadata_location()
+            .expect("recovered metadata location")
+            .to_owned();
+        assert_eq!(recovered_location, accepted_location);
+        assert_eq!(
+            family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.",).await,
+            (1, 2)
+        );
+        assert_completed_cleanup_evidence(&fixture).await;
+        let evidence: serde_json::Value =
+            sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("accepted expiry cleanup evidence");
+        let candidates = evidence["cleanup_candidates"]
+            .as_array()
+            .expect("accepted cleanup candidates");
+        assert!(!candidates.is_empty());
+        for candidate in candidates {
+            let path = candidate["path"].as_str().expect("cleanup candidate path");
+            assert_eq!(
+                fixture.reads.delete_attempts_for(path),
+                1,
+                "cleanup candidate must be attempted exactly once: {path}"
+            );
+        }
+        assert_eq!(
+            fixture.reads.total_delete_attempts(),
+            candidates.len(),
+            "successor must not attempt deletes outside exact cleanup evidence"
+        );
+    }
+
+    /// A persisted active watermark detached from every Iceberg ref fails before effects.
+    #[tokio::test]
+    async fn persisted_detached_watermark_rejects_expiry_before_prepared_or_cleanup() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        fixture.schedule_and_execute().await;
+        fixture.seed_files_at(100, 4, true).await;
+        fixture.schedule_and_execute().await;
+        let (detached_id, detached_timestamp) = fixture.persist_detached_prior_snapshot().await;
+        let detached_table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("persisted detached table");
+        let metadata_before = detached_table
+            .metadata_location()
+            .expect("detached metadata location")
+            .to_owned();
+        let current_before = detached_table.metadata().current_snapshot_id();
+        let task_id = ForgeTasks::new(fixture.operator_pool.clone())
+            .enqueue(&NewForgeTask {
+                base_snapshot_id: detached_id,
+                ..fixture.durable_task(
+                    ForgeTaskStrategy::StagingFold,
+                    ForgeTaskPlan {
+                        version: FORGE_TASK_PAYLOAD_VERSION,
+                        inputs: vec!["detached-watermark.parquet".to_owned()],
+                        parameters: serde_json::json!({"kind":"staging_fold"}),
+                    },
+                    221,
+                )
+            })
+            .await
+            .expect("detached watermark task");
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("detached watermark claim query")
+            .expect("detached watermark claim");
+        assert_eq!(claim.task_id, task_id);
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET state='running',watermark_snapshot_id=$2,watermark_timestamp_ms=$3 WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .bind(detached_id)
+        .bind(detached_timestamp)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("activate detached persisted watermark");
+        let result = fixture
+            .forge
+            .run_snapshot_expiry_for_test(&fixture.binding)
+            .await;
+        assert!(
+            matches!(result, Err(ForgeError::SnapshotExpiry { ref detail }) if detail.contains("detached")),
+            "{result:?}"
+        );
+        assert_eq!(
+            family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.",).await,
+            (0, 0)
+        );
+        let after = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("unchanged detached table");
+        assert_eq!(after.metadata_location(), Some(metadata_before.as_str()));
+        assert_eq!(after.metadata().current_snapshot_id(), current_before);
+        let evidence: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("detached watermark cleanup evidence");
+        assert!(evidence.is_none());
     }
 
     /// Checks completed cleanup evidence against object storage and live metadata.

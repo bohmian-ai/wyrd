@@ -23,5 +23,5 @@ pub use helpers::{
 pub use python::python_register;
 pub use registry::{ToolRegistry, default_registry};
 pub use resolver::ToolResolver;
-pub use toolerror::{ToolError, ToolResult};
+pub use toolerror::{StructuredInvocationError, ToolError, ToolResult};
 pub use trait_::AgentTool;

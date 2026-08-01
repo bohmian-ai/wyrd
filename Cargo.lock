@@ -10799,6 +10799,7 @@ dependencies = [
  "wyrd-semver",
  "wyrd-spec",
  "wyrd-sql",
+ "wyrd-testing",
 ]
 
 [[package]]

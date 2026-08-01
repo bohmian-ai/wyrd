@@ -8,11 +8,11 @@ order: 22
 
 # OpenAPI
 
-The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd API` and its version is `0.0.1`.
+The repository OpenAPI document is `openapi.yaml`. Its current title is `wyrd-server` and its version is `0.0.1`.
 
 ## Routes
 
-No HTTP routes are published in the current OpenAPI document.
+- `/v1/query`
 
 ## Refresh
 

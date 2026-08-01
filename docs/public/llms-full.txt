@@ -60,7 +60,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 - [Data plane internals](https://mitari-ai.github.io/wyrd/bifrost/data-plane-internals/): Scribe WAL format, seal state machine, vala.file_list schema, Forge maintenance, and audit data.
 - [Forge system overview](https://mitari-ai.github.io/wyrd/bifrost/forge/): How Forge maintains Bifrost data and connects Gate, Scribe, Oracle, Iceberg, Postgres, and object storage.
 - [Quickstart](https://mitari-ai.github.io/wyrd/bifrost/quickstart/): Emit an observation via vala-sdk and query it back through a typed ValaQueryService method.
-- [Reading Data](https://mitari-ai.github.io/wyrd/bifrost/reading-data/): ValaQueryService typed methods, signed page tokens, payload-read permissions, the governed generic SQL surface, and Arrow conversion.
+- [Reading Data](https://mitari-ai.github.io/wyrd/bifrost/reading-data/): Query Bifrost synchronously through the governed Oracle stream.
 - [Schema](https://mitari-ai.github.io/wyrd/bifrost/schema/): Pre-declared Bifrost domain tables, physical schemas, system columns, and type mapping.
 - [SLOs](https://mitari-ai.github.io/wyrd/bifrost/slos/): Bifrost performance targets and methodology, including Forge maintenance benchmarks.
 - [Writing Data](https://mitari-ai.github.io/wyrd/bifrost/writing-data/): vala-sdk producer, batching, backpressure, payload governance, and tenant stamping.

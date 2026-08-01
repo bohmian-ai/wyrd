@@ -417,6 +417,26 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
+    /// Count Bifrost read-decision audit rows for the fixture tenant.
+    ///
+    /// Agent-surface denial journeys use this test-only probe to prove Gate
+    /// rejection occurs before Oracle planning or durable read accounting.
+    ///
+    /// # Errors
+    /// Returns an error when the tenant transaction or audit query fails.
+    pub async fn bifrost_read_decision_count(&self) -> Result<i64, WyrdTestServerError> {
+        let mut conn = self.tenant_conn().await?;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision'",
+        )
+        .bind(self.data_tenant_id().as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(count)
+    }
+
     /// Trip the server-owned WAL breaker for a deterministic benchmark probe.
     pub fn trip_bifrost_wal_disk_full_for_test(&self) -> Result<(), WyrdTestServerError> {
         self.inner
@@ -1405,6 +1425,12 @@ impl WyrdTestServerBuilder {
         };
         let bifrost = test_catalog(&fixture, &storage).await?;
         let bifrost_redux = test_redux_catalog(&fixture, &storage).await?;
+        if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
+            && self.oracle_peer_credentials.is_none()
+        {
+            self.oracle_peer_credentials =
+                Some(provision_oracle_peer_credentials(Arc::clone(&fixture)).await?);
+        }
 
         self.start_with_resources(fixture, storage, bifrost, bifrost_redux, storage_root)
             .await

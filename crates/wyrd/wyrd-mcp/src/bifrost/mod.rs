@@ -22,7 +22,7 @@ use arrow::json::ArrayWriter;
 use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::{Value, json};
-use skald_tool::{AgentTool, ToolError, ToolRegistry};
+use skald_tool::{AgentTool, StructuredInvocationError, ToolError, ToolRegistry};
 use vala_sdk::{CollectedQueryLimits, QueryClient};
 use wyrd_client::WyrdClient;
 use wyrd_runtime::Permission;
@@ -263,10 +263,78 @@ impl AgentTool for BifrostQueryTool {
         json!({
             "type": "object",
             "required": ["schema", "rows", "terminal"],
+            "additionalProperties": false,
+            "x-wyrd-error": {
+                "type": "object",
+                "required": ["code", "status", "title", "detail", "remediation", "safe_details"],
+                "additionalProperties": false,
+                "properties": {
+                    "code": {"type": "string"},
+                    "status": {"type": "integer", "minimum": 100, "maximum": 599},
+                    "title": {"type": "string"},
+                    "detail": {"type": "string"},
+                    "remediation": {"type": "string"},
+                    "safe_details": {"type": ["object", "array", "string", "number", "boolean", "null"]}
+                }
+            },
             "properties": {
-                "schema": {"type": "object"},
-                "rows": {"type": "array", "items": {"type": "object"}},
-                "terminal": {"type": "object"}
+                "schema": {
+                    "type": "object",
+                    "required": ["fields"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "fields": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["name", "data_type", "nullable"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "data_type": {"type": "string"},
+                                    "nullable": {"type": "boolean"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "rows": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+                "terminal": {
+                    "type": "object",
+                    "required": ["outcome", "freshness", "row_count", "warnings", "source_completion", "error"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "outcome": {"enum": ["success", "degraded", "failed"]},
+                        "freshness": {"enum": ["complete", "degraded"]},
+                        "row_count": {"type": "integer", "minimum": 0},
+                        "warnings": {"type": "array", "items": {"enum": ["live_tail_unavailable", "stale_cut_replanned"]}},
+                        "source_completion": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["source", "outcome"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "source": {"enum": ["iceberg", "hot_sealed", "live_tail"]},
+                                    "outcome": {"enum": ["complete", "unavailable"]}
+                                }
+                            }
+                        },
+                        "error": {
+                            "type": ["object", "null"],
+                            "required": ["code", "detail"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "code": {"enum": [
+                                    "query_timeout", "query_visibility_unavailable", "query_tenant_invariant",
+                                    "query_reconciliation_invariant", "query_peer_security", "query_audit_unavailable",
+                                    "catalog_unreachable", "storage_unreachable", "query_execution_failed"
+                                ]},
+                                "detail": {"type": ["string", "null"]}
+                            }
+                        }
+                    }
+                }
             }
         })
     }
@@ -283,10 +351,7 @@ impl AgentTool for BifrostQueryTool {
         let result = QueryClient::new(self.client.as_ref())
             .collect_bounded(&request, limits)
             .await
-            .map_err(|error| ToolError::Invocation {
-                detail: format!("[{}] {error}", error.code()),
-                cause: None,
-            })?;
+            .map_err(query_tool_error)?;
         let schema = result
             .batches
             .first()
@@ -318,6 +383,56 @@ impl AgentTool for BifrostQueryTool {
             "terminal": result.terminal
         }))
     }
+}
+
+/// Maps one Vala SDK failure into the structured MCP invocation envelope.
+///
+/// The stable fields come directly from the SDK accessors. Transport details
+/// use the Wyrd problem payload and terminal details use the already scrubbed
+/// terminal object; no machine-readable field is recovered from formatted text.
+fn query_tool_error(error: vala_sdk::ValaSdkError) -> ToolError {
+    let (detail, safe_details) = match &error {
+        vala_sdk::ValaSdkError::Transport(source) => {
+            let problem = source.as_problem_json();
+            (
+                problem
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or("query transport failed")
+                    .to_owned(),
+                problem.get("details").cloned(),
+            )
+        }
+        vala_sdk::ValaSdkError::Protocol(detail) | vala_sdk::ValaSdkError::Arrow(detail) => {
+            (detail.clone(), None)
+        }
+        vala_sdk::ValaSdkError::IncompleteQueryStream => (
+            "query stream ended before its required terminal frame".to_owned(),
+            None,
+        ),
+        vala_sdk::ValaSdkError::FailedTerminal { terminal } => (
+            terminal
+                .error
+                .as_ref()
+                .and_then(|error| error.detail.as_ref())
+                .map_or_else(
+                    || "query terminal reported failure".to_owned(),
+                    |detail| detail.as_str().to_owned(),
+                ),
+            serde_json::to_value(terminal).ok(),
+        ),
+        vala_sdk::ValaSdkError::ResultTooLarge => {
+            ("query result exceeds configured bounds".to_owned(), None)
+        }
+    };
+    ToolError::StructuredInvocation(Box::new(StructuredInvocationError {
+        code: error.code().to_owned(),
+        status: error.status(),
+        title: error.title().to_owned(),
+        detail,
+        remediation: error.remediation().to_owned(),
+        safe_details,
+    }))
 }
 
 /// Extracts one required string argument.
@@ -489,6 +604,17 @@ pub fn bifrost_error_catalog() -> Vec<BifrostErrorDescriptor> {
 /// The catalog test below keeps this list aligned with the `BifrostError` enum.
 fn bifrost_error_variants() -> Vec<BifrostError> {
     let variants = vec![
+        BifrostError::OracleRoleUnavailable,
+        BifrostError::ScribeRoleUnavailable,
+        BifrostError::QueryAdmissionRejected,
+        BifrostError::QueryVisibilityUnavailable,
+        BifrostError::QueryTenantInvariant,
+        BifrostError::QueryReconciliationInvariant,
+        BifrostError::QueryPeerSecurity,
+        BifrostError::QueryStreamProtocol,
+        BifrostError::QueryStreamIncomplete,
+        BifrostError::QueryAuditUnavailable,
+        BifrostError::QueryExecutionFailed,
         BifrostError::IngestAuthentication {
             message: String::new(),
         },
@@ -595,15 +721,22 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
 mod bifrost_tools {
     use std::sync::Arc;
 
-    use serde_json::json;
-    use skald_tool::ToolRegistry;
+    use serde_json::{Value, json};
+    use skald_tool::{ToolError, ToolRegistry};
     use strum::EnumCount;
+    use vala_sdk::ValaSdkError;
     use wyrd_client::{WyrdClient, config::ClientConfig};
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::vala::api::{
+        QueryErrorDetail, QueryFreshness, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
+        QueryTerminalFrame, QueryTerminalOutcome, QueryWarning, SourceCompletion,
+        SourceCompletionOutcome,
+    };
     use wyrd_spec::vala::error::BifrostError;
 
     use crate::bifrost::{
         McpQueryLimits, bifrost_error_catalog, bifrost_permissions, parse_freshness,
-        parse_visibility, register_bifrost_tools, requested_limits,
+        parse_visibility, query_tool_error, register_bifrost_tools, requested_limits,
     };
 
     fn dummy_client() -> WyrdClient {
@@ -669,6 +802,175 @@ mod bifrost_tools {
             parse_freshness(Some(&json!("allow_degraded"))).expect("degraded is explicit"),
             wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded
         );
+    }
+
+    /// The query tool publishes a closed terminal and structured error shape.
+    #[test]
+    fn bifrost_query_schema_is_closed_and_terminal_typed() {
+        let registry = ToolRegistry::new();
+        register_bifrost_tools(&registry, Arc::new(dummy_client())).expect("registration succeeds");
+        let schema = registry
+            .resolve("bifrost.query")
+            .expect("query tool registered")
+            .output_schema();
+        let terminal = &schema["properties"]["terminal"];
+        assert_eq!(terminal["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(schema["properties"]["rows"]["items"]["type"], "object");
+        assert_eq!(
+            schema["properties"]["rows"]["items"]["additionalProperties"],
+            true
+        );
+        assert_eq!(
+            schema["x-wyrd-error"]["required"],
+            json!([
+                "code",
+                "status",
+                "title",
+                "detail",
+                "remediation",
+                "safe_details"
+            ])
+        );
+        assert_eq!(schema["x-wyrd-error"]["additionalProperties"], false);
+        assert_eq!(
+            terminal["required"],
+            json!([
+                "outcome",
+                "freshness",
+                "row_count",
+                "warnings",
+                "source_completion",
+                "error"
+            ])
+        );
+        assert_eq!(
+            terminal["properties"]["outcome"]["enum"],
+            json!(["success", "degraded", "failed"])
+        );
+        assert_eq!(
+            terminal["properties"]["error"]["properties"]["code"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(9)
+        );
+    }
+
+    /// Assert one SDK failure projects every structured invocation field exactly.
+    fn assert_structured_error(
+        error: ValaSdkError,
+        code: &str,
+        status: u16,
+        title: &str,
+        detail: &str,
+        remediation: &str,
+        safe_details: Option<Value>,
+    ) {
+        let ToolError::StructuredInvocation(error) = query_tool_error(error) else {
+            panic!("query SDK failure must map to structured invocation metadata");
+        };
+        assert_eq!(error.code, code);
+        assert_eq!(error.status, status);
+        assert_eq!(error.title, title);
+        assert_eq!(error.detail, detail);
+        assert_eq!(error.remediation, remediation);
+        assert_eq!(error.safe_details, safe_details);
+    }
+
+    /// Incomplete and unavailable SDK failures retain exact recovery metadata.
+    #[test]
+    fn bifrost_query_error_mapping_preserves_incomplete_and_unavailable() {
+        assert_structured_error(
+            ValaSdkError::IncompleteQueryStream,
+            "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+            502,
+            "Query stream incomplete",
+            "query stream ended before its required terminal frame",
+            "Retry the query because the response ended before its required terminal frame.",
+            None,
+        );
+        let details = json!({"dependency": "catalog"});
+        assert_structured_error(
+            ValaSdkError::Transport(WyrdError::UpstreamFailure {
+                message: "catalog unavailable".to_owned(),
+                details: details.clone(),
+            }),
+            "WYRD_SPEC_502_UPSTREAM_FAILURE",
+            502,
+            "Upstream dependency failed",
+            "catalog unavailable",
+            "Check the upstream dependency health and retry policy.",
+            Some(details),
+        );
+    }
+
+    /// Failed terminals retain scrubbed terminal details without flattening them.
+    #[test]
+    fn bifrost_query_error_mapping_preserves_failed_terminal_details() {
+        let terminal = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            freshness: QueryFreshness::Complete,
+            row_count: 2,
+            warnings: Vec::new(),
+            source_completion: vec![
+                SourceCompletion {
+                    source: QuerySource::Iceberg,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::HotSealed,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+            ],
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: Some(QueryErrorDetail::new("safe terminal detail").expect("detail valid")),
+            }),
+        };
+        let expected = serde_json::to_value(&terminal).expect("terminal serializes");
+        assert_structured_error(
+            ValaSdkError::FailedTerminal { terminal },
+            "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+            500,
+            "Query execution failed",
+            "safe terminal detail",
+            "Inspect the retained terminal error and correct the query or source failure before retrying.",
+            Some(expected),
+        );
+    }
+
+    /// Degraded terminals remain closed and explicit for agent branching.
+    #[test]
+    fn bifrost_degraded_terminal_retains_structured_fields() {
+        let terminal = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Degraded,
+            freshness: QueryFreshness::Degraded,
+            row_count: 2,
+            warnings: vec![QueryWarning::LiveTailUnavailable],
+            source_completion: vec![
+                SourceCompletion {
+                    source: QuerySource::Iceberg,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::HotSealed,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::LiveTail,
+                    outcome: SourceCompletionOutcome::Unavailable,
+                },
+            ],
+            error: None,
+        };
+        let value = serde_json::to_value(terminal).expect("degraded terminal serializes");
+        assert_eq!(value["outcome"], "degraded");
+        assert_eq!(value["freshness"], "degraded");
+        assert_eq!(value["warnings"], json!(["live_tail_unavailable"]));
+        assert_eq!(value["error"], Value::Null);
     }
 
     #[test]

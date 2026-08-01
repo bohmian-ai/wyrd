@@ -53,3 +53,4 @@ tempfile = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
+wyrd-testing = { workspace = true }

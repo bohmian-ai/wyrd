@@ -16,6 +16,7 @@ pub mod cluster;
 mod deployment_contract;
 pub mod forge_harness;
 pub mod harness;
+pub mod query_fixture;
 
 pub use cluster::{
     BifrostClusterSpec, BifrostNodeSpec, BifrostTopology, ClusterError, TestOracleResources,
@@ -27,3 +28,4 @@ pub use forge_harness::{
     seed_forge_group_for_tenant_with_schema_and_days,
 };
 pub use harness::{BifrostHarness, HarnessError};
+pub use query_fixture::{SeededBifrostQuery, seed_query_fixture};

@@ -9,13 +9,22 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 1
 fi
 
+lane_chain_body() {
+  local manifest="$1"
+  local lane="$2"
+  local task_body
+  task_body="$(sed -n "/^\[tasks\.\"$lane\"\]/,/^\[tasks\./p" "$manifest")"
+  printf '%s\n' "$task_body"
+  if printf '%s\n' "$task_body" | rg -n -- "mise run ${lane}:inner([[:space:]'\";]|$)" >/dev/null; then
+    sed -n "/^\[tasks\.\"$lane:inner\"\]/,/^\[tasks\./p" "$manifest"
+  fi
+}
+
 require_lane_runner() {
   local manifest="$1"
   local lane="$2"
   local runner="$3"
-  local task_body
-  task_body="$(sed -n "/^\[tasks\.\"$lane\"\]/,/^\[tasks\./p" "$manifest")"
-  printf '%s\n' "$task_body" | rg -n -F -- "$runner" >/dev/null
+  lane_chain_body "$manifest" "$lane" | rg -n -F -- "$runner" >/dev/null
 }
 
 for lane in \
@@ -48,7 +57,7 @@ for lane in "${forge_topology_lanes[@]}"; do
 done
 
 forge_reports="$(for lane in "${forge_topology_lanes[@]}"; do
-  sed -n "/^\[tasks\.\"$lane\"\]/,/^\[tasks\./p" mise.toml | rg -o 'WYRD_BIFROST_REPORT = "[^"]+"' || true
+  lane_chain_body mise.toml "$lane" | rg -o 'WYRD_BIFROST_REPORT = "[^"]+"' || true
 done)"
 if [[ "$(printf '%s\n' "$forge_reports" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')" != "3" ]]; then
   echo "Forge topology lanes must write three distinct WYRD_BIFROST_REPORT paths" >&2
@@ -143,6 +152,15 @@ fixture="$fixture_dir/mise.toml"
 printf '%s\n' '[tasks."bench:bifrost:scribe:slo"]' 'run = "echo registered but no workload"' > "$fixture"
 if require_lane_runner "$fixture" "bench:bifrost:scribe:slo" "--bench bench_bifrost_scribe"; then
   echo "benchmark registration checker negative self-test fixture unexpectedly passed" >&2
+  exit 1
+fi
+printf '%s\n' \
+  '[tasks."bench:bifrost:scribe:slo"]' \
+  'run = "mise run bench:bifrost:scribe:slo:inner-wrong"' \
+  '[tasks."bench:bifrost:scribe:slo:inner"]' \
+  'run = "cargo bench --bench bench_bifrost_scribe"' > "$fixture"
+if require_lane_runner "$fixture" "bench:bifrost:scribe:slo" "--bench bench_bifrost_scribe"; then
+  echo "benchmark registration checker followed a non-exact inner task" >&2
   exit 1
 fi
 

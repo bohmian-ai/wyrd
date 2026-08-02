@@ -1,26 +1,26 @@
 //! Shared-resource, independently bound Bifrost test cluster.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use opendal::Operator;
 use thiserror::Error;
-use vala_bifrost::catalog::WyrdCatalog;
-use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::forge::ForgeWorkerCompletionObserver;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::config::ForgeProcessRole;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::{WyrdTelemetryRuntime, install_capture_runtime};
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
-use wyrd_telemetry::TelemetryConfig;
+use wyrd_telemetry::{TelemetryConfig, TelemetryGuard};
 
-use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
+use crate::bifrost::forge_harness::{CommitUncertaintyCatalog, CommitUncertaintyControls};
 use crate::bifrost::telemetry::ForgeTelemetryCapture;
 use crate::server::{
-    WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError, test_catalog, test_redux_catalog,
+    WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError, test_catalog_with_postgres,
+    test_redux_catalog_with_postgres,
 };
 
 /// Supported role topology for a Bifrost cluster journey.
@@ -81,6 +81,14 @@ pub enum ClusterError {
     /// A server failed during explicit teardown.
     #[error("cluster shutdown failed: {0}")]
     Shutdown(String),
+    /// Startup failed and explicit rollback also observed teardown errors.
+    #[error("cluster startup failed: {primary}; rollback also failed: {cleanup}")]
+    StartupRollback {
+        /// Original startup failure, preserved ahead of cleanup diagnostics.
+        primary: String,
+        /// Aggregated cleanup errors from already-bound server processes.
+        cleanup: String,
+    },
 }
 
 /// A real multi-pod Bifrost test topology.
@@ -132,6 +140,20 @@ fn process_telemetry() -> Result<&'static ProcessTelemetry, ClusterError> {
         .ok_or_else(|| ClusterError::Resource("process telemetry installation raced".to_owned()))
 }
 
+/// Return the shared production recorder guard and its read-only capture facade.
+///
+/// This lets an isolated [`WyrdTestServer`] join the same process-wide telemetry
+/// runtime as cluster tests without installing a second global recorder.
+///
+/// # Errors
+///
+/// Returns when the shared production telemetry runtime cannot be installed.
+pub fn shared_process_telemetry_for_test()
+-> Result<(Arc<TelemetryGuard>, ForgeTelemetryCapture), ClusterError> {
+    let telemetry = process_telemetry()?;
+    Ok((telemetry.runtime.guard(), telemetry.capture.clone()))
+}
+
 /// Private role-specific inputs for one shared-resource cluster construction.
 ///
 /// The settings keep the public fixture constructors focused on their named
@@ -152,6 +174,79 @@ struct ClusterRoleSettings {
     inject_commit_uncertainty: bool,
     /// Optional complete Forge limits profile validated by normal role startup.
     forge_config: Option<ForgeConfig>,
+    /// Fail after this many successful role binds to exercise rollback.
+    fail_after_bound_servers: Option<usize>,
+    /// Optional observations retained across an injected partial-start rollback.
+    startup_rollback_probe: Option<Arc<StartupRollbackProbe>>,
+}
+
+/// Captures only test-visible resources needed to verify startup rollback.
+///
+/// The probe never participates in server routing or lifecycle. It retains
+/// clones of already-bound listener URLs and process-local pools so the test
+/// can prove explicit rollback closed both after construction returns.
+#[derive(Default)]
+struct StartupRollbackProbe {
+    /// Bound API URLs that must reject requests after rollback.
+    base_urls: Mutex<Vec<String>>,
+    /// Process-local app pools that must be explicitly closed after rollback.
+    app_pools: Mutex<Vec<sqlx::PgPool>>,
+}
+
+impl StartupRollbackProbe {
+    /// Record one successfully bound role before injecting the next startup failure.
+    fn record(&self, server: &WyrdTestServer) {
+        if let Some(base_url) = server.base_url() {
+            let mut base_urls = match self.base_urls.lock() {
+                Ok(base_urls) => base_urls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            base_urls.push(base_url.to_owned());
+        }
+        let mut app_pools = match self.app_pools.lock() {
+            Ok(app_pools) => app_pools,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        app_pools.push(server.app_pool());
+    }
+
+    /// Prove rollback closed each observed pool and listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns a cluster resource error when a process-local pool remains open
+    /// or an API listener still accepts requests after rollback.
+    async fn verify_rolled_back(&self) -> Result<(), ClusterError> {
+        let app_pools = match self.app_pools.lock() {
+            Ok(app_pools) => app_pools,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+        .clone();
+        if app_pools.iter().any(|pool| !pool.is_closed()) {
+            return Err(ClusterError::Resource(
+                "partial-start rollback left a process-local app pool open".to_owned(),
+            ));
+        }
+        let base_urls = match self.base_urls.lock() {
+            Ok(base_urls) => base_urls,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+        .clone();
+        let client = reqwest::Client::new();
+        for base_url in base_urls {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.get(format!("{base_url}/healthz")).send(),
+            )
+            .await;
+            if matches!(response, Ok(Ok(_))) {
+                return Err(ClusterError::Resource(format!(
+                    "partial-start rollback left listener accepting requests at {base_url}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WyrdTestCluster {
@@ -168,6 +263,47 @@ impl WyrdTestCluster {
     /// directory, or an independently bound server cannot be created.
     pub async fn start(pods: usize, topology: BifrostTopology) -> Result<Self, ClusterError> {
         Self::start_with_wal_sync_delay(pods, topology, std::time::Duration::ZERO).await
+    }
+
+    /// Prove a failure after one successful bind rolls back the whole process graph.
+    ///
+    /// This test-tier probe starts one real server, retains only observational
+    /// listener and pool handles, then injects a construction error. It returns
+    /// only after explicit rollback proves that the pool closed and the listener
+    /// rejects new work.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the injected failure unexpectedly succeeds or explicit
+    /// rollback leaves a listener or process-local pool alive.
+    pub async fn verify_partial_start_rollback_for_test() -> Result<(), ClusterError> {
+        let probe = Arc::new(StartupRollbackProbe::default());
+        let result = Self::start_with_wal_sync_delay_and_admission_and_roles(
+            1,
+            BifrostTopology::OnePod,
+            ClusterRoleSettings {
+                wal_sync_delay: std::time::Duration::ZERO,
+                scribe_admission: None,
+                roles: vec![ForgeProcessRole::All],
+                forge_completion_observer: None,
+                forge_interval: std::time::Duration::from_secs(60),
+                inject_commit_uncertainty: false,
+                forge_config: None,
+                fail_after_bound_servers: Some(1),
+                startup_rollback_probe: Some(Arc::clone(&probe)),
+            },
+        )
+        .await;
+        if let Ok(cluster) = result {
+            let shutdown = cluster.shutdown().await;
+            return match shutdown {
+                Err(error) => Err(error),
+                Ok(()) => Err(ClusterError::Resource(
+                    "partial-start rollback probe unexpectedly constructed a cluster".to_owned(),
+                )),
+            };
+        }
+        probe.verify_rolled_back().await
     }
 
     /// Start one real scheduler/server and three real worker-only processes.
@@ -216,6 +352,8 @@ impl WyrdTestCluster {
                 forge_interval,
                 inject_commit_uncertainty: false,
                 forge_config: None,
+                fail_after_bound_servers: None,
+                startup_rollback_probe: None,
             },
         )
         .await
@@ -244,6 +382,8 @@ impl WyrdTestCluster {
                 forge_interval: std::time::Duration::from_secs(60),
                 inject_commit_uncertainty: false,
                 forge_config: None,
+                fail_after_bound_servers: None,
+                startup_rollback_probe: None,
             },
         )
         .await
@@ -278,6 +418,8 @@ impl WyrdTestCluster {
                 forge_interval: std::time::Duration::from_secs(60),
                 inject_commit_uncertainty: true,
                 forge_config: None,
+                fail_after_bound_servers: None,
+                startup_rollback_probe: None,
             },
         )
         .await
@@ -313,6 +455,8 @@ impl WyrdTestCluster {
                 forge_interval: std::time::Duration::from_secs(60),
                 inject_commit_uncertainty: false,
                 forge_config: Some(config),
+                fail_after_bound_servers: None,
+                startup_rollback_probe: None,
             },
         )
         .await
@@ -359,6 +503,8 @@ impl WyrdTestCluster {
                 forge_interval: std::time::Duration::from_secs(60),
                 inject_commit_uncertainty: false,
                 forge_config: None,
+                fail_after_bound_servers: None,
+                startup_rollback_probe: None,
             },
         )
         .await
@@ -425,21 +571,69 @@ impl WyrdTestCluster {
         })
         .await
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let catalog: Arc<WyrdCatalog> = test_catalog(&fixture, &storage).await?;
-        let redux_catalog: Arc<BifrostCatalog> = test_redux_catalog(&fixture, &storage).await?;
-        let commit_uncertainty_catalog = settings
+        let uncertainty_controls = settings
             .inject_commit_uncertainty
-            .then(|| CommitUncertaintyCatalog::new(redux_catalog.iceberg_catalog()));
+            .then(|| Arc::new(CommitUncertaintyControls::new()));
+        let mut commit_uncertainty_catalog = None;
 
         let mut wal_dirs = Vec::with_capacity(pods);
         let mut servers = Vec::with_capacity(pods);
         for role in settings.roles {
-            let wal_dir =
-                tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?;
+            let wal_dir = match tempfile::tempdir() {
+                Ok(directory) => directory,
+                Err(error) => {
+                    return Err(Self::rollback_startup(
+                        servers,
+                        ClusterError::Resource(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            let (wyrd, vala) = match fixture.fresh_runtime_handles().await {
+                Ok(handles) => handles,
+                Err(error) => {
+                    return Err(Self::rollback_startup(
+                        servers,
+                        ClusterError::Resource(error.to_string()),
+                    )
+                    .await);
+                }
+            };
+            let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+            let catalog = match test_catalog_with_postgres(&fixture, &storage, postgres.as_ref())
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    postgres.close().await;
+                    return Err(Self::rollback_startup(servers, ClusterError::Server(error)).await);
+                }
+            };
+            let redux_catalog =
+                match test_redux_catalog_with_postgres(&fixture, &storage, postgres.as_ref()).await
+                {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        postgres.close().await;
+                        return Err(
+                            Self::rollback_startup(servers, ClusterError::Server(error)).await
+                        );
+                    }
+                };
+            let process_uncertainty_catalog = uncertainty_controls.as_ref().map(|controls| {
+                CommitUncertaintyCatalog::new_with_controls(
+                    redux_catalog.iceberg_catalog(),
+                    Arc::clone(controls),
+                )
+            });
+            if commit_uncertainty_catalog.is_none() {
+                commit_uncertainty_catalog = process_uncertainty_catalog.clone();
+            }
             let builder = WyrdTestServerBuilder::default()
                 .with_wal_sync_delay(settings.wal_sync_delay)
                 .with_forge_interval(settings.forge_interval)
                 .with_forge_process_role_for_test(role)
+                .with_postgres_for_test(Arc::clone(&postgres))
                 .with_telemetry_for_test(telemetry.runtime.guard());
             let builder = if let Some(config) = &settings.forge_config {
                 builder.with_forge_config_for_test(config.clone())
@@ -451,7 +645,7 @@ impl WyrdTestCluster {
             } else {
                 builder
             };
-            let builder = if let Some(catalog) = &commit_uncertainty_catalog {
+            let builder = if let Some(catalog) = &process_uncertainty_catalog {
                 let forge_catalog: Arc<dyn iceberg::Catalog> = catalog.clone();
                 builder.with_forge_catalog_for_test(forge_catalog)
             } else {
@@ -462,19 +656,45 @@ impl WyrdTestCluster {
             } else {
                 builder
             };
-            let server = builder
+            let server = match builder
                 .start_with_resources(
                     Arc::clone(&fixture),
                     Arc::clone(&storage),
-                    Arc::clone(&catalog),
-                    Arc::clone(&redux_catalog),
+                    catalog,
+                    redux_catalog,
                     Some(Arc::clone(&storage_root)),
                 )
-                .await?
-                .bind()
-                .await?;
+                .await
+            {
+                Ok(server) => server,
+                Err(error) => {
+                    postgres.close().await;
+                    return Err(Self::rollback_startup(servers, ClusterError::Server(error)).await);
+                }
+            };
+            let server = match server.bind().await {
+                Ok(server) => server,
+                Err(error) => {
+                    return Err(Self::rollback_startup(servers, ClusterError::Server(error)).await);
+                }
+            };
+            if let Some(probe) = &settings.startup_rollback_probe {
+                probe.record(&server);
+            }
             wal_dirs.push(wal_dir);
             servers.push(server);
+            if settings
+                .fail_after_bound_servers
+                .is_some_and(|bound| servers.len() == bound)
+            {
+                return Err(Self::rollback_startup(
+                    servers,
+                    ClusterError::Resource(
+                        "injected failure after a successful cluster role bind".to_owned(),
+                    ),
+                )
+                .await);
+            }
         }
 
         Ok(Self {
@@ -575,6 +795,32 @@ impl WyrdTestCluster {
     /// Return each pod's local WAL directory.
     pub fn wal_dirs(&self) -> impl Iterator<Item = &std::path::Path> {
         self.wal_dirs.iter().map(tempfile::TempDir::path)
+    }
+
+    /// Shut down every already-bound process after a later cluster startup failure.
+    ///
+    /// Servers are consumed in reverse startup order so their local workers,
+    /// listeners, and process-local pools stop before the fixture and storage
+    /// resources are dropped. The original startup error remains primary;
+    /// rollback failures are appended only as diagnostic context.
+    async fn rollback_startup(
+        mut servers: Vec<WyrdTestServer>,
+        primary: ClusterError,
+    ) -> ClusterError {
+        let mut cleanup_errors = Vec::new();
+        while let Some(server) = servers.pop() {
+            if let Err(error) = server.shutdown().await {
+                cleanup_errors.push(error.to_string());
+            }
+        }
+        if cleanup_errors.is_empty() {
+            primary
+        } else {
+            ClusterError::StartupRollback {
+                primary: primary.to_string(),
+                cleanup: cleanup_errors.join("; "),
+            }
+        }
     }
 
     /// Explicitly stop all bound servers and release cluster resources.

@@ -263,24 +263,51 @@ impl ForgeMemoryProbe {
 #[derive(Debug)]
 pub struct CommitUncertaintyCatalog {
     inner: Arc<dyn Catalog>,
+    controls: Arc<CommitUncertaintyControls>,
+}
+
+/// Shared deterministic state for one or more process-local uncertainty catalogs.
+///
+/// A cluster gives every Forge process its own catalog and database pools, then
+/// shares this narrow test control so one journey can arm the same fault across
+/// all real worker processes without sharing a runtime catalog handle.
+#[derive(Debug)]
+pub(crate) struct CommitUncertaintyControls {
+    /// Counts all delegated commit attempts across process-local wrappers.
     update_attempts: AtomicUsize,
+    /// Arms one injected retryable response after a durable commit.
     fail_after_next_commit: AtomicBool,
+    /// Refuses later commits after a simulated lost response.
     uncertainty_active: AtomicBool,
+    /// Arms a response-boundary pause after one commit.
     pause_after_commit: AtomicBool,
     /// Whether to pause only after a commit removes retained snapshots.
     pause_after_snapshot_removal: AtomicBool,
+    /// Records that the post-commit pause has been reached.
     commit_reached: AtomicBool,
+    /// Selects a stale-worker response after the post-commit pause.
     reject_after_commit: AtomicBool,
+    /// Wakes waiters when a post-commit pause is reached.
     commit_ready: tokio::sync::Notify,
+    /// Releases a paused post-commit response.
     commit_release: tokio::sync::Notify,
+    /// Records cancellation while a post-commit response was paused.
     after_commit_dropped: AtomicBool,
+    /// Wakes waiters when the paused post-commit call is cancelled.
     after_commit_drop_ready: tokio::sync::Notify,
+    /// Arms a pause before a delegated commit.
     pause_before_commit: AtomicBool,
+    /// Records that the pre-commit pause has been reached.
     before_commit_reached: AtomicBool,
+    /// Selects a stale-worker response before delegation.
     reject_before_commit: AtomicBool,
+    /// Wakes waiters when a pre-commit pause is reached.
     before_commit_ready: tokio::sync::Notify,
+    /// Releases a paused pre-commit call.
     before_commit_release: tokio::sync::Notify,
+    /// Records cancellation while a pre-commit call was paused.
     before_commit_dropped: AtomicBool,
+    /// Wakes waiters when the paused pre-commit call is cancelled.
     before_commit_drop_ready: tokio::sync::Notify,
 }
 
@@ -339,8 +366,25 @@ impl CommitUncertaintyCatalog {
     /// Wrap a real catalog and arm one post-commit retryable response.
     #[must_use]
     pub fn new(inner: Arc<dyn Catalog>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
+        Self::new_with_controls(inner, Arc::new(CommitUncertaintyControls::new()))
+    }
+
+    /// Wrap one process-local catalog with controls shared by sibling wrappers.
+    ///
+    #[must_use]
+    pub(crate) fn new_with_controls(
+        inner: Arc<dyn Catalog>,
+        controls: Arc<CommitUncertaintyControls>,
+    ) -> Arc<Self> {
+        Arc::new(Self { inner, controls })
+    }
+}
+
+impl CommitUncertaintyControls {
+    /// Build the unarmed shared control state for process-local catalog wrappers.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
             update_attempts: AtomicUsize::new(0),
             fail_after_next_commit: AtomicBool::new(false),
             uncertainty_active: AtomicBool::new(false),
@@ -359,23 +403,34 @@ impl CommitUncertaintyCatalog {
             before_commit_release: tokio::sync::Notify::new(),
             before_commit_dropped: AtomicBool::new(false),
             before_commit_drop_ready: tokio::sync::Notify::new(),
-        })
+        }
     }
+}
 
+impl CommitUncertaintyCatalog {
     /// Make the next successful catalog update appear retryably uncertain.
     pub fn fail_after_next_commit(&self) {
-        self.fail_after_next_commit.store(true, Ordering::Release);
+        self.controls
+            .fail_after_next_commit
+            .store(true, Ordering::Release);
     }
 
     /// Pause after the real catalog has accepted one commit.
     pub fn pause_after_commit(&self) {
-        self.update_attempts.store(0, Ordering::Release);
-        self.commit_reached.store(false, Ordering::Release);
-        self.reject_after_commit.store(false, Ordering::Release);
-        self.after_commit_dropped.store(false, Ordering::Release);
-        self.pause_after_snapshot_removal
+        self.controls.update_attempts.store(0, Ordering::Release);
+        self.controls.commit_reached.store(false, Ordering::Release);
+        self.controls
+            .reject_after_commit
             .store(false, Ordering::Release);
-        self.pause_after_commit.store(true, Ordering::Release);
+        self.controls
+            .after_commit_dropped
+            .store(false, Ordering::Release);
+        self.controls
+            .pause_after_snapshot_removal
+            .store(false, Ordering::Release);
+        self.controls
+            .pause_after_commit
+            .store(true, Ordering::Release);
     }
 
     /// Pause after a catalog commit semantically removes at least one snapshot.
@@ -384,20 +439,27 @@ impl CommitUncertaintyCatalog {
     /// the delegated update. Earlier manifest rewrites therefore pass through,
     /// while the actual snapshot-expiry commit is held after acceptance.
     pub fn pause_after_snapshot_removal(&self) {
-        self.update_attempts.store(0, Ordering::Release);
-        self.commit_reached.store(false, Ordering::Release);
-        self.reject_after_commit.store(false, Ordering::Release);
-        self.after_commit_dropped.store(false, Ordering::Release);
-        self.pause_after_commit.store(false, Ordering::Release);
-        self.pause_after_snapshot_removal
+        self.controls.update_attempts.store(0, Ordering::Release);
+        self.controls.commit_reached.store(false, Ordering::Release);
+        self.controls
+            .reject_after_commit
+            .store(false, Ordering::Release);
+        self.controls
+            .after_commit_dropped
+            .store(false, Ordering::Release);
+        self.controls
+            .pause_after_commit
+            .store(false, Ordering::Release);
+        self.controls
+            .pause_after_snapshot_removal
             .store(true, Ordering::Release);
     }
 
     /// Wait until the real catalog commit has completed and the wrapper is
     /// holding the response boundary open.
     pub async fn wait_for_commit(&self) {
-        while !self.commit_reached.load(Ordering::Acquire) {
-            self.commit_ready.notified().await;
+        while !self.controls.commit_reached.load(Ordering::Acquire) {
+            self.controls.commit_ready.notified().await;
         }
     }
 
@@ -407,36 +469,46 @@ impl CommitUncertaintyCatalog {
     /// controls the complete scheduler-bound assertion.
     pub async fn wait_for_after_commit_drop(&self) {
         wait_for_paused_catalog_call_drop(
-            &self.after_commit_dropped,
-            &self.after_commit_drop_ready,
+            &self.controls.after_commit_dropped,
+            &self.controls.after_commit_drop_ready,
         )
         .await;
     }
 
     /// Mark the paused caller stale and let it observe the injected response.
     pub fn reject_paused_commit(&self) {
-        self.reject_after_commit.store(true, Ordering::Release);
-        self.commit_release.notify_waiters();
+        self.controls
+            .reject_after_commit
+            .store(true, Ordering::Release);
+        self.controls.commit_release.notify_waiters();
     }
 
     /// Return catalog update attempts observed since the uncertainty seam was armed.
     #[must_use]
     pub fn update_attempts(&self) -> usize {
-        self.update_attempts.load(Ordering::Acquire)
+        self.controls.update_attempts.load(Ordering::Acquire)
     }
 
     /// Pause immediately before delegating a catalog commit.
     pub fn pause_before_commit(&self) {
-        self.before_commit_reached.store(false, Ordering::Release);
-        self.reject_before_commit.store(false, Ordering::Release);
-        self.before_commit_dropped.store(false, Ordering::Release);
-        self.pause_before_commit.store(true, Ordering::Release);
+        self.controls
+            .before_commit_reached
+            .store(false, Ordering::Release);
+        self.controls
+            .reject_before_commit
+            .store(false, Ordering::Release);
+        self.controls
+            .before_commit_dropped
+            .store(false, Ordering::Release);
+        self.controls
+            .pause_before_commit
+            .store(true, Ordering::Release);
     }
 
     /// Wait until the production commit has reached the wrapped catalog seam.
     pub async fn wait_for_before_commit(&self) {
-        while !self.before_commit_reached.load(Ordering::Acquire) {
-            self.before_commit_ready.notified().await;
+        while !self.controls.before_commit_reached.load(Ordering::Acquire) {
+            self.controls.before_commit_ready.notified().await;
         }
     }
 
@@ -446,16 +518,18 @@ impl CommitUncertaintyCatalog {
     /// controls the complete scheduler-bound assertion.
     pub async fn wait_for_before_commit_drop(&self) {
         wait_for_paused_catalog_call_drop(
-            &self.before_commit_dropped,
-            &self.before_commit_drop_ready,
+            &self.controls.before_commit_dropped,
+            &self.controls.before_commit_drop_ready,
         )
         .await;
     }
 
     /// Reject the paused commit as stale and resume the caller.
     pub fn reject_paused_before_commit(&self) {
-        self.reject_before_commit.store(true, Ordering::Release);
-        self.before_commit_release.notify_waiters();
+        self.controls
+            .reject_before_commit
+            .store(true, Ordering::Release);
+        self.controls.before_commit_release.notify_waiters();
     }
 }
 
@@ -537,24 +611,30 @@ impl Catalog for CommitUncertaintyCatalog {
     }
 
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
-        self.update_attempts.fetch_add(1, Ordering::AcqRel);
-        if self.uncertainty_active.load(Ordering::Acquire) {
+        self.controls.update_attempts.fetch_add(1, Ordering::AcqRel);
+        if self.controls.uncertainty_active.load(Ordering::Acquire) {
             return Err(IcebergError::new(
                 IcebergErrorKind::Unexpected,
                 "injected post-commit uncertainty remains unresolved",
             )
             .with_retryable(true));
         }
-        if self.pause_before_commit.swap(false, Ordering::AcqRel) {
+        if self
+            .controls
+            .pause_before_commit
+            .swap(false, Ordering::AcqRel)
+        {
             let mut drop_ack = PausedCatalogCallDropAck::new(
-                &self.before_commit_dropped,
-                &self.before_commit_drop_ready,
+                &self.controls.before_commit_dropped,
+                &self.controls.before_commit_drop_ready,
             );
-            self.before_commit_reached.store(true, Ordering::Release);
-            self.before_commit_ready.notify_waiters();
-            self.before_commit_release.notified().await;
+            self.controls
+                .before_commit_reached
+                .store(true, Ordering::Release);
+            self.controls.before_commit_ready.notify_waiters();
+            self.controls.before_commit_release.notified().await;
             drop_ack.disarm();
-            if self.reject_before_commit.load(Ordering::Acquire) {
+            if self.controls.reject_before_commit.load(Ordering::Acquire) {
                 return Err(IcebergError::new(
                     IcebergErrorKind::Unexpected,
                     "injected stale Forge lease before catalog commit",
@@ -562,7 +642,10 @@ impl Catalog for CommitUncertaintyCatalog {
                 .with_retryable(false));
             }
         }
-        let observe_snapshot_removal = self.pause_after_snapshot_removal.load(Ordering::Acquire);
+        let observe_snapshot_removal = self
+            .controls
+            .pause_after_snapshot_removal
+            .load(Ordering::Acquire);
         let snapshots_before = if observe_snapshot_removal {
             Some(
                 self.inner
@@ -585,21 +668,25 @@ impl Catalog for CommitUncertaintyCatalog {
                 .collect::<std::collections::BTreeSet<_>>();
             before.difference(&after).next().is_some()
         });
-        let pause_after_commit = self.pause_after_commit.swap(false, Ordering::AcqRel)
+        let pause_after_commit = self
+            .controls
+            .pause_after_commit
+            .swap(false, Ordering::AcqRel)
             || (removed_snapshot
                 && self
+                    .controls
                     .pause_after_snapshot_removal
                     .swap(false, Ordering::AcqRel));
         if pause_after_commit {
             let mut drop_ack = PausedCatalogCallDropAck::new(
-                &self.after_commit_dropped,
-                &self.after_commit_drop_ready,
+                &self.controls.after_commit_dropped,
+                &self.controls.after_commit_drop_ready,
             );
-            self.commit_reached.store(true, Ordering::Release);
-            self.commit_ready.notify_waiters();
-            self.commit_release.notified().await;
+            self.controls.commit_reached.store(true, Ordering::Release);
+            self.controls.commit_ready.notify_waiters();
+            self.controls.commit_release.notified().await;
             drop_ack.disarm();
-            if self.reject_after_commit.load(Ordering::Acquire) {
+            if self.controls.reject_after_commit.load(Ordering::Acquire) {
                 return Err(IcebergError::new(
                     IcebergErrorKind::Unexpected,
                     "injected stale Forge lease after catalog commit",
@@ -607,8 +694,14 @@ impl Catalog for CommitUncertaintyCatalog {
                 .with_retryable(true));
             }
         }
-        if self.fail_after_next_commit.swap(false, Ordering::AcqRel) {
-            self.uncertainty_active.store(true, Ordering::Release);
+        if self
+            .controls
+            .fail_after_next_commit
+            .swap(false, Ordering::AcqRel)
+        {
+            self.controls
+                .uncertainty_active
+                .store(true, Ordering::Release);
             return Err(IcebergError::new(
                 IcebergErrorKind::Unexpected,
                 "injected post-commit uncertainty",

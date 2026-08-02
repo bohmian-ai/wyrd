@@ -15,7 +15,10 @@ pub mod forge_harness;
 pub mod harness;
 pub mod telemetry;
 
-pub use cluster::{BifrostTopology, ClusterError, WyrdTestCluster, full_bifrost_topology};
+pub use cluster::{
+    BifrostTopology, ClusterError, WyrdTestCluster, full_bifrost_topology,
+    shared_process_telemetry_for_test,
+};
 pub use forge_harness::{
     CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, StandaloneForgeFixture,
     seed_forge_group, seed_forge_group_for_tenant, seed_forge_group_for_tenant_with_schema,

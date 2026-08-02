@@ -149,6 +149,8 @@ struct WyrdTestServerInner {
     forge_scheduler_trigger: ForgeSchedulerTrigger,
     /// Process composition selected for the real bound server supervisor.
     forge_process_role: ForgeProcessRole,
+    /// Deterministic test seam that fails readiness after real socket binding.
+    force_readiness_failure: bool,
 }
 
 /// Socket state for an in-process or production-supervised test server.
@@ -188,8 +190,12 @@ pub struct WyrdTestServerBuilder {
     forge_catalog: Option<Arc<dyn Catalog>>,
     /// Optional complete Forge limit profile for deterministic role journeys.
     forge_config: Option<ForgeConfig>,
+    /// Optional independent runtime pools for one simulated server process.
+    postgres: Option<Arc<ServerPostgres>>,
     /// Process runtime guard injected by production-shaped telemetry capture.
     telemetry: Option<Arc<TelemetryGuard>>,
+    /// Deterministic readiness failure injected after real listeners bind.
+    force_readiness_failure: bool,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -212,7 +218,9 @@ impl Default for WyrdTestServerBuilder {
             forge_completion_observer: None,
             forge_catalog: None,
             forge_config: None,
+            postgres: None,
             telemetry: None,
+            force_readiness_failure: false,
         }
     }
 }
@@ -322,10 +330,13 @@ impl WyrdTestServer {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
-        if let Some(handle) = self.serve_handle.take() {
-            Self::join_serve_handle(handle).await?;
-        }
-        Ok(())
+        let join_result = if let Some(handle) = self.serve_handle.take() {
+            Self::join_serve_handle(handle).await
+        } else {
+            Ok(())
+        };
+        self.inner.state.postgres.close().await;
+        join_result
     }
 
     /// Joins one API or dedicated-worker serve task within the shutdown budget.
@@ -507,7 +518,7 @@ impl WyrdTestServer {
     /// Return a clone of the app Postgres pool for direct SQL in tests.
     #[must_use]
     pub fn app_pool(&self) -> sqlx::PgPool {
-        self.inner.fixture.app_pool().clone()
+        self.inner.state.postgres.app_pool().clone()
     }
 
     /// Return the deterministic public verifying key.
@@ -1084,7 +1095,12 @@ impl WyrdTestServer {
     }
 
     async fn tenant_conn(&self) -> Result<TenantConn<'_>, WyrdTestServerError> {
-        self.inner.fixture.tenant_conn().await.map_err(sql)
+        self.inner
+            .state
+            .postgres
+            .tenant_conn(self.data_tenant_id())
+            .await
+            .map_err(sql)
     }
 
     /// Open a tenant-scoped transaction bound to an explicit tenant.
@@ -1100,8 +1116,9 @@ impl WyrdTestServer {
         tenant_id: DataTenantId,
     ) -> Result<TenantConn<'_>, WyrdTestServerError> {
         self.inner
-            .fixture
-            .tenant_conn_for(tenant_id)
+            .state
+            .postgres
+            .tenant_conn(tenant_id)
             .await
             .map_err(sql)
     }
@@ -1176,9 +1193,11 @@ impl WyrdTestServer {
         let grpc_addr = bound.grpc_addr();
         let base_url = addr.map(|address| format!("http://{address}"));
         if addr.is_none() || grpc_addr.is_none() {
-            return Err(WyrdTestServerError::Bind(
-                "server role did not bind both public API listeners".to_owned(),
-            ));
+            return Err(self
+                .abort_bound_startup(WyrdTestServerError::Bind(
+                    "server role did not bind both public API listeners".to_owned(),
+                ))
+                .await);
         }
 
         let serve_handle = wyrd_runtime::runtime().spawn(async move { bound.run().await });
@@ -1192,20 +1211,41 @@ impl WyrdTestServer {
         };
 
         if let Some(base_url) = base_url
-            && let Err(error) = wait_for_ready(&base_url).await
+            && let Err(error) = if self.inner.force_readiness_failure {
+                Err(WyrdTestServerError::Bind(
+                    "injected readiness failure after listener bind".to_owned(),
+                ))
+            } else {
+                wait_for_ready(&base_url).await
+            }
         {
+            let mut primary = error;
             if let Some(handle) = self.serve_handle.take()
                 && handle.is_finished()
                 && let Ok(Err(exit)) = handle.await
             {
-                return Err(WyrdTestServerError::Start(format!(
+                primary = WyrdTestServerError::Start(format!(
                     "bound Wyrd test server exited before readiness: {exit:?}"
-                )));
+                ));
             }
-            return Err(error);
+            return Err(self.abort_bound_startup(primary).await);
         }
 
         Ok(self)
+    }
+
+    /// Stop a partially bound server before returning its original startup error.
+    ///
+    /// A readiness failure happens after the real production serve task has
+    /// started. Explicit teardown cancels and joins that task, then closes the
+    /// process-local pools instead of relying on [`Drop`] to cancel only.
+    async fn abort_bound_startup(self, primary: WyrdTestServerError) -> WyrdTestServerError {
+        match self.shutdown().await {
+            Ok(()) => primary,
+            Err(cleanup) => WyrdTestServerError::Join(format!(
+                "bound startup failed: {primary}; rollback also failed: {cleanup}"
+            )),
+        }
     }
 }
 
@@ -1406,6 +1446,27 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Use independently constructed runtime pools for this simulated process.
+    ///
+    /// Shared-cluster fixtures use this to model the process-local app,
+    /// platform-admin, and Vala pools a production pod owns while preserving
+    /// their common database and storage resources.
+    #[must_use]
+    pub fn with_postgres_for_test(mut self, postgres: Arc<ServerPostgres>) -> Self {
+        self.postgres = Some(postgres);
+        self
+    }
+
+    /// Force readiness to fail after the production server has bound its sockets.
+    ///
+    /// This test-tier seam proves startup rollback joins the real task and
+    /// closes process-local pools without changing production configuration.
+    #[must_use]
+    pub fn with_readiness_failure_for_test(mut self) -> Self {
+        self.force_readiness_failure = true;
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -1447,8 +1508,16 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (Some(Arc::new(root)), handle)
         };
-        let bifrost = test_catalog(&fixture, &storage).await?;
-        let bifrost_redux = test_redux_catalog(&fixture, &storage).await?;
+        let postgres = self.postgres.clone().unwrap_or_else(|| {
+            Arc::new(ServerPostgres::from_parts(
+                fixture.wyrd_postgres().clone(),
+                fixture.vala_postgres().clone(),
+            ))
+        });
+        let bifrost = test_catalog_with_postgres(&fixture, &storage, postgres.as_ref()).await?;
+        let bifrost_redux =
+            test_redux_catalog_with_postgres(&fixture, &storage, postgres.as_ref()).await?;
+        self.postgres = Some(postgres);
 
         self.start_with_resources(fixture, storage, bifrost, bifrost_redux, storage_root)
             .await
@@ -1476,6 +1545,13 @@ impl WyrdTestServerBuilder {
         // AppState must observe the same pool so query and rewrite admission
         // share accounting rather than silently creating independent budgets.
         let tenant_id = fixture.data_tenant_id();
+        let postgres = self.postgres.unwrap_or_else(|| {
+            Arc::new(ServerPostgres::from_parts(
+                fixture.wyrd_postgres().clone(),
+                fixture.vala_postgres().clone(),
+            ))
+        });
+        let app_pool = Arc::new(postgres.app_pool().clone());
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -1493,9 +1569,7 @@ impl WyrdTestServerBuilder {
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
             ),
         );
-        let resolver = Arc::new(SqlPermissionResolver::new(Arc::new(
-            fixture.app_pool().clone(),
-        )));
+        let resolver = Arc::new(SqlPermissionResolver::new(Arc::clone(&app_pool)));
         let verify_settings = self.auth_verify_settings.unwrap_or_default();
 
         // Postgres-backed boot, mirroring a self-hosted deployment: discover and
@@ -1506,7 +1580,7 @@ impl WyrdTestServerBuilder {
         // verifier's external (foreign-OIDC) path.
         let sealing_key = Arc::new(SecretKey::from_bytes([9_u8; 32]));
         seed_trusted_issuers(
-            fixture.app_pool(),
+            app_pool.as_ref(),
             tenant_id,
             &self.trusted_issuer_configs,
             Some(sealing_key.as_ref()),
@@ -1515,22 +1589,20 @@ impl WyrdTestServerBuilder {
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        seed_workload_bindings(fixture.app_pool(), tenant_id, &bindings)
+        seed_workload_bindings(app_pool.as_ref(), tenant_id, &bindings)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
         let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            Arc::new(fixture.app_pool().clone()),
+            Arc::clone(&app_pool),
             Some(Arc::clone(&sealing_key)),
         ));
-        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
-            fixture.app_pool().clone(),
-        )));
+        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::clone(&app_pool)));
 
         let verifier = Arc::new(
             TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
                 .with_revocation(Arc::new(SqlRevocationCheck::new_with_ttl(
-                    Arc::new(fixture.app_pool().clone()),
+                    Arc::clone(&app_pool),
                     Duration::ZERO,
                 )))
                 .with_external(
@@ -1552,10 +1624,6 @@ impl WyrdTestServerBuilder {
             TokenExchangeSettings::default()
         };
 
-        let postgres = Arc::new(ServerPostgres::from_parts(
-            fixture.wyrd_postgres().clone(),
-            fixture.vala_postgres().clone(),
-        ));
         let operator_pool = postgres.operator_pool().ok_or_else(|| {
             WyrdTestServerError::Start(
                 "test server requires a platform-admin operator pool for Forge".to_owned(),
@@ -1706,6 +1774,7 @@ impl WyrdTestServerBuilder {
                 forge_clock: forge_clock_control,
                 forge_scheduler_trigger,
                 forge_process_role: self.forge_process_role,
+                force_readiness_failure: self.force_readiness_failure,
             },
             mode: Mode::InProcess,
             shutdown_token: None,
@@ -1992,14 +2061,25 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
     WyrdTestServerError::Sql(error.to_string())
 }
 
-pub(crate) async fn test_catalog(
+/// Build the Bifrost query catalog over one process's control-plane pool.
+///
+/// The fixture continues to own migration and seed lifetime, while every
+/// server runtime receives its independently constructed app pool through the
+/// supplied [`ServerPostgres`].
+///
+/// # Errors
+///
+/// Returns when the catalog cannot connect or initialize against the supplied
+/// runtime pool and storage backend.
+pub(crate) async fn test_catalog_with_postgres(
     fixture: &PgFixture,
     storage: &Arc<wyrd_storage::StorageHandle>,
+    postgres: &ServerPostgres,
 ) -> Result<Arc<WyrdCatalog>, WyrdTestServerError> {
     let catalog = WyrdCatalog::new(
         fixture.catalog_dsn().expose_secret(),
         storage.backend_config(),
-        Arc::new(fixture.app_pool().clone()),
+        Arc::new(postgres.app_pool().clone()),
     )
     .await
     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -2010,10 +2090,29 @@ pub(crate) async fn test_redux_catalog(
     fixture: &PgFixture,
     storage: &Arc<wyrd_storage::StorageHandle>,
 ) -> Result<Arc<BifrostCatalog>, WyrdTestServerError> {
+    let postgres = server_postgres_from_fixture(fixture);
+    test_redux_catalog_with_postgres(fixture, storage, &postgres).await
+}
+
+/// Build the Bifrost ingest and Forge catalog over one process's Vala pool.
+///
+/// The fixture owns only database lifetime and initial seed data. Runtime
+/// catalog SQL traffic must use the injected process-local [`ServerPostgres`]
+/// so one simulated pod cannot starve another pod's pool.
+///
+/// # Errors
+///
+/// Returns when the catalog cannot connect or initialize against the supplied
+/// runtime pool and storage backend.
+pub(crate) async fn test_redux_catalog_with_postgres(
+    fixture: &PgFixture,
+    storage: &Arc<wyrd_storage::StorageHandle>,
+    postgres: &ServerPostgres,
+) -> Result<Arc<BifrostCatalog>, WyrdTestServerError> {
     BifrostCatalog::new(
         fixture.catalog_dsn().expose_secret(),
         storage.backend_config(),
-        fixture.vala_postgres().clone(),
+        postgres.vala().clone(),
     )
     .await
     .map(Arc::new)

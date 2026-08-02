@@ -259,6 +259,12 @@ impl AgentTool for BifrostQueryTool {
         })
     }
 
+    /// Describes the closed successful query result and structured invocation error.
+    ///
+    /// Successful output always contains exactly `schema`, `rows`, and `terminal`.
+    /// The terminal object carries the complete source outcome even when no rows
+    /// were returned, while `x-wyrd-error` describes failures raised before a
+    /// contract-valid terminal can be collected.
     fn output_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -339,6 +345,21 @@ impl AgentTool for BifrostQueryTool {
         })
     }
 
+    /// Executes one bounded Oracle query and projects its terminal-aware result.
+    ///
+    /// The workflow validates the MCP arguments, applies hard row and encoded-byte
+    /// ceilings, delegates planning and execution to the authenticated Vala client,
+    /// validates the required terminal frame, and only then serializes Arrow rows.
+    /// Cancellation drops the in-flight client future; rows already collected are
+    /// not returned without a validated terminal, so callers never observe partial
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid-argument errors for malformed query policies or bounds,
+    /// structured invocation errors for authorization, query-floor, admission,
+    /// catalog, storage, timeout, terminal, or incomplete-stream failures, and
+    /// output-serialization errors when an Arrow batch cannot be encoded as JSON.
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
         let sql = required_string(&args, "sql")?;
         let request = BifrostQueryRequest {

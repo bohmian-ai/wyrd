@@ -1,4 +1,8 @@
 //! SQL planning owner for Oracle's immutable visibility cut.
+//!
+//! Planning validates read-only requests, pins tenant-qualified metadata under
+//! one deadline, classifies the cut, and builds session-local providers without
+//! performing admission, audit, or row execution side effects.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -12,15 +16,118 @@ use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
 use wyrd_spec::vala::api::ClusterCapabilities;
 
+use super::*;
 use super::{
     AuthorizedQueryContext, BifrostCatalog, BifrostCatalogError, BifrostError, DrainedTails,
-    HotFileSource, OracleAudit, OracleMemoryResources, OraclePlanner, OracleTableInputs,
-    OracleTableProvider, OracleTelemetry, PinnedSealedTable, PlannedSqlCut, QueryClass, TableRef,
-    map_datafusion_error, optimized_plan_is_complex, query_class_label,
+    HotFileSource, OracleAudit, OracleMemoryResources, OracleTableInputs, OracleTableProvider,
+    OracleTelemetry, PinnedSealedTable, PlannedSqlCut, QueryClass, TableRef, map_datafusion_error,
+    optimized_plan_is_complex, query_class_label,
 };
+
+/// Query floor and logical-plan preparation owner.
+#[derive(Debug, Clone)]
+pub struct OraclePlanner {
+    /// Synchronous floor, deadline, and capacity configuration.
+    pub(super) config: OracleConfig,
+    /// Bounded permits covering sealed metadata planning.
+    pub(super) planning: Arc<Semaphore>,
+}
+
+/// One closed classification result with its production accounting inputs.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct OracleClassification {
+    /// Locked query class selected for admission.
+    pub(super) query_class: QueryClass,
+    /// Closed reason explaining the class selection.
+    pub(super) reason: &'static str,
+    /// Predicted sealed scan duration from the normative formula.
+    pub(super) predicted_scan_seconds: f64,
+}
+
+impl OraclePlanner {
+    /// Creates a planner with bounded synchronous validation settings.
+    #[must_use]
+    pub fn new(config: OracleConfig) -> Self {
+        Self {
+            planning: Arc::new(Semaphore::new(config.planning_permits)),
+            config,
+        }
+    }
+
+    /// Validates one non-empty, single-statement `SELECT` request.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryInvalidSql`] for floor violations.
+    pub fn validate_query(&self, request: &BifrostQueryRequest) -> Result<(), BifrostError> {
+        request
+            .validate()
+            .map_err(|error| BifrostError::QueryInvalidSql {
+                detail: error.to_string(),
+            })?;
+        if request.sql.len() > self.config.max_sql_bytes {
+            return Err(BifrostError::QueryInvalidSql {
+                detail: "query exceeds configured SQL byte limit".to_owned(),
+            });
+        }
+        parse_select_tables(&request.sql)?;
+        Ok(())
+    }
+
+    /// Tries to reserve one bounded planning slot without queuing unbounded work.
+    ///
+    /// # Errors
+    ///
+    /// Returns admission rejection while the planning bound is saturated.
+    fn try_planning(&self) -> Result<OwnedSemaphorePermit, BifrostError> {
+        Arc::clone(&self.planning)
+            .try_acquire_owned()
+            .map_err(|_| BifrostError::QueryAdmissionRejected)
+    }
+
+    /// Applies the normative estimated-byte classification formula.
+    #[must_use]
+    pub fn classify(estimated_bytes: u64, live_oracle_cpu: f64, complex: bool) -> QueryClass {
+        Self::classification(estimated_bytes, live_oracle_cpu, complex).query_class
+    }
+
+    /// Produces the class, closed reason, and predicted duration from one cut.
+    #[must_use]
+    fn classification(
+        estimated_bytes: u64,
+        live_oracle_cpu: f64,
+        complex: bool,
+    ) -> OracleClassification {
+        let cpu = (live_oracle_cpu * 0.8).floor().max(1.0);
+        let seconds =
+            estimated_bytes.to_f64().unwrap_or(f64::MAX) / ESTIMATED_SCAN_BYTES_PER_SECOND / cpu;
+        if complex {
+            OracleClassification {
+                query_class: QueryClass::Analytical,
+                reason: "global_operator",
+                predicted_scan_seconds: seconds,
+            }
+        } else if seconds > INTERACTIVE_SCAN_LIMIT_SECONDS {
+            OracleClassification {
+                query_class: QueryClass::Analytical,
+                reason: "predicted_scan",
+                predicted_scan_seconds: seconds,
+            }
+        } else {
+            OracleClassification {
+                query_class: QueryClass::Interactive,
+                reason: "estimated_scan",
+                predicted_scan_seconds: seconds,
+            }
+        }
+    }
+}
 
 impl OraclePlanner {
     /// Pins every table scan in a typed plan against one authenticated tenant.
+    ///
+    /// Tables are pinned sequentially under one absolute deadline. Cancellation
+    /// drops the active catalog future; cuts already returned are immutable local
+    /// values and are discarded with the incomplete result.
     ///
     /// # Errors
     /// Returns invalid SQL for non-canonical scans or timeout/catalog failures
@@ -49,6 +156,10 @@ impl OraclePlanner {
     }
 
     /// Builds executable providers from authenticated cuts and drained tails.
+    ///
+    /// Provider construction consumes each cut and transfers its matching drained
+    /// batches into the provider map. Cancellation can leave only local partially
+    /// constructed providers, which are dropped because no map is returned.
     ///
     /// # Errors
     /// Returns metadata, storage, or provider-construction failures.
@@ -121,6 +232,9 @@ impl OraclePlanner {
 
     /// Creates one physical plan and retains its execution session context.
     ///
+    /// Cancellation drops the `DataFusion` planning future and returns no session
+    /// or executable plan, so no partially prepared execution escapes.
+    ///
     /// # Errors
     /// Returns query execution failure when `DataFusion` cannot lower the plan.
     pub(super) async fn create_physical_plan(
@@ -139,6 +253,9 @@ impl OraclePlanner {
     ///
     /// The planner owns parsing-adjacent metadata work and never executes rows;
     /// provider installation remains an Oracle composition concern after audit.
+    /// The planning permit spans all catalog pins, schema-only optimization, and
+    /// classification. Cancellation drops that permit and any local partial cuts;
+    /// no admission or audit side effect has occurred at this stage.
     ///
     /// # Errors
     /// Returns timeout, catalog, planning, or byte-accounting failures.
@@ -196,6 +313,9 @@ impl OraclePlanner {
     }
 
     /// Lowers and optimizes SQL against schema-only providers from one cut.
+    ///
+    /// All registered providers are empty and session-local. Cancellation during
+    /// SQL lowering or optimization drops the session and exposes no partial plan.
     ///
     /// # Errors
     /// Returns a stable planning failure when schema projection, registration,

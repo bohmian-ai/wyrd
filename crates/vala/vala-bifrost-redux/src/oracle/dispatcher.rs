@@ -1,11 +1,13 @@
 //! Bounded local and tonic sealed-fragment dispatch.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
@@ -23,7 +25,6 @@ use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::tonic::{Request, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
-use super::OracleSlotManager;
 use super::attempt::{AttemptBuffer, AttemptError, ValidatedAttempt};
 use super::executor::{ExecutorError, SealedFragmentExecutor};
 use super::fragment::SealedScanFragment;
@@ -35,6 +36,7 @@ use super::telemetry::{
     FragmentLocality, FragmentOutcome, FragmentTelemetry, PeerErrorClass, SecurityEventClass,
     SlotOutcome, record_peer_attempt, record_security, record_slot,
 };
+use super::{OracleExecutionError, OracleSlotManager, decode_attempt_batches};
 use crate::scribe::memory::BifrostMemoryGovernor;
 
 /// Fixed private peer protocol version.
@@ -43,6 +45,10 @@ pub const PEER_PROTOCOL_VERSION: u32 = 1;
 const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
 const RESERVATION_RETRY_MS: u32 = 1_000;
+
+/// One lazily polled production fragment attempt owned by bounded query dispatch.
+pub(super) type SealedFragmentFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ValidatedAttempt, OracleExecutionError>> + Send + 'a>>;
 
 /// Transport failure classification used by retry policy.
 #[derive(Debug, Error)]
@@ -1123,6 +1129,52 @@ pub struct FragmentDispatcher {
 }
 
 impl FragmentDispatcher {
+    /// Polls fragment attempts under the admitted bound and drains siblings on failure.
+    ///
+    /// Bytes are decoded only after a complete attempt validates. A terminal or
+    /// decode failure cancels the shared token and awaits every active sibling so
+    /// reservation guards release before this operation returns. Cancellation of
+    /// the owning task may interrupt cleanup after already-polled siblings make
+    /// partial progress; their reservation guards remain drop-safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first transport, terminal, or decode failure after sibling cleanup.
+    pub(super) async fn dispatch_attempts(
+        attempts: Vec<SealedFragmentFuture<'_>>,
+        parallelism: usize,
+        siblings: &CancellationToken,
+        output: &mut Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<(), OracleExecutionError> {
+        let mut attempts = attempts.into_iter();
+        let mut pending = FuturesUnordered::new();
+        loop {
+            while pending.len() < parallelism {
+                let Some(attempt) = attempts.next() else {
+                    break;
+                };
+                pending.push(attempt);
+            }
+            let Some(attempt) = pending.next().await else {
+                return Ok(());
+            };
+            match attempt {
+                Ok(attempt) => {
+                    if let Err(error) = decode_attempt_batches(attempt, output) {
+                        siblings.cancel();
+                        while pending.next().await.is_some() {}
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => {
+                    siblings.cancel();
+                    while pending.next().await.is_some() {}
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     /// Creates a dispatcher from narrow authority and transport capabilities.
     #[must_use]
     pub fn new(

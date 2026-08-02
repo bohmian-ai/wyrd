@@ -1,15 +1,210 @@
 //! Terminal-aware query stream owner.
+//!
+//! The stream retains admission, renewal, cancellation, telemetry, and lazy
+//! physical batches until exactly one terminal outcome releases owned resources.
 
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 
-use super::{
-    OracleQueryStream, QueryStreamEvent, QueryStreamFrame, QueryStreamInput,
-    QueryTerminalErrorCode, encode_batch_frame, encode_schema_frame,
-    failed_terminal_for_visibility, query_class_label, successful_terminal, terminal_error_code,
-    terminal_error_label,
-};
+use super::*;
+
+/// Owned query stream handle.  Frame production remains lazy and cancellation-aware.
+pub struct OracleQueryStream {
+    /// Stable fingerprint known before the first transport byte is emitted.
+    pub schema_fingerprint: String,
+    /// Underlying frame stream.
+    pub frames: std::pin::Pin<Box<OracleFrameStream>>,
+    /// Cancellation signal used by the stream owner to force awaited cleanup.
+    pub(super) cancellation: CancellationToken,
+}
+
+impl std::fmt::Debug for OracleQueryStream {
+    /// Formats only the stream owner label without exposing schema, frames,
+    /// cancellation, or lifecycle state; formatting never consumes or polls
+    /// the lazy frame stream.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OracleQueryStream")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Complete owned inputs for one terminal-aware query stream.
+pub(super) struct QueryStreamInput {
+    /// Public output schema.
+    pub(super) schema: SchemaRef,
+    /// Lazy physical batch stream.
+    pub(super) batches: SendableRecordBatchStream,
+    /// Pre-byte lookahead result.
+    pub(super) first: Option<Result<RecordBatch, datafusion::error::DataFusionError>>,
+    /// Stream-owned durable and local admission capacity.
+    pub(super) admitted: AdmittedQueryGuard,
+    /// Absolute execution deadline.
+    pub(super) deadline: Instant,
+    /// Requested visibility contract.
+    pub(super) visibility: VisibilityMode,
+    /// Immutable admission class.
+    pub(super) query_class: QueryClass,
+    /// Whether live visibility degraded.
+    pub(super) degraded: bool,
+    /// Whether the one stale-cut replan was consumed.
+    pub(super) stale_replanned: bool,
+    /// Production query telemetry retained through terminal emission.
+    pub(super) query_telemetry: QueryTelemetryGuard,
+}
+
+/// One cancellation-, timeout-, or batch-aware stream step.
+enum QueryStreamEvent {
+    /// Next physical batch result, or `None` when execution completed.
+    Batch(Option<Result<RecordBatch, datafusion::error::DataFusionError>>),
+    /// Stable terminal failure selected before another batch is exposed.
+    Failed(QueryTerminalErrorCode),
+}
+
+/// Waits for the next physical batch while enforcing lease cancellation and deadline.
+///
+/// Lease cancellation wins over starting another read when already observable.
+/// While waiting, cancellation and the absolute deadline race the physical stream;
+/// any earlier batches remain accounted by the owner, but no additional batch is
+/// exposed after a cancellation or timeout event is selected.
+async fn next_query_stream_event(
+    batches: &mut SendableRecordBatchStream,
+    cancellation: &CancellationToken,
+    renewal_terminal: &Mutex<Option<QueryTerminalErrorCode>>,
+    deadline: Instant,
+) -> QueryStreamEvent {
+    if cancellation.is_cancelled() {
+        return QueryStreamEvent::Failed(renewal_terminal_code(renewal_terminal));
+    }
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout);
+    };
+    tokio::select! {
+        () = cancellation.cancelled() => {
+            QueryStreamEvent::Failed(renewal_terminal_code(renewal_terminal))
+        }
+        () = tokio::time::sleep(remaining) => {
+            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout)
+        }
+        value = batches.next() => QueryStreamEvent::Batch(value),
+    }
+}
+
+/// Reads the renewal-selected terminal code without exposing lock poisoning.
+fn renewal_terminal_code(
+    renewal_terminal: &Mutex<Option<QueryTerminalErrorCode>>,
+) -> QueryTerminalErrorCode {
+    renewal_terminal
+        .lock()
+        .ok()
+        .and_then(|reason| *reason)
+        .unwrap_or(QueryTerminalErrorCode::QueryExecutionFailed)
+}
+
+/// Constructs the validated success/degraded terminal for one completed stream.
+fn successful_terminal(
+    visibility: VisibilityMode,
+    degraded: bool,
+    stale_replanned: bool,
+    row_count: u64,
+) -> QueryTerminalFrame {
+    let freshness = if degraded {
+        QueryFreshness::Degraded
+    } else {
+        QueryFreshness::Complete
+    };
+    let outcome = if degraded {
+        QueryTerminalOutcome::Degraded
+    } else {
+        QueryTerminalOutcome::Success
+    };
+    let mut warnings = Vec::new();
+    if degraded {
+        warnings.push(wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable);
+    }
+    if stale_replanned {
+        warnings.push(wyrd_spec::vala::api::QueryWarning::StaleCutReplanned);
+    }
+    let mut source_completion = vec![
+        SourceCompletion {
+            source: QuerySource::Iceberg,
+            outcome: SourceCompletionOutcome::Complete,
+        },
+        SourceCompletion {
+            source: QuerySource::HotSealed,
+            outcome: SourceCompletionOutcome::Complete,
+        },
+    ];
+    if visibility == VisibilityMode::Fused {
+        source_completion.push(SourceCompletion {
+            source: QuerySource::LiveTail,
+            outcome: if degraded {
+                SourceCompletionOutcome::Unavailable
+            } else {
+                SourceCompletionOutcome::Complete
+            },
+        });
+    }
+    QueryTerminalFrame {
+        outcome,
+        freshness,
+        row_count,
+        warnings,
+        source_completion,
+        error: None,
+    }
+}
+
+/// Encodes one Arrow schema frame and its stable fingerprint.
+///
+/// # Errors
+///
+/// Returns query execution failure when Arrow IPC rejects the schema.
+fn encode_schema_frame(schema: &SchemaRef) -> Result<QuerySchemaFrame, BifrostError> {
+    let mut bytes = Vec::new();
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema)
+        .map_err(|_| BifrostError::QueryExecutionFailed)?;
+    writer
+        .finish()
+        .map_err(|_| BifrostError::QueryExecutionFailed)?;
+    Ok(QuerySchemaFrame {
+        schema_fingerprint: hex::encode(SchemaFingerprint::from_arrow_schema(schema).0),
+        arrow_ipc_schema: bytes,
+    })
+}
+
+/// Encodes one bounded Arrow record batch frame.
+///
+/// # Errors
+///
+/// Returns query execution failure when Arrow IPC rejects the batch.
+fn encode_batch_frame(batch: &RecordBatch) -> Result<QueryBatchFrame, BifrostError> {
+    let mut bytes = Vec::new();
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &batch.schema())
+        .map_err(|_| BifrostError::QueryExecutionFailed)?;
+    writer
+        .write(batch)
+        .and_then(|()| writer.finish())
+        .map_err(|_| BifrostError::QueryExecutionFailed)?;
+    Ok(QueryBatchFrame {
+        arrow_ipc_batch: bytes,
+    })
+}
+
+/// Maps a late `DataFusion` failure to the closed terminal-code catalog.
+fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTerminalErrorCode {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("tenant invariant") {
+        QueryTerminalErrorCode::QueryTenantInvariant
+    } else if message.contains("reconciliation invariant") {
+        QueryTerminalErrorCode::QueryReconciliationInvariant
+    } else if message.contains("audit unavailable") {
+        QueryTerminalErrorCode::QueryAuditUnavailable
+    } else {
+        QueryTerminalErrorCode::QueryExecutionFailed
+    }
+}
 
 impl OracleQueryStream {
     /// Builds a synthetic stream for transport and collector tests.
@@ -70,11 +265,11 @@ impl OracleQueryStream {
             yield Ok(QueryStreamFrame::Schema(schema_frame));
             loop {
                 let event = if lease_cancellation.is_cancelled() {
-                    QueryStreamEvent::Failed(super::renewal_terminal_code(&renewal_terminal))
+                    QueryStreamEvent::Failed(renewal_terminal_code(&renewal_terminal))
                 } else if let Some(value) = next.take() {
                     QueryStreamEvent::Batch(Some(value))
                 } else {
-                    super::next_query_stream_event(
+                    next_query_stream_event(
                         &mut batches,
                         &lease_cancellation,
                         &renewal_terminal,

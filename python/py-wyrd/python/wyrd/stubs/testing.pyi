@@ -43,7 +43,25 @@ class WyrdTestServer:
         ...
 
     def prepare_oracle_query_fixture(self) -> tuple[str, str]:
-        """Create a sealed query table and return ``(table_fqn, access_token)``."""
+        """Create sealed and live query rows and return ``(table_fqn, access_token)``."""
+        ...
+
+    def stall_next_query_after_schema(self) -> None:
+        """Stall the next query after its schema for cancellation testing."""
+        ...
+
+    def wait_query_schema_stall(self) -> str:
+        """Wait until the scheduled query reaches its schema stall."""
+        ...
+
+    def bifrost_query_resource_snapshot(self, query_id: str) -> dict[str, int]:
+        """Return exact admission, memory, peer-slot, and tail-fence counts."""
+        ...
+
+    def wait_bifrost_query_resources_released(
+        self, query_id: str, baseline: dict[str, int]
+    ) -> dict[str, int]:
+        """Wait until query resource counts return exactly to ``baseline``."""
         ...
 
 __all__ = ["WyrdTestServer"]

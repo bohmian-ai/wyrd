@@ -65,9 +65,19 @@ pub(crate) async fn sync_query(
         .query_stream_fault
         .as_ref()
         .and_then(|controller| controller.claim());
+    #[cfg(feature = "test-support")]
+    let stall = match fault {
+        Some(crate::state::QueryStreamFault::StallAfterSchema) => state
+            .query_stream_fault
+            .as_ref()
+            .and_then(|controller| controller.claim_stall()),
+        _ => None,
+    };
     #[cfg(not(feature = "test-support"))]
     let fault = None;
-    query_stream_response_with_fault(result, fault)
+    #[cfg(not(feature = "test-support"))]
+    let stall = None;
+    query_stream_response_with_fault(result, fault, stall)
 }
 
 /// Converts an admitted Oracle stream into the stable HTTP frame transport.
@@ -82,7 +92,24 @@ pub(crate) async fn sync_query(
 /// response construction failures return the stable internal problem response.
 #[cfg(test)]
 pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
-    query_stream_response_with_fault(result, None)
+    query_stream_response_with_fault(result, None, None)
+}
+
+/// Drop guard notifying test waiters after the stalled body releases its stream.
+#[cfg(feature = "test-support")]
+struct QueryBodyDropNotifier {
+    /// Shared lifecycle state paired with the scheduled stall.
+    stall: Option<std::sync::Arc<crate::state::QueryStreamStall>>,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for QueryBodyDropNotifier {
+    /// Publishes response-owner release after later-declared stream state drops.
+    fn drop(&mut self) {
+        if let Some(stall) = &self.stall {
+            stall.mark_dropped();
+        }
+    }
 }
 
 /// Converts an admitted Oracle stream into HTTP frames, optionally truncating
@@ -95,10 +122,15 @@ pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
 fn query_stream_response_with_fault(
     result: OracleQueryStream,
     fault: Option<crate::state::QueryStreamFault>,
+    stall: Option<std::sync::Arc<crate::state::QueryStreamStall>>,
 ) -> Response {
     let schema_fingerprint = result.schema_fingerprint.clone();
-    let mut stream = Some(result);
+    if let Some(stall) = &stall {
+        stall.bind_resource_probe(result.resource_probe_for_test());
+    }
     let body = Body::from_stream(async_stream::stream! {
+        let _drop_notifier = QueryBodyDropNotifier { stall: stall.clone() };
+        let mut stream = Some(result);
         let mut emitted = 0_u8;
         while let Some(frame) = match stream.as_mut() {
             Some(query) => query.frames.next().await,
@@ -127,6 +159,13 @@ fn query_stream_response_with_fault(
                     }
                     return;
                 }
+                Some(crate::state::QueryStreamFault::StallAfterSchema) if emitted >= 1 => {
+                    if let Some(stall) = &stall {
+                        stall.mark_entered();
+                        std::future::pending::<()>().await;
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -147,7 +186,11 @@ fn query_stream_response_with_fault(
 }
 
 #[cfg(not(feature = "test-support"))]
-fn query_stream_response_with_fault(result: OracleQueryStream, _fault: Option<()>) -> Response {
+fn query_stream_response_with_fault(
+    result: OracleQueryStream,
+    _fault: Option<()>,
+    _stall: Option<()>,
+) -> Response {
     let schema_fingerprint = result.schema_fingerprint;
     let mut frames = result.frames;
     let body = Body::from_stream(async_stream::stream! {

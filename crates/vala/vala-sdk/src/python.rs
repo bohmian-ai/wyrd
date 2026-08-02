@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use futures_util::future::{AbortHandle, Abortable};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyType};
@@ -39,11 +40,11 @@ impl NativeStreamOwner {
     ///
     /// Returns the owner's protocol, Arrow, transport, terminal, or
     /// incomplete-stream error without changing its retained terminal state.
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
         match self {
-            Self::Production(stream) => wyrd_runtime::runtime().block_on(stream.next_batch()),
+            Self::Production(stream) => stream.next_batch().await,
             #[cfg(test)]
-            Self::Test(stream) => stream.next_batch(),
+            Self::Test(stream) => stream.next_batch().await,
         }
     }
 
@@ -68,6 +69,35 @@ struct TestStreamOwner {
     dropped: Arc<std::sync::atomic::AtomicBool>,
     /// Counts calls into the injected owner so closed polls prove no re-entry.
     polls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Optional gate that leaves a poll pending until cancellation drops it.
+    pending: Option<TestPendingPoll>,
+}
+
+#[cfg(test)]
+/// Deterministic pending-poll controls used by cancellation race tests.
+struct TestPendingPoll {
+    /// Signals that the native poll reached its blocking point.
+    entered: Option<std::sync::mpsc::SyncSender<()>>,
+    /// Future that remains pending until its sender is dropped by the test.
+    release: tokio::sync::oneshot::Receiver<()>,
+    /// Sentinel set when cancellation drops the pending future.
+    future_dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+/// Drop sentinel wrapped around a deterministic pending future.
+struct PendingDropGuard {
+    /// Sentinel set when the pending poll future is cancelled or completes.
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for PendingDropGuard {
+    /// Records that the native pending future no longer occupies a worker.
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -84,6 +114,28 @@ impl TestStreamOwner {
             terminal,
             dropped,
             polls,
+            pending: None,
+        }
+    }
+
+    /// Creates an owner whose first poll deterministically blocks until aborted.
+    fn pending(
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        future_dropped: Arc<std::sync::atomic::AtomicBool>,
+        owner_dropped: Arc<std::sync::atomic::AtomicBool>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            next: std::collections::VecDeque::new(),
+            terminal: None,
+            dropped: owner_dropped,
+            polls,
+            pending: Some(TestPendingPoll {
+                entered: Some(entered),
+                release,
+                future_dropped,
+            }),
         }
     }
 
@@ -93,8 +145,17 @@ impl TestStreamOwner {
     ///
     /// Returns the injected error, or [`ValaSdkError::IncompleteQueryStream`]
     /// after all injected results have been consumed.
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
         self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(mut pending) = self.pending.take() {
+            let _drop_guard = PendingDropGuard {
+                dropped: Arc::clone(&pending.future_dropped),
+            };
+            if let Some(entered) = pending.entered.take() {
+                let _ = entered.send(());
+            }
+            let _ = pending.release.await;
+        }
         self.next
             .pop_front()
             .unwrap_or(Err(ValaSdkError::IncompleteQueryStream))
@@ -253,7 +314,9 @@ impl PyBifrostQueryClient {
             .detach(|| wyrd_runtime::runtime().block_on(self.client.query(&request)))
             .map_err(query_error_to_py)?;
         Ok(PyBifrostQueryStream {
+            consumer: Mutex::new(()),
             stream: Mutex::new(Some(NativeStreamOwner::Production(Box::new(stream)))),
+            poll_abort: Mutex::new(PollAbortState::new()),
             terminal_json: Mutex::new(None),
         })
     }
@@ -262,10 +325,75 @@ impl PyBifrostQueryClient {
 /// Native terminal-validating stream used by Python's async iterator facade.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "_NativeBifrostQueryStream")]
 pub struct PyBifrostQueryStream {
+    /// Serializes consumers without blocking cancellation signalling.
+    consumer: Mutex<()>,
     /// Rust stream removed on explicit close or after terminal completion.
     stream: Mutex<Option<NativeStreamOwner>>,
+    /// Short-held state for aborting the currently pending native poll.
+    poll_abort: Mutex<PollAbortState>,
     /// Serialized terminal retained after the Rust stream is released.
     terminal_json: Mutex<Option<String>>,
+}
+
+/// Abort state for exactly one serialized native query poll.
+struct PollAbortState {
+    /// Monotonic identity used to avoid clearing a replacement handle.
+    next_id: u64,
+    /// Identity and handle for the poll currently entering or awaiting IO.
+    current: Option<(u64, AbortHandle)>,
+}
+
+impl PollAbortState {
+    /// Creates empty abort state for a newly opened stream.
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            current: None,
+        }
+    }
+
+    /// Installs one handle and returns its identity.
+    fn install(&mut self, handle: AbortHandle) -> u64 {
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        self.current = Some((id, handle));
+        id
+    }
+
+    /// Clears the handle only when it still belongs to the completed poll.
+    fn clear(&mut self, id: u64) {
+        if matches!(self.current, Some((current, _)) if current == id) {
+            self.current = None;
+        }
+    }
+
+    /// Takes and signals the pending poll without retaining the state lock.
+    fn abort_current(&mut self) {
+        if let Some((_, handle)) = self.current.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Rust-native poll outcome retained until the response owner has dropped.
+enum NativePollOutcome {
+    /// One Arrow batch encoded successfully.
+    Batch(Vec<u8>),
+    /// The stream completed with serialized terminal metadata.
+    Complete(String),
+    /// The stream was already closed before polling began.
+    Closed,
+    /// Explicit close aborted the pending network poll.
+    Aborted,
+    /// The SDK returned a structured query failure.
+    QueryError {
+        /// Structured SDK error projected after native ownership is released.
+        error: ValaSdkError,
+        /// Optional serialized terminal retained before projecting the error.
+        terminal: Option<String>,
+    },
+    /// Local serialization or Arrow encoding failed.
+    ProjectionError(String),
 }
 
 #[pymethods]
@@ -281,49 +409,89 @@ impl PyBifrostQueryStream {
     /// Arrow, or poisoned-state failures.
     fn next_ipc(&self, py: Python<'_>) -> PyResult<Option<Vec<u8>>> {
         py.detach(|| {
-            let mut stream_slot = self
-                .stream
+            let _consumer = self
+                .consumer
                 .lock()
-                .map_err(|_| PyRuntimeError::new_err("query stream lock poisoned"))?;
-            let stream = stream_slot
-                .as_mut()
-                .ok_or_else(|| PyRuntimeError::new_err("query stream is closed"))?;
-            let next = match stream.next_batch() {
-                Ok(next) => next,
-                Err(error) => {
-                    let terminal = stream
-                        .terminal()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|error| PyRuntimeError::new_err(error.to_string()));
-                    *stream_slot = None;
-                    let terminal = terminal?;
-                    if let Some(terminal) = terminal {
-                        *self
-                            .terminal_json
-                            .lock()
-                            .map_err(|_| PyRuntimeError::new_err("terminal lock poisoned"))? =
-                            Some(terminal);
-                    }
-                    return Err(query_error_to_py(error));
-                }
-            };
-            match next {
-                Some(batch) => match encode_batch(&batch) {
-                    Ok(batch) => Ok(Some(batch)),
-                    Err(error) => {
-                        *stream_slot = None;
-                        Err(error)
+                .map_err(|_| PyRuntimeError::new_err("query consumer lock poisoned"))?;
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            let poll_id = self
+                .poll_abort
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("query abort lock poisoned"))?
+                .install(abort_handle);
+
+            let outcome = match self.stream.lock() {
+                Ok(mut stream_slot) => match stream_slot.as_mut() {
+                    None => NativePollOutcome::Closed,
+                    Some(stream) => {
+                        let next = wyrd_runtime::runtime()
+                            .block_on(Abortable::new(stream.next_batch(), abort_registration));
+                        match next {
+                            Err(_) => {
+                                drop(stream_slot.take());
+                                NativePollOutcome::Aborted
+                            }
+                            Ok(Err(error)) => {
+                                let terminal = stream
+                                    .terminal()
+                                    .map(serde_json::to_string)
+                                    .transpose()
+                                    .map_err(|error| error.to_string());
+                                drop(stream_slot.take());
+                                match terminal {
+                                    Ok(terminal) => {
+                                        NativePollOutcome::QueryError { error, terminal }
+                                    }
+                                    Err(error) => NativePollOutcome::ProjectionError(error),
+                                }
+                            }
+                            Ok(Ok(Some(batch))) => match encode_batch(&batch) {
+                                Ok(batch) => NativePollOutcome::Batch(batch),
+                                Err(error) => {
+                                    drop(stream_slot.take());
+                                    NativePollOutcome::ProjectionError(error)
+                                }
+                            },
+                            Ok(Ok(None)) => {
+                                let terminal = stream
+                                    .terminal()
+                                    .map(serde_json::to_string)
+                                    .transpose()
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|terminal| {
+                                        terminal.ok_or_else(|| {
+                                            ValaSdkError::IncompleteQueryStream.detail()
+                                        })
+                                    });
+                                drop(stream_slot.take());
+                                match terminal {
+                                    Ok(terminal) => NativePollOutcome::Complete(terminal),
+                                    Err(error)
+                                        if error
+                                            == ValaSdkError::IncompleteQueryStream.detail() =>
+                                    {
+                                        NativePollOutcome::QueryError {
+                                            error: ValaSdkError::IncompleteQueryStream,
+                                            terminal: None,
+                                        }
+                                    }
+                                    Err(error) => NativePollOutcome::ProjectionError(error),
+                                }
+                            }
+                        }
                     }
                 },
-                None => {
-                    let terminal = match stream.terminal() {
-                        Some(terminal) => serde_json::to_string(terminal)
-                            .map_err(|error| PyRuntimeError::new_err(error.to_string())),
-                        None => Err(query_error_to_py(ValaSdkError::IncompleteQueryStream)),
-                    };
-                    *stream_slot = None;
-                    let terminal = terminal?;
+                Err(_) => NativePollOutcome::ProjectionError("query stream lock poisoned".into()),
+            };
+
+            self.poll_abort
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("query abort lock poisoned"))?
+                .clear(poll_id);
+
+            match outcome {
+                NativePollOutcome::Batch(batch) => Ok(Some(batch)),
+                NativePollOutcome::Complete(terminal) => {
                     *self
                         .terminal_json
                         .lock()
@@ -331,6 +499,21 @@ impl PyBifrostQueryStream {
                         Some(terminal);
                     Ok(None)
                 }
+                NativePollOutcome::Closed => Err(PyRuntimeError::new_err("query stream is closed")),
+                NativePollOutcome::Aborted => {
+                    Err(PyRuntimeError::new_err("query stream poll aborted"))
+                }
+                NativePollOutcome::QueryError { error, terminal } => {
+                    if let Some(terminal) = terminal {
+                        *self
+                            .terminal_json
+                            .lock()
+                            .map_err(|_| PyRuntimeError::new_err("terminal lock poisoned"))? =
+                            Some(terminal);
+                    }
+                    Err(query_error_to_py(error))
+                }
+                NativePollOutcome::ProjectionError(error) => Err(PyRuntimeError::new_err(error)),
             }
         })
     }
@@ -354,10 +537,16 @@ impl PyBifrostQueryStream {
     ///
     /// Raises `RuntimeError` when internal synchronization was poisoned.
     fn close(&self) -> PyResult<()> {
-        *self
-            .stream
+        self.poll_abort
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("query stream lock poisoned"))? = None;
+            .map_err(|_| PyRuntimeError::new_err("query abort lock poisoned"))?
+            .abort_current();
+        drop(
+            self.stream
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("query stream lock poisoned"))?
+                .take(),
+        );
         Ok(())
     }
 
@@ -380,7 +569,9 @@ impl PyBifrostQueryStream {
     /// Wraps an injectable owner for deterministic native cleanup tests.
     fn new_for_test(owner: TestStreamOwner) -> Self {
         Self {
+            consumer: Mutex::new(()),
             stream: Mutex::new(Some(NativeStreamOwner::Test(owner))),
+            poll_abort: Mutex::new(PollAbortState::new()),
             terminal_json: Mutex::new(None),
         }
     }
@@ -470,14 +661,14 @@ fn parse_freshness(value: &str) -> PyResult<FreshnessPolicy> {
 /// # Errors
 ///
 /// Raises a Wyrd-coded `RuntimeError` when Arrow IPC encoding fails.
-fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> PyResult<Vec<u8>> {
+fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref())
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     writer
         .write(batch)
         .and_then(|()| writer.finish())
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     Ok(bytes)
 }
 
@@ -539,6 +730,27 @@ mod tests {
     };
 
     use super::*;
+
+    /// Builds the complete published-only terminal used by lifecycle tests.
+    fn success_terminal() -> QueryTerminalFrame {
+        QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Success,
+            freshness: QueryFreshness::Complete,
+            row_count: 0,
+            warnings: Vec::new(),
+            source_completion: vec![
+                SourceCompletion {
+                    source: QuerySource::Iceberg,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::HotSealed,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+            ],
+            error: None,
+        }
+    }
 
     /// Python query exceptions retain their subtype and every typed metadata field.
     #[test]
@@ -605,12 +817,11 @@ mod tests {
                     .expect("u16"),
                 502
             );
-            assert_eq!(
+            assert!(
                 incomplete_value
                     .getattr("details")
                     .expect("details")
-                    .is_none(),
-                true
+                    .is_none()
             );
 
             let unavailable =
@@ -860,6 +1071,122 @@ mod tests {
             );
             assert!(value.getattr("details").expect("details").is_none());
         });
+    }
+
+    /// Closing before a poll starts is idempotent and prevents owner re-entry.
+    #[test]
+    fn native_close_before_poll_drops_owner_without_polling() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
+            std::collections::VecDeque::new(),
+            None,
+            Arc::clone(&dropped),
+            Arc::clone(&polls),
+        ));
+
+        owner.close().expect("first close succeeds");
+        owner.close().expect("second close is idempotent");
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert!(
+            poll(&owner)
+                .expect_err("closed poll rejects")
+                .to_string()
+                .contains("closed")
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Closing a pending poll aborts its future and leaves no worker blocked.
+    #[test]
+    fn native_close_during_poll_aborts_and_drops_owner() {
+        let future_dropped = Arc::new(AtomicBool::new(false));
+        let owner_dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let owner = Arc::new(PyBifrostQueryStream::new_for_test(
+            TestStreamOwner::pending(
+                entered_tx,
+                release_rx,
+                Arc::clone(&future_dropped),
+                Arc::clone(&owner_dropped),
+                Arc::clone(&polls),
+            ),
+        ));
+
+        std::thread::scope(|scope| {
+            let poll_owner = Arc::clone(&owner);
+            let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+            let worker = scope.spawn(move || {
+                let result = poll(&poll_owner);
+                completed_tx
+                    .send(())
+                    .expect("bounded completion receiver remains live");
+                result
+            });
+            entered_rx
+                .recv()
+                .expect("pending poll reports entry without timing guesses");
+            owner
+                .close()
+                .expect("close signals abort before waiting for stream");
+            completed_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("native poll completion arrives within the test bound");
+            let error = worker
+                .join()
+                .expect("native poll worker exits")
+                .expect_err("aborted poll returns an internal closed outcome");
+            assert!(error.to_string().contains("aborted"));
+        });
+
+        assert!(future_dropped.load(Ordering::SeqCst));
+        assert!(owner_dropped.load(Ordering::SeqCst));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(
+            poll(&owner).is_err(),
+            "follow-up poll is immediately closed"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(
+            owner
+                .poll_abort
+                .lock()
+                .expect("abort state remains healthy")
+                .current
+                .is_none()
+        );
+    }
+
+    /// Closing after terminal completion is idempotent and retains diagnostics.
+    #[test]
+    fn native_terminal_then_close_is_idempotent() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
+            std::collections::VecDeque::from([Ok(None)]),
+            Some(success_terminal()),
+            Arc::clone(&dropped),
+            Arc::clone(&polls),
+        ));
+
+        assert!(poll(&owner).expect("terminal poll succeeds").is_none());
+        let terminal = owner
+            .terminal_json()
+            .expect("terminal lock remains healthy")
+            .expect("terminal diagnostics are retained");
+        owner.close().expect("first close after terminal succeeds");
+        owner.close().expect("second close after terminal succeeds");
+
+        assert_eq!(
+            owner.terminal_json().expect("terminal remains readable"),
+            Some(terminal)
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 
     /// A poisoned terminal lock still drops the stream before returning failure.

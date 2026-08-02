@@ -80,3 +80,47 @@ def test_bifrost_query_gate_denial_has_no_oracle_side_effect(
 
     asyncio.run(query())
     assert wyrd_server.bifrost_read_decision_count() == before
+
+
+@pytest.mark.integration
+def test_bifrost_query_cancellation_releases_all_resources(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    baseline = {
+        "admission_slots": 0,
+        "memory_bytes": 0,
+        "peer_slots": 0,
+        "tail_fences": 0,
+    }
+    wyrd_server.stall_next_query_after_schema()
+
+    async def cancel_query() -> tuple[dict[str, int], dict[str, int]]:
+        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+            f"SELECT id, value FROM {table_fqn} ORDER BY id",
+            visibility="fused",
+            freshness="strict",
+        )
+        consumer = asyncio.create_task(stream.__anext__())
+        query_id = await asyncio.to_thread(wyrd_server.wait_query_schema_stall)
+        active = await asyncio.to_thread(wyrd_server.bifrost_query_resource_snapshot, query_id)
+        consumer.cancel("cancel stalled Bifrost query")
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        released = await asyncio.to_thread(
+            wyrd_server.wait_bifrost_query_resources_released,
+            query_id,
+            baseline,
+        )
+        await stream.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
+        return active, released
+
+    active, released = asyncio.run(cancel_query())
+    assert active["admission_slots"] > baseline["admission_slots"]
+    assert active["memory_bytes"] > baseline["memory_bytes"]
+    assert active["peer_slots"] > baseline["peer_slots"]
+    # The live tail is drained into query-owned memory before schema emission.
+    assert active["tail_fences"] == baseline["tail_fences"]
+    assert released == baseline

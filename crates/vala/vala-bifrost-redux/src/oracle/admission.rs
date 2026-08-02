@@ -26,6 +26,94 @@ pub struct OracleAdmission {
     pub(super) lease_release_queue: Arc<Mutex<LeaseReleaseQueue>>,
 }
 
+/// Exact resources retained by one query identity for test-tier lifecycle proof.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryResourceSnapshot {
+    /// Durable admission slot units retained by this query.
+    pub admission_slots: u64,
+    /// Query-owned memory bytes retained after live-tail drain.
+    pub memory_bytes: u64,
+    /// Local leader or peer-worker slot units retained by this query.
+    pub peer_slots: u64,
+    /// Live-tail fences retained by this query.
+    pub tail_fences: u64,
+}
+
+/// Query-identity-keyed lifecycle observation shared with test-tier transports.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct QueryResourceProbe {
+    /// Existing Oracle query identity naming this observation.
+    query_id: QueryId,
+    /// Latest exact resource ownership and notification channel.
+    snapshot: tokio::sync::watch::Sender<QueryResourceSnapshot>,
+}
+
+#[cfg(feature = "test-support")]
+impl QueryResourceProbe {
+    /// Creates the probe after tail drain and before stream construction.
+    #[must_use]
+    fn new(query_id: QueryId, memory_bytes: u64, slot_units: u64) -> Self {
+        let (snapshot, _) = tokio::sync::watch::channel(QueryResourceSnapshot {
+            admission_slots: slot_units,
+            memory_bytes,
+            peer_slots: slot_units,
+            tail_fences: 0,
+        });
+        Self { query_id, snapshot }
+    }
+
+    /// Returns the existing Oracle query identity.
+    #[must_use]
+    pub fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
+    /// Returns the current exact ownership for this query only.
+    #[must_use]
+    pub fn snapshot(&self) -> QueryResourceSnapshot {
+        *self.snapshot.borrow()
+    }
+
+    /// Subscribes to this query's ownership transitions.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<QueryResourceSnapshot> {
+        self.snapshot.subscribe()
+    }
+
+    /// Records synchronous release of query-owned memory and local slots.
+    fn release_local(&self) {
+        self.snapshot.send_modify(|snapshot| {
+            snapshot.memory_bytes = 0;
+            snapshot.peer_slots = 0;
+        });
+    }
+
+    /// Records committed release of this query's durable admission lease.
+    fn release_admission(&self) {
+        self.snapshot
+            .send_modify(|snapshot| snapshot.admission_slots = 0);
+    }
+
+    /// Publishes admission release only for a committed release mutation.
+    fn observe_release_mutation(&self, mutation: &LeaseMutation) -> bool {
+        let released = release_mutation_completed(mutation);
+        if released {
+            self.release_admission();
+        }
+        released
+    }
+}
+
+/// Returns whether a committed mutation proves the lease is no longer active.
+fn release_mutation_completed(mutation: &LeaseMutation) -> bool {
+    matches!(
+        mutation,
+        LeaseMutation::Released | LeaseMutation::AlreadyReleased
+    )
+}
+
 /// Durable admission lease awaiting asynchronous cleanup by the admission owner.
 pub(super) struct PendingLeaseRelease {
     /// Tenant whose transaction contains the lease row.
@@ -34,6 +122,9 @@ pub(super) struct PendingLeaseRelease {
     pub(super) query_id: QueryId,
     /// Leader fence that originally admitted the query.
     pub(super) leader: RoleFence,
+    /// Query-keyed test observation completed after durable release.
+    #[cfg(feature = "test-support")]
+    pub(super) resource_probe: Option<Arc<QueryResourceProbe>>,
 }
 
 /// FIFO for lease releases initiated from synchronous `Drop` paths.
@@ -552,12 +643,28 @@ impl OracleAdmission {
                 )
                 .await
                 {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(mutation)) if release_mutation_completed(&mutation) => {
+                        #[cfg(feature = "test-support")]
+                        {
+                            if let Some(probe) = &release.resource_probe {
+                                probe.observe_release_mutation(&mutation);
+                            }
+                        }
                         metrics::counter!(
                             "bifrost_oracle_lease_release_queue_total",
                             "outcome" => "released"
                         )
                         .increment(1);
+                    }
+                    Ok(Ok(_mutation)) => {
+                        pending.push_front(release);
+                        if let Ok(mut queue) = self.lease_release_queue.lock() {
+                            queue.requeue(pending);
+                        }
+                        tracing::warn!(
+                            "Oracle shutdown lease cleanup made no durable release; requests requeued"
+                        );
+                        return;
                     }
                     Ok(Err(error)) => {
                         pending.push_front(release);
@@ -636,12 +743,24 @@ impl OracleAdmission {
                                 )
                                 .await
                             {
-                                Ok(_) => {
+                                Ok(mutation) if release_mutation_completed(&mutation) => {
+                                    #[cfg(feature = "test-support")]
+                                    {
+                                        if let Some(probe) = &release.resource_probe {
+                                            probe.observe_release_mutation(&mutation);
+                                        }
+                                    }
                                     metrics::counter!(
                                         "bifrost_oracle_lease_release_queue_total",
                                         "outcome" => "released"
                                     )
                                     .increment(1);
+                                }
+                                Ok(_mutation) => {
+                                    if let Ok(mut queue) = lease_release_queue.lock() {
+                                        queue.requeue(std::iter::once(release));
+                                    }
+                                    tracing::warn!("Oracle dropped-lease cleanup made no durable release; request requeued");
                                 }
                                 Err(error) => {
                                     if let Ok(mut queue) = lease_release_queue.lock() {
@@ -800,6 +919,8 @@ impl OracleAdmission {
                     renewal_terminal,
                     renewal: Some(renewal),
                     release_pending: true,
+                    #[cfg(feature = "test-support")]
+                    resource_probe: None,
                 })
             }
         }
@@ -853,6 +974,9 @@ pub(super) struct AdmittedQueryGuard {
     pub(super) renewal: Option<JoinHandle<()>>,
     /// Whether explicit awaited release still owns durable cleanup.
     pub(super) release_pending: bool,
+    /// Query-keyed lifecycle observation retained through cleanup.
+    #[cfg(feature = "test-support")]
+    pub(super) resource_probe: Option<Arc<QueryResourceProbe>>,
 }
 
 impl Drop for AdmittedQueryGuard {
@@ -866,8 +990,13 @@ impl Drop for AdmittedQueryGuard {
         if let Some(renewal) = self.renewal.take() {
             renewal.abort();
         }
+        self.live_reservations.clear();
         self.running.take();
         self.slot_telemetry.take();
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &self.resource_probe {
+            probe.release_local();
+        }
         if self.release_pending {
             self.release_pending = false;
             self.admission.enqueue_lease_release(PendingLeaseRelease {
@@ -877,12 +1006,35 @@ impl Drop for AdmittedQueryGuard {
                     node_id: self.leader.node_id,
                     fencing_token: self.leader.fencing_token,
                 },
+                #[cfg(feature = "test-support")]
+                resource_probe: self.resource_probe.clone(),
             });
         }
     }
 }
 
 impl AdmittedQueryGuard {
+    /// Attaches exact query-keyed ownership after live-tail drain completes.
+    #[cfg(feature = "test-support")]
+    pub(super) fn attach_resource_probe(&mut self) -> Arc<QueryResourceProbe> {
+        let memory_bytes = self
+            .live_reservations
+            .iter()
+            .map(|reservation| reservation.bytes as u64)
+            .sum();
+        let slot_units = self.running.as_ref().map_or(0, |permit| {
+            u64::try_from(permit.num_permits())
+                .expect("invariant: admitted u32 slot demand fits u64")
+        });
+        let probe = Arc::new(QueryResourceProbe::new(
+            self.query_id,
+            memory_bytes,
+            slot_units,
+        ));
+        self.resource_probe = Some(Arc::clone(&probe));
+        probe
+    }
+
     /// Cancels renewal, releases local resources, and durably releases the lease.
     ///
     /// The query stream awaits this method after emitting its terminal frame or
@@ -898,14 +1050,30 @@ impl AdmittedQueryGuard {
         self.live_reservations.clear();
         self.running.take();
         self.slot_telemetry.take();
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &self.resource_probe {
+            probe.release_local();
+        }
         let result = self
             .admission
             .release_lease(self.data_tenant_id, self.query_id, &self.leader)
             .await;
-        if let Err(error) = result {
-            tracing::error!(error = %error, "Oracle admission cleanup failed");
-        } else {
-            self.release_pending = false;
+        match result {
+            Ok(mutation) if release_mutation_completed(&mutation) => {
+                self.release_pending = false;
+                #[cfg(feature = "test-support")]
+                if let Some(probe) = &self.resource_probe {
+                    probe.observe_release_mutation(&mutation);
+                }
+            }
+            Ok(_mutation) => {
+                tracing::warn!(
+                    "Oracle admission cleanup made no durable release; cleanup requeued"
+                );
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Oracle admission cleanup failed");
+            }
         }
     }
 }
@@ -913,6 +1081,54 @@ impl AdmittedQueryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Query-keyed lifecycle observations ignore unrelated concurrent work.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn query_resource_probes_are_identity_isolated() {
+        let first = QueryResourceProbe::new(QueryId::new(uuid::Uuid::now_v7()), 128, 1);
+        let second = QueryResourceProbe::new(QueryId::new(uuid::Uuid::now_v7()), 256, 2);
+
+        first.release_local();
+        first.release_admission();
+
+        assert_eq!(first.snapshot(), QueryResourceSnapshot::default());
+        assert_eq!(
+            second.snapshot(),
+            QueryResourceSnapshot {
+                admission_slots: 2,
+                memory_bytes: 256,
+                peer_slots: 2,
+                tail_fences: 0,
+            }
+        );
+        assert_ne!(first.query_id(), second.query_id());
+    }
+
+    /// Probe publication follows committed fenced-release mutation outcomes.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn query_resource_probe_publishes_only_durable_release_outcomes() {
+        let stale = QueryResourceProbe::new(QueryId::new(uuid::Uuid::now_v7()), 128, 1);
+        assert_eq!(stale.snapshot().admission_slots, 1);
+        assert!(!stale.observe_release_mutation(&LeaseMutation::StaleLeaderFence));
+        assert_eq!(
+            stale.snapshot().admission_slots,
+            1,
+            "a fenced durable no-op cannot publish release"
+        );
+
+        for mutation in [LeaseMutation::Released, LeaseMutation::AlreadyReleased] {
+            let released = QueryResourceProbe::new(QueryId::new(uuid::Uuid::now_v7()), 128, 1);
+            assert_eq!(
+                released.snapshot().admission_slots,
+                1,
+                "observation remains active before the committed mutation is applied"
+            );
+            assert!(released.observe_release_mutation(&mutation));
+            assert_eq!(released.snapshot().admission_slots, 0);
+        }
+    }
 
     /// Tenant repair insertion coalesces duplicates and saturates at 64 scopes.
     #[test]
@@ -982,6 +1198,8 @@ mod tests {
                     node_id: leader,
                     fencing_token: 1,
                 },
+                #[cfg(feature = "test-support")]
+                resource_probe: None,
             }));
         }
         assert_eq!(queue.order.len(), 300);
@@ -993,6 +1211,8 @@ mod tests {
                 node_id: leader,
                 fencing_token: 1,
             },
+            #[cfg(feature = "test-support")]
+            resource_probe: None,
         }));
         assert_eq!(queue.take(usize::MAX).len(), 300);
         assert!(queue.order.is_empty());

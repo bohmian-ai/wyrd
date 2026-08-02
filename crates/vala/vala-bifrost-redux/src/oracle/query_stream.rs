@@ -17,6 +17,9 @@ pub struct OracleQueryStream {
     pub frames: std::pin::Pin<Box<OracleFrameStream>>,
     /// Cancellation signal used by the stream owner to force awaited cleanup.
     pub(super) cancellation: CancellationToken,
+    /// Query-keyed lifecycle observation used only by test-tier transports.
+    #[cfg(feature = "test-support")]
+    resource_probe: Option<Arc<super::admission::QueryResourceProbe>>,
 }
 
 impl std::fmt::Debug for OracleQueryStream {
@@ -206,6 +209,15 @@ fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTermi
     }
 }
 
+/// Creates the low-cardinality span retained across one lazy query stream.
+fn query_stream_span(visibility: VisibilityMode, query_class: QueryClass) -> tracing::Span {
+    tracing::info_span!(
+        "bifrost.oracle.stream",
+        visibility = super::visibility_label(visibility),
+        query_class = query_class_label(query_class)
+    )
+}
+
 impl OracleQueryStream {
     /// Builds a synthetic stream for transport and collector tests.
     ///
@@ -222,6 +234,8 @@ impl OracleQueryStream {
             schema_fingerprint,
             frames,
             cancellation,
+            #[cfg(feature = "test-support")]
+            resource_probe: None,
         }
     }
 
@@ -238,7 +252,7 @@ impl OracleQueryStream {
             schema,
             batches,
             first,
-            admitted,
+            mut admitted,
             deadline,
             visibility,
             query_class,
@@ -247,16 +261,14 @@ impl OracleQueryStream {
             mut query_telemetry,
         } = input;
         let schema_frame = encode_schema_frame(&schema)?;
+        #[cfg(feature = "test-support")]
+        let resource_probe = Some(admitted.attach_resource_probe());
         let schema_fingerprint = schema_frame.schema_fingerprint.clone();
         let lease_cancellation = admitted.cancellation.clone();
         let cancellation = lease_cancellation.clone();
         let renewal_terminal = Arc::clone(&admitted.renewal_terminal);
         query_telemetry.start_stream();
-        let _stream_span = tracing::info_span!(
-            "bifrost.oracle.stream",
-            visibility = super::visibility_label(visibility),
-            query_class = query_class_label(query_class)
-        );
+        let _stream_span = query_stream_span(visibility, query_class);
         let frames = async_stream::stream! {
             let mut admitted = Some(admitted);
             let mut batches = batches;
@@ -332,7 +344,24 @@ impl OracleQueryStream {
             schema_fingerprint,
             frames: Box::pin(frames),
             cancellation,
+            #[cfg(feature = "test-support")]
+            resource_probe,
         })
+    }
+
+    /// Returns this stream's query-identity-keyed lifecycle probe for tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when a synthetic stream bypasses the production constructor.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn resource_probe_for_test(&self) -> Arc<super::admission::QueryResourceProbe> {
+        Arc::clone(
+            self.resource_probe
+                .as_ref()
+                .expect("production Oracle streams attach a resource probe under test-support"),
+        )
     }
 
     /// Signals cancellation and drains to a terminal frame under a short bound.

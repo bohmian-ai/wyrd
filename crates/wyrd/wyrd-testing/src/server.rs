@@ -201,6 +201,21 @@ struct WyrdTestServerInner {
     forge_publisher: StagingFilePublisher,
     /// Atomic one-shot query truncation controls for language journeys.
     query_stream_fault: QueryStreamFaultController,
+    /// Current notification-backed schema stall used by cancellation journeys.
+    query_stream_stall: std::sync::Mutex<Option<Arc<wyrd_server::state::QueryStreamStall>>>,
+}
+
+/// Exact query-owned resources inspected by test-tier cancellation journeys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BifrostQueryResourceSnapshot {
+    /// Durable Oracle admission slot units currently retained.
+    pub admission_slots: u64,
+    /// Parent-governed bytes currently retained by Oracle queries.
+    pub memory_bytes: u64,
+    /// Local leader or peer-worker slot units currently retained.
+    pub peer_slots: u64,
+    /// Scribe tail fences currently retained for Fused reads.
+    pub tail_fences: u64,
 }
 
 enum Mode {
@@ -528,6 +543,128 @@ impl WyrdTestServer {
         self.inner
             .query_stream_fault
             .set_next(QueryStreamFault::EofAfterBatch);
+    }
+
+    /// Stall the next query after its schema frame using test-tier notifications.
+    pub fn stall_next_query_after_schema(&self) {
+        let stall = self.inner.query_stream_fault.stall_next_after_schema();
+        if let Ok(mut current) = self.inner.query_stream_stall.lock() {
+            *current = Some(stall);
+        }
+    }
+
+    /// Wait until the scheduled query reaches its schema stall.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lifecycle error when no stall is scheduled or the server drain
+    /// deadline expires before the response reaches its deterministic barrier.
+    pub async fn wait_query_schema_stall(&self) -> Result<String, WyrdTestServerError> {
+        let stall = self
+            .inner
+            .query_stream_stall
+            .lock()
+            .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
+        let deadline = Duration::from_millis(WyrdServerConfig::default().shutdown.drain_ms);
+        tokio::time::timeout(deadline, stall.wait_entered())
+            .await
+            .map_err(|_| {
+                WyrdTestServerError::Start("query schema stall deadline elapsed".to_owned())
+            })?;
+        let probe = stall.resource_probe().map_err(WyrdTestServerError::Start)?;
+        Ok(probe.query_id().as_uuid().to_string())
+    }
+
+    /// Captures exact durable and in-memory query resource ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns a setup, SQL, conversion, or tail-registry error when the
+    /// production-shaped owners cannot provide an exact snapshot.
+    pub fn bifrost_query_resource_snapshot(
+        &self,
+        query_id: &str,
+    ) -> Result<BifrostQueryResourceSnapshot, WyrdTestServerError> {
+        let probe = self.query_resource_probe(query_id)?;
+        let snapshot = probe.snapshot();
+        Ok(BifrostQueryResourceSnapshot {
+            admission_slots: snapshot.admission_slots,
+            memory_bytes: snapshot.memory_bytes,
+            peer_slots: snapshot.peer_slots,
+            tail_fences: snapshot.tail_fences,
+        })
+    }
+
+    /// Waits on lifecycle notifications until every query resource returns to baseline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lifecycle or inspection error when client cancellation does
+    /// not drop the body and release all resources before `shutdown.drain_ms`.
+    pub async fn wait_bifrost_query_resources_released(
+        &self,
+        query_id: &str,
+        baseline: BifrostQueryResourceSnapshot,
+    ) -> Result<BifrostQueryResourceSnapshot, WyrdTestServerError> {
+        let stall = self
+            .inner
+            .query_stream_stall
+            .lock()
+            .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
+        let probe = self.query_resource_probe(query_id)?;
+        let mut releases = probe.subscribe();
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(WyrdServerConfig::default().shutdown.drain_ms);
+        tokio::time::timeout_at(deadline, stall.wait_dropped())
+            .await
+            .map_err(|_| {
+                WyrdTestServerError::Start("query body drop deadline elapsed".to_owned())
+            })?;
+        loop {
+            let snapshot = self.bifrost_query_resource_snapshot(query_id)?;
+            if snapshot == baseline {
+                return Ok(snapshot);
+            }
+            tokio::time::timeout_at(deadline, releases.changed())
+                .await
+                .map_err(|_| {
+                    WyrdTestServerError::Start(format!(
+                        "query resource release deadline elapsed: {snapshot:?}"
+                    ))
+                })?
+                .map_err(|_| {
+                    WyrdTestServerError::Start("query release notifier closed".to_owned())
+                })?;
+        }
+    }
+
+    /// Resolves the lifecycle observation for one exact Oracle query identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no stalled query is bound or the identity differs.
+    fn query_resource_probe(
+        &self,
+        query_id: &str,
+    ) -> Result<Arc<vala_bifrost_redux::oracle::QueryResourceProbe>, WyrdTestServerError> {
+        let stall = self
+            .inner
+            .query_stream_stall
+            .lock()
+            .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
+        let probe = stall.resource_probe().map_err(WyrdTestServerError::Start)?;
+        if probe.query_id().as_uuid().to_string() != query_id {
+            return Err(WyrdTestServerError::Start(format!(
+                "query resource identity mismatch: requested {query_id}"
+            )));
+        }
+        Ok(probe)
     }
 
     /// Flush the server-owned Scribe through a specific tenant's seal path.
@@ -1922,6 +2059,7 @@ impl WyrdTestServerBuilder {
                 api_key: SecretString::from(String::new()),
                 forge_publisher,
                 query_stream_fault,
+                query_stream_stall: std::sync::Mutex::new(None),
             },
             mode: Mode::InProcess,
             shutdown_token: None,

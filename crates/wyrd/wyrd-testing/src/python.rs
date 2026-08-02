@@ -11,6 +11,7 @@ use pyo3::types::PyAny;
 use secrecy::ExposeSecret;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::tail_rpc::{LocalTailReadTransport, TailReadTransport};
 use vala_sdk::{BifrostGrpcTransport, IngestTransport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -257,6 +258,77 @@ impl WyrdTestServer {
         Ok(())
     }
 
+    /// Stall the next query after its schema for deterministic cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the context manager is inactive.
+    fn stall_next_query_after_schema(&self) -> PyResult<()> {
+        self.server
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))?
+            .stall_next_query_after_schema();
+        Ok(())
+    }
+
+    /// Wait until the real response body reaches its notification-backed stall.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when no stall is scheduled or the configured
+    /// server drain deadline expires.
+    fn wait_query_schema_stall(&self, py: Python<'_>) -> PyResult<String> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
+        })?;
+        py.detach(|| wyrd_runtime::runtime().block_on(server.wait_query_schema_stall()))
+            .map_err(|error| wyrd_error_to_py_err(error.into()))
+    }
+
+    /// Return exact admission, memory, peer-slot, and tail-fence counts.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when production-shaped resource owners cannot
+    /// provide an exact snapshot.
+    fn bifrost_query_resource_snapshot(
+        &self,
+        query_id: &str,
+    ) -> PyResult<std::collections::BTreeMap<String, u64>> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
+        })?;
+        let snapshot = server
+            .bifrost_query_resource_snapshot(query_id)
+            .map_err(|error| wyrd_error_to_py_err(error.into()))?;
+        Ok(query_resource_snapshot_to_map(snapshot))
+    }
+
+    /// Wait until all exact query resources equal the supplied baseline.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` for a malformed baseline and a Wyrd Python error
+    /// when notification-backed release exceeds `shutdown.drain_ms`.
+    fn wait_bifrost_query_resources_released(
+        &self,
+        py: Python<'_>,
+        query_id: &str,
+        baseline: std::collections::BTreeMap<String, u64>,
+    ) -> PyResult<std::collections::BTreeMap<String, u64>> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
+        })?;
+        let baseline = query_resource_snapshot_from_map(&baseline)?;
+        let snapshot = py
+            .detach(|| {
+                wyrd_runtime::runtime()
+                    .block_on(server.wait_bifrost_query_resources_released(query_id, baseline))
+            })
+            .map_err(|error| wyrd_error_to_py_err(error.into()))?;
+        Ok(query_resource_snapshot_to_map(snapshot))
+    }
+
     /// Mint an authenticated token lacking `bifrost_query:read`.
     ///
     /// # Errors
@@ -286,6 +358,42 @@ impl WyrdTestServer {
             .block_on(server.bifrost_read_decision_count())
             .map_err(|error| wyrd_error_to_py_err(error.into()))
     }
+}
+
+/// Projects one exact Rust resource snapshot into a Python dictionary.
+fn query_resource_snapshot_to_map(
+    snapshot: crate::server::BifrostQueryResourceSnapshot,
+) -> std::collections::BTreeMap<String, u64> {
+    std::collections::BTreeMap::from([
+        ("admission_slots".to_owned(), snapshot.admission_slots),
+        ("memory_bytes".to_owned(), snapshot.memory_bytes),
+        ("peer_slots".to_owned(), snapshot.peer_slots),
+        ("tail_fences".to_owned(), snapshot.tail_fences),
+    ])
+}
+
+/// Parses one Python baseline dictionary into exact Rust resource counts.
+///
+/// # Errors
+///
+/// Raises `ValueError` when a required counter is absent or does not fit the
+/// platform's native count width.
+fn query_resource_snapshot_from_map(
+    baseline: &std::collections::BTreeMap<String, u64>,
+) -> PyResult<crate::server::BifrostQueryResourceSnapshot> {
+    let value = |name: &str| {
+        baseline.get(name).copied().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "query resource baseline is missing {name}"
+            ))
+        })
+    };
+    Ok(crate::server::BifrostQueryResourceSnapshot {
+        admission_slots: value("admission_slots")?,
+        memory_bytes: value("memory_bytes")?,
+        peer_slots: value("peer_slots")?,
+        tail_fences: value("tail_fences")?,
+    })
 }
 
 /// Builds the Python query journey's real ingest-to-sealed prerequisite.
@@ -359,15 +467,70 @@ async fn prepare_oracle_query_fixture(
         ..ClientConfig::default()
     })
     .map_err(harness_error)?;
-    BifrostGrpcTransport::connect(&client)
+    let transport = BifrostGrpcTransport::connect(&client)
         .await
-        .map_err(harness_error)?
+        .map_err(harness_error)?;
+    transport
         .insert_batch(&table_fqn, uuid::Uuid::now_v7().into_bytes(), ipc)
         .await
         .map_err(harness_error)?;
+    let ingest = srv
+        .state()
+        .bifrost_ingest
+        .as_ref()
+        .ok_or_else(|| harness_error("Scribe runtime is unavailable"))?;
+    let stream = ingest
+        .scribe()
+        .tail_service()
+        .map_err(harness_error)?
+        .stream();
+    let writer_epoch = u64::try_from(stream.writer_epoch.as_i64()).map_err(harness_error)?;
+    let event_day = wyrd_spec::vala::api::EventDay::new(
+        chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+    .map_err(harness_error)?;
+    let tail_transport: std::sync::Arc<dyn TailReadTransport> =
+        std::sync::Arc::new(LocalTailReadTransport::new(ingest.tail_reader()));
+    srv.state()
+        .bifrost_query()
+        .ok_or_else(|| harness_error("Oracle runtime is unavailable"))?
+        .oracle()
+        .tail_transports()
+        .insert_live_stream_for_tenant(
+            srv.data_tenant_id(),
+            &table_fqn,
+            wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
+            writer_epoch,
+            event_day,
+            tail_transport,
+        );
     srv.flush_bifrost()
         .await
         .map_err(wyrd_spec::error::WyrdError::from)?;
+    let live_batch = RecordBatch::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![3])),
+            std::sync::Arc::new(StringArray::from(vec!["live"])),
+        ],
+    )
+    .map_err(harness_error)?;
+    let mut live_ipc = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut live_ipc, live_batch.schema().as_ref())
+            .map_err(harness_error)?;
+        writer
+            .write(&live_batch)
+            .and_then(|()| writer.finish())
+            .map_err(harness_error)?;
+    }
+    transport
+        .insert_batch(&table_fqn, uuid::Uuid::now_v7().into_bytes(), live_ipc)
+        .await
+        .map_err(harness_error)?;
     let token = srv
         .exchange_api_key(api_key)
         .await

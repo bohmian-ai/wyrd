@@ -3,8 +3,10 @@
 import asyncio
 import inspect
 import json
+import threading
 
 import pyarrow
+import pytest
 from wyrd.bifrost import (
     BifrostQueryClient,
     BifrostQueryStream,
@@ -156,3 +158,44 @@ def test_bifrost_query_decode_failure_closes_native_without_masking_error() -> N
     else:
         raise AssertionError("invalid IPC must raise a decode error")
     assert native.closed
+
+
+def test_bifrost_query_cancellation_waits_for_cleanup_and_preserves_cancelled_error() -> None:
+    entered = threading.Event()
+    released = threading.Event()
+
+    class BlockingNativeStream(_NativeStream):
+        def __init__(self) -> None:
+            super().__init__([], None)
+            self.close_calls = 0
+
+        def next_ipc(self) -> bytes | None:
+            entered.set()
+            released.wait()
+            return None
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+            released.set()
+            if self.close_calls == 1:
+                raise RuntimeError("secondary cleanup failure")
+
+    native = BlockingNativeStream()
+
+    async def cancel_poll() -> tuple[str, int]:
+        stream = BifrostQueryStream(native)
+        consumer = asyncio.create_task(stream.__anext__())
+        assert await asyncio.to_thread(entered.wait)
+        consumer.cancel("original cancellation")
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await consumer
+        await stream.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
+        return captured.value.args[0], native.close_calls
+
+    reason, close_calls = asyncio.run(cancel_poll())
+    assert reason == "original cancellation"
+    assert native.closed
+    assert close_calls == 2

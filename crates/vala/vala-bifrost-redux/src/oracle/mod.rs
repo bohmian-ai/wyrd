@@ -72,6 +72,8 @@ pub mod telemetry;
 
 use admission::AdmittedQueryGuard;
 pub use admission::OracleAdmission;
+#[cfg(feature = "test-support")]
+pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
 use exec::{HotFileSource, OracleTableInputs, OracleTableProvider};
 pub use exec::{ReconcileExec, TenantTripwireExec};
 use planner::OracleClassification;

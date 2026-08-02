@@ -590,6 +590,75 @@ pub enum QueryStreamFault {
     EofAfterSchema = 1,
     /// End the next query immediately after its first batch frame.
     EofAfterBatch = 2,
+    /// Stall the next query after its schema until the HTTP body is cancelled.
+    StallAfterSchema = 3,
+}
+
+/// Notification-backed lifecycle state for one stalled test-tier query body.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct QueryStreamStall {
+    /// Records whether the response body reached the deterministic stall.
+    entered: AtomicBool,
+    /// Wakes a waiter when the response body reaches the deterministic stall.
+    entered_notify: tokio::sync::Notify,
+    /// Records whether client cancellation dropped the stalled response body.
+    dropped: AtomicBool,
+    /// Wakes a waiter after stream ownership and response-body state drop.
+    dropped_notify: tokio::sync::Notify,
+    /// Exact lifecycle observation for the query that claimed this stall.
+    resource_probe: std::sync::Mutex<Option<Arc<vala_bifrost_redux::oracle::QueryResourceProbe>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl QueryStreamStall {
+    /// Binds the stall to the existing Oracle query identity before schema emission.
+    pub fn bind_resource_probe(&self, probe: Arc<vala_bifrost_redux::oracle::QueryResourceProbe>) {
+        if let Ok(mut current) = self.resource_probe.lock() {
+            *current = Some(probe);
+        }
+    }
+
+    /// Returns the exact lifecycle probe for the query that reached this stall.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stall has not been claimed or its lock is poisoned.
+    pub fn resource_probe(
+        &self,
+    ) -> Result<Arc<vala_bifrost_redux::oracle::QueryResourceProbe>, String> {
+        self.resource_probe
+            .lock()
+            .map_err(|_| "query resource-probe lock poisoned".to_owned())?
+            .clone()
+            .ok_or_else(|| "query resource probe is not bound".to_owned())
+    }
+
+    /// Publishes that the body is blocked immediately after its schema frame.
+    pub fn mark_entered(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
+    }
+
+    /// Waits without polling until the response reaches its schema stall.
+    pub async fn wait_entered(&self) {
+        while !self.entered.load(Ordering::Acquire) {
+            self.entered_notify.notified().await;
+        }
+    }
+
+    /// Publishes that cancellation dropped the stalled body and its stream owner.
+    pub fn mark_dropped(&self) {
+        self.dropped.store(true, Ordering::Release);
+        self.dropped_notify.notify_waiters();
+    }
+
+    /// Waits without polling until cancellation drops the stalled response body.
+    pub async fn wait_dropped(&self) {
+        while !self.dropped.load(Ordering::Acquire) {
+            self.dropped_notify.notified().await;
+        }
+    }
 }
 
 /// Atomic next-query fault controller owned by a test server instance.
@@ -597,6 +666,8 @@ pub enum QueryStreamFault {
 #[derive(Debug, Default, Clone)]
 pub struct QueryStreamFaultController {
     next: Arc<AtomicU8>,
+    /// Lifecycle state retained for the one scheduled stall probe.
+    stall: Arc<std::sync::Mutex<Option<Arc<QueryStreamStall>>>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -606,14 +677,32 @@ impl QueryStreamFaultController {
         self.next.store(fault as u8, Ordering::Release);
     }
 
+    /// Schedules one schema stall and returns its notification-backed lifecycle.
+    #[must_use]
+    pub fn stall_next_after_schema(&self) -> Arc<QueryStreamStall> {
+        let stall = Arc::new(QueryStreamStall::default());
+        if let Ok(mut current) = self.stall.lock() {
+            *current = Some(Arc::clone(&stall));
+        }
+        self.set_next(QueryStreamFault::StallAfterSchema);
+        stall
+    }
+
     /// Claim and clear the one-shot fault atomically.
     #[must_use]
     pub fn claim(&self) -> Option<QueryStreamFault> {
         match self.next.swap(0, Ordering::AcqRel) {
             1 => Some(QueryStreamFault::EofAfterSchema),
             2 => Some(QueryStreamFault::EofAfterBatch),
+            3 => Some(QueryStreamFault::StallAfterSchema),
             _ => None,
         }
+    }
+
+    /// Takes the lifecycle state paired with a claimed schema stall.
+    #[must_use]
+    pub fn claim_stall(&self) -> Option<Arc<QueryStreamStall>> {
+        self.stall.lock().ok().and_then(|mut stall| stall.take())
     }
 }
 

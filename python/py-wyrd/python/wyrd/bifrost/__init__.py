@@ -35,7 +35,19 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
             payload = await asyncio.to_thread(self._native.next_ipc)
         except asyncio.CancelledError:
             self._done = True
-            await asyncio.shield(asyncio.to_thread(self._native.close))
+            cleanup = asyncio.create_task(asyncio.to_thread(self._native.close))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if cleanup.done() and not cleanup.cancelled():
+                try:
+                    cleanup.result()
+                except Exception:
+                    pass
             raise
         except Exception:
             self._done = True

@@ -648,16 +648,78 @@ mod tests {
     /// catalog as the independently bootstrapped external Postgres owner.
     #[tokio::test]
     async fn fresh_embedded_and_external_catalog_snapshots_match() {
-        let Some(external_dsns) =
-            crate::dsn::resolve_external_dsns_from_env().expect("external test DSNs resolve")
-        else {
-            return;
-        };
-        let external_admin_url = env::var("WYRD_TEST_DATABASE_ADMIN_URL")
-            .expect("neutral external administrator URL is configured");
-        let external_admin = build_pool(&external_admin_url, PoolConfig::migrator_defaults())
-            .await
-            .expect("external administrator connects");
+        let external_root = test_dir("fresh-external-role-catalog");
+        let _ = std::fs::remove_dir_all(&external_root);
+        let external_boot = PostgresBoot::embedded(EmbeddedConfig {
+            data_dir: external_root.join("pg"),
+            port: 0,
+            superuser: "wyrd_external_owner".to_owned(),
+            superuser_password: Some(SecretString::from("externalOwnerPassword123")),
+            max_connections: 30,
+        })
+        .await
+        .expect("isolated external-owner lifecycle starts");
+        let seeded_dsns = external_boot
+            .dsns()
+            .expect("seeded external-owner DSNs resolve");
+        let mut external_admin_url =
+            Url::parse(seeded_dsns.app.expose_secret()).expect("seeded application DSN parses");
+        external_admin_url
+            .set_username("wyrd_external_owner")
+            .expect("external owner is valid URL userinfo");
+        external_admin_url
+            .set_password(Some("externalOwnerPassword123"))
+            .expect("external owner password is valid URL userinfo");
+        let external_admin =
+            build_pool(external_admin_url.as_str(), PoolConfig::migrator_defaults())
+                .await
+                .expect("external administrator connects");
+        sqlx::raw_sql(
+            "REVOKE ALL PRIVILEGES ON DATABASE wyrd FROM wyrd_migrator, wyrd_app, \
+             wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app; \
+             REVOKE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, \
+             wyrd_catalog_app FROM wyrd_migrator, wyrd_app, wyrd_platform_admin, \
+             wyrd_catalog, wyrd_catalog_app; \
+             DROP ROLE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, \
+             wyrd_catalog_app",
+        )
+        .execute(&external_admin)
+        .await
+        .expect("seeded managed roles drop before external bootstrap");
+        let external_admin_dsn = external_admin_url.to_string();
+        let role_bootstrap = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("bootstrap")
+            .join("roles.sql");
+        let external_status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("psql")
+                .env("PGPASSWORD", "externalOwnerPassword123")
+                .arg(&external_admin_dsn)
+                .arg("--set=migrator_password=externalMigrator123")
+                .arg("--set=app_password=externalApp123")
+                .arg("--set=platform_admin_password=externalAdmin123")
+                .arg("--set=catalog_app_password=externalCatalog123")
+                .arg(format!("--file={}", role_bootstrap.display()))
+                .status()
+        })
+        .await
+        .expect("external bootstrap process joins")
+        .expect("psql executes external bootstrap");
+        assert!(external_status.success(), "external bootstrap succeeds");
+        let mut external_app_url = external_admin_url.clone();
+        external_app_url
+            .set_username("wyrd_app")
+            .expect("application role is valid URL userinfo");
+        external_app_url
+            .set_password(Some("externalApp123"))
+            .expect("application password is valid URL userinfo");
+        let external_dsns = crate::dsn::resolve_external_dsns(
+            Some(external_app_url.to_string()),
+            Some(SecretString::from("externalMigrator123")),
+            Some(SecretString::from("externalAdmin123")),
+            Some(SecretString::from("externalCatalog123")),
+        )
+        .expect("external test DSNs resolve")
+        .expect("external test DSNs are present");
         let external_snapshot = managed_catalog_snapshot(&external_admin, &external_dsns).await;
         external_admin.close().await;
 
@@ -688,7 +750,9 @@ mod tests {
 
         assert_eq!(embedded_snapshot, external_snapshot);
         drop(boot);
+        drop(external_boot);
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&external_root);
     }
 
     #[tokio::test]

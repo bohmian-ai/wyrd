@@ -106,6 +106,13 @@ impl Forge {
     /// Returns [`ForgeError::AlreadyRunning`] for duplicate supervision or a
     /// construction error before the loop starts. Per-pass failures are logged
     /// and retained as durable demand for later retry.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation interrupts idle waits, durable hint persistence, and
+    /// scheduling passes. A cancelled hint write remains absent or committed
+    /// according to the database transaction boundary and is safe to recreate
+    /// from the durable staging-file roster on a later pass.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), ForgeError> {
         let _guard = self.acquire_run_guard()?;
         #[cfg(feature = "test-support")]
@@ -128,8 +135,14 @@ impl Forge {
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 hint = self.receive_hint(), if hints_open => match hint {
-                    Some(hint) => if let Err(error) = scheduler.record_hint(hint).await {
-                        tracing::error!(error = %error, "Forge planning hint persistence failed");
+                    Some(hint) => {
+                        let result = tokio::select! {
+                            () = shutdown.cancelled() => return Ok(()),
+                            result = scheduler.record_hint(hint) => result,
+                        };
+                        if let Err(error) = result {
+                            tracing::error!(error = %error, "Forge planning hint persistence failed");
+                        }
                     },
                     None => hints_open = false,
                 },
@@ -140,10 +153,15 @@ impl Forge {
                         result = tracing::field::Empty,
                         role = "server",
                     );
-                    match tracing::Instrument::instrument(
+                    let pass = tracing::Instrument::instrument(
                         scheduler.schedule_once(&shutdown),
                         pass_span.clone(),
-                    ).await {
+                    );
+                    let result = tokio::select! {
+                        () = shutdown.cancelled() => return Ok(()),
+                        result = pass => result,
+                    };
+                    match result {
                     Ok(outcome) => {
                         pass_span.record("result", "succeeded");
                         self.core.telemetry.record_scheduler_pass(&outcome, started.elapsed());
@@ -174,10 +192,15 @@ impl Forge {
                         result = tracing::field::Empty,
                         role = "server",
                     );
-                    match tracing::Instrument::instrument(
+                    let pass = tracing::Instrument::instrument(
                         scheduler.schedule_once(&shutdown),
                         pass_span.clone(),
-                    ).await {
+                    );
+                    let result = tokio::select! {
+                        () = shutdown.cancelled() => return Ok(()),
+                        result = pass => result,
+                    };
+                    match result {
                     Ok(outcome) => {
                         pass_span.record("result", "succeeded");
                         self.core.telemetry.record_scheduler_pass(&outcome, started.elapsed());

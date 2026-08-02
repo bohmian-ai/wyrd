@@ -12,6 +12,7 @@
     "unknown-concern",
     "extra-row",
     "stale-target",
+    "stale-wyrd-target",
     "missing-assertion",
     "unselected-proof",
     "stale-success-removal"

@@ -9,7 +9,8 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-target_commit="d4a8483f7f0df0d27ccf0ec39495661cb476c4c0"
+target_commit="$(git rev-parse HEAD)"
+redacted
 ledger_path="${WYRD_BIFROST_PARITY_LEDGER:-architecture/references/domain/bifrost-forge-parity.json}"
 report_root="${WYRD_BIFROST_PARITY_REPORT_ROOT:-target/bifrost-benchmarks/task16}"
 receipt_path="${WYRD_BIFROST_PARITY_PROOF:-$report_root/forge-parity-proof.json}"
@@ -40,7 +41,7 @@ fail() {
 }
 
 [[ -s "$ledger_path" ]] || fail "missing Forge parity ledger: $ledger_path"
-jq -e --arg target "$target_commit" '
+redacted
   .ledger_version == "wyrd.bifrost.forge-parity-ledger/v1"
 redacted
   and (.rows | type == "array" and length == 10)

@@ -6,12 +6,12 @@ cd "$repo_root"
 
 fixtures="scripts/checks/fixtures/bifrost-forge-parity/cases.json"
 matrix="scripts/checks/bifrost-forge-report-matrix.sh"
-target="d4a8483f7f0df0d27ccf0ec39495661cb476c4c0"
+target="$(git rev-parse HEAD)"
 
 jq -e '
   .fixture_version == "wyrd.bifrost.forge-parity-fixtures/v1"
-  and (.negative_cases | type == "array" and length == 13)
-  and (.negative_cases | unique | length == 13)
+  and (.negative_cases | type == "array" and length == 14)
+  and (.negative_cases | unique | length == 14)
 ' "$fixtures" >/dev/null
 
 if rg -U -n 'record_(task_terminal|task_spill|conflict|cleanup)\([^;]*?("|\.as_str\(\))' \
@@ -106,14 +106,15 @@ redacted
     unknown-classification) jq '.rows[0].classification = "unknown"' "$fixture_root/ledger.json" > "$fixture_root/next.json" ;;
     unknown-concern) jq '.rows[0].concern = "unknown"' "$fixture_root/ledger.json" > "$fixture_root/next.json" ;;
     extra-row) jq '.rows += [.rows[0]]' "$fixture_root/ledger.json" > "$fixture_root/next.json" ;;
-    stale-target) jq '.target_commit = "stale"' "$fixture_root/receipt.json" > "$fixture_root/next.json" ;;
+redacted
+    stale-wyrd-target) jq '.target_commit = "stale" | .result_id = "stale:pg_bifrost_forge_distributed_journey"' "$fixture_root/receipt.json" > "$fixture_root/next.json" ;;
     missing-assertion) jq 'del(.assertions[0])' "$fixture_root/receipt.json" > "$fixture_root/next.json" ;;
     unselected-proof) jq '.assertions += [{id:"forge.unselected",passed:true}]' "$fixture_root/receipt.json" > "$fixture_root/next.json" ;;
     stale-success-removal) jq '.passed = false' "$fixture_root/receipt.json" > "$fixture_root/next.json" ;;
     *) echo "unknown Forge parity fixture: $case_name" >&2; exit 1 ;;
   esac
   if [[ "$case_name" != "missing-proof" ]]; then
-    if [[ "$case_name" == failed-result || "$case_name" == duplicate-proof || "$case_name" == stale-target || "$case_name" == missing-assertion || "$case_name" == unselected-proof || "$case_name" == stale-success-removal ]]; then
+    if [[ "$case_name" == failed-result || "$case_name" == duplicate-proof || "$case_name" == stale-wyrd-target || "$case_name" == missing-assertion || "$case_name" == unselected-proof || "$case_name" == stale-success-removal ]]; then
       mv "$fixture_root/next.json" "$fixture_root/receipt.json"
     else
       mv "$fixture_root/next.json" "$fixture_root/ledger.json"

@@ -68,9 +68,6 @@ const WRITE_CYCLES: usize = 3;
 /// Number of spans carried by each OTLP writer request.
 const SPANS_PER_WRITE: usize = 6;
 
-redacted
-const FORGE_PARITY_TARGET_COMMIT: &str = "d4a8483f7f0df0d27ccf0ec39495661cb476c4c0";
-
 /// Exact journey assertions selected by the versioned Forge parity ledger.
 const FORGE_PARITY_ASSERTIONS: [&str; 6] = [
     "forge.continuous-triggering",
@@ -270,8 +267,8 @@ struct ForgeParityAssertion {
 struct ForgeParityProofReceipt {
     /// Wire version accepted by the fail-closed parity matrix.
     proof_version: &'static str,
-redacted
-    target_commit: &'static str,
+    /// Wyrd revision whose production journey produced this receipt.
+    target_commit: String,
     /// Exact ignored integration-test identity that produced this receipt.
     test_identity: &'static str,
     /// Stable identity joining this receipt to every journey ledger row.
@@ -328,6 +325,7 @@ async fn forge_distributed_writer_matrix_journey() {
 #[ignore = "gated parity proof: real distributed Forge journey and atomic receipt"]
 async fn forge_parity_proof_receipt_follows_all_selected_distributed_assertions() {
     let receipt_path = forge_parity_receipt_path();
+    let target_commit = forge_parity_target_commit();
     if receipt_path.exists() {
         std::fs::remove_file(&receipt_path).expect("remove stale Forge parity receipt");
     }
@@ -365,7 +363,7 @@ async fn forge_parity_proof_receipt_follows_all_selected_distributed_assertions(
         id: "forge.failover",
         passed: true,
     });
-    write_forge_parity_receipt(&receipt_path, assertions)
+    write_forge_parity_receipt(&receipt_path, &target_commit, assertions)
         .expect("atomically write Forge parity receipt");
 }
 
@@ -373,18 +371,21 @@ async fn forge_parity_proof_receipt_follows_all_selected_distributed_assertions(
 ///
 /// # Panics
 ///
-/// Panics when the focused task does not provide the required proof path or
-/// target revision, or when the revision differs from the pinned ledger target.
+/// Panics when the focused task does not provide the required proof path.
 fn forge_parity_receipt_path() -> std::path::PathBuf {
-    let target = std::env::var("WYRD_BIFROST_PARITY_TARGET_COMMIT")
-        .expect("focused parity task sets WYRD_BIFROST_PARITY_TARGET_COMMIT");
-    assert_eq!(
-        target, FORGE_PARITY_TARGET_COMMIT,
-        "focused parity target must match the pinned ledger revision"
-    );
     std::env::var_os("WYRD_BIFROST_PARITY_PROOF")
         .map(std::path::PathBuf::from)
         .expect("focused parity task sets WYRD_BIFROST_PARITY_PROOF")
+}
+
+/// Resolve the Wyrd revision selected by the focused parity-proof task.
+///
+/// # Panics
+///
+/// Panics when the focused task does not provide the current Wyrd revision.
+fn forge_parity_target_commit() -> String {
+    std::env::var("WYRD_BIFROST_PARITY_TARGET_COMMIT")
+        .expect("focused parity task sets WYRD_BIFROST_PARITY_TARGET_COMMIT")
 }
 
 /// Validate and atomically write one complete distributed-parity proof receipt.
@@ -400,6 +401,7 @@ fn forge_parity_receipt_path() -> std::path::PathBuf {
 /// serialization operations prevent the atomic rename.
 fn write_forge_parity_receipt(
     path: &std::path::Path,
+    target_commit: &str,
     assertions: Vec<ForgeParityAssertion>,
 ) -> Result<(), String> {
     let mut assertion_ids = assertions
@@ -422,9 +424,9 @@ fn write_forge_parity_receipt(
         .map_err(|error| format!("create Forge parity receipt directory: {error}"))?;
     let receipt = ForgeParityProofReceipt {
         proof_version: "wyrd.bifrost.forge-parity-proof/v1",
-        target_commit: FORGE_PARITY_TARGET_COMMIT,
+        target_commit: target_commit.to_owned(),
         test_identity: "pg_bifrost_forge_distributed_journey",
-        result_id: format!("{FORGE_PARITY_TARGET_COMMIT}:pg_bifrost_forge_distributed_journey"),
+        result_id: format!("{target_commit}:pg_bifrost_forge_distributed_journey"),
         passed: true,
         assertions,
     };
@@ -450,7 +452,7 @@ fn forge_parity_receipt_rejects_failed_assertion_without_output() {
             passed: id != "forge.failover",
         })
         .collect::<Vec<_>>();
-    assert!(write_forge_parity_receipt(&path, assertions).is_err());
+    assert!(write_forge_parity_receipt(&path, "test-target", assertions).is_err());
     assert!(!path.exists());
     assert!(!directory.exists());
 }

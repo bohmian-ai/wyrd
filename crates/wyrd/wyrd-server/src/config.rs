@@ -144,6 +144,18 @@ pub enum ForgeProcessRole {
     ForgeWorker,
 }
 
+impl ForgeProcessRole {
+    /// Returns whether this role owns the Wyrd HTTP and gRPC serving shell.
+    ///
+    /// `all` and `server` construct [`crate::app::WyrdServer`] and bind public
+    /// transports. `forge-worker` is deliberately excluded because
+    /// [`crate::app::run`] owns its metrics-only dedicated process lifecycle.
+    #[must_use]
+    pub(crate) fn serves_api(self) -> bool {
+        matches!(self, Self::All | Self::Server)
+    }
+}
+
 /// Private Forge worker placement and process-local capacity configuration.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2142,21 +2154,41 @@ mod tests {
         assert!(ServeMode::Grpc.serves_grpc());
     }
 
-    /// Internal role and bounded worker settings deserialize without adding a
-    /// public transport contract.
+    /// Every documented process role parses to its exact closed variant and
+    /// retains bounded worker configuration.
     #[test]
-    fn forge_process_role_and_worker_bounds_parse() {
-        let cfg = from_toml_str(
-            r#"
-                role = "forge-worker"
-                [forge]
-                worker_concurrency = 3
-            "#,
-        )
-        .expect("Forge role parses");
-        assert_eq!(cfg.role, ForgeProcessRole::ForgeWorker);
-        assert_eq!(cfg.forge.worker_concurrency, 3);
-        cfg.validate().expect("positive Forge bounds validate");
+    fn forge_process_roles_are_closed_and_parse_exactly() {
+        for (value, expected) in [
+            ("all", ForgeProcessRole::All),
+            ("server", ForgeProcessRole::Server),
+            ("forge-worker", ForgeProcessRole::ForgeWorker),
+        ] {
+            let cfg = from_toml_str(&format!(
+                "role = {value:?}\n[forge]\nworker_concurrency = 3"
+            ))
+            .expect("documented Forge role parses");
+            assert_eq!(cfg.role, expected, "role {value:?} must remain exact");
+            assert_eq!(cfg.forge.worker_concurrency, 3);
+            cfg.validate().expect("positive Forge bounds validate");
+        }
+
+        for legacy in ["scribe", "forge", "all,forge-worker"] {
+            let err = from_toml_str(&format!("role = {legacy:?}"))
+                .expect_err("legacy role subsets must not parse");
+            let ConfigError::ParseToml { source, .. } = err else {
+                panic!("legacy role must fail during TOML parsing");
+            };
+            let message = source.to_string();
+            assert!(message.contains("all"), "missing all correction: {message}");
+            assert!(
+                message.contains("server"),
+                "missing server correction: {message}"
+            );
+            assert!(
+                message.contains("forge-worker"),
+                "missing forge-worker correction: {message}"
+            );
+        }
 
         let invalid = from_toml_str(
             r#"
@@ -2169,11 +2201,80 @@ mod tests {
         assert!(invalid.validate().is_err());
     }
 
+    /// Environment role overrides accept only the documented process roles and
+    /// identify every corrective value when rejecting legacy component subsets.
+    #[test]
+    fn env_forge_process_roles_are_closed_and_parse_exactly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for (value, expected) in [
+            ("all", Some(ForgeProcessRole::All)),
+            ("server", Some(ForgeProcessRole::Server)),
+            ("forge-worker", Some(ForgeProcessRole::ForgeWorker)),
+            ("scribe", None),
+            ("forge", None),
+            ("all,forge-worker", None),
+        ] {
+            temp_env::with_vars([("WYRD_ROLES", Some(value))], || {
+                let mut cfg = WyrdServerConfig::default();
+                match expected {
+                    Some(role) => {
+                        cfg.apply_env_overrides()
+                            .expect("documented role override must parse");
+                        assert_eq!(cfg.role, role, "role {value:?} must remain exact");
+                    }
+                    None => {
+                        let error = cfg
+                            .apply_env_overrides()
+                            .expect_err("legacy role subsets must fail");
+                        let ConfigError::BadEnvVar { key, message } = error else {
+                            panic!("legacy role must fail as BadEnvVar(WYRD_ROLES)");
+                        };
+                        assert_eq!(key, "WYRD_ROLES");
+                        for corrective_value in ["all", "server", "forge-worker"] {
+                            assert!(
+                                message.contains(corrective_value),
+                                "missing {corrective_value:?} correction for {value:?}: {message}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     /// The default embedded topology contains exactly one bounded executor.
     #[test]
     fn forge_process_defaults_to_embedded_single_worker() {
         let cfg = WyrdServerConfig::default();
         assert_eq!(cfg.role, ForgeProcessRole::All);
         assert_eq!(cfg.forge.worker_concurrency, 1);
+    }
+
+    /// Process-role guidance stays synchronized across the Bifrost overview,
+    /// deployment guide, and architecture reference without preserving legacy
+    /// component-subset examples.
+    #[test]
+    fn process_role_docs_publish_only_the_closed_contract() {
+        let documents = [
+            include_str!("../../../../docs/src/content/docs/bifrost/index.svx"),
+            include_str!("../../../../docs/src/content/docs/bifrost/architecture.svx"),
+            include_str!("../../../../architecture/references/domain/iceberg-bifrost.md"),
+        ];
+        for document in documents {
+            for role in ["`all`", "`server`", "`forge-worker`"] {
+                assert!(document.contains(role), "missing documented role {role}");
+            }
+            for legacy in [
+                "WYRD_ROLES=gate,scribe,forge,oracle",
+                "WYRD_ROLES=scribe",
+                "WYRD_ROLES=oracle",
+                "Optional role specialization",
+            ] {
+                assert!(
+                    !document.contains(legacy),
+                    "legacy process-role guidance remains: {legacy}"
+                );
+            }
+        }
     }
 }

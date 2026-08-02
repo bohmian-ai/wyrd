@@ -6,6 +6,8 @@
 
 use std::future::ready;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 use axum::{Router, routing::get};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -226,6 +228,20 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
         .map_err(MetricsError::Install)
 }
 
+/// Shared test-only Prometheus handle that installs the process recorder once.
+///
+/// Production composition receives its handle from [`WyrdTelemetryRuntime`].
+/// Tests that exercise a real listener use this helper so they retain the same
+/// one-recorder invariant without attempting a second global installation.
+#[cfg(test)]
+pub(crate) fn test_prometheus_handle() -> PrometheusHandle {
+    /// Holds the one test-process recorder used by listener and middleware tests.
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| install_recorder().expect("test recorder installs exactly once"))
+        .clone()
+}
+
 /// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.
 pub fn metrics_router(handle: PrometheusHandle) -> Router {
     Router::new().route("/metrics", get(move || ready(handle.render())))
@@ -278,8 +294,6 @@ mod tests {
     // recorder exactly once via `OnceLock`.
 
     use super::*;
-    use std::sync::OnceLock;
-
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -290,11 +304,10 @@ mod tests {
 
     use crate::http::middleware::metrics::track_metrics;
 
-    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-
     fn get_handle() -> &'static PrometheusHandle {
-        HANDLE
-            .get_or_init(|| install_recorder().expect("recorder installs exactly once per process"))
+        /// Holds the recorder shared by the metrics module's rendering tests.
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE.get_or_init(test_prometheus_handle)
     }
 
     #[test]

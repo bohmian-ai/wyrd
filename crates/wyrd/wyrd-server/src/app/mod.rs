@@ -91,6 +91,7 @@ async fn run_forge_worker_process(
     state: AppState,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> Result<(), BootExit> {
+    let _role_telemetry = metrics::ForgeRoleTelemetryGuard::started(config.role);
     let shutdown = state.shutdown_token.clone();
     let mut set: JoinSet<TaskExit> = JoinSet::new();
     let worker = spawn_forge_worker(&state, shutdown.clone(), config.forge.worker_concurrency)
@@ -125,5 +126,125 @@ async fn run_forge_worker_process(
     match terminal {
         Some(message) => Err(BootExit::Other(message.into())),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+/// Static composition assertions that keep API and dedicated-worker ownership separate.
+mod tests {
+    /// The API lifecycle has no worker-only branch, while the dedicated runner
+    /// has exactly one top-level worker construction path.
+    #[test]
+    fn process_role_composition_has_one_dedicated_worker_runner() {
+        let dedicated_runner = include_str!("mod.rs");
+        let production_runner = dedicated_runner
+            .split("#[cfg(test)]")
+            .next()
+            .expect("application module has production source before tests");
+        assert_eq!(
+            production_runner
+                .matches("async fn run_forge_worker_process(")
+                .count(),
+            1,
+            "one dedicated worker-only runner must own process composition"
+        );
+        assert_eq!(
+            production_runner.matches("spawn_forge_worker(").count(),
+            1,
+            "dedicated worker composition must create one shared worker graph"
+        );
+
+        let server = include_str!("server.rs");
+        let production_server = server
+            .split("#[cfg(test)]")
+            .next()
+            .expect("server module has production source before tests");
+        assert!(
+            !production_server.contains("ForgeProcessRole::ForgeWorker"),
+            "WyrdServer bind/run must not own a dedicated worker branch"
+        );
+    }
+}
+
+#[cfg(test)]
+/// PostgreSQL-backed dedicated-worker lifecycle regressions.
+mod pg_tests {
+    use std::net::{SocketAddr, TcpListener as StdTcpListener};
+    use std::process::Command;
+
+    use super::*;
+
+    /// Reserves an ephemeral loopback address long enough to learn a distinct
+    /// port for one dedicated-runner listener assertion.
+    fn available_loopback_addr() -> SocketAddr {
+        let listener = StdTcpListener::bind("127.0.0.1:0")
+            .expect("test loopback listener reserves an ephemeral port");
+        listener
+            .local_addr()
+            .expect("reserved listener reports its local address")
+    }
+
+    /// The dedicated runner exposes metrics only, creates one bounded worker,
+    /// and drains after the real process signal path without opening API ports.
+    #[tokio::test]
+    async fn dedicated_forge_worker_process_is_metrics_only_and_drains_bounded() {
+        let (state, _publisher) = crate::boot::pg_tests::composed_test_state().await;
+        let http_addr = available_loopback_addr();
+        let grpc_addr = available_loopback_addr();
+        let metrics_addr = available_loopback_addr();
+        let config = WyrdServerConfig {
+            role: ForgeProcessRole::ForgeWorker,
+            http: crate::config::HttpConfig { bind: http_addr },
+            grpc: crate::config::GrpcConfig {
+                bind: grpc_addr,
+                ..crate::config::GrpcConfig::default()
+            },
+            forge: crate::config::ForgeRuntimeConfig {
+                worker_concurrency: 1,
+            },
+            metrics: crate::config::MetricsConfig {
+                enabled: true,
+                bind: Some(metrics_addr),
+            },
+            shutdown: crate::config::ShutdownConfig { drain_ms: 100 },
+            ..WyrdServerConfig::default()
+        };
+
+        let runner = tokio::spawn(async move {
+            run_forge_worker_process(&config, state, Some(metrics::test_prometheus_handle())).await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if std::net::TcpStream::connect(metrics_addr).is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dedicated metrics listener did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            StdTcpListener::bind(http_addr).is_ok(),
+            "dedicated runner must not bind HTTP"
+        );
+        assert!(
+            StdTcpListener::bind(grpc_addr).is_ok(),
+            "dedicated runner must not bind gRPC"
+        );
+
+        let status = Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("test process can deliver SIGTERM to its Tokio signal watcher");
+        assert!(status.success(), "SIGTERM delivery must succeed");
+        let result = tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .expect("dedicated runner must drain within its bounded shutdown window")
+            .expect("dedicated runner task joins");
+        assert!(
+            result.is_ok(),
+            "signal-driven drain must succeed: {result:?}"
+        );
     }
 }

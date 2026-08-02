@@ -954,7 +954,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pg_tests {
+/// PostgreSQL-backed boot composition regressions and shared Forge fixtures.
+pub(crate) mod pg_tests {
     use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
@@ -971,7 +972,7 @@ mod pg_tests {
     use crate::postgres::ServerPostgres;
 
     /// Compose one real Forge from the retained test fixture resources.
-    async fn composed_test_state() -> (
+    pub(crate) async fn composed_test_state() -> (
         AppState,
         vala_bifrost_redux::maintenance::StagingFilePublisher,
     ) {

@@ -20,7 +20,7 @@ use crate::boot::{
     ServerBootError, spawn_forge_worker, spawn_maintenance_scheduler, spawn_storage_sweeper,
 };
 use crate::components::health::readiness_loop;
-use crate::config::{ForgeProcessRole, ServeMode, WyrdServerConfig};
+use crate::config::{ConfigError, ForgeProcessRole, ServeMode, WyrdServerConfig};
 use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener,
@@ -194,10 +194,20 @@ impl WyrdServer {
     /// never-run server never touches the global recorder.
     ///
     /// # Errors
-    /// Returns [`BootExit::Other`] on listener bind failure.
+    ///
+    /// Returns [`BootExit::Config`] before binding when the role belongs to the
+    /// dedicated Forge worker runner, or [`BootExit::Other`] on listener bind
+    /// failure.
     pub async fn bind(self, mode: ServeMode) -> Result<BoundServer, BootExit> {
-        let serves_api = self.config.role != ForgeProcessRole::ForgeWorker;
-        let (http_listener, http_addr) = if serves_api && mode.serves_http() {
+        if !self.config.role.serves_api() {
+            return Err(BootExit::Config(Box::new(ConfigError::Invalid {
+                message: "WyrdServer accepts only API roles 'all' or 'server'; run the \
+                          dedicated 'forge-worker' role through app::run"
+                    .to_owned(),
+            })));
+        }
+
+        let (http_listener, http_addr) = if mode.serves_http() {
             let bind = self.config.http.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
                 BootExit::Other(format!("HTTP listener failed to bind {bind}: {e}").into())
@@ -209,7 +219,7 @@ impl WyrdServer {
         } else {
             (None, None)
         };
-        let (grpc_listener, grpc_addr) = if serves_api && mode.serves_grpc() {
+        let (grpc_listener, grpc_addr) = if mode.serves_grpc() {
             let bind = self.config.grpc.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
                 BootExit::Other(format!("gRPC listener failed to bind {bind}: {e}").into())
@@ -319,79 +329,65 @@ impl BoundServer {
         let _role_telemetry = super::metrics::ForgeRoleTelemetryGuard::started(self.config.role);
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
-        let serves_api = self.config.role != ForgeProcessRole::ForgeWorker;
-        let schedules = matches!(
-            self.config.role,
-            ForgeProcessRole::All | ForgeProcessRole::Server
-        );
-        let executes = matches!(
-            self.config.role,
-            ForgeProcessRole::All | ForgeProcessRole::ForgeWorker
-        );
+        // Health: publish the initial snapshot before driving it.
+        publish_initial_health(&self.state.readiness, &mut self.reporter).await;
 
-        if serves_api {
-            // Health: publish the initial snapshot before driving it.
-            publish_initial_health(&self.state.readiness, &mut self.reporter).await;
-
+        set.spawn(worker_task(
+            TaskId::Worker("readiness"),
+            readiness_loop(
+                self.state.clone(),
+                Duration::from_millis(self.config.readiness.tick_ms),
+                Duration::from_millis(self.config.readiness.probe_timeout_ms),
+                shutdown.clone(),
+            ),
+        ));
+        set.spawn(worker_task(
+            TaskId::Worker("health_status"),
+            drive_health_status(
+                self.state.readiness.clone(),
+                self.reporter.clone(),
+                shutdown.clone(),
+            ),
+        ));
+        if let Some(scribe) = self
+            .state
+            .bifrost_ingest
+            .as_ref()
+            .map(|runtime| Arc::clone(runtime.scribe()))
+        {
+            let shutdown = shutdown.clone();
             set.spawn(worker_task(
-                TaskId::Worker("readiness"),
-                readiness_loop(
-                    self.state.clone(),
-                    Duration::from_millis(self.config.readiness.tick_ms),
-                    Duration::from_millis(self.config.readiness.probe_timeout_ms),
-                    shutdown.clone(),
-                ),
-            ));
-            set.spawn(worker_task(
-                TaskId::Worker("health_status"),
-                drive_health_status(
-                    self.state.readiness.clone(),
-                    self.reporter.clone(),
-                    shutdown.clone(),
-                ),
-            ));
-            if let Some(scribe) = self
-                .state
-                .bifrost_ingest
-                .as_ref()
-                .map(|runtime| Arc::clone(runtime.scribe()))
-            {
-                let shutdown = shutdown.clone();
-                set.spawn(worker_task(
-                    TaskId::Worker("scribe_age_scanner"),
-                    async move {
-                        let mut ticks = tokio::time::interval(Duration::from_secs(1));
-                        loop {
-                            tokio::select! {
-                                _ = shutdown.cancelled() => break,
-                                _ = ticks.tick() => scribe.check_age(std::time::Instant::now()),
-                            }
+                TaskId::Worker("scribe_age_scanner"),
+                async move {
+                    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticks.tick() => scribe.check_age(std::time::Instant::now()),
                         }
-                    },
-                ));
-            }
-            if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
-                .map_err(|e| BootExit::Other(Box::new(e)))?
-            {
-                set.spawn(worker_task(TaskId::Worker("storage_sweeper"), async move {
-                    if let Err(join_error) = handle.await
-                        && join_error.is_panic()
-                    {
-                        std::panic::resume_unwind(join_error.into_panic());
                     }
-                }));
-            }
-        }
-
-        if schedules {
-            let scheduler = spawn_maintenance_scheduler(&self.state, shutdown.clone())
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
-            set.spawn(fallible_task(
-                TaskId::Worker("maintenance_scheduler"),
-                scheduler,
+                },
             ));
         }
-        if executes {
+        if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
+            .map_err(|e| BootExit::Other(Box::new(e)))?
+        {
+            set.spawn(worker_task(TaskId::Worker("storage_sweeper"), async move {
+                if let Err(join_error) = handle.await
+                    && join_error.is_panic()
+                {
+                    std::panic::resume_unwind(join_error.into_panic());
+                }
+            }));
+        }
+
+        let scheduler = spawn_maintenance_scheduler(&self.state, shutdown.clone())
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+        set.spawn(fallible_task(
+            TaskId::Worker("maintenance_scheduler"),
+            scheduler,
+        ));
+        if self.config.role == ForgeProcessRole::All {
             let worker = spawn_forge_worker(
                 &self.state,
                 shutdown.clone(),
@@ -402,10 +398,8 @@ impl BoundServer {
         }
 
         // Enterprise workers.
-        if serves_api {
-            for (name, worker) in self.extra_workers.drain(..) {
-                set.spawn(worker_task(TaskId::Worker(name), worker));
-            }
+        for (name, worker) in self.extra_workers.drain(..) {
+            set.spawn(worker_task(TaskId::Worker(name), worker));
         }
 
         // Transports — drive the listeners bound in `WyrdServer::bind`.
@@ -565,9 +559,10 @@ mod pg_tests {
         drop(server2);
     }
 
-    /// Worker-only composition bypasses both public API listener paths.
+    /// Dedicated worker configuration is rejected before WyrdServer binds any
+    /// public or metrics listener.
     #[tokio::test]
-    async fn forge_worker_role_binds_no_wyrd_api_socket() {
+    async fn forge_worker_role_fails_before_api_server_binding() {
         let config = WyrdServerConfig {
             role: ForgeProcessRole::ForgeWorker,
             metrics: crate::config::MetricsConfig {
@@ -577,13 +572,14 @@ mod pg_tests {
             ..WyrdServerConfig::default()
         };
         let server = WyrdServer::new(config, test_state_with_auth().await)
-            .expect("worker-only server shell builds");
-        let bound = server
-            .bind(ServeMode::Both)
-            .await
-            .expect("worker-only bind bypasses public transports");
-        assert_eq!(bound.http_addr(), None);
-        assert_eq!(bound.grpc_addr(), None);
-        assert_eq!(bound.metrics_addr(), None);
+            .expect("server shell builds before bind-time role validation");
+        let err = match server.bind(ServeMode::Both).await {
+            Ok(_) => panic!("dedicated worker role must not enter the API server lifecycle"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(err, BootExit::Config(_)),
+            "expected config exit: {err:?}"
+        );
     }
 }

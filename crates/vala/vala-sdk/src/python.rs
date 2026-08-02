@@ -9,7 +9,6 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use futures_util::future::{AbortHandle, Abortable};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -19,162 +18,15 @@ use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_queue::QueueConfig;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_utils::py::json_to_pyobject;
 
-use crate::{QueryClient, QueryResultStream, ValaSdkError};
-
-/// Rust-owned stream implementation used by the Python native owner.
-enum NativeStreamOwner {
-    /// Production Vala stream.
-    Production(Box<QueryResultStream>),
-    #[cfg(test)]
-    /// Injectable owner used only by deterministic native-owner tests.
-    Test(TestStreamOwner),
-}
-
-impl NativeStreamOwner {
-    /// Polls one decoded batch or terminal state from the underlying owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns the owner's protocol, Arrow, transport, terminal, or
-    /// incomplete-stream error without changing its retained terminal state.
-    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
-        match self {
-            Self::Production(stream) => stream.next_batch().await,
-            #[cfg(test)]
-            Self::Test(stream) => stream.next_batch().await,
-        }
-    }
-
-    /// Returns terminal metadata retained by the underlying owner.
-    fn terminal(&self) -> Option<&wyrd_spec::vala::api::QueryTerminalFrame> {
-        match self {
-            Self::Production(stream) => stream.terminal(),
-            #[cfg(test)]
-            Self::Test(stream) => stream.terminal(),
-        }
-    }
-}
-
-#[cfg(test)]
-/// Deterministic stream owner used to exercise native cleanup branches.
-struct TestStreamOwner {
-    /// Results returned by successive native polls.
-    next: std::collections::VecDeque<Result<Option<RecordBatch>, ValaSdkError>>,
-    /// Terminal metadata exposed while projecting a failed or successful end.
-    terminal: Option<wyrd_spec::vala::api::QueryTerminalFrame>,
-    /// Sentinel set when the native owner drops this stream.
-    dropped: Arc<std::sync::atomic::AtomicBool>,
-    /// Counts calls into the injected owner so closed polls prove no re-entry.
-    polls: Arc<std::sync::atomic::AtomicUsize>,
-    /// Optional gate that leaves a poll pending until cancellation drops it.
-    pending: Option<TestPendingPoll>,
-}
-
-#[cfg(test)]
-/// Deterministic pending-poll controls used by cancellation race tests.
-struct TestPendingPoll {
-    /// Signals that the native poll reached its blocking point.
-    entered: Option<std::sync::mpsc::SyncSender<()>>,
-    /// Future that remains pending until its sender is dropped by the test.
-    release: tokio::sync::oneshot::Receiver<()>,
-    /// Sentinel set when cancellation drops the pending future.
-    future_dropped: Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[cfg(test)]
-/// Drop sentinel wrapped around a deterministic pending future.
-struct PendingDropGuard {
-    /// Sentinel set when the pending poll future is cancelled or completes.
-    dropped: Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[cfg(test)]
-impl Drop for PendingDropGuard {
-    /// Records that the native pending future no longer occupies a worker.
-    fn drop(&mut self) {
-        self.dropped
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-impl TestStreamOwner {
-    /// Creates an owner with injected poll results and terminal metadata.
-    fn new(
-        next: std::collections::VecDeque<Result<Option<RecordBatch>, ValaSdkError>>,
-        terminal: Option<wyrd_spec::vala::api::QueryTerminalFrame>,
-        dropped: Arc<std::sync::atomic::AtomicBool>,
-        polls: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
-        Self {
-            next,
-            terminal,
-            dropped,
-            polls,
-            pending: None,
-        }
-    }
-
-    /// Creates an owner whose first poll deterministically blocks until aborted.
-    fn pending(
-        entered: std::sync::mpsc::SyncSender<()>,
-        release: tokio::sync::oneshot::Receiver<()>,
-        future_dropped: Arc<std::sync::atomic::AtomicBool>,
-        owner_dropped: Arc<std::sync::atomic::AtomicBool>,
-        polls: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
-        Self {
-            next: std::collections::VecDeque::new(),
-            terminal: None,
-            dropped: owner_dropped,
-            polls,
-            pending: Some(TestPendingPoll {
-                entered: Some(entered),
-                release,
-                future_dropped,
-            }),
-        }
-    }
-
-    /// Returns the next injected result.
-    ///
-    /// # Errors
-    ///
-    /// Returns the injected error, or [`ValaSdkError::IncompleteQueryStream`]
-    /// after all injected results have been consumed.
-    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
-        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(mut pending) = self.pending.take() {
-            let _drop_guard = PendingDropGuard {
-                dropped: Arc::clone(&pending.future_dropped),
-            };
-            if let Some(entered) = pending.entered.take() {
-                let _ = entered.send(());
-            }
-            let _ = pending.release.await;
-        }
-        self.next
-            .pop_front()
-            .unwrap_or(Err(ValaSdkError::IncompleteQueryStream))
-    }
-
-    /// Returns injected terminal metadata.
-    fn terminal(&self) -> Option<&wyrd_spec::vala::api::QueryTerminalFrame> {
-        self.terminal.as_ref()
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestStreamOwner {
-    /// Marks the sentinel before the native method returns its error.
-    fn drop(&mut self) {
-        self.dropped
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
+use crate::native_owner::NativeStreamOwner;
+use crate::{
+    BifrostGrpcTransport, BifrostIngestSink, ClientScope, QueryClient, SinkKind, ValaSdkError,
+    schema_from_json_schema,
+};
 
 pyo3::create_exception!(
     wyrd._wyrd.bifrost,
@@ -189,30 +41,66 @@ pyo3::create_exception!(
     "Raised when EOF arrives before the required query terminal."
 );
 
-/// Python-facing Bifrost write handle over the pooled C4b producers.
+/// Python-facing Bifrost write handle over the pooled native producers.
 ///
-/// The networked ingest transport is not yet wired — constructing this class
-/// raises `RuntimeError` until the gRPC ingest path lands. Callers should catch
-/// the error and disable any code paths that require live Bifrost writes.
+/// Construction resolves the explicit HTTP server URL and API key together
+/// with the configured gRPC endpoint, connects the real ingest transport, and
+/// keeps all buffering and producer ownership in the Rust SDK.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
-    _private: (),
+    /// Rust-native pooled write handle shared with the observe projection.
+    handle: crate::Bifrost,
 }
 
 #[pymethods]
 impl Bifrost {
-    /// Not yet available — raises `RuntimeError` until gRPC ingest is wired.
+    /// Connects the native write handle to the configured gRPC ingest endpoint.
+    ///
+    /// `server_url` selects the HTTP authentication plane. The gRPC endpoint
+    /// follows [`ClientConfig::from_env`], including `WYRD_GRPC_URL`, so local
+    /// test servers and split-plane deployments can expose distinct ports.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` for empty or invalid configuration and
+    /// `RuntimeError` when the authenticated gRPC connection cannot be made.
     #[new]
-    #[pyo3(signature = (_server_url, _api_key))]
-    fn __new__(_server_url: String, _api_key: String) -> PyResult<Self> {
-        Err(PyRuntimeError::new_err(
-            "bifrost transport unavailable: gRPC ingest not wired",
-        ))
+    #[pyo3(signature = (server_url, api_key))]
+    fn __new__(py: Python<'_>, server_url: &str, api_key: &str) -> PyResult<Self> {
+        if server_url.trim().is_empty() {
+            return Err(PyValueError::new_err("server_url must not be empty"));
+        }
+        if api_key.is_empty() {
+            return Err(PyValueError::new_err("api_key must not be empty"));
+        }
+
+        let mut config = ClientConfig::from_env();
+        config.http.base_url = server_url.trim_end_matches('/').to_owned();
+        config.api_key = Some(SecretString::from(api_key.to_owned()));
+        let scope = ClientScope::from_config(&config)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let client = WyrdClient::with_config(config)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let transport = py
+            .detach(|| wyrd_runtime::runtime().block_on(BifrostGrpcTransport::connect(&client)))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let sink = Arc::new(BifrostIngestSink::new(Arc::new(transport)));
+        Ok(Self {
+            handle: crate::Bifrost::new(scope, sink, QueueConfig::default()),
+        })
     }
 
-    /// Explicit write path: enqueue one JSON `row`, propagating queue-full.
+    /// Explicit write path: parse the JSON schema and card reference, then enqueue one JSON `row`.
+    ///
+    /// The native producer pool owns batching and the authenticated gRPC sink
+    /// owns delivery; this boundary only converts Python strings into native
+    /// contract values and preserves queue backpressure.
+    ///
+    /// # Errors
+    /// Raises `ValueError` for malformed JSON schema, unsupported schema nodes,
+    /// or an invalid card reference. Raises `RuntimeError` when the bounded
+    /// producer queue is full or the producer has begun draining.
     #[pyo3(signature = (table, schema, row, card_ref, run_id=None))]
-    #[allow(unused_variables)]
     fn insert(
         &self,
         table: &str,
@@ -221,21 +109,61 @@ impl Bifrost {
         card_ref: &str,
         run_id: Option<String>,
     ) -> PyResult<()> {
-        Err(PyRuntimeError::new_err(
-            "bifrost transport unavailable: gRPC ingest not wired",
-        ))
+        let schema_value: serde_json::Value = serde_json::from_str(schema)
+            .map_err(|error| PyValueError::new_err(format!("invalid JSON schema: {error}")))?;
+        let schema = schema_from_json_schema(&schema_value)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let card_ref = card_ref
+            .parse()
+            .map_err(|error| PyValueError::new_err(format!("invalid card_ref: {error}")))?;
+        let run_id = run_id.map(wyrd_spec::vala::ids::RunId::from_string);
+        self.handle
+            .insert(
+                SinkKind::Record,
+                table,
+                &schema,
+                row.as_bytes().to_vec(),
+                card_ref,
+                run_id,
+            )
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    /// Flush all queued rows and await each native ingest acknowledgement.
+    ///
+    /// Releases the Python GIL while the native drain performs queue and
+    /// network work.
+    ///
+    /// # Errors
+    /// Raises `RuntimeError` when a batch cannot be sealed or acknowledged by
+    /// the server, preserving the native queue error text at the boundary.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.handle.flush())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    /// Drain queued rows and stop every native producer background task.
+    ///
+    /// Releases the Python GIL while the native terminal drain completes.
+    ///
+    /// # Errors
+    /// Raises `RuntimeError` when the terminal drain cannot complete or a
+    /// server acknowledgement reports a write failure.
+    fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.handle.shutdown())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
     /// Rows dropped by the fire-and-forget observe path under backpressure.
     #[getter]
     fn dropped(&self) -> u64 {
-        0
+        self.handle.dropped()
     }
 
     /// Number of distinct producers currently pooled.
     #[getter]
     fn producer_count(&self) -> usize {
-        0
+        self.handle.producer_count()
     }
 }
 
@@ -564,25 +492,16 @@ impl PyBifrostQueryStream {
     }
 }
 
-#[cfg(test)]
-impl PyBifrostQueryStream {
-    /// Wraps an injectable owner for deterministic native cleanup tests.
-    fn new_for_test(owner: TestStreamOwner) -> Self {
-        Self {
-            consumer: Mutex::new(()),
-            stream: Mutex::new(Some(NativeStreamOwner::Test(owner))),
-            poll_abort: Mutex::new(PollAbortState::new()),
-            terminal_json: Mutex::new(None),
-        }
-    }
-}
-
 /// Record one telemetry observation, fire-and-forget.
 ///
-/// Not yet available — raises `RuntimeError` until gRPC ingest is wired.
+/// Uses the same native handle and producer pool as explicit Bifrost inserts.
+///
+/// # Errors
+/// Raises `ValueError` for malformed JSON schema, unsupported schema nodes, or
+/// an invalid card reference. Queue saturation is intentionally swallowed by
+/// the native observe path and reflected through the handle's drop counter.
 #[pyfunction]
 #[pyo3(signature = (bifrost, table, schema, row, card_ref, run_id=None))]
-#[allow(unused_variables)]
 fn record(
     bifrost: PyRef<'_, Bifrost>,
     table: &str,
@@ -591,9 +510,24 @@ fn record(
     card_ref: &str,
     run_id: Option<String>,
 ) -> PyResult<()> {
-    Err(PyRuntimeError::new_err(
-        "bifrost transport unavailable: gRPC ingest not wired",
-    ))
+    let schema_value: serde_json::Value = serde_json::from_str(schema)
+        .map_err(|error| PyValueError::new_err(format!("invalid JSON schema: {error}")))?;
+    let schema = schema_from_json_schema(&schema_value)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let card_ref = card_ref
+        .parse()
+        .map_err(|error| PyValueError::new_err(format!("invalid card_ref: {error}")))?;
+    let run_id = run_id.map(wyrd_spec::vala::ids::RunId::from_string);
+    crate::observe::record(
+        &bifrost.handle,
+        SinkKind::Record,
+        table,
+        &schema,
+        row.as_bytes().to_vec(),
+        card_ref,
+        run_id,
+    );
+    Ok(())
 }
 
 /// Register the `bifrost` write handle on the supplied module.
@@ -716,521 +650,4 @@ fn query_error_to_py(error: ValaSdkError) -> PyErr {
             .expect("invariant: Python exception accepts details");
         PyErr::from_value(instance)
     })
-}
-
-#[cfg(all(test, feature = "python"))]
-mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use pyo3::Python;
-    use wyrd_spec::error::WyrdError;
-    use wyrd_spec::vala::api::{
-        QueryErrorDetail, QueryFreshness, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
-    };
-
-    use super::*;
-
-    /// Builds the complete published-only terminal used by lifecycle tests.
-    fn success_terminal() -> QueryTerminalFrame {
-        QueryTerminalFrame {
-            outcome: QueryTerminalOutcome::Success,
-            freshness: QueryFreshness::Complete,
-            row_count: 0,
-            warnings: Vec::new(),
-            source_completion: vec![
-                SourceCompletion {
-                    source: QuerySource::Iceberg,
-                    outcome: SourceCompletionOutcome::Complete,
-                },
-                SourceCompletion {
-                    source: QuerySource::HotSealed,
-                    outcome: SourceCompletionOutcome::Complete,
-                },
-            ],
-            error: None,
-        }
-    }
-
-    /// Python query exceptions retain their subtype and every typed metadata field.
-    #[test]
-    fn query_error_projection_preserves_structured_metadata() {
-        Python::initialize();
-        Python::attach(|py| {
-            let error = ValaSdkError::Transport(WyrdError::PermissionDeniedRbac {
-                message: "query denied".to_owned(),
-                details: serde_json::json!({"required_scope": "bifrost_query:read"}),
-            });
-            let projected = query_error_to_py(error);
-            let value = projected.value(py);
-            assert!(value.is_instance_of::<BifrostQueryError>());
-            assert_eq!(
-                value
-                    .getattr("code")
-                    .expect("code")
-                    .extract::<String>()
-                    .expect("string"),
-                "WYRD_PERMISSION_403_DENIED_RBAC"
-            );
-            assert_eq!(
-                value
-                    .getattr("status")
-                    .expect("status")
-                    .extract::<u16>()
-                    .expect("u16"),
-                403
-            );
-            assert_eq!(
-                value
-                    .getattr("detail")
-                    .expect("detail")
-                    .extract::<String>()
-                    .expect("string"),
-                "query denied"
-            );
-            let details = value.getattr("details").expect("details");
-            assert_eq!(
-                details
-                    .get_item("required_scope")
-                    .expect("scope")
-                    .extract::<String>()
-                    .expect("string"),
-                "bifrost_query:read"
-            );
-
-            let incomplete = query_error_to_py(ValaSdkError::IncompleteQueryStream);
-            let incomplete_value = incomplete.value(py);
-            assert!(incomplete_value.is_instance_of::<IncompleteQueryStreamError>());
-            assert_eq!(
-                incomplete_value
-                    .getattr("code")
-                    .expect("code")
-                    .extract::<String>()
-                    .expect("string"),
-                "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
-            );
-            assert_eq!(
-                incomplete_value
-                    .getattr("status")
-                    .expect("status")
-                    .extract::<u16>()
-                    .expect("u16"),
-                502
-            );
-            assert!(
-                incomplete_value
-                    .getattr("details")
-                    .expect("details")
-                    .is_none()
-            );
-
-            let unavailable =
-                query_error_to_py(ValaSdkError::Transport(WyrdError::ServiceUnavailable {
-                    message: "query unavailable".to_owned(),
-                    details: serde_json::json!({"retryable": true}),
-                }));
-            let unavailable_value = unavailable.value(py);
-            assert_eq!(
-                unavailable_value
-                    .getattr("status")
-                    .expect("status")
-                    .extract::<u16>()
-                    .expect("u16"),
-                503
-            );
-            assert_eq!(
-                unavailable_value
-                    .getattr("detail")
-                    .expect("detail")
-                    .extract::<String>()
-                    .expect("string"),
-                "query unavailable"
-            );
-
-            let terminal = query_error_to_py(ValaSdkError::FailedTerminal {
-                terminal: failed_terminal(),
-            });
-            let terminal_value = terminal.value(py);
-            assert_eq!(
-                terminal_value
-                    .getattr("status")
-                    .expect("status")
-                    .extract::<u16>()
-                    .expect("u16"),
-                500
-            );
-            assert_eq!(
-                terminal_value
-                    .getattr("detail")
-                    .expect("detail")
-                    .extract::<String>()
-                    .expect("string"),
-                "python native sentinel failure"
-            );
-            assert!(
-                terminal_value
-                    .getattr("details")
-                    .expect("details")
-                    .is_instance_of::<pyo3::types::PyDict>()
-            );
-        });
-    }
-
-    /// Calls one native Python poll while holding the interpreter.
-    ///
-    /// # Errors
-    ///
-    /// Returns the native stream's projected Python error when the poll cannot
-    /// produce a batch or validated terminal.
-    fn poll(owner: &PyBifrostQueryStream) -> PyResult<Option<Vec<u8>>> {
-        Python::initialize();
-        Python::attach(|py| owner.next_ipc(py))
-    }
-
-    /// Builds a failed terminal carrying a scrubbed diagnostic.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the fixed test diagnostic stops satisfying
-    /// `QueryErrorDetail`'s scrubbed-value invariant.
-    fn failed_terminal() -> QueryTerminalFrame {
-        QueryTerminalFrame {
-            outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Complete,
-            row_count: 0,
-            warnings: Vec::new(),
-            source_completion: vec![
-                SourceCompletion {
-                    source: QuerySource::Iceberg,
-                    outcome: SourceCompletionOutcome::Complete,
-                },
-                SourceCompletion {
-                    source: QuerySource::HotSealed,
-                    outcome: SourceCompletionOutcome::Complete,
-                },
-            ],
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: Some(
-                    QueryErrorDetail::new("python native sentinel failure").expect("detail"),
-                ),
-            }),
-        }
-    }
-
-    /// Failed terminals retain diagnostics and drop their native owner first.
-    #[test]
-    fn native_owner_failed_terminal_drops_before_error_and_closes() {
-        let dropped = std::sync::Arc::new(AtomicBool::new(false));
-        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let terminal = failed_terminal();
-        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
-            std::collections::VecDeque::from([Err(ValaSdkError::FailedTerminal {
-                terminal: terminal.clone(),
-            })]),
-            Some(terminal),
-            std::sync::Arc::clone(&dropped),
-            std::sync::Arc::clone(&polls),
-        ));
-        let error = poll(&owner).expect_err("failed terminal is projected");
-        Python::attach(|py| {
-            assert_eq!(
-                error
-                    .value(py)
-                    .getattr("code")
-                    .expect("code")
-                    .extract::<String>()
-                    .expect("string"),
-                "WYRD_VALA_500_QUERY_EXECUTION_FAILED"
-            );
-        });
-        assert!(
-            owner
-                .terminal_json()
-                .expect("terminal lock remains healthy")
-                .expect("diagnostics retained")
-                .contains("python native sentinel failure")
-        );
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(
-            poll(&owner)
-                .expect_err("second poll closes")
-                .to_string()
-                .contains("query stream is closed")
-        );
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-    }
-
-    /// Protocol, Arrow, EOF, and source errors release ownership before projection.
-    #[test]
-    fn native_owner_projection_errors_drop_before_error_and_close() {
-        let cases = vec![
-            Err(ValaSdkError::Protocol("malformed".to_owned())),
-            Err(ValaSdkError::Arrow("malformed Arrow".to_owned())),
-            Err(ValaSdkError::IncompleteQueryStream),
-        ];
-        for result in cases {
-            let dropped = std::sync::Arc::new(AtomicBool::new(false));
-            let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
-                std::collections::VecDeque::from([result]),
-                None,
-                std::sync::Arc::clone(&dropped),
-                std::sync::Arc::clone(&polls),
-            ));
-            let error = poll(&owner).expect_err("projection error is surfaced");
-            Python::attach(|py| {
-                assert!(
-                    error
-                        .value(py)
-                        .getattr("code")
-                        .expect("code")
-                        .extract::<String>()
-                        .expect("string")
-                        .starts_with("WYRD_VALA_")
-                );
-            });
-            assert!(dropped.load(Ordering::SeqCst));
-            assert_eq!(polls.load(Ordering::SeqCst), 1);
-            assert!(poll(&owner).is_err(), "second poll closes");
-            assert_eq!(polls.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    /// Transport diagnostics survive owner cleanup and the next poll is closed.
-    #[test]
-    fn native_owner_transport_error_drops_before_error_and_closes() {
-        let dropped = std::sync::Arc::new(AtomicBool::new(false));
-        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
-            std::collections::VecDeque::from([Err(ValaSdkError::Transport(
-                WyrdError::ServiceUnavailable {
-                    message: "body transport failed".to_owned(),
-                    details: serde_json::json!({}),
-                },
-            ))]),
-            None,
-            std::sync::Arc::clone(&dropped),
-            std::sync::Arc::clone(&polls),
-        ));
-        let error = poll(&owner).expect_err("transport error projects");
-        Python::attach(|py| {
-            let value = error.value(py);
-            assert_eq!(
-                value
-                    .getattr("code")
-                    .expect("code")
-                    .extract::<String>()
-                    .expect("string"),
-                "WYRD_SERVER_503_SERVICE_UNAVAILABLE"
-            );
-            assert_eq!(
-                value
-                    .getattr("status")
-                    .expect("status")
-                    .extract::<u16>()
-                    .expect("u16"),
-                503
-            );
-        });
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(poll(&owner).is_err(), "second poll closes");
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-    }
-
-    /// Native completion without a retained terminal uses the typed incomplete seam.
-    #[test]
-    fn native_owner_missing_terminal_projects_structured_incomplete_error() {
-        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
-            std::collections::VecDeque::from([Ok(None)]),
-            None,
-            std::sync::Arc::new(AtomicBool::new(false)),
-            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        ));
-        let error = poll(&owner).expect_err("missing terminal rejects");
-        Python::attach(|py| {
-            let value = error.value(py);
-            assert!(value.is_instance_of::<IncompleteQueryStreamError>());
-            assert_eq!(
-                value
-                    .getattr("code")
-                    .expect("code")
-                    .extract::<String>()
-                    .expect("string"),
-                "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
-            );
-            assert_eq!(
-                value
-                    .getattr("status")
-                    .expect("status")
-                    .extract::<u16>()
-                    .expect("u16"),
-                502
-            );
-            assert!(value.getattr("details").expect("details").is_none());
-        });
-    }
-
-    /// Closing before a poll starts is idempotent and prevents owner re-entry.
-    #[test]
-    fn native_close_before_poll_drops_owner_without_polling() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
-            std::collections::VecDeque::new(),
-            None,
-            Arc::clone(&dropped),
-            Arc::clone(&polls),
-        ));
-
-        owner.close().expect("first close succeeds");
-        owner.close().expect("second close is idempotent");
-
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(polls.load(Ordering::SeqCst), 0);
-        assert!(
-            poll(&owner)
-                .expect_err("closed poll rejects")
-                .to_string()
-                .contains("closed")
-        );
-        assert_eq!(polls.load(Ordering::SeqCst), 0);
-    }
-
-    /// Closing a pending poll aborts its future and leaves no worker blocked.
-    #[test]
-    fn native_close_during_poll_aborts_and_drops_owner() {
-        let future_dropped = Arc::new(AtomicBool::new(false));
-        let owner_dropped = Arc::new(AtomicBool::new(false));
-        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let owner = Arc::new(PyBifrostQueryStream::new_for_test(
-            TestStreamOwner::pending(
-                entered_tx,
-                release_rx,
-                Arc::clone(&future_dropped),
-                Arc::clone(&owner_dropped),
-                Arc::clone(&polls),
-            ),
-        ));
-
-        std::thread::scope(|scope| {
-            let poll_owner = Arc::clone(&owner);
-            let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
-            let worker = scope.spawn(move || {
-                let result = poll(&poll_owner);
-                completed_tx
-                    .send(())
-                    .expect("bounded completion receiver remains live");
-                result
-            });
-            entered_rx
-                .recv()
-                .expect("pending poll reports entry without timing guesses");
-            owner
-                .close()
-                .expect("close signals abort before waiting for stream");
-            completed_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("native poll completion arrives within the test bound");
-            let error = worker
-                .join()
-                .expect("native poll worker exits")
-                .expect_err("aborted poll returns an internal closed outcome");
-            assert!(error.to_string().contains("aborted"));
-        });
-
-        assert!(future_dropped.load(Ordering::SeqCst));
-        assert!(owner_dropped.load(Ordering::SeqCst));
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(
-            poll(&owner).is_err(),
-            "follow-up poll is immediately closed"
-        );
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(
-            owner
-                .poll_abort
-                .lock()
-                .expect("abort state remains healthy")
-                .current
-                .is_none()
-        );
-    }
-
-    /// Closing after terminal completion is idempotent and retains diagnostics.
-    #[test]
-    fn native_terminal_then_close_is_idempotent() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
-            std::collections::VecDeque::from([Ok(None)]),
-            Some(success_terminal()),
-            Arc::clone(&dropped),
-            Arc::clone(&polls),
-        ));
-
-        assert!(poll(&owner).expect("terminal poll succeeds").is_none());
-        let terminal = owner
-            .terminal_json()
-            .expect("terminal lock remains healthy")
-            .expect("terminal diagnostics are retained");
-        owner.close().expect("first close after terminal succeeds");
-        owner.close().expect("second close after terminal succeeds");
-
-        assert_eq!(
-            owner.terminal_json().expect("terminal remains readable"),
-            Some(terminal)
-        );
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-    }
-
-    /// A poisoned terminal lock still drops the stream before returning failure.
-    #[test]
-    fn native_owner_terminal_lock_failure_drops_before_error_and_closes() {
-        let dropped = std::sync::Arc::new(AtomicBool::new(false));
-        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
-            std::collections::VecDeque::from([Ok(None)]),
-            Some(QueryTerminalFrame {
-                outcome: QueryTerminalOutcome::Success,
-                freshness: QueryFreshness::Complete,
-                row_count: 0,
-                warnings: Vec::new(),
-                source_completion: vec![
-                    SourceCompletion {
-                        source: QuerySource::Iceberg,
-                        outcome: SourceCompletionOutcome::Complete,
-                    },
-                    SourceCompletion {
-                        source: QuerySource::HotSealed,
-                        outcome: SourceCompletionOutcome::Complete,
-                    },
-                ],
-                error: None,
-            }),
-            std::sync::Arc::clone(&dropped),
-            std::sync::Arc::clone(&polls),
-        ));
-        let terminal_lock = &owner.terminal_json;
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let _guard = terminal_lock.lock().expect("terminal lock acquires");
-                    panic!("poison terminal lock for owner test");
-                })
-                .join()
-                .expect_err("poisoning thread panics");
-        });
-        let error = poll(&owner).expect_err("terminal lock failure projects");
-        assert!(error.to_string().contains("terminal lock poisoned"));
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(poll(&owner).is_err(), "second poll closes");
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
-    }
 }

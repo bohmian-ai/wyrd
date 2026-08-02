@@ -48,6 +48,10 @@ class WyrdTestServer:
         """Create sealed and live query rows and return ``(table_fqn, access_token)``."""
         ...
 
+    def flush_bifrost(self) -> None:
+        """Flush server-owned Scribe state after a client drain."""
+        ...
+
     def stall_next_query_after_schema(self) -> None:
         """Stall the next query after its schema for cancellation testing."""
         ...

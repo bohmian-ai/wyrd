@@ -289,6 +289,19 @@ impl ScribeIngressCpuPool {
     }
 }
 
+/// Decode one admitted Arrow payload, validate its projected schema and card
+/// scope, then stamp the server-owned physical columns before persistence.
+///
+/// Native payloads may carry one nullable Utf8 `run_id` correlation field;
+/// projected payloads retain their correlation fields as supplied by the
+/// projection path. In either mode, user schema fingerprinting excludes
+/// correlation and managed columns.
+///
+/// # Errors
+/// Returns [`ScribeError::InvalidFrame`] for malformed IPC, duplicate or
+/// invalid managed fields, and failed physical assembly; returns
+/// [`ScribeError::FingerprintMismatch`] or authorization errors when the
+/// admitted payload does not match the registered table contract.
 fn decode(
     payload: IngressPayload,
     principal: &Principal,
@@ -327,14 +340,15 @@ fn decode(
     }
     for field in rows.schema().fields() {
         let reserved = match field.name().as_str() {
-            CARD_UID | PRINCIPAL_ID | "run_id" | DATA_TENANT_ID | WYRD_BATCH_ID
-            | WYRD_ROW_ORDINAL | WYRD_INGESTED_AT | WYRD_REQUEST_ID => true,
+            CARD_UID | PRINCIPAL_ID | DATA_TENANT_ID | WYRD_BATCH_ID | WYRD_ROW_ORDINAL
+            | WYRD_INGESTED_AT | WYRD_REQUEST_ID => true,
             WYRD_EVENT_TIME => native_payload,
             _ => false,
         };
+        let native_run_id = native_payload && field.name() == "run_id";
         let projected_correlation =
             !native_payload && matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id");
-        if reserved && !projected_correlation {
+        if reserved && !projected_correlation && !native_run_id {
             return Err(ScribeError::InvalidFrame);
         }
     }
@@ -389,9 +403,10 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
 
 /// Stamps server-owned correlation and managed columns onto one admitted batch.
 ///
-/// Native Arrow payloads cannot supply correlation fields, so the canonical
-/// nullable `run_id` field is materialized as all-null before the other
-/// correlation columns. Projected payloads retain their server-derived value.
+/// Native Arrow payloads may supply one valid nullable `run_id` correlation
+/// field; it is removed from the user projection and reinserted exactly once as
+/// the canonical nullable physical column. Omitted native values become null.
+/// Projected payloads retain their correlation values unchanged.
 ///
 /// # Errors
 /// Returns a typed Scribe error when correlation resolution, timestamp
@@ -405,13 +420,38 @@ fn stamp_correlation_columns(
 ) -> Result<RecordBatch, ScribeError> {
     let row_count = rows.num_rows();
     let stamp_event_time = native_payload || rows.schema().index_of(WYRD_EVENT_TIME).is_err();
-    let server_owned = server_owned_columns(stamp_event_time);
+    let native_run_id = if native_payload {
+        let schema = rows.schema();
+        let matches = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name() == "run_id")
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(ScribeError::InvalidFrame);
+        }
+        matches
+            .first()
+            .map(|(index, field)| {
+                if field.data_type() != &DataType::Utf8 {
+                    return Err(ScribeError::InvalidFrame);
+                }
+                Ok(Arc::clone(rows.column(*index)))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let server_owned = server_owned_columns(native_payload, stamp_event_time);
     let card_uids = resolve_card_uids(rows, principal, row_count)?;
     let mut fields = user_fields(rows, &server_owned);
     let mut columns = user_columns(rows, &server_owned);
     if native_payload {
         fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-        columns.push(Arc::new(StringArray::from(vec![None::<&str>; row_count])));
+        columns.push(native_run_id.unwrap_or_else(|| {
+            Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
+        }));
     }
     columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
     columns.push(Arc::new(StringArray::from(vec![
@@ -434,7 +474,12 @@ fn stamp_correlation_columns(
         .map_err(|_| ScribeError::InvalidFrame)
 }
 
-fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
+/// Return physical columns excluded from user projection for one payload mode.
+///
+/// `stamp_event_time` is independent from `native_payload`: projected payloads
+/// that omit event time still receive the server-managed timestamp, while only
+/// native payloads replace the inbound `run_id` field.
+fn server_owned_columns(native_payload: bool, stamp_event_time: bool) -> Vec<&'static str> {
     let mut columns = vec![
         CARD_REF,
         CARD_UID,
@@ -445,8 +490,11 @@ fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
         WYRD_ROW_ORDINAL,
         DATA_TENANT_ID,
     ];
-    if native_payload {
+    if stamp_event_time {
         columns.push(WYRD_EVENT_TIME);
+    }
+    if native_payload {
+        columns.push("run_id");
     }
     columns
 }
@@ -1127,6 +1175,7 @@ mod tests {
     use uuid::Uuid;
     use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
@@ -1274,28 +1323,143 @@ mod tests {
         );
     }
 
+    /// Projected payloads retain their caller-provided run identifier as the
+    /// correlation value used by the projected-observation path.
     #[test]
-    fn reserved_columns_reject_before_writer_admission() {
+    fn projected_run_id_remains_correlation_data() {
         let rows = batch(
             vec![Field::new("run_id", DataType::Utf8, false)],
             vec![Arc::new(StringArray::from(vec!["client-run"]))],
         );
-        let mut payload = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut payload, &rows.schema())
-                .expect("IPC writer initializes");
-            writer.write(&rows).expect("IPC batch writes");
-            writer.finish().expect("IPC writer finishes");
-        }
         let error = decode(
-            IngressPayload::ArrowIpc(payload.into()),
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
         )
-        .expect_err("run_id is server-owned");
-        assert!(matches!(error, crate::contracts::ScribeError::InvalidFrame));
+        .expect("projected run_id is correlation data");
+        let run_id = error
+            .column_by_name("run_id")
+            .expect("projected run_id remains present")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("run_id is Utf8");
+        assert_eq!(run_id.value(0), "client-run");
+    }
+
+    /// Native payloads preserve one valid client run identifier while stamping
+    /// exactly one authoritative nullable `run_id` column for the physical record.
+    #[test]
+    fn native_run_id_is_replaced_by_one_authoritative_nullable_field() {
+        let card = CardRef::from_str("test/Service/python-integration-writer@1.0.0").expect("card");
+        let card = CardRef {
+            uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
+            ..card
+        };
+        let principal = Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalKind::Service {
+                card_ref: card.clone(),
+                card_ref_scope: CardRefScope::own(&card),
+            },
+            crate::test_support::tenant(),
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new("run_id", DataType::Utf8, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec!["client-run"])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+            ],
+        );
+        let native = decode(
+            IngressPayload::ArrowIpc({
+                let mut payload = Vec::new();
+                let mut writer = StreamWriter::try_new(&mut payload, rows.schema().as_ref())
+                    .expect("IPC writer initializes");
+                writer.write(&rows).expect("IPC batch writes");
+                writer.finish().expect("IPC writer finishes");
+                payload.into()
+            }),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect("native run_id is preserved and canonicalized");
+        assert_eq!(
+            native
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name() == "run_id")
+                .count(),
+            1
+        );
+        let run_id_index = native.schema().index_of("run_id").expect("native run_id");
+        assert!(native.schema().field(run_id_index).is_nullable());
+        let run_id = native
+            .column(run_id_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("native run_id is Utf8");
+        assert_eq!(run_id.value(0), "client-run");
+
+        let invalid_type = batch(
+            vec![Field::new("run_id", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        );
+        let invalid = decode(
+            IngressPayload::ArrowIpc({
+                let mut payload = Vec::new();
+                let mut writer =
+                    StreamWriter::try_new(&mut payload, invalid_type.schema().as_ref())
+                        .expect("IPC writer initializes");
+                writer.write(&invalid_type).expect("IPC batch writes");
+                writer.finish().expect("IPC writer finishes");
+                payload.into()
+            }),
+            &principal,
+            source_schema_fingerprint(invalid_type.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect_err("native run_id type is validated");
+        assert!(matches!(invalid, ScribeError::InvalidFrame));
+
+        let duplicate = batch(
+            vec![
+                Field::new("run_id", DataType::Utf8, false),
+                Field::new("run_id", DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["first"])),
+                Arc::new(StringArray::from(vec!["second"])),
+            ],
+        );
+        let duplicate_error = decode(
+            IngressPayload::ArrowIpc({
+                let mut payload = Vec::new();
+                let mut writer = StreamWriter::try_new(&mut payload, duplicate.schema().as_ref())
+                    .expect("IPC writer initializes");
+                writer.write(&duplicate).expect("IPC batch writes");
+                writer.finish().expect("IPC writer finishes");
+                payload.into()
+            }),
+            &principal,
+            source_schema_fingerprint(duplicate.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect_err("duplicate native physical fields fail closed");
+        assert!(matches!(duplicate_error, ScribeError::InvalidFrame));
     }
 
     #[test]

@@ -84,6 +84,12 @@ impl WyrdTestServer {
         }
     }
 
+    /// Start a bound server, bootstrap its writer service key, and optionally
+    /// publish the endpoints through the documented `WYRD_*` environment vars.
+    ///
+    /// # Errors
+    /// Returns a Python error when server startup, service bootstrap, or
+    /// environment setup cannot complete.
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
         let mutate_env = slf.mutate_env;
 
@@ -102,7 +108,21 @@ impl WyrdTestServer {
                 .map_err(wyrd_spec::error::WyrdError::from)?;
             let base_url = srv.base_url().unwrap_or("").to_owned();
             let grpc_url = srv.grpc_url().unwrap_or_default();
-            let api_key = srv.api_key().expose_secret().to_owned();
+            let bootstrap = srv
+                .bootstrap_service("python-integration-writer", &["admin"])
+                .await
+                .map_err(wyrd_spec::error::WyrdError::from)?;
+            let api_key = match bootstrap {
+                crate::server::Bootstrap::Machine { api_key, .. } => {
+                    api_key.expose_secret().to_owned()
+                }
+                crate::server::Bootstrap::User { .. } => {
+                    return Err(wyrd_spec::error::WyrdError::HarnessStart {
+                        message: "Python test server writer bootstrap returned a user".to_owned(),
+                        details: serde_json::json!({}),
+                    });
+                }
+            };
             let tenant_id = srv.data_tenant_id().to_string();
             Ok((srv, base_url, grpc_url, api_key, tenant_id))
         });
@@ -230,6 +250,20 @@ impl WyrdTestServer {
         wyrd_runtime::runtime()
             .block_on(prepare_oracle_query_fixture(srv))
             .map_err(wyrd_error_to_py_err)
+    }
+
+    /// Flush the server-owned Scribe after a public client drain.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or the
+    /// production Scribe seal path cannot commit its buffered rows.
+    fn flush_bifrost(&self) -> PyResult<()> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
+        })?;
+        wyrd_runtime::runtime()
+            .block_on(server.flush_bifrost())
+            .map_err(|error| wyrd_error_to_py_err(error.into()))
     }
 
     /// Truncate the next query after its schema frame in the real server.

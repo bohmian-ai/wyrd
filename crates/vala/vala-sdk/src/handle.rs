@@ -100,6 +100,76 @@ impl Bifrost {
             .enqueue(json, card_ref, run_id)
     }
 
+    /// Flush every pooled producer and wait for each sink acknowledgement.
+    ///
+    /// The producer set is snapshotted before blocking so concurrent inserts
+    /// can continue to resolve their existing handles without holding the pool
+    /// mutex across network IO. Every producer is attempted in deterministic
+    /// table order even after an earlier producer reports an error.
+    ///
+    /// # Errors
+    /// Returns the first [`WyrdQueueError`] reported by a producer flush after
+    /// all producers have been attempted, including transport failures returned
+    /// by the configured sink.
+    ///
+    /// # Panics
+    /// Panics if the producer pool mutex is poisoned, which indicates an
+    /// invariant-breaking panic in another handle operation.
+    pub fn flush(&self) -> Result<(), WyrdQueueError> {
+        let mut producers = self
+            .producers
+            .lock()
+            .expect("producer pool poisoned")
+            .iter()
+            .map(|(key, producer)| (key.table.clone(), Arc::clone(producer)))
+            .collect::<Vec<_>>();
+        producers.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut first_error = None;
+        for (_, producer) in producers {
+            if let Err(error) = producer.flush()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Drain every pooled producer and stop its background task.
+    ///
+    /// The producer set is snapshotted before blocking. Once each producer
+    /// enters its draining state, new rows are rejected and buffered rows are
+    /// sent before this method returns; later producers are still drained after
+    /// an earlier producer fails.
+    ///
+    /// # Errors
+    /// Returns the first [`WyrdQueueError`] reported by a producer shutdown
+    /// after every producer has been stopped, including a failed terminal sink
+    /// acknowledgement.
+    ///
+    /// # Panics
+    /// Panics if the producer pool mutex is poisoned, which indicates an
+    /// invariant-breaking panic in another handle operation.
+    pub fn shutdown(&self) -> Result<(), WyrdQueueError> {
+        let mut producers = self
+            .producers
+            .lock()
+            .expect("producer pool poisoned")
+            .iter()
+            .map(|(key, producer)| (key.table.clone(), Arc::clone(producer)))
+            .collect::<Vec<_>>();
+        producers.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut first_error = None;
+        for (_, producer) in producers {
+            if let Err(error) = producer.shutdown()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Record one fire-and-forget drop: bump the counter and warn once.
     ///
     /// The observe path calls this after swallowing a queue-full so telemetry

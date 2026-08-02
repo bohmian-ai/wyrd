@@ -24,6 +24,7 @@
 
 pub mod grpc;
 pub mod handle;
+mod native_owner;
 pub mod observe;
 #[cfg(feature = "python")]
 pub mod python;
@@ -119,6 +120,29 @@ mod sdk {
         }
     }
 
+    /// Sink that fails one named table while recording every attempted drain.
+    #[derive(Default)]
+    struct LifecycleSink {
+        attempts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BatchSink for LifecycleSink {
+        async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
+            self.attempts
+                .lock()
+                .expect("attempts lock")
+                .push(batch.table.clone());
+            if batch.table == "a" {
+                return Err(WyrdError::Internal {
+                    message: "a producer failed".to_owned(),
+                    details: serde_json::json!({}),
+                });
+            }
+            Ok(batch.rows)
+        }
+    }
+
     fn wait_until_started(sink: &StallSink) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while !sink.started.load(Ordering::SeqCst) {
@@ -207,6 +231,47 @@ mod sdk {
         assert!(
             rejected > 0,
             "a saturated queue must reject on the write path"
+        );
+    }
+
+    /// Flush and shutdown visit every producer, return the deterministic first
+    /// error, and leave successful later producers fully drained.
+    #[test]
+    fn lifecycle_drains_all_producers_after_first_error() {
+        let sink = Arc::new(LifecycleSink::default());
+        let scope =
+            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
+        let bifrost = Bifrost::new(
+            scope,
+            Arc::clone(&sink) as Arc<dyn BatchSink>,
+            QueueConfig {
+                flush_max_rows: 1,
+                flush_interval_ms: 0,
+                ..QueueConfig::default()
+            },
+        );
+        let schema = test_schema();
+        bifrost
+            .insert(SinkKind::Record, "b", &schema, row(), card(), None)
+            .expect("later producer accepted");
+        bifrost
+            .insert(SinkKind::Record, "a", &schema, row(), card(), None)
+            .expect("earlier producer accepted");
+
+        let flush_error = bifrost.flush().expect_err("a producer must fail");
+        assert!(flush_error.to_string().contains("a producer failed"));
+        let attempts_after_flush = sink.attempts.lock().expect("attempts lock").clone();
+        assert!(attempts_after_flush.iter().any(|table| table == "a"));
+        assert!(attempts_after_flush.iter().any(|table| table == "b"));
+
+        let shutdown_error = bifrost.shutdown().expect_err("a retry must fail shutdown");
+        assert!(shutdown_error.to_string().contains("a producer failed"));
+        assert!(
+            bifrost
+                .insert(SinkKind::Record, "b", &schema, row(), card(), None)
+                .expect_err("shutdown stops later producer")
+                .to_string()
+                .contains("queue full")
         );
     }
 

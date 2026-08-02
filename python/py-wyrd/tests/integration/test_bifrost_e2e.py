@@ -1,22 +1,13 @@
-"""Integration journeys: Bifrost write surface against a live WyrdTestServer.
-
-All tests require the ``integration`` pytest marker and a running WyrdTestServer
-provided by the ``wyrd_server`` session fixture in conftest.py.
-
-Current state of the transport layer: the Python ``Bifrost`` handle drains into
-an in-process MockSink. Full round-trip assertions (rows land in warehouse,
-fingerprint == describe().fingerprint, audit log gap-free seq) require the gRPC
-ingest transport wired in a later stage. Until then the journeys verify the SDK
-lifecycle, backpressure contract, and error boundaries that are observable now.
-"""
+"""Integration journeys for the public Bifrost gRPC write surface."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING
 
 import pytest
-from wyrd.bifrost import Bifrost
+from wyrd.bifrost import Bifrost, BifrostQueryClient
 from wyrd.observe import record
 
 if TYPE_CHECKING:
@@ -34,7 +25,15 @@ SCHEMA = json.dumps(
     }
 )
 
-CARD_REF = "prod/Service/genai_pipeline@1.0.0"
+# The harness API key is scoped to this deterministic service card.
+CARD_REF = "test/Service/python-integration-writer@1.0.0"
+WRITE_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {"id": {"type": "integer"}, "value": {"type": "string"}},
+        "required": ["id", "value"],
+    }
+)
 
 
 def _row(i: int) -> str:
@@ -85,6 +84,40 @@ def test_observe_record_no_raises(wyrd_server: WyrdTestServer) -> None:
     assert bifrost.dropped == 0
 
 
+@pytest.mark.integration
+def test_bifrost_write_flush_shutdown_and_readback(wyrd_server: WyrdTestServer) -> None:
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    bifrost = Bifrost(wyrd_server.base_url, wyrd_server.api_key)
+    written = [(4, "fourth"), (5, "fifth")]
+    for row_id, value in written:
+        bifrost.insert(
+            table=table_fqn,
+            schema=WRITE_SCHEMA,
+            row=json.dumps({"id": row_id, "value": value}),
+            card_ref=CARD_REF,
+        )
+    bifrost.flush()
+    bifrost.shutdown()
+    wyrd_server.flush_bifrost()
+
+    async def readback() -> list[tuple[int, str]]:
+        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+            f"SELECT id, value FROM {table_fqn} WHERE id >= 4 ORDER BY id",
+        )
+        rows: list[tuple[int, str]] = []
+        async for batch in stream:
+            rows.extend(
+                zip(
+                    batch.column("id").to_pylist(),
+                    batch.column("value").to_pylist(),
+                    strict=True,
+                )
+            )
+        return rows
+
+    assert asyncio.run(readback()) == written
+
+
 # ---------------------------------------------------------------------------
 # C6: backpressure contracts
 # ---------------------------------------------------------------------------
@@ -94,9 +127,8 @@ def test_observe_record_no_raises(wyrd_server: WyrdTestServer) -> None:
 def test_bifrost_insert_propagates_queue_full(wyrd_server: WyrdTestServer) -> None:
     bifrost = Bifrost(wyrd_server.base_url, wyrd_server.api_key)
 
-    # With MockSink (instant drain), queue-full is unlikely under normal load.
-    # This test verifies the API surface accepts inserts without error under
-    # current transport; backpressure is fully exercised in sdk.rs unit tests.
+    # The public transport drains this small batch quickly; queue-full remains
+    # covered by the native queue tests where a stall sink is deterministic.
     for i in range(500):
         bifrost.insert(
             table="genai.backpressure",
@@ -115,7 +147,7 @@ def test_observe_record_swallows_and_counts(wyrd_server: WyrdTestServer) -> None
         record(
             bifrost, table="genai.observe_overflow", schema=SCHEMA, row=_row(i), card_ref=CARD_REF
         )
-    assert bifrost.dropped == 0, "MockSink drains immediately; no spurious drops expected"
+    assert bifrost.dropped == 0, "public transport drains immediately; no spurious drops expected"
 
 
 # ---------------------------------------------------------------------------
@@ -133,19 +165,43 @@ def test_negative_bad_card_ref_raises(wyrd_server: WyrdTestServer) -> None:
 @pytest.mark.integration
 def test_negative_conflicting_schema_fingerprint_mismatch(wyrd_server: WyrdTestServer) -> None:
     pytest.skip(
-        "Requires Bifrost.register() — gRPC ingest transport not yet wired. "
-        "The WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH contract is unit-covered in "
-        "vala-bifrost and will be e2e-verified when transport lands."
+        "Requires the public table registration helper; the write transport is covered "
+        "by the round-trip journey above."
     )
 
 
 @pytest.mark.integration
 def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestServer) -> None:
-    pytest.skip(
-        "Requires real gRPC ingest transport so the server can enforce RBAC and return "
-        "WYRD_PERMISSION_403_DENIED_RBAC. Currently Bifrost drains into MockSink; "
-        "server-side RBAC enforcement is verified in wyrd-server authz e2e tests."
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    denied_key = wyrd_server.bootstrap_service([], name="bifrost-write-denied")
+    bifrost = Bifrost(wyrd_server.base_url, denied_key)
+    bifrost.insert(
+        table=table_fqn,
+        schema=WRITE_SCHEMA,
+        row=json.dumps({"id": 999, "value": "denied"}),
+        card_ref=CARD_REF,
     )
+    with pytest.raises(RuntimeError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
+        bifrost.flush()
+    with pytest.raises(RuntimeError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
+        bifrost.shutdown()
+
+    async def readback() -> list[tuple[int, str]]:
+        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+            f"SELECT id, value FROM {table_fqn} WHERE id = 999",
+        )
+        rows: list[tuple[int, str]] = []
+        async for batch in stream:
+            rows.extend(
+                zip(
+                    batch.column("id").to_pylist(),
+                    batch.column("value").to_pylist(),
+                    strict=True,
+                )
+            )
+        return rows
+
+    assert asyncio.run(readback()) == [], "denied write must not mutate durable rows"
 
 
 @pytest.mark.integration

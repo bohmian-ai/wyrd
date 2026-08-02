@@ -6,13 +6,10 @@ from typing import Any
 import pyarrow
 
 class Bifrost:
-    """Vala Bifrost client write handle over the pooled producers.
+    """Vala Bifrost client write handle over the pooled native producers.
 
-    Keyed under a credential-fingerprint scope derived from ``server_url`` and
-    ``api_key``; the scope and pool keys are never exposed to Python. Until the
-    networked ingest transport is wired, the handle drains into an in-process
-    loopback sink so the enqueue/observe/drop-count boundary is exercised
-    without a server.
+    The handle connects to the configured gRPC ingest endpoint and keeps
+    credential scope, batching, backpressure, and producer pooling in Rust.
     """
 
     def __init__(self, server_url: str, api_key: str) -> None: ...
@@ -28,6 +25,14 @@ class Bifrost:
 
         ``schema`` is JSON-Schema text; ``card_ref`` is ``space/Kind/name@version``.
         """
+        ...
+
+    def flush(self) -> None:
+        """Flush queued rows and await native ingest acknowledgements."""
+        ...
+
+    def shutdown(self) -> None:
+        """Drain queued rows and stop native producer tasks."""
         ...
 
     @property

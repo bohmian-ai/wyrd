@@ -314,7 +314,7 @@ impl Task {
     /// Seal repeatedly until staging is empty. Stops and surfaces the error on the
     /// first failed pass (rows stay re-buffered, never dropped).
     async fn drain_to_completion(&self) -> Result<(), WyrdQueueError> {
-        while self.queue.staging_len() > 0 {
+        while self.queue.has_pending() {
             self.queue.seal_and_send().await?;
         }
         Ok(())

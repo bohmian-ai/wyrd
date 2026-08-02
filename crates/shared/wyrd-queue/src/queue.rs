@@ -116,6 +116,21 @@ impl RecordQueue {
         self.staging.len()
     }
 
+    /// Whether rows remain in staging or in the retry buffer after a failed
+    /// sink attempt.
+    ///
+    /// # Panics
+    /// Panics if the retry mutex is poisoned by a prior panic in queue logic.
+    #[must_use]
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.staging.is_empty()
+            || !self
+                .retry
+                .lock()
+                .expect("retry lock is not poisoned")
+                .is_empty()
+    }
+
     /// Buffer one row into staging, sealing once to make room if the buffer is
     /// full. A row that still cannot land after a seal is dropped with a counter
     /// bump (never silently) — the flush path is the only backpressure valve the

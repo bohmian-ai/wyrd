@@ -114,6 +114,8 @@ async fn release_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use crate::{MIGRATION_SEARCH_PATH, OWNED_SCHEMAS};
 
     use std::fs;
@@ -224,6 +226,47 @@ mod tests {
                 "migration file {file_name} must use snake_case"
             );
         }
+    }
+
+    /// Verifies the Forge/Oracle migration partition and forward grant owner.
+    #[test]
+    fn forge_and_oracle_migrations_have_unique_forward_owners() {
+        let files = migration_files();
+        let forge = [
+            "20260910000010_forge_tasks.sql",
+            "20260910000011_forge_planning_demands.sql",
+            "20260910000012_forge_worker_claim_state.sql",
+        ];
+        let oracle = [
+            "20260910000013_oracle_coordination.sql",
+            "20260910000014_oracle_recovery_audit_authority.sql",
+        ];
+        for file in forge.into_iter().chain(oracle) {
+            assert!(
+                files.iter().any(|candidate| candidate == file),
+                "missing migration {file}"
+            );
+        }
+        let old_olap = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations/20260619000001_olap_minimal.sql"),
+        )
+        .expect("older OLAP migration is readable");
+        let old_olap_digest = Sha256::digest(old_olap.as_bytes());
+        assert_eq!(
+            format!("{old_olap_digest:x}"),
+            "d70ec48be662b9067c21e1deb69ec0a873ec5d78579250f96ec5c096124fa478",
+            "older migration checksum must remain stable"
+        );
+        let oracle_coordination = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations/20260910000013_oracle_coordination.sql"),
+        )
+        .expect("Oracle coordination migration is readable");
+        assert!(
+            oracle_coordination
+                .contains("GRANT SELECT ON vala.bifrost_tables TO wyrd_platform_admin")
+        );
     }
 
     #[test]

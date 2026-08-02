@@ -44,7 +44,7 @@ mod pg_tests {
         }
     }
 
-    /// Exact migration 11 upgrades a real pre-Oracle schema and Scribe row.
+    /// Exact migration 13 upgrades a real pre-Oracle schema and Scribe row.
     #[tokio::test]
     async fn old_scribe_membership_shape_is_preserved() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -79,7 +79,7 @@ mod pg_tests {
         ))
         .execute(&pool)
         .await
-        .expect("exact migration 11 applies");
+        .expect("exact migration 13 applies");
         let row: (uuid::Uuid, i16, serde_json::Value, bool) = sqlx::query_as(
             "SELECT data_tenant_id,capability_version,capabilities,ready \
              FROM vala.cluster_nodes \

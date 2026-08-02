@@ -939,7 +939,8 @@ async fn pg_oracle_recovery_audit_failure_rolls_back_all_state() {
     assert_eq!(audit_count, 0);
 }
 
-/// The platform operator receives only the fixed recovery function capability.
+/// The platform operator receives the fixed recovery capability plus Forge's
+/// narrow append grants, while destructive audit access remains denied.
 #[tokio::test]
 async fn pg_oracle_recovery_audit_authority_is_execute_only() {
     let (fixture, _) = setup().await;
@@ -969,16 +970,17 @@ async fn pg_oracle_recovery_audit_authority_is_execute_only() {
         .fetch_one(&superuser)
         .await
         .expect("table privilege metadata reads");
-        assert_eq!(privileges, (false, false, false, false), "{table}");
+        let expected = if table == "vala.audit_chain_head" {
+            (true, true, true, false)
+        } else {
+            (false, true, false, false)
+        };
+        assert_eq!(privileges, expected, "{table}");
     }
 
     for statement in [
-        "SELECT * FROM vala.audit_chain_head LIMIT 1",
-        "INSERT INTO vala.audit_chain_head DEFAULT VALUES",
-        "UPDATE vala.audit_chain_head SET updated_at=now()",
         "DELETE FROM vala.audit_chain_head",
         "SELECT * FROM vala.audit_outbox LIMIT 1",
-        "INSERT INTO vala.audit_outbox DEFAULT VALUES",
         "UPDATE vala.audit_outbox SET payload_summary='forbidden'",
         "DELETE FROM vala.audit_outbox",
     ] {

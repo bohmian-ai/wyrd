@@ -255,7 +255,7 @@ mod tests {
             .await
             .expect("neutral administrator connects");
         sqlx::raw_sql(
-            "CREATE ROLE wyrd_embedded_operator; \
+            "CREATE ROLE wyrd_embedded_operator LOGIN BYPASSRLS; \
              GRANT wyrd_embedded_operator TO wyrd_app; \
              GRANT CONNECT ON DATABASE wyrd TO wyrd_embedded_operator; \
              GRANT wyrd_app TO wyrd_catalog",
@@ -397,6 +397,18 @@ mod tests {
             .fetch_one(&admin)
             .await
             .expect("unrelated database ACL reads")
+        );
+        let unrelated_attributes: (bool, bool, bool, bool) = sqlx::query_as(
+            "SELECT rolcanlogin,rolbypassrls,rolsuper,rolcreatedb FROM pg_roles \
+             WHERE rolname='wyrd_embedded_operator'",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("unrelated role attributes read");
+        assert_eq!(
+            unrelated_attributes,
+            (true, true, false, false),
+            "bootstrap preserves elevated unrelated role attributes"
         );
 
         sqlx::raw_sql(

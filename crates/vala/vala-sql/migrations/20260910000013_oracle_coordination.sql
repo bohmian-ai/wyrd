@@ -122,3 +122,8 @@ TO wyrd_app;
 
 GRANT SELECT, DELETE ON vala.oracle_admission_leases TO wyrd_platform_admin;
 GRANT SELECT, INSERT, UPDATE ON vala.oracle_admission_accounting TO wyrd_platform_admin;
+
+-- Oracle's cross-tenant catalog reconciliation authority is introduced with
+-- the coordination migration so the older OLAP migration remains checksum-stable.
+GRANT USAGE ON SCHEMA vala TO wyrd_platform_admin;
+GRANT SELECT ON vala.bifrost_tables TO wyrd_platform_admin;

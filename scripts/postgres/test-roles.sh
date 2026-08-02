@@ -22,7 +22,7 @@ docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; exit 1
 
   admin_password="${WYRD_TEST_POSTGRES_ADMIN_PASSWORD:-wyrd_test_admin_pw}"
   role_sql="${PWD}/crates/wyrd/wyrd-sql/bootstrap/roles.sql"
-  PGPASSWORD="$admin_password" psql "$WYRD_TEST_DATABASE_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE wyrd_operator_fixture LOGIN PASSWORD '\''operator_fixture_pw'\''; GRANT wyrd_operator_fixture TO wyrd_app; GRANT CONNECT ON DATABASE wyrd TO wyrd_operator_fixture; ALTER ROLE wyrd_app CREATEDB BYPASSRLS; REVOKE wyrd_catalog FROM wyrd_migrator; GRANT wyrd_app TO wyrd_catalog; REVOKE CONNECT ON DATABASE wyrd FROM wyrd_app; GRANT CREATE ON DATABASE wyrd TO wyrd_app;"
+  PGPASSWORD="$admin_password" psql "$WYRD_TEST_DATABASE_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE wyrd_operator_fixture LOGIN BYPASSRLS PASSWORD '\''operator_fixture_pw'\''; GRANT wyrd_operator_fixture TO wyrd_app; GRANT CONNECT ON DATABASE wyrd TO wyrd_operator_fixture; ALTER ROLE wyrd_app CREATEDB BYPASSRLS; REVOKE wyrd_catalog FROM wyrd_migrator; GRANT wyrd_app TO wyrd_catalog; REVOKE CONNECT ON DATABASE wyrd FROM wyrd_app; GRANT CREATE ON DATABASE wyrd TO wyrd_app;"
   PGPASSWORD="$admin_password" psql "$WYRD_TEST_DATABASE_ADMIN_URL" \
     --set=migrator_password="$WYRD_DATABASE_MIGRATOR_PASSWORD" \
     --set=app_password="${WYRD_TEST_POSTGRES_APP_PASSWORD:-wyrd_app_pw}" \
@@ -40,6 +40,7 @@ docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; exit 1
   managed_memberships="$(psql "$DATABASE_URL" -Atqc "SELECT string_agg(granted.rolname || '\''->'\'' || member.rolname, '\'','\'' ORDER BY granted.rolname, member.rolname) FROM pg_auth_members edge JOIN pg_roles granted ON granted.oid=edge.roleid JOIN pg_roles member ON member.oid=edge.member WHERE granted.rolname IN ('\''wyrd_migrator'\'','\''wyrd_app'\'','\''wyrd_platform_admin'\'','\''wyrd_catalog'\'','\''wyrd_catalog_app'\'') AND member.rolname IN ('\''wyrd_migrator'\'','\''wyrd_app'\'','\''wyrd_platform_admin'\'','\''wyrd_catalog'\'','\''wyrd_catalog_app'\'')")"
   test "$managed_memberships" = "wyrd_catalog->wyrd_catalog_app,wyrd_catalog->wyrd_migrator"
   test "$(psql "$DATABASE_URL" -Atqc "SELECT pg_has_role('\''wyrd_app'\'', '\''wyrd_operator_fixture'\'', '\''member'\'')")" = "t"
+  test "$(psql "$DATABASE_URL" -Atqc "SELECT rolcanlogin, rolbypassrls, rolsuper, rolcreatedb FROM pg_roles WHERE rolname = '\''wyrd_operator_fixture'\''")" = "t|t|f|f"
   test "$(psql "$DATABASE_URL" -Atqc "SELECT has_database_privilege('\''wyrd_app'\'', '\''wyrd'\'', '\''CONNECT'\''), has_database_privilege('\''wyrd_app'\'', '\''wyrd'\'', '\''CREATE'\''), has_database_privilege('\''wyrd_operator_fixture'\'', '\''wyrd'\'', '\''CONNECT'\'')")" = "t|f|t"
   database_acl="$(psql "$DATABASE_URL" -Atqc "SELECT string_agg(role.rolname || '\'':'\'' || acl.privilege_type, '\'','\'' ORDER BY role.rolname, acl.privilege_type) FROM pg_database database CROSS JOIN LATERAL aclexplode(database.datacl) acl JOIN pg_roles role ON role.oid=acl.grantee WHERE database.datname='\''wyrd'\'' AND role.rolname IN ('\''wyrd_migrator'\'','\''wyrd_app'\'','\''wyrd_platform_admin'\'','\''wyrd_catalog'\'','\''wyrd_catalog_app'\'')")"
   test "$database_acl" = "wyrd_app:CONNECT,wyrd_catalog_app:CONNECT,wyrd_migrator:CONNECT,wyrd_migrator:CREATE,wyrd_platform_admin:CONNECT"

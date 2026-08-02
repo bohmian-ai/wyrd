@@ -3,7 +3,7 @@ mod pg_tests {
 
     use sqlx::types::Uuid;
     use vala_sql::TenantConn;
-    use vala_sql::queries::file_list::list_nonterminal_file_paths;
+    use vala_sql::queries::file_list::{list_nonterminal_file_paths, list_nonterminal_files};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
 
@@ -16,6 +16,7 @@ mod pg_tests {
         pool: &sqlx::PgPool,
         tenant: DataTenantId,
         path: &str,
+        file_size: i64,
         compacted: bool,
         committed_snapshot_id: Option<i64>,
     ) {
@@ -28,14 +29,15 @@ mod pg_tests {
                 compacted, committed_snapshot_id
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', $3,
-                1024, 100, now(), now(), current_date,
-                $4, 1, 100, 200, $5, $6
+                $4, 100, now(), now(), current_date,
+                $5, 1, 100, 200, $6, $7
             )
             "#,
         )
         .bind(Uuid::now_v7())
         .bind(tenant.as_uuid())
         .bind(path)
+        .bind(file_size)
         .bind(Uuid::now_v7())
         .bind(compacted)
         .bind(committed_snapshot_id)
@@ -60,11 +62,11 @@ mod pg_tests {
             .await
             .expect("seed second tenant");
 
-        insert_row(&pool, tenant_a, "table/a.parquet", false, None).await;
-        insert_row(&pool, tenant_a, "table/b.parquet", false, Some(1)).await;
-        insert_row(&pool, tenant_a, "table/c.parquet", true, None).await;
-        insert_row(&pool, tenant_a, "table/d.parquet", true, Some(1)).await;
-        insert_row(&pool, tenant_b, "table/other.parquet", false, None).await;
+        insert_row(&pool, tenant_a, "table/a.parquet", 1024, false, None).await;
+        insert_row(&pool, tenant_a, "table/b.parquet", 1024, false, Some(1)).await;
+        insert_row(&pool, tenant_a, "table/c.parquet", 1024, true, None).await;
+        insert_row(&pool, tenant_a, "table/d.parquet", 1024, true, Some(1)).await;
+        insert_row(&pool, tenant_b, "table/other.parquet", 1024, false, None).await;
 
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant_a)
             .await
@@ -91,5 +93,30 @@ mod pg_tests {
                 .expect("focused terminal read");
         assert!(terminal.is_empty());
         conn.commit().await.expect("commit read transaction");
+    }
+
+    /// Proves Forge rejects a negative persisted file size instead of casting it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup or the expected invariant error is absent.
+    #[tokio::test]
+    async fn nonterminal_file_list_rejects_negative_size() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let tenant = fixture.data_tenant_id();
+        insert_row(&pool, tenant, "table/negative.parquet", -1, false, None).await;
+
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let error = list_nonterminal_files(&mut conn, "vala.traces", "spans")
+            .await
+            .expect_err("negative file size must fail closed");
+        assert!(matches!(
+            error,
+            vala_sql::SqlError::InvariantViolation { detail }
+                if detail.contains("file size is negative")
+        ));
     }
 }

@@ -366,6 +366,12 @@ mod tests {
                 "SQL operation conflict",
             ),
             (
+                SqlError::ForgeDemandGenerationChanged,
+                "WYRD_SQL_409_FORGE_DEMAND_GENERATION_CHANGED",
+                409,
+                "Forge planning demand changed",
+            ),
+            (
                 SqlError::InvariantViolation {
                     detail: "bad enum".to_owned(),
                 },

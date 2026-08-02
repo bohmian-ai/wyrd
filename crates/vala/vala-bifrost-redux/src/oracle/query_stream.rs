@@ -302,7 +302,7 @@ impl OracleQueryStream {
                                     visibility,
                                 );
                                 if let Some(admitted) = admitted.take() {
-                                    admitted.release().await;
+                                    let _ = admitted.release().await;
                                 }
                                 yield Ok(QueryStreamFrame::Terminal(terminal));
                                 return;
@@ -315,7 +315,7 @@ impl OracleQueryStream {
                         query_telemetry.finish("failed", "complete");
                         let terminal = failed_terminal_for_visibility(code, row_count, visibility);
                         if let Some(admitted) = admitted.take() {
-                            admitted.release().await;
+                            let _ = admitted.release().await;
                         }
                         yield Ok(QueryStreamFrame::Terminal(terminal));
                         return;
@@ -325,7 +325,7 @@ impl OracleQueryStream {
                         query_telemetry.finish("failed", "complete");
                         let terminal = failed_terminal_for_visibility(code, row_count, visibility);
                         if let Some(admitted) = admitted.take() {
-                            admitted.release().await;
+                            let _ = admitted.release().await;
                         }
                         yield Ok(QueryStreamFrame::Terminal(terminal));
                         return;
@@ -336,7 +336,7 @@ impl OracleQueryStream {
             debug_assert!(terminal.validate(visibility).is_ok());
             query_telemetry.finish(if degraded { "degraded" } else { "success" }, if degraded { "degraded" } else { "complete" });
             if let Some(admitted) = admitted.take() {
-                admitted.release().await;
+                let _ = admitted.release().await;
             }
             yield Ok(QueryStreamFrame::Terminal(terminal));
         };

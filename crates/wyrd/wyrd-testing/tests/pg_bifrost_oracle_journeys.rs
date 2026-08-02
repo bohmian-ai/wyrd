@@ -31,7 +31,7 @@ use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, EventDay,
-    FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome, VisibilityMode,
+    FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning, VisibilityMode,
 };
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
@@ -370,7 +370,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey() {
             1
         );
     }
-    seed_foreign_hot_row(&cluster, tenant_a, &table_name, tenant_b)
+    seed_foreign_hot_row(&cluster, tenant_a, &table_name, tenant_b, "j5-foreign")
         .await
         .expect("foreign physical row");
     let tenant_a_client = client_for_tenant(server, tenant_a, "j5-tripwire")
@@ -554,6 +554,123 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
         .expect("J7 admission cleanup");
     owner.close().await;
     cluster.shutdown().await.expect("J7 shutdown");
+}
+
+/// A real SDK query replans once when its selected worker restarts before dispatch.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
+    let mut cluster = WyrdTestCluster::start_spec_with_oracle_peer_tls_delayed_last(
+        BifrostClusterSpec::three_mixed(),
+    )
+    .await
+    .expect("leader-first TLS topology");
+    let delayed = *cluster
+        .configured_node_ids()
+        .last()
+        .expect("delayed worker identity");
+    cluster
+        .restart_node_at_new_address(delayed)
+        .await
+        .expect("worker joins after leader boot");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("late worker snapshot");
+    let server = cluster.server(0).expect("query leader");
+    let table = unique_table("oracle_topology_replan");
+    register_table(server, cluster.data_tenant_id(), &table)
+        .await
+        .expect("topology table");
+    let client = client(server, "oracle-topology-replan")
+        .await
+        .expect("topology client");
+    // The production planner closes at most 16 files into one fragment. Four
+    // deterministic fragments exercise the real portable assignment rather
+    // than the single-fragment leader-only fast path.
+    for ordinal in 0..64 {
+        seed_foreign_hot_row(
+            &cluster,
+            cluster.data_tenant_id(),
+            &table,
+            cluster.data_tenant_id(),
+            &format!("topology-{ordinal}"),
+        )
+        .await
+        .expect("independent sealed file");
+    }
+    let probe = Arc::new(vala_bifrost_redux::oracle::OracleTopologyProbe::default());
+    server
+        .state()
+        .bifrost_query()
+        .expect("boot query runtime")
+        .oracle()
+        .bind_topology_probe_for_test(Arc::clone(&probe));
+    let checkpoint = cluster.telemetry().checkpoint();
+    let mut query = tokio::spawn(async move {
+        let mut stream = QueryClient::new(&client)
+            .query(&BifrostQueryRequest {
+                sql: format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(20_000),
+            })
+            .await?;
+        let mut rows = 0_u64;
+        while let Some(batch) = stream.next_batch().await? {
+            rows = rows.saturating_add(u64::try_from(batch.num_rows())?);
+        }
+        let terminal = stream.terminal().cloned().ok_or("query terminal missing")?;
+        Ok::<_, JourneyError>((rows, terminal))
+    });
+    tokio::select! {
+        () = probe.wait_selected() => {}
+        result = &mut query => panic!("query ended before remote selection: {result:?}"),
+    }
+    let selected = probe.selected_worker().expect("remote selected worker");
+    let old_peer = cluster
+        .server_by_node(selected)
+        .and_then(|server| server.state().oracle_peer.as_ref())
+        .expect("selected peer")
+        .clone();
+    cluster
+        .stop_node(selected)
+        .await
+        .expect("selected worker stops");
+    cluster
+        .restart_node_at_new_address(selected)
+        .await
+        .expect("selected worker replacement");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("replacement snapshot");
+    probe.resume();
+    let (rows, terminal) = query
+        .await
+        .expect("query task joins")
+        .expect("replacement query succeeds");
+    assert_eq!(rows, 64);
+    assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
+    assert!(terminal.warnings.contains(&QueryWarning::StaleCutReplanned));
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .expect("replan telemetry");
+    assert_eq!(
+        delta
+            .metrics
+            .iter()
+            .filter(|sample| {
+                sample.family == "bifrost_oracle_stale_replans_total"
+                    && sample.labels.get("outcome").map(String::as_str) == Some("retried")
+            })
+            .map(|sample| sample.value)
+            .sum::<f64>(),
+        1.0
+    );
+    assert_eq!(old_peer.worker().pending_reservations(), 0);
+    cluster.shutdown().await.expect("topology replan shutdown");
 }
 
 /// J-typed proves Vala's typed route enters the same Oracle cut as SQL.
@@ -1505,6 +1622,7 @@ async fn seed_foreign_hot_row(
     owner: DataTenantId,
     table: &str,
     foreign: DataTenantId,
+    path_tag: &str,
 ) -> Result<(), JourneyError> {
     let table_ref = TableRef::new(BifrostNamespace::Bifrost, table);
     let binding = TenantTableBinding::resolve((owner, table_ref))?;
@@ -1534,7 +1652,7 @@ async fn seed_foreign_hot_row(
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, None)?;
     writer.write(&batch)?;
     writer.close()?;
-    let path = format!("{}/j5-foreign.parquet", binding.object_prefix);
+    let path = format!("{}/{path_tag}.parquet", binding.object_prefix);
     cluster
         .storage_operator()
         .write(&path, Buffer::from(parquet.clone()))

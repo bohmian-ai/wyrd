@@ -118,6 +118,32 @@ impl ClusterSnapshot {
             .filter(|lease| lease.key.role == ClusterRole::Oracle)
             .collect()
     }
+
+    /// Returns one ready, live Oracle lease from this immutable snapshot cut.
+    ///
+    /// The composite lookup prevents another role on the same physical node
+    /// from being mistaken for an Oracle routing target.
+    #[must_use]
+    pub fn live_oracle(&self, node_id: NodeId) -> Option<&ClusterRoleLease> {
+        self.roles.get(&SnapshotKey {
+            node_id,
+            role: SnapshotRole::Oracle,
+        })
+    }
+
+    /// Returns one Oracle lease only when its live snapshot fence is exact.
+    ///
+    /// Dispatch uses this projection to prevent an address from a restarted
+    /// role incarnation being paired with a candidate selected earlier.
+    #[must_use]
+    pub fn live_oracle_at_fence(
+        &self,
+        node_id: NodeId,
+        fencing_token: u64,
+    ) -> Option<&ClusterRoleLease> {
+        self.live_oracle(node_id)
+            .filter(|lease| lease.fencing_token == fencing_token)
+    }
 }
 
 /// Concrete Redux owner for role registration, fenced lifecycle updates, and snapshots.
@@ -535,5 +561,40 @@ mod tests {
             ClusterSnapshot::new(vec![lease(ClusterRole::Oracle), lease(ClusterRole::Scribe)]);
         assert_eq!(snapshot.live_scribes().len(), 1);
         assert_eq!(snapshot.live_oracles().len(), 1);
+    }
+
+    /// Resolves only the exact live Oracle incarnation selected by planning.
+    #[test]
+    fn snapshot_resolves_oracle_by_node_and_exact_fence() {
+        let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+        let lease = ClusterRoleLease {
+            key: ClusterNodeKey {
+                node_id,
+                role: ClusterRole::Oracle,
+            },
+            address: "https://worker.example:50052".to_owned(),
+            fencing_token: 7,
+            capability_version: 1,
+            capabilities: ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {
+                tail_protocol_version: 1,
+            }),
+            ready: true,
+            started_at: Utc::now(),
+            heartbeat_at: Utc::now(),
+        };
+        let snapshot = ClusterSnapshot::new(vec![lease]);
+
+        assert_eq!(
+            snapshot
+                .live_oracle_at_fence(node_id, 7)
+                .map(|target| target.address.as_str()),
+            Some("https://worker.example:50052")
+        );
+        assert!(snapshot.live_oracle_at_fence(node_id, 6).is_none());
+        assert!(
+            snapshot
+                .live_oracle_at_fence(wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()), 7)
+                .is_none()
+        );
     }
 }

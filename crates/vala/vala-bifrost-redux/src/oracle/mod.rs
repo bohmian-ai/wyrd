@@ -43,9 +43,9 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AdmissionScope, AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
-    BifrostSecurityViolationKind, ClusterCapabilities, OracleAdmissionLease, QueryAuditDigest,
-    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryFreshness, QueryId, QuerySchemaFrame,
-    QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
+    BifrostSecurityViolationKind, ClusterCapabilities, NodeId, OracleAdmissionLease,
+    QueryAuditDigest, QueryBatchFrame, QueryClass, QueryExecutionMode, QueryFreshness, QueryId,
+    QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
     QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome, VisibilityMode,
 };
 #[cfg(feature = "test-support")]
@@ -70,8 +70,8 @@ mod query_stream;
 mod tail_fence;
 pub mod telemetry;
 
-use admission::AdmittedQueryGuard;
 pub use admission::OracleAdmission;
+use admission::{AdmissionReleaseStatus, AdmittedQueryGuard};
 #[cfg(feature = "test-support")]
 pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
 use exec::{HotFileSource, OracleTableInputs, OracleTableProvider};
@@ -1210,6 +1210,107 @@ pub struct Oracle {
     startup_result: Mutex<Option<StartupResultReceiver>>,
     /// Cancellation-bound admission maintenance task.
     maintenance: Mutex<Option<JoinHandle<()>>>,
+    /// Test-tier one-shot pause after immutable worker selection.
+    #[cfg(feature = "test-support")]
+    topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
+    /// Test-tier one-shot pause at the stale-first-batch durable-release gate.
+    #[cfg(feature = "test-support")]
+    stale_release_probe: Mutex<Option<Arc<OracleStaleReleaseProbe>>>,
+}
+
+/// Notification-backed test seam for a topology change after worker selection.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct OracleTopologyProbe {
+    /// Ensures exactly one query attempt pauses at the selected-candidate seam.
+    claimed: AtomicBool,
+    /// Wakes the journey once the first attempt has selected its immutable cut.
+    selected: tokio::sync::Notify,
+    /// Records permission for the paused attempt to continue dispatch.
+    resumed: AtomicBool,
+    /// Wakes the paused attempt after the fixture changes membership.
+    resume: tokio::sync::Notify,
+    /// Remote worker selected by the paused immutable assignment.
+    target: Mutex<Option<NodeId>>,
+}
+
+/// Notification-backed test seam at the stale-first-batch release gate.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct OracleStaleReleaseProbe {
+    /// Records that the actual first-batch stale branch reached its release gate.
+    reached: AtomicBool,
+    /// Wakes the regression after the branch has retained its admitted guard.
+    reached_notify: tokio::sync::Notify,
+    /// Records permission for the branch to begin durable release.
+    resumed: AtomicBool,
+    /// Wakes the paused branch after the regression prepares durable state.
+    resume_notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl OracleStaleReleaseProbe {
+    /// Waits until the stale-first-batch branch retains admission at its release gate.
+    pub async fn wait_reached(&self) {
+        while !self.reached.load(Ordering::Acquire) {
+            self.reached_notify.notified().await;
+        }
+    }
+
+    /// Permits the stale-first-batch branch to begin its bounded durable release.
+    pub fn resume(&self) {
+        self.resumed.store(true, Ordering::Release);
+        self.resume_notify.notify_waiters();
+    }
+
+    /// Pauses the actual stale-first-batch branch before it consumes admission.
+    async fn pause_before_release(&self) {
+        self.reached.store(true, Ordering::Release);
+        self.reached_notify.notify_waiters();
+        while !self.resumed.load(Ordering::Acquire) {
+            self.resume_notify.notified().await;
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl OracleTopologyProbe {
+    /// Waits until the first query attempt has selected its worker candidates.
+    pub async fn wait_selected(&self) {
+        while !self.claimed.load(Ordering::Acquire) {
+            self.selected.notified().await;
+        }
+    }
+
+    /// Returns the remote worker selected by the paused first attempt.
+    #[must_use]
+    pub fn selected_worker(&self) -> Option<NodeId> {
+        self.target.lock().ok().and_then(|target| *target)
+    }
+
+    /// Releases the selected attempt after the fixture changes membership.
+    pub fn resume(&self) {
+        self.resumed.store(true, Ordering::Release);
+        self.resume.notify_waiters();
+    }
+
+    /// Pauses only the first attempt and lets the replan proceed immediately.
+    async fn pause_first_selection(&self, target: NodeId) {
+        if self
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(mut selected) = self.target.lock() {
+            *selected = Some(target);
+        }
+        self.selected.notify_waiters();
+        while !self.resumed.load(Ordering::Acquire) {
+            self.resume.notified().await;
+        }
+    }
 }
 
 /// One-shot startup recovery result consumed exactly once by activation.
@@ -1299,7 +1400,40 @@ impl Oracle {
             ready,
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
+            #[cfg(feature = "test-support")]
+            topology_probe: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            stale_release_probe: Mutex::new(None),
         })
+    }
+
+    /// Binds a one-shot topology selection probe for a test-tier query.
+    #[cfg(feature = "test-support")]
+    pub fn bind_topology_probe_for_test(&self, probe: Arc<OracleTopologyProbe>) {
+        if let Ok(mut current) = self.topology_probe.lock() {
+            *current = Some(probe);
+        }
+    }
+
+    /// Binds a one-shot stale-first-batch release probe for a test-tier query.
+    #[cfg(feature = "test-support")]
+    pub fn bind_stale_release_probe_for_test(&self, probe: Arc<OracleStaleReleaseProbe>) {
+        if let Ok(mut current) = self.stale_release_probe.lock() {
+            *current = Some(probe);
+        }
+    }
+
+    /// Pauses the stale-first-batch branch at its test-tier durable-release gate.
+    #[cfg(feature = "test-support")]
+    async fn pause_stale_release_for_test(&self) {
+        let probe = self
+            .stale_release_probe
+            .lock()
+            .ok()
+            .and_then(|probe| probe.clone());
+        if let Some(probe) = probe {
+            probe.pause_before_release().await;
+        }
     }
 
     /// Validates the query floor before any asynchronous metadata operation.
@@ -1447,8 +1581,8 @@ impl Oracle {
             let (schema, mut batches) = match execution {
                 Ok(execution) => execution,
                 Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
+                    await_stale_release(deadline, admitted.release()).await?;
                     record_stale_replan();
-                    drop(admitted);
                     continue;
                 }
                 Err(OracleExecutionError::StaleObject) => {
@@ -1464,8 +1598,10 @@ impl Oracle {
                 .map_err(|_| BifrostError::QueryTimeout)?
             {
                 Some(Err(error)) if retry_ordinal == 0 && is_stale_file_error(&error) => {
+                    #[cfg(feature = "test-support")]
+                    self.pause_stale_release_for_test().await;
+                    await_stale_release(deadline, admitted.release()).await?;
                     record_stale_replan();
-                    drop(admitted);
                 }
                 first => {
                     let query_telemetry = query_telemetry
@@ -2052,6 +2188,21 @@ impl Oracle {
             .ok_or(BifrostError::QueryExecutionFailed)?;
         let leader = input.admitted.leader.node_id;
         let prepared = self.prepare_sealed_dispatch(input)?;
+        #[cfg(feature = "test-support")]
+        let topology_probe = self
+            .topology_probe
+            .lock()
+            .ok()
+            .and_then(|probe| probe.clone());
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = topology_probe
+            && let Some(target) = prepared
+                .assignment
+                .iter()
+                .find_map(|(node, work)| (*node != leader && !work.is_empty()).then_some(*node))
+        {
+            probe.pause_first_selection(target).await;
+        }
         let mut output = Vec::new();
         let siblings = prepared.context.cancellation.child_token();
         let parallelism = dispatch_parallelism(
@@ -2708,12 +2859,114 @@ fn record_stale_replan() {
     .increment(1);
 }
 
+/// Awaits proof that stale-attempt capacity is durably free before readmission.
+///
+/// The absolute query deadline bounds cleanup. A cancelled release future drops
+/// its consuming guard, which retains the ordinary queued-cleanup fallback.
+///
+/// # Errors
+///
+/// Returns query timeout when the absolute deadline expires. SQL/commit errors
+/// and committed no-op mutations map to the existing execution failure rather
+/// than permitting a fresh admission to collide with retained capacity.
+async fn await_stale_release<F, E>(deadline: Instant, release: F) -> Result<(), BifrostError>
+where
+    F: std::future::Future<Output = Result<AdmissionReleaseStatus, E>>,
+{
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(BifrostError::QueryTimeout)?;
+    match tokio::time::timeout(remaining, release).await {
+        Err(_) => Err(BifrostError::QueryTimeout),
+        Ok(Ok(AdmissionReleaseStatus::Released)) => Ok(()),
+        Ok(Ok(AdmissionReleaseStatus::NotReleased) | Err(_)) => {
+            Err(BifrostError::QueryExecutionFailed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::atomic::AtomicUsize;
+
+    /// A stalled explicit release times out without authorizing another admission.
+    #[tokio::test]
+    async fn stale_replan_stalled_release_never_readmits() {
+        let admissions = AtomicUsize::new(1);
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("test deadline remains representable");
+        let result = await_stale_release(
+            deadline,
+            std::future::pending::<Result<AdmissionReleaseStatus, ()>>(),
+        )
+        .await;
+        if result.is_ok() {
+            admissions.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(matches!(result, Err(BifrostError::QueryTimeout)));
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    }
+
+    /// SQL failure and a committed no-op both refuse stale-query readmission.
+    #[tokio::test]
+    async fn stale_replan_failed_or_noop_release_never_readmits() {
+        for release in [Err(()), Ok(AdmissionReleaseStatus::NotReleased)] {
+            let admissions = AtomicUsize::new(1);
+            let result = await_stale_release(
+                Instant::now() + Duration::from_secs(1),
+                std::future::ready(release),
+            )
+            .await;
+            if result.is_ok() {
+                admissions.fetch_add(1, Ordering::SeqCst);
+            }
+            assert!(matches!(result, Err(BifrostError::QueryExecutionFailed)));
+            assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// A proven durable release authorizes exactly one fresh admission.
+    #[tokio::test]
+    async fn stale_replan_completed_release_readmits_exactly_once() {
+        let admissions = AtomicUsize::new(1);
+        await_stale_release(
+            Instant::now() + Duration::from_secs(1),
+            std::future::ready(Ok::<AdmissionReleaseStatus, ()>(
+                AdmissionReleaseStatus::Released,
+            )),
+        )
+        .await
+        .expect("committed release authorizes replan");
+        admissions.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
+    }
+
+    /// Pauses exactly one selected attempt and leaves the replan unblocked.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn topology_probe_pauses_only_the_first_selection() {
+        let probe = Arc::new(OracleTopologyProbe::default());
+        let paused = Arc::clone(&probe);
+        let first = tokio::spawn(async move {
+            paused
+                .pause_first_selection(NodeId::new(uuid::Uuid::from_u128(2)))
+                .await;
+        });
+        probe.wait_selected().await;
+        probe.resume();
+        first.await.expect("first selection resumes");
+        assert_eq!(
+            probe.selected_worker(),
+            Some(NodeId::new(uuid::Uuid::from_u128(2)))
+        );
+        probe
+            .pause_first_selection(NodeId::new(uuid::Uuid::from_u128(3)))
+            .await;
+    }
 
     /// Keeps stateful Oracle owners and bounded dispatch orchestration out of the façade.
     #[test]

@@ -115,8 +115,8 @@ impl OraclePeerService for RefreshProbeService {
 use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
 use vala_bifrost_redux::oracle::fragment::{SealedScanFile, SealedScanFragment, SealedSourceTier};
 use vala_bifrost_redux::oracle::peer::{
-    PeerSecurityAudit, PeerSecurityAuditError, PeerTicketClaims, PeerTicketVerifier,
-    projection_digest,
+    PeerSecurityAudit, PeerSecurityAuditError, PeerTicketClaims, PeerTicketMinter,
+    PeerTicketVerifier, projection_digest,
 };
 use wyrd_semver::VersionBlock;
 use wyrd_server::oracle::OraclePeerAuthority;
@@ -1103,7 +1103,7 @@ async fn oracle_peer_tonic_stale_bearer_refreshes_exactly_once() {
     let credentials = Arc::new(RefreshProbeCredentials {
         forced: AtomicUsize::new(0),
     });
-    let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+    let transport = TonicOraclePeerTransport::with_test_credentials_and_tls(
         HashMap::from([(worker, format!("https://{address}"))]),
         credentials.clone(),
         OraclePeerTls::new(PEER_TLS_CA_PEM.as_bytes().to_vec(), "localhost".to_owned()),
@@ -1136,7 +1136,7 @@ async fn oracle_peer_tls_rejects_plaintext_before_bearer() {
     let credentials = Arc::new(BearerCallProbe {
         calls: AtomicUsize::new(0),
     });
-    let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+    let transport = TonicOraclePeerTransport::with_test_credentials_and_tls(
         HashMap::from([(worker, "http://127.0.0.1:9".to_owned())]),
         credentials.clone(),
         OraclePeerTls::new(
@@ -1202,7 +1202,7 @@ async fn oracle_peer_tls_rejects_untrusted_certificate_and_name_before_bearer() 
         let credentials = Arc::new(BearerCallProbe {
             calls: AtomicUsize::new(0),
         });
-        let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+        let transport = TonicOraclePeerTransport::with_test_credentials_and_tls(
             HashMap::from([(worker, format!("https://{address}"))]),
             credentials.clone(),
             OraclePeerTls::new(ca.as_bytes().to_vec(), server_name.to_owned()),
@@ -1251,7 +1251,7 @@ async fn oracle_peer_tls_dispatches_and_releases_over_trusted_channel() {
         Arc::clone(&security_audit),
     )
     .await;
-    let transport = TonicOraclePeerTransport::with_credentials_and_tls(
+    let transport = TonicOraclePeerTransport::with_test_credentials_and_tls(
         HashMap::from([(worker, format!("https://{}", peer.address))]),
         Arc::new(RefreshProbeCredentials {
             forced: AtomicUsize::new(0),
@@ -1452,6 +1452,249 @@ async fn oracle_peer_two_wyrd_server_tls_journey() {
     client.release_slots(release).await.expect("TLS release");
     assert_eq!(peer.worker().pending_reservations(), 0);
     cluster.shutdown().await.expect("TLS cluster shutdown");
+}
+
+/// A leader routes a late worker join and address/fence replacement from live snapshots.
+#[tokio::test]
+async fn oracle_peer_three_node_live_topology_routes_without_leader_restart() {
+    let mut cluster = WyrdTestCluster::start_spec_with_oracle_peer_tls_delayed_last(
+        BifrostClusterSpec::three_mixed(),
+    )
+    .await
+    .expect("leader boots before delayed worker");
+    let nodes = cluster.ready_query_nodes();
+    let leader = nodes[0];
+    let worker = *cluster
+        .configured_node_ids()
+        .last()
+        .expect("delayed worker identity");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("delayed worker excluded");
+    assert!(
+        cluster
+            .server(0)
+            .expect("leader server")
+            .state()
+            .oracle_peer
+            .as_ref()
+            .expect("leader peer")
+            .cluster()
+            .snapshot()
+            .live_oracle(worker)
+            .is_none(),
+        "unbooted worker must be excluded from the refreshed ready/live cut"
+    );
+    let transport = cluster
+        .oracle_peer_transport(0)
+        .expect("production registry-backed transport");
+    cluster
+        .restart_node_at_new_address(worker)
+        .await
+        .expect("late worker joins at a new address");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("late join published");
+    let leader_peer = cluster
+        .server(0)
+        .expect("leader server")
+        .state()
+        .oracle_peer
+        .as_ref()
+        .expect("leader peer");
+    let snapshot = leader_peer.cluster().snapshot();
+    let leader_lease = snapshot.live_oracle(leader).expect("leader lease");
+    let worker_lease = snapshot
+        .live_oracle(worker)
+        .expect("late worker lease")
+        .clone();
+    let query_id = QueryId::new(uuid::Uuid::now_v7());
+    let pending = transport
+        .reserve(
+            worker,
+            ReserveNodeSlotsRequest {
+                query_id,
+                leader_node_id: leader,
+                leader_fencing_token: leader_lease.fencing_token,
+                query_class: QueryClass::Interactive,
+                slot_units: 1,
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(5),
+            },
+        )
+        .await
+        .expect("late worker reserve reaches its live address");
+    let pending = match pending {
+        ReserveNodeSlotsResponse::Pending(pending) => pending,
+        other => panic!("expected pending late-worker reservation, got {other:?}"),
+    };
+    transport
+        .release(
+            worker,
+            ReleaseNodeSlotsRequest {
+                reservation_id: pending.reservation_id,
+                query_id,
+                leader_node_id: leader,
+                leader_fencing_token: leader_lease.fencing_token,
+            },
+        )
+        .await
+        .expect("late worker release uses the same live topology");
+
+    cluster
+        .stop_node(worker)
+        .await
+        .expect("joined worker stops");
+    cluster
+        .restart_node_at_new_address(worker)
+        .await
+        .expect("worker restarts on replacement address");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("replacement fence published");
+    let replacement = cluster
+        .server(2)
+        .expect("replacement worker")
+        .state()
+        .oracle_peer
+        .as_ref()
+        .expect("replacement peer")
+        .clone();
+    let replacement_fence = replacement
+        .cluster()
+        .snapshot()
+        .live_oracle(worker)
+        .expect("replacement lease")
+        .fencing_token;
+    assert_ne!(
+        replacement_fence, worker_lease.fencing_token,
+        "restart must advance the role fence"
+    );
+    assert_ne!(
+        replacement
+            .cluster()
+            .snapshot()
+            .live_oracle(worker)
+            .expect("replacement address")
+            .address,
+        worker_lease.address,
+        "restart fixture must replace the advertised endpoint"
+    );
+    let replacement_query = QueryId::new(uuid::Uuid::now_v7());
+    let replacement_pending = transport
+        .reserve(
+            worker,
+            ReserveNodeSlotsRequest {
+                query_id: replacement_query,
+                leader_node_id: leader,
+                leader_fencing_token: leader_lease.fencing_token,
+                query_class: QueryClass::Interactive,
+                slot_units: 1,
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(5),
+            },
+        )
+        .await
+        .expect("replacement worker reserve reaches its new address");
+    let replacement_pending = match replacement_pending {
+        ReserveNodeSlotsResponse::Pending(pending) => pending,
+        other => panic!("expected replacement reservation, got {other:?}"),
+    };
+    transport
+        .release(
+            worker,
+            ReleaseNodeSlotsRequest {
+                reservation_id: replacement_pending.reservation_id,
+                query_id: replacement_query,
+                leader_node_id: leader,
+                leader_fencing_token: leader_lease.fencing_token,
+            },
+        )
+        .await
+        .expect("replacement worker release reaches its new address");
+    assert_eq!(replacement.worker().pending_reservations(), 0);
+    let security_audit: Arc<dyn PeerSecurityAudit> = replacement.security_audit();
+    let authority = Arc::new(
+        OraclePeerAuthority::from_pem(
+            &wyrd_testing::keys::oracle_peer_signing_key_pem(),
+            Arc::clone(&security_audit),
+        )
+        .expect("matching peer authority"),
+    );
+    let ticket_minter: Arc<dyn PeerTicketMinter> = authority.clone();
+    let stale_dispatcher = FragmentDispatcher::new(
+        ticket_minter,
+        transport_directory(
+            leader,
+            authority,
+            security_audit,
+            cluster
+                .oracle_peer_transport(0)
+                .expect("replacement production transport"),
+        ),
+    );
+    let stale_file = NamedTempFile::new().expect("stale fragment file");
+    let mut routed_fragment = fragment(&stale_file);
+    let object_path = format!("oracle-peer/{}.parquet", uuid::Uuid::now_v7());
+    cluster
+        .server(0)
+        .expect("leader storage")
+        .state()
+        .storage
+        .operator()
+        .write(
+            &object_path,
+            std::fs::read(stale_file.path()).expect("routed fragment bytes"),
+        )
+        .await
+        .expect("routed fragment uploaded");
+    let warehouse = match cluster
+        .server(0)
+        .expect("leader storage")
+        .state()
+        .storage
+        .backend_config()
+    {
+        wyrd_storage::BackendConfig::Local { root } => format!("file://{}", root.display()),
+        other => panic!("topology journey requires local storage, got {other:?}"),
+    };
+    routed_fragment.files[0].location = format!("{warehouse}/{object_path}");
+    routed_fragment.binding = format!("{warehouse}/oracle-peer");
+    routed_fragment.fragment_id = routed_fragment.digest();
+    let mut routed_context = context(leader);
+    routed_context.leader_fence = leader_lease.fencing_token;
+    routed_context.tenant_id = cluster.data_tenant_id().as_uuid();
+    let stale = stale_dispatcher
+        .execute(
+            &routed_context,
+            routed_fragment.clone(),
+            &[DispatchCandidate {
+                node_id: worker,
+                worker_fence: worker_lease.fencing_token,
+            }],
+        )
+        .await
+        .expect_err("old selected fence is rejected by live topology");
+    assert!(matches!(stale, DispatchError::StaleObject));
+    assert_eq!(
+        replacement.worker().pending_reservations(),
+        0,
+        "stale candidate must not mutate replacement capacity"
+    );
+    stale_dispatcher
+        .execute(
+            &routed_context,
+            routed_fragment,
+            &[DispatchCandidate {
+                node_id: worker,
+                worker_fence: replacement_fence,
+            }],
+        )
+        .await
+        .expect("replacement endpoint completes signed fragment execution");
+    assert_eq!(replacement.worker().pending_reservations(), 0);
+    cluster.shutdown().await.expect("topology cluster shutdown");
 }
 
 /// Production tonic authentication, SQL membership, audit, and capacity gate reserve mutation.

@@ -37,6 +37,7 @@ use super::telemetry::{
     SlotOutcome, record_peer_attempt, record_security, record_slot,
 };
 use super::{OracleExecutionError, OracleSlotManager, decode_attempt_batches};
+use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 use crate::scribe::memory::BifrostMemoryGovernor;
 
 /// Fixed private peer protocol version.
@@ -730,14 +731,73 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
     }
 }
 
-/// Real tonic client transport keyed by immutable Oracle-node addresses.
+/// Real tonic client transport resolving Oracle peers from live membership.
 pub struct TonicOraclePeerTransport {
-    /// Frozen worker-address snapshot keyed by node identity.
-    addresses: HashMap<NodeId, String>,
+    /// Existing registry publishing immutable ready/live membership cuts.
+    topology: OraclePeerTopology,
     /// Optional authenticated service credential attached to private calls.
     credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional immutable CA and DNS identity; absent only for local development tests.
     tls: Option<OraclePeerTls>,
+}
+
+/// Membership source used by production and feature-gated transport fixtures.
+enum OraclePeerTopology {
+    /// Production's continuously refreshed authoritative registry.
+    Registry(Arc<ClusterRegistry>),
+    /// Immutable fixture projection used only by transport-focused tests.
+    #[cfg(feature = "test-support")]
+    TestAddresses(HashMap<NodeId, String>),
+}
+
+/// Safe closed reason why a selected peer cannot be routed from one snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerTopologyMismatch {
+    /// The selected Oracle identity is absent from the snapshot.
+    Missing,
+    /// The selected role is present but has not advertised readiness.
+    Unready,
+    /// The selected role heartbeat is outside the live cutoff.
+    Expired,
+    /// The selected role has been replaced by a newer fence.
+    Fence,
+    /// Production trust forbids the advertised plaintext address.
+    PlaintextAddress,
+}
+
+/// Resolves one exact candidate from a single immutable membership cut.
+///
+/// # Errors
+/// Returns a scrub-safe topology class for absence, readiness, expiry, fence,
+/// or HTTPS policy mismatch.
+///
+/// # Panics
+/// Panics only if the fixed repository-owned liveness cutoff cannot fit a
+/// `chrono::Duration`, which is an invariant of its seconds-scale value.
+fn resolve_snapshot_candidate<'a>(
+    snapshot: &'a ClusterSnapshot,
+    candidate: &DispatchCandidate,
+    tls_required: bool,
+    now: DateTime<Utc>,
+) -> Result<&'a str, PeerTopologyMismatch> {
+    let lease = snapshot
+        .live_oracle(candidate.node_id)
+        .ok_or(PeerTopologyMismatch::Missing)?;
+    if !lease.ready {
+        return Err(PeerTopologyMismatch::Unready);
+    }
+    let cutoff = ChronoDuration::from_std(ROLE_LIVENESS_CUTOFF)
+        .expect("invariant: role liveness cutoff fits chrono duration");
+    if lease.heartbeat_at < now - cutoff {
+        return Err(PeerTopologyMismatch::Expired);
+    }
+    if lease.fencing_token != candidate.worker_fence {
+        return Err(PeerTopologyMismatch::Fence);
+    }
+    if tls_required && !lease.address.starts_with("https://") {
+        return Err(PeerTopologyMismatch::PlaintextAddress);
+    }
+    Ok(lease.address.as_str())
 }
 
 /// Immutable trust material for authenticating remote Oracle peers.
@@ -797,17 +857,18 @@ impl OraclePeerCredentials for StaticOraclePeerCredentials {
 }
 
 impl TonicOraclePeerTransport {
-    /// Creates a transport from one immutable membership snapshot.
+    /// Creates a development transport over the live cluster registry.
     ///
     /// # Errors
     /// Returns terminal rejection when the bearer value is invalid metadata.
+    #[cfg(feature = "test-support")]
     pub fn new(
         addresses: HashMap<NodeId, String>,
         bearer: Option<&str>,
     ) -> Result<Self, DispatchError> {
         let bearer = bearer.unwrap_or_default();
         Ok(Self {
-            addresses,
+            topology: OraclePeerTopology::TestAddresses(addresses),
             credentials: Arc::new(StaticOraclePeerCredentials::new(
                 secrecy::SecretString::from(bearer.to_owned()),
             )),
@@ -818,11 +879,11 @@ impl TonicOraclePeerTransport {
     /// Creates a production transport backed by a refreshing credential owner.
     #[must_use]
     pub fn with_credentials(
-        addresses: HashMap<NodeId, String>,
+        registry: Arc<ClusterRegistry>,
         credentials: Arc<dyn OraclePeerCredentials>,
     ) -> Self {
         Self {
-            addresses,
+            topology: OraclePeerTopology::Registry(registry),
             credentials,
             tls: None,
         }
@@ -831,41 +892,121 @@ impl TonicOraclePeerTransport {
     /// Creates a production transport with CA-authenticated TLS.
     #[must_use]
     pub fn with_credentials_and_tls(
-        addresses: HashMap<NodeId, String>,
+        registry: Arc<ClusterRegistry>,
         credentials: Arc<dyn OraclePeerCredentials>,
         tls: OraclePeerTls,
     ) -> Self {
         Self {
-            addresses,
+            topology: OraclePeerTopology::Registry(registry),
             credentials,
             tls: Some(tls),
         }
     }
 
-    /// Connects to the exact selected worker from the frozen snapshot.
+    /// Creates a TLS transport over an immutable endpoint fixture.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_test_credentials_and_tls(
+        addresses: HashMap<NodeId, String>,
+        credentials: Arc<dyn OraclePeerCredentials>,
+        tls: OraclePeerTls,
+    ) -> Self {
+        Self {
+            topology: OraclePeerTopology::TestAddresses(addresses),
+            credentials,
+            tls: Some(tls),
+        }
+    }
+
+    /// Resolves an exact candidate from one current immutable membership cut.
+    ///
+    /// # Errors
+    /// Returns stale-object when the node is absent or its current role fence
+    /// differs, and terminal when production membership advertises plaintext.
+    fn resolve_candidate(&self, candidate: &DispatchCandidate) -> Result<String, DispatchError> {
+        #[cfg(feature = "test-support")]
+        if let OraclePeerTopology::TestAddresses(addresses) = &self.topology {
+            return addresses
+                .get(&candidate.node_id)
+                .cloned()
+                .ok_or(DispatchError::StaleObject);
+        }
+        let snapshot = self.snapshot();
+        match resolve_snapshot_candidate(&snapshot, candidate, self.tls.is_some(), Utc::now()) {
+            Ok(address) => Ok(address.to_owned()),
+            Err(mismatch) => {
+                tracing::warn!(
+                    worker = %candidate.node_id.as_uuid(),
+                    expected_fence = candidate.worker_fence,
+                    mismatch = ?mismatch,
+                    "Oracle peer topology target is stale"
+                );
+                if mismatch == PeerTopologyMismatch::PlaintextAddress {
+                    Err(DispatchError::Terminal)
+                } else {
+                    Err(DispatchError::StaleObject)
+                }
+            }
+        }
+    }
+
+    /// Resolves the currently live fence for public trait compatibility.
+    ///
+    /// Production directory dispatch does not use this projection because it
+    /// must preserve the planning candidate's exact fence.
+    ///
+    /// # Errors
+    /// Returns stale-object when the worker has no current ready/live lease.
+    fn current_candidate(&self, worker: NodeId) -> Result<DispatchCandidate, DispatchError> {
+        #[cfg(feature = "test-support")]
+        if let OraclePeerTopology::TestAddresses(addresses) = &self.topology {
+            return addresses
+                .contains_key(&worker)
+                .then_some(DispatchCandidate {
+                    node_id: worker,
+                    worker_fence: 0,
+                })
+                .ok_or(DispatchError::StaleObject);
+        }
+        let snapshot = self.snapshot();
+        let lease = snapshot
+            .live_oracle(worker)
+            .ok_or(DispatchError::StaleObject)?;
+        Ok(DispatchCandidate {
+            node_id: worker,
+            worker_fence: lease.fencing_token,
+        })
+    }
+
+    /// Loads exactly one immutable topology cut for one outbound resolution.
+    fn snapshot(&self) -> Arc<crate::cluster::ClusterSnapshot> {
+        match &self.topology {
+            OraclePeerTopology::Registry(registry) => registry.snapshot(),
+            #[cfg(feature = "test-support")]
+            OraclePeerTopology::TestAddresses(_) => {
+                unreachable!("test address fixtures resolve before registry snapshot access")
+            }
+        }
+    }
+
+    /// Connects to the exact selected worker after live fence resolution.
     ///
     /// # Errors
     /// Returns retryable failure for absent, invalid, or unreachable endpoints.
     async fn client(
         &self,
-        worker: NodeId,
+        candidate: &DispatchCandidate,
     ) -> Result<OraclePeerServiceClient<Channel>, DispatchError> {
-        let address = self
-            .addresses
-            .get(&worker)
-            .ok_or(DispatchError::Retryable)?;
-        if self.tls.is_some() && !address.starts_with("https://") {
-            return Err(DispatchError::Terminal);
-        }
+        let address = self.resolve_candidate(candidate)?;
         let endpoint = if let Some(tls) = &self.tls {
             wyrd_tonic::transport::authenticated_tls_endpoint(
-                address.clone(),
+                address,
                 &tls.ca_certificate_pem,
                 tls.server_name.clone(),
             )
             .map_err(|_| DispatchError::Terminal)?
         } else {
-            wyrd_tonic::transport::plaintext_endpoint(address.clone())
+            wyrd_tonic::transport::plaintext_endpoint(address)
                 .map_err(|_| DispatchError::Retryable)?
         };
         let channel = endpoint
@@ -873,6 +1014,88 @@ impl TonicOraclePeerTransport {
             .await
             .map_err(|_| DispatchError::Retryable)?;
         Ok(OraclePeerServiceClient::new(channel))
+    }
+
+    /// Reserves capacity for one exact planned node/fence target.
+    ///
+    /// # Errors
+    /// Returns stale-object for a changed lease, retryable for transport
+    /// failure, or terminal for invalid transport and response contracts.
+    async fn reserve_candidate(
+        &self,
+        candidate: &DispatchCandidate,
+        request: ReserveNodeSlotsRequest,
+    ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+        let wire: wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest = request.into();
+        let mut client = self.client(candidate).await?;
+        let response = match client
+            .reserve_slots(self.authenticated(wire.clone(), false).await?)
+            .await
+        {
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
+                .reserve_slots(self.authenticated(wire, true).await?)
+                .await
+                .map_err(|status| status_error(&status))?,
+            result => result.map_err(|status| status_error(&status))?,
+        }
+        .into_inner();
+        response.try_into().map_err(|_| DispatchError::Terminal)
+    }
+
+    /// Releases capacity for one exact planned node/fence target.
+    ///
+    /// # Errors
+    /// Returns stale-object for a changed lease, retryable for transport
+    /// failure, or terminal for invalid transport and response contracts.
+    async fn release_candidate(
+        &self,
+        candidate: &DispatchCandidate,
+        request: ReleaseNodeSlotsRequest,
+    ) -> Result<(), DispatchError> {
+        let mut client = self.client(candidate).await?;
+        let wire: wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest = request.into();
+        match client
+            .release_slots(self.authenticated(wire.clone(), false).await?)
+            .await
+        {
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
+                .release_slots(self.authenticated(wire, true).await?)
+                .await
+                .map_err(|status| status_error(&status))?,
+            result => result.map_err(|status| status_error(&status))?,
+        };
+        Ok(())
+    }
+
+    /// Executes a fragment for one exact planned node/fence target.
+    ///
+    /// # Errors
+    /// Returns stale-object for a changed lease, retryable for transport
+    /// failure, or terminal for invalid transport and stream contracts.
+    async fn execute_candidate(
+        &self,
+        candidate: &DispatchCandidate,
+        request: ExecuteFragmentRequest,
+    ) -> Result<WorkerAttemptStream, DispatchError> {
+        let mut client = self.client(candidate).await?;
+        let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
+        let response = match client
+            .execute_fragment(self.authenticated(wire.clone(), false).await?)
+            .await
+        {
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
+                .execute_fragment(self.authenticated(wire, true).await?)
+                .await
+                .map_err(|status| status_error(&status))?,
+            result => result.map_err(|status| status_error(&status))?,
+        };
+        let mut stream = response.into_inner();
+        let output = async_stream::stream! {
+            while let Some(frame) = stream.next().await {
+                yield frame.map_err(|status| status_error(&status)).and_then(|frame| frame.try_into().map_err(|_| DispatchError::Terminal));
+            }
+        };
+        Ok(Box::pin(output))
     }
 
     /// Adds workload authorization metadata when configured.
@@ -902,20 +1125,8 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         worker: NodeId,
         request: ReserveNodeSlotsRequest,
     ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
-        let wire: wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest = request.into();
-        let mut client = self.client(worker).await?;
-        let response = match client
-            .reserve_slots(self.authenticated(wire.clone(), false).await?)
-            .await
-        {
-            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .reserve_slots(self.authenticated(wire, true).await?)
-                .await
-                .map_err(|status| status_error(&status))?,
-            result => result.map_err(|status| status_error(&status))?,
-        }
-        .into_inner();
-        response.try_into().map_err(|_| DispatchError::Terminal)
+        let candidate = self.current_candidate(worker)?;
+        self.reserve_candidate(&candidate, request).await
     }
 
     /// Releases one tuple-bound reservation through the generated tonic client.
@@ -927,19 +1138,8 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         worker: NodeId,
         request: ReleaseNodeSlotsRequest,
     ) -> Result<(), DispatchError> {
-        let mut client = self.client(worker).await?;
-        let wire: wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest = request.into();
-        match client
-            .release_slots(self.authenticated(wire.clone(), false).await?)
-            .await
-        {
-            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .release_slots(self.authenticated(wire, true).await?)
-                .await
-                .map_err(|status| status_error(&status))?,
-            result => result.map_err(|status| status_error(&status))?,
-        };
-        Ok(())
+        let candidate = self.current_candidate(worker)?;
+        self.release_candidate(&candidate, request).await
     }
 
     /// Adapts one footer-terminated tonic stream without collecting frames.
@@ -951,27 +1151,8 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         worker: NodeId,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
-        let mut client = self.client(worker).await?;
-        let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
-        let response = match client
-            .execute_fragment(self.authenticated(wire.clone(), false).await?)
-            .await
-        {
-            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .execute_fragment(self.authenticated(wire, true).await?)
-                .await
-                .map_err(|status| status_error(&status))?,
-            result => result.map_err(|status| status_error(&status))?,
-        };
-        let mut stream = response.into_inner();
-        let output = async_stream::stream! {
-            while let Some(frame) = stream.next().await {
-                yield frame
-                    .map_err(|status| status_error(&status))
-                    .and_then(|frame| frame.try_into().map_err(|_| DispatchError::Terminal));
-            }
-        };
-        Ok(Box::pin(output))
+        let candidate = self.current_candidate(worker)?;
+        self.execute_candidate(&candidate, request).await
     }
 }
 
@@ -981,8 +1162,17 @@ pub struct OraclePeerTransportDirectory {
     local_node_id: NodeId,
     /// Shared in-process adapter backed by the same fenced worker as the gRPC service.
     local: Arc<dyn OraclePeerTransport>,
-    /// Remote adapter whose immutable endpoint map excludes local dispatch decisions.
-    remote: Arc<dyn OraclePeerTransport>,
+    /// Closed remote route separating live production resolution from injection.
+    remote: RemoteOraclePeerTransport,
+}
+
+/// Private remote dispatch variants preserving the public transport contract.
+enum RemoteOraclePeerTransport {
+    /// Production tonic owner that resolves the exact planned candidate.
+    Production(Arc<TonicOraclePeerTransport>),
+    /// Test-only adapter retaining isolated transport injection.
+    #[cfg(test)]
+    Injected(Arc<dyn OraclePeerTransport>),
 }
 
 impl OraclePeerTransportDirectory {
@@ -996,7 +1186,7 @@ impl OraclePeerTransportDirectory {
         Self {
             local_node_id,
             local,
-            remote,
+            remote: RemoteOraclePeerTransport::Production(remote),
         }
     }
 
@@ -1011,7 +1201,7 @@ impl OraclePeerTransportDirectory {
         Self {
             local_node_id,
             local,
-            remote,
+            remote: RemoteOraclePeerTransport::Injected(remote),
         }
     }
 
@@ -1021,15 +1211,6 @@ impl OraclePeerTransportDirectory {
         node_id == self.local_node_id
     }
 
-    /// Selects the only permitted adapter for one candidate identity.
-    fn transport(&self, node_id: NodeId) -> &dyn OraclePeerTransport {
-        if self.is_local(node_id) {
-            self.local.as_ref()
-        } else {
-            self.remote.as_ref()
-        }
-    }
-
     /// Reserves through the identity-selected local or remote adapter.
     ///
     /// # Errors
@@ -1037,10 +1218,22 @@ impl OraclePeerTransportDirectory {
     /// Returns the selected adapter's retryable or terminal failure.
     async fn reserve(
         &self,
-        worker: NodeId,
+        candidate: &DispatchCandidate,
         request: ReserveNodeSlotsRequest,
     ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
-        self.transport(worker).reserve(worker, request).await
+        if self.is_local(candidate.node_id) {
+            self.local.reserve(candidate.node_id, request).await
+        } else {
+            match &self.remote {
+                RemoteOraclePeerTransport::Production(remote) => {
+                    remote.reserve_candidate(candidate, request).await
+                }
+                #[cfg(test)]
+                RemoteOraclePeerTransport::Injected(remote) => {
+                    remote.reserve(candidate.node_id, request).await
+                }
+            }
+        }
     }
 
     /// Releases through the same identity-selected adapter used for reserve.
@@ -1050,10 +1243,22 @@ impl OraclePeerTransportDirectory {
     /// Returns the selected adapter's retryable or terminal failure.
     async fn release(
         &self,
-        worker: NodeId,
+        candidate: &DispatchCandidate,
         request: ReleaseNodeSlotsRequest,
     ) -> Result<(), DispatchError> {
-        self.transport(worker).release(worker, request).await
+        if self.is_local(candidate.node_id) {
+            self.local.release(candidate.node_id, request).await
+        } else {
+            match &self.remote {
+                RemoteOraclePeerTransport::Production(remote) => {
+                    remote.release_candidate(candidate, request).await
+                }
+                #[cfg(test)]
+                RemoteOraclePeerTransport::Injected(remote) => {
+                    remote.release(candidate.node_id, request).await
+                }
+            }
+        }
     }
 
     /// Executes through the same identity-selected adapter used for reserve.
@@ -1063,10 +1268,22 @@ impl OraclePeerTransportDirectory {
     /// Returns the selected adapter's retryable or terminal failure.
     async fn execute(
         &self,
-        worker: NodeId,
+        candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
-        self.transport(worker).execute(worker, request).await
+        if self.is_local(candidate.node_id) {
+            self.local.execute(candidate.node_id, request).await
+        } else {
+            match &self.remote {
+                RemoteOraclePeerTransport::Production(remote) => {
+                    remote.execute_candidate(candidate, request).await
+                }
+                #[cfg(test)]
+                RemoteOraclePeerTransport::Injected(remote) => {
+                    remote.execute(candidate.node_id, request).await
+                }
+            }
+        }
     }
 }
 
@@ -1237,7 +1454,7 @@ impl FragmentDispatcher {
                 .ok_or(DispatchError::Retryable)?;
             let pending = match tokio::select! {
                 () = context.cancellation.cancelled() => Err(DispatchError::Retryable),
-                result = tokio::time::timeout(remaining, self.transports.reserve(candidate.node_id, reserve)) =>
+                result = tokio::time::timeout(remaining, self.transports.reserve(candidate, reserve)) =>
                     result.map_err(|_| DispatchError::Retryable).and_then(std::convert::identity),
             } {
                 Err(DispatchError::Retryable) | Ok(ReserveNodeSlotsResponse::Rejected(_)) => {
@@ -1272,8 +1489,7 @@ impl FragmentDispatcher {
                 permission_digest: context.permission_digest.clone(),
             };
             let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) else {
-                self.release_pending(candidate.node_id, release, context)
-                    .await;
+                self.release_pending(candidate, release, context).await;
                 return Err(DispatchError::Terminal);
             };
             let request = ExecuteFragmentRequest {
@@ -1282,13 +1498,12 @@ impl FragmentDispatcher {
                 reservation_id: pending.reservation_id,
             };
             let result = self
-                .execute_attempt(candidate.node_id, request, context, &fragment)
+                .execute_attempt(candidate, request, context, &fragment)
                 .await;
             if result.is_ok() {
                 return result;
             }
-            self.release_pending(candidate.node_id, release, context)
-                .await;
+            self.release_pending(candidate, release, context).await;
             if matches!(
                 result,
                 Err(DispatchError::Terminal | DispatchError::StaleObject)
@@ -1302,18 +1517,18 @@ impl FragmentDispatcher {
     /// Attempts immediate tuple-bound cleanup after any accepted-attempt failure.
     async fn release_pending(
         &self,
-        worker: NodeId,
+        candidate: &DispatchCandidate,
         release: ReleaseNodeSlotsRequest,
         context: &DispatchContext,
     ) {
         let result = tokio::select! {
             biased;
-            result = self.transports.release(worker, release) => result,
+            result = self.transports.release(candidate, release) => result,
             () = tokio::time::sleep_until(context.deadline) => Err(DispatchError::Retryable),
         };
         if let Err(error) = result {
             tracing::warn!(
-                worker = %worker.as_uuid(),
+                worker = %candidate.node_id.as_uuid(),
                 ?error,
                 "Oracle pending reservation release failed; worker TTL remains fallback"
             );
@@ -1327,16 +1542,16 @@ impl FragmentDispatcher {
     #[tracing::instrument(
         name = "bifrost.oracle.fragment",
         skip_all,
-        fields(locality = if worker == context.leader_node_id { "local" } else { "remote" })
+        fields(locality = if candidate.node_id == context.leader_node_id { "local" } else { "remote" })
     )]
     async fn execute_attempt(
         &self,
-        worker: NodeId,
+        candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
         context: &DispatchContext,
         fragment: &SealedScanFragment,
     ) -> Result<ValidatedAttempt, DispatchError> {
-        let locality = if worker == context.leader_node_id {
+        let locality = if candidate.node_id == context.leader_node_id {
             FragmentLocality::Local
         } else {
             FragmentLocality::Remote
@@ -1359,7 +1574,7 @@ impl FragmentDispatcher {
             .ok_or(DispatchError::Retryable)?;
         let mut frames = match tokio::select! {
             () = context.cancellation.cancelled() => Err(DispatchError::Retryable),
-            result = tokio::time::timeout(remaining, self.transports.execute(worker, request)) =>
+            result = tokio::time::timeout(remaining, self.transports.execute(candidate, request)) =>
                 result.map_err(|_| DispatchError::Retryable).and_then(std::convert::identity),
         } {
             Ok(frames) => frames,
@@ -1422,6 +1637,125 @@ mod tests {
     use super::super::fragment::{SealedScanFile, SealedSourceTier};
     use super::super::peer::DeterministicTestSigner;
     use super::*;
+    use wyrd_spec::vala::api::{
+        ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, OracleCapabilitiesV1,
+    };
+
+    /// Builds one Oracle lease for deterministic topology resolution cases.
+    fn topology_lease(
+        node_id: NodeId,
+        address: &str,
+        fence: u64,
+        ready: bool,
+        heartbeat_at: DateTime<Utc>,
+    ) -> ClusterRoleLease {
+        ClusterRoleLease {
+            key: ClusterNodeKey {
+                node_id,
+                role: ClusterRole::Oracle,
+            },
+            address: address.to_owned(),
+            fencing_token: fence,
+            capability_version: 1,
+            capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
+                peer_protocol_version: 1,
+                storage_protocol_version: 1,
+                cpu_cores: 1.0,
+                memory_budget_bytes: 1,
+                cpu_cores_per_slot: 1.0,
+                memory_bytes_per_slot: 1,
+                raw_slots: 1,
+                usable_slots: 1,
+                supported_classes: vec![QueryClass::Interactive],
+                max_workers_per_query: 1,
+            }),
+            ready,
+            started_at: heartbeat_at,
+            heartbeat_at,
+        }
+    }
+
+    /// Classifies every live-routing outcome without IO, sleeps, or secret detail.
+    #[test]
+    fn oracle_peer_snapshot_resolver_matrix_is_exact_and_safe() {
+        let now = Utc::now();
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let candidate = DispatchCandidate {
+            node_id: node,
+            worker_fence: 7,
+        };
+        let matching = ClusterSnapshot::new(vec![topology_lease(
+            node,
+            "https://worker-a.example:50052",
+            7,
+            true,
+            now,
+        )]);
+        assert_eq!(
+            resolve_snapshot_candidate(&matching, &candidate, true, now),
+            Ok("https://worker-a.example:50052")
+        );
+        assert_eq!(
+            resolve_snapshot_candidate(&ClusterSnapshot::default(), &candidate, true, now),
+            Err(PeerTopologyMismatch::Missing)
+        );
+        let unready = ClusterSnapshot::new(vec![topology_lease(
+            node,
+            "https://worker-a.example:50052",
+            7,
+            false,
+            now,
+        )]);
+        assert_eq!(
+            resolve_snapshot_candidate(&unready, &candidate, true, now),
+            Err(PeerTopologyMismatch::Unready)
+        );
+        let expired = ClusterSnapshot::new(vec![topology_lease(
+            node,
+            "https://worker-a.example:50052",
+            7,
+            true,
+            now - ChronoDuration::seconds(16),
+        )]);
+        assert_eq!(
+            resolve_snapshot_candidate(&expired, &candidate, true, now),
+            Err(PeerTopologyMismatch::Expired)
+        );
+        let replaced = ClusterSnapshot::new(vec![topology_lease(
+            node,
+            "https://worker-b.example:50053",
+            8,
+            true,
+            now,
+        )]);
+        assert_eq!(
+            resolve_snapshot_candidate(&replaced, &candidate, true, now),
+            Err(PeerTopologyMismatch::Fence)
+        );
+        assert_eq!(
+            resolve_snapshot_candidate(
+                &replaced,
+                &DispatchCandidate {
+                    node_id: node,
+                    worker_fence: 8,
+                },
+                true,
+                now,
+            ),
+            Ok("https://worker-b.example:50053")
+        );
+        let plaintext = ClusterSnapshot::new(vec![topology_lease(
+            node,
+            "http://worker.example:50052",
+            7,
+            true,
+            now,
+        )]);
+        assert_eq!(
+            resolve_snapshot_candidate(&plaintext, &candidate, true, now),
+            Err(PeerTopologyMismatch::PlaintextAddress)
+        );
+    }
 
     /// Transport that rejects the first reserve transiently and reaches the second candidate.
     struct RetryReserveTransport {

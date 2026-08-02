@@ -114,6 +114,15 @@ fn release_mutation_completed(mutation: &LeaseMutation) -> bool {
     )
 }
 
+/// Durable result of one explicit admission-lease release attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdmissionReleaseStatus {
+    /// The committed mutation proved the lease released or already released.
+    Released,
+    /// The committed mutation did not prove that the lease stopped consuming capacity.
+    NotReleased,
+}
+
 /// Durable admission lease awaiting asynchronous cleanup by the admission owner.
 pub(super) struct PendingLeaseRelease {
     /// Tenant whose transaction contains the lease row.
@@ -1042,7 +1051,12 @@ impl AdmittedQueryGuard {
     /// the caller regains control. Local permits and memory are released before
     /// durable IO. If caller cancellation interrupts the durable release, `Drop`
     /// requeues the lease and expiry remains the final recovery boundary.
-    pub(super) async fn release(mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the durable SQL error when tenant acquisition, fenced release,
+    /// or transaction commit fails. The consuming guard then requeues cleanup.
+    pub(super) async fn release(mut self) -> Result<AdmissionReleaseStatus, vala_sql::SqlError> {
         self.cancellation.cancel();
         if let Some(renewal) = self.renewal.take() {
             renewal.abort();
@@ -1054,26 +1068,27 @@ impl AdmittedQueryGuard {
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
         }
-        let result = self
+        let mutation = match self
             .admission
             .release_lease(self.data_tenant_id, self.query_id, &self.leader)
-            .await;
-        match result {
-            Ok(mutation) if release_mutation_completed(&mutation) => {
-                self.release_pending = false;
-                #[cfg(feature = "test-support")]
-                if let Some(probe) = &self.resource_probe {
-                    probe.observe_release_mutation(&mutation);
-                }
-            }
-            Ok(_mutation) => {
-                tracing::warn!(
-                    "Oracle admission cleanup made no durable release; cleanup requeued"
-                );
-            }
+            .await
+        {
+            Ok(mutation) => mutation,
             Err(error) => {
                 tracing::error!(error = %error, "Oracle admission cleanup failed");
+                return Err(error);
             }
+        };
+        if release_mutation_completed(&mutation) {
+            self.release_pending = false;
+            #[cfg(feature = "test-support")]
+            if let Some(probe) = &self.resource_probe {
+                probe.observe_release_mutation(&mutation);
+            }
+            Ok(AdmissionReleaseStatus::Released)
+        } else {
+            tracing::warn!("Oracle admission cleanup made no durable release; cleanup requeued");
+            Ok(AdmissionReleaseStatus::NotReleased)
         }
     }
 }

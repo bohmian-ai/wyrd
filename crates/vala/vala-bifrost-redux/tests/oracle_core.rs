@@ -39,7 +39,8 @@ use vala_bifrost_redux::oracle::peer::{
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, Oracle,
     OracleAudit, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-    QueryOptions, TailTransportDirectory, TestPostgresOracleAudit, VerifiedSecurityContext,
+    OracleStaleReleaseProbe, QueryOptions, TailTransportDirectory, TestPostgresOracleAudit,
+    VerifiedSecurityContext,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -507,10 +508,14 @@ impl OracleFixture {
         let transports = OraclePeerTransportDirectory::new(
             self.role.key.node_id,
             Arc::new(LocalOraclePeerTransport::new(worker)),
-            Arc::new(
-                TonicOraclePeerTransport::new(HashMap::new(), None)
-                    .expect("empty remote transport"),
-            ),
+            Arc::new(TonicOraclePeerTransport::with_credentials(
+                Arc::clone(&self.cluster),
+                Arc::new(
+                    vala_bifrost_redux::oracle::dispatcher::StaticOraclePeerCredentials::new(
+                        secrecy::SecretString::from(String::new()),
+                    ),
+                ),
+            )),
         );
         let oracle = self.build_oracle_with_transport(
             audit,
@@ -1528,6 +1533,23 @@ async fn active_lease_count(fixture: &OracleFixture) -> i64 {
     count
 }
 
+/// Counts durable read decisions for the isolated fixture tenant.
+///
+/// # Panics
+///
+/// Panics when the fixture owner cannot query the audit outbox.
+async fn read_decision_count(fixture: &OracleFixture) -> i64 {
+    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox \
+         WHERE data_tenant_id=$1 AND operation='bifrost.query.read_decision'",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .fetch_one(&owner)
+    .await
+    .expect("read-decision count")
+}
+
 /// Real tenant SQL audit appends the exact locked T1 detail and commits it.
 #[tokio::test]
 async fn oracle_postgres_audit_commits_locked_read_decision() {
@@ -2286,18 +2308,28 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
         .await;
     let recorder = wyrd_bench::BenchmarkRecorder::new();
     let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let mut query = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect("second stale attempt returns a closed failed stream");
+    let release_probe = Arc::new(OracleStaleReleaseProbe::default());
+    oracle.bind_stale_release_probe_for_test(Arc::clone(&release_probe));
+    let query = oracle.query_sql(
+        fixture.context(),
+        BifrostQueryRequest {
+            sql: format!("SELECT * FROM {}", fixture.table.fqn()),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(5_000),
+        },
+    );
+    let release_control = async {
+        release_probe.wait_reached().await;
+        assert_eq!(
+            read_decision_count(&fixture).await,
+            1,
+            "the stale first attempt cannot readmit before durable release"
+        );
+        release_probe.resume();
+    };
+    let (query, ()) = tokio::join!(query, release_control);
+    let mut query = query.expect("second stale attempt returns a closed failed stream");
     let mut observed_batch = false;
     let mut observed_terminal = None;
     while let Some(frame) = query.frames.next().await {
@@ -2341,6 +2373,114 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
         &snapshot,
         "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"failed\"}",
     );
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// A stale-first-batch fenced release no-op cannot admit a second attempt.
+#[tokio::test(flavor = "current_thread")]
+async fn pg_bifrost_oracle_stale_first_batch_noop_release_never_readmits() {
+    let fixture = OracleFixture::new("oracle_stale_release_noop").await;
+    fixture.seed_missing_hot_row().await;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            OracleConfig::default(),
+        )
+        .await;
+    let release_probe = Arc::new(OracleStaleReleaseProbe::default());
+    oracle.bind_stale_release_probe_for_test(Arc::clone(&release_probe));
+    let query = oracle.query_sql(
+        fixture.context(),
+        BifrostQueryRequest {
+            sql: format!("SELECT * FROM {}", fixture.table.fqn()),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(5_000),
+        },
+    );
+    let release_control = async {
+        release_probe.wait_reached().await;
+        let query_id = sole_lease_id(&fixture).await;
+        let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+        sqlx::query(
+            "UPDATE vala.oracle_admission_leases \
+             SET leader_fencing_token=leader_fencing_token+1 \
+             WHERE data_tenant_id=$1 AND query_id=$2",
+        )
+        .bind(uuid::Uuid::from(fixture.tenant))
+        .bind(query_id)
+        .execute(&owner)
+        .await
+        .expect("replace stale-attempt leader fence");
+        release_probe.resume();
+    };
+    let (result, ()) = tokio::join!(query, release_control);
+    assert!(matches!(result, Err(BifrostError::QueryExecutionFailed)));
+    assert_eq!(
+        read_decision_count(&fixture).await,
+        1,
+        "a committed release no-op must not readmit"
+    );
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// A stalled stale-first-batch release consumes the original deadline without readmission.
+#[tokio::test(flavor = "current_thread")]
+async fn pg_bifrost_oracle_stale_first_batch_stalled_release_never_readmits() {
+    let fixture = OracleFixture::new("oracle_stale_release_stall").await;
+    fixture.seed_missing_hot_row().await;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            OracleConfig::default(),
+        )
+        .await;
+    let release_probe = Arc::new(OracleStaleReleaseProbe::default());
+    oracle.bind_stale_release_probe_for_test(Arc::clone(&release_probe));
+    let query = oracle.query_sql(
+        fixture.context(),
+        BifrostQueryRequest {
+            sql: format!("SELECT * FROM {}", fixture.table.fqn()),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(1_000),
+        },
+    );
+    let release_control = async {
+        release_probe.wait_reached().await;
+        let query_id = sole_lease_id(&fixture).await;
+        let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+        let mut lock = owner.begin().await.expect("lease lock transaction");
+        sqlx::query(
+            "SELECT query_id FROM vala.oracle_admission_leases \
+             WHERE data_tenant_id=$1 AND query_id=$2 FOR UPDATE",
+        )
+        .bind(uuid::Uuid::from(fixture.tenant))
+        .bind(query_id)
+        .fetch_one(&mut *lock)
+        .await
+        .expect("lock stale-attempt lease");
+        release_probe.resume();
+        lock
+    };
+    let (result, lock) = tokio::join!(query, release_control);
+    assert!(matches!(result, Err(BifrostError::QueryTimeout)));
+    assert_eq!(
+        read_decision_count(&fixture).await,
+        1,
+        "a stalled release must not readmit"
+    );
+    lock.rollback().await.expect("release lease lock");
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;

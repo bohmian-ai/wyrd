@@ -4,7 +4,6 @@ pub mod auth;
 pub mod bootstrap;
 pub mod issuer;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -895,16 +894,14 @@ impl<'a> OracleRoleBuilder<'a> {
             running_slots,
         ));
         let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
-        let addresses = cluster
-            .snapshot()
-            .live_oracles()
-            .into_iter()
-            .filter(|lease| lease.key.node_id != node_id)
-            .map(|lease| (lease.key.node_id, lease.address.clone()))
-            .collect::<HashMap<_, _>>();
+        let snapshot = cluster.snapshot();
         validate_remote_oracle_addresses(
             config.deployment_profile,
-            addresses.values().map(String::as_str),
+            snapshot
+                .live_oracles()
+                .into_iter()
+                .filter(|lease| lease.key.node_id != node_id)
+                .map(|lease| lease.address.as_str()),
         )?;
         #[cfg(feature = "test-support")]
         let peer_credentials: Arc<dyn OraclePeerCredentials> = match injected_peer_credentials {
@@ -956,13 +953,13 @@ impl<'a> OracleRoleBuilder<'a> {
                 ))
             })?;
             Arc::new(TonicOraclePeerTransport::with_credentials_and_tls(
-                addresses,
+                Arc::clone(&cluster),
                 peer_credentials,
                 OraclePeerTls::new(ca_certificate_pem, server_name.clone()),
             ))
         } else {
             Arc::new(TonicOraclePeerTransport::with_credentials(
-                addresses,
+                Arc::clone(&cluster),
                 peer_credentials,
             ))
         };
@@ -1488,6 +1485,7 @@ pub fn spawn_maintenance_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// Production boot rejects a plaintext address discovered from live membership.
     #[test]

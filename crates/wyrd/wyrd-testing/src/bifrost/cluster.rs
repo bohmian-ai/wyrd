@@ -11,7 +11,9 @@ use sqlx::Row;
 use thiserror::Error;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
-use vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials;
+use vala_bifrost_redux::oracle::dispatcher::{
+    OraclePeerCredentials, OraclePeerTls, TonicOraclePeerTransport,
+};
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::tail_rpc::TonicTailReadTransport;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
@@ -564,6 +566,51 @@ impl WyrdTestCluster {
             .map_err(|error| ClusterError::Resource(error.to_string()))
     }
 
+    /// Builds the same registry-backed TLS peer transport used by server boot.
+    ///
+    /// # Errors
+    /// Returns a resource error when TLS is disabled, the leader is absent, or
+    /// the retained CA fixture cannot be read.
+    pub fn oracle_peer_transport(
+        &self,
+        leader_index: usize,
+    ) -> Result<TonicOraclePeerTransport, ClusterError> {
+        let (_, tls) = self
+            .oracle_peer_tls
+            .as_ref()
+            .ok_or_else(|| ClusterError::Resource("Oracle peer TLS is not enabled".to_owned()))?;
+        let server = self
+            .server(leader_index)
+            .ok_or_else(|| ClusterError::Resource("Oracle leader is absent".to_owned()))?;
+        let peer =
+            server.state().oracle_peer.as_ref().ok_or_else(|| {
+                ClusterError::Resource("Oracle leader runtime is absent".to_owned())
+            })?;
+        let ca = std::fs::read(&tls.ca_path)
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        Ok(TonicOraclePeerTransport::with_credentials_and_tls(
+            peer.cluster(),
+            Arc::clone(&self.oracle_peer_credentials),
+            OraclePeerTls::new(ca, tls.server_name.clone()),
+        ))
+    }
+
+    /// Refreshes every running node's authoritative immutable membership cut.
+    ///
+    /// # Errors
+    /// Returns a resource error when any registry refresh fails.
+    pub async fn refresh_oracle_snapshots(&self) -> Result<(), ClusterError> {
+        for server in self.servers.values().flatten() {
+            if let Some(peer) = &server.state().oracle_peer {
+                peer.cluster()
+                    .refresh_snapshot()
+                    .await
+                    .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Start a legacy named topology over shared real dependencies.
     ///
     /// # Errors
@@ -583,7 +630,7 @@ impl WyrdTestCluster {
     /// installation failure, or node bind failure. Nodes already started are
     /// shut down before the error returns.
     pub async fn start_spec(spec: BifrostClusterSpec) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None, false).await
+        Self::start_spec_with_options(spec, Duration::ZERO, None, false, false).await
     }
 
     /// Start real Wyrd servers whose Oracle membership and gRPC listeners use TLS.
@@ -594,7 +641,18 @@ impl WyrdTestCluster {
     pub async fn start_spec_with_oracle_peer_tls(
         spec: BifrostClusterSpec,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None, true).await
+        Self::start_spec_with_options(spec, Duration::ZERO, None, true, false).await
+    }
+
+    /// Starts a TLS topology while retaining the final node as an unbooted slot.
+    ///
+    /// # Errors
+    /// Returns the same resource, topology, and boot errors as
+    /// [`Self::start_spec_with_oracle_peer_tls`].
+    pub async fn start_spec_with_oracle_peer_tls_delayed_last(
+        spec: BifrostClusterSpec,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_options(spec, Duration::ZERO, None, true, true).await
     }
 
     /// Start a named topology with an explicit WAL fsync delay.
@@ -608,7 +666,7 @@ impl WyrdTestCluster {
         wal_sync_delay: Duration,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(topology.spec(), wal_sync_delay, None, false).await
+        Self::start_spec_with_options(topology.spec(), wal_sync_delay, None, false, false).await
     }
 
     /// Start a named topology with deterministic Scribe admission bounds.
@@ -622,7 +680,14 @@ impl WyrdTestCluster {
         admission: AdmissionConfig,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(topology.spec(), Duration::ZERO, Some(admission), false).await
+        Self::start_spec_with_options(
+            topology.spec(),
+            Duration::ZERO,
+            Some(admission),
+            false,
+            false,
+        )
+        .await
     }
 
     /// Build shared dependencies, retained roots, and every node slot.
@@ -631,6 +696,7 @@ impl WyrdTestCluster {
         wal_sync_delay: Duration,
         scribe_admission: Option<AdmissionConfig>,
         enable_oracle_peer_tls: bool,
+        delay_last_node: bool,
     ) -> Result<Self, ClusterError> {
         spec.validate()?;
         let process = process_telemetry()?;
@@ -746,7 +812,8 @@ impl WyrdTestCluster {
             oracle_peer_tls,
         };
         let node_ids = cluster.nodes.keys().copied().collect::<Vec<_>>();
-        for node_id in node_ids {
+        let delayed = delay_last_node.then(|| node_ids.last().copied()).flatten();
+        for node_id in node_ids.into_iter().filter(|node| Some(*node) != delayed) {
             if let Err(error) = cluster.restart_node(node_id).await {
                 let _ = cluster.shutdown().await;
                 return Err(error);
@@ -806,6 +873,12 @@ impl WyrdTestCluster {
     #[must_use]
     pub fn ready_query_nodes(&self) -> Vec<NodeId> {
         self.ready_nodes_for(BifrostRuntimeRole::Oracle)
+    }
+
+    /// Returns every configured node identity, including delayed or stopped slots.
+    #[must_use]
+    pub fn configured_node_ids(&self) -> Vec<NodeId> {
+        self.nodes.keys().copied().collect()
     }
 
     /// Filter live node slots by one configured role.
@@ -1061,6 +1134,24 @@ impl WyrdTestCluster {
         let server = self.build_node(node_id).await?;
         self.servers.insert(node_id, Some(server));
         Ok(())
+    }
+
+    /// Restarts one stopped node on newly reserved HTTP and gRPC addresses.
+    ///
+    /// # Errors
+    /// Returns the same unknown/running, address-allocation, or boot errors as
+    /// [`Self::restart_node`].
+    pub async fn restart_node_at_new_address(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(), ClusterError> {
+        let resources = self
+            .nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
+        resources.http_addr = reserve_loopback_addr()?;
+        resources.grpc_addr = reserve_loopback_addr()?;
+        self.restart_node(node_id).await
     }
 
     /// Return the shared fixture tenant.

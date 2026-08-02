@@ -69,6 +69,8 @@ describe("Oracle query journey", () => {
       ).rejects.toMatchObject({
         code: "WYRD_PERMISSION_403_DENIED_RBAC",
         status: 403,
+        title: "Permission denied (RBAC)",
+        details: expect.any(Object),
       } satisfies Partial<WyrdError>);
       expect(server.bifrostReadDecisionCount()).toBe(before);
     } finally {

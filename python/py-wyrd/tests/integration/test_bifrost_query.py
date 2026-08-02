@@ -42,11 +42,15 @@ def test_bifrost_query_missing_terminal_fails_closed(
         stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
         )
-        with pytest.raises(
-            IncompleteQueryStreamError, match="WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
-        ):
+        with pytest.raises(IncompleteQueryStreamError) as captured:
             while True:
                 await stream.__anext__()
+        assert captured.value.code == "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
+        assert captured.value.status == 502
+        assert captured.value.title == "Query stream incomplete"
+        assert captured.value.message == captured.value.detail
+        assert captured.value.remediation
+        assert captured.value.details is None
         await stream.aclose()
         with pytest.raises(StopAsyncIteration):
             await stream.__anext__()
@@ -63,10 +67,16 @@ def test_bifrost_query_gate_denial_has_no_oracle_side_effect(
     before = wyrd_server.bifrost_read_decision_count()
 
     async def query() -> None:
-        with pytest.raises(BifrostQueryError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
+        with pytest.raises(BifrostQueryError) as captured:
             await BifrostQueryClient(wyrd_server.base_url, denied_token).query(
                 f"SELECT * FROM {table_fqn}",
             )
+        assert captured.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+        assert captured.value.status == 403
+        assert captured.value.title == "Permission denied (RBAC)"
+        assert captured.value.detail
+        assert captured.value.remediation
+        assert isinstance(captured.value.details, dict)
 
     asyncio.run(query())
     assert wyrd_server.bifrost_read_decision_count() == before

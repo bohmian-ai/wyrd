@@ -48,7 +48,8 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
             terminal_json = self._native.terminal_json
             if terminal_json is None:
                 self._done = True
-                raise IncompleteQueryStreamError("query completed without terminal metadata")
+                self._native.raise_incomplete_error()
+                raise AssertionError("native incomplete projection must raise")
             try:
                 self._terminal = json.loads(terminal_json)
             except Exception:

@@ -12,13 +12,14 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyModule, PyType};
 use secrecy::SecretString;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_utils::py::json_to_pyobject;
 
 use crate::{QueryClient, QueryResultStream, ValaSdkError};
 
@@ -319,9 +320,7 @@ impl PyBifrostQueryStream {
                     let terminal = match stream.terminal() {
                         Some(terminal) => serde_json::to_string(terminal)
                             .map_err(|error| PyRuntimeError::new_err(error.to_string())),
-                        None => Err(PyRuntimeError::new_err(
-                            "[WYRD_VALA_502_QUERY_STREAM_INCOMPLETE] missing terminal",
-                        )),
+                        None => Err(query_error_to_py(ValaSdkError::IncompleteQueryStream)),
                     };
                     *stream_slot = None;
                     let terminal = terminal?;
@@ -360,6 +359,19 @@ impl PyBifrostQueryStream {
             .lock()
             .map_err(|_| PyRuntimeError::new_err("query stream lock poisoned"))? = None;
         Ok(())
+    }
+
+    /// Raises the typed incomplete-stream exception for facade invariant failures.
+    ///
+    /// The pure Python facade uses this only if a native poll returns completion
+    /// without the terminal JSON that the native owner promises to retain.
+    ///
+    /// # Errors
+    ///
+    /// Always raises [`IncompleteQueryStreamError`] with metadata projected by
+    /// the Rust-native [`ValaSdkError`] seam.
+    fn raise_incomplete_error(&self) -> PyResult<()> {
+        Err(query_error_to_py(ValaSdkError::IncompleteQueryStream))
     }
 }
 
@@ -469,14 +481,50 @@ fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> PyResult<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Converts one SDK failure into a Python runtime error while preserving its code.
+/// Converts one SDK failure into its typed Python exception with stable metadata.
+///
+/// # Panics
+///
+/// Panics only if PyO3 stops allowing attributes on registered exception
+/// instances or the existing JSON-to-Python converter rejects valid JSON.
 fn query_error_to_py(error: ValaSdkError) -> PyErr {
-    let message = format!("[{}] {error}", error.code());
-    if matches!(error, ValaSdkError::IncompleteQueryStream) {
-        IncompleteQueryStreamError::new_err(message)
-    } else {
-        BifrostQueryError::new_err(message)
-    }
+    Python::attach(|py| {
+        let exception_type: Bound<'_, PyType> =
+            if matches!(error, ValaSdkError::IncompleteQueryStream) {
+                py.get_type::<IncompleteQueryStreamError>()
+            } else {
+                py.get_type::<BifrostQueryError>()
+            };
+        let detail = error.detail();
+        let instance = exception_type
+            .call1((detail.clone(),))
+            .expect("invariant: registered query exception constructs from one string");
+        instance
+            .setattr("code", error.code())
+            .expect("invariant: Python exception accepts stable code");
+        instance
+            .setattr("status", error.status())
+            .expect("invariant: Python exception accepts status");
+        instance
+            .setattr("title", error.title())
+            .expect("invariant: Python exception accepts title");
+        instance
+            .setattr("message", detail.clone())
+            .expect("invariant: Python exception accepts message");
+        instance
+            .setattr("detail", detail)
+            .expect("invariant: Python exception accepts detail");
+        instance
+            .setattr("remediation", error.remediation())
+            .expect("invariant: Python exception accepts remediation");
+        let details = error.safe_details().unwrap_or(serde_json::Value::Null);
+        let details = json_to_pyobject(py, &details)
+            .expect("invariant: scrubbed JSON details convert to Python");
+        instance
+            .setattr("details", details.bind(py))
+            .expect("invariant: Python exception accepts details");
+        PyErr::from_value(instance)
+    })
 }
 
 #[cfg(all(test, feature = "python"))]
@@ -491,6 +539,131 @@ mod tests {
     };
 
     use super::*;
+
+    /// Python query exceptions retain their subtype and every typed metadata field.
+    #[test]
+    fn query_error_projection_preserves_structured_metadata() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = ValaSdkError::Transport(WyrdError::PermissionDeniedRbac {
+                message: "query denied".to_owned(),
+                details: serde_json::json!({"required_scope": "bifrost_query:read"}),
+            });
+            let projected = query_error_to_py(error);
+            let value = projected.value(py);
+            assert!(value.is_instance_of::<BifrostQueryError>());
+            assert_eq!(
+                value
+                    .getattr("code")
+                    .expect("code")
+                    .extract::<String>()
+                    .expect("string"),
+                "WYRD_PERMISSION_403_DENIED_RBAC"
+            );
+            assert_eq!(
+                value
+                    .getattr("status")
+                    .expect("status")
+                    .extract::<u16>()
+                    .expect("u16"),
+                403
+            );
+            assert_eq!(
+                value
+                    .getattr("detail")
+                    .expect("detail")
+                    .extract::<String>()
+                    .expect("string"),
+                "query denied"
+            );
+            let details = value.getattr("details").expect("details");
+            assert_eq!(
+                details
+                    .get_item("required_scope")
+                    .expect("scope")
+                    .extract::<String>()
+                    .expect("string"),
+                "bifrost_query:read"
+            );
+
+            let incomplete = query_error_to_py(ValaSdkError::IncompleteQueryStream);
+            let incomplete_value = incomplete.value(py);
+            assert!(incomplete_value.is_instance_of::<IncompleteQueryStreamError>());
+            assert_eq!(
+                incomplete_value
+                    .getattr("code")
+                    .expect("code")
+                    .extract::<String>()
+                    .expect("string"),
+                "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
+            );
+            assert_eq!(
+                incomplete_value
+                    .getattr("status")
+                    .expect("status")
+                    .extract::<u16>()
+                    .expect("u16"),
+                502
+            );
+            assert_eq!(
+                incomplete_value
+                    .getattr("details")
+                    .expect("details")
+                    .is_none(),
+                true
+            );
+
+            let unavailable =
+                query_error_to_py(ValaSdkError::Transport(WyrdError::ServiceUnavailable {
+                    message: "query unavailable".to_owned(),
+                    details: serde_json::json!({"retryable": true}),
+                }));
+            let unavailable_value = unavailable.value(py);
+            assert_eq!(
+                unavailable_value
+                    .getattr("status")
+                    .expect("status")
+                    .extract::<u16>()
+                    .expect("u16"),
+                503
+            );
+            assert_eq!(
+                unavailable_value
+                    .getattr("detail")
+                    .expect("detail")
+                    .extract::<String>()
+                    .expect("string"),
+                "query unavailable"
+            );
+
+            let terminal = query_error_to_py(ValaSdkError::FailedTerminal {
+                terminal: failed_terminal(),
+            });
+            let terminal_value = terminal.value(py);
+            assert_eq!(
+                terminal_value
+                    .getattr("status")
+                    .expect("status")
+                    .extract::<u16>()
+                    .expect("u16"),
+                500
+            );
+            assert_eq!(
+                terminal_value
+                    .getattr("detail")
+                    .expect("detail")
+                    .extract::<String>()
+                    .expect("string"),
+                "python native sentinel failure"
+            );
+            assert!(
+                terminal_value
+                    .getattr("details")
+                    .expect("details")
+                    .is_instance_of::<pyo3::types::PyDict>()
+            );
+        });
+    }
 
     /// Calls one native Python poll while holding the interpreter.
     ///
@@ -549,11 +722,17 @@ mod tests {
             std::sync::Arc::clone(&polls),
         ));
         let error = poll(&owner).expect_err("failed terminal is projected");
-        assert!(
-            error
-                .to_string()
-                .contains("WYRD_VALA_500_QUERY_EXECUTION_FAILED")
-        );
+        Python::attach(|py| {
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("code")
+                    .expect("code")
+                    .extract::<String>()
+                    .expect("string"),
+                "WYRD_VALA_500_QUERY_EXECUTION_FAILED"
+            );
+        });
         assert!(
             owner
                 .terminal_json()
@@ -590,7 +769,17 @@ mod tests {
                 std::sync::Arc::clone(&polls),
             ));
             let error = poll(&owner).expect_err("projection error is surfaced");
-            assert!(error.to_string().contains("WYRD_VALA_"));
+            Python::attach(|py| {
+                assert!(
+                    error
+                        .value(py)
+                        .getattr("code")
+                        .expect("code")
+                        .extract::<String>()
+                        .expect("string")
+                        .starts_with("WYRD_VALA_")
+                );
+            });
             assert!(dropped.load(Ordering::SeqCst));
             assert_eq!(polls.load(Ordering::SeqCst), 1);
             assert!(poll(&owner).is_err(), "second poll closes");
@@ -615,15 +804,62 @@ mod tests {
             std::sync::Arc::clone(&polls),
         ));
         let error = poll(&owner).expect_err("transport error projects");
-        assert!(
-            error
-                .to_string()
-                .contains("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
-        );
+        Python::attach(|py| {
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("code")
+                    .expect("code")
+                    .extract::<String>()
+                    .expect("string"),
+                "WYRD_SERVER_503_SERVICE_UNAVAILABLE"
+            );
+            assert_eq!(
+                value
+                    .getattr("status")
+                    .expect("status")
+                    .extract::<u16>()
+                    .expect("u16"),
+                503
+            );
+        });
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert!(poll(&owner).is_err(), "second poll closes");
         assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Native completion without a retained terminal uses the typed incomplete seam.
+    #[test]
+    fn native_owner_missing_terminal_projects_structured_incomplete_error() {
+        let owner = PyBifrostQueryStream::new_for_test(TestStreamOwner::new(
+            std::collections::VecDeque::from([Ok(None)]),
+            None,
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ));
+        let error = poll(&owner).expect_err("missing terminal rejects");
+        Python::attach(|py| {
+            let value = error.value(py);
+            assert!(value.is_instance_of::<IncompleteQueryStreamError>());
+            assert_eq!(
+                value
+                    .getattr("code")
+                    .expect("code")
+                    .extract::<String>()
+                    .expect("string"),
+                "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
+            );
+            assert_eq!(
+                value
+                    .getattr("status")
+                    .expect("status")
+                    .extract::<u16>()
+                    .expect("u16"),
+                502
+            );
+            assert!(value.getattr("details").expect("details").is_none());
+        });
     }
 
     /// A poisoned terminal lock still drops the stream before returning failure.

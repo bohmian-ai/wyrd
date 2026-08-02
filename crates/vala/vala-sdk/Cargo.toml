@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-python = ["dep:pyo3"]
+python = ["dep:pyo3", "dep:wyrd-utils", "wyrd-utils/python"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -40,6 +40,7 @@ reqwest = { workspace = true }
 wyrd-tls = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
+wyrd-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

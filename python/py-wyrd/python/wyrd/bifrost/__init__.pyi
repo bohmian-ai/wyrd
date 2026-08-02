@@ -43,6 +43,14 @@ class Bifrost:
 class BifrostQueryError(RuntimeError):
     """Base exception for terminal-safe Bifrost query failures."""
 
+    code: str
+    status: int
+    title: str
+    message: str
+    detail: str
+    remediation: str
+    details: Any | None
+
 class IncompleteQueryStreamError(BifrostQueryError):
     """Raised when transport EOF arrives before a validated terminal."""
 

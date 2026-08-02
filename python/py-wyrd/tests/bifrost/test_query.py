@@ -32,6 +32,19 @@ class _NativeStream:
     def close(self) -> None:
         self.closed = True
 
+    def raise_incomplete_error(self) -> None:
+        error = IncompleteQueryStreamError("query stream ended before its required terminal frame")
+        error.code = "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
+        error.status = 502
+        error.title = "Query stream incomplete"
+        error.message = str(error)
+        error.detail = str(error)
+        error.remediation = (
+            "Retry the query because the response ended before its required terminal frame."
+        )
+        error.details = None
+        raise error
+
 
 def test_bifrost_query_public_imports_are_available() -> None:
     assert BifrostQueryClient.__module__ == "wyrd.bifrost"
@@ -102,8 +115,13 @@ def test_bifrost_query_missing_terminal_raises_typed_exception() -> None:
 
     try:
         asyncio.run(consume())
-    except IncompleteQueryStreamError:
-        pass
+    except IncompleteQueryStreamError as error:
+        assert error.code == "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
+        assert error.status == 502
+        assert error.title == "Query stream incomplete"
+        assert error.message == error.detail
+        assert error.remediation
+        assert error.details is None
     else:
         raise AssertionError("missing terminal must raise IncompleteQueryStreamError")
 

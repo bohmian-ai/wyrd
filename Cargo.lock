@@ -9873,6 +9873,7 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-utils",
 ]
 
 [[package]]

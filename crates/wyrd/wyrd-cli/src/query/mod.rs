@@ -15,7 +15,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 
-use crate::error::WyrdCliError;
+use crate::error::{CliBoundaryError, WyrdCliError};
 
 /// Operator arguments for one streaming Oracle query.
 #[derive(Debug, Args)]
@@ -82,7 +82,7 @@ pub enum QueryOutputFormat {
 ///
 /// Returns a typed CLI error for missing configuration, input IO, client
 /// construction, stream validation, Arrow encoding, or stdout failures.
-pub async fn dispatch(command: QueryCommand) -> Result<std::process::ExitCode, WyrdCliError> {
+pub async fn dispatch(command: QueryCommand) -> Result<std::process::ExitCode, CliBoundaryError> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     execute(command, &mut stdout, &mut stderr).await?;
@@ -98,22 +98,26 @@ pub async fn execute(
     command: QueryCommand,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-) -> Result<(), WyrdCliError> {
-    let request = request(&command)?;
-    let client = client(&command)?;
+) -> Result<(), CliBoundaryError> {
+    let request = request(&command).map_err(CliBoundaryError::Local)?;
+    let client = client(&command).map_err(CliBoundaryError::Local)?;
     let mut stream = QueryClient::new(&client)
         .query(&request)
         .await
-        .map_err(query_error)?;
+        .map_err(CliBoundaryError::Query)?;
     match command.format {
         QueryOutputFormat::Jsonl => write_jsonl(&mut stream, stdout).await?,
         QueryOutputFormat::Arrow => write_arrow(&mut stream, stdout).await?,
     }
     let terminal = stream
         .terminal()
-        .ok_or_else(|| query_error(vala_sdk::ValaSdkError::IncompleteQueryStream))?;
-    serde_json::to_writer(&mut *stderr, terminal).map_err(output_error)?;
-    writeln!(stderr).map_err(output_error)?;
+        .ok_or_else(|| CliBoundaryError::Query(vala_sdk::ValaSdkError::IncompleteQueryStream))?;
+    serde_json::to_writer(&mut *stderr, terminal)
+        .map_err(output_error)
+        .map_err(CliBoundaryError::Local)?;
+    writeln!(stderr)
+        .map_err(output_error)
+        .map_err(CliBoundaryError::Local)?;
     Ok(())
 }
 
@@ -198,12 +202,18 @@ fn client(command: &QueryCommand) -> Result<WyrdClient, WyrdCliError> {
 async fn write_jsonl(
     stream: &mut QueryResultStream,
     stdout: &mut dyn Write,
-) -> Result<(), WyrdCliError> {
+) -> Result<(), CliBoundaryError> {
     let mut writer = LineDelimitedWriter::new(stdout);
-    while let Some(batch) = stream.next_batch().await.map_err(query_error)? {
-        writer.write(&batch).map_err(output_error)?;
+    while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::Query)? {
+        writer
+            .write(&batch)
+            .map_err(output_error)
+            .map_err(CliBoundaryError::Local)?;
     }
-    writer.finish().map_err(output_error)
+    writer
+        .finish()
+        .map_err(output_error)
+        .map_err(CliBoundaryError::Local)
 }
 
 /// Emits all batches as one valid Arrow IPC stream without terminal bytes.
@@ -214,30 +224,32 @@ async fn write_jsonl(
 async fn write_arrow(
     stream: &mut QueryResultStream,
     stdout: &mut dyn Write,
-) -> Result<(), WyrdCliError> {
-    let first = stream.next_batch().await.map_err(query_error)?;
-    let schema = stream
-        .schema()
-        .cloned()
-        .ok_or_else(|| WyrdCliError::Query {
+) -> Result<(), CliBoundaryError> {
+    let first = stream.next_batch().await.map_err(CliBoundaryError::Query)?;
+    let schema = stream.schema().cloned().ok_or_else(|| {
+        CliBoundaryError::Local(WyrdCliError::Query {
             detail: "query stream did not provide an Arrow schema".to_owned(),
-        })?;
-    let mut writer =
-        arrow::ipc::writer::StreamWriter::try_new(stdout, schema.as_ref()).map_err(output_error)?;
+        })
+    })?;
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(stdout, schema.as_ref())
+        .map_err(output_error)
+        .map_err(CliBoundaryError::Local)?;
     if let Some(batch) = first {
-        writer.write(&batch).map_err(output_error)?;
+        writer
+            .write(&batch)
+            .map_err(output_error)
+            .map_err(CliBoundaryError::Local)?;
     }
-    while let Some(batch) = stream.next_batch().await.map_err(query_error)? {
-        writer.write(&batch).map_err(output_error)?;
+    while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::Query)? {
+        writer
+            .write(&batch)
+            .map_err(output_error)
+            .map_err(CliBoundaryError::Local)?;
     }
-    writer.finish().map_err(output_error)
-}
-
-/// Maps a terminal-safe SDK error into the CLI catalog.
-fn query_error(error: vala_sdk::ValaSdkError) -> WyrdCliError {
-    WyrdCliError::Query {
-        detail: format!("[{}] {error}", error.code()),
-    }
+    writer
+        .finish()
+        .map_err(output_error)
+        .map_err(CliBoundaryError::Local)
 }
 
 /// Maps boundary encoding and setup failures into a scrubbed CLI error.

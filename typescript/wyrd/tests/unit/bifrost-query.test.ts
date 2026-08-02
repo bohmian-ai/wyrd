@@ -84,6 +84,36 @@ describe("BifrostQueryStream", () => {
     expect(polls).toBe(1);
   });
 
+  it("preserves failed-terminal step details and status", async () => {
+    const terminal = {
+      outcome: "failed",
+      error: { code: "query_execution_failed", detail: "source unavailable" },
+    };
+    const native = {
+      async next() {
+        return {
+          ipc: undefined,
+          terminalJson: undefined,
+          errorCode: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+          errorStatus: 500,
+          errorTitle: "Query execution failed",
+          errorDetail: "source unavailable",
+          errorRemediation: "Inspect the retained terminal error.",
+          errorDetailsJson: JSON.stringify(terminal),
+        };
+      },
+      async close() {},
+      terminalJson: JSON.stringify(terminal),
+    };
+    const stream = new BifrostQueryStream(native);
+    await expect(stream.next()).rejects.toMatchObject({
+      code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+      status: 500,
+      detail: "source unavailable",
+      details: terminal,
+    } satisfies Partial<WyrdError>);
+  });
+
   it("closes native ownership before propagating Arrow decode failures", async () => {
     let closed = false;
     const native = {
@@ -153,6 +183,7 @@ describe("BifrostClient", () => {
       title: "Permission denied (RBAC)",
       detail: "principal lacks bifrost_query:read",
       remediation: "Request the required role from a workspace admin.",
+      details: { required_scope: "bifrost_query:read" },
     },
     {
       boundary: "authentication",
@@ -162,6 +193,7 @@ describe("BifrostClient", () => {
       detail: "access token is invalid",
       remediation:
         "Send a valid `Authorization: Bearer <token>` header before invoking permission-protected routes.",
+      details: { reason: "invalid_token" },
     },
     {
       boundary: "transport",
@@ -171,6 +203,7 @@ describe("BifrostClient", () => {
       detail: "query transport is unavailable",
       remediation:
         "Retry with exponential backoff; the server is shedding load to protect inflight requests.",
+      details: { retryable: true },
     },
     {
       boundary: "request",
@@ -180,10 +213,11 @@ describe("BifrostClient", () => {
       detail: "only SELECT statements are accepted",
       remediation:
         "Submit a single SELECT statement; DDL/DML and unsupported constructs are rejected.",
+      details: null,
     },
   ])(
     "preserves structured $boundary startup errors",
-    async ({ code, status, title, detail, remediation }) => {
+    async ({ code, status, title, detail, remediation, details }) => {
       const native = {
         async query() {
           return {
@@ -195,6 +229,7 @@ describe("BifrostClient", () => {
             errorTitle: title,
             errorDetail: detail,
             errorRemediation: remediation,
+            errorDetailsJson: JSON.stringify(details),
           };
         },
       };
@@ -213,6 +248,7 @@ describe("BifrostClient", () => {
         title,
         detail,
         remediation,
+        details,
       });
     },
   );

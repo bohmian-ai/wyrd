@@ -48,6 +48,45 @@ pub enum ValaSdkError {
 }
 
 impl ValaSdkError {
+    /// Returns the scrubbed human-readable detail for boundary projections.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Transport(error) => error
+                .as_problem_json()
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("query transport failed")
+                .to_owned(),
+            Self::Protocol(detail) | Self::Arrow(detail) => detail.clone(),
+            Self::IncompleteQueryStream => {
+                "query stream ended before its required terminal frame".to_owned()
+            }
+            Self::FailedTerminal { terminal } => terminal
+                .error
+                .as_ref()
+                .and_then(|error| error.detail.as_ref())
+                .map_or_else(
+                    || "query terminal reported failure".to_owned(),
+                    |detail| detail.as_str().to_owned(),
+                ),
+            Self::ResultTooLarge => "query result exceeds configured bounds".to_owned(),
+        }
+    }
+
+    /// Returns structured diagnostics already scrubbed for public projection.
+    #[must_use]
+    pub fn safe_details(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Transport(error) => error.as_problem_json().get("details").cloned(),
+            Self::FailedTerminal { terminal } => serde_json::to_value(terminal).ok(),
+            Self::Protocol(_)
+            | Self::Arrow(_)
+            | Self::IncompleteQueryStream
+            | Self::ResultTooLarge => None,
+        }
+    }
+
     /// Returns the stable public code used by language projections.
     #[must_use]
     pub fn code(&self) -> &'static str {
@@ -544,15 +583,65 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use bytes::Bytes;
     use futures_util::stream;
+    use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryFreshness, QuerySchemaFrame, QuerySource, QueryTerminalError,
-        QueryTerminalErrorCode, QueryWarning, SourceCompletion, SourceCompletionOutcome,
-        VisibilityMode,
+        QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame, QuerySource,
+        QueryTerminalError, QueryTerminalErrorCode, QueryWarning, SourceCompletion,
+        SourceCompletionOutcome, VisibilityMode,
     };
     use wyrd_tonic::frame_codec::FrameEncoder;
     use wyrd_tonic::wyrd::v1 as proto;
 
     use super::*;
+
+    /// Stable metadata accessors preserve typed transport and terminal diagnostics.
+    #[test]
+    fn vala_sdk_error_projects_typed_detail_and_safe_details() {
+        let transport = ValaSdkError::Transport(WyrdError::PermissionDeniedRbac {
+            message: "query denied".to_owned(),
+            details: serde_json::json!({"required_scope": "bifrost_query:read"}),
+        });
+        assert_eq!(transport.detail(), "query denied");
+        assert_eq!(
+            transport.safe_details(),
+            Some(serde_json::json!({"required_scope": "bifrost_query:read"}))
+        );
+
+        let mut terminal = failed_terminal(0);
+        terminal
+            .error
+            .as_mut()
+            .expect("failed terminal has error")
+            .detail =
+            Some(QueryErrorDetail::new("source failed").expect("fixed detail is scrubbed"));
+        let failed = ValaSdkError::FailedTerminal {
+            terminal: terminal.clone(),
+        };
+        assert_eq!(failed.detail(), "source failed");
+        assert_eq!(
+            failed.safe_details(),
+            Some(serde_json::to_value(terminal).expect("terminal serializes"))
+        );
+
+        let protocol = ValaSdkError::Protocol("safe protocol detail".to_owned());
+        assert_eq!(protocol.detail(), "safe protocol detail");
+        assert_eq!(protocol.safe_details(), None);
+
+        let arrow = ValaSdkError::Arrow("safe Arrow detail".to_owned());
+        assert_eq!(arrow.detail(), "safe Arrow detail");
+        assert_eq!(arrow.safe_details(), None);
+
+        let incomplete = ValaSdkError::IncompleteQueryStream;
+        assert_eq!(
+            incomplete.detail(),
+            "query stream ended before its required terminal frame"
+        );
+        assert_eq!(incomplete.safe_details(), None);
+
+        let too_large = ValaSdkError::ResultTooLarge;
+        assert_eq!(too_large.detail(), "query result exceeds configured bounds");
+        assert_eq!(too_large.safe_details(), None);
+    }
 
     /// Builds the schema used by client state-machine tests.
     fn test_schema() -> SchemaRef {

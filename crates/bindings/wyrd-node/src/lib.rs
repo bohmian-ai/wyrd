@@ -143,6 +143,8 @@ pub struct NativeQueryStep {
     pub error_detail: Option<String>,
     /// Operator-facing remediation for a failed native step.
     pub error_remediation: Option<String>,
+    /// Serialized JSON-safe structured details for a failed native step.
+    pub error_details_json: Option<String>,
 }
 
 /// Structured result of starting a native terminal-safe query.
@@ -160,6 +162,8 @@ pub struct NativeQueryStart {
     error_detail: Option<String>,
     /// Operator-facing remediation when startup failed.
     error_remediation: Option<String>,
+    /// Serialized JSON-safe structured details when startup failed.
+    error_details_json: Option<String>,
 }
 
 impl NativeQueryStart {
@@ -172,6 +176,7 @@ impl NativeQueryStart {
             error_title: None,
             error_detail: None,
             error_remediation: None,
+            error_details_json: None,
         }
     }
 
@@ -182,8 +187,11 @@ impl NativeQueryStart {
             error_code: Some(error.code().to_owned()),
             error_status: Some(u32::from(error.status())),
             error_title: Some(error.title().to_owned()),
-            error_detail: Some(error.to_string()),
+            error_detail: Some(error.detail()),
             error_remediation: Some(error.remediation().to_owned()),
+            error_details_json: error
+                .safe_details()
+                .and_then(|value| serde_json::to_string(&value).ok()),
         }
     }
 }
@@ -224,6 +232,12 @@ impl NativeQueryStart {
     #[napi(getter)]
     pub fn error_remediation(&self) -> Option<String> {
         self.error_remediation.clone()
+    }
+
+    /// Returns serialized JSON-safe structured details when startup failed.
+    #[napi(getter)]
+    pub fn error_details_json(&self) -> Option<String> {
+        self.error_details_json.clone()
     }
 }
 
@@ -350,6 +364,7 @@ impl NativeBifrostQueryStream {
                     error_title: None,
                     error_detail: None,
                     error_remediation: None,
+                    error_details_json: None,
                 }),
                 Err(error) => {
                     *stream_slot = None;
@@ -383,6 +398,7 @@ impl NativeBifrostQueryStream {
                     error_title: None,
                     error_detail: None,
                     error_remediation: None,
+                    error_details_json: None,
                 })
             }
             Err(error) => {
@@ -404,8 +420,11 @@ impl NativeBifrostQueryStream {
                     error_code: Some(error.code().to_owned()),
                     error_status: Some(u32::from(error.status())),
                     error_title: Some(error.title().to_owned()),
-                    error_detail: Some(error.to_string()),
+                    error_detail: Some(error.detail()),
                     error_remediation: Some(error.remediation().to_owned()),
+                    error_details_json: error
+                        .safe_details()
+                        .and_then(|value| serde_json::to_string(&value).ok()),
                 })
             }
         }
@@ -500,7 +519,7 @@ mod tests {
         let code = error.code().to_owned();
         let status = u32::from(error.status());
         let title = error.title().to_owned();
-        let detail = error.to_string();
+        let detail = error.detail();
         let remediation = error.remediation().to_owned();
         let start = NativeQueryStart::failure(error);
 
@@ -512,6 +531,12 @@ mod tests {
         assert_eq!(
             start.error_remediation.as_deref(),
             Some(remediation.as_str())
+        );
+        assert_eq!(
+            start.error_details_json,
+            error
+                .safe_details()
+                .and_then(|value| serde_json::to_string(&value).ok())
         );
     }
 
@@ -568,7 +593,7 @@ mod tests {
             std::collections::VecDeque::from([Err(ValaSdkError::FailedTerminal {
                 terminal: terminal.clone(),
             })]),
-            Some(terminal),
+            Some(terminal.clone()),
             Arc::clone(&dropped),
             Arc::clone(&polls),
         ));
@@ -578,6 +603,14 @@ mod tests {
             Some("WYRD_VALA_500_QUERY_EXECUTION_FAILED")
         );
         assert!(step.error_detail.is_some());
+        assert_eq!(
+            step.error_details_json
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()
+                .expect("details JSON parses"),
+            Some(serde_json::to_value(&terminal).expect("terminal serializes"))
+        );
         assert!(
             owner
                 .terminal_json()
@@ -669,6 +702,8 @@ mod tests {
             step.error_code.as_deref(),
             Some("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
         );
+        assert_eq!(step.error_status, Some(503));
+        assert_eq!(step.error_details_json.as_deref(), Some("{}"));
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert!(

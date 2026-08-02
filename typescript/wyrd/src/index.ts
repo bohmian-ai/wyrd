@@ -37,6 +37,8 @@ export class WyrdError extends Error {
   readonly title: string;
   readonly detail: string;
   readonly remediation: string | undefined;
+  /** JSON-safe structured diagnostics supplied by the originating Wyrd error. */
+  readonly details: unknown;
 
   constructor(
     code: string,
@@ -44,6 +46,7 @@ export class WyrdError extends Error {
     title: string,
     detail: string,
     remediation?: string,
+    details?: unknown,
   ) {
     super(detail);
     this.name = "WyrdError";
@@ -52,6 +55,7 @@ export class WyrdError extends Error {
     this.title = title;
     this.detail = detail;
     this.remediation = remediation;
+    this.details = details;
   }
 }
 
@@ -61,6 +65,7 @@ export class IncompleteQueryStreamError extends WyrdError {
     title: string,
     detail: string,
     remediation?: string,
+    details?: unknown,
   ) {
     super(
       "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
@@ -68,6 +73,7 @@ export class IncompleteQueryStreamError extends WyrdError {
       title,
       detail,
       remediation,
+      details,
     );
     this.name = "IncompleteQueryStreamError";
   }
@@ -79,6 +85,7 @@ interface NativeErrorMetadata {
   errorTitle?: string | null;
   errorDetail?: string | null;
   errorRemediation?: string | null;
+  errorDetailsJson?: string | null;
 }
 
 function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
@@ -89,12 +96,16 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
   const status = metadata.errorStatus ?? 500;
   const title = metadata.errorTitle ?? "Bifrost query failed";
   const remediation = metadata.errorRemediation ?? undefined;
+  const details = metadata.errorDetailsJson == null
+    ? undefined
+    : JSON.parse(metadata.errorDetailsJson) as unknown;
   if (metadata.errorCode === "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE") {
     return new IncompleteQueryStreamError(
       status,
       title,
       detail,
       remediation,
+      details,
     );
   }
   return new WyrdError(
@@ -103,6 +114,7 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
     title,
     detail,
     remediation,
+    details,
   );
 }
 

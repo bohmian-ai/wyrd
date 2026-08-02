@@ -50,6 +50,8 @@ export declare class NativeQueryStart {
   get errorDetail(): string | null
   /** Returns operator-facing remediation when startup failed. */
   get errorRemediation(): string | null
+  /** Returns serialized JSON-safe structured details when startup failed. */
+  get errorDetailsJson(): string | null
 }
 
 /** JavaScript query request projected onto the pure Wyrd contract. */
@@ -80,4 +82,6 @@ export interface NativeQueryStep {
   errorDetail?: string
   /** Operator-facing remediation for a failed native step. */
   errorRemediation?: string
+  /** Serialized JSON-safe structured details for a failed native step. */
+  errorDetailsJson?: string
 }

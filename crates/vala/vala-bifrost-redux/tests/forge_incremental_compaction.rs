@@ -1895,6 +1895,56 @@ mod pg_tests {
         Shutdown,
     }
 
+    /// Verifies that cancellation at a maintenance boundary published no durable effect.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the audit, task-evidence, or catalog queries fail, or when
+    /// cancellation left a durable transition, cleanup evidence, changed table
+    /// metadata, an output write, or an object-deletion attempt behind.
+    async fn assert_cancelled_maintenance_state(
+        fixture: &Fixture,
+        task_id: uuid::Uuid,
+        metadata_before: &str,
+        snapshot_before: Option<i64>,
+        output_puts_before: usize,
+        deletes_before: usize,
+    ) {
+        let (states, audits) =
+            family_transition_counts(fixture, "snapshot_expire", "forge.snapshot_expire.").await;
+        assert_eq!(states, 0);
+        assert_eq!(audits, 0);
+        let evidence: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("cancelled maintenance evidence");
+        assert!(
+            evidence
+                .as_ref()
+                .and_then(|value| value.get("cleanup_candidates"))
+                .is_none()
+        );
+        let table_after = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("post-cancellation maintenance table");
+        assert_eq!(
+            table_after.metadata_location(),
+            Some(metadata_before),
+            "catalog metadata changed across the cancellation boundary"
+        );
+        assert_eq!(
+            table_after.metadata().current_snapshot_id(),
+            snapshot_before,
+            "current snapshot changed across the cancellation boundary"
+        );
+        assert_eq!(fixture.reads.output_put_calls(), output_puts_before);
+        assert_eq!(fixture.reads.total_delete_attempts(), deletes_before);
+    }
+
     /// Exercises one deterministic maintenance boundary under every cancellation source.
     async fn assert_maintenance_boundary_loss(expiry_submission: bool) {
         for loss in [
@@ -1966,40 +2016,15 @@ mod pg_tests {
                 .expect("maintenance cancellation bound")
                 .expect("maintenance worker join");
             assert!(result.is_err(), "authority loss must stop maintenance");
-            let (states, audits) =
-                family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.")
-                    .await;
-            assert_eq!(states, 0);
-            assert_eq!(audits, 0);
-            let evidence: Option<serde_json::Value> =
-                sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
-                    .bind(task_id)
-                    .fetch_one(fixture.operator_pool.pool())
-                    .await
-                    .expect("cancelled maintenance evidence");
-            assert!(
-                evidence
-                    .as_ref()
-                    .and_then(|value| value.get("cleanup_candidates"))
-                    .is_none()
-            );
-            let table_after = fixture
-                .catalog
-                .load_table(&fixture.binding.table_ident())
-                .await
-                .expect("post-cancellation maintenance table");
-            assert_eq!(
-                table_after.metadata_location(),
-                Some(metadata_before.as_str()),
-                "catalog metadata changed across the cancellation boundary"
-            );
-            assert_eq!(
-                table_after.metadata().current_snapshot_id(),
+            assert_cancelled_maintenance_state(
+                &fixture,
+                task_id,
+                &metadata_before,
                 snapshot_before,
-                "current snapshot changed across the cancellation boundary"
-            );
-            assert_eq!(fixture.reads.output_put_calls(), output_puts_before);
-            assert_eq!(fixture.reads.total_delete_attempts(), deletes_before);
+                output_puts_before,
+                deletes_before,
+            )
+            .await;
         }
     }
 

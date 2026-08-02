@@ -336,13 +336,15 @@ mod tests {
     /// Configuration conversion copies every field and rejects invalid relationships.
     #[test]
     fn capacity_conversion_is_field_complete_and_validated() {
-        let mut config = ForgeConfig::default();
-        config.max_files_per_tick = 17;
-        config.max_bytes_per_tick = 101;
-        config.max_concurrent_reads = 3;
-        config.max_memory_bytes = 103;
-        config.spill_limit_bytes = 107;
-        config.max_large_task_bytes = 109;
+        let mut config = ForgeConfig {
+            max_files_per_tick: 17,
+            max_bytes_per_tick: 101,
+            max_concurrent_reads: 3,
+            max_memory_bytes: 103,
+            spill_limit_bytes: 107,
+            max_large_task_bytes: 109,
+            ..ForgeConfig::default()
+        };
         assert_eq!(
             ForgeCapacity::try_from(&config).expect("valid capacity"),
             ForgeCapacity {

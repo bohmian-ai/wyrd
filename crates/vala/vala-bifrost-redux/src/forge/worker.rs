@@ -1792,58 +1792,16 @@ impl ForgeWorker {
             .finalize_expiry_terminals(lease, claim.data_tenant_id, result.expiry_terminals)
             .await?;
 
+        let cleanup_attempt = CleanupAttempt {
+            task_id: claim.task_id,
+            tenant: claim.data_tenant_id,
+            attempt,
+            binding,
+        };
         for (index, candidate) in evidence.cleanup_candidates.iter().enumerate() {
-            if stop.is_cancelled() {
-                return Err(ForgeError::Shutdown);
-            }
-            lease.require_fence(&self.forge.core.operator_pool).await?;
-            let path = binding
-                .validate_object_path(candidate.path.as_str())
-                .ok_or_else(|| ForgeError::Reconciliation {
-                    detail: "expired cleanup candidate escaped table binding".to_owned(),
-                })?;
-            let deletion = self.forge.core.object_store.delete(&path);
-            tokio::pin!(deletion);
-            let deletion = tokio::select! {
-                result = &mut deletion => result,
-                () = stop.cancelled() => return Err(ForgeError::Shutdown),
-            };
-            match deletion {
-                Ok(()) => {}
-                Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
-                Err(error) => return Err(ForgeError::ObjectDelete(error)),
-            }
-            let expected = u32::try_from(index).map_err(|_| ForgeError::Invariant {
-                detail: "expired cleanup cursor exceeds u32".to_owned(),
-            })?;
-            let next = expected
-                .checked_add(1)
-                .ok_or_else(|| ForgeError::Invariant {
-                    detail: "expired cleanup cursor overflowed".to_owned(),
-                })?;
-            require_running(stop)?;
-            lease.require_fence(&self.forge.core.operator_pool).await?;
-            let mut cursor = self
-                .forge
-                .core
-                .vala
-                .tenant_conn(claim.data_tenant_id)
-                .await
-                .map_err(ForgeError::Sql)?;
-            self.tasks
-                .advance_cleanup_cursor(
-                    &mut cursor,
-                    claim.task_id,
-                    attempt,
-                    self.owner,
-                    expected,
-                    next,
-                )
-                .await
-                .map_err(ForgeError::Sql)?;
-            lease.assert_transaction_fence(&mut cursor).await?;
-            cursor.commit().await.map_err(ForgeError::Sql)?;
-            evidence.deleted_candidate_count = next;
+            evidence.deleted_candidate_count = self
+                .delete_cleanup_candidate(&cleanup_attempt, lease, candidate, index, stop)
+                .await?;
         }
         let key = super::compact::ForgeTableKey {
             tenant: claim.data_tenant_id,
@@ -1853,6 +1811,77 @@ impl ForgeWorker {
             .collect_never_published(lease, &key, binding, stop)
             .await?;
         Ok(evidence)
+    }
+
+    /// Deletes one table-bound cleanup candidate and commits its successor cursor.
+    ///
+    /// A missing object counts as an idempotent successful deletion. The cursor
+    /// advances only after the object-store result is accepted and the lease
+    /// fence is rechecked inside the tenant transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation, path-binding, object-store, cursor conversion,
+    /// fencing, or durable SQL failures. A failed cursor commit leaves the
+    /// candidate replayable by the current or successor lease owner.
+    async fn delete_cleanup_candidate(
+        &self,
+        attempt: &CleanupAttempt<'_>,
+        lease: &mut ForgeLease,
+        candidate: &ForgeCleanupCandidate,
+        index: usize,
+        stop: &CancellationToken,
+    ) -> Result<u32, ForgeError> {
+        require_running(stop)?;
+        lease.require_fence(&self.forge.core.operator_pool).await?;
+        let path = attempt
+            .binding
+            .validate_object_path(candidate.path.as_str())
+            .ok_or_else(|| ForgeError::Reconciliation {
+                detail: "expired cleanup candidate escaped table binding".to_owned(),
+            })?;
+        let deletion = self.forge.core.object_store.delete(&path);
+        tokio::pin!(deletion);
+        let deletion = tokio::select! {
+            result = &mut deletion => result,
+            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+        };
+        match deletion {
+            Ok(()) => {}
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {}
+            Err(error) => return Err(ForgeError::ObjectDelete(error)),
+        }
+        let expected = u32::try_from(index).map_err(|_| ForgeError::Invariant {
+            detail: "expired cleanup cursor exceeds u32".to_owned(),
+        })?;
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "expired cleanup cursor overflowed".to_owned(),
+            })?;
+        require_running(stop)?;
+        lease.require_fence(&self.forge.core.operator_pool).await?;
+        let mut cursor = self
+            .forge
+            .core
+            .vala
+            .tenant_conn(attempt.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        self.tasks
+            .advance_cleanup_cursor(
+                &mut cursor,
+                attempt.task_id,
+                attempt.attempt,
+                self.owner,
+                expected,
+                next,
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut cursor).await?;
+        cursor.commit().await.map_err(ForgeError::Sql)?;
+        Ok(next)
     }
 
     /// Record the completed durable expired-cleanup obligation at its owner boundary.

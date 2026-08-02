@@ -1374,7 +1374,6 @@ async fn dedicated_unschedulable_admission_journey() {
         bootstrap,
         ForgeWorkerConfig {
             worker_concurrency: 1,
-            ..ForgeWorkerConfig::default()
         },
     )
     .expect("bootstrap worker");
@@ -2007,8 +2006,7 @@ async fn assert_scheduler_takeover_preserves_fairness_bound(
     let expected_final = eligible
         .iter()
         .copied()
-        .filter(|tenant| *tenant <= prior_cursor)
-        .next_back()
+        .rfind(|tenant| *tenant <= prior_cursor)
         .or_else(|| eligible.last().copied())
         .expect("non-empty eligible ring");
     assert_eq!(

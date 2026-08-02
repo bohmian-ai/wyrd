@@ -147,37 +147,9 @@ impl Forge {
                     None => hints_open = false,
                 },
                 _ = ticker.tick() => {
-                    let started = Instant::now();
-                    let pass_span = tracing::info_span!(
-                        "bifrost.forge.scheduler.pass",
-                        result = tracing::field::Empty,
-                        role = "server",
-                    );
-                    let pass = tracing::Instrument::instrument(
-                        scheduler.schedule_once(&shutdown),
-                        pass_span.clone(),
-                    );
-                    let result = tokio::select! {
-                        () = shutdown.cancelled() => return Ok(()),
-                        result = pass => result,
-                    };
-                    match result {
-                    Ok(outcome) => {
-                        pass_span.record("result", "succeeded");
-                        self.core.telemetry.record_scheduler_pass(&outcome, started.elapsed());
-                        tracing::debug!(demands_seen = outcome.demands_seen, tasks_enqueued = outcome.tasks_enqueued, incomplete = outcome.incomplete, "Forge scheduling pass completed");
-                        if let Some(trigger) = &self.core.scheduler_trigger {
-                            trigger.record_completed_pass();
-                        }
+                    if !self.run_planning_pass(&scheduler, &shutdown, false).await {
+                        return Ok(());
                     }
-                    Err(error) => {
-                        pass_span.record("result", "failed");
-                        tracing::error!(error = %error, "Forge scheduling pass failed");
-                        if let Some(trigger) = &self.core.scheduler_trigger {
-                            trigger.record_completed_pass();
-                        }
-                    }
-                }
                 },
                 () = async {
                     if let Some(trigger) = &self.core.scheduler_trigger {
@@ -186,40 +158,63 @@ impl Forge {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    let started = Instant::now();
-                    let pass_span = tracing::info_span!(
-                        "bifrost.forge.scheduler.pass",
-                        result = tracing::field::Empty,
-                        role = "server",
-                    );
-                    let pass = tracing::Instrument::instrument(
-                        scheduler.schedule_once(&shutdown),
-                        pass_span.clone(),
-                    );
-                    let result = tokio::select! {
-                        () = shutdown.cancelled() => return Ok(()),
-                        result = pass => result,
-                    };
-                    match result {
-                    Ok(outcome) => {
-                        pass_span.record("result", "succeeded");
-                        self.core.telemetry.record_scheduler_pass(&outcome, started.elapsed());
-                        tracing::debug!(demands_seen = outcome.demands_seen, tasks_enqueued = outcome.tasks_enqueued, incomplete = outcome.incomplete, "Forge triggered scheduling pass completed");
-                        if let Some(trigger) = &self.core.scheduler_trigger {
-                            trigger.record_completed_pass();
-                        }
+                    if !self.run_planning_pass(&scheduler, &shutdown, true).await {
+                        return Ok(());
                     }
-                    Err(error) => {
-                        pass_span.record("result", "failed");
-                        tracing::error!(error = %error, "Forge triggered scheduling pass failed");
-                        if let Some(trigger) = &self.core.scheduler_trigger {
-                            trigger.record_completed_pass();
-                        }
-                    }
-                }
                 },
             }
         }
+    }
+
+    /// Runs and records one periodic or explicitly triggered planning pass.
+    ///
+    /// Per-pass scheduler failures remain supervised: they are recorded and
+    /// logged, then the outer loop continues. Cancellation interrupts the pass
+    /// without publishing a result or recording trigger completion.
+    ///
+    /// Returns `false` when shutdown interrupts the pass and the supervisor
+    /// must exit, or `true` after recording a completed pass attempt.
+    async fn run_planning_pass(
+        &self,
+        scheduler: &ForgeScheduler<'_>,
+        shutdown: &CancellationToken,
+        triggered: bool,
+    ) -> bool {
+        let started = Instant::now();
+        let pass_span = tracing::info_span!(
+            "bifrost.forge.scheduler.pass",
+            result = tracing::field::Empty,
+            role = "server",
+        );
+        let pass =
+            tracing::Instrument::instrument(scheduler.schedule_once(shutdown), pass_span.clone());
+        let result = tokio::select! {
+            () = shutdown.cancelled() => return false,
+            result = pass => result,
+        };
+        match result {
+            Ok(outcome) => {
+                pass_span.record("result", "succeeded");
+                self.core
+                    .telemetry
+                    .record_scheduler_pass(&outcome, started.elapsed());
+                tracing::debug!(
+                    demands_seen = outcome.demands_seen,
+                    tasks_enqueued = outcome.tasks_enqueued,
+                    incomplete = outcome.incomplete,
+                    triggered,
+                    "Forge scheduling pass completed"
+                );
+            }
+            Err(error) => {
+                pass_span.record("result", "failed");
+                tracing::error!(error = %error, triggered, "Forge scheduling pass failed");
+            }
+        }
+        if let Some(trigger) = &self.core.scheduler_trigger {
+            trigger.record_completed_pass();
+        }
+        true
     }
 
     /// Runs one durable planning pass without executing claimed work.

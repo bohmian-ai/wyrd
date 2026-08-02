@@ -16,6 +16,7 @@ use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
     ForgePlanningDemand, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
@@ -302,6 +303,49 @@ impl<'forge> ForgeScheduler<'forge> {
         outcome.incomplete |= overflowed;
         outcome.demands_seen = demands.len();
         let mut admitted_by_tenant = BTreeMap::<_, usize>::new();
+        self.plan_demands(demands, fence, stop, &mut outcome, &mut admitted_by_tenant)
+            .await?;
+        outcome.fairness_lag_tasks = admitted_by_tenant
+            .values()
+            .min()
+            .zip(admitted_by_tenant.values().max())
+            .map_or(0, |(minimum, maximum)| maximum.saturating_sub(*minimum));
+        if stop.is_cancelled() {
+            outcome.incomplete = true;
+            return Ok(outcome);
+        }
+        self.renew_fence(fence).await?;
+        self.publish_status(&mut outcome, fence).await?;
+        metrics::counter!("bifrost_forge_scheduling_total", "result" => if outcome.incomplete { "incomplete" } else { "complete" }).increment(1);
+        metrics::counter!("bifrost_forge_unschedulable_total")
+            .increment(outcome.unschedulable as u64);
+        metrics::histogram!("bifrost_forge_scheduling_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        #[cfg(feature = "test-support")]
+        if !outcome.incomplete {
+            self.complete_publications.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(outcome)
+    }
+
+    /// Plans a bounded demand page while retaining raced or failed demands for retry.
+    ///
+    /// The method updates the pass outcome and per-tenant admission counts in
+    /// demand order. A generation race is refreshed once, and cancellation
+    /// stops before the next demand or retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns fence-renewal or durable SQL failures. Individual planning
+    /// failures are logged and retained without aborting the remaining page.
+    async fn plan_demands(
+        &self,
+        demands: Vec<ForgePlanningDemand>,
+        fence: i64,
+        stop: &CancellationToken,
+        outcome: &mut ForgeScheduleOutcome,
+        admitted_by_tenant: &mut BTreeMap<DataTenantId, usize>,
+    ) -> Result<(), ForgeError> {
         for mut demand in demands {
             if stop.is_cancelled() {
                 outcome.incomplete = true;
@@ -364,27 +408,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 }
             }
         }
-        outcome.fairness_lag_tasks = admitted_by_tenant
-            .values()
-            .min()
-            .zip(admitted_by_tenant.values().max())
-            .map_or(0, |(minimum, maximum)| maximum.saturating_sub(*minimum));
-        if stop.is_cancelled() {
-            outcome.incomplete = true;
-            return Ok(outcome);
-        }
-        self.renew_fence(fence).await?;
-        self.publish_status(&mut outcome, fence).await?;
-        metrics::counter!("bifrost_forge_scheduling_total", "result" => if outcome.incomplete { "incomplete" } else { "complete" }).increment(1);
-        metrics::counter!("bifrost_forge_unschedulable_total")
-            .increment(outcome.unschedulable as u64);
-        metrics::histogram!("bifrost_forge_scheduling_duration_seconds")
-            .record(started.elapsed().as_secs_f64());
-        #[cfg(feature = "test-support")]
-        if !outcome.incomplete {
-            self.complete_publications.fetch_add(1, Ordering::AcqRel);
-        }
-        Ok(outcome)
+        Ok(())
     }
 
     /// Pauses once at the deterministic post-roster renewal boundary when armed.

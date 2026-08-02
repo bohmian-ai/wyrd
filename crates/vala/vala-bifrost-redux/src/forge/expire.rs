@@ -617,6 +617,42 @@ fn expiry_detail(
     })
 }
 
+/// Validates and borrows the canonical selection encoded by expiry audit detail.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::SnapshotExpiry`] when `detail` is not snapshot-expiry
+/// evidence for `key`, or when its selected snapshot identifiers are not a
+/// non-empty strictly increasing sequence.
+fn expiry_selection<'detail>(
+    detail: &'detail AuditDetail,
+    key: &ForgeTableKey,
+) -> Result<(&'detail [i64], i64), ForgeError> {
+    let AuditDetail::ForgeSnapshotExpire {
+        operation_id: _,
+        selected_snapshot_ids,
+        cutoff_ms,
+        group,
+        ..
+    } = detail
+    else {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expiry audit detail has the wrong kind".to_owned(),
+        });
+    };
+    if group != &table_resource_for_key(key)
+        || selected_snapshot_ids.is_empty()
+        || selected_snapshot_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expiry audit detail is not canonical".to_owned(),
+        });
+    }
+    Ok((selected_snapshot_ids, *cutoff_ms))
+}
+
 /// Commit an expiry selection after rechecking metadata and the lease fence.
 impl Forge {
     /// Submits the canonical expiry transaction while preserving uncertain acceptance.
@@ -639,28 +675,7 @@ impl Forge {
         detail: &AuditDetail,
         stop: &CancellationToken,
     ) -> Result<ExpiredFileSet, ForgeError> {
-        let AuditDetail::ForgeSnapshotExpire {
-            operation_id: _,
-            selected_snapshot_ids,
-            cutoff_ms,
-            group,
-            ..
-        } = detail
-        else {
-            return Err(ForgeError::SnapshotExpiry {
-                detail: "expiry audit detail has the wrong kind".to_owned(),
-            });
-        };
-        if group != &table_resource_for_key(key)
-            || selected_snapshot_ids.is_empty()
-            || selected_snapshot_ids
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
-        {
-            return Err(ForgeError::SnapshotExpiry {
-                detail: "expiry audit detail is not canonical".to_owned(),
-            });
-        }
+        let (selected_snapshot_ids, cutoff_ms) = expiry_selection(detail, key)?;
         if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
@@ -675,7 +690,7 @@ impl Forge {
         if !selected_ids_are_eligible(
             &table,
             selected_snapshot_ids,
-            *cutoff_ms,
+            cutoff_ms,
             self.core.config.retain_last,
         )? {
             return Err(ForgeError::SnapshotExpiry {
@@ -687,7 +702,7 @@ impl Forge {
         let action = tx
             .expire_snapshots()
             .expire_snapshot_ids(selected_snapshot_ids.iter().copied())
-            .expire_older_than_ms(*cutoff_ms)
+            .expire_older_than_ms(cutoff_ms)
             .retain_last(self.core.config.retain_last.max(1));
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
         lease.require_fence(&self.core.operator_pool).await?;

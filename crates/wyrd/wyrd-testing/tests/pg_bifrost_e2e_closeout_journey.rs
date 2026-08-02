@@ -13,11 +13,16 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sdk::{BifrostFrame, BifrostGrpcTransport, IngestTransport};
+use vala_sdk::{
+    BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, CollectedQueryResult,
+    IngestTransport, QueryClient,
+};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_spec::vala::api::SyncQueryRequest;
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, FreshnessPolicy, QueryTerminalOutcome, VisibilityMode,
+};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster, full_bifrost_topology};
 
@@ -98,6 +103,23 @@ async fn fresh_boot_provisions_redux_before_first_write() {
     cluster.shutdown().await.expect("cluster shutdown");
 }
 
+/// Exercises the complete multi-pod ingest, rejection, flush, query, and audit journey.
+///
+/// Every accepted write is flushed before each independently authenticated
+/// Oracle entrypoint must return the same exact ordered rows and terminal
+/// metadata. Returning early leaves already acknowledged and flushed test data
+/// durable until the caller shuts down the cluster.
+///
+/// # Errors
+///
+/// Returns an error when table creation, client bootstrap, ingest, flush,
+/// query collection, SQL inspection, or tenant connection acquisition fails.
+///
+/// # Cancellation
+///
+/// Cancelling this future stops the current client or SQL operation. Accepted
+/// writes and completed flushes are not rolled back; the caller retains cluster
+/// ownership and is responsible for bounded shutdown.
 async fn run_closeout_journey(
     cluster: &WyrdTestCluster,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -190,27 +212,20 @@ async fn run_closeout_journey(
         .expect_err("schema conflict must be rejected before ACK");
     assert_eq!(conflict.status(), 409);
 
-    let mut oracle_rows = 0_u64;
     for (pod, server) in cluster.servers().enumerate() {
         let query_client =
             bootstrap_client(server, &format!("closeout-query-{pod}"), &["admin"]).await?;
-        let query = query_client
-            .request_arrow(
-                reqwest::Method::POST,
-                "/v1/query",
-                Some(&SyncQueryRequest {
-                    sql: format!("SELECT id, value FROM \"{TABLE_FQN}\" ORDER BY id"),
-                    params: Vec::new(),
-                }),
+        let query = QueryClient::new(&query_client)
+            .collect_bounded(
+                &closeout_query(),
+                CollectedQueryLimits {
+                    max_rows: 1_024,
+                    max_encoded_bytes: 8 * 1024 * 1024,
+                },
             )
             .await?;
-        oracle_rows = oracle_rows.saturating_add(query.row_count.unwrap_or_default());
-        assert!(!query.frames.is_empty(), "Oracle must return Arrow data");
+        assert_query_result(&query, &[1, 2, 3, 4, 10, 11, 12, 99]);
     }
-    assert_eq!(
-        oracle_rows, 8,
-        "distributed Oracle reads must cover every unique row"
-    );
 
     let rows: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(row_count), 0)::bigint
@@ -239,6 +254,22 @@ async fn run_closeout_journey(
     Ok(())
 }
 
+/// Exercises delayed WAL fsync through flush and exact public query readback.
+///
+/// The flush boundary must retain all eight acknowledged frames before the
+/// terminal-safe query validates their exact ordered contents. Returning early
+/// may leave already acknowledged test writes durable until cluster shutdown.
+///
+/// # Errors
+///
+/// Returns an error when table creation, client bootstrap, ingest, flush, or
+/// bounded query collection fails.
+///
+/// # Cancellation
+///
+/// Cancelling this future stops the active operation but does not retract
+/// acknowledged WAL appends or completed flush work. The caller retains the
+/// cluster and must perform bounded shutdown.
 async fn run_delayed_fsync_journey(
     cluster: &WyrdTestCluster,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -269,18 +300,67 @@ async fn run_delayed_fsync_journey(
     server.flush_bifrost().await?;
 
     let query_client = bootstrap_client(server, "delayed-fsync-query", &["admin"]).await?;
-    let query = query_client
-        .request_arrow(
-            reqwest::Method::POST,
-            "/v1/query",
-            Some(&SyncQueryRequest {
-                sql: format!("SELECT id, value FROM \"{TABLE_FQN}\" ORDER BY id"),
-                params: Vec::new(),
-            }),
+    let query = QueryClient::new(&query_client)
+        .collect_bounded(
+            &closeout_query(),
+            CollectedQueryLimits {
+                max_rows: 1_024,
+                max_encoded_bytes: 8 * 1024 * 1024,
+            },
         )
         .await?;
-    assert_eq!(query.row_count, Some(8));
+    assert_query_result(&query, &[0, 1, 2, 3, 4, 5, 6, 7]);
     Ok(())
+}
+
+/// Verifies the authoritative schema, decoded rows, and successful terminal.
+///
+/// # Panics
+///
+/// Panics when schema, terminal, row or byte counts, batch presence, decoded
+/// identifiers, or decoded values differ from the expected query result.
+fn assert_query_result(query: &CollectedQueryResult, expected_ids: &[i64]) {
+    assert_eq!(query.schema.fields().len(), 2);
+    assert_eq!(query.schema.field(0).name(), "id");
+    assert_eq!(query.schema.field(0).data_type(), &DataType::Int64);
+    assert!(!query.schema.field(0).is_nullable());
+    assert_eq!(query.schema.field(1).name(), "value");
+    assert_eq!(query.schema.field(1).data_type(), &DataType::Utf8);
+    assert!(!query.schema.field(1).is_nullable());
+    assert_eq!(query.rows, 8);
+    assert!(query.encoded_bytes > 0);
+    assert_eq!(query.terminal.outcome, QueryTerminalOutcome::Success);
+    assert_eq!(query.terminal.row_count, 8);
+    assert!(!query.batches.is_empty(), "Oracle must return Arrow data");
+
+    let mut ids = Vec::new();
+    let mut values = Vec::new();
+    for batch in &query.batches {
+        let batch_ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("query id column must match the authoritative schema");
+        let batch_values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("query value column must match the authoritative schema");
+        ids.extend((0..batch.num_rows()).map(|row| batch_ids.value(row)));
+        values.extend((0..batch.num_rows()).map(|row| batch_values.value(row)));
+    }
+    assert_eq!(ids, expected_ids);
+    assert_eq!(values, ["journey"; 8]);
+}
+
+/// Builds the explicit public Oracle policy used by closeout readback.
+fn closeout_query() -> BifrostQueryRequest {
+    BifrostQueryRequest {
+        sql: format!("SELECT id, value FROM {TABLE_FQN} ORDER BY id"),
+        visibility: VisibilityMode::PublishedOnly,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: None,
+    }
 }
 
 async fn bootstrap_transport(

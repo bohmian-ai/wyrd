@@ -922,14 +922,17 @@ impl TonicOraclePeerTransport {
     ///
     /// # Errors
     /// Returns stale-object when the node is absent or its current role fence
-    /// differs, and terminal when production membership advertises plaintext.
+    /// differs, and terminal when a TLS transport is configured with plaintext.
     fn resolve_candidate(&self, candidate: &DispatchCandidate) -> Result<String, DispatchError> {
         #[cfg(feature = "test-support")]
         if let OraclePeerTopology::TestAddresses(addresses) = &self.topology {
-            return addresses
+            let address = addresses
                 .get(&candidate.node_id)
-                .cloned()
-                .ok_or(DispatchError::StaleObject);
+                .ok_or(DispatchError::StaleObject)?;
+            if self.tls.is_some() && !address.starts_with("https://") {
+                return Err(DispatchError::Terminal);
+            }
+            return Ok(address.clone());
         }
         let snapshot = self.snapshot();
         match resolve_snapshot_candidate(&snapshot, candidate, self.tls.is_some(), Utc::now()) {

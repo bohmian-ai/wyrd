@@ -1158,7 +1158,10 @@ async fn oracle_peer_tls_rejects_plaintext_before_bearer() {
         )
         .await
         .expect_err("plaintext endpoint must fail closed");
-    assert!(matches!(error, DispatchError::Terminal));
+    assert!(
+        matches!(error, DispatchError::Terminal),
+        "plaintext TLS configuration must be terminal, not stale topology: {error:?}"
+    );
     assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
 }
 

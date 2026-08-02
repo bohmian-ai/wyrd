@@ -164,6 +164,53 @@ impl ForgeTelemetryCapture {
         self.metrics.render()
     }
 
+    /// Return the current production Prometheus series as absolute samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the recorder emits a malformed series.
+    pub fn snapshot(&self) -> Result<Vec<ForgeMetricSample>, ForgeTelemetryReportError> {
+        rendered_values(&self.metrics.render())?
+            .into_iter()
+            .map(|(series, value)| parse_sample(&series, value))
+            .collect()
+    }
+
+    /// Return the metric families currently rendered by the production recorder.
+    #[must_use]
+    pub fn families(&self) -> BTreeSet<String> {
+        rendered_values(&self.metrics.render())
+            .ok()
+            .into_iter()
+            .flat_map(|values| values.into_iter())
+            .filter_map(|(series, value)| parse_sample(&series, value).ok())
+            .map(|sample| sample.family)
+            .collect()
+    }
+
+    /// Return a one-shot synchronous delta from a production checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same parse, reuse, regression, and interval errors as the
+    /// asynchronous sampler-backed capture.
+    pub fn delta_since(
+        &self,
+        checkpoint: &ForgeTelemetryCheckpoint,
+    ) -> Result<ForgeTelemetryDelta, ForgeTelemetryReportError> {
+        self.delta_without_sampler(checkpoint.clone())
+    }
+
+    /// Return the names of all finished spans in the shared production capture.
+    #[must_use]
+    pub fn span_names(&self) -> BTreeSet<String> {
+        self.traces
+            .finished_since(0)
+            .into_iter()
+            .map(|span| span.name)
+            .collect()
+    }
+
     /// Build one checked delta from the checkpointed production exporter state.
     ///
     /// Gauge maxima include the baseline and end snapshot. A caller that needs
@@ -271,7 +318,7 @@ impl ForgeTelemetryCapture {
     ///
     /// Returns the same errors as checkpoint/delta construction, including
     /// single-use window and counter-regression failures.
-    pub async fn delta_since(
+    pub async fn delta_since_with_sampler(
         &self,
         checkpoint: ForgeTelemetryCheckpoint,
         sampler: ForgeGaugeSampler,

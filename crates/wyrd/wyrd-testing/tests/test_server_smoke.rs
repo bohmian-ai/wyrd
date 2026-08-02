@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use wyrd_testing::WyrdTestServer;
 
 fn e2e_enabled() -> bool {
@@ -48,8 +51,18 @@ async fn readiness_failure_rolls_back_before_fresh_bound_server_starts() {
     if !e2e_enabled() {
         return;
     }
+    let reserve = || {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve test address");
+        listener.local_addr().expect("reserved address")
+    };
+    let http = reserve();
+    let grpc = reserve();
+    let aborted = Arc::new(AtomicBool::new(false));
     let result = WyrdTestServer::builder()
+        .with_bind_addrs_for_test(http, grpc)
         .with_readiness_failure_for_test()
+        .with_stalled_drain_for_test(Arc::clone(&aborted))
         .start_bound()
         .await;
     let error = match result {
@@ -66,8 +79,14 @@ async fn readiness_failure_rolls_back_before_fresh_bound_server_starts() {
         matches!(error, wyrd_testing::WyrdTestServerError::Bind(message) if message.contains("injected readiness failure")),
         "readiness error must remain primary after rollback"
     );
+    assert!(
+        aborted.load(Ordering::SeqCst),
+        "timed-out startup drain must abort the stalled serve task"
+    );
 
-    let fresh = WyrdTestServer::start_bound()
+    let fresh = WyrdTestServer::builder()
+        .with_bind_addrs_for_test(http, grpc)
+        .start_bound()
         .await
         .expect("fresh process after readiness rollback");
     let response = reqwest::Client::new()

@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arrow::array::Int64Array;
@@ -12,7 +13,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
-use chrono::Duration as ChronoDuration;
+use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
 use opendal::{Buffer, Entry, Metadata, Operator};
 use secrecy::{ExposeSecret, SecretString};
@@ -25,7 +26,8 @@ use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
+    ForgeRewriteRuntime, ForgeSchedulerTrigger, ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
@@ -58,7 +60,9 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
-use wyrd_server::config::{BifrostRuntimeRole, IssuerEntry, ServeMode, WorkloadBindingEntry};
+use wyrd_server::config::{
+    BifrostRuntimeRole, ForgeProcessRole, IssuerEntry, ServeMode, WorkloadBindingEntry,
+};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::BifrostIngestRuntime;
 use wyrd_server::state::{QueryStreamFault, QueryStreamFaultController};
@@ -183,6 +187,10 @@ pub struct WyrdTestServer {
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// Optional TLS material applied when this in-process server binds.
     requested_oracle_peer_tls: Option<TestOraclePeerTls>,
+    /// Test-only readiness failure requested by the builder.
+    readiness_failure: bool,
+    /// Optional test-only serve task that ignores cancellation until aborted.
+    stalled_drain_for_test: Option<Arc<AtomicBool>>,
 }
 
 struct WyrdTestServerInner {
@@ -199,6 +207,18 @@ struct WyrdTestServerInner {
     issuing_key: Arc<IssuingKey>,
     api_key: SecretString,
     forge_publisher: StagingFilePublisher,
+    /// Redux catalog retained for test-only built-in provisioning.
+    bifrost_catalog: Arc<BifrostCatalog>,
+    /// Manual wall-clock control shared by Forge fixtures derived from this server.
+    forge_clock: ForgeClockControl,
+    /// Trigger that wakes the real supervised Forge scheduler.
+    forge_scheduler_trigger: ForgeSchedulerTrigger,
+    /// Process composition selected for this test server.
+    forge_process_role: ForgeProcessRole,
+    /// Stable identity assigned to this server process.
+    node_id: NodeId,
+    /// Optional lifecycle telemetry owner retained until shutdown.
+    _forge_role_telemetry: Option<wyrd_server::app::metrics::TestForgeRoleTelemetryGuard>,
     /// Atomic one-shot query truncation controls for language journeys.
     query_stream_fault: QueryStreamFaultController,
     /// Current notification-backed schema stall used by cancellation journeys.
@@ -216,6 +236,15 @@ pub struct BifrostQueryResourceSnapshot {
     pub peer_slots: u64,
     /// Scribe tail fences currently retained for Fused reads.
     pub tail_fences: u64,
+}
+
+/// Stable pointer identities for one server-owned runtime pool graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostgresPoolIdentity {
+    /// Wyrd application pool identity.
+    pub wyrd_app: usize,
+    /// Vala/Bifrost application pool identity.
+    pub vala_app: usize,
 }
 
 enum Mode {
@@ -259,6 +288,18 @@ pub struct WyrdTestServerBuilder {
     oracle_peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
     oracle_peer_tls: Option<TestOraclePeerTls>,
+    /// Production Forge process role used by bound test servers.
+    forge_process_role: ForgeProcessRole,
+    /// Optional observer of successful supervised worker completions.
+    forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
+    /// Optional test-only Forge catalog wrapper.
+    forge_catalog: Option<Arc<dyn iceberg::Catalog>>,
+    /// Optional complete Forge limit profile.
+    forge_config: Option<ForgeConfig>,
+    /// Force readiness failure after listeners are bound for rollback tests.
+    readiness_failure: bool,
+    /// Replace the serve task with a cancellation-resistant test task.
+    stalled_drain_for_test: Option<Arc<AtomicBool>>,
 }
 
 /// Test-only file paths for a shared Oracle TLS identity and trust root.
@@ -304,6 +345,12 @@ impl Default for WyrdTestServerBuilder {
             bind_addrs: None,
             oracle_peer_credentials: None,
             oracle_peer_tls: None,
+            forge_process_role: ForgeProcessRole::All,
+            forge_completion_observer: None,
+            forge_catalog: None,
+            forge_config: None,
+            readiness_failure: false,
+            stalled_drain_for_test: None,
         }
     }
 }
@@ -763,6 +810,56 @@ impl WyrdTestServer {
     #[must_use]
     pub fn state(&self) -> &AppState {
         &self.inner.state
+    }
+
+    /// Return the production Forge process role selected for this server.
+    #[must_use]
+    pub const fn forge_process_role(&self) -> ForgeProcessRole {
+        self.inner.forge_process_role
+    }
+
+    /// Wake the production Forge scheduler supervisor for one pass.
+    pub fn trigger_forge_scheduler_for_test(&self) {
+        self.inner.forge_scheduler_trigger.request_pass();
+    }
+
+    /// Return the scheduler trigger retained by this server.
+    #[must_use]
+    pub fn forge_scheduler_trigger_for_test(&self) -> ForgeSchedulerTrigger {
+        self.inner.forge_scheduler_trigger.clone()
+    }
+
+    /// Return the manual Forge clock control shared by derived fixtures.
+    #[must_use]
+    pub fn forge_clock(&self) -> ForgeClockControl {
+        self.inner.forge_clock.clone()
+    }
+
+    /// Return the stable node identity assigned by the cluster harness.
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.inner.node_id
+    }
+
+    /// Provision the canonical traces/spans table for one test tenant.
+    ///
+    /// # Errors
+    /// Returns an error when the built-in definition or catalog operation is
+    /// unavailable.
+    pub async fn ensure_traces_spans_table_for_test(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<(), WyrdTestServerError> {
+        let definition =
+            vala_bifrost_redux::tables::builtin_table("traces", "spans").ok_or_else(|| {
+                WyrdTestServerError::Start("missing traces spans built-in".to_owned())
+            })?;
+        self.inner
+            .bifrost_catalog
+            .ensure_builtin(tenant, definition)
+            .await
+            .map(|_| ())
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
     /// Return the publisher paired with this server's Forge inbox.
@@ -1375,6 +1472,47 @@ impl WyrdTestServer {
         &self.inner.fixture
     }
 
+    /// Return pointer identities proving this process owns fresh runtime pools.
+    #[must_use]
+    pub fn postgres_pool_identity(&self) -> PostgresPoolIdentity {
+        PostgresPoolIdentity {
+            wyrd_app: std::ptr::from_ref(self.inner.state.postgres.app_pool()) as usize,
+            vala_app: std::ptr::from_ref(self.inner.state.postgres.vala().pool()) as usize,
+        }
+    }
+
+    /// Cancel and drain a partially started bound server while preserving the
+    /// startup error that caused rollback.
+    async fn rollback_bound_startup(
+        &mut self,
+        primary: WyrdTestServerError,
+    ) -> WyrdTestServerError {
+        if let Some(token) = self.shutdown_token.take() {
+            token.cancel();
+        }
+        let Some(mut handle) = self.serve_handle.take() else {
+            return primary;
+        };
+        if tokio::time::timeout(Duration::from_secs(2), &mut handle)
+            .await
+            .is_ok()
+        {
+            return primary;
+        }
+        handle.abort();
+        if tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("bound test server did not terminate after startup rollback abort");
+        } else {
+            tracing::warn!(
+                "bound test server did not drain before startup rollback deadline; aborted"
+            );
+        }
+        primary
+    }
+
     /// Verify one Oracle peer bearer and return its effective permission set.
     ///
     /// # Errors
@@ -1405,6 +1543,20 @@ impl WyrdTestServer {
             .clone()
             .with_shutdown_token(shutdown_token.clone());
 
+        if self.forge_process_role() == ForgeProcessRole::ForgeWorker {
+            let worker = wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1)
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let serve_handle = wyrd_runtime::runtime().spawn(async move {
+                worker
+                    .await
+                    .map_err(|error| wyrd_server::BootExit::Other(Box::new(error)))
+            });
+            self.shutdown_token = Some(shutdown_token);
+            self.serve_handle = Some(serve_handle);
+            self.mode = Mode::InProcess;
+            return Ok(self);
+        }
+
         // Ephemeral ports, metrics off (the recorder is a process-global
         // singleton that must not be installed per-test), reflection off.
         let loopback = "127.0.0.1:0"
@@ -1414,6 +1566,7 @@ impl WyrdTestServer {
         let mut config = WyrdServerConfig::default();
         config.http.bind = http_bind;
         config.grpc.bind = grpc_bind;
+        config.role = self.forge_process_role();
         if let Some(tls) = &self.requested_oracle_peer_tls {
             config.grpc.certificate_chain_path = Some(tls.certificate_path.clone());
             config.grpc.private_key_path = Some(tls.private_key_path.clone());
@@ -1435,7 +1588,24 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
         let base_url = format!("http://{addr}");
 
-        let serve_handle = wyrd_runtime::runtime().spawn(async move { bound.run().await });
+        let serve_handle = if let Some(aborted) = self.stalled_drain_for_test.take() {
+            wyrd_runtime::runtime().spawn(async move {
+                struct AbortObservation(Arc<AtomicBool>);
+
+                impl Drop for AbortObservation {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+
+                let _observation = AbortObservation(aborted);
+                let _bound = bound;
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        } else {
+            wyrd_runtime::runtime().spawn(async move { bound.run().await })
+        };
 
         self.shutdown_token = Some(shutdown_token);
         self.serve_handle = Some(serve_handle);
@@ -1445,16 +1615,15 @@ impl WyrdTestServer {
             grpc_addr,
         };
 
+        if self.readiness_failure {
+            return Err(self
+                .rollback_bound_startup(WyrdTestServerError::Bind(
+                    "test-injected readiness failure".to_owned(),
+                ))
+                .await);
+        }
         if let Err(error) = wait_for_ready(&base_url).await {
-            if let Some(handle) = self.serve_handle.take()
-                && handle.is_finished()
-                && let Ok(Err(exit)) = handle.await
-            {
-                return Err(WyrdTestServerError::Start(format!(
-                    "bound Wyrd test server exited before readiness: {exit:?}"
-                )));
-            }
-            return Err(error);
+            return Err(self.rollback_bound_startup(error).await);
         }
 
         Ok(self)
@@ -1488,6 +1657,71 @@ impl Drop for WyrdTestServer {
 }
 
 impl WyrdTestServerBuilder {
+    /// Attach the process-installed production telemetry guard.
+    #[must_use]
+    pub fn with_telemetry_for_test(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Select the production Forge process role for this fixture.
+    #[must_use]
+    pub fn with_forge_process_role_for_test(mut self, role: ForgeProcessRole) -> Self {
+        self.forge_process_role = role;
+        self
+    }
+
+    /// Observe successful completions from the production Forge worker.
+    #[must_use]
+    pub fn with_forge_completion_observer_for_test(
+        mut self,
+        observer: ForgeWorkerCompletionObserver,
+    ) -> Self {
+        self.forge_completion_observer = Some(observer);
+        self
+    }
+
+    /// Replace the Forge catalog with a deterministic test wrapper.
+    #[must_use]
+    pub fn with_forge_catalog_for_test(mut self, catalog: Arc<dyn iceberg::Catalog>) -> Self {
+        self.forge_catalog = Some(catalog);
+        self
+    }
+
+    /// Use one complete validated Forge configuration for this fixture.
+    #[must_use]
+    pub fn with_forge_config_for_test(mut self, config: ForgeConfig) -> Self {
+        self.forge_config = Some(config);
+        self
+    }
+
+    /// Force the bound readiness phase to fail and exercise startup rollback.
+    #[must_use]
+    pub fn with_readiness_failure_for_test(mut self) -> Self {
+        self.readiness_failure = true;
+        self
+    }
+
+    /// Make the bound serve task ignore shutdown until the rollback aborts it.
+    ///
+    /// The supplied flag is set when the stalled task is dropped, allowing a
+    /// smoke test to prove that a timed-out drain was followed by an abort.
+    #[must_use]
+    pub fn with_stalled_drain_for_test(mut self, aborted: Arc<AtomicBool>) -> Self {
+        self.stalled_drain_for_test = Some(aborted);
+        self
+    }
+
+    /// Bind a test server to caller-reserved HTTP and gRPC addresses.
+    #[must_use]
+    pub fn with_bind_addrs_for_test(
+        mut self,
+        http: std::net::SocketAddr,
+        grpc: std::net::SocketAddr,
+    ) -> Self {
+        self.bind_addrs = Some((http, grpc));
+        self
+    }
     /// Override the default allow policy hook.
     #[must_use]
     pub fn with_policy_hook(mut self, hook: Arc<dyn PolicyHook>) -> Self {
@@ -1743,6 +1977,10 @@ impl WyrdTestServerBuilder {
         // AppState must observe the same pool so query and rewrite admission
         // share accounting rather than silently creating independent budgets.
         let tenant_id = fixture.data_tenant_id();
+        let (runtime_wyrd, runtime_vala) = fixture
+            .fresh_runtime_handles()
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -1761,7 +1999,7 @@ impl WyrdTestServerBuilder {
             ),
         );
         let resolver = Arc::new(SqlPermissionResolver::new(Arc::new(
-            fixture.app_pool().clone(),
+            runtime_wyrd.app_pool().clone(),
         )));
         let verify_settings = self.auth_verify_settings.unwrap_or_default();
 
@@ -1773,7 +2011,7 @@ impl WyrdTestServerBuilder {
         // verifier's external (foreign-OIDC) path.
         let sealing_key = Arc::new(SecretKey::from_bytes([9_u8; 32]));
         seed_trusted_issuers(
-            fixture.app_pool(),
+            runtime_wyrd.app_pool(),
             tenant_id,
             &self.trusted_issuer_configs,
             Some(sealing_key.as_ref()),
@@ -1782,22 +2020,22 @@ impl WyrdTestServerBuilder {
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        seed_workload_bindings(fixture.app_pool(), tenant_id, &bindings)
+        seed_workload_bindings(runtime_wyrd.app_pool(), tenant_id, &bindings)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
         let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            Arc::new(fixture.app_pool().clone()),
+            Arc::new(runtime_wyrd.app_pool().clone()),
             Some(Arc::clone(&sealing_key)),
         ));
         let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
-            fixture.app_pool().clone(),
+            runtime_wyrd.app_pool().clone(),
         )));
 
         let verifier = Arc::new(
             TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
                 .with_revocation(Arc::new(SqlRevocationCheck::new_with_ttl(
-                    Arc::new(fixture.app_pool().clone()),
+                    Arc::new(runtime_wyrd.app_pool().clone()),
                     Duration::ZERO,
                 )))
                 .with_external(
@@ -1819,10 +2057,7 @@ impl WyrdTestServerBuilder {
             TokenExchangeSettings::default()
         };
 
-        let postgres = Arc::new(ServerPostgres::from_parts(
-            fixture.wyrd_postgres().clone(),
-            fixture.vala_postgres().clone(),
-        ));
+        let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
         let operator_pool = postgres.operator_pool().ok_or_else(|| {
             WyrdTestServerError::Start(
                 "test server requires a platform-admin operator pool for Forge".to_owned(),
@@ -1834,10 +2069,12 @@ impl WyrdTestServerBuilder {
             scribe_admission.scribe_memory_limit_bytes,
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge_config = ForgeConfig {
+        let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
             ..ForgeConfig::default()
-        };
+        });
+        let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
+        let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_memory = Arc::new(
@@ -1872,16 +2109,18 @@ impl WyrdTestServerBuilder {
                 Forge::new(ForgeBuildConfig {
                     vala: postgres.vala().clone(),
                     operator_pool: operator_pool.clone(),
-                    catalog: bifrost_redux.iceberg_catalog(),
+                    catalog: self
+                        .forge_catalog
+                        .unwrap_or_else(|| bifrost_redux.iceberg_catalog()),
                     staging,
                     object_store,
                     rewrite_runtime: forge_runtime,
                     hints: forge_inbox,
                     config: forge_config,
                     maintenance_interval: self.forge_interval,
-                    clock: vala_bifrost_redux::forge::ForgeClock::system(),
-                    completion_observer: None,
-                    scheduler_trigger: None,
+                    clock: forge_clock.clone(),
+                    completion_observer: self.forge_completion_observer.clone(),
+                    scheduler_trigger: Some(forge_scheduler_trigger.clone()),
                     telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
                 })
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
@@ -2049,6 +2288,9 @@ impl WyrdTestServerBuilder {
             state.authz.policy_hook = hook;
         }
         let router = build_router(state.clone());
+        let forge_role_telemetry = Some(wyrd_server::start_capture_forge_role(
+            self.forge_process_role,
+        ));
 
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
@@ -2062,6 +2304,12 @@ impl WyrdTestServerBuilder {
                 issuing_key,
                 api_key: SecretString::from(String::new()),
                 forge_publisher,
+                bifrost_catalog: Arc::clone(&bifrost_redux),
+                forge_clock: forge_clock_control,
+                forge_scheduler_trigger,
+                forge_process_role: self.forge_process_role,
+                node_id,
+                _forge_role_telemetry: forge_role_telemetry,
                 query_stream_fault,
                 query_stream_stall: std::sync::Mutex::new(None),
             },
@@ -2070,6 +2318,8 @@ impl WyrdTestServerBuilder {
             serve_handle: None,
             requested_bind: self.bind_addrs,
             requested_oracle_peer_tls: self.oracle_peer_tls,
+            readiness_failure: self.readiness_failure,
+            stalled_drain_for_test: self.stalled_drain_for_test,
         })
     }
 

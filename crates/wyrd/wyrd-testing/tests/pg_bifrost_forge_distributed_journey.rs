@@ -20,7 +20,10 @@ use vala_sql::row_types::forge_tasks::{
 };
 use wyrd_server::config::ForgeProcessRole;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{AuditDetail, ForgeCompactionPhase, StoragePath, SyncQueryRequest};
+use wyrd_spec::vala::api::{
+    AuditDetail, BifrostQueryRequest, ForgeCompactionPhase, FreshnessPolicy, StoragePath,
+    VisibilityMode,
+};
 use wyrd_testing::bifrost::forge_harness::seed_forge_group;
 use wyrd_testing::bifrost::{
     BifrostQueryTelemetryReport, BifrostTopology, WyrdTestCluster,
@@ -755,7 +758,7 @@ async fn dedicated_forge_workers_journey() {
     let roles = cluster
         .servers()
         .iter()
-        .map(WyrdTestServer::forge_process_role)
+        .map(|server| server.forge_process_role())
         .collect::<Vec<_>>();
     assert_eq!(
         roles,
@@ -819,6 +822,12 @@ async fn dedicated_forge_workers_journey() {
     )
     .await
     .expect("all three worker-only processes completed durable work");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completion.wait_for_at_least(tenants.len()),
+    )
+    .await
+    .expect("every dedicated worker tenant reached terminal completion");
     let scribe = scheduler_server
         .bifrost_scribe()
         .expect("server-role Scribe");
@@ -2047,7 +2056,7 @@ async fn run_scenario(scenario: Scenario) {
         }
     }
     let delta = telemetry
-        .delta_since(checkpoint, sampler)
+        .delta_since_with_sampler(checkpoint, sampler)
         .await
         .unwrap_or_else(|error| panic!("{} query telemetry delta: {error}", scenario.name));
     let query = BifrostQueryTelemetryReport::from_server_delta(&delta)
@@ -2786,10 +2795,12 @@ async fn query_response(server: &WyrdTestServer, jwt: &str) -> reqwest::Response
             server.base_url().expect("bound server URL")
         ))
         .header("x-wyrd-access-token", format!("Bearer {jwt}"))
-        .json(&SyncQueryRequest {
+        .json(&BifrostQueryRequest {
             sql: "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'"
                 .to_owned(),
-            params: Vec::new(),
+            visibility: VisibilityMode::Fused,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
         })
         .send()
         .await

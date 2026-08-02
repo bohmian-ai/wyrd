@@ -221,7 +221,11 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
             warmup_queries = warmup_queries.saturating_add(1);
         }
     }
-    let checkpoint = cluster.telemetry().checkpoint();
+    let checkpoint = cluster.telemetry().checkpoint()?;
+    let sampler = cluster
+        .telemetry()
+        .begin_gauge_sampling(&checkpoint)
+        .await?;
     let audit_checkpoint = cluster.oracle_inspection().await?.audit_rows;
     let probe_cancel = tokio_util::sync::CancellationToken::new();
     let probe_shutdown = probe_cancel.clone();
@@ -264,7 +268,10 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     let cpu_seconds = (process_cpu_seconds()? - cpu_started).max(0.0);
     probe_cancel.cancel();
     let (probe_peak_memory, probe_peak_slots) = peak_probe.await??;
-    let telemetry = cluster.telemetry().delta_since(&checkpoint)?;
+    let telemetry = cluster
+        .telemetry()
+        .delta_since_with_sampler(checkpoint, sampler)
+        .await?;
     let measured_audit_rows = cluster
         .oracle_inspection()
         .await?
@@ -735,7 +742,7 @@ async fn measured_query(
     client: &WyrdClient,
     request: &BifrostQueryRequest,
     expected_rows: u64,
-    telemetry: &super::cluster::OracleTelemetryCapture,
+    telemetry: &super::telemetry::ForgeTelemetryCapture,
 ) -> Result<QueryMeasurement, BenchError> {
     let started = Instant::now();
     let mut stream = QueryClient::new(client).query(request).await?;
@@ -796,7 +803,7 @@ fn percentile_us(samples: &[u64], percentile: usize) -> f64 {
 }
 
 /// Sum all changed production series belonging to one normalized family.
-fn metric_sum(samples: &[super::cluster::OracleMetricSample], family: &str) -> f64 {
+fn metric_sum(samples: &[super::telemetry::ForgeMetricSample], family: &str) -> f64 {
     samples
         .iter()
         .filter(|sample| sample.family == family)
@@ -806,7 +813,7 @@ fn metric_sum(samples: &[super::cluster::OracleMetricSample], family: &str) -> f
 
 /// Sum changed production series with one exact closed label value.
 fn metric_sum_matching(
-    samples: &[super::cluster::OracleMetricSample],
+    samples: &[super::telemetry::ForgeMetricSample],
     family: &str,
     label: &str,
     value: &str,

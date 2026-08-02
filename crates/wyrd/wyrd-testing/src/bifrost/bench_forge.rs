@@ -315,7 +315,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         return Err(error);
     }
     let expected_roles = roles.expected().clone();
-    let delta = capture.delta_since(checkpoint, sampler).await;
+    let delta = capture.delta_since_with_sampler(checkpoint, sampler).await;
     let shutdown = roles.shutdown().await;
     shutdown?;
     let delta = delta?;

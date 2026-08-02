@@ -43,7 +43,6 @@ use wyrd_tonic::otlp::trace::v1::{
 };
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
-use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::Request;
 use wyrd_tonic::tonic::metadata::MetadataValue;
 use wyrd_tonic::wyrd::v1 as proto;
@@ -69,10 +68,6 @@ const ORACLE_METRIC_LABELS: &[(&str, &[&str])] = &[
     ),
     ("bifrost_oracle_in_flight", &["query_class", "visibility"]),
     ("bifrost_role_ready", &["role"]),
-    (
-        "bifrost_gate_role_unavailable_total",
-        &["reason", "required_role"],
-    ),
     (
         "bifrost_oracle_admission_wait_seconds",
         &["outcome", "scope"],
@@ -250,7 +245,7 @@ async fn public_grpc_matches_http_frames() {
     cluster.shutdown().await.expect("parity shutdown");
 }
 
-/// Proves a real Gate without Oracle returns typed gRPC UNAVAILABLE before planning.
+/// Rejects the retired component-partial process topology.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn public_grpc_without_oracle_is_unavailable() {
@@ -263,37 +258,7 @@ async fn public_grpc_without_oracle_is_unavailable() {
             oracle: None,
         }],
     };
-    let cluster = WyrdTestCluster::start_spec(spec)
-        .await
-        .expect("no-Oracle cluster");
-    let server = cluster.server(0).expect("no-Oracle server");
-    let table = unique_table("oracle_unavailable");
-    register_table(server, cluster.data_tenant_id(), &table)
-        .await
-        .expect("register unavailable table");
-    let client = client(server, "grpc-unavailable").await.expect("client");
-    let before = server
-        .bifrost_read_decision_count()
-        .await
-        .expect("read-decision count");
-    let code = grpc_query_status(
-        &client,
-        &BifrostQueryRequest {
-            sql: format!("SELECT * FROM vala.bifrost.{table}"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: None,
-        },
-    )
-    .await
-    .expect("missing Oracle status");
-    assert_eq!(code, Code::Unavailable);
-    let after = server
-        .bifrost_read_decision_count()
-        .await
-        .expect("read-decision count after denial");
-    assert_eq!(before, after);
-    cluster.shutdown().await.expect("unavailable shutdown");
+    assert!(WyrdTestCluster::start_spec(spec).await.is_err());
 }
 
 /// Proves dropping a public gRPC stream releases Oracle admission resources.
@@ -469,7 +434,10 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
     let missing_path = seed_missing_hot_row(&cluster, cluster.data_tenant_id(), &table)
         .await
         .expect("J7 missing hot row");
-    let checkpoint = cluster.telemetry().checkpoint();
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .expect("J7 telemetry checkpoint");
     let stale = QueryClient::new(&client)
         .query(&BifrostQueryRequest {
             sql: format!("SELECT * FROM vala.bifrost.{table}"),
@@ -606,7 +574,10 @@ async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
         .expect("boot query runtime")
         .oracle()
         .bind_topology_probe_for_test(Arc::clone(&probe));
-    let checkpoint = cluster.telemetry().checkpoint();
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .expect("topology telemetry checkpoint");
     let mut query = tokio::spawn(async move {
         let mut stream = QueryClient::new(&client)
             .query(&BifrostQueryRequest {
@@ -1039,7 +1010,10 @@ async fn oracle_production_telemetry_contract() {
         .await
         .expect("telemetry ingest");
     server.flush_bifrost().await.expect("telemetry flush");
-    let checkpoint = cluster.telemetry().checkpoint();
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .expect("telemetry checkpoint");
     assert_eq!(
         query_rows(&reader, &table, VisibilityMode::PublishedOnly)
             .await
@@ -1211,43 +1185,19 @@ async fn oracle_production_telemetry_contract() {
     );
     cluster.shutdown().await.expect("telemetry shutdown");
 
-    let unavailable_cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated())
+    let role_cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated())
         .await
         .expect("role telemetry cluster");
-    let ingest_only = unavailable_cluster.server(0).expect("ingest-only server");
-    let unavailable_client = client(ingest_only, "oracle-role-unavailable")
-        .await
-        .expect("unavailable client");
-    let checkpoint = unavailable_cluster.telemetry().checkpoint();
-    let unavailable = QueryClient::new(&unavailable_client)
-        .query(&BifrostQueryRequest {
-            sql: "SELECT * FROM vala.bifrost.unavailable".to_owned(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: None,
-        })
-        .await;
-    assert!(
-        unavailable.is_err(),
-        "ingest-only Gate must reject query routing"
-    );
-    let unavailable_delta = unavailable_cluster
-        .telemetry()
-        .delta_since(&checkpoint)
-        .expect("unavailable telemetry delta");
-    observed_families.extend(
-        unavailable_delta
-            .metrics
-            .iter()
-            .map(|sample| sample.family.clone()),
-    );
-    assert!(unavailable_delta.metrics.iter().any(|sample| {
-        sample.family == "bifrost_gate_role_unavailable_total"
-            && sample.labels.get("required_role").map(String::as_str) == Some("oracle")
-            && sample.labels.get("reason").map(String::as_str) == Some("not_configured")
-            && sample.value == 1.0
-    }));
-    let role_samples = unavailable_cluster
+    for server in role_cluster.servers() {
+        assert_eq!(
+            server.forge_process_role(),
+            wyrd_server::config::ForgeProcessRole::Server,
+            "role-separated roster must use full Server processes"
+        );
+        assert!(server.bifrost_scribe().is_some());
+        assert!(server.state().bifrost_query().is_some());
+    }
+    let role_samples = role_cluster
         .telemetry()
         .snapshot()
         .expect("role gauge snapshot");
@@ -1264,7 +1214,7 @@ async fn oracle_production_telemetry_contract() {
             "required production metric family {family} was absent across captured scenarios: {observed_families:?}"
         );
     }
-    unavailable_cluster
+    role_cluster
         .shutdown()
         .await
         .expect("role telemetry shutdown");
@@ -1342,10 +1292,16 @@ async fn public_roundtrip(
     }
     let query_server = cluster.server(query_index).ok_or("missing query node")?;
     let reader = client(query_server, "oracle-journey-reader").await?;
-    let checkpoint = cluster.telemetry().checkpoint();
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .expect("helper telemetry checkpoint");
     assert_eq!(query_rows(&reader, &table, visibility).await?, 2);
     if let Some(family) = expected_metric {
-        let delta = cluster.telemetry().delta_since(&checkpoint)?;
+        let delta = cluster
+            .telemetry()
+            .delta_since(&checkpoint)
+            .map_err(|error| error.to_string())?;
         assert!(
             delta
                 .metrics
@@ -1486,31 +1442,6 @@ async fn grpc_query_frames(
         frames.push(frame);
     }
     Ok(frames)
-}
-
-/// Return the typed status from a query that should fail before its first frame.
-///
-/// # Errors
-///
-/// Returns setup errors or an error when the server unexpectedly accepts the
-/// query and opens a stream.
-async fn grpc_query_status(
-    client: &WyrdClient,
-    request: &BifrostQueryRequest,
-) -> Result<Code, JourneyError> {
-    let connection = client.connect_grpc().await?;
-    let bearer = connection.auth().bearer().await?;
-    let mut rpc = BifrostQueryServiceClient::new(connection.channel());
-    let mut rpc_request =
-        wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request.clone()));
-    rpc_request.metadata_mut().insert(
-        "x-wyrd-access-token",
-        MetadataValue::try_from(format!("Bearer {}", bearer.expose()))?,
-    );
-    match rpc.query(rpc_request).await {
-        Ok(_) => Err("query unexpectedly returned a stream".into()),
-        Err(status) => Ok(status.code()),
-    }
 }
 
 /// Send one Arrow IPC batch through the public authenticated Gate transport.

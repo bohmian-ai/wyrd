@@ -11,6 +11,7 @@ use sqlx::Row;
 use thiserror::Error;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::{
     OraclePeerCredentials, OraclePeerTls, TonicOraclePeerTransport,
 };
@@ -25,6 +26,7 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_server::app::metrics::install_recorder;
 use wyrd_server::config::BifrostRuntimeRole;
+use wyrd_server::config::ForgeProcessRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -32,6 +34,8 @@ use wyrd_telemetry::{CapturedSpan, TelemetryConfig, TelemetryGuard, TestTraceCap
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::Bootstrap;
+use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
+use crate::bifrost::telemetry::ForgeTelemetryCapture;
 use crate::server::{
     TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
     provision_oracle_peer_credentials, test_catalog, test_redux_catalog,
@@ -48,6 +52,8 @@ pub enum BifrostTopology {
     RoleSeparated,
     /// Run six mixed pods for capacity calibration.
     SixPod,
+    /// Run one API/scheduler process with three dedicated Forge workers.
+    DedicatedForgeWorkers,
 }
 
 impl BifrostTopology {
@@ -58,6 +64,7 @@ impl BifrostTopology {
             Self::ThreePod => BifrostClusterSpec::three_mixed(),
             Self::RoleSeparated => BifrostClusterSpec::role_separated(),
             Self::SixPod => BifrostClusterSpec::six_capacity(),
+            Self::DedicatedForgeWorkers => BifrostClusterSpec::dedicated_forge_workers(),
         }
     }
 
@@ -130,22 +137,38 @@ impl BifrostClusterSpec {
         Self::mixed(3)
     }
 
-    /// Construct one Scribe/Forge node and two Oracle nodes.
+    /// Construct three full Server processes for the role-separated lane.
     #[must_use]
     pub fn role_separated() -> Self {
-        Self {
-            nodes: vec![
-                Self::node(1, [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Forge]),
-                Self::node(2, [BifrostRuntimeRole::Oracle]),
-                Self::node(3, [BifrostRuntimeRole::Oracle]),
-            ],
+        let mut spec = Self::mixed(3);
+        // Retain an explicit Oracle resource marker so legacy lane reporting
+        // can distinguish this named topology from the ordinary three-pod
+        // capacity lane without reintroducing component-partial roles.
+        for node in &mut spec.nodes {
+            node.oracle = Some(TestOracleResources::default());
         }
+        spec
     }
 
     /// Construct six mixed capacity nodes.
     #[must_use]
     pub fn six_capacity() -> Self {
         Self::mixed(6)
+    }
+
+    /// Construct one server process and three worker-only Forge processes.
+    #[must_use]
+    pub fn dedicated_forge_workers() -> Self {
+        let mut nodes = vec![Self::node(
+            1,
+            [
+                BifrostRuntimeRole::Scribe,
+                BifrostRuntimeRole::Forge,
+                BifrostRuntimeRole::Oracle,
+            ],
+        )];
+        nodes.extend((2..=4).map(|id| Self::node(id, [BifrostRuntimeRole::Forge])));
+        Self { nodes }
     }
 
     /// Build `count` mixed nodes with deterministic identities.
@@ -198,6 +221,14 @@ impl BifrostClusterSpec {
             if !ids.insert(node.node_id) {
                 return Err(ClusterError::Resource(format!(
                     "duplicate node identity {}",
+                    node.node_id.as_uuid()
+                )));
+            }
+            let forge_worker =
+                node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge);
+            if !forge_worker && !has_full_server_roles(&node.roles) {
+                return Err(ClusterError::Resource(format!(
+                    "node {} must declare all Server roles or Forge only",
                     node.node_id.as_uuid()
                 )));
             }
@@ -389,34 +420,14 @@ impl OracleTelemetryCapture {
             .map(|(series, value)| parse_metric_sample(&series, value))
             .collect()
     }
-
-    /// Return every metric family currently rendered by the production recorder.
-    #[must_use]
-    fn families(&self) -> BTreeSet<String> {
-        rendered_values(&self.metrics.render())
-            .into_iter()
-            .filter_map(|(series, value)| parse_metric_sample(&series, value).ok())
-            .map(|sample| sample.family)
-            .collect()
-    }
-
-    /// Return every finished span name currently held by the exporter.
-    #[must_use]
-    fn span_names(&self) -> BTreeSet<String> {
-        self.traces
-            .finished_since(0)
-            .into_iter()
-            .map(|span| span.name)
-            .collect()
-    }
 }
 
 /// Process-global telemetry resources kept alive for every cluster node.
 struct ProcessTelemetry {
     /// Guard retaining the one SDK tracer provider.
     guard: Arc<TelemetryGuard>,
-    /// Cloneable inspection handle.
-    capture: OracleTelemetryCapture,
+    /// Forge report capture backed by the same process recorder and provider.
+    forge_capture: ForgeTelemetryCapture,
 }
 
 /// One telemetry installation per test process.
@@ -446,13 +457,25 @@ fn process_telemetry() -> Result<&'static ProcessTelemetry, ClusterError> {
     })
     .map_err(|error| ClusterError::Telemetry(error.to_string()))?;
     let metrics = install_recorder().map_err(|error| ClusterError::Telemetry(error.to_string()))?;
+    let forge_capture = ForgeTelemetryCapture::new(metrics.clone(), traces.clone());
     let _ = PROCESS_TELEMETRY.set(ProcessTelemetry {
         guard: Arc::new(guard),
-        capture: OracleTelemetryCapture { metrics, traces },
+        forge_capture,
     });
     PROCESS_TELEMETRY
         .get()
         .ok_or_else(|| ClusterError::Telemetry("process telemetry installation raced".to_owned()))
+}
+
+/// Borrow the one process-installed production telemetry runtime for Forge tests.
+///
+/// # Errors
+/// Returns a telemetry error when process installation fails or another global
+/// recorder/subscriber already owns the process.
+pub fn shared_process_telemetry_for_test()
+-> Result<(Arc<TelemetryGuard>, ForgeTelemetryCapture), ClusterError> {
+    let process = process_telemetry()?;
+    Ok((Arc::clone(&process.guard), process.forge_capture.clone()))
 }
 
 /// Persistent local resources for one restartable node slot.
@@ -467,6 +490,31 @@ struct NodeResources {
     http_addr: std::net::SocketAddr,
     /// Fixed private/public gRPC bind retained across a restart.
     grpc_addr: std::net::SocketAddr,
+    /// Closed production process role derived from the component set.
+    process_role: ForgeProcessRole,
+}
+
+/// Optional Forge supervision controls shared by every node in one cluster.
+struct ForgeHarnessOptions {
+    /// Observer receiving successful worker completions.
+    completion_observer: Option<ForgeWorkerCompletionObserver>,
+    /// Complete Forge limit profile supplied by a journey.
+    config: Option<ForgeConfig>,
+    /// Enable the deterministic uncertain-commit catalog wrapper.
+    inject_uncertainty: bool,
+    /// Scheduler interval used by bound server roles.
+    interval: Duration,
+}
+
+impl Default for ForgeHarnessOptions {
+    fn default() -> Self {
+        Self {
+            completion_observer: None,
+            config: None,
+            inject_uncertainty: false,
+            interval: Duration::from_secs(60),
+        }
+    }
 }
 
 /// Errors raised while constructing, inspecting, or stopping a test cluster.
@@ -521,11 +569,45 @@ pub struct WyrdTestCluster {
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
-    telemetry: OracleTelemetryCapture,
+    telemetry: ForgeTelemetryCapture,
     /// Valid SYSTEM_OWNER Service credential retained across node restarts.
     oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional retained TLS fixture directory and paths for real peer transport.
     oracle_peer_tls: Option<(Arc<tempfile::TempDir>, TestOraclePeerTls)>,
+    /// Shared observer for supervised Forge worker completions.
+    forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
+    /// Shared uncertainty-injection catalog wrapper, when enabled.
+    commit_uncertainty_catalog: Option<Arc<CommitUncertaintyCatalog>>,
+    /// Optional complete Forge configuration for role fixtures.
+    forge_config: Option<ForgeConfig>,
+    /// Interval used by supervised scheduler roles.
+    forge_interval: Duration,
+}
+
+/// Stable read-only view of all currently running server slots.
+pub struct ServerView<'a> {
+    /// Running servers in stable node order.
+    items: Vec<&'a WyrdTestServer>,
+    /// Iterator cursor for direct `for`/adapter use.
+    cursor: usize,
+}
+
+impl<'a> std::ops::Deref for ServerView<'a> {
+    type Target = [&'a WyrdTestServer];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<'a> Iterator for ServerView<'a> {
+    type Item = &'a WyrdTestServer;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let server = self.items.get(self.cursor).copied();
+        self.cursor = self.cursor.saturating_add(1);
+        server
+    }
 }
 
 impl WyrdTestCluster {
@@ -690,6 +772,87 @@ impl WyrdTestCluster {
         .await
     }
 
+    /// Start one server process with three dedicated Forge workers.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, or role-supervision error.
+    pub async fn start_with_dedicated_forge_workers() -> Result<Self, ClusterError> {
+        Self::start_with_dedicated_forge_workers_with_options(None, None, None).await
+    }
+
+    /// Start dedicated workers with deterministic uncertain-commit injection.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, or role-supervision error.
+    pub async fn start_with_dedicated_forge_workers_with_uncertainty_for_test()
+    -> Result<Self, ClusterError> {
+        Self::start_with_dedicated_forge_workers_with_options(None, None, Some(true)).await
+    }
+
+    /// Start dedicated workers with a complete validated Forge config.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, or role-supervision error.
+    pub async fn start_with_dedicated_forge_workers_with_config_for_test(
+        config: ForgeConfig,
+    ) -> Result<Self, ClusterError> {
+        Self::start_with_dedicated_forge_workers_with_options(Some(config), None, None).await
+    }
+
+    /// Start an embedded `all` process with a completion observer.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, or role-supervision error.
+    pub async fn start_with_embedded_forge_observer() -> Result<Self, ClusterError> {
+        let observer = ForgeWorkerCompletionObserver::new();
+        Self::start_spec_with_all_options(
+            BifrostClusterSpec::one_mixed(),
+            Duration::ZERO,
+            None,
+            false,
+            false,
+            ForgeHarnessOptions {
+                completion_observer: Some(observer),
+                ..ForgeHarnessOptions::default()
+            },
+        )
+        .await
+    }
+
+    async fn start_with_dedicated_forge_workers_with_options(
+        forge_config: Option<ForgeConfig>,
+        forge_interval: Option<Duration>,
+        uncertainty: Option<bool>,
+    ) -> Result<Self, ClusterError> {
+        let observer = ForgeWorkerCompletionObserver::new();
+        Self::start_spec_with_all_options(
+            BifrostClusterSpec::dedicated_forge_workers(),
+            Duration::ZERO,
+            None,
+            false,
+            false,
+            ForgeHarnessOptions {
+                completion_observer: Some(observer),
+                config: forge_config,
+                inject_uncertainty: uncertainty.unwrap_or(false),
+                interval: forge_interval.unwrap_or(Duration::from_secs(60)),
+            },
+        )
+        .await
+    }
+
+    /// Return the shared Forge completion observer, when configured.
+    #[must_use]
+    pub fn forge_completion_observer(&self) -> Option<ForgeWorkerCompletionObserver> {
+        self.forge_completion_observer.clone()
+    }
+
+    /// Return the uncertainty catalog control, when configured.
+    #[must_use]
+    pub fn commit_uncertainty_catalog(&self) -> Option<Arc<CommitUncertaintyCatalog>> {
+        self.commit_uncertainty_catalog.clone()
+    }
+
     /// Build shared dependencies, retained roots, and every node slot.
     async fn start_spec_with_options(
         spec: BifrostClusterSpec,
@@ -697,6 +860,26 @@ impl WyrdTestCluster {
         scribe_admission: Option<AdmissionConfig>,
         enable_oracle_peer_tls: bool,
         delay_last_node: bool,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            spec,
+            wal_sync_delay,
+            scribe_admission,
+            enable_oracle_peer_tls,
+            delay_last_node,
+            ForgeHarnessOptions::default(),
+        )
+        .await
+    }
+
+    /// Build a topology with production Forge role supervision controls.
+    async fn start_spec_with_all_options(
+        spec: BifrostClusterSpec,
+        wal_sync_delay: Duration,
+        scribe_admission: Option<AdmissionConfig>,
+        enable_oracle_peer_tls: bool,
+        delay_last_node: bool,
+        options: ForgeHarnessOptions,
     ) -> Result<Self, ClusterError> {
         spec.validate()?;
         let process = process_telemetry()?;
@@ -734,6 +917,9 @@ impl WyrdTestCluster {
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let catalog: Arc<WyrdCatalog> = test_catalog(&fixture, &storage).await?;
         let redux_catalog: Arc<BifrostCatalog> = test_redux_catalog(&fixture, &storage).await?;
+        let commit_uncertainty_catalog = options
+            .inject_uncertainty
+            .then(|| CommitUncertaintyCatalog::new(redux_catalog.iceberg_catalog()));
         let oracle_peer_credentials =
             provision_oracle_peer_credentials(Arc::clone(&fixture)).await?;
         let oracle_peer_tls = if enable_oracle_peer_tls {
@@ -768,6 +954,7 @@ impl WyrdTestCluster {
             None
         };
         let topology = classify_topology(&spec);
+        let node_count = spec.nodes.len();
         let mut nodes = BTreeMap::new();
         for node in spec.nodes {
             let wal_root = if node.roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -784,6 +971,21 @@ impl WyrdTestCluster {
             } else {
                 None
             };
+            let process_role =
+                if node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge) {
+                    ForgeProcessRole::ForgeWorker
+                } else if has_full_server_roles(&node.roles) {
+                    if node_count == 1 {
+                        ForgeProcessRole::All
+                    } else {
+                        ForgeProcessRole::Server
+                    }
+                } else {
+                    return Err(ClusterError::Resource(format!(
+                        "node {} must declare all Server roles or Forge only",
+                        node.node_id.as_uuid()
+                    )));
+                };
             nodes.insert(
                 node.node_id,
                 NodeResources {
@@ -792,6 +994,7 @@ impl WyrdTestCluster {
                     spill_root,
                     http_addr: reserve_loopback_addr()?,
                     grpc_addr: reserve_loopback_addr()?,
+                    process_role,
                 },
             );
         }
@@ -807,9 +1010,13 @@ impl WyrdTestCluster {
             wal_sync_delay,
             scribe_admission,
             faults: OracleFaultController::default(),
-            telemetry: process.capture.clone(),
+            telemetry: process.forge_capture.clone(),
             oracle_peer_credentials,
             oracle_peer_tls,
+            forge_completion_observer: options.completion_observer.clone(),
+            commit_uncertainty_catalog: commit_uncertainty_catalog.clone(),
+            forge_config: options.config.clone(),
+            forge_interval: options.interval,
         };
         let node_ids = cluster.nodes.keys().copied().collect::<Vec<_>>();
         let delayed = delay_last_node.then(|| node_ids.last().copied()).flatten();
@@ -838,6 +1045,17 @@ impl WyrdTestCluster {
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
             .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
             .with_telemetry(Arc::clone(&process_telemetry()?.guard));
+        builder = builder.with_forge_process_role_for_test(resources.process_role);
+        builder = builder.with_forge_interval(self.forge_interval);
+        if let Some(observer) = &self.forge_completion_observer {
+            builder = builder.with_forge_completion_observer_for_test(observer.clone());
+        }
+        if let Some(config) = &self.forge_config {
+            builder = builder.with_forge_config_for_test(config.clone());
+        }
+        if let Some(catalog) = &self.commit_uncertainty_catalog {
+            builder = builder.with_forge_catalog_for_test(catalog.clone());
+        }
         if let Some(admission) = self.scribe_admission {
             builder = builder.with_scribe_admission_for_test(admission);
         }
@@ -904,7 +1122,7 @@ impl WyrdTestCluster {
 
     /// Return the process production telemetry capture handle.
     #[must_use]
-    pub const fn telemetry(&self) -> &OracleTelemetryCapture {
+    pub const fn telemetry(&self) -> &ForgeTelemetryCapture {
         &self.telemetry
     }
 
@@ -1198,14 +1416,17 @@ impl WyrdTestCluster {
     }
 
     /// Iterate independently bound running servers in stable node order.
-    pub fn servers(&self) -> impl Iterator<Item = &WyrdTestServer> {
-        self.servers.values().filter_map(Option::as_ref)
+    pub fn servers(&self) -> ServerView<'_> {
+        ServerView {
+            items: self.servers.values().filter_map(Option::as_ref).collect(),
+            cursor: 0,
+        }
     }
 
     /// Return one running pod by stable order index.
     #[must_use]
     pub fn server(&self, index: usize) -> Option<&WyrdTestServer> {
-        self.servers().nth(index)
+        self.servers().get(index).copied()
     }
 
     /// Return one running pod by stable physical node identity.
@@ -1248,17 +1469,29 @@ impl WyrdTestCluster {
     }
 }
 
+/// Return whether a node carries the complete public Server component roster.
+fn has_full_server_roles(roles: &BTreeSet<BifrostRuntimeRole>) -> bool {
+    roles.len() == 3
+        && roles.contains(&BifrostRuntimeRole::Scribe)
+        && roles.contains(&BifrostRuntimeRole::Forge)
+        && roles.contains(&BifrostRuntimeRole::Oracle)
+}
+
 /// Classify a validated concrete descriptor for legacy lane reporting.
 fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
     match spec.nodes.len() {
         1 => BifrostTopology::OnePod,
-        3 if spec
-            .nodes
-            .iter()
-            .any(|node| node.roles != BifrostClusterSpec::three_mixed().nodes[0].roles) =>
+        4 if spec.nodes.first().is_some_and(|node| {
+            node.roles.contains(&BifrostRuntimeRole::Scribe)
+                && node.roles.contains(&BifrostRuntimeRole::Forge)
+                && node.roles.contains(&BifrostRuntimeRole::Oracle)
+        }) && spec.nodes[1..].iter().all(|node| {
+            node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge)
+        }) =>
         {
-            BifrostTopology::RoleSeparated
+            BifrostTopology::DedicatedForgeWorkers
         }
+        3 if spec.nodes.iter().any(|node| node.oracle.is_some()) => BifrostTopology::RoleSeparated,
         3 => BifrostTopology::ThreePod,
         6 => BifrostTopology::SixPod,
         _ => BifrostTopology::RoleSeparated,
@@ -1369,11 +1602,16 @@ mod tests {
             .await
             .expect("cluster starts");
         let node_id = cluster.ready_query_nodes()[0];
+        let original_identity = cluster
+            .server_by_node(node_id)
+            .expect("running node")
+            .postgres_pool_identity();
         let wal_root = cluster.wal_dirs().next().expect("WAL root").to_path_buf();
         cluster.stop_node(node_id).await.expect("node stops");
         assert!(cluster.server_by_node(node_id).is_none());
         cluster.restart_node(node_id).await.expect("node restarts");
         let server = cluster.server_by_node(node_id).expect("node is running");
+        assert_ne!(server.postgres_pool_identity(), original_identity);
         assert_eq!(cluster.wal_dirs().next(), Some(wal_root.as_path()));
         let mut system_conn = cluster
             .fixture
@@ -1409,14 +1647,52 @@ mod tests {
         cluster.shutdown().await.expect("cluster shuts down");
     }
 
+    /// Stopping one process closes only its fresh pools while another process
+    /// remains queryable, and restart allocates a new pool graph.
+    #[tokio::test]
+    async fn process_pool_lifecycle_isolated_across_restart() {
+        let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
+            .await
+            .expect("cluster starts");
+        let ids = cluster.configured_node_ids();
+        let before = ids
+            .iter()
+            .map(|id| {
+                cluster
+                    .server_by_node(*id)
+                    .expect("running node")
+                    .postgres_pool_identity()
+            })
+            .collect::<Vec<_>>();
+        cluster.stop_node(ids[0]).await.expect("node stops");
+        let survivor = cluster.server_by_node(ids[1]).expect("survivor remains");
+        sqlx::query("SELECT 1")
+            .execute(survivor.state().postgres.app_pool())
+            .await
+            .expect("survivor pool remains usable");
+        cluster.restart_node(ids[0]).await.expect("node restarts");
+        let after = ids
+            .iter()
+            .map(|id| {
+                cluster
+                    .server_by_node(*id)
+                    .expect("running replacement")
+                    .postgres_pool_identity()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(after[0], before[0]);
+        assert_eq!(after[1..], before[1..]);
+        cluster.shutdown().await.expect("cluster shuts down");
+    }
+
     /// Role-separated descriptors expose only matching live endpoint sets.
     #[tokio::test]
     async fn role_separated_readiness_matches_configured_roles() {
         let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated())
             .await
             .expect("role-separated cluster starts");
-        assert_eq!(cluster.ready_ingest_nodes().len(), 1);
-        assert_eq!(cluster.ready_query_nodes().len(), 2);
+        assert_eq!(cluster.ready_ingest_nodes().len(), 3);
+        assert_eq!(cluster.ready_query_nodes().len(), 3);
         assert!(cluster.ready_ingest_nodes().iter().all(|node| {
             cluster
                 .server_by_node(*node)
@@ -1426,7 +1702,7 @@ mod tests {
         assert!(cluster.ready_query_nodes().iter().all(|node| {
             cluster
                 .server_by_node(*node)
-                .is_some_and(|server| server.bifrost_scribe().is_none())
+                .is_some_and(|server| server.bifrost_scribe().is_some())
         }));
         cluster.shutdown().await.expect("cluster shuts down");
     }

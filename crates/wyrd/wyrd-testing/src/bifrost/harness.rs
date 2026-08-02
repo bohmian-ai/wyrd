@@ -332,5 +332,6 @@ fn pods_for(cluster: &WyrdTestCluster) -> usize {
         BifrostTopology::OnePod => 1,
         BifrostTopology::ThreePod | BifrostTopology::RoleSeparated => 3,
         BifrostTopology::SixPod => 6,
+        BifrostTopology::DedicatedForgeWorkers => 4,
     }
 }

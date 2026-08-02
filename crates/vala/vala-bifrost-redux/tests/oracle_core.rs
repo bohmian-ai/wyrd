@@ -39,7 +39,7 @@ use vala_bifrost_redux::oracle::peer::{
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, Oracle,
     OracleAudit, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-    TailTransportDirectory, TestPostgresOracleAudit, VerifiedSecurityContext,
+    QueryOptions, TailTransportDirectory, TestPostgresOracleAudit, VerifiedSecurityContext,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -874,6 +874,68 @@ struct SecurityFailingAudit {
     reads: TestPostgresOracleAudit,
 }
 
+/// Audit probe that signals post-acquisition entry and remains pending until timeout.
+struct BlockingAudit {
+    /// Notification proving Oracle reached audit only after acquiring the full cut.
+    entered: Arc<tokio::sync::Notify>,
+}
+
+/// Audit probe that counts read decisions and optionally refuses them.
+struct CountingAudit {
+    /// Number of read decisions presented after a complete visibility cut.
+    decisions: Arc<AtomicUsize>,
+    /// Whether the read decision append fails closed.
+    fail: bool,
+}
+
+#[async_trait]
+impl OracleAudit for CountingAudit {
+    /// Counts the decision and returns the configured durable outcome.
+    async fn append_read_decision(
+        &self,
+        _context: &AuthorizedQueryContext,
+        _decision: BifrostQueryReadDecision,
+    ) -> Result<(), BifrostError> {
+        self.decisions.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            Err(BifrostError::QueryAuditUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Accepts unrelated security events; focused typed plans remain tenant-correct.
+    async fn append_security_violation(
+        &self,
+        _context: VerifiedSecurityContext,
+        _violation: BifrostSecurityViolation,
+    ) -> Result<(), BifrostError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl OracleAudit for BlockingAudit {
+    /// Signals audit entry and waits forever so the query's absolute deadline wins.
+    async fn append_read_decision(
+        &self,
+        _context: &AuthorizedQueryContext,
+        _decision: BifrostQueryReadDecision,
+    ) -> Result<(), BifrostError> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+
+    /// Accepts unrelated security events; the timeout proof never emits one.
+    async fn append_security_violation(
+        &self,
+        _context: VerifiedSecurityContext,
+        _violation: BifrostSecurityViolation,
+    ) -> Result<(), BifrostError> {
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl OracleAudit for SecurityFailingAudit {
     /// Commits the read decision through the standard SQL-backed owner.
@@ -966,6 +1028,80 @@ impl TailReadTransport for FenceProbeTransport {
             });
         }
         Ok(FenceRelease { released: true })
+    }
+}
+
+/// Async release probe that records first polls and can remain pending forever.
+struct CleanupReleaseProbeTransport {
+    /// Stream identity returned by successful acquisition.
+    node_id: wyrd_spec::vala::api::NodeId,
+    /// Whether the async release remains pending until its cleanup timeout.
+    block_release: bool,
+    /// Shared count incremented on the first poll of each async release body.
+    release_polls: Arc<AtomicUsize>,
+    /// Shared count incremented only when a release future finishes normally.
+    release_completions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl TailReadTransport for CleanupReleaseProbeTransport {
+    /// Returns one valid metadata-only fence for the requested stream.
+    async fn acquire_fence(
+        &self,
+        request: wyrd_spec::vala::api::AcquireTailFenceRequest,
+    ) -> Result<wyrd_spec::vala::api::TailReadFence, TailReadError> {
+        Ok(wyrd_spec::vala::api::TailReadFence {
+            fence_id: wyrd_spec::vala::api::TailFenceId::new(uuid::Uuid::now_v7()),
+            binding: request.binding,
+            event_day: request.event_day,
+            stream: wyrd_spec::vala::api::TailStreamIdentity {
+                node_id: self.node_id,
+                writer_epoch: request.exclusive_sealed.writer_epoch,
+            },
+            inclusive_live: request.exclusive_sealed.clone(),
+            exclusive_sealed: request.exclusive_sealed,
+            schema_fingerprint: request.schema_fingerprint,
+            tail_protocol_version: request.tail_protocol_version,
+            expires_at: request.deadline,
+        })
+    }
+
+    /// Returns an empty complete page; this probe is used only before draining.
+    async fn read_page(
+        &self,
+        _request: wyrd_spec::vala::api::TailPageRequest,
+    ) -> Result<LocalTailPage, TailReadError> {
+        Ok(LocalTailPage {
+            batches: Vec::new(),
+            next: None,
+            complete: true,
+        })
+    }
+
+    /// Rejects the synchronous path because cleanup must exercise the async future.
+    fn release_fence(
+        &self,
+        _fence_id: wyrd_spec::vala::api::TailFenceId,
+    ) -> Result<FenceRelease, TailReadError> {
+        Err(TailReadError::State {
+            detail: "cleanup probe requires async release".to_owned(),
+        })
+    }
+
+    /// Records first poll, then either blocks or completes with an injected failure.
+    async fn release_fence_async(
+        &self,
+        _fence_id: wyrd_spec::vala::api::TailFenceId,
+    ) -> Result<FenceRelease, TailReadError> {
+        self.release_polls.fetch_add(1, Ordering::SeqCst);
+        if self.block_release {
+            std::future::pending().await
+        } else {
+            self.release_completions.fetch_add(1, Ordering::SeqCst);
+            Err(TailReadError::State {
+                detail: "injected async release failure".to_owned(),
+            })
+        }
     }
 }
 
@@ -2399,6 +2535,288 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
+}
+
+/// A post-acquisition audit refusal awaits every release, including after one sibling fails.
+#[tokio::test]
+async fn fused_audit_failure_releases_every_fence_before_return() {
+    let fixture = OracleFixture::new("oracle_audit_fence_cleanup").await;
+    let tails = Arc::new(TailTransportDirectory::default());
+    let releases = Arc::new(AtomicUsize::new(0));
+    for (fail_release, writer_epoch) in [(true, 1_u64), (false, 2_u64)] {
+        let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+        tails.insert_live_stream(
+            fixture.table.fqn(),
+            node_id,
+            writer_epoch,
+            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            Arc::new(FenceProbeTransport {
+                node_id,
+                fail_acquire: false,
+                fail_release,
+                releases: Arc::clone(&releases),
+                batches: Vec::new(),
+                page_reads: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+    }
+    let oracle = fixture
+        .oracle(Arc::new(FailingAudit), tails, OracleConfig::default())
+        .await;
+    let error = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT value FROM {}", fixture.table.fqn()),
+                visibility: VisibilityMode::Fused,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect_err("audit refusal fails the query");
+    assert_eq!(error, BifrostError::QueryAuditUnavailable);
+    assert_eq!(releases.load(Ordering::SeqCst), 2);
+    tokio::task::yield_now().await;
+    assert_eq!(releases.load(Ordering::SeqCst), 2);
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// A synchronized post-acquisition deadline releases the complete cut before return.
+#[tokio::test]
+async fn fused_post_acquisition_timeout_releases_before_return() {
+    let fixture = OracleFixture::new("oracle_audit_fence_timeout").await;
+    let tails = Arc::new(TailTransportDirectory::default());
+    let release_polls = Arc::new(AtomicUsize::new(0));
+    let release_completions = Arc::new(AtomicUsize::new(0));
+    for (block_release, writer_epoch) in [(true, 1_u64), (false, 2_u64)] {
+        let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+        tails.insert_live_stream(
+            fixture.table.fqn(),
+            node_id,
+            writer_epoch,
+            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            Arc::new(CleanupReleaseProbeTransport {
+                node_id,
+                block_release,
+                release_polls: Arc::clone(&release_polls),
+                release_completions: Arc::clone(&release_completions),
+            }),
+        );
+    }
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let oracle = Arc::new(
+        fixture
+            .oracle(
+                Arc::new(BlockingAudit {
+                    entered: Arc::clone(&entered),
+                }),
+                tails,
+                OracleConfig::default(),
+            )
+            .await,
+    );
+    let query_oracle = Arc::clone(&oracle);
+    let context = fixture.context();
+    let table = fixture.table.fqn();
+    let query = tokio::spawn(async move {
+        query_oracle
+            .query_sql(
+                context,
+                BifrostQueryRequest {
+                    sql: format!("SELECT value FROM {table}"),
+                    visibility: VisibilityMode::Fused,
+                    freshness: FreshnessPolicy::Strict,
+                    deadline_ms: Some(100),
+                },
+            )
+            .await
+    });
+    entered.notified().await;
+    let error = query
+        .await
+        .expect("query task joins")
+        .expect_err("audit wait reaches query deadline");
+    assert_eq!(error, BifrostError::QueryTimeout);
+    assert_eq!(release_polls.load(Ordering::SeqCst), 2);
+    assert_eq!(release_completions.load(Ordering::SeqCst), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(release_polls.load(Ordering::SeqCst), 2);
+    assert_eq!(release_completions.load(Ordering::SeqCst), 1);
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// Typed Fused acquisition failure records no success decision or provider read.
+#[tokio::test]
+async fn typed_fused_acquisition_failure_precedes_audit_and_read() {
+    let fixture = OracleFixture::new("oracle_typed_acquire_failure").await;
+    let tails = Arc::new(TailTransportDirectory::default());
+    let releases = Arc::new(AtomicUsize::new(0));
+    let page_reads = Arc::new(AtomicUsize::new(0));
+    let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+    tails.insert_live_stream(
+        fixture.table.fqn(),
+        node_id,
+        1,
+        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        Arc::new(FenceProbeTransport {
+            node_id,
+            fail_acquire: true,
+            fail_release: false,
+            releases,
+            batches: Vec::new(),
+            page_reads: Arc::clone(&page_reads),
+        }),
+    );
+    let decisions = Arc::new(AtomicUsize::new(0));
+    let oracle = fixture
+        .oracle(
+            Arc::new(CountingAudit {
+                decisions: Arc::clone(&decisions),
+                fail: false,
+            }),
+            tails,
+            OracleConfig::default(),
+        )
+        .await;
+    let plan = oracle
+        .typed_dataframe(fixture.tenant, &fixture.table.fqn())
+        .await
+        .expect("typed dataframe")
+        .into_optimized_plan()
+        .expect("typed plan");
+    let error = oracle
+        .query_plan(
+            fixture.context(),
+            plan,
+            QueryOptions {
+                visibility: VisibilityMode::Fused,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .await
+        .expect_err("typed acquisition fails");
+    assert_eq!(error, BifrostError::QueryVisibilityUnavailable);
+    assert_eq!(decisions.load(Ordering::SeqCst), 0);
+    assert_eq!(page_reads.load(Ordering::SeqCst), 0);
+    shutdown_oracle(&oracle).await;
+}
+
+/// Typed Fused success commits one decision and produces one successful output.
+#[tokio::test]
+async fn typed_fused_success_commits_one_decision_and_output() {
+    let fixture = OracleFixture::new("oracle_typed_success").await;
+    let decisions = Arc::new(AtomicUsize::new(0));
+    let tails = Arc::new(TailTransportDirectory::default());
+    let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+    tails.insert_live_stream(
+        fixture.table.fqn(),
+        node_id,
+        1,
+        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        Arc::new(FenceProbeTransport {
+            node_id,
+            fail_acquire: false,
+            fail_release: false,
+            releases: Arc::new(AtomicUsize::new(0)),
+            batches: Vec::new(),
+            page_reads: Arc::new(AtomicUsize::new(0)),
+        }),
+    );
+    let oracle = fixture
+        .oracle(
+            Arc::new(CountingAudit {
+                decisions: Arc::clone(&decisions),
+                fail: false,
+            }),
+            tails,
+            OracleConfig::default(),
+        )
+        .await;
+    let plan = oracle
+        .typed_dataframe(fixture.tenant, &fixture.table.fqn())
+        .await
+        .expect("typed dataframe")
+        .into_optimized_plan()
+        .expect("typed plan");
+    let stream = oracle
+        .query_plan(
+            fixture.context(),
+            plan,
+            QueryOptions {
+                visibility: VisibilityMode::Fused,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .await
+        .expect("typed query starts");
+    assert_eq!(
+        terminal(stream).await.outcome,
+        QueryTerminalOutcome::Success
+    );
+    assert_eq!(decisions.load(Ordering::SeqCst), 1);
+    shutdown_oracle(&oracle).await;
+}
+
+/// Typed Fused audit failure releases the pre-acquired complete cut before return.
+#[tokio::test]
+async fn typed_fused_audit_failure_releases_before_return() {
+    let fixture = OracleFixture::new("oracle_typed_audit_failure").await;
+    let tails = Arc::new(TailTransportDirectory::default());
+    let releases = Arc::new(AtomicUsize::new(0));
+    let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+    tails.insert_live_stream(
+        fixture.table.fqn(),
+        node_id,
+        1,
+        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        Arc::new(FenceProbeTransport {
+            node_id,
+            fail_acquire: false,
+            fail_release: false,
+            releases: Arc::clone(&releases),
+            batches: Vec::new(),
+            page_reads: Arc::new(AtomicUsize::new(0)),
+        }),
+    );
+    let decisions = Arc::new(AtomicUsize::new(0));
+    let oracle = fixture
+        .oracle(
+            Arc::new(CountingAudit {
+                decisions: Arc::clone(&decisions),
+                fail: true,
+            }),
+            tails,
+            OracleConfig::default(),
+        )
+        .await;
+    let plan = oracle
+        .typed_dataframe(fixture.tenant, &fixture.table.fqn())
+        .await
+        .expect("typed dataframe")
+        .into_optimized_plan()
+        .expect("typed plan");
+    let error = oracle
+        .query_plan(
+            fixture.context(),
+            plan,
+            QueryOptions {
+                visibility: VisibilityMode::Fused,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .await
+        .expect_err("typed audit refuses query");
+    assert_eq!(error, BifrostError::QueryAuditUnavailable);
+    assert_eq!(decisions.load(Ordering::SeqCst), 1);
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+    shutdown_oracle(&oracle).await;
 }
 
 /// Remote-style release failure is awaited and `Drop` schedules no second release.

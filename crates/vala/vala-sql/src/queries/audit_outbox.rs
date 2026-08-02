@@ -219,3 +219,78 @@ fn result_str(result: AuditResult) -> &'static str {
         AuditResult::Failure => "failure",
     }
 }
+
+#[cfg(test)]
+mod pg_tests {
+    //! Database parity proof for the execute-only recovery audit encoder.
+
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::{
+        auth::{PrincipalId, PrincipalKindTag},
+        request_id::RequestId,
+        vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod},
+    };
+
+    use super::entry_hash;
+
+    /// The SQL definer function produces the exact canonical Rust detail and hash bytes.
+    #[tokio::test]
+    async fn oracle_recovery_sql_hash_matches_canonical_rust_encoder() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let request_id = RequestId::now_v7();
+        let seq: i64 = sqlx::query_scalar(
+            "SELECT vala.append_oracle_admission_recovery_audit($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(request_id.as_str())
+        .bind(2_i64)
+        .bind(3_i64)
+        .bind(5_i64)
+        .bind(8_i64)
+        .bind(13_i64)
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("recovery append executes");
+        let (stored_detail, stored_prev_hash, stored_entry_hash): (String, Vec<u8>, Vec<u8>) =
+            sqlx::query_as(
+                "SELECT detail,prev_hash,entry_hash FROM vala.audit_outbox \
+                 WHERE data_tenant_id=$1 AND seq=$2",
+            )
+            .bind(uuid::Uuid::nil())
+            .bind(seq)
+            .fetch_one(&fixture.superuser_pool().await.expect("superuser pool"))
+            .await
+            .expect("recovery audit reads");
+        let detail = AuditDetail::OracleAdmissionRecovery {
+            expired_lease_count: 2,
+            active_lease_count: 3,
+            interactive_slots: 5,
+            analytical_slots: 8,
+            total_slots: 13,
+        };
+        let canonical_detail = wyrd_spec::vala::api::audit_detail_canonical_json(&detail);
+        let event = AuditEvent::new(
+            request_id,
+            None,
+            "bifrost.oracle.admission_recovery".to_owned(),
+            "bifrost.oracle.admission".to_owned(),
+            None,
+            PrincipalId::new(uuid::Uuid::nil()),
+            PrincipalKindTag::Service,
+            AuthMethod::Internal,
+            "bifrost:oracle".to_owned(),
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "recovered Oracle admission aggregates".to_owned(),
+        )
+        .with_detail(detail);
+        let expected_hash = entry_hash(
+            &stored_prev_hash,
+            seq,
+            &event,
+            None,
+            Some(&canonical_detail),
+        );
+        assert_eq!(stored_detail, canonical_detail);
+        assert_eq!(stored_entry_hash, expected_hash);
+    }
+}

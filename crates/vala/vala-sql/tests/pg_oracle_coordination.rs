@@ -733,7 +733,13 @@ async fn reconciliation_repairs_interrupted_counter() {
 #[tokio::test]
 async fn pg_oracle_startup_reconciles_shared_scopes() {
     let (fixture, tenant) = setup().await;
+    let tenant_b = DataTenantId::new_v7();
+    fixture
+        .seed_additional_tenant_with_uuid(tenant_b, "oracle-recovery-second")
+        .await
+        .expect("second tenant seeds");
     let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+    let owner_b = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant_b);
     let leader = NodeId::new(uuid::Uuid::now_v7());
     let now = Utc::now();
     let mut interactive = request(
@@ -776,6 +782,36 @@ async fn pg_oracle_startup_reconciles_shared_scopes() {
     expired.class_limit = 20;
     expired.tenant_limit = 20;
     owner.acquire(&expired).await.expect("crash-leftover lease");
+    let mut second_tenant_active = request(
+        tenant_b,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        7,
+        now + Duration::minutes(5),
+    );
+    second_tenant_active.cluster_limit = 20;
+    second_tenant_active.class_limit = 20;
+    second_tenant_active.tenant_limit = 20;
+    owner_b
+        .acquire(&second_tenant_active)
+        .await
+        .expect("second tenant active lease");
+    let mut second_tenant_expired = request(
+        tenant_b,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        1,
+        now + Duration::seconds(1),
+    );
+    second_tenant_expired.cluster_limit = 20;
+    second_tenant_expired.class_limit = 20;
+    second_tenant_expired.tenant_limit = 20;
+    owner_b
+        .acquire(&second_tenant_expired)
+        .await
+        .expect("second tenant expired lease");
     let recovery_now = now + Duration::seconds(2);
 
     owner
@@ -793,8 +829,8 @@ async fn pg_oracle_startup_reconciles_shared_scopes() {
     .fetch_all(fixture.operator_pool().pool())
     .await
     .expect("shared counters read");
-    assert!(rows.contains(&("cluster".to_owned(), "all".to_owned(), 5)));
-    assert!(rows.contains(&("class".to_owned(), "interactive".to_owned(), 2)));
+    assert!(rows.contains(&("cluster".to_owned(), "all".to_owned(), 12)));
+    assert!(rows.contains(&("class".to_owned(), "interactive".to_owned(), 9)));
     assert!(rows.contains(&("class".to_owned(), "analytical".to_owned(), 3)));
     let expired_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.oracle_admission_leases WHERE expires_at <= $1",
@@ -804,6 +840,181 @@ async fn pg_oracle_startup_reconciles_shared_scopes() {
     .await
     .expect("expired leases count");
     assert_eq!(expired_count, 0);
+    let events: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT operation,resource,principal_kind,payload_summary,detail \
+         FROM vala.audit_outbox WHERE data_tenant_id=$1 \
+         AND operation='bifrost.oracle.admission_recovery'",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_all(&fixture.superuser_pool().await.expect("superuser pool"))
+    .await
+    .expect("system recovery audit reads");
+    assert_eq!(events.len(), 1);
+    let (operation, resource, principal_kind, summary, detail) = &events[0];
+    assert_eq!(operation, "bifrost.oracle.admission_recovery");
+    assert_eq!(resource, "bifrost.oracle.admission");
+    assert_eq!(principal_kind, "service");
+    assert_eq!(summary, "recovered Oracle admission aggregates");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).expect("recovery detail JSON"),
+        serde_json::json!({
+            "kind": "oracle_admission_recovery",
+            "expired_lease_count": 2,
+            "active_lease_count": 3,
+            "interactive_slots": 9,
+            "analytical_slots": 3,
+            "total_slots": 12,
+        })
+    );
+}
+
+/// An audit append failure rolls back lease expiry, counter repair, and chain state.
+#[tokio::test]
+async fn pg_oracle_recovery_audit_failure_rolls_back_all_state() {
+    let (fixture, tenant) = setup().await;
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+    let now = Utc::now();
+    let mut expired = request(
+        tenant,
+        QueryId::new(uuid::Uuid::now_v7()),
+        NodeId::new(uuid::Uuid::now_v7()),
+        1,
+        4,
+        now + Duration::seconds(1),
+    );
+    expired.cluster_limit = 20;
+    expired.class_limit = 20;
+    expired.tenant_limit = 20;
+    owner.acquire(&expired).await.expect("expired lease seeds");
+    let recovery_now = now + Duration::seconds(2);
+    let superuser = fixture.superuser_pool().await.expect("table-owner pool");
+    sqlx::query(
+        "CREATE FUNCTION vala.reject_oracle_recovery_audit() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN IF NEW.operation='bifrost.oracle.admission_recovery' THEN \
+         RAISE EXCEPTION 'injected recovery audit failure'; END IF; RETURN NEW; END $$",
+    )
+    .execute(&superuser)
+    .await
+    .expect("audit rejection function installs");
+    sqlx::query(
+        "CREATE TRIGGER reject_oracle_recovery_audit BEFORE INSERT ON vala.audit_outbox \
+         FOR EACH ROW EXECUTE FUNCTION vala.reject_oracle_recovery_audit()",
+    )
+    .execute(&superuser)
+    .await
+    .expect("audit rejection trigger installs");
+
+    owner
+        .inner
+        .recover_shared_scopes(fixture.operator_pool(), recovery_now)
+        .await
+        .expect_err("recovery audit failure propagates");
+
+    let lease_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_leases WHERE data_tenant_id=$1",
+    )
+    .bind(uuid::Uuid::from(tenant))
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("rolled-back lease reads");
+    assert_eq!(lease_count, 1);
+    let cluster_slots: i64 = sqlx::query_scalar(
+        "SELECT used_slots FROM vala.oracle_admission_accounting \
+         WHERE data_tenant_id=$1 AND scope_kind='cluster' AND scope_key='global' \
+         AND accounting_class='all'",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("rolled-back counter reads");
+    assert_eq!(cluster_slots, 4);
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 \
+         AND operation='bifrost.oracle.admission_recovery'",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_one(&superuser)
+    .await
+    .expect("rolled-back audit reads");
+    assert_eq!(audit_count, 0);
+}
+
+/// The platform operator receives only the fixed recovery function capability.
+#[tokio::test]
+async fn pg_oracle_recovery_audit_authority_is_execute_only() {
+    let (fixture, _) = setup().await;
+    let superuser = fixture.superuser_pool().await.expect("superuser pool");
+    let metadata: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT p.prosecdef, \
+         COALESCE(p.proconfig, ARRAY[]::text[]) @> ARRAY['search_path=\"\"'], \
+         NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) acl WHERE acl.grantee=0 AND acl.privilege_type='EXECUTE'), \
+         has_function_privilege('wyrd_platform_admin', \
+           'vala.append_oracle_admission_recovery_audit(text,bigint,bigint,bigint,bigint,bigint)', 'EXECUTE') \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='vala' AND p.proname='append_oracle_admission_recovery_audit'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("function authority metadata reads");
+    assert_eq!(metadata, (true, true, true, true));
+
+    for table in ["vala.audit_chain_head", "vala.audit_outbox"] {
+        let privileges: (bool, bool, bool, bool) = sqlx::query_as(
+            "SELECT has_table_privilege('wyrd_platform_admin',$1,'SELECT'), \
+             has_table_privilege('wyrd_platform_admin',$1,'INSERT'), \
+             has_table_privilege('wyrd_platform_admin',$1,'UPDATE'), \
+             has_table_privilege('wyrd_platform_admin',$1,'DELETE')",
+        )
+        .bind(table)
+        .fetch_one(&superuser)
+        .await
+        .expect("table privilege metadata reads");
+        assert_eq!(privileges, (false, false, false, false), "{table}");
+    }
+
+    for statement in [
+        "SELECT * FROM vala.audit_chain_head LIMIT 1",
+        "INSERT INTO vala.audit_chain_head DEFAULT VALUES",
+        "UPDATE vala.audit_chain_head SET updated_at=now()",
+        "DELETE FROM vala.audit_chain_head",
+        "SELECT * FROM vala.audit_outbox LIMIT 1",
+        "INSERT INTO vala.audit_outbox DEFAULT VALUES",
+        "UPDATE vala.audit_outbox SET payload_summary='forbidden'",
+        "DELETE FROM vala.audit_outbox",
+    ] {
+        let error = sqlx::query(statement)
+            .execute(fixture.operator_pool().pool())
+            .await
+            .expect_err("direct audit-table access is denied");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .as_deref(),
+            Some("42501")
+        );
+    }
+
+    let request_id = wyrd_spec::request_id::RequestId::now_v7();
+    let negative = sqlx::query_scalar::<_, i64>(
+        "SELECT vala.append_oracle_admission_recovery_audit($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(request_id.as_str())
+    .bind(-1_i64)
+    .bind(0_i64)
+    .bind(0_i64)
+    .bind(0_i64)
+    .bind(0_i64)
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect_err("negative recovery counter is rejected");
+    assert_eq!(
+        negative
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("22003")
+    );
 }
 
 /// Proves reconciliation and acquisition serialize on the canonical counter.

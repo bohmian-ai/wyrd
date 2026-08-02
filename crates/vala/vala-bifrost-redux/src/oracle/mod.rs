@@ -79,6 +79,13 @@ pub const DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
 pub const INTERACTIVE_SCAN_LIMIT_SECONDS: f64 = 10.0;
 /// Bytes per second used by the normative classification estimate.
 pub const ESTIMATED_SCAN_BYTES_PER_SECOND: f64 = 1_073_741_824.0;
+/// Maximum joined cleanup time for every fence after the query deadline has failed.
+///
+/// Cleanup receives a fresh private budget so an expired query deadline cannot
+/// prevent first-polling a release. All sibling releases run concurrently under
+/// this bound; cancellation of the owning query task can still stop outstanding
+/// remote attempts, which remain idempotent and recoverable by the Scribe TTL.
+const TAIL_FENCE_RELEASE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 /// Authenticated caller context used by the engine before a server adapter
 /// adds transport-specific metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1536,10 +1543,6 @@ impl Oracle {
         } else {
             Vec::new()
         };
-        let remaining = input
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BifrostError::QueryTimeout)?;
         let audit_span = tracing::info_span!(
             "bifrost.oracle.audit",
             audit_kind = "read_decision",
@@ -1547,6 +1550,10 @@ impl Oracle {
         );
         let audit_started = Instant::now();
         let result = async {
+            let remaining = input
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(BifrostError::QueryTimeout)?;
             let decision = read_decision(
                 input.context,
                 &input.request.sql,
@@ -1575,11 +1582,13 @@ impl Oracle {
         .record(audit_started.elapsed().as_secs_f64());
         if let Err(error) = result {
             tracing::error!(error = %error, "Oracle read-decision audit failed");
-            return Err(if error == BifrostError::QueryTimeout {
+            let public_error = if error == BifrostError::QueryTimeout {
                 error
             } else {
                 BifrostError::QueryAuditUnavailable
-            });
+            };
+            drainer.release_acquired(acquired).await;
+            return Err(public_error);
         }
         if acquired.is_empty() {
             Ok(DrainedTails {
@@ -1665,51 +1674,32 @@ impl Oracle {
                 &self.catalog,
             )
             .await?;
-        let remaining = options
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BifrostError::QueryTimeout)?;
-        let audit_span = tracing::info_span!(
-            "bifrost.oracle.audit",
-            audit_kind = "read_decision",
-            query_class = query_class_label(class)
+        let fence_owner = TailFenceDrainer::new(
+            &self.tails,
+            &self.memory,
+            Arc::clone(&self.telemetry),
+            class,
+            options.deadline,
+            admitted.cancellation.clone(),
+            wyrd_spec::vala::api::FreshnessPolicy::Strict,
         );
-        let audit_started = Instant::now();
-        let audit_result = async {
-            tokio::time::timeout(
-                remaining,
-                self.audit.append_read_decision(
-                    context,
-                    plan_read_decision(context, &plan, options, class, &cuts)?,
-                ),
-            )
-            .await
-            .map_err(|_| BifrostError::QueryTimeout)?
-            .map_err(|_| BifrostError::QueryAuditUnavailable)
+        let acquired = if options.visibility == VisibilityMode::Fused {
+            fence_owner.acquire(&cuts).await?
+        } else {
+            Vec::new()
+        };
+        let audit_result = self
+            .audit_typed_decision(context, &plan, options, class, &cuts)
+            .await;
+        if let Err(error) = audit_result {
+            fence_owner.release_acquired(acquired).await;
+            return Err(error);
         }
-        .instrument(audit_span)
-        .await;
-        metrics::histogram!(
-            "bifrost_oracle_audit_seconds",
-            "audit_kind" => "read_decision",
-            "outcome" => if audit_result.is_ok() { "success" } else { "failed" }
-        )
-        .record(audit_started.elapsed().as_secs_f64());
-        audit_result?;
-        let mut drained = DrainedTails::default();
-        if options.visibility == VisibilityMode::Fused {
-            let fence_owner = TailFenceDrainer::new(
-                &self.tails,
-                &self.memory,
-                Arc::clone(&self.telemetry),
-                class,
-                options.deadline,
-                admitted.cancellation.clone(),
-                wyrd_spec::vala::api::FreshnessPolicy::Strict,
-            );
-            let fences = fence_owner.acquire(&cuts).await?;
-            drained = fence_owner.drain(fences).await?;
-        }
+        let mut drained = if acquired.is_empty() {
+            DrainedTails::default()
+        } else {
+            fence_owner.drain(acquired).await?
+        };
         admitted.live_reservations = std::mem::take(&mut drained.reservations);
         let providers = self
             .planner
@@ -1748,6 +1738,58 @@ impl Oracle {
             stale_replanned: false,
             query_telemetry,
         })
+    }
+
+    /// Builds and durably appends one typed-plan success decision within its deadline.
+    ///
+    /// The operation runs only after the caller has acquired the complete optional
+    /// Fused cut. It records the canonical audit latency and leaves acquired-fence
+    /// cleanup to the typed execution workflow that owns those resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns query timeout when no deadline remains or the append exceeds it,
+    /// query audit unavailable when the durable writer refuses the event, or the
+    /// typed decision-construction error for an invalid immutable cut.
+    async fn audit_typed_decision(
+        &self,
+        context: &AuthorizedQueryContext,
+        plan: &datafusion::logical_expr::LogicalPlan,
+        options: QueryOptions,
+        class: QueryClass,
+        cuts: &[PinnedSealedTable],
+    ) -> Result<(), BifrostError> {
+        let audit_span = tracing::info_span!(
+            "bifrost.oracle.audit",
+            audit_kind = "read_decision",
+            query_class = query_class_label(class)
+        );
+        let audit_started = Instant::now();
+        let result = async {
+            let remaining = options
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(BifrostError::QueryTimeout)?;
+            tokio::time::timeout(
+                remaining,
+                self.audit.append_read_decision(
+                    context,
+                    plan_read_decision(context, plan, options, class, cuts)?,
+                ),
+            )
+            .await
+            .map_err(|_| BifrostError::QueryTimeout)?
+            .map_err(|_| BifrostError::QueryAuditUnavailable)
+        }
+        .instrument(audit_span)
+        .await;
+        metrics::histogram!(
+            "bifrost_oracle_audit_seconds",
+            "audit_kind" => "read_decision",
+            "outcome" => if result.is_ok() { "success" } else { "failed" }
+        )
+        .record(audit_started.elapsed().as_secs_f64());
+        result
     }
 
     /// Returns whether startup reconciliation completed and queries may enter admission.
@@ -3363,10 +3405,27 @@ impl TailFenceDrainer<'_> {
         }
     }
 
-    /// Releases every completed acquisition before returning from a partial failure.
+    /// Releases every completed acquisition under one fresh joined cleanup budget.
+    ///
+    /// Every release future is installed and first-polled independently of the
+    /// expired query deadline. A blocking or failed release cannot prevent a
+    /// sibling attempt, and no release future survives this awaited method.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the owning task can interrupt outstanding remote releases after
+    /// some siblings complete. Release is idempotent and Scribe's retained-fence
+    /// TTL remains the crash/cancellation fallback rather than ordinary cleanup.
     async fn release_acquired(&self, acquired: Vec<AcquiredTailFence>) {
+        let mut releases = FuturesUnordered::new();
         for mut fence in acquired {
-            if !self.release_one(&mut fence).await {
+            releases.push(async move {
+                self.release_one_with_timeout(&mut fence, TAIL_FENCE_RELEASE_CLEANUP_TIMEOUT)
+                    .await
+            });
+        }
+        while let Some(released) = releases.next().await {
+            if !released {
                 tracing::warn!("Oracle live-tail fence release was not confirmed");
             }
         }
@@ -3710,8 +3769,20 @@ impl TailFenceDrainer<'_> {
             .deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
+        self.release_one_with_timeout(acquired, remaining).await
+    }
+
+    /// Polls one release within the caller-owned lifecycle budget.
+    ///
+    /// The query drain path supplies its remaining query duration, while
+    /// post-error aggregate cleanup supplies a fresh private bound.
+    async fn release_one_with_timeout(
+        &self,
+        acquired: &mut AcquiredTailFence,
+        timeout: Duration,
+    ) -> bool {
         let released = tokio::time::timeout(
-            remaining,
+            timeout,
             acquired
                 .transport
                 .release_fence_async(acquired.fence.fence_id),

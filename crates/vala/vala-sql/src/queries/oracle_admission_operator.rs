@@ -4,7 +4,7 @@
 //! classes across tenants and is compiled without a live SQLx schema cache.
 
 use chrono::{DateTime, Utc};
-use wyrd_spec::DataTenantId;
+use wyrd_spec::{DataTenantId, request_id::RequestId};
 
 use super::oracle_admission::OracleAdmissionLeases;
 use crate::{OperatorPool, SqlError};
@@ -52,15 +52,16 @@ impl OracleAdmissionLeases {
                     detail: "Oracle shared accounting rows are incomplete".to_owned(),
                 });
             }
-            sqlx::query(
+            let expired_lease_count = sqlx::query(
                 "DELETE FROM vala.oracle_admission_leases WHERE expires_at <= $1",
             )
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(SqlError::from)?;
-            let active = sqlx::query_as::<_, (String, i64)>(
-                "SELECT query_class::text, COALESCE(sum(slot_units), 0)::bigint \
+            .map_err(SqlError::from)?
+            .rows_affected();
+            let active = sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT query_class::text, count(*)::bigint, COALESCE(sum(slot_units), 0)::bigint \
                  FROM vala.oracle_admission_leases \
                  WHERE expires_at > $1 GROUP BY query_class",
             )
@@ -70,13 +71,17 @@ impl OracleAdmissionLeases {
             .map_err(SqlError::from)?;
             let interactive = active
                 .iter()
-                .find(|(class, _)| class == "interactive")
-                .map_or(0, |(_, slots)| *slots);
+                .find(|(class, _, _)| class == "interactive")
+                .map_or(0, |(_, _, slots)| *slots);
             let analytical = active
                 .iter()
-                .find(|(class, _)| class == "analytical")
-                .map_or(0, |(_, slots)| *slots);
-            let total = interactive + analytical;
+                .find(|(class, _, _)| class == "analytical")
+                .map_or(0, |(_, _, slots)| *slots);
+            let total = interactive.checked_add(analytical).ok_or_else(|| {
+                SqlError::InvariantViolation {
+                    detail: "Oracle recovered slot total overflowed i64".to_owned(),
+                }
+            })?;
             for (scope_kind, accounting_class, used_slots) in [
                 ("cluster", "all", total),
                 ("class", "interactive", interactive),
@@ -94,6 +99,29 @@ impl OracleAdmissionLeases {
                 .await
                 .map_err(SqlError::from)?;
             }
+            let active_lease_count = active.iter().try_fold(0_i64, |count, (_, rows, _)| {
+                count.checked_add(*rows).ok_or_else(|| SqlError::InvariantViolation {
+                    detail: "Oracle active lease count overflowed i64".to_owned(),
+                })
+            })?;
+            let expired_lease_count = i64::try_from(expired_lease_count).map_err(|_| {
+                SqlError::InvariantViolation {
+                    detail: "Oracle expired lease count overflowed i64".to_owned(),
+                }
+            })?;
+            let request_id = RequestId::now_v7();
+            sqlx::query_scalar::<_, i64>(
+                "SELECT vala.append_oracle_admission_recovery_audit($1,$2,$3,$4,$5,$6)",
+            )
+            .bind(request_id.as_str())
+            .bind(expired_lease_count)
+            .bind(active_lease_count)
+            .bind(interactive)
+            .bind(analytical)
+            .bind(total)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(SqlError::from)?;
             Ok::<(), SqlError>(())
         }
         .await;

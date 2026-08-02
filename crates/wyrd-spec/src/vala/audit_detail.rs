@@ -289,6 +289,19 @@ pub enum CardScopeMintKind {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditDetail {
+    /// Bounded deployment-wide aggregates captured by Oracle admission recovery.
+    OracleAdmissionRecovery {
+        /// Number of expired admission leases removed by recovery.
+        expired_lease_count: u64,
+        /// Number of unexpired admission leases retained by recovery.
+        active_lease_count: u64,
+        /// Interactive slot units retained across active leases.
+        interactive_slots: u64,
+        /// Analytical slot units retained across active leases.
+        analytical_slots: u64,
+        /// Total slot units retained across every active lease.
+        total_slots: u64,
+    },
     /// Immutable, scrubbed Bifrost visibility-cut read decision.
     BifrostQueryReadDecision {
         /// Digest of the normalized query.
@@ -688,6 +701,35 @@ mod tests {
             r#"{"backend":"s3","error_code":"STORAGE_BACKEND_FAILURE","kind":"storage","operation":"backend_failed","status_code":503,"storage_path":"cards/a","upload_id":null}"#
         );
         assert!(!audit_detail_canonical_json(&detail).contains(' '));
+    }
+
+    /// Pins the scrubbed recovery aggregate as a closed canonical contract.
+    #[test]
+    fn oracle_admission_recovery_is_bounded_and_canonical() {
+        let detail = AuditDetail::OracleAdmissionRecovery {
+            expired_lease_count: 2,
+            active_lease_count: 3,
+            interactive_slots: 5,
+            analytical_slots: 8,
+            total_slots: 13,
+        };
+        let canonical = audit_detail_canonical_json(&detail);
+        assert_eq!(
+            canonical,
+            r#"{"active_lease_count":3,"analytical_slots":8,"expired_lease_count":2,"interactive_slots":5,"kind":"oracle_admission_recovery","total_slots":13}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AuditDetail>(&canonical).expect("deserialize recovery detail"),
+            detail
+        );
+        assert_eq!(
+            serde_json::to_value(&detail)
+                .expect("serialize recovery detail")
+                .as_object()
+                .expect("recovery detail object")
+                .len(),
+            6
+        );
     }
 
     /// Preserves the live replacement audit shape across its persisted JSON boundary.

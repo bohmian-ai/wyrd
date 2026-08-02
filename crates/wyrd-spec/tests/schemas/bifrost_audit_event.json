@@ -131,6 +131,56 @@
       "description": "Structured detail for one auditable operation.",
       "oneOf": [
         {
+          "description": "Bounded deployment-wide aggregates captured by Oracle admission recovery.",
+          "type": "object",
+          "required": [
+            "active_lease_count",
+            "analytical_slots",
+            "expired_lease_count",
+            "interactive_slots",
+            "kind",
+            "total_slots"
+          ],
+          "properties": {
+            "active_lease_count": {
+              "description": "Number of unexpired admission leases retained by recovery.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "analytical_slots": {
+              "description": "Analytical slot units retained across active leases.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "expired_lease_count": {
+              "description": "Number of expired admission leases removed by recovery.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "interactive_slots": {
+              "description": "Interactive slot units retained across active leases.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_admission_recovery"
+              ]
+            },
+            "total_slots": {
+              "description": "Total slot units retained across every active lease.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
           "description": "Immutable, scrubbed Bifrost visibility-cut read decision.",
           "type": "object",
           "required": [

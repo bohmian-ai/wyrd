@@ -92,14 +92,12 @@ fn sql_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-
     use secrecy::{ExposeSecret, SecretString};
     use sqlx::AssertSqlSafe;
     use url::Url;
 
     use super::{ROLE_BOOTSTRAP_SQL_TEMPLATE, role_bootstrap_sql};
-    use crate::postgres_boot::EmbeddedRoleCredentials;
+    use crate::postgres_boot::{EmbeddedConfig, EmbeddedRoleCredentials, PostgresBoot};
     use crate::{PoolConfig, pool::build_pool};
 
     /// External bootstrap source used to assert contract parity.
@@ -220,25 +218,38 @@ mod tests {
         }
     }
 
-    /// The rendered embedded owner repairs every managed membership edge while
-    /// retaining authority that belongs to an unrelated operator role.
+    /// A private embedded lifecycle repairs every managed membership edge
+    /// while retaining authority that belongs to an unrelated operator role.
     #[tokio::test]
     async fn embedded_bootstrap_converges_real_catalog() {
-        let Some(admin_url) = env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok() else {
-            return;
-        };
+        let root = std::env::temp_dir().join(format!(
+            "wyrd-role-bootstrap-convergence-{}",
+            ulid::Ulid::new()
+        ));
+        let boot = PostgresBoot::embedded(EmbeddedConfig {
+            data_dir: root.join("pg"),
+            port: 0,
+            superuser: "wyrd_embedded_owner".to_owned(),
+            superuser_password: Some(SecretString::from("embeddedOwnerPassword123")),
+            max_connections: 30,
+        })
+        .await
+        .expect("isolated embedded lifecycle starts");
+        let dsns = boot.dsns().expect("isolated embedded role DSNs resolve");
+        let admin_url = role_url(
+            dsns.platform_admin
+                .as_ref()
+                .expect("embedded platform administrator DSN exists")
+                .expose_secret(),
+            "wyrd_embedded_owner",
+            "embeddedOwnerPassword123",
+        );
         let credentials = EmbeddedRoleCredentials {
-            superuser: SecretString::from(password_from_url(&admin_url)),
-            migrator: SecretString::from(password_from_env_url("DATABASE_URL")),
-            app: SecretString::from(password_from_env_url("WYRD_DATABASE_URL")),
-            platform_admin: SecretString::from(
-                env::var("WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD")
-                    .expect("platform administrator password is configured"),
-            ),
-            catalog_app: SecretString::from(
-                env::var("WYRD_DATABASE_CATALOG_APP_PASSWORD")
-                    .expect("catalog application password is configured"),
-            ),
+            superuser: SecretString::from("embeddedOwnerPassword123"),
+            migrator: SecretString::from("embeddedMigrator123"),
+            app: SecretString::from("embeddedApp123"),
+            platform_admin: SecretString::from("embeddedAdmin123"),
+            catalog_app: SecretString::from("embeddedCatalog123"),
         };
         let admin = build_pool(&admin_url, PoolConfig::migrator_defaults())
             .await
@@ -397,20 +408,8 @@ mod tests {
         .await
         .expect("embedded drift fixture cleans up");
         admin.close().await;
-    }
-
-    /// Extracts the password from a test-only Postgres URL.
-    fn password_from_url(value: &str) -> String {
-        Url::parse(value)
-            .expect("test Postgres URL parses")
-            .password()
-            .expect("test Postgres URL carries a password")
-            .to_owned()
-    }
-
-    /// Extracts a password from one required test-only Postgres URL variable.
-    fn password_from_env_url(name: &str) -> String {
-        password_from_url(&env::var(name).expect("test Postgres URL is configured"))
+        drop(boot);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Rewrites the neutral administrator URL for one managed login role.

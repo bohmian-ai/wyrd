@@ -627,6 +627,25 @@ impl Memtable {
     /// Retire only committed immutable generations whose grace period elapsed.
     /// The returned ranges are the only ranges eligible for WAL retirement.
     pub fn sweep_once_at(&self, now: Instant) -> Result<Vec<(SealKey, WalRange)>, ScribeError> {
+        Ok(self
+            .sweep_once_with_sizes_at(now)?
+            .into_iter()
+            .map(|(seal_key, wal_range, _arrow_bytes)| (seal_key, wal_range))
+            .collect())
+    }
+
+    /// Retire committed immutable generations and retain their exact Arrow sizes.
+    ///
+    /// This shared primitive keeps ordinary WAL retirement and test-only memory
+    /// accounting aligned: both consume exactly the generations removed here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
+    fn sweep_once_with_sizes_at(
+        &self,
+        now: Instant,
+    ) -> Result<Vec<(SealKey, WalRange, usize)>, ScribeError> {
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
@@ -640,7 +659,11 @@ impl Memtable {
                         if now.saturating_duration_since(observed_at) >= self.retention_grace
                 );
                 if retire {
-                    retired.push((seal_key.clone(), entry.wal_range()));
+                    retired.push((
+                        seal_key.clone(),
+                        entry.wal_range(),
+                        entry.frozen.arrow_bytes,
+                    ));
                 } else {
                     kept.push(entry);
                 }
@@ -649,6 +672,24 @@ impl Memtable {
         }
         immutable.retain(|_, entries| !entries.is_empty());
         Ok(retired)
+    }
+
+    /// Retire eligible committed generations and return their exact Arrow bytes.
+    ///
+    /// This test-support control reports only bytes removed from the immutable
+    /// map, so callers cannot release memory for a still-pending generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn sweep_once_for_test(&self, now: Instant) -> Result<usize, ScribeError> {
+        Ok(self
+            .sweep_once_with_sizes_at(now)?
+            .into_iter()
+            .fold(0_usize, |total, (_, _, arrow_bytes)| {
+                total.saturating_add(arrow_bytes)
+            }))
     }
 
     /// Retire one published generation after its grace period.
@@ -1343,6 +1384,52 @@ mod tests {
             memtable.should_seal(&seal_key).expect("should_seal"),
             "600s active age triggers rotation"
         );
+    }
+
+    /// Test-only retirement reports only bytes from generations it removed.
+    #[test]
+    fn test_retirement_bytes_exclude_ineligible_immutable_generations() {
+        let memtable = Memtable::new_with_retention(Duration::from_secs(1));
+        let seal_key = make_test_seal_key();
+        memtable
+            .insert(
+                &seal_key,
+                make_test_event(),
+                make_test_meta(10),
+                make_test_batch(1),
+            )
+            .expect("first insert");
+        let first = memtable.freeze(&seal_key).expect("first freeze");
+        memtable
+            .complete_post_commit(first.seal_id, make_file_list_key(10, 10))
+            .expect("first complete");
+        let first_bytes = memtable.stats().expect("first stats").immutable_bytes;
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        memtable
+            .insert(
+                &seal_key,
+                make_test_event(),
+                make_test_meta(20),
+                make_test_batch(1),
+            )
+            .expect("second insert");
+        let second = memtable.freeze(&seal_key).expect("second freeze");
+        memtable
+            .complete_post_commit(second.seal_id, make_file_list_key(20, 20))
+            .expect("second complete");
+        let total_bytes = memtable.stats().expect("combined stats").immutable_bytes;
+
+        let retired_bytes = memtable
+            .sweep_once_for_test(Instant::now())
+            .expect("test retirement");
+        assert_eq!(retired_bytes, first_bytes);
+        assert!(retired_bytes < total_bytes);
+        assert_eq!(
+            memtable.stats().expect("remaining stats").immutable_bytes,
+            total_bytes.saturating_sub(retired_bytes)
+        );
+        assert_eq!(memtable.immutable_generation_count().expect("remaining"), 1);
     }
 
     #[test]

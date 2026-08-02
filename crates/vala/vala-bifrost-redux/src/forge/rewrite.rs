@@ -83,8 +83,8 @@ impl fmt::Debug for ForgeRewritePipeline {
 
 /// Immutable inputs for one deterministic rewrite operation.
 pub(crate) struct RewriteRequest<'a> {
-    /// Stable identity shared by output names, Iceberg, and audit transitions.
-    pub(crate) operation_id: Uuid,
+    /// Unique `UUIDv7` generation for this concrete execution attempt's paths.
+    pub(crate) attempt_generation: ForgeAttemptGeneration,
     /// Validated tenant/table object-storage binding.
     pub(crate) binding: &'a TenantTableBinding,
     /// Physical Arrow schema registered by the destination Iceberg table.
@@ -103,6 +103,42 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) sort_order_id: i32,
     /// Output target resolved from this operation's Iceberg table metadata.
     pub(crate) target_file_size_bytes: u64,
+}
+
+/// `UUIDv7` identity that prevents a later attempt from reusing terminal output paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForgeAttemptGeneration(Uuid);
+
+impl ForgeAttemptGeneration {
+    /// Create a fresh time-ordered generation for one rewrite execution.
+    #[must_use]
+    pub(crate) fn now_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// Reuses the durable task attempt as the immutable output generation.
+    ///
+    /// The claim transaction creates a fresh `UUIDv7` for every attempt. Passing
+    /// that identity through the rewrite boundary prevents a later retry from
+    /// publishing or reclaiming an earlier attempt's output paths.
+    #[must_use]
+    pub(crate) const fn from_attempt(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Wrap an explicit generation for deterministic test assertions.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) const fn for_test(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for ForgeAttemptGeneration {
+    /// Format the UUID generation used in immutable object names.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 /// Immutable source identity consumed by one bounded rewrite.
@@ -908,7 +944,7 @@ impl ForgeRewritePipeline {
         }
         let object_path = deterministic_output_path(
             &request.binding.object_prefix,
-            request.operation_id,
+            request.attempt_generation,
             ordinal,
         );
         self.validate_table_location(request.binding, request.table_location)?;
@@ -932,7 +968,7 @@ impl ForgeRewritePipeline {
         let table_path = format!(
             "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{}-{ordinal:05}.parquet",
             request.table_location.trim_end_matches('/'),
-            request.operation_id
+            request.attempt_generation
         );
         let partition_day = request.partition_day;
         let partition_spec_id = request.partition_spec_id;
@@ -989,6 +1025,7 @@ impl ForgeRewritePipeline {
             .write(&object_path, Buffer::from(bytes))
             .await
             .map_err(ForgeError::ObjectStore)?;
+        self.object_store.after_output_put(&object_path).await;
         Ok((file, object_path))
     }
 
@@ -1156,10 +1193,28 @@ impl ForgeRewritePipeline {
 }
 
 /// Build one deterministic relative output path from operation identity.
-fn deterministic_output_path(prefix: &str, operation_id: Uuid, ordinal: usize) -> String {
+fn deterministic_output_path(
+    prefix: &str,
+    generation: ForgeAttemptGeneration,
+    ordinal: usize,
+) -> String {
     format!(
-        "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{operation_id}-{ordinal:05}.parquet",
+        "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{generation}-{ordinal:05}.parquet",
         prefix.trim_end_matches('/')
+    )
+}
+
+/// Builds the production deterministic Forge output path for test fixtures.
+#[cfg(feature = "test-support")]
+pub fn deterministic_output_path_for_test(
+    prefix: &str,
+    operation_id: Uuid,
+    ordinal: usize,
+) -> String {
+    deterministic_output_path(
+        prefix,
+        ForgeAttemptGeneration::for_test(operation_id),
+        ordinal,
     )
 }
 
@@ -1557,21 +1612,31 @@ mod tests {
 
     /// Rotated names preserve one operation identity and ordered ordinals.
     #[test]
-    fn rotation_keeps_one_operation_identity() {
-        let operation_id = Uuid::from_u128(42);
-        let first = deterministic_output_path("tenants/a/table", operation_id, 0);
-        let second = deterministic_output_path("tenants/a/table", operation_id, 1);
-        assert!(first.contains(&operation_id.to_string()));
-        assert!(second.contains(&operation_id.to_string()));
-        assert!(first.ends_with("-00000.parquet"));
-        assert!(second.ends_with("-00001.parquet"));
+    fn terminal_attempt_cannot_republish() {
+        let terminal_generation = Uuid::now_v7();
+        let retry_generation = Uuid::now_v7();
+        let terminal = deterministic_output_path(
+            "tenants/a/table",
+            ForgeAttemptGeneration::for_test(terminal_generation),
+            0,
+        );
+        let retry = deterministic_output_path(
+            "tenants/a/table",
+            ForgeAttemptGeneration::for_test(retry_generation),
+            0,
+        );
+        assert_ne!(terminal_generation, retry_generation);
+        assert_ne!(terminal, retry);
+        assert!(terminal.ends_with("-00000.parquet"));
+        assert!(retry.ends_with("-00000.parquet"));
     }
 
     /// A writer recipe change produces a distinct deterministic storage path.
     #[test]
     fn writer_recipe_version_changes_deterministic_path() {
         let operation_id = Uuid::from_u128(42);
-        let path = deterministic_output_path("tenants/a/table", operation_id, 0);
+        let generation = ForgeAttemptGeneration::for_test(operation_id);
+        let path = deterministic_output_path("tenants/a/table", generation, 0);
         assert_eq!(
             path,
             format!(

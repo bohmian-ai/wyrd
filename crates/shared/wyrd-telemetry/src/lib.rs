@@ -2,6 +2,11 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "test-support")]
+use std::collections::BTreeMap;
+#[cfg(feature = "test-support")]
+use std::sync::{Arc, Mutex};
+
 use tracing_subscriber::EnvFilter;
 use wyrd_spec::error::WyrdError;
 
@@ -56,6 +61,114 @@ pub enum OtlpProtocol {
 pub struct TelemetryGuard {
     config: TelemetryConfig,
     tracer_provider: Option<opentelemetry_sdk::trace::TracerProvider>,
+}
+
+/// Read-only representation of one production-pipeline span captured in tests.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedSpan {
+    /// Exact instrumentation span name.
+    pub name: String,
+    /// Scrubbed production attributes indexed by their field names.
+    pub attributes: BTreeMap<String, String>,
+    /// Span duration measured by the configured provider.
+    pub duration_nanos: u64,
+}
+
+/// Read-only handle for spans exported through the test runtime's production
+/// tracer-provider construction.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub struct TestTraceCapture {
+    /// Same-provider exporter storage retained outside production owner code.
+    spans: Arc<Mutex<Vec<opentelemetry_sdk::export::trace::SpanData>>>,
+}
+
+/// Minimal in-memory exporter used without enabling the SDK's broad testing feature.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, Default)]
+struct TestSpanExporter {
+    /// Finished spans emitted by the production-shaped tracer provider.
+    spans: Arc<Mutex<Vec<opentelemetry_sdk::export::trace::SpanData>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl opentelemetry_sdk::export::trace::SpanExporter for TestSpanExporter {
+    /// Append one provider-owned export batch to the shared capture.
+    fn export(
+        &mut self,
+        mut batch: Vec<opentelemetry_sdk::export::trace::SpanData>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = opentelemetry_sdk::export::trace::ExportResult>
+                + Send
+                + 'static,
+        >,
+    > {
+        let result = self
+            .spans
+            .lock()
+            .map(|mut spans| spans.append(&mut batch))
+            .map_err(opentelemetry::trace::TraceError::from);
+        Box::pin(std::future::ready(result))
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl TestTraceCapture {
+    /// Return the current finished-span position for a later delta.
+    #[must_use]
+    pub fn checkpoint(&self) -> usize {
+        self.spans.lock().map_or(0, |spans| spans.len())
+    }
+
+    /// Return all spans finished through the test runtime's installed provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exporter lock error when a concurrent export prevents a
+    /// consistent read.
+    pub fn finished_spans(
+        &self,
+    ) -> opentelemetry::trace::TraceResult<Vec<opentelemetry_sdk::export::trace::SpanData>> {
+        self.spans
+            .lock()
+            .map(|spans| spans.clone())
+            .map_err(opentelemetry::trace::TraceError::from)
+    }
+
+    /// Return spans finished at or after one checkpoint.
+    #[must_use]
+    pub fn finished_since(&self, checkpoint: usize) -> Vec<CapturedSpan> {
+        self.finished_spans().map_or_else(
+            |_| Vec::new(),
+            |spans| {
+                spans
+                    .into_iter()
+                    .skip(checkpoint)
+                    .map(|span| CapturedSpan {
+                        name: span.name.to_string(),
+                        attributes: span
+                            .attributes
+                            .into_iter()
+                            .map(|attribute| {
+                                (
+                                    attribute.key.as_str().to_owned(),
+                                    attribute.value.to_string(),
+                                )
+                            })
+                            .collect(),
+                        duration_nanos: span
+                            .end_time
+                            .duration_since(span.start_time)
+                            .map_or(0, |duration| {
+                                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+                            }),
+                    })
+                    .collect()
+            },
+        )
+    }
 }
 
 impl TelemetryGuard {
@@ -181,6 +294,60 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
         config,
         tracer_provider: provider,
     })
+}
+
+/// Install the normal Wyrd provider construction with an in-memory span
+/// exporter for deterministic test and benchmark capture.
+///
+/// This intentionally changes only the exporter. Resource, sampling, global
+/// subscriber, and tracing-layer composition remain the production shape.
+///
+/// # Errors
+///
+/// Returns a conflict when another global tracing subscriber is already
+/// installed.
+#[cfg(feature = "test-support")]
+pub fn init_capture(
+    config: TelemetryConfig,
+) -> Result<(TelemetryGuard, TestTraceCapture), WyrdError> {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    let filter = resolve_filter(&config);
+    let service_name = config.service_name.as_deref().unwrap_or("wyrd").to_string();
+    let instance_id = ulid::Ulid::new().to_string();
+    let resource = opentelemetry_sdk::Resource::new(vec![
+        opentelemetry::KeyValue::new("service.name", service_name),
+        opentelemetry::KeyValue::new("service.instance.id", instance_id),
+    ]);
+    let sampler = match config.sample_ratio {
+        Some(ratio) => opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(ratio),
+        None => opentelemetry_sdk::trace::Sampler::AlwaysOn,
+    };
+    let exporter = TestSpanExporter::default();
+    let spans = Arc::clone(&exporter.spans);
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .with_sampler(sampler)
+        .with_resource(resource)
+        .build();
+    let tracer = provider.tracer("wyrd");
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .try_init()
+        .map_err(|_| WyrdError::Conflict {
+            message: "global tracing subscriber already set".to_string(),
+            details: serde_json::json!({ "component": "telemetry" }),
+        })?;
+    Ok((
+        TelemetryGuard {
+            config,
+            tracer_provider: Some(provider),
+        },
+        TestTraceCapture { spans },
+    ))
 }
 
 fn build_otlp_exporter(

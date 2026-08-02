@@ -56,6 +56,8 @@ where
 /// Semantics (must match the retired `select!` + `await_drain`):
 /// - The first task to finish cancels `shutdown`.
 /// - `Signal` finishing is the normal shutdown trigger — never terminal.
+/// - External cancellation enters the drain phase without classifying a worker
+///   that observes the same token as an unexpected early exit.
 /// - Any transport or worker finishing *before* shutdown is terminal (a
 ///   transport returning `Ok` early still means it stopped unexpectedly).
 /// - After shutdown is requested, remaining tasks drain up to `drain`; their
@@ -67,9 +69,18 @@ pub async fn supervise(
 ) -> Option<String> {
     let mut terminal: Option<String> = None;
 
-    // Phase 1 — wait for the first exit (or an empty set).
-    if let Some(joined) = set.join_next().await {
-        classify_first(joined, &mut terminal);
+    // Phase 1 — wait for external cancellation or the first task exit. Give an
+    // already-ready cancellation priority over workers draining that token.
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            tracing::info!("external shutdown requested; initiating drain");
+        }
+        joined = set.join_next() => {
+            if let Some(joined) = joined {
+                classify_first(joined, &mut terminal);
+            }
+        }
     }
     shutdown.cancel();
 
@@ -166,6 +177,25 @@ mod tests {
         assert!(
             shutdown.is_cancelled(),
             "token must be cancelled after supervise"
+        );
+    }
+
+    /// External cancellation does not misclassify a cooperatively draining worker.
+    #[tokio::test]
+    async fn external_cancellation_enters_graceful_drain() {
+        let shutdown = CancellationToken::new();
+        let mut set: JoinSet<TaskExit> = JoinSet::new();
+        let worker_shutdown = shutdown.clone();
+        set.spawn(worker_task(TaskId::Worker("cooperative"), async move {
+            worker_shutdown.cancelled().await;
+        }));
+
+        shutdown.cancel();
+        let result = supervise(set, shutdown, Duration::from_millis(500)).await;
+
+        assert!(
+            result.is_none(),
+            "external cancellation must drain without a terminal error: {result:?}"
         );
     }
 

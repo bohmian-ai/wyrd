@@ -16,9 +16,11 @@ use crate::app::BootExit;
 use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
-use crate::boot::{ServerBootError, spawn_maintenance_scheduler, spawn_storage_sweeper};
+use crate::boot::{
+    ServerBootError, spawn_forge_worker, spawn_maintenance_scheduler, spawn_storage_sweeper,
+};
 use crate::components::health::readiness_loop;
-use crate::config::{ServeMode, WyrdServerConfig};
+use crate::config::{ConfigError, ForgeProcessRole, ServeMode, WyrdServerConfig};
 use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener,
@@ -192,8 +194,19 @@ impl WyrdServer {
     /// never-run server never touches the global recorder.
     ///
     /// # Errors
-    /// Returns [`BootExit::Other`] on listener bind failure.
+    ///
+    /// Returns [`BootExit::Config`] before binding when the role belongs to the
+    /// dedicated Forge worker runner, or [`BootExit::Other`] on listener bind
+    /// failure.
     pub async fn bind(self, mode: ServeMode) -> Result<BoundServer, BootExit> {
+        if !self.config.role.serves_api() {
+            return Err(BootExit::Config(Box::new(ConfigError::Invalid {
+                message: "WyrdServer accepts only API roles 'all' or 'server'; run the \
+                          dedicated 'forge-worker' role through app::run"
+                    .to_owned(),
+            })));
+        }
+
         let (http_listener, http_addr) = if mode.serves_http() {
             let bind = self.config.http.bind;
             let listener = TcpListener::bind(bind).await.map_err(|e| {
@@ -313,13 +326,12 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error or if the process-
     /// global metrics recorder fails to install.
     pub async fn run(mut self) -> Result<(), BootExit> {
+        let _role_telemetry = super::metrics::ForgeRoleTelemetryGuard::started(self.config.role);
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
-
         // Health: publish the initial snapshot before driving it.
         publish_initial_health(&self.state.readiness, &mut self.reporter).await;
 
-        // Core workers.
         set.spawn(worker_task(
             TaskId::Worker("readiness"),
             readiness_loop(
@@ -368,14 +380,22 @@ impl BoundServer {
                 }
             }));
         }
-        // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
-        // live-set rebuild, and orphan GC for this process.
+
         let scheduler = spawn_maintenance_scheduler(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?;
         set.spawn(fallible_task(
             TaskId::Worker("maintenance_scheduler"),
             scheduler,
         ));
+        if self.config.role == ForgeProcessRole::All {
+            let worker = spawn_forge_worker(
+                &self.state,
+                shutdown.clone(),
+                self.config.forge.worker_concurrency,
+            )
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
+        }
 
         // Enterprise workers.
         for (name, worker) in self.extra_workers.drain(..) {
@@ -537,5 +557,29 @@ mod pg_tests {
         // Drop both without calling serve() to confirm no recorder was installed.
         drop(server1);
         drop(server2);
+    }
+
+    /// Dedicated worker configuration is rejected before WyrdServer binds any
+    /// public or metrics listener.
+    #[tokio::test]
+    async fn forge_worker_role_fails_before_api_server_binding() {
+        let config = WyrdServerConfig {
+            role: ForgeProcessRole::ForgeWorker,
+            metrics: crate::config::MetricsConfig {
+                enabled: false,
+                ..crate::config::MetricsConfig::default()
+            },
+            ..WyrdServerConfig::default()
+        };
+        let server = WyrdServer::new(config, test_state_with_auth().await)
+            .expect("server shell builds before bind-time role validation");
+        let err = match server.bind(ServeMode::Both).await {
+            Ok(_) => panic!("dedicated worker role must not enter the API server lifecycle"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(err, BootExit::Config(_)),
+            "expected config exit: {err:?}"
+        );
     }
 }

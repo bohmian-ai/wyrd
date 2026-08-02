@@ -1,7 +1,7 @@
 //! Threshold loading and hard-fail SLO evaluation.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -122,7 +122,7 @@ impl SloGate {
 
     /// Load the repository's canonical threshold file.
     pub fn from_default_path() -> Result<Self, SloError> {
-        Self::from_path("benches/thresholds.toml")
+        Self::from_path(default_threshold_path())
     }
 
     /// Return a configured threshold by its normalized key.
@@ -197,6 +197,13 @@ impl SloGate {
     }
 }
 
+/// Resolves the checked-in threshold file independently of process cwd.
+fn default_threshold_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("benches/thresholds.toml")
+}
+
 fn normalize_group(group: &str) -> String {
     let normalized = group.replace('/', ".");
     normalized
@@ -210,6 +217,15 @@ mod tests {
     use super::*;
 
     const THRESHOLDS: &str = include_str!("../../../../benches/thresholds.toml");
+
+    /// Proves the canonical loader uses the compile-time repository location.
+    #[test]
+    fn default_threshold_path_loads_checked_in_thresholds() {
+        let path = default_threshold_path();
+        assert!(path.is_absolute());
+        let gate = SloGate::from_default_path().expect("checked-in thresholds load");
+        assert!(gate.threshold("bench.bifrost.forge_slo").is_some());
+    }
 
     #[test]
     fn test_threshold_parse_from_toml() {

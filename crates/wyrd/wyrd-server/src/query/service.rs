@@ -266,6 +266,40 @@ pub async fn run_sync_query(
     caller: Caller,
     body: SyncQueryRequest,
 ) -> Result<SyncQueryResult, WyrdError> {
+    let started = std::time::Instant::now();
+    let span = tracing::info_span!("bifrost.query.execute", result = tracing::field::Empty);
+    let result =
+        tracing::Instrument::instrument(run_sync_query_inner(state, caller, body), span.clone())
+            .await;
+    let outcome = match &result {
+        Ok(_) => "success",
+        Err(
+            WyrdError::Internal { .. }
+            | WyrdError::UpstreamFailure { .. }
+            | WyrdError::Timeout { .. },
+        ) => "failed",
+        Err(_) => "rejected",
+    };
+    metrics::histogram!(
+        "bifrost_query_duration_seconds",
+        "result" => outcome
+    )
+    .record(started.elapsed().as_secs_f64());
+    span.record("result", outcome);
+    result
+}
+
+/// Execute the authorized Bifrost query after the public telemetry boundary.
+///
+/// # Errors
+///
+/// Returns authorization, validation, DataFusion, result-ceiling, encoding, or
+/// audit failures through the public query contract.
+async fn run_sync_query_inner(
+    state: &AppState,
+    caller: Caller,
+    body: SyncQueryRequest,
+) -> Result<SyncQueryResult, WyrdError> {
     authorize_audited(
         state,
         &caller,

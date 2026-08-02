@@ -9,7 +9,10 @@ use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 
-use crate::catalog::table_ref::{TableRef, is_safe_name};
+use crate::catalog::table_ref::TableRef;
+#[cfg(test)]
+use crate::catalog::table_ref::is_safe_name;
+#[cfg(test)]
 use crate::namespaces::BifrostNamespace;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -24,13 +27,14 @@ pub struct ForgeGroupKey {
 }
 
 impl ForgeGroupKey {
-    /// Build a group key from the SQL representation of a Bifrost table.
+    /// Builds a group key from the SQL representation used by parser regressions.
     ///
     /// # Errors
     ///
     /// Returns an error when the namespace is unknown or the table name is
-    /// unsafe for use in a server-owned table reference.
-    pub fn from_sql(
+    /// unsafe for a server-owned table reference.
+    #[cfg(test)]
+    fn from_sql(
         tenant: DataTenantId,
         namespace: &str,
         table_name: &str,

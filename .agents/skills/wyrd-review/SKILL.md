@@ -98,7 +98,9 @@ classification, the durable artifact, and canonical planning.
    a `Blocked` task only to validate its blocker claim. A `Planned` task is not
    eligible for implementation-conformance approval.
 4. Read `$wyrd-implement` completion evidence and living-task execution updates
-   when present. Treat them as claims to verify, not proof by themselves.
+   only after deriving the review scope from the canonical task and current
+   source. Treat them as untrusted claims: they may help locate evidence, but
+   they never establish coverage, completion, or correctness.
 5. Read the owning manifests, relevant `mise.toml` tasks, tests, generated
    sources, and nearest implementation patterns needed to judge the change.
 6. Resolve the applicable execution skill from the task and write set. Use
@@ -153,13 +155,29 @@ Do not duplicate their repository rules in this skill.
 
 ## Review conformance and adaptations
 
-Build a traceability matrix for every in-scope requirement and acceptance
-criterion:
+Derive every in-scope requirement and acceptance criterion fresh from the
+canonical task. Do not use an implementor-maintained ledger, task status,
+completion summary, test count, or prior reviewer verdict as the coverage
+source. For each requirement and criterion, reconstruct the behavior from the
+current source and tests and report:
 
-- implementation path and owning symbol;
-- test or generated artifact;
-- verification evidence;
+- the owning symbol and the code that enforces the invariant;
+- every material caller, consumer, projection, and cleanup/error path;
+- the exact test assertion that exercises the claimed production boundary;
+- recorded verification evidence and whether it actually selected that test;
 - `PASS`, `FAIL`, or `UNVERIFIED`.
+
+A path, symbol, test name, command result, or restatement of the requirement is
+not an explanation of correctness. State how the implementation enforces the
+invariant and how the cited assertion would fail if that invariant regressed.
+If either explanation cannot be made from inspected source, mark the item
+`FAIL` or `UNVERIFIED`; never infer completion from silence or narrative
+claims.
+
+In plan-execution binding mode, inspect the current cumulative source for the
+task's owners, contracts, and consumers, not only the task delta. Report any
+post-acceptance change that alters an earlier task's invariant so the
+orchestrator can reopen that task.
 
 Inspect required behavior, invariants, ordering, errors, side effects,
 negative cases, non-goals, task boundaries, consumers, and changed files.
@@ -196,9 +214,12 @@ was defective.
 Use these exact uppercase verdict tokens in the artifact and handoff. Do not
 rename them to `PASS`, `REJECT`, `CHANGES_REQUIRED`, or `BLOCKED`.
 
-Do not approve intent, compilation alone, narrative claims, weakened proof, or
-a subset of acceptance criteria. Do not use `REPLAN_REQUIRED` for work that
-`$wyrd-implement` is already authorized to diagnose and fix.
+Do not approve intent, compilation alone, narrative claims, test names, passing
+counts, weakened proof, or a subset of acceptance criteria. Do not approve a
+public/package/user-journey claim when the test bypasses that boundary through
+an in-process owner, private module, fixture-only shortcut, or mocked
+substitute. Do not use `REPLAN_REQUIRED` for work that `$wyrd-implement` is
+already authorized to diagnose and fix.
 
 ## Write and route the result
 

@@ -7,7 +7,7 @@
 //! Iceberg commits observable; the next Forge tick reconciles that state before
 //! selecting more files.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,13 +15,16 @@ use arrow::array::{Array, StringArray};
 use arrow::compute::cast;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use iceberg::spec::DataFile;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::{Buffer, Entry, Metadata};
 use sqlx::Row;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -34,7 +37,9 @@ use super::Forge;
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
+use super::metrics::{ForgeCatalogCommitStrategy, ForgeTaskMetricStrategy, ForgeTelemetry};
+use super::planner::ForgePlanCandidate;
+use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
     ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
     validate_supported_layout,
@@ -44,6 +49,8 @@ use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
+const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -57,6 +64,10 @@ pub struct ForgeConfig {
     pub max_files_per_tick: usize,
     /// Maximum input bytes processed by one tick.
     pub max_bytes_per_tick: u64,
+    /// Maximum peak memory estimate admitted for either Forge execution lane.
+    pub max_memory_bytes: u64,
+    /// Hard ceiling for one oversized singleton admitted outside the ordinary byte lane.
+    pub max_large_task_bytes: u64,
     /// Maximum bins committed by one tick.
     pub max_bins_per_tick: usize,
     /// Lease duration used to fence one table's maintenance work.
@@ -85,6 +96,10 @@ pub struct ForgeConfig {
     pub spill_limit_bytes: u64,
     /// Maximum staging hints drained by one wake-up.
     pub max_hints_per_wake: usize,
+    /// Maximum bounded open operations classified for one table and family.
+    pub max_open_operations_per_table: usize,
+    /// Maximum retained snapshots traversed by one reconciliation observation.
+    pub max_retained_snapshots_per_table: usize,
 }
 
 impl Default for ForgeConfig {
@@ -95,6 +110,8 @@ impl Default for ForgeConfig {
             max_files_per_bin: 256,
             max_files_per_tick: 1_024,
             max_bytes_per_tick: 2 * 512 * 1024 * 1024,
+            max_memory_bytes: 4 * 512 * 1024 * 1024,
+            max_large_task_bytes: 4 * 512 * 1024 * 1024,
             max_bins_per_tick: 64,
             lease_ttl: Duration::from_mins(15),
             iceberg_total_retry_timeout: Duration::from_mins(5),
@@ -109,6 +126,8 @@ impl Default for ForgeConfig {
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
             spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
             max_hints_per_wake: 256,
+            max_open_operations_per_table: DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE,
+            max_retained_snapshots_per_table: DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE,
         }
     }
 }
@@ -126,6 +145,8 @@ impl ForgeConfig {
             || self.max_files_per_bin < 2
             || self.max_files_per_tick == 0
             || self.max_bytes_per_tick == 0
+            || self.max_memory_bytes == 0
+            || self.max_large_task_bytes == 0
             || self.max_bins_per_tick == 0
             || self.lease_ttl.is_zero()
             || self.iceberg_total_retry_timeout.is_zero()
@@ -140,9 +161,18 @@ impl ForgeConfig {
             || self.max_concurrent_reads == 0
             || self.spill_limit_bytes == 0
             || self.max_hints_per_wake == 0
+            || self.max_open_operations_per_table == 0
+            || self.max_retained_snapshots_per_table == 0
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge limits must be positive and min_files/max_files_per_bin must be at least two".to_owned(),
+            });
+        }
+        if self.max_files_per_bin > self.max_files_per_tick
+            || self.max_large_task_bytes < self.max_bytes_per_tick
+        {
+            return Err(ForgeError::InvalidConfig {
+                detail: "max_files_per_bin must not exceed max_files_per_tick and max_large_task_bytes must cover the ordinary byte limit".to_owned(),
             });
         }
         let required = self
@@ -186,6 +216,13 @@ pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
     async fn before_output_put(&self, _path: &str) -> opendal::Result<()> {
         Ok(())
     }
+
+    /// Notifies test-support wrappers after one rewrite output is durable.
+    ///
+    /// Production implementations use this infallible default no-op.
+    /// Implementations may delay return for deterministic tests but cannot
+    /// reject the already successful write or mutate its ownership.
+    async fn after_output_put(&self, _path: &str) {}
 
     /// Read one staged or Iceberg-owned object.
     ///
@@ -246,6 +283,10 @@ pub struct ForgeTickOutcome {
     pub bins_skipped: usize,
     /// Durable operations recovered from audit state.
     pub reconciled: usize,
+    /// Registrations discovered by the periodic catalog roster.
+    pub tables_discovered: usize,
+    /// Registrations that reached a terminal local classification.
+    pub tables_examined: usize,
     /// Tables whose stages completed successfully.
     pub tables_succeeded: usize,
     /// Tables skipped due to lease contention or cancellation.
@@ -258,6 +299,8 @@ pub struct ForgeTickOutcome {
     pub expiry_reconciled: usize,
     /// Orphan-GC operations recovered.
     pub gc_reconciled: usize,
+    /// Objects considered by orphan GC.
+    pub gc_candidates: usize,
     /// Objects deleted by orphan GC.
     pub gc_deleted: usize,
     /// Objects skipped after a live-set or fence recheck.
@@ -266,6 +309,8 @@ pub struct ForgeTickOutcome {
     pub budget_skips: usize,
     /// Tables skipped because another Forge owner held the lease.
     pub lease_contention: usize,
+    /// Leases obtained by replacing expired owners.
+    pub lease_takeovers: usize,
     /// Operations stopped after losing the table fence.
     pub fence_losses: usize,
     /// Stage-level failures that did not abort discovery of other tables.
@@ -278,45 +323,103 @@ pub struct ForgeTickOutcome {
     pub output_rows: u64,
     /// Number of rotated output files committed to Iceberg.
     pub outputs_committed: usize,
+    /// Prepared live replacements proven committed by fresh manifest evidence.
+    pub live_recovered: usize,
+    /// Prepared live replacements proven abandoned and safely reset.
+    pub live_reset: usize,
+    /// Prepared live replacements still inside the uncertainty window.
+    pub live_pending: usize,
+    /// Prepared live replacements lacking terminal proof.
+    pub live_unresolved: usize,
+    /// Open-operation pages that exceeded their configured cap.
+    pub open_operation_overflows: usize,
+    /// Staging files that remain for a later fold.
+    pub staging_pending_files: usize,
+    /// Current-snapshot live files seen by right-size planning.
+    pub live_candidates: usize,
+    /// Live rewrite groups planned by the tick.
+    pub live_groups_planned: usize,
+    /// Live rewrite groups committed by the tick.
+    pub live_groups_committed: usize,
+    /// Live plans invalidated by snapshot change.
+    pub live_snapshot_changes: usize,
+    /// Staging inputs committed by fold work.
+    pub staging_input_files: usize,
+    /// Staging input bytes committed by fold work.
+    pub staging_input_bytes: u64,
+    /// Staging outputs committed by fold work.
+    pub staging_output_files: usize,
+    /// Staging output bytes committed by fold work.
+    pub staging_output_bytes: u64,
+    /// Live replacement input files committed by the tick.
+    pub live_input_files: usize,
+    /// Live replacement input bytes committed by the tick.
+    pub live_input_bytes: u64,
+    /// Live replacement output files committed by the tick.
+    pub live_output_files: usize,
+    /// Live replacement output bytes committed by the tick.
+    pub live_output_bytes: u64,
+    /// Whether the periodic owner examined its complete roster.
+    pub tick_complete: bool,
+    /// Whether conservative work remains after this outcome.
+    pub pending_work: bool,
 }
 
 impl ForgeTickOutcome {
-    /// Merge another isolated stage outcome into this aggregate.
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.groups_seen += other.groups_seen;
-        self.bins_committed += other.bins_committed;
-        self.bins_skipped += other.bins_skipped;
-        self.reconciled += other.reconciled;
-        self.tables_succeeded += other.tables_succeeded;
-        self.tables_skipped += other.tables_skipped;
-        self.tables_failed += other.tables_failed;
-        self.reconciliation_recovered += other.reconciliation_recovered;
-        self.expiry_reconciled += other.expiry_reconciled;
-        self.gc_reconciled += other.gc_reconciled;
-        self.gc_deleted += other.gc_deleted;
-        self.gc_skipped += other.gc_skipped;
-        self.budget_skips += other.budget_skips;
-        self.lease_contention += other.lease_contention;
-        self.fence_losses += other.fence_losses;
-        self.stage_failures += other.stage_failures;
-        self.spill_bytes = self.spill_bytes.saturating_add(other.spill_bytes);
-        self.input_rows = self.input_rows.saturating_add(other.input_rows);
-        self.output_rows = self.output_rows.saturating_add(other.output_rows);
-        self.outputs_committed = self
-            .outputs_committed
-            .saturating_add(other.outputs_committed);
+    /// Returns true only for a complete, observed no-work periodic pass.
+    #[must_use]
+    pub fn is_converged(&self) -> bool {
+        self.tick_complete
+            && self.tables_examined == self.tables_discovered
+            && !self.pending_work
+            && [
+                self.groups_seen,
+                self.bins_committed,
+                self.bins_skipped,
+                self.reconciled,
+                self.tables_skipped,
+                self.tables_failed,
+                self.reconciliation_recovered,
+                self.expiry_reconciled,
+                self.gc_reconciled,
+                self.gc_candidates,
+                self.gc_deleted,
+                self.gc_skipped,
+                self.budget_skips,
+                self.lease_contention,
+                self.lease_takeovers,
+                self.fence_losses,
+                self.stage_failures,
+                self.staging_pending_files,
+                self.live_candidates,
+                self.live_groups_planned,
+                self.live_groups_committed,
+                self.live_snapshot_changes,
+                self.live_recovered,
+                self.live_reset,
+                self.live_pending,
+                self.live_unresolved,
+                self.open_operation_overflows,
+                self.staging_input_files,
+                self.staging_output_files,
+                self.live_input_files,
+                self.live_output_files,
+                self.outputs_committed,
+            ]
+            .into_iter()
+            .all(|value| value == 0)
+            && [
+                self.staging_input_bytes,
+                self.staging_output_bytes,
+                self.live_input_bytes,
+                self.live_output_bytes,
+                self.spill_bytes,
+                self.input_rows,
+                self.output_rows,
+            ]
+            .into_iter()
+            .all(|value| value == 0)
     }
-}
-
-/// File, byte, and bin counters shared by one bounded Forge work batch.
-#[derive(Debug, Default)]
-pub(crate) struct ForgeTickBudget {
-    /// Input files already committed by the batch.
-    files: usize,
-    /// Input bytes already committed by the batch.
-    bytes: u64,
-    /// Rewrite bins already committed by the batch.
-    bins: usize,
 }
 
 /// Reconcile prepared compaction audits for one tenant/table before new work.
@@ -384,141 +487,423 @@ impl Forge {
         )
     }
 
-    /// Reconcile prepared compactions before admitting new table work.
+    /// Discovers bounded per-partition staging bins for durable task planning.
+    ///
+    /// Each returned candidate is executable by one task and one Iceberg
+    /// transaction. Cross-day staging rows therefore never enter a single
+    /// durable payload that the worker could only publish partially.
     ///
     /// # Errors
     ///
-    /// Returns SQL, catalog, audit, or fence failures. Recovery preserves all
-    /// prepared outputs until their complete live-set status is certain.
-    pub(super) async fn run_compaction_reconciliation_for_table(
+    /// Returns SQL, row decoding, layout-policy, size, or bound failures.
+    pub(super) async fn discover_staging_task_candidates(
         &self,
-        lease: &mut ForgeLease,
-        table_key: &ForgeTableKey,
         binding: &TenantTableBinding,
-    ) -> Result<usize, ForgeError> {
-        let mut reconciled = 0;
-        for key in self.load_reconciliation_keys().await? {
-            if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
-                continue;
-            }
-            reconciled += self.reconcile_group(lease, &key, binding).await?;
+        current_day: NaiveDate,
+    ) -> Result<Vec<ForgePlanCandidate>, ForgeError> {
+        let rows = sqlx::query(
+            r"SELECT id,file_path,file_size,min_event_time,max_event_time,partition_day
+                FROM vala.file_list
+               WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND NOT compacted
+               ORDER BY partition_day,min_event_time,max_event_time,id
+               LIMIT $4",
+        )
+        .bind(binding.tenant.as_uuid())
+        .bind(&binding.logical_namespace)
+        .bind(&binding.table_name)
+        .bind(
+            i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
+                }
+            })?,
+        )
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        let mut grouped = BTreeMap::<NaiveDate, Vec<CandidateFile>>::new();
+        for row in rows {
+            let day = row
+                .try_get("partition_day")
+                .map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?;
+            let size: i64 = row
+                .try_get("file_size")
+                .map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?;
+            grouped.entry(day).or_default().push(CandidateFile {
+                id: row.try_get("id").map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?,
+                path: row
+                    .try_get("file_path")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?,
+                size: u64::try_from(size).map_err(|_| ForgeError::Group {
+                    detail: "negative staging file size".to_owned(),
+                })?,
+                min_event_time: row.try_get("min_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+                max_event_time: row.try_get("max_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+            });
         }
-        Ok(reconciled)
-    }
-
-    /// Select, bin-pack, and commit bounded periodic compaction work.
-    ///
-    /// # Errors
-    ///
-    /// Returns discovery, lease, rewrite, catalog, or bookkeeping failures.
-    pub(super) async fn run_compaction_bins_for_table(
-        &self,
-        lease: &mut ForgeLease,
-        table_key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        stop: &CancellationToken,
-    ) -> Result<ForgeTickOutcome, ForgeError> {
-        let rows = self.select_candidate_groups(table_key).await?;
-        let right_size_policy = self.table_right_size_policy(binding).await?;
-        let mut budget = ForgeTickBudget::default();
-        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, &mut budget, stop)
-            .await
-    }
-
-    /// Query and compact one exact durable day after an advisory hint.
-    ///
-    /// # Errors
-    ///
-    /// Returns discovery, lease, rewrite, catalog, or bookkeeping failures.
-    pub(super) async fn run_targeted_compaction_for_table(
-        &self,
-        lease: &mut ForgeLease,
-        key: &ForgeGroupKey,
-        binding: &TenantTableBinding,
-        budget: &mut ForgeTickBudget,
-        stop: &CancellationToken,
-    ) -> Result<ForgeTickOutcome, ForgeError> {
-        let rows = self.select_targeted_candidate_group(key).await?;
-        let right_size_policy = self.table_right_size_policy(binding).await?;
-        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, budget, stop)
-            .await
-    }
-}
-
-/// Plan and commit candidate rows against one caller-owned work budget.
-///
-/// # Errors
-///
-/// Returns a fence, catalog, rewrite, or durable bookkeeping error. Budget
-/// exhaustion is represented in the returned outcome rather than as failure.
-impl Forge {
-    async fn compact_candidate_rows(
-        &self,
-        lease: &mut ForgeLease,
-        binding: &TenantTableBinding,
-        rows: Vec<CandidateRow>,
-        right_size_policy: &ForgeRightSizePolicy,
-        budget: &mut ForgeTickBudget,
-        stop: &CancellationToken,
-    ) -> Result<ForgeTickOutcome, ForgeError> {
-        let mut outcome = ForgeTickOutcome::default();
-        'groups: for row in rows {
-            outcome.groups_seen += 1;
-            let bins = plan_staging_bins(
-                right_size_policy,
-                &row.files,
+        let policy = self.table_right_size_policy(binding).await?;
+        let mut candidates = Vec::new();
+        for (day, files) in grouped {
+            for bin in plan_staging_bins(
+                &policy,
+                &files,
                 self.core.config.max_files_per_bin,
-                row.key.partition_day,
-                Utc::now().date_naive(),
+                day,
+                current_day,
+            ) {
+                let total_bytes = bin.total_bytes;
+                let mut inputs = bin
+                    .files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect::<Vec<_>>();
+                inputs.sort();
+                candidates.push(ForgePlanCandidate {
+                    strategy: ForgeTaskStrategy::StagingFold,
+                    parallelism: 1,
+                    memory_bytes: total_bytes,
+                    spill_bytes: total_bytes,
+                    inputs,
+                    bytes: total_bytes,
+                    parameters: serde_json::json!({"kind":"staging_fold"}),
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Executes one exact durable staging-fold payload under the task attempt.
+    ///
+    /// The persisted input list is authoritative: every path must still be an
+    /// uncompacted row for the same tenant/table and all rows must share one
+    /// day partition. The current T13 planner emits one bounded staging task;
+    /// rejecting a changed or cross-partition set prevents the worker from
+    /// silently selecting replacement work outside that exact payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, identity, stale-plan, capacity, rewrite, fencing, catalog,
+    /// or durable-bookkeeping errors. No rewrite begins until the exact set is
+    /// reconstructed and validated.
+    pub(super) async fn execute_staging_task(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        inputs: &[String],
+        task_id: Uuid,
+        attempt_id: Uuid,
+        stop: &CancellationToken,
+    ) -> Result<iceberg::table::Table, ForgeError> {
+        let (key, bin) = self.load_exact_staging_bin(binding, inputs).await?;
+        let policy = self.table_right_size_policy(binding).await?;
+        let commit = self
+            .compact_bin(StagingRewriteRequest {
+                lease,
+                key: &key,
+                binding,
+                bin: &bin,
+                right_size_policy: &policy,
+                attempt_generation: ForgeAttemptGeneration::from_attempt(attempt_id),
+                task_identity: Some((task_id, attempt_id)),
+                stop,
+            })
+            .await?;
+        self.core
+            .telemetry
+            .record_task_spill(ForgeTaskMetricStrategy::StagingFold, commit.spill_bytes);
+        Ok(commit.committed_table)
+    }
+
+    /// Reconstructs and validates the exact durable staging payload from SQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, row decoding, stale-set, cross-partition, negative-size,
+    /// or byte-overflow errors before any rewrite begins.
+    async fn load_exact_staging_bin(
+        &self,
+        binding: &TenantTableBinding,
+        inputs: &[String],
+    ) -> Result<(ForgeGroupKey, RewriteBin), ForgeError> {
+        if inputs.is_empty() || inputs.len() > self.core.config.max_files_per_bin {
+            return Err(ForgeError::Group {
+                detail: "exact staging task must contain one bounded non-empty bin".to_owned(),
+            });
+        }
+        let rows = sqlx::query(
+            r"SELECT id,file_path,file_size,min_event_time,max_event_time,partition_day
+                 FROM vala.file_list
+                WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3
+                  AND file_path=ANY($4) AND NOT compacted
+                ORDER BY partition_day,min_event_time,max_event_time,id",
+        )
+        .bind(binding.tenant.as_uuid())
+        .bind(&binding.logical_namespace)
+        .bind(&binding.table_name)
+        .bind(inputs)
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if rows.len() != inputs.len() {
+            return Err(ForgeError::Reconciliation {
+                detail: "exact staging task inputs changed before execution".to_owned(),
+            });
+        }
+        let mut files = Vec::with_capacity(rows.len());
+        let mut partition_day = None;
+        for row in rows {
+            let day: NaiveDate =
+                row.try_get("partition_day")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?;
+            if partition_day
+                .replace(day)
+                .is_some_and(|current| current != day)
+            {
+                return Err(ForgeError::Group {
+                    detail: "exact staging task crosses a partition day".to_owned(),
+                });
+            }
+            let size: i64 = row
+                .try_get("file_size")
+                .map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?;
+            files.push(CandidateFile {
+                id: row.try_get("id").map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?,
+                path: row
+                    .try_get("file_path")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?,
+                size: u64::try_from(size).map_err(|_| ForgeError::Group {
+                    detail: "negative exact staging file size".to_owned(),
+                })?,
+                min_event_time: row.try_get("min_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+                max_event_time: row.try_get("max_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+            });
+        }
+        let actual = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let planned = inputs.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if actual != planned {
+            return Err(ForgeError::Reconciliation {
+                detail: "exact staging task path set changed before execution".to_owned(),
+            });
+        }
+        let partition_day = partition_day.ok_or_else(|| ForgeError::Group {
+            detail: "exact staging task lost its partition day".to_owned(),
+        })?;
+        let total_bytes = files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size)
+                .ok_or_else(|| ForgeError::Group {
+                    detail: "exact staging task byte total overflow".to_owned(),
+                })
+        })?;
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        Ok((key, RewriteBin { files, total_bytes }))
+    }
+
+    /// Finalizes the exact staging projection after task-tagged commit recovery.
+    ///
+    /// The persisted task input paths remain authoritative. Recovery accepts
+    /// only compacted rows from that exact set, requires one partition day,
+    /// and transitions the one matching prepared compaction operation. A
+    /// replay after the projection and audit transaction committed is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, identity, exact-set, operation-state, audit, or fence
+    /// errors. Missing, cross-partition, differently stamped, or ambiguously
+    /// prepared inputs fail closed without changing durable state.
+    pub(super) async fn stamp_recovered_staging_task(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        inputs: &[String],
+        snapshot_id: i64,
+    ) -> Result<(), ForgeError> {
+        if inputs.is_empty() || inputs.len() > self.core.config.max_files_per_bin {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovered staging task must contain one bounded non-empty bin".to_owned(),
+            });
+        }
+        let rows = sqlx::query(
+            r"SELECT id,file_path,partition_day,committed_snapshot_id
+                 FROM vala.file_list
+                WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3
+                  AND file_path=ANY($4) AND compacted
+                ORDER BY partition_day,id",
+        )
+        .bind(binding.tenant.as_uuid())
+        .bind(&binding.logical_namespace)
+        .bind(&binding.table_name)
+        .bind(inputs)
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if rows.len() != inputs.len() {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovered staging task inputs do not match the exact compacted set"
+                    .to_owned(),
+            });
+        }
+        let mut partition_day = None;
+        let mut file_ids = Vec::with_capacity(rows.len());
+        let mut actual_paths = BTreeSet::new();
+        let mut already_stamped = true;
+        for row in rows {
+            let day: NaiveDate =
+                row.try_get("partition_day")
+                    .map_err(|error| ForgeError::Reconciliation {
+                        detail: error.to_string(),
+                    })?;
+            if partition_day
+                .replace(day)
+                .is_some_and(|current| current != day)
+            {
+                return Err(ForgeError::Reconciliation {
+                    detail: "recovered staging task crosses a partition day".to_owned(),
+                });
+            }
+            file_ids.push(
+                row.try_get("id")
+                    .map_err(|error| ForgeError::Reconciliation {
+                        detail: error.to_string(),
+                    })?,
             );
-            for bin in bins {
-                if stop.is_cancelled() {
-                    return Ok(outcome);
+            actual_paths.insert(row.try_get::<String, _>("file_path").map_err(|error| {
+                ForgeError::Reconciliation {
+                    detail: error.to_string(),
                 }
-                if budget.bins >= self.core.config.max_bins_per_tick {
-                    break;
+            })?);
+            let committed: Option<i64> = row.try_get("committed_snapshot_id").map_err(|error| {
+                ForgeError::Reconciliation {
+                    detail: error.to_string(),
                 }
-                if budget.files.saturating_add(bin.files.len())
-                    > self.core.config.max_files_per_tick
-                    || budget.bytes.saturating_add(bin.total_bytes)
-                        > self.core.config.max_bytes_per_tick
-                {
-                    outcome.bins_skipped += 1;
-                    outcome.budget_skips += 1;
-                    break 'groups;
-                }
-                if !lease.renew(&self.core.operator_pool).await? {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: lease.lease_key.clone(),
+            })?;
+            match committed {
+                Some(id) if id == snapshot_id => {}
+                None => already_stamped = false,
+                Some(_) => {
+                    return Err(ForgeError::Reconciliation {
+                        detail: "recovered staging input is stamped to another snapshot".to_owned(),
                     });
                 }
-                if !lease.commit_window_fits(self.core.config.commit_window()) {
-                    outcome.bins_skipped += 1;
-                    outcome.budget_skips += 1;
-                    break 'groups;
-                }
-                let stats = self
-                    .compact_bin(lease, &row.key, binding, &bin, right_size_policy, stop)
-                    .await?;
-                outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
-                outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
-                outcome.output_rows = outcome.output_rows.saturating_add(stats.output_rows);
-                outcome.outputs_committed = outcome
-                    .outputs_committed
-                    .saturating_add(stats.outputs_committed);
-                budget.files += bin.files.len();
-                budget.bytes = budget.bytes.saturating_add(bin.total_bytes);
-                budget.bins += 1;
-                outcome.bins_committed += 1;
-            }
-            if budget.bins >= self.core.config.max_bins_per_tick
-                || budget.files >= self.core.config.max_files_per_tick
-                || budget.bytes >= self.core.config.max_bytes_per_tick
-            {
-                break;
             }
         }
-        Ok(outcome)
+        let planned_paths = inputs.iter().cloned().collect::<BTreeSet<_>>();
+        if actual_paths != planned_paths {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovered staging task path set changed".to_owned(),
+            });
+        }
+        if already_stamped {
+            return Ok(());
+        }
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day: partition_day.ok_or_else(|| ForgeError::Reconciliation {
+                detail: "recovered staging task lost its partition day".to_owned(),
+            })?,
+        };
+        let detail = self
+            .prepared_staging_detail(binding.tenant, &key, &planned_paths)
+            .await?;
+        self.stamp_reconciled(lease, &key, &file_ids, &detail, snapshot_id)
+            .await
+    }
+
+    /// Resolve the one open staging operation matching an exact recovered path set.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL or reconciliation errors when bounded operation evidence is
+    /// malformed, overflowed, absent, or ambiguous.
+    async fn prepared_staging_detail(
+        &self,
+        tenant: DataTenantId,
+        key: &ForgeGroupKey,
+        planned_paths: &BTreeSet<String>,
+    ) -> Result<AuditDetail, ForgeError> {
+        let resource = key.audit_resource();
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = ForgeOperations::new(&resource, ForgeOperationFamily::StagingFold)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if page.overflowed {
+            return Err(ForgeError::Reconciliation {
+                detail: "open staging operations exceeded the recovery bound".to_owned(),
+            });
+        }
+        let matching = page
+            .operations
+            .into_iter()
+            .filter(|operation| match &operation.prepared_detail {
+                AuditDetail::ForgeCompaction { input_paths, .. } => input_paths
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>()
+                    .eq(planned_paths),
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "expected exactly one prepared staging operation for recovered inputs; matched {}",
+                    matching.len()
+                ),
+            });
+        }
+        Ok(matching
+            .into_iter()
+            .next()
+            .expect("exactly one matching prepared staging operation was validated")
+            .prepared_detail)
     }
 }
 
@@ -586,251 +971,51 @@ fn plan_staging_bins(
         .collect()
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CandidateRow {
-    /// Tenant/table/day identity shared by every file in the row.
-    key: ForgeGroupKey,
-    /// Uncompacted files selected for this candidate group.
-    files: Vec<CandidateFile>,
+/// Borrowed authority and exact payload for one staging rewrite transaction.
+struct StagingRewriteRequest<'a> {
+    /// Mutable publication fence retained through every external effect.
+    lease: &'a mut ForgeLease,
+    /// Tenant/table/day identity for the exact staging bin.
+    key: &'a ForgeGroupKey,
+    /// Server-resolved physical table binding.
+    binding: &'a TenantTableBinding,
+    /// Exact planned staging input set.
+    bin: &'a RewriteBin,
+    /// Table-derived packing and output-size policy.
+    right_size_policy: &'a ForgeRightSizePolicy,
+    /// Attempt-owned output generation.
+    attempt_generation: ForgeAttemptGeneration,
+    /// Durable task and attempt stamped into snapshot properties.
+    task_identity: Option<(Uuid, Uuid)>,
+    /// Cancellation source observed around each effect boundary.
+    stop: &'a CancellationToken,
 }
 
 impl Forge {
-    /// Load bounded, old-enough staging candidates for one tenant/table.
-    ///
-    /// The query uses the operator pool because Forge discovers work across tenant
-    /// rows. Results are grouped by partition day and ordered deterministically so
-    /// repeated ticks make the same selection under the same durable state.
-    async fn select_candidate_groups(
-        &self,
-        table_key: &ForgeTableKey,
-    ) -> Result<Vec<CandidateRow>, ForgeError> {
-        let rows = sqlx::query(
-            r"
-        SELECT id, file_path, file_size, min_event_time, max_event_time,
-               partition_day
-          FROM vala.file_list
-         WHERE data_tenant_id = $1
-           AND namespace = $2
-           AND table_name = $3
-           AND NOT compacted
-           AND created_at < now() - interval '2 min'
-         ORDER BY partition_day, min_event_time, max_event_time, id
-         LIMIT $4
-        ",
-        )
-        .bind(table_key.tenant.as_uuid())
-        .bind(table_key.table_ref.namespace.as_str())
-        .bind(&table_key.table_ref.name)
-        .bind(
-            i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
-                }
-            })?,
-        )
-        .fetch_all(self.core.operator_pool.pool())
-        .await
-        .map_err(|error| ForgeError::Sql(error.into()))?;
-
-        let mut groups = BTreeMap::<NaiveDate, Vec<CandidateFile>>::new();
-        for row in rows {
-            let id: Uuid = row.try_get("id").map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-            let path: String = row
-                .try_get("file_path")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?;
-            let file_size: i64 = row
-                .try_get("file_size")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?;
-            let min_event_time: DateTime<Utc> =
-                row.try_get("min_event_time")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            let max_event_time: DateTime<Utc> =
-                row.try_get("max_event_time")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            let partition_day: NaiveDate =
-                row.try_get("partition_day")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            groups
-                .entry(partition_day)
-                .or_default()
-                .push(CandidateFile {
-                    id,
-                    path,
-                    size: u64::try_from(file_size).map_err(|_| ForgeError::Group {
-                        detail: "negative file size".to_owned(),
-                    })?,
-                    min_event_time,
-                    max_event_time,
-                });
-        }
-
-        Ok(groups
-            .into_iter()
-            .map(|(partition_day, files)| CandidateRow {
-                key: ForgeGroupKey {
-                    tenant: table_key.tenant,
-                    table_ref: table_key.table_ref.clone(),
-                    partition_day,
-                },
-                files,
-            })
-            .collect())
-    }
-
-    /// Load one exact durable candidate group without the periodic age guard.
-    ///
-    /// All other periodic predicates and deterministic ordering remain identical,
-    /// so a hint accelerates discovery without becoming work authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns SQL, identifier, file-size, or candidate-row decoding failures.
-    async fn select_targeted_candidate_group(
-        &self,
-        key: &ForgeGroupKey,
-    ) -> Result<Vec<CandidateRow>, ForgeError> {
-        let rows = sqlx::query(
-            r"
-        SELECT id, file_path, file_size, min_event_time, max_event_time,
-               partition_day
-          FROM vala.file_list
-         WHERE data_tenant_id = $1
-           AND namespace = $2
-           AND table_name = $3
-           AND partition_day = $4
-           AND NOT compacted
-         ORDER BY partition_day, min_event_time, max_event_time, id
-         LIMIT $5
-        ",
-        )
-        .bind(key.tenant.as_uuid())
-        .bind(key.table_ref.namespace.as_str())
-        .bind(&key.table_ref.name)
-        .bind(key.partition_day)
-        .bind(
-            i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
-                }
-            })?,
-        )
-        .fetch_all(self.core.operator_pool.pool())
-        .await
-        .map_err(|error| ForgeError::Sql(error.into()))?;
-
-        let mut files = Vec::with_capacity(rows.len());
-        for row in rows {
-            let file_size: i64 = row
-                .try_get("file_size")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?;
-            files.push(CandidateFile {
-                id: row.try_get("id").map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?,
-                path: row
-                    .try_get("file_path")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?,
-                size: u64::try_from(file_size).map_err(|_| ForgeError::Group {
-                    detail: "negative file size".to_owned(),
-                })?,
-                min_event_time: row.try_get("min_event_time").map_err(|error| {
-                    ForgeError::Group {
-                        detail: error.to_string(),
-                    }
-                })?,
-                max_event_time: row.try_get("max_event_time").map_err(|error| {
-                    ForgeError::Group {
-                        detail: error.to_string(),
-                    }
-                })?,
-            });
-        }
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(vec![CandidateRow {
-            key: key.clone(),
-            files,
-        }])
-    }
-
-    /// Load groups whose prepared SQL transition has no committed snapshot ID.
-    async fn load_reconciliation_keys(&self) -> Result<Vec<ForgeGroupKey>, ForgeError> {
-        let rows = sqlx::query(
-            r"SELECT DISTINCT data_tenant_id, namespace, table_name, partition_day
-             FROM vala.file_list
-            WHERE compacted AND committed_snapshot_id IS NULL
-            ORDER BY data_tenant_id, namespace, table_name, partition_day",
-        )
-        .fetch_all(self.core.operator_pool.pool())
-        .await
-        .map_err(|error| ForgeError::Sql(error.into()))?;
-        rows.into_iter()
-            .map(|row| {
-                let tenant_uuid: Uuid =
-                    row.try_get("data_tenant_id")
-                        .map_err(|error| ForgeError::Group {
-                            detail: error.to_string(),
-                        })?;
-                let tenant = Self::data_tenant_from_uuid(tenant_uuid)?;
-                let namespace: String =
-                    row.try_get("namespace")
-                        .map_err(|error| ForgeError::Group {
-                            detail: error.to_string(),
-                        })?;
-                let table_name: String =
-                    row.try_get("table_name")
-                        .map_err(|error| ForgeError::Group {
-                            detail: error.to_string(),
-                        })?;
-                let partition_day: NaiveDate =
-                    row.try_get("partition_day")
-                        .map_err(|error| ForgeError::Group {
-                            detail: error.to_string(),
-                        })?;
-                ForgeGroupKey::from_sql(tenant, &namespace, &table_name, partition_day)
-                    .map_err(|detail| ForgeError::Group { detail })
-            })
-            .collect()
-    }
-
-    /// Convert a database UUID into a validated data-tenant ID.
-    fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
-        DataTenantId::try_from(value).map_err(|error| ForgeError::Group {
-            detail: error.to_string(),
-        })
-    }
-
     /// Execute one fenced compaction operation from staged files to Iceberg.
     ///
     /// The sequence is read and validate, write the output, mark inputs prepared,
     /// commit the Iceberg transaction, and stamp the committed snapshot. Every
     /// external boundary is fenced so a stale lease cannot finish the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, rewrite, object-store, fence, audit, or SQL errors at
+    /// the exact durable boundary where execution stopped.
     async fn compact_bin(
         &self,
-        lease: &mut ForgeLease,
-        key: &ForgeGroupKey,
-        binding: &TenantTableBinding,
-        bin: &RewriteBin,
-        right_size_policy: &ForgeRightSizePolicy,
-        stop: &CancellationToken,
-    ) -> Result<CompactStats, ForgeError> {
+        request: StagingRewriteRequest<'_>,
+    ) -> Result<CompactCommit, ForgeError> {
+        let StagingRewriteRequest {
+            lease,
+            key,
+            binding,
+            bin,
+            right_size_policy,
+            attempt_generation,
+            task_identity,
+            stop,
+        } = request;
         let operation_id = operation_id(key, bin);
         let table = self.load_table(&binding.table_ident()).await?;
         let source_files = bin
@@ -852,7 +1037,7 @@ impl Forge {
             .rewrite
             .rewrite(
                 RewriteRequest {
-                    operation_id,
+                    attempt_generation,
                     binding,
                     schema,
                     iceberg_schema: table.metadata().current_schema().clone(),
@@ -879,6 +1064,7 @@ impl Forge {
             spill_bytes = rewrite.spill_bytes,
             "Forge streaming rewrite completed"
         );
+        let output_bytes = rewrite_output_bytes(&rewrite.files)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let prepared = forge_detail(
             key,
@@ -889,38 +1075,55 @@ impl Forge {
             None,
         )?;
         self.prepare_inputs(lease, key, bin, prepared).await?;
-        self.commit_rewrite(
-            lease,
-            CommitRewriteRequest {
-                key,
-                binding,
-                bin,
-                operation_id,
-                rewrite: &rewrite,
-                stop,
-            },
-        )
-        .await?;
-        Ok(CompactStats {
+        let committed_table = self
+            .commit_rewrite(
+                lease,
+                CommitRewriteRequest {
+                    key,
+                    binding,
+                    bin,
+                    operation_id,
+                    rewrite: &rewrite,
+                    task_identity,
+                    stop,
+                },
+            )
+            .await?;
+        self.core.telemetry.record_rewrite_volume(
+            super::metrics::ForgeMetricSource::Staging,
+            bin.files.len(),
+            bin.total_bytes,
+            rewrite.files.len(),
+            output_bytes,
+        );
+        Ok(CompactCommit {
+            committed_table,
             spill_bytes: rewrite.spill_bytes,
-            input_rows: rewrite.input_rows,
-            output_rows: rewrite.output_rows,
-            outputs_committed: rewrite.object_paths.len(),
         })
     }
 }
 
-/// Rewrite statistics returned only after the Iceberg commit succeeds.
-#[derive(Debug, Default, Clone, Copy)]
-struct CompactStats {
-    /// Peak spill bytes observed by the rewrite runtime.
+/// Sum exact output-file sizes for the production rewrite-volume counter.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the committed byte total exceeds `u64`.
+fn rewrite_output_bytes(files: &[iceberg::spec::DataFile]) -> Result<u64, ForgeError> {
+    files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.file_size_in_bytes())
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "staging rewrite output bytes overflowed u64".to_owned(),
+            })
+    })
+}
+
+/// One staging rewrite commit retaining exact returned catalog evidence.
+struct CompactCommit {
+    /// Exact table returned by the Iceberg transaction.
+    committed_table: iceberg::table::Table,
+    /// Final spill accounting observed by the completed rewrite.
     spill_bytes: u64,
-    /// Rows accepted from source batches.
-    input_rows: u64,
-    /// Rows encoded into outputs.
-    output_rows: u64,
-    /// Number of non-empty output files committed.
-    outputs_committed: usize,
 }
 
 /// Immutable inputs for one fenced Iceberg commit and its durable bookkeeping.
@@ -935,6 +1138,8 @@ struct CommitRewriteRequest<'a> {
     operation_id: Uuid,
     /// Rewritten outputs awaiting Iceberg publication.
     rewrite: &'a RewriteOutput,
+    /// Optional durable task identity recorded in the committed snapshot.
+    task_identity: Option<(Uuid, Uuid)>,
     /// Cancellation source observed while the catalog commit is unresolved.
     stop: &'a CancellationToken,
 }
@@ -947,7 +1152,10 @@ impl Forge {
     /// fence; uncertain failures remain prepared for reconciliation.
     /// Cancellation while the catalog future is unresolved returns shutdown
     /// without resetting inputs, allowing the normal lease-release path and a
-    /// successor reconciliation tick to decide the terminal state.
+    /// successor reconciliation tick to decide the terminal state. The catalog
+    /// future runs inside the shared Forge commit span with only its closed
+    /// strategy/result/role fields and scrubbed durable task UUIDs; tenant,
+    /// table, SQL, object-path, and error details never enter the span.
     ///
     /// # Errors
     ///
@@ -956,13 +1164,14 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         request: CommitRewriteRequest<'_>,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<iceberg::table::Table, ForgeError> {
         let CommitRewriteRequest {
             key,
             binding,
             bin,
             operation_id,
             rewrite,
+            task_identity,
             stop,
         } = request;
         lease.require_fence(&self.core.operator_pool).await?;
@@ -976,6 +1185,10 @@ impl Forge {
         properties.insert("forge.workflow".to_owned(), "staging-fold".to_owned());
         properties.insert("forge.operation_id".to_owned(), operation_id.to_string());
         properties.insert("forge.group".to_owned(), key.audit_resource());
+        if let Some((task_id, attempt_id)) = task_identity {
+            properties.insert("forge.task_id".to_owned(), task_id.to_string());
+            properties.insert("forge.task_attempt".to_owned(), attempt_id.to_string());
+        }
         let tx = Transaction::new(&table);
         let action = tx
             .rewrite_files()
@@ -990,39 +1203,84 @@ impl Forge {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        let commit = transaction.commit(self.core.catalog.as_ref());
+        let span = ForgeTelemetry::catalog_commit_span(
+            ForgeCatalogCommitStrategy::StagingFold,
+            task_identity,
+        );
+        let commit = transaction.commit_once(self.core.catalog.as_ref());
         tokio::pin!(commit);
         let response = tokio::select! {
-            response = tokio::time::timeout(
-                self.core.config.iceberg_total_retry_timeout,
-                &mut commit,
+            response = tracing::Instrument::instrument(
+                tokio::time::timeout(
+                    self.core.config.iceberg_total_retry_timeout,
+                    &mut commit,
+                ),
+                span.clone(),
             ) => response,
-            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            () = stop.cancelled() => {
+                span.record("result", "cancelled");
+                return Err(ForgeError::Shutdown);
+            },
         };
-        match response {
-            Ok(Ok(_)) => {}
+        let committed_table = match response {
+            Ok(Ok(committed_table)) => {
+                span.record("result", "succeeded");
+                committed_table
+            }
             Ok(Err(error)) => {
-                if !Self::is_retryable(&error) {
-                    if lease.require_fence(&self.core.operator_pool).await.is_ok() {
-                        self.reset_inputs(lease, key, bin, &rewrite.files, operation_id)
-                            .await?;
-                    } else {
-                        tracing::warn!(
-                            lease_key = %lease.lease_key,
-                            operation_id = %operation_id,
-                            "definite Iceberg failure could not be reset after fence loss"
-                        );
+                span.record("result", "failed");
+                if Self::is_retryable(&error)
+                    && let Some(recovered) = self
+                        .recover_uncertain_staging_commit(binding, task_identity)
+                        .await?
+                {
+                    recovered
+                } else {
+                    if !Self::is_retryable(&error) {
+                        if lease.require_fence(&self.core.operator_pool).await.is_ok() {
+                            self.reset_inputs(lease, key, bin, &rewrite.files, operation_id)
+                                .await?;
+                        } else {
+                            tracing::warn!(
+                                lease_key = %lease.lease_key,
+                                operation_id = %operation_id,
+                                "definite Iceberg failure could not be reset after fence loss"
+                            );
+                        }
                     }
+                    return Err(ForgeError::Catalog(error));
                 }
-                return Err(ForgeError::Catalog(error));
             }
             Err(_) => {
+                span.record("result", "timed_out");
                 return Err(ForgeError::Timeout {
                     operation: "Iceberg commit",
                 });
             }
-        }
-        let committed_table = self.load_table(&binding.table_ident()).await?;
+        };
+        self.finalize_staging_commit(lease, key, bin, rewrite, operation_id, committed_table)
+            .await
+    }
+
+    /// Stamp SQL terminal state after a staging catalog commit has succeeded.
+    ///
+    /// The Iceberg mutation has already committed before this method runs. A
+    /// failure therefore leaves the prepared SQL state for reconciliation by a
+    /// successor owner rather than attempting to reverse the catalog commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns reconciliation errors when the committed table has no current
+    /// snapshot, or SQL, audit, and fencing errors from the terminal stamp.
+    async fn finalize_staging_commit(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        bin: &RewriteBin,
+        rewrite: &RewriteOutput,
+        operation_id: Uuid,
+        committed_table: iceberg::table::Table,
+    ) -> Result<iceberg::table::Table, ForgeError> {
         let snapshot_id = committed_table
             .metadata()
             .current_snapshot_id()
@@ -1030,7 +1288,43 @@ impl Forge {
                 detail: "Iceberg replace committed without a current snapshot".to_owned(),
             })?;
         self.stamp_committed(lease, key, bin, &rewrite.files, operation_id, snapshot_id)
-            .await
+            .await?;
+        Ok(committed_table)
+    }
+
+    /// Reload an accepted staging commit after its catalog response was uncertain.
+    ///
+    /// Recovery accepts only the current snapshot tagged with both the exact
+    /// durable task and attempt identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog errors when the table cannot be reloaded.
+    async fn recover_uncertain_staging_commit(
+        &self,
+        binding: &TenantTableBinding,
+        task_identity: Option<(Uuid, Uuid)>,
+    ) -> Result<Option<iceberg::table::Table>, ForgeError> {
+        let Some((task_id, attempt_id)) = task_identity else {
+            return Ok(None);
+        };
+        let recovered = self.load_table(&binding.table_ident()).await?;
+        let matches = recovered
+            .metadata()
+            .current_snapshot()
+            .is_some_and(|snapshot| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get("forge.task_id")
+                    == Some(&task_id.to_string())
+                    && snapshot
+                        .summary()
+                        .additional_properties
+                        .get("forge.task_attempt")
+                        == Some(&attempt_id.to_string())
+            });
+        Ok(matches.then_some(recovered))
     }
 
     /// Return whether Iceberg classified an error as safe to retry.
@@ -1107,6 +1401,11 @@ impl Forge {
     ///
     /// The SQL transition and audit append share one tenant transaction, which is
     /// fenced immediately before commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn prepare_inputs(
         &self,
         lease: &mut ForgeLease,
@@ -1130,7 +1429,8 @@ impl Forge {
             r"UPDATE vala.file_list
               SET compacted = true
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5) AND NOT compacted",
+              AND partition_day = $4 AND id = ANY($5)
+              AND committed_snapshot_id IS NULL",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
@@ -1155,6 +1455,11 @@ impl Forge {
 
 impl Forge {
     /// Stamp the Iceberg snapshot ID on prepared input rows and audit the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn stamp_committed(
         &self,
         lease: &mut ForgeLease,
@@ -1177,7 +1482,8 @@ impl Forge {
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_day = $5 AND id = ANY($6)
-              AND compacted AND committed_snapshot_id IS NULL",
+              AND compacted
+              AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
         .bind(snapshot_id)
         .bind(key.tenant.as_uuid())
@@ -1210,6 +1516,11 @@ impl Forge {
 
     /// Restore prepared input rows to the uncompacted state after a definite
     /// Iceberg failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn reset_inputs(
         &self,
         lease: &mut ForgeLease,
@@ -1230,7 +1541,7 @@ impl Forge {
             r"UPDATE vala.file_list
               SET compacted = false, committed_snapshot_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5) AND compacted
+              AND partition_day = $4 AND id = ANY($5)
               AND committed_snapshot_id IS NULL",
         )
         .bind(key.tenant.as_uuid())
@@ -1263,297 +1574,13 @@ impl Forge {
 }
 
 impl Forge {
-    /// Reconcile the latest prepared audit transition for every group in a table.
-    ///
-    /// A live output is stamped as recovered. An output absent after the
-    /// uncertainty window resets the hidden inputs so a future tick can retry.
-    async fn reconcile_group(
-        &self,
-        lease: &mut ForgeLease,
-        key: &ForgeGroupKey,
-        binding: &TenantTableBinding,
-    ) -> Result<usize, ForgeError> {
-        let resource = key.audit_resource();
-        let latest = self.load_reconciliation_audits(key, &resource).await?;
-        let mut recovered = 0;
-        for (_operation_id, (detail, created_at)) in latest {
-            if !matches!(
-                &detail,
-                AuditDetail::ForgeCompaction {
-                    phase: ForgeCompactionPhase::Prepared,
-                    ..
-                }
-            ) {
-                continue;
-            }
-            let AuditDetail::ForgeCompaction {
-                input_file_ids,
-                output_paths,
-                ..
-            } = &detail
-            else {
-                continue;
-            };
-            if Self::detail_group(&detail) != resource {
-                return Err(ForgeError::Reconciliation {
-                    detail: "audit detail group differs from its resource".to_owned(),
-                });
-            }
-            self.verify_hidden_inputs(key, input_file_ids, &detail)
-                .await?;
-            if !lease.renew(&self.core.operator_pool).await? {
-                return Err(ForgeError::FenceLost {
-                    lease_key: lease.lease_key.clone(),
-                });
-            }
-            let table = self.load_table(&binding.table_ident()).await?;
-            if let Some(snapshot_id) = self.live_snapshot_for_paths(&table, output_paths).await? {
-                if !lease.renew(&self.core.operator_pool).await? {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: lease.lease_key.clone(),
-                    });
-                }
-                self.stamp_reconciled(lease, key, input_file_ids, &detail, snapshot_id)
-                    .await?;
-                recovered += 1;
-                continue;
-            }
-            if Utc::now()
-                .signed_duration_since(created_at)
-                .to_std()
-                .unwrap_or_default()
-                < self.core.config.uncertainty_bound
-            {
-                continue;
-            }
-            let first_reload = self.load_table(&binding.table_ident()).await?;
-            if self
-                .live_snapshot_for_paths(&first_reload, output_paths)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-            let second_reload = self.load_table(&binding.table_ident()).await?;
-            if self
-                .live_snapshot_for_paths(&second_reload, output_paths)
-                .await?
-                .is_none()
-            {
-                if !lease.renew(&self.core.operator_pool).await? {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: lease.lease_key.clone(),
-                    });
-                }
-                self.reset_reconciled(lease, key, input_file_ids, &detail)
-                    .await?;
-                recovered += 1;
-            }
-        }
-        Ok(recovered)
-    }
-}
-
-/// Load the latest audit detail for each compaction operation in a group.
-impl Forge {
-    async fn load_reconciliation_audits(
-        &self,
-        key: &ForgeGroupKey,
-        resource: &str,
-    ) -> Result<HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, ForgeError> {
-        let mut after_seq = 0_i64;
-        let mut latest = HashMap::new();
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        loop {
-            let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
-                &mut conn,
-                resource,
-                after_seq,
-                self.core.config.audit_page_size,
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-            let page_len = page.len();
-            for row in page {
-                after_seq = row.seq;
-                let Some(detail) = row.detail else { continue };
-                let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
-                    ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    }
-                })?;
-                Self::validate_reconciliation_detail(&detail, resource)?;
-                let AuditDetail::ForgeCompaction { operation_id, .. } = &detail else {
-                    continue;
-                };
-                latest.insert(*operation_id, (detail, row.created_at));
-            }
-            if page_len < usize::try_from(self.core.config.audit_page_size).unwrap_or(usize::MAX) {
-                break;
-            }
-        }
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        Ok(latest)
-    }
-
-    /// Validate the identity and ordering fields needed for compaction recovery.
-    fn validate_reconciliation_detail(
-        detail: &AuditDetail,
-        resource: &str,
-    ) -> Result<(), ForgeError> {
-        let AuditDetail::ForgeCompaction {
-            group,
-            input_file_ids,
-            input_paths,
-            output_paths,
-            ..
-        } = detail
-        else {
-            return Ok(());
-        };
-        if group != resource {
-            return Err(ForgeError::Reconciliation {
-                detail: "audit detail group differs from its resource".to_owned(),
-            });
-        }
-        if input_file_ids.len() < 2
-            || input_file_ids.len() != input_paths.len()
-            || input_file_ids.windows(2).any(|pair| pair[0] >= pair[1])
-            || output_paths.is_empty()
-            || output_paths.iter().any(|path| path.as_str().is_empty())
-            || output_paths.windows(2).any(|pair| pair[0] == pair[1])
-        {
-            return Err(ForgeError::Reconciliation {
-                detail: "audit detail does not contain sorted complete input identity".to_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Extract the group resource from a compaction audit detail.
-    fn detail_group(detail: &AuditDetail) -> String {
-        match detail {
-            AuditDetail::ForgeCompaction { group, .. } => group.clone(),
-            _ => String::new(),
-        }
-    }
-
-    /// Find the current snapshot only when every operation output remains live.
-    async fn live_snapshot_for_paths(
-        &self,
-        table: &iceberg::table::Table,
-        paths: &[StoragePath],
-    ) -> Result<Option<i64>, ForgeError> {
-        if paths.is_empty() {
-            return Ok(None);
-        }
-        let Some(snapshot) = table.metadata().current_snapshot() else {
-            return Ok(None);
-        };
-        let mut remaining = paths
-            .iter()
-            .map(StoragePath::as_str)
-            .collect::<std::collections::HashSet<_>>();
-        let manifest_list = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await
-            .map_err(ForgeError::Catalog)?;
-        for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
-                .await
-                .map_err(ForgeError::Catalog)?;
-            for entry in manifest.entries() {
-                if entry.is_alive() {
-                    remaining.remove(entry.data_file().file_path());
-                    if remaining.is_empty() {
-                        return Ok(Some(snapshot.snapshot_id()));
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Confirm that prepared audit inputs still match hidden `file_list` rows.
-    async fn verify_hidden_inputs(
-        &self,
-        key: &ForgeGroupKey,
-        input_file_ids: &[Uuid],
-        detail: &AuditDetail,
-    ) -> Result<(), ForgeError> {
-        let AuditDetail::ForgeCompaction { input_paths, .. } = detail else {
-            return Err(ForgeError::Reconciliation {
-                detail: "prepared audit detail is not a Forge compaction".to_owned(),
-            });
-        };
-        if input_file_ids.len() != input_paths.len() {
-            return Err(ForgeError::Reconciliation {
-                detail: "prepared audit detail has unpaired input IDs and paths".to_owned(),
-            });
-        }
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let rows = sqlx::query(
-            r"SELECT id, file_path
-             FROM vala.file_list
-            WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5)
-              AND compacted AND committed_snapshot_id IS NULL
-            ORDER BY id",
-        )
-        .bind(key.tenant.as_uuid())
-        .bind(key.table_ref.namespace.as_str())
-        .bind(&key.table_ref.name)
-        .bind(key.partition_day)
-        .bind(input_file_ids)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .map_err(|error| ForgeError::Sql(error.into()))?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-
-        let observed = rows
-            .into_iter()
-            .map(|row| {
-                Ok::<_, ForgeError>((
-                    row.try_get::<Uuid, _>("id")
-                        .map_err(|error| ForgeError::Reconciliation {
-                            detail: error.to_string(),
-                        })?,
-                    row.try_get::<String, _>("file_path").map_err(|error| {
-                        ForgeError::Reconciliation {
-                            detail: error.to_string(),
-                        }
-                    })?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut expected = input_file_ids
-            .iter()
-            .copied()
-            .zip(input_paths.iter().map(|path| path.as_str().to_owned()))
-            .collect::<Vec<_>>();
-        expected.sort_by_key(|(id, _)| *id);
-        if observed != expected {
-            return Err(ForgeError::Reconciliation {
-                detail: "prepared audit inputs no longer match hidden file_list rows".to_owned(),
-            });
-        }
-        Ok(())
-    }
-
     /// Stamp a recovered compaction with the snapshot that already contains its
     /// output.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn stamp_reconciled(
         &self,
         lease: &mut ForgeLease,
@@ -1574,7 +1601,8 @@ impl Forge {
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_day = $5 AND id = ANY($6)
-              AND compacted AND committed_snapshot_id IS NULL",
+              AND compacted
+              AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
         .bind(snapshot_id)
         .bind(key.tenant.as_uuid())
@@ -1602,6 +1630,11 @@ impl Forge {
     }
 
     /// Reset a recovered compaction whose output was never committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn reset_reconciled(
         &self,
         lease: &mut ForgeLease,
@@ -1621,7 +1654,7 @@ impl Forge {
               SET compacted = false, committed_snapshot_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5)
-              AND compacted AND committed_snapshot_id IS NULL",
+              AND committed_snapshot_id IS NULL",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
@@ -1643,6 +1676,88 @@ impl Forge {
             Self::terminal_detail(detail, ForgeCompactionPhase::Reset, None),
         )
         .await?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Drive the production recovered-stamping writer from DB integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lease, SQL, reconciliation, transition, audit, fence,
+    /// and commit errors as the production recovery path.
+    #[cfg(feature = "test-support")]
+    pub async fn stamp_reconciled_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        partition_day: NaiveDate,
+        input_file_ids: &[Uuid],
+        detail: &AuditDetail,
+        snapshot_id: i64,
+    ) -> Result<(), ForgeError> {
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        self.stamp_reconciled(lease, &key, input_file_ids, detail, snapshot_id)
+            .await
+    }
+
+    /// Drive the production reconciliation-reset writer from DB integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lease, SQL, reconciliation, transition, audit, fence,
+    /// and commit errors as the production reset path.
+    #[cfg(feature = "test-support")]
+    pub async fn reset_reconciled_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        partition_day: NaiveDate,
+        input_file_ids: &[Uuid],
+        detail: &AuditDetail,
+    ) -> Result<(), ForgeError> {
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        self.reset_reconciled(lease, &key, input_file_ids, detail)
+            .await
+    }
+
+    /// Drive the production staging-fold transition writer from integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lease, SQL, transition, audit, fence, and commit errors
+    /// as the production staging-fold transition path.
+    #[cfg(feature = "test-support")]
+    pub async fn append_compaction_transition_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        partition_day: NaiveDate,
+        detail: AuditDetail,
+        operation: &str,
+    ) -> Result<(), ForgeError> {
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        lease.require_fence(&self.core.operator_pool).await?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        self.append_system_audit(&mut conn, &key, operation, detail)
+            .await?;
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }
@@ -1676,33 +1791,59 @@ impl Forge {
         }
     }
 
-    /// Append a system-owned Forge audit event to the caller's tenant transaction.
-    pub(super) async fn append_system_audit(
+    /// Append one staging-fold transition to audit and projection in the caller's transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when event validation, audit persistence, or
+    /// the bounded operation-state transition fails.
+    async fn append_system_audit(
         &self,
         conn: &mut vala_sql::TenantConn<'_>,
         key: &ForgeGroupKey,
         operation: &str,
         detail: AuditDetail,
     ) -> Result<(), ForgeError> {
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: operation.to_owned(),
-            resource: key.audit_resource(),
-            card_ref: None,
-            principal_id: SYSTEM_PRINCIPAL,
-            principal_kind: PrincipalKindTag::Service,
-            auth_method: AuthMethod::Internal,
-            permission: "bifrost:forge".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: operation.to_owned(),
-            detail: Some(detail),
-        };
-        vala_sql::queries::audit_outbox::append_audit(conn, &event)
-            .await
-            .map(|_| ())
-            .map_err(ForgeError::Sql)
+        let resource = key.audit_resource();
+        let event = forge_transition_event(operation, resource.clone(), detail);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::StagingFold)
+            .map_err(ForgeError::Sql)?;
+        let transition = if operation == "forge.file_compact.prepared" {
+            operations.append_prepared(conn, &event).await
+        } else {
+            operations.append_terminal(conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => Ok(()),
+        }
+    }
+}
+
+/// Construct system-owned metadata for one Forge transition event.
+///
+/// Family and phase validation remain owned by [`ForgeOperations`]; this pure
+/// helper only preserves the established event envelope.
+pub(super) fn forge_transition_event(
+    operation: &str,
+    resource: String,
+    detail: AuditDetail,
+) -> AuditEvent {
+    AuditEvent {
+        request_id: RequestId::now_v7(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource,
+        card_ref: None,
+        principal_id: SYSTEM_PRINCIPAL,
+        principal_kind: PrincipalKindTag::Service,
+        auth_method: AuthMethod::Internal,
+        permission: "bifrost:forge".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: operation.to_owned(),
+        detail: Some(detail),
     }
 }
 
@@ -1775,6 +1916,51 @@ fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
+
+    /// Minimal object-store implementation used to exercise trait defaults.
+    #[derive(Debug)]
+    struct DefaultHookObjectStore;
+
+    #[async_trait]
+    impl ForgeObjectStore for DefaultHookObjectStore {
+        /// Reject reads because this unit exercises only the default notification.
+        async fn read(&self, _path: &str) -> opendal::Result<Buffer> {
+            unreachable!("default hook unit does not read objects")
+        }
+
+        /// Reject ranged reads because this unit exercises only the default notification.
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> opendal::Result<Buffer> {
+            unreachable!("default hook unit does not read object ranges")
+        }
+
+        /// Reject listings because this unit exercises only the default notification.
+        async fn list(&self, _prefix: &str) -> opendal::Result<Vec<Entry>> {
+            unreachable!("default hook unit does not list objects")
+        }
+
+        /// Reject metadata reads because this unit exercises only the default notification.
+        async fn stat(&self, _path: &str) -> opendal::Result<Metadata> {
+            unreachable!("default hook unit does not inspect objects")
+        }
+
+        /// Reject deletes because this unit exercises only the default notification.
+        async fn delete(&self, _path: &str) -> opendal::Result<()> {
+            unreachable!("default hook unit does not delete objects")
+        }
+    }
+
+    /// The production default post-PUT notification completes without failure or side effects.
+    #[tokio::test]
+    async fn after_output_put_default_is_infallible_noop() {
+        DefaultHookObjectStore
+            .after_output_put("durable/output.parquet")
+            .await;
+    }
 
     /// Forge output encoding uses the shared Bifrost Parquet recipe.
     #[test]
@@ -1792,6 +1978,30 @@ mod tests {
         let _ = Transaction::new;
         let config = ForgeConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    /// Both reconciliation caps default to 256 and reject zero independently.
+    #[test]
+    fn forge_reconciliation_default_caps_are_256_and_zero_is_invalid() {
+        let config = ForgeConfig::default();
+        assert_eq!(config.max_open_operations_per_table, 256);
+        assert_eq!(config.max_retained_snapshots_per_table, 256);
+        let mut invalid_open = config.clone();
+        invalid_open.max_open_operations_per_table = 0;
+        assert!(invalid_open.validate().is_err());
+        let mut invalid_snapshots = config;
+        invalid_snapshots.max_retained_snapshots_per_table = 0;
+        assert!(invalid_snapshots.validate().is_err());
+    }
+
+    /// Forge rejects a zero planner memory ceiling before composing scheduler or workers.
+    #[test]
+    fn forge_config_rejects_zero_memory_capacity() {
+        let config = ForgeConfig {
+            max_memory_bytes: 0,
+            ..ForgeConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     /// The staging seam consumes the right-size policy's selected groups.
@@ -1829,6 +2039,29 @@ mod tests {
         );
     }
 
+    /// Forge transition writers cannot bypass the operation-state owner.
+    ///
+    /// The history readers may continue to call the audit query module until
+    /// state-backed reconciliation replaces them, but none of the four
+    /// transition modules may append an audit event directly.
+    #[test]
+    fn forge_transition_writers_do_not_append_audit_directly() {
+        let modules = [
+            ("compact.rs", include_str!("compact.rs")),
+            ("live_replace.rs", include_str!("live_replace.rs")),
+            ("expire.rs", include_str!("expire.rs")),
+            ("orphan_gc.rs", include_str!("orphan_gc.rs")),
+        ];
+        let forbidden_call = ["audit_outbox::append_", "audit"].concat();
+
+        for (module, source) in modules {
+            assert!(
+                !source.contains(&forbidden_call),
+                "{module} bypasses ForgeOperations"
+            );
+        }
+    }
+
     /// A bounded undersized group never leaves a singleton remainder for a
     /// worthless one-to-one rewrite.
     #[test]
@@ -1853,5 +2086,32 @@ mod tests {
         assert_eq!(bins.len(), 1);
         assert_eq!(bins[0].files.len(), 2);
         assert_eq!(bins[0].total_bytes, 40);
+    }
+
+    /// An accepted open-partition tail creates no actionable bin or pending work.
+    #[test]
+    fn accepted_open_partition_tail_is_not_pending_work() {
+        let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
+        let tail = CandidateFile {
+            id: Uuid::from_u128(1),
+            path: "open-tail".to_owned(),
+            size: 20,
+            min_event_time: timestamp,
+            max_event_time: timestamp,
+        };
+        let bins = plan_staging_bins(&policy, &[tail], 256, day, day);
+        assert!(bins.is_empty());
+        let outcome = ForgeTickOutcome {
+            tables_discovered: 1,
+            tables_examined: 1,
+            tables_succeeded: 1,
+            tick_complete: true,
+            ..ForgeTickOutcome::default()
+        };
+        assert_eq!(outcome.staging_pending_files, 0);
+        assert!(!outcome.pending_work);
+        assert!(outcome.is_converged());
     }
 }

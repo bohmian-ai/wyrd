@@ -8,7 +8,7 @@ order: 3
 
 # Bifrost Architecture
 
-Bifrost uses a four-component design: Gate (stateless routing), Scribe (durable WAL + seal), Oracle (stateless query), and Forge (stateless compaction). One binary can run all four roles by default. Optional role specialization via `WYRD_ROLES` env flag for separated deployments.
+Bifrost uses a four-component design: Gate (stateless routing), Scribe (durable WAL + seal), Oracle (stateless query), and Forge (stateless compaction). Wyrd deploys that design through one binary and three closed process-role values.
 
 ## System diagram
 
@@ -204,13 +204,45 @@ Idempotent: if the pod crashed after PUT but before COMMIT, replay re-encodes Pa
 
 ## Deployment modes
 
-**Default:** One binary runs all four roles: Gate + Scribe + Oracle + Forge.
+`WYRD_ROLES` accepts exactly `all`, `server`, or `forge-worker`; comma-separated
+component subsets are rejected at boot.
 
-**Optional specialization via `WYRD_ROLES` env flag:**
-- `WYRD_ROLES=gate,scribe,forge,oracle` (default if unset)
-- Operator may restrict pod to subset: e.g., `WYRD_ROLES=scribe` for fast-disk StatefulSets, `WYRD_ROLES=oracle` for memory-heavy nodes.
+| Role | Listeners | Scheduler | Forge executor | Concurrency |
+| --- | --- | --- | --- | --- |
+| `all` | HTTP, gRPC, optional loopback metrics | Yes | One shared worker pool | `WYRD_FORGE_WORKER_CONCURRENCY` bounds the pool. |
+| `server` | HTTP, gRPC, optional loopback metrics | Yes | No | No Forge executor. |
+| `forge-worker` | Optional loopback metrics only | No | One shared worker pool | `WYRD_FORGE_WORKER_CONCURRENCY` bounds the pool. |
 
-Not a requirement; architecture works with flag unset. Autoscaling is per-pod, not per-role: HPA on CPU/memory, add pods, done.
+The Prometheus metrics listener is orthogonal to API serving and defaults to
+loopback. In `forge-worker` mode it is the only listener; the process never
+opens Wyrd HTTP or gRPC sockets. Every role uses the configured
+`WYRD_SHUTDOWN_DRAIN_MS` budget for cooperative shutdown before remaining work
+is cancelled.
+
+### Embedded topology
+
+```bash
+export WYRD_ROLES=all
+export WYRD_FORGE_WORKER_CONCURRENCY=1
+wyrd-server
+```
+
+`all` is the default and runs Gate, Scribe, Oracle, the Forge scheduler, and
+one bounded worker pool in the API-serving process.
+
+### Dedicated worker topology
+
+```bash
+# API-serving scheduler process
+WYRD_ROLES=server wyrd-server
+
+# One or more executor-only processes
+WYRD_ROLES=forge-worker WYRD_FORGE_WORKER_CONCURRENCY=2 wyrd-server
+```
+
+The `server` process schedules Forge work; every `forge-worker` process runs
+one shared executor graph and may expose only its metrics endpoint. Autoscaling
+remains a process-level operational decision.
 
 ## Data categories
 

@@ -130,6 +130,55 @@ pub enum ServeMode {
     Grpc,
 }
 
+/// Server-internal process composition for Bifrost maintenance placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum ForgeProcessRole {
+    /// Serve APIs, schedule Forge work, and run one embedded worker pool.
+    #[default]
+    All,
+    /// Serve APIs and participate in scheduling without executing tasks.
+    Server,
+    /// Execute Forge tasks without opening a public Wyrd API socket.
+    ForgeWorker,
+}
+
+impl ForgeProcessRole {
+    /// Returns whether this role owns the Wyrd HTTP and gRPC serving shell.
+    ///
+    /// `all` and `server` construct [`crate::app::WyrdServer`] and bind public
+    /// transports. `forge-worker` is deliberately excluded because
+    /// [`crate::app::run`] owns its metrics-only dedicated process lifecycle.
+    #[must_use]
+    pub(crate) fn serves_api(self) -> bool {
+        matches!(self, Self::All | Self::Server)
+    }
+}
+
+/// Private Forge worker placement and process-local capacity configuration.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeRuntimeConfig {
+    /// Fixed number of executors in an `all` or `forge-worker` process.
+    #[serde(default = "default_forge_worker_concurrency")]
+    pub worker_concurrency: usize,
+}
+
+impl Default for ForgeRuntimeConfig {
+    /// Uses one executor for embedded and development deployments.
+    fn default() -> Self {
+        Self {
+            worker_concurrency: default_forge_worker_concurrency(),
+        }
+    }
+}
+
+/// Returns the bounded default executor count.
+fn default_forge_worker_concurrency() -> usize {
+    1
+}
+
 impl ServeMode {
     /// True when this mode binds the HTTP listener.
     #[must_use]
@@ -305,6 +354,9 @@ pub struct WyrdServerConfig {
     /// Active deployment profile.
     #[serde(default)]
     pub deployment_profile: DeploymentProfile,
+    /// Internal process role; defaults to the complete embedded topology.
+    #[serde(default)]
+    pub role: ForgeProcessRole,
     /// HTTP server bind configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -329,6 +381,9 @@ pub struct WyrdServerConfig {
     /// Bounded Scribe runtime and queue configuration.
     #[serde(default)]
     pub scribe: ScribeRuntimeConfig,
+    /// Forge worker pool sizing for roles that execute tasks.
+    #[serde(default)]
+    pub forge: ForgeRuntimeConfig,
     /// Prometheus metrics server configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -748,6 +803,29 @@ impl WyrdServerConfig {
     /// Unset variables are silently skipped. Empty variables produce
     /// [`ConfigError::EmptyEnvVar`].
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
+        if let Some(val) = env_opt("WYRD_ROLES")? {
+            self.role = match val.as_str() {
+                "all" => ForgeProcessRole::All,
+                "server" => ForgeProcessRole::Server,
+                "forge-worker" => ForgeProcessRole::ForgeWorker,
+                _ => {
+                    return Err(ConfigError::BadEnvVar {
+                        key: "WYRD_ROLES".to_owned(),
+                        message: format!(
+                            "expected 'all', 'server', or 'forge-worker', got {val:?}"
+                        ),
+                    });
+                }
+            };
+        }
+        if let Some(val) = env_opt("WYRD_FORGE_WORKER_CONCURRENCY")? {
+            self.forge.worker_concurrency =
+                val.parse::<usize>()
+                    .map_err(|error| ConfigError::BadEnvVar {
+                        key: "WYRD_FORGE_WORKER_CONCURRENCY".to_owned(),
+                        message: error.to_string(),
+                    })?;
+        }
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -970,6 +1048,11 @@ impl WyrdServerConfig {
         self.scribe
             .validate()
             .map_err(|message| ConfigError::Invalid { message })?;
+        if self.forge.worker_concurrency == 0 {
+            return Err(ConfigError::Invalid {
+                message: "forge.worker_concurrency must be positive".to_owned(),
+            });
+        }
 
         // 1. HTTP and gRPC bind addresses must differ.
         if self.http.bind == self.grpc.bind {
@@ -2069,5 +2152,129 @@ mod tests {
         assert!(!ServeMode::Http.serves_grpc());
         assert!(!ServeMode::Grpc.serves_http());
         assert!(ServeMode::Grpc.serves_grpc());
+    }
+
+    /// Every documented process role parses to its exact closed variant and
+    /// retains bounded worker configuration.
+    #[test]
+    fn forge_process_roles_are_closed_and_parse_exactly() {
+        for (value, expected) in [
+            ("all", ForgeProcessRole::All),
+            ("server", ForgeProcessRole::Server),
+            ("forge-worker", ForgeProcessRole::ForgeWorker),
+        ] {
+            let cfg = from_toml_str(&format!(
+                "role = {value:?}\n[forge]\nworker_concurrency = 3"
+            ))
+            .expect("documented Forge role parses");
+            assert_eq!(cfg.role, expected, "role {value:?} must remain exact");
+            assert_eq!(cfg.forge.worker_concurrency, 3);
+            cfg.validate().expect("positive Forge bounds validate");
+        }
+
+        for legacy in ["scribe", "forge", "all,forge-worker"] {
+            let err = from_toml_str(&format!("role = {legacy:?}"))
+                .expect_err("legacy role subsets must not parse");
+            let ConfigError::ParseToml { source, .. } = err else {
+                panic!("legacy role must fail during TOML parsing");
+            };
+            let message = source.to_string();
+            assert!(message.contains("all"), "missing all correction: {message}");
+            assert!(
+                message.contains("server"),
+                "missing server correction: {message}"
+            );
+            assert!(
+                message.contains("forge-worker"),
+                "missing forge-worker correction: {message}"
+            );
+        }
+
+        let invalid = from_toml_str(
+            r#"
+                role = "all"
+                [forge]
+                worker_concurrency = 0
+            "#,
+        )
+        .expect("zero remains a parse-time value");
+        assert!(invalid.validate().is_err());
+    }
+
+    /// Environment role overrides accept only the documented process roles and
+    /// identify every corrective value when rejecting legacy component subsets.
+    #[test]
+    fn env_forge_process_roles_are_closed_and_parse_exactly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for (value, expected) in [
+            ("all", Some(ForgeProcessRole::All)),
+            ("server", Some(ForgeProcessRole::Server)),
+            ("forge-worker", Some(ForgeProcessRole::ForgeWorker)),
+            ("scribe", None),
+            ("forge", None),
+            ("all,forge-worker", None),
+        ] {
+            temp_env::with_vars([("WYRD_ROLES", Some(value))], || {
+                let mut cfg = WyrdServerConfig::default();
+                match expected {
+                    Some(role) => {
+                        cfg.apply_env_overrides()
+                            .expect("documented role override must parse");
+                        assert_eq!(cfg.role, role, "role {value:?} must remain exact");
+                    }
+                    None => {
+                        let error = cfg
+                            .apply_env_overrides()
+                            .expect_err("legacy role subsets must fail");
+                        let ConfigError::BadEnvVar { key, message } = error else {
+                            panic!("legacy role must fail as BadEnvVar(WYRD_ROLES)");
+                        };
+                        assert_eq!(key, "WYRD_ROLES");
+                        for corrective_value in ["all", "server", "forge-worker"] {
+                            assert!(
+                                message.contains(corrective_value),
+                                "missing {corrective_value:?} correction for {value:?}: {message}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// The default embedded topology contains exactly one bounded executor.
+    #[test]
+    fn forge_process_defaults_to_embedded_single_worker() {
+        let cfg = WyrdServerConfig::default();
+        assert_eq!(cfg.role, ForgeProcessRole::All);
+        assert_eq!(cfg.forge.worker_concurrency, 1);
+    }
+
+    /// Process-role guidance stays synchronized across the Bifrost overview,
+    /// deployment guide, and architecture reference without preserving legacy
+    /// component-subset examples.
+    #[test]
+    fn process_role_docs_publish_only_the_closed_contract() {
+        let documents = [
+            include_str!("../../../../docs/src/content/docs/bifrost/index.svx"),
+            include_str!("../../../../docs/src/content/docs/bifrost/architecture.svx"),
+            include_str!("../../../../architecture/references/domain/iceberg-bifrost.md"),
+        ];
+        for document in documents {
+            for role in ["`all`", "`server`", "`forge-worker`"] {
+                assert!(document.contains(role), "missing documented role {role}");
+            }
+            for legacy in [
+                "WYRD_ROLES=gate,scribe,forge,oracle",
+                "WYRD_ROLES=scribe",
+                "WYRD_ROLES=oracle",
+                "Optional role specialization",
+            ] {
+                assert!(
+                    !document.contains(legacy),
+                    "legacy process-role guidance remains: {legacy}"
+                );
+            }
+        }
     }
 }

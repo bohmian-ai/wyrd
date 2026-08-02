@@ -6,7 +6,7 @@
 //!    rejected with gRPC `PERMISSION_DENIED` / HTTP `403` and no row is written.
 //! 2. **Malformed request body** — a body that cannot be decoded as OTLP
 //!    protobuf is rejected with gRPC `INVALID_ARGUMENT` / HTTP `400` with the
-//!    stable `WYRD_VALA_400_INGEST_PROTO` code, and no row is written.
+//!    stable `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code, and no row is written.
 //!
 //! Saturation (backpressure) journey note: driving the group-commit
 //! coordinator's mpsc channel to `try_send` failure end-to-end requires either
@@ -348,7 +348,7 @@ mod pg_tests {
     }
 
     /// HTTP: a body that cannot be decoded as OTLP protobuf is rejected with
-    /// HTTP `400` and a `WYRD_VALA_400_INGEST_PROTO` code in the
+    /// HTTP `400` and a `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code in the
     /// problem+json body. No row is written.
     #[tokio::test]
     async fn http_malformed_protobuf_body_400_and_no_row_written() {
@@ -386,8 +386,8 @@ mod pg_tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            code, "WYRD_VALA_400_INGEST_PROTO",
-            "malformed body must carry WYRD_VALA_400_INGEST_PROTO, got {code:?}"
+            code, "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+            "malformed body must carry WYRD_VALA_400_OTLP_REQUEST_MALFORMED, got {code:?}"
         );
         assert_ne!(
             code, "WYRD_VALA_400_QUERY_INVALID_SQL",
@@ -404,7 +404,8 @@ mod pg_tests {
     }
 
     /// HTTP: a malformed JSON body (invalid JSON syntax) at `/v1/traces` with
-    /// `application/json` encoding is rejected with `400 WYRD_VALA_400_INGEST_PROTO`.
+    /// `application/json` encoding is rejected with
+    /// `400 WYRD_VALA_400_OTLP_REQUEST_MALFORMED`.
     #[tokio::test]
     async fn http_malformed_json_body_400_and_no_row_written() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
@@ -437,7 +438,7 @@ mod pg_tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            code, "WYRD_VALA_400_INGEST_PROTO",
+            code, "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
             "malformed JSON body must carry the OTLP-specific 400 code, got {code:?}"
         );
 

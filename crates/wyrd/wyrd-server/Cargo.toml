@@ -10,7 +10,7 @@ authors = { workspace = true }
 [features]
 cloud = ["wyrd-storage/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
-test-support = ["vala-bifrost-redux/test-support"]
+test-support = ["vala-bifrost-redux/test-support", "wyrd-telemetry/test-support"]
 
 [[bin]]
 name = "wyrd-server"

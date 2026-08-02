@@ -98,6 +98,51 @@ async fn fresh_boot_provisions_redux_before_first_write() {
     cluster.shutdown().await.expect("cluster shutdown");
 }
 
+/// Each cluster role keeps serving after the fixture's seed pool is exhausted.
+///
+/// # Panics
+///
+/// Panics when a running role shares the fixture app pool instead of the
+/// process-local pool created for that simulated server.
+#[tokio::test]
+#[ignore = "requires the real Postgres-backed Bifrost journey lane"]
+async fn cluster_role_pool_is_independent_from_fixture_pool() {
+    let cluster = WyrdTestCluster::start(1, BifrostTopology::OnePod)
+        .await
+        .expect("one-pod cluster");
+    let tenant = cluster.data_tenant_id();
+    let fixture_pool = cluster.pg_fixture().app_pool().clone();
+    fixture_pool.close().await;
+
+    let server = cluster.server(0).expect("bound cluster role");
+    assert!(fixture_pool.is_closed(), "fixture pool must be exhausted");
+    assert!(
+        !server.app_pool().is_closed(),
+        "role must own a process-local app pool"
+    );
+    let conn = server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("role-local tenant connection after fixture pool closure");
+    conn.commit().await.expect("role-local transaction commit");
+
+    cluster.shutdown().await.expect("cluster shutdown");
+}
+
+/// A post-bind construction failure explicitly stops the listener and local pool.
+///
+/// # Panics
+///
+/// Panics when partial cluster startup leaves a bound listener or local pool
+/// alive after the injected failure returns.
+#[tokio::test]
+#[ignore = "requires the real Postgres-backed Bifrost journey lane"]
+async fn cluster_partial_start_failure_rolls_back_listener_and_pool() {
+    WyrdTestCluster::verify_partial_start_rollback_for_test()
+        .await
+        .expect("partial startup rollback proof");
+}
+
 async fn run_closeout_journey(
     cluster: &WyrdTestCluster,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -329,9 +329,14 @@ impl BifrostHarness {
     }
 }
 
+/// Return the exact number of independently constructed pods in a cluster.
+///
+/// The helper keeps test-only Scribe setup aligned with the cluster's role
+/// topology, including a scheduler/server accompanied by dedicated workers.
 fn pods_for(cluster: &WyrdTestCluster) -> usize {
     match cluster.topology() {
         BifrostTopology::OnePod => 1,
         BifrostTopology::ThreePod => 3,
+        BifrostTopology::DedicatedForgeWorkers => 4,
     }
 }

@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -133,9 +134,9 @@ struct BifrostIngestParts {
     /// State without an ingest subsystem.
     state: AppState,
     /// Recovered Scribe allocation that Gate must wrap.
-    scribe: Arc<ScribeImpl>,
+    scribe: Option<Arc<ScribeImpl>>,
     /// Dedicated runtime that owns Scribe coordination tasks.
-    coordination_runtime: Arc<tokio::runtime::Runtime>,
+    coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 /// Errors raised while assembling server state.
@@ -259,7 +260,7 @@ pub async fn build_app_state_from_boot_with_config(
     boot: &PostgresBoot,
     scribe_config: crate::config::ScribeRuntimeConfig,
 ) -> Result<AppState, ServerBootError> {
-    Ok(build_bifrost_parts_from_boot(boot, scribe_config)
+    Ok(build_bifrost_parts_from_boot(boot, scribe_config, true)
         .await?
         .state)
 }
@@ -273,6 +274,7 @@ pub async fn build_app_state_from_boot_with_config(
 async fn build_bifrost_parts_from_boot(
     boot: &PostgresBoot,
     scribe_config: crate::config::ScribeRuntimeConfig,
+    include_scribe: bool,
 ) -> Result<BifrostIngestParts, ServerBootError> {
     scribe_config.validate().map_err(ServerBootError::Scribe)?;
     let dsns = boot.dsns()?;
@@ -298,7 +300,9 @@ async fn build_bifrost_parts_from_boot(
     // Provision the pre-declared OLAP domain tables (traces.spans, genai.*, ...)
     // so the ingest and query paths have their physical Iceberg tables. Idempotent
     // and append-only — a no-op after first boot; fails closed on schema drift.
-    vala_bifrost::tables::register_all(&bifrost).await?;
+    if include_scribe {
+        vala_bifrost::tables::register_all(&bifrost).await?;
+    }
     let bifrost_redux = Arc::new(
         BifrostCatalog::new(
             dsns.catalog_app.expose_secret(),
@@ -315,55 +319,12 @@ async fn build_bifrost_parts_from_boot(
             .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
-    let node_id = NodeId::generate();
-    let advertise_addr =
-        std::env::var("WYRD_SERVER_ADVERTISE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-    let stream = acquire_on_boot(&operator_pool, node_id, "scribe", &advertise_addr)
-        .await
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
     std::fs::create_dir_all(&wal_dir).map_err(|error| {
         ServerBootError::Scribe(format!("WAL directory creation failed: {error}"))
     })?;
-    let wal = Arc::new(
-        WalWriter::new(
-            &wal_dir,
-            *stream.node_id.as_bytes(),
-            stream.writer_epoch.as_i64(),
-            WalConfig::default()
-                .with_disk_limit(scribe_config.wal_disk_limit_bytes)
-                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-        )
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-    );
-    tracing::info!(
-        coordination_threads = scribe_config.coordination_threads,
-        ingress_cpu_threads = scribe_config.ingress_cpu_threads,
-        persistence_cpu_threads = scribe_config.persistence_cpu_threads,
-        wal_io_threads = scribe_config.wal_io_threads,
-        memory_limit_bytes = scribe_config.memory_limit_bytes,
-        wal_disk_limit_bytes = scribe_config.wal_disk_limit_bytes,
-        "resolved Scribe runtime configuration"
-    );
-    let coordination_runtime = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(scribe_config.coordination_threads)
-            .thread_name_fn(|| {
-                static THREAD_INDEX: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                format!(
-                    "wyrd-scribe-coordination-{}",
-                    THREAD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                )
-            })
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
-            })?,
-    );
     let pod_memory_limit = BifrostMemoryGovernor::detect(1024 * 1024 * 1024)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?
         .pod_limit_bytes();
@@ -376,48 +337,97 @@ async fn build_bifrost_parts_from_boot(
         Arc::new(BifrostDataFusionMemoryPool::new(bifrost_memory.clone()));
     let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
-    let admission = AdmissionConfig {
-        memory_limit_bytes: pod_memory_limit,
-        scribe_memory_limit_bytes: scribe_config.memory_limit_bytes,
-    };
-    let execution_pools = ScribeExecutionPools::new(
-        ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
-            .map_err(|error| {
-                ServerBootError::Scribe(format!("ingress CPU pool failed: {error}"))
-            })?,
-        ScribePersistenceCpuPool::try_new_with_capacity(scribe_config.persistence_cpu_threads, 64)
+    let (scribe, coordination_runtime) = if include_scribe {
+        let node_id = NodeId::generate();
+        let advertise_addr = std::env::var("WYRD_SERVER_ADVERTISE_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+        let stream = acquire_on_boot(&operator_pool, node_id, "scribe", &advertise_addr)
+            .await
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+        let wal = Arc::new(
+            WalWriter::new(
+                &wal_dir,
+                *stream.node_id.as_bytes(),
+                stream.writer_epoch.as_i64(),
+                WalConfig::default()
+                    .with_disk_limit(scribe_config.wal_disk_limit_bytes)
+                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+            )
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        );
+        tracing::info!(
+            coordination_threads = scribe_config.coordination_threads,
+            ingress_cpu_threads = scribe_config.ingress_cpu_threads,
+            persistence_cpu_threads = scribe_config.persistence_cpu_threads,
+            wal_io_threads = scribe_config.wal_io_threads,
+            memory_limit_bytes = scribe_config.memory_limit_bytes,
+            wal_disk_limit_bytes = scribe_config.wal_disk_limit_bytes,
+            "resolved Scribe runtime configuration"
+        );
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(scribe_config.coordination_threads)
+                .thread_name_fn(|| {
+                    static THREAD_INDEX: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    format!(
+                        "wyrd-scribe-coordination-{}",
+                        THREAD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    )
+                })
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
+                })?,
+        );
+        let admission = AdmissionConfig {
+            memory_limit_bytes: pod_memory_limit,
+            scribe_memory_limit_bytes: scribe_config.memory_limit_bytes,
+        };
+        let execution_pools = ScribeExecutionPools::new(
+            ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
+                .map_err(|error| {
+                    ServerBootError::Scribe(format!("ingress CPU pool failed: {error}"))
+                })?,
+            ScribePersistenceCpuPool::try_new_with_capacity(
+                scribe_config.persistence_cpu_threads,
+                64,
+            )
             .map_err(|error| {
                 ServerBootError::Scribe(format!("persistence CPU pool failed: {error}"))
             })?,
-        ScribeWalIoPool::try_new_with_capacity(scribe_config.wal_io_threads, 256)
-            .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
-    );
-    let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-        operator: Arc::new(storage.operator().clone()),
-        wal,
-        stream,
-        admission,
-        coordination_runtime: coordination_runtime.handle().clone(),
-        execution_pools,
-        persistence: Some(ScribePersistenceConfig::new(
-            Arc::new(postgres.vala().clone()),
-            64,
-            scribe_config.wal_io_threads,
-        )),
-        memory_budget: Some(bifrost_memory.scribe_budget()),
-        staging_file_publisher: Some(staging_file_publisher),
-    }));
-    match scribe.replay_wal_async().await {
-        Ok(replayed_generations) => {
-            tracing::info!(replayed_generations, "Scribe WAL recovery complete");
+            ScribeWalIoPool::try_new_with_capacity(scribe_config.wal_io_threads, 256)
+                .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
+        );
+        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            operator: Arc::new(storage.operator().clone()),
+            wal,
+            stream,
+            admission,
+            coordination_runtime: runtime.handle().clone(),
+            execution_pools,
+            persistence: Some(ScribePersistenceConfig::new(
+                Arc::new(postgres.vala().clone()),
+                64,
+                scribe_config.wal_io_threads,
+            )),
+            memory_budget: Some(bifrost_memory.scribe_budget()),
+            staging_file_publisher: Some(staging_file_publisher),
+        }));
+        match scribe.replay_wal_async().await {
+            Ok(replayed_generations) => {
+                tracing::info!(replayed_generations, "Scribe WAL recovery complete");
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Scribe WAL recovery failed; keeping the server alive but not ready");
+            }
         }
-        Err(error) => {
-            tracing::error!(
-                error = %error,
-                "Scribe WAL recovery failed; keeping the server alive but not ready"
-            );
-        }
-    }
+        (Some(scribe), Some(runtime))
+    } else {
+        drop(staging_file_publisher);
+        (None, None)
+    };
 
     let forge_config = ForgeConfig::default();
     let rewrite_runtime = ForgeRewriteRuntime::new(
@@ -438,6 +448,10 @@ async fn build_bifrost_parts_from_boot(
         hints: staging_file_inbox,
         config: forge_config,
         maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+        clock: ForgeClock::system(),
+        completion_observer: None,
+        scheduler_trigger: None,
+        telemetry: Arc::new(ForgeTelemetry::new()),
     })?);
 
     let state = AppState::new(postgres, storage, bifrost)
@@ -489,11 +503,15 @@ pub async fn build_state(
     let shutdown = CancellationToken::new();
 
     let boot = PostgresBoot::from_env().await?;
-    let bifrost_parts = build_bifrost_parts_from_boot(&boot, config.scribe).await?;
+    let worker_only = config.role == crate::config::ForgeProcessRole::ForgeWorker;
+    let bifrost_parts = build_bifrost_parts_from_boot(&boot, config.scribe, !worker_only).await?;
     let state = bifrost_parts.state;
-    let sealing_key = build_sealing_key(config)?;
-
     let state = attach_config_fields(state, config, shutdown, telemetry)?;
+    if worker_only {
+        return Ok(state);
+    }
+
+    let sealing_key = build_sealing_key(config)?;
     let state = install_auth(state, config, sealing_key.clone()).await?;
     let verifier = state
         .auth
@@ -505,11 +523,13 @@ pub async fn build_state(
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))?;
     let ingest = Arc::new(BifrostIngestRuntime::new(
-        bifrost_parts.scribe,
+        bifrost_parts
+            .scribe
+            .ok_or_else(|| ServerBootError::Scribe("server role requires Scribe".to_owned()))?,
         bifrost_redux,
         verifier,
         vala_bifrost_redux::gate::limits::IngestLimits::default(),
-        Some(bifrost_parts.coordination_runtime),
+        bifrost_parts.coordination_runtime,
     ));
     let state = state.with_bifrost_ingest(ingest);
     seed_federation(&state, config, sealing_key.as_deref()).await?;
@@ -835,6 +855,36 @@ pub fn spawn_maintenance_scheduler(
     Ok(async move { forge.run(shutdown).await })
 }
 
+/// Build the single bounded claim-driven Forge worker-pool future.
+///
+/// Embedded and dedicated roles call this same constructor, which keeps task
+/// decoding, execution, reporting, and recovery on one implementation path.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge dependencies
+/// are absent, or [`ServerBootError::Forge`] when worker bounds are invalid.
+pub fn spawn_forge_worker(
+    state: &AppState,
+    shutdown: CancellationToken,
+    worker_concurrency: usize,
+) -> Result<
+    impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
+    + Send
+    + 'static,
+    ServerBootError,
+> {
+    let forge =
+        state
+            .forge_handle()
+            .cloned()
+            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+                detail: "AppState has no shared Forge for worker execution".to_owned(),
+            })?;
+    let worker = ForgeWorker::new(forge, ForgeWorkerConfig { worker_concurrency })?;
+    Ok(async move { worker.run(shutdown).await })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,7 +954,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pg_tests {
+/// PostgreSQL-backed boot composition regressions and shared Forge fixtures.
+pub(crate) mod pg_tests {
     use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
@@ -921,7 +972,7 @@ mod pg_tests {
     use crate::postgres::ServerPostgres;
 
     /// Compose one real Forge from the retained test fixture resources.
-    async fn composed_test_state() -> (
+    pub(crate) async fn composed_test_state() -> (
         AppState,
         vala_bifrost_redux::maintenance::StagingFilePublisher,
     ) {
@@ -955,6 +1006,10 @@ mod pg_tests {
                 hints: inbox,
                 config,
                 maintenance_interval: Duration::from_millis(10),
+                clock: ForgeClock::system(),
+                completion_observer: None,
+                scheduler_trigger: None,
+                telemetry: Arc::new(ForgeTelemetry::new()),
             })
             .expect("Forge"),
         );

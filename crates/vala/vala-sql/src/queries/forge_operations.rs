@@ -80,7 +80,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// |---|---|---|
     /// | Absent | Valid identity/detail | Append audit; insert Prepared; `Applied(seq)` |
     /// | Prepared | Canonical detail matches stored | No write; `AlreadyApplied` |
-    /// | Reset | Canonical detail matches original | Append new Prepared; reopen; `Applied(new_seq)` |
+    /// | Reset | Any replay | `Conflict`; retry requires a new generation/operation |
     /// | Committed / Recovered | Canonical detail matches stored | No write; `AlreadyApplied(terminal_seq)` |
     /// | Any row | Conflicting detail/identity | `Conflict`; no durable change |
     ///
@@ -146,11 +146,9 @@ impl<'resource> ForgeOperations<'resource> {
                         })
                     }
                     ForgeOperationPhase::Reset => {
-                        // Reset -> Prepared: reopen with a new Prepared sequence.
-                        let seq = append_audit(conn, event).await?;
-                        self.reopen_prepared(conn, operation_id, &detail, seq)
-                            .await?;
-                        Ok(ForgeOperationTransition::Applied { audit_seq: seq })
+                        Err(SqlError::Conflict {
+                            detail: "Reset Forge generation cannot be reopened; retry requires a new operation and output generation".to_owned(),
+                        })
                     }
                     ForgeOperationPhase::Committed | ForgeOperationPhase::Recovered => {
                         // Terminal state: return the terminal sequence.
@@ -375,6 +373,53 @@ impl<'resource> ForgeOperations<'resource> {
             overflowed,
         })
     }
+
+    /// Lists a bounded page of terminal Reset operations as never-published proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns conflict for a zero/overflowed cap, invariant errors for malformed
+    /// durable details, or SQL errors while reading the tenant projection.
+    ///
+    /// # Cancellation
+    ///
+    /// This read-only operation has no durable partial progress.
+    pub async fn list_reset(
+        &self,
+        conn: &mut TenantConn<'_>,
+        cap: usize,
+    ) -> Result<OpenForgeOperationPage, SqlError> {
+        if cap == 0 {
+            return Err(SqlError::Conflict {
+                detail: "cap must be greater than zero".to_owned(),
+            });
+        }
+        let limit = i64::try_from(cap)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "cap overflow".to_owned(),
+            })?;
+        let rows: Vec<ForgeOperationStateSqlRow> = sqlx::query_as(
+            "WITH selected AS MATERIALIZED (SELECT * FROM vala.forge_operation_state WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND phase='reset' ORDER BY updated_at,operation_id LIMIT $3) SELECT selected.*,audit.operation AS prepared_audit_operation,audit.resource AS prepared_audit_resource,audit.detail AS prepared_audit_detail FROM selected LEFT JOIN vala.audit_outbox audit ON audit.data_tenant_id=wyrd.current_tenant() AND audit.seq=selected.prepared_audit_seq ORDER BY selected.updated_at,selected.operation_id",
+        )
+        .bind(self.resource)
+        .bind(self.family.as_str())
+        .bind(limit)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+        let mut decoded = rows
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<ForgeOperationStateRow>, _>>()?;
+        let overflowed = decoded.len() > cap;
+        decoded.truncate(cap);
+        Ok(OpenForgeOperationPage {
+            operations: decoded,
+            overflowed,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,63 +556,6 @@ impl<'resource> ForgeOperations<'resource> {
                 $4::jsonb, $4::jsonb,
                 $5, NULL,
                 $6, $6)
-        "#,
-        )
-        .bind(self.resource)
-        .bind(self.family.as_str())
-        .bind(operation_id)
-        .bind(detail_json.to_string())
-        .bind(prepared_seq)
-        .bind(now)
-        .execute(&mut **conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-
-        Ok(())
-    }
-
-    /// Reopens a Reset operation with a new Prepared sequence.
-    ///
-    /// Replaces `prepared_detail`, `current_detail`, `prepared_audit_seq`,
-    /// `prepared_at`, clears `terminal_audit_seq`, and sets `phase` to
-    /// `prepared`. The `updated_at` timestamp is advanced.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError`] when the update fails.
-    ///
-    /// # Cancellation
-    ///
-    /// The update participates in the caller's transaction. Cancellation
-    /// cannot commit only the new Prepared audit; dropping the transaction
-    /// rolls back audit and reopen state together.
-    async fn reopen_prepared(
-        &self,
-        conn: &mut TenantConn<'_>,
-        operation_id: Uuid,
-        detail: &AuditDetail,
-        prepared_seq: i64,
-    ) -> Result<(), SqlError> {
-        let now = Utc::now();
-        let detail_json =
-            serde_json::to_value(detail).map_err(|e| SqlError::InvariantViolation {
-                detail: format!("failed to serialize prepared detail: {e}"),
-            })?;
-
-        sqlx::query(
-            r#"
-        UPDATE vala.forge_operation_state
-           SET phase = 'prepared',
-               prepared_detail = $4::jsonb,
-               current_detail = $4::jsonb,
-               prepared_audit_seq = $5,
-               terminal_audit_seq = NULL,
-               prepared_at = $6,
-               updated_at = $6
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND resource = $1
-           AND family = $2
-           AND operation_id = $3
         "#,
         )
         .bind(self.resource)

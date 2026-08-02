@@ -50,6 +50,52 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
 
+/// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
+///
+/// The phase is never polled after deadline expiry. Cancellation drops only
+/// the graceful wait; concrete owners retain their task handles for the
+/// unconditional abort finalizer in [`ScribeImpl::shutdown`].
+async fn await_shutdown_phase<T>(
+    deadline: std::time::Instant,
+    phase: impl std::future::Future<Output = T>,
+) -> bool {
+    if tokio::time::Instant::now() >= tokio::time::Instant::from_std(deadline) {
+        return false;
+    }
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), phase)
+        .await
+        .is_ok()
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// Proves a stalled Scribe phase returns exactly at the caller-owned deadline.
+    #[tokio::test]
+    async fn stalled_shutdown_phase_obeys_caller_deadline() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(10);
+        let completed = await_shutdown_phase(deadline, std::future::pending::<()>()).await;
+
+        assert!(!completed);
+        assert!(std::time::Instant::now() >= deadline);
+    }
+
+    /// Proves an expired budget skips a later Scribe phase without polling it.
+    #[tokio::test]
+    async fn expired_shutdown_phase_is_not_polled() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&polled);
+        let completed = await_shutdown_phase(std::time::Instant::now(), async move {
+            probe.store(true, Ordering::Release);
+        })
+        .await;
+
+        assert!(!completed);
+        assert!(!polled.load(Ordering::Acquire));
+    }
+}
+
 /// Build a test-tier `DataFusion` pool with an explicit bounded ceiling.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
@@ -617,21 +663,103 @@ impl ScribeImpl {
         })
     }
 
-    /// Stop accepting new shard work and drain the bounded execution lanes.
-    pub async fn shutdown(&self) {
+    /// Stop accepting new shard work and drain execution lanes until `deadline`.
+    ///
+    /// Cancellation may leave durable accepted work for normal recovery. Every
+    /// phase is first closed, then awaited only while the caller's process-wide
+    /// shutdown budget remains. Dropped or timed-out graceful futures retain
+    /// their task handles until the finalizer aborts them before returning.
+    pub async fn shutdown(&self, deadline: std::time::Instant) {
         let started = std::time::Instant::now();
-        self.closed.store(true, Ordering::Release);
-        let _ = self.shards.flush_all().await;
-        self.shards.drain().await;
-        if let Some(persistence) = &self.persistence {
-            persistence.close_and_drain().await;
+        self.begin_shutdown();
+        let mut graceful = if tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline)
+        {
+            matches!(
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.shards.flush_all(),
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
+        };
+        self.close_lanes();
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.shards.drain()).await;
         }
-        self.shards.shutdown().await;
-        self.persistence_cpu.drain().await;
-        self.wal_io.drain().await;
-        self.ingress_cpu.drain().await;
+        if graceful && let Some(persistence) = &self.persistence {
+            graceful = await_shutdown_phase(deadline, persistence.drain()).await;
+        }
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.shards.shutdown(deadline)).await;
+        }
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.persistence_cpu.drain()).await;
+        }
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.wal_io.drain()).await;
+        }
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.ingress_cpu.drain()).await;
+        }
+        self.shards.abort_retained();
+        if let Some(persistence) = &self.persistence {
+            persistence.abort_retained();
+        }
+        if !graceful {
+            tracing::warn!("Scribe graceful cleanup was incomplete at shutdown deadline");
+        }
         metrics::histogram!("bifrost_scribe_shutdown_seconds")
             .record(started.elapsed().as_secs_f64());
+    }
+
+    /// Closes external admission and aborts every retained Tokio worker without waiting.
+    ///
+    /// This is the deadline-expiry path. It deliberately skips graceful flush,
+    /// closes execution lanes, and leaves any unfinished durable work to WAL
+    /// recovery. No external await or detached cleanup is started.
+    pub fn abort_shutdown(&self) {
+        self.begin_shutdown();
+        self.close_lanes();
+        self.shards.abort_retained();
+        if let Some(persistence) = &self.persistence {
+            persistence.abort_retained();
+        }
+    }
+
+    /// Closes external Scribe admission without cancelling internal flush lanes.
+    ///
+    /// Already accepted writable generations may still use the internal lanes
+    /// during [`Self::shutdown`]'s bounded flush. Dropping shutdown after this
+    /// transition is fail-closed; [`Self::abort_shutdown`] performs final abort.
+    fn begin_shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.shards.close();
+    }
+
+    /// Closes internal execution lanes after graceful flush has completed or timed out.
+    ///
+    /// Persistence remains available until this transition so accepted writable
+    /// generations can be frozen and submitted during the bounded flush. Once
+    /// closed, later drains can only finish work that was already admitted.
+    fn close_lanes(&self) {
+        if let Some(persistence) = &self.persistence {
+            persistence.close();
+        }
+        self.persistence_cpu.close();
+        self.wal_io.close();
+        self.ingress_cpu.close();
+    }
+
+    /// Installs one retained never-completing shard task for shutdown-bound tests.
+    ///
+    /// The returned abort handle lets the production-owner test prove the real
+    /// Scribe finalizer cancelled the task rather than merely dropping its wait.
+    #[cfg(feature = "test-support")]
+    pub async fn install_shutdown_stall_for_test(&self) -> tokio::task::AbortHandle {
+        self.shards.install_shutdown_stall_for_test().await
     }
 
     /// Return whether Scribe has completed recovery and still accepts writes.

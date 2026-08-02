@@ -18,7 +18,7 @@ use crate::app::BootExit;
 use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{
-    TaskExit, TaskId, fallible_task, supervise_with_shutdown, worker_task,
+    TaskExit, TaskId, classify_first_exit, drain_with_shutdown_hooks, fallible_task, worker_task,
 };
 use crate::boot::{ServerBootError, spawn_maintenance_scheduler, spawn_storage_sweeper};
 use crate::components::health::readiness_loop;
@@ -30,6 +30,11 @@ use crate::grpc::{
 use crate::state::AppState;
 
 type BoxWorker = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Reports whether Tokio's runtime clock still has shutdown budget remaining.
+fn shutdown_deadline_active(deadline: std::time::Instant) -> bool {
+    tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline)
+}
 
 /// Boot-loaded gRPC identity whose private key remains redacted until tonic consumes it.
 struct GrpcIdentityMaterial {
@@ -70,6 +75,8 @@ pub struct WyrdServer {
     reporter: HealthReporter,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
+    #[cfg(feature = "test-support")]
+    shutdown_probe: Option<ShutdownTestProbe>,
 }
 
 impl WyrdServer {
@@ -152,6 +159,8 @@ impl WyrdServer {
             reporter,
             metrics_handle,
             extra_workers: Vec::new(),
+            #[cfg(feature = "test-support")]
+            shutdown_probe: None,
         })
     }
 
@@ -211,6 +220,14 @@ impl WyrdServer {
         F: Future<Output = ()> + Send + 'static,
     {
         self.extra_workers.push((name, Box::pin(worker)));
+        self
+    }
+
+    /// Installs the test-only production shutdown probe.
+    #[cfg(all(feature = "test-support", test))]
+    #[must_use]
+    fn with_shutdown_probe(mut self, probe: ShutdownTestProbe) -> Self {
+        self.shutdown_probe = Some(probe);
         self
     }
 
@@ -319,6 +336,8 @@ impl WyrdServer {
             reporter: self.reporter,
             metrics_handle: self.metrics_handle,
             extra_workers: self.extra_workers,
+            #[cfg(feature = "test-support")]
+            shutdown_probe: self.shutdown_probe,
             http_listener,
             grpc_listener,
             metrics_listener,
@@ -349,6 +368,59 @@ pub struct BoundServer {
     http_addr: Option<SocketAddr>,
     grpc_addr: Option<SocketAddr>,
     metrics_addr: Option<SocketAddr>,
+    #[cfg(feature = "test-support")]
+    shutdown_probe: Option<ShutdownTestProbe>,
+}
+
+/// Test-only shutdown boundaries exercised through [`BoundServer::run`].
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownTestPhase {
+    Readiness,
+    Transport,
+    OracleRegistry,
+    ScribeShutdown,
+    ScribeRegistry,
+}
+
+/// Test-only recorder and deterministic stall injected into the production owner.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct ShutdownTestProbe {
+    stall: ShutdownTestPhase,
+    calls: Arc<std::sync::Mutex<Vec<(ShutdownTestPhase, tokio::time::Instant)>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl ShutdownTestProbe {
+    /// Creates a probe that stalls exactly one production shutdown phase.
+    #[cfg(test)]
+    fn new(stall: ShutdownTestPhase) -> Self {
+        Self {
+            stall,
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Records the deadline by value and stalls the selected phase forever.
+    async fn enter(&self, phase: ShutdownTestPhase, deadline: tokio::time::Instant) {
+        self.calls
+            .lock()
+            .expect("shutdown probe call lock remains available")
+            .push((phase, deadline));
+        if self.stall == phase {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Returns the ordered production phases reached before deadline exhaustion.
+    #[cfg(test)]
+    fn calls(&self) -> Vec<(ShutdownTestPhase, tokio::time::Instant)> {
+        self.calls
+            .lock()
+            .expect("shutdown probe call lock remains available")
+            .clone()
+    }
 }
 
 impl BoundServer {
@@ -491,9 +563,19 @@ impl BoundServer {
         let drain = Duration::from_millis(self.config.shutdown.drain_ms);
         let query = self.state.bifrost_query();
         let ingest = self.state.bifrost_ingest.clone();
-        let terminal = supervise_with_shutdown(set, shutdown, drain, || {
+        #[cfg(feature = "test-support")]
+        let shutdown_probe = self.shutdown_probe.clone();
+        let terminal = classify_first_exit(&mut set).await;
+        let deadline = tokio::time::Instant::now() + drain;
+        drain_with_shutdown_hooks(set, shutdown, deadline, || {
             let ingest = ingest.clone();
+            #[cfg(feature = "test-support")]
+            let shutdown_probe = shutdown_probe.clone();
             async move {
+                #[cfg(feature = "test-support")]
+                if let Some(probe) = shutdown_probe {
+                    probe.enter(ShutdownTestPhase::Readiness, deadline).await;
+                }
                 if let Some(runtime) = query
                     && let Err(error) = runtime.begin_shutdown().await
                 {
@@ -505,14 +587,82 @@ impl BoundServer {
                     tracing::warn!(%error, "failed to remove Scribe readiness before transport drain");
                 }
             }
-        })
-        .await;
+        }, || {
+            #[cfg(feature = "test-support")]
+            let shutdown_probe = shutdown_probe.clone();
+            async move {
+                #[cfg(feature = "test-support")]
+                if let Some(probe) = shutdown_probe {
+                    probe.enter(ShutdownTestPhase::Transport, deadline).await;
+                    return true;
+                }
+                false
+            }
+        }).await;
 
-        if let Some(runtime) = self.state.bifrost_query() {
-            runtime.shutdown(std::time::Instant::now() + drain).await;
+        let deadline = deadline.into_std();
+        if shutdown_deadline_active(deadline)
+            && let Some(runtime) = self.state.bifrost_query()
+        {
+            runtime.shutdown_owner(deadline).await;
+        } else if let Some(runtime) = self.state.bifrost_query() {
+            runtime.abort_shutdown();
         }
-        if let Some(runtime) = &self.state.bifrost_ingest {
-            runtime.shutdown().await;
+        #[cfg(feature = "test-support")]
+        if shutdown_deadline_active(deadline)
+            && let Some(probe) = &self.shutdown_probe
+        {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                probe.enter(
+                    ShutdownTestPhase::OracleRegistry,
+                    tokio::time::Instant::from_std(deadline),
+                ),
+            )
+            .await;
+        }
+        if shutdown_deadline_active(deadline)
+            && let Some(runtime) = self.state.bifrost_query()
+        {
+            runtime.shutdown_registry(deadline).await;
+        }
+        #[cfg(feature = "test-support")]
+        if shutdown_deadline_active(deadline)
+            && let Some(probe) = &self.shutdown_probe
+        {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                probe.enter(
+                    ShutdownTestPhase::ScribeShutdown,
+                    tokio::time::Instant::from_std(deadline),
+                ),
+            )
+            .await;
+        }
+        if shutdown_deadline_active(deadline)
+            && let Some(runtime) = &self.state.bifrost_ingest
+        {
+            runtime.shutdown_owner(deadline).await;
+        } else if let Some(runtime) = &self.state.bifrost_ingest {
+            runtime.abort_shutdown();
+        }
+        #[cfg(feature = "test-support")]
+        if shutdown_deadline_active(deadline)
+            && let Some(probe) = &self.shutdown_probe
+        {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                probe.enter(
+                    ShutdownTestPhase::ScribeRegistry,
+                    tokio::time::Instant::from_std(deadline),
+                ),
+            )
+            .await;
+        }
+        if shutdown_deadline_active(deadline)
+            && let Some(runtime) = &self.state.bifrost_ingest
+        {
+            runtime.shutdown_registry(deadline).await;
         }
 
         tracing::info!("wyrd-server shutdown complete");
@@ -533,12 +683,16 @@ mod pg_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tempfile::tempdir;
     use uuid::Uuid;
+    use vala_bifrost_redux::cluster::ClusterRegistry;
+    use vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials;
+    use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
     use vala_bifrost_redux::scribe::{
         ScribeImpl,
         wal::{WalConfig, WalWriter},
     };
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use super::*;
@@ -624,6 +778,163 @@ mod pg_tests {
                 token_verifier: Some(verifier),
                 ..ServerAuth::default()
             })
+    }
+
+    /// Builds production-shaped Oracle and Scribe role task ownership for shutdown tests.
+    #[cfg(feature = "test-support")]
+    async fn test_state_with_role_tasks() -> AppState {
+        let mut state = test_state_with_auth().await;
+        state.postgres = crate::test_support::test_server_postgres().await;
+        let memory =
+            BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("test memory governor is valid");
+        let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
+        state = state.with_bifrost_memory_pool(memory, query_memory);
+
+        let node_id = ClusterNodeId::new(Uuid::now_v7());
+        let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
+        let scribe_role = cluster
+            .register_scribe(
+                "127.0.0.1:0",
+                ScribeCapabilitiesV1 {
+                    tail_protocol_version: 1,
+                },
+            )
+            .await
+            .expect("test Scribe role registers");
+        let ingest = Arc::new(
+            state
+                .bifrost_ingest
+                .as_ref()
+                .expect("test state owns Scribe")
+                .clone_with_scribe_role_for_test(cluster, scribe_role),
+        );
+        let gate = ingest.gate();
+        state = state.with_bifrost_ingest(ingest).with_bifrost_gate(gate);
+        let mut oracle_config = crate::config::WyrdServerConfig::default();
+        let oracle_signing_key =
+            IssuingKey::generate_ephemeral_pem().expect("test Oracle signing key");
+        oracle_config.auth.signing_key = Some(oracle_signing_key.clone());
+        let (state, credentials): (AppState, Arc<dyn OraclePeerCredentials>) =
+            crate::boot::pg_tests::with_test_oracle_peer_credentials(
+                state,
+                &oracle_config,
+                &oracle_signing_key,
+            )
+            .await;
+        crate::boot::attach_test_oracle_runtime_for_node_at_with_credentials(
+            state,
+            wyrd_spec::vala::api::NodeId::new(Uuid::now_v7()),
+            oracle_signing_key,
+            "http://127.0.0.1:0".to_owned(),
+            credentials,
+        )
+        .await
+        .expect("test Oracle role attaches")
+    }
+
+    /// Proves the production server owner does not grant a stalled Scribe a second budget.
+    #[cfg(feature = "test-support")]
+    #[tokio::test(start_paused = true)]
+    async fn bound_server_run_aborts_stalled_scribe_at_original_deadline() {
+        tokio::time::resume();
+        let mut config = WyrdServerConfig::default();
+        config.http.bind = "127.0.0.1:0".parse().expect("static bind is valid");
+        config.metrics.enabled = false;
+        config.shutdown.drain_ms = 1_000;
+        let state = test_state_with_role_tasks().await;
+        let query = Arc::clone(state.bifrost_query().expect("test state owns Oracle"));
+        let ingest = Arc::clone(
+            state
+                .bifrost_ingest
+                .as_ref()
+                .expect("test state owns Scribe role"),
+        );
+        let scribe = Arc::clone(
+            state
+                .bifrost_ingest
+                .as_ref()
+                .expect("test state owns Scribe")
+                .scribe(),
+        );
+        let stalled = scribe.install_shutdown_stall_for_test().await;
+        tokio::time::pause();
+        let server = WyrdServer::new(config, state)
+            .expect("test server builds")
+            .spawn_worker("shutdown_trigger", async {});
+        let bound = server.bind(ServeMode::Http).await.expect("HTTP binds");
+        let started = tokio::time::Instant::now();
+
+        let result = bound.run().await;
+        tokio::task::yield_now().await;
+
+        assert!(result.is_err(), "early worker exit remains terminal");
+        assert!(
+            tokio::time::Instant::now() - started <= Duration::from_millis(1_001),
+            "role task timers must not add a second shutdown budget"
+        );
+        assert!(
+            stalled.is_finished(),
+            "Scribe retained task must be aborted"
+        );
+        assert!(!scribe.is_ready(), "Scribe admission must be closed");
+        assert_eq!(
+            query.role_tasks_finished_for_test(),
+            (true, true),
+            "Oracle heartbeat and snapshot poller cannot survive server completion"
+        );
+        assert_eq!(
+            ingest.role_tasks_finished_for_test(),
+            Some((true, true)),
+            "Scribe heartbeat and snapshot poller cannot survive server completion"
+        );
+    }
+
+    /// Proves every production shutdown phase shares one deadline and later phases are skipped.
+    #[cfg(feature = "test-support")]
+    #[tokio::test(start_paused = true)]
+    async fn bound_server_run_uses_one_deadline_for_each_stalled_phase() {
+        let phases = [
+            ShutdownTestPhase::Readiness,
+            ShutdownTestPhase::Transport,
+            ShutdownTestPhase::OracleRegistry,
+            ShutdownTestPhase::ScribeShutdown,
+            ShutdownTestPhase::ScribeRegistry,
+        ];
+        for (stall_index, stall) in phases.into_iter().enumerate() {
+            let mut config = WyrdServerConfig::default();
+            config.http.bind = "127.0.0.1:0".parse().expect("static bind is valid");
+            config.metrics.enabled = false;
+            config.shutdown.drain_ms = 1_000;
+            let probe = ShutdownTestProbe::new(stall);
+            let server = WyrdServer::new(config, test_state_with_auth().await)
+                .expect("test server builds")
+                .with_shutdown_probe(probe.clone())
+                .spawn_worker("shutdown_trigger", async {});
+            let bound = server.bind(ServeMode::Http).await.expect("HTTP binds");
+            let started = tokio::time::Instant::now();
+
+            let result = bound.run().await;
+
+            assert!(result.is_err(), "early worker exit remains terminal");
+            assert_eq!(
+                tokio::time::Instant::now() - started,
+                Duration::from_secs(1),
+                "{stall:?} must return at the original bound"
+            );
+            let calls = probe.calls();
+            assert_eq!(
+                calls.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+                phases[..=stall_index],
+                "no phase may start after {stall:?} exhausts the deadline"
+            );
+            let recorded_deadline = calls[0].1;
+            assert!(
+                calls
+                    .iter()
+                    .all(|(_, deadline)| *deadline == recorded_deadline),
+                "every phase must receive the identical absolute deadline"
+            );
+        }
     }
 
     #[tokio::test]

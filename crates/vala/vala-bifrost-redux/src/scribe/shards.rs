@@ -364,13 +364,23 @@ pub(crate) struct ShardMemtableSnapshot {
 /// The live fixed-shard Scribe runtime.
 #[derive(Debug)]
 pub(crate) struct ScribeShardRuntime {
+    /// Fixed owner mailboxes used for internal and admitted commands.
     senders: Vec<ScribeShard<ShardCommand>>,
+    /// Coalescing pressure channels paired with the fixed owners.
     pressure_senders: Vec<watch::Sender<Option<PressureSignal>>>,
+    /// Last snapshots published by the fixed owners.
     snapshots: Vec<Arc<Mutex<ShardMemtableSnapshot>>>,
+    /// Retained owner tasks that graceful shutdown joins or abort shutdown cancels.
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Accepted append commands that have not completed.
     pending: Arc<AtomicUsize>,
+    /// Notification used to wake a drain when accepted work completes.
     drained: Arc<Notify>,
+    /// Whether external shard admission has closed.
     closed: AtomicBool,
+    /// Owner acknowledgements received through the graceful flush path.
+    #[cfg(any(test, feature = "test-support"))]
+    shutdown_flush_completions: AtomicUsize,
 }
 
 pub(crate) struct ScribeShardStartConfig {
@@ -395,6 +405,31 @@ pub(crate) struct ScribeShardStartConfig {
 }
 
 impl ScribeShardRuntime {
+    /// Closes shard admission before any potentially stalled graceful wait.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Aborts every retained shard owner that remains after graceful cleanup.
+    ///
+    /// This operation never awaits. Dropping an unfinished shutdown future is
+    /// safe because retained handles remain here until this method aborts them.
+    pub(crate) fn abort_retained(&self) {
+        if let Ok(mut tasks) = self.tasks.try_lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
+
+    /// Retains one never-completing owner and returns its abort probe.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn install_shutdown_stall_for_test(&self) -> tokio::task::AbortHandle {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        self.tasks.lock().await.push(task);
+        abort
+    }
     /// Start exactly sixteen shard owners and their bounded command mailboxes.
     ///
     /// # Panics
@@ -469,6 +504,8 @@ impl ScribeShardRuntime {
             pending,
             drained,
             closed: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            shutdown_flush_completions: AtomicUsize::new(0),
         })
     }
 
@@ -652,6 +689,9 @@ impl ScribeShardRuntime {
             result.await.map_err(|_| ScribeError::Internal {
                 detail: "shard dropped shutdown flush response".to_owned(),
             })??;
+            #[cfg(any(test, feature = "test-support"))]
+            self.shutdown_flush_completions
+                .fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }
@@ -696,16 +736,29 @@ impl ScribeShardRuntime {
             .collect()
     }
 
-    /// Stop all owners after draining accepted work.
-    pub(crate) async fn shutdown(&self) {
-        self.closed.store(true, Ordering::Release);
+    /// Drains accepted commands and joins shard owners until `deadline`.
+    ///
+    /// [`Self::close`] must run first. Cancellation or deadline expiry may
+    /// leave partial graceful progress; [`Self::abort_retained`] remains the
+    /// mandatory finalizer and ensures no Tokio owner survives shutdown.
+    pub(crate) async fn shutdown(&self, deadline: std::time::Instant) {
         self.drain().await;
         for sender in &self.senders {
             let _ = sender.try_send(ShardCommand::Shutdown);
         }
-        let mut tasks = self.tasks.lock().await;
-        for task in tasks.drain(..) {
-            let _ = task.await;
+        let Ok(mut tasks) =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), self.tasks.lock())
+                .await
+        else {
+            return;
+        };
+        for mut task in tasks.drain(..) {
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
     }
 }
@@ -1785,13 +1838,47 @@ mod tests {
         }
     }
 
-    /// Proves the production shard runtime owns its tasks and drains cleanly.
+    /// Proves an ample shutdown budget flushes every owner before draining tasks.
     #[tokio::test]
-    async fn shard_owner_runtime_starts_and_drains_without_pending_work() {
+    async fn ample_time_scribe_shutdown_flushes_all_shard_owners() {
         let scribe = crate::scribe::ScribeImpl::new();
         assert_eq!(scribe.runtime_snapshot().shards.pending_items, 0);
-        scribe.shutdown().await;
+        assert_eq!(
+            scribe
+                .shards
+                .shutdown_flush_completions
+                .load(Ordering::Acquire),
+            0
+        );
+        scribe
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
         assert_eq!(scribe.runtime_snapshot().shards.pending_items, 0);
+        assert_eq!(
+            scribe
+                .shards
+                .shutdown_flush_completions
+                .load(Ordering::Acquire),
+            SCRIBE_SHARD_COUNT
+        );
+        assert!(scribe.shards.tasks.lock().await.is_empty());
+    }
+
+    /// Proves deadline expiry aborts every retained shard owner after all admission closes.
+    #[tokio::test]
+    async fn expired_scribe_shutdown_aborts_retained_shard_tasks() {
+        let scribe = crate::scribe::ScribeImpl::new();
+        let stalled = tokio::spawn(std::future::pending::<()>());
+        let stalled_abort = stalled.abort_handle();
+        scribe.shards.tasks.lock().await.push(stalled);
+
+        scribe.shutdown(std::time::Instant::now()).await;
+        tokio::task::yield_now().await;
+
+        assert!(scribe.closed.load(Ordering::Acquire));
+        assert!(scribe.shards.closed.load(Ordering::Acquire));
+        assert!(stalled_abort.is_finished());
+        assert!(scribe.shards.tasks.lock().await.is_empty());
     }
 
     #[test]

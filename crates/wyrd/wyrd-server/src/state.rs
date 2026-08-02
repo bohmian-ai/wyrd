@@ -8,7 +8,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use datafusion::execution::memory_pool::MemoryPool;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
@@ -135,8 +135,12 @@ struct ScribeRoleRuntime {
     shutdown: CancellationToken,
     /// Retains the heartbeat task so teardown can prove it stopped before unregister.
     heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Synchronously aborts the heartbeat without acquiring its async owner lock.
+    heartbeat_abort: AbortHandle,
     /// Retains the snapshot poller so role-owned background work is drained.
     snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Synchronously aborts the snapshot poller without acquiring its async owner lock.
+    snapshot_poller_abort: AbortHandle,
     /// Enforces readiness removal before transport drain and role teardown.
     lifecycle: Arc<RoleLifecycle>,
     /// Readiness value preserved by heartbeats during transport drain.
@@ -158,8 +162,12 @@ pub struct BifrostQueryRuntime {
     role_shutdown: CancellationToken,
     /// Retains the heartbeat task until ordered shutdown stops it.
     heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Synchronously aborts the heartbeat without acquiring its async owner lock.
+    heartbeat_abort: AbortHandle,
     /// Retains the membership poller until ordered shutdown stops it.
     snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Synchronously aborts the snapshot poller without acquiring its async owner lock.
+    snapshot_poller_abort: AbortHandle,
     /// Enforces readiness removal before transport drain and role teardown.
     lifecycle: Arc<RoleLifecycle>,
     /// Readiness value preserved by heartbeats during transport drain.
@@ -169,6 +177,19 @@ pub struct BifrostQueryRuntime {
 }
 
 impl BifrostQueryRuntime {
+    /// Cancels Oracle work and explicitly aborts retained role tasks without awaiting.
+    ///
+    /// Used only after the process deadline is exhausted. It closes role
+    /// activity synchronously, aborts the heartbeat and snapshot poller through
+    /// handles that do not require their async owner locks, starts no registry
+    /// operation, and leaves incomplete durable cleanup to existing recovery.
+    pub(crate) fn abort_shutdown(&self) {
+        self.lifecycle.begin_stopping();
+        self.role_shutdown.cancel();
+        self.heartbeat_abort.abort();
+        self.snapshot_poller_abort.abort();
+        self.oracle.begin_shutdown();
+    }
     /// Creates the retained query lifecycle after role registration succeeds.
     #[must_use]
     pub fn new(
@@ -186,6 +207,8 @@ impl BifrostQueryRuntime {
             role_shutdown.clone(),
         );
         let snapshot_poller = Arc::clone(&registry).start_snapshot_poller(role_shutdown.clone());
+        let heartbeat_abort = heartbeat.abort_handle();
+        let snapshot_poller_abort = snapshot_poller.abort_handle();
         Self {
             oracle,
             registered_role,
@@ -193,7 +216,9 @@ impl BifrostQueryRuntime {
             registry,
             role_shutdown,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
+            heartbeat_abort,
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
+            snapshot_poller_abort,
             lifecycle: Arc::new(RoleLifecycle::serving()),
             advertise_ready,
             coordination_runtime,
@@ -241,25 +266,47 @@ impl BifrostQueryRuntime {
     /// # Cancellation
     ///
     /// Cancellation after readiness removal can leave accepted Oracle work
-    /// draining. The server lifecycle should continue invoking shutdown until
-    /// its process deadline.
+    /// for durable recovery. Cleanup is best-effort and never extends the
+    /// caller-owned process deadline.
     pub async fn shutdown(&self, deadline: Instant) {
-        if let Err(error) = self.begin_shutdown().await {
-            tracing::warn!(%error, "failed to remove Oracle readiness before shutdown");
-        }
+        self.shutdown_owner(deadline).await;
+        self.shutdown_registry(deadline).await;
+    }
+
+    /// Stops Oracle-owned work and retained role tasks within `deadline`.
+    ///
+    /// Cancellation first closes new work. Maintenance and role tasks then
+    /// drain against the unchanged process deadline; partial progress is
+    /// retained for recovery when the future reaches or is dropped at expiry.
+    pub(crate) async fn shutdown_owner(&self, deadline: Instant) {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
+        self.oracle.shutdown(deadline).await;
         await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await;
         await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await;
-        self.oracle.shutdown(deadline).await;
-        if let Err(error) = self
-            .registry
-            .shutdown_role(self.registered_role.clone())
+    }
+
+    /// Unregisters the exact Oracle fence within `deadline`.
+    ///
+    /// No registry await starts after expiry. Failure or timeout leaves the
+    /// lifecycle unfinished and observable in logs rather than claiming cleanup.
+    pub(crate) async fn shutdown_registry(&self, deadline: Instant) {
+        if tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline) {
+            match timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.registry.shutdown_role(self.registered_role.clone()),
+            )
             .await
-        {
-            tracing::warn!(%error, "failed to unregister the Oracle role during shutdown");
+            {
+                Ok(Ok(())) => self.lifecycle.finish(),
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "failed to unregister the Oracle role during shutdown")
+                }
+                Err(_) => tracing::warn!("Oracle role unregister exceeded shutdown deadline"),
+            }
+        } else {
+            tracing::warn!("skipping Oracle role unregister after shutdown deadline");
         }
-        self.lifecycle.finish();
     }
 
     /// Returns whether the runtime retains a dedicated coordination executor.
@@ -267,9 +314,34 @@ impl BifrostQueryRuntime {
     pub fn has_dedicated_coordination_runtime(&self) -> bool {
         self.coordination_runtime.is_some()
     }
+
+    /// Returns whether both retained Oracle role tasks have reached termination.
+    #[cfg(all(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn role_tasks_finished_for_test(&self) -> (bool, bool) {
+        (
+            self.heartbeat_abort.is_finished(),
+            self.snapshot_poller_abort.is_finished(),
+        )
+    }
 }
 
 impl BifrostIngestRuntime {
+    /// Closes Gate and explicitly aborts all retained Scribe role work without awaiting.
+    ///
+    /// This deadline-expiry path signals role cancellation, explicitly aborts
+    /// heartbeat and snapshot tasks without acquiring their async owner locks,
+    /// and aborts retained Scribe workers. It performs no flush or external await.
+    pub(crate) fn abort_shutdown(&self) {
+        self.gate.close();
+        if let Some(role) = &self.scribe_role {
+            role.lifecycle.begin_stopping();
+            role.shutdown.cancel();
+            role.heartbeat_abort.abort();
+            role.snapshot_poller_abort.abort();
+        }
+        self.scribe.abort_shutdown();
+    }
     /// Builds Gate around the exact Scribe allocation retained by this runtime.
     ///
     /// The projection shares Scribe's bounded ingress CPU lane, while an
@@ -323,16 +395,33 @@ impl BifrostIngestRuntime {
             shutdown.clone(),
         );
         let snapshot_poller = Arc::clone(&registry).start_snapshot_poller(shutdown.clone());
+        let heartbeat_abort = heartbeat.abort_handle();
+        let snapshot_poller_abort = snapshot_poller.abort_handle();
         self.scribe_role = Some(ScribeRoleRuntime {
             registry,
             registered,
             shutdown,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
+            heartbeat_abort,
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
+            snapshot_poller_abort,
             lifecycle: Arc::new(RoleLifecycle::serving()),
             advertise_ready,
         });
         self
+    }
+
+    /// Clones this test runtime while attaching a production-shaped Scribe role lifecycle.
+    #[cfg(all(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn clone_with_scribe_role_for_test(
+        &self,
+        registry: Arc<ClusterRegistry>,
+        registered: RegisteredRole,
+    ) -> Self {
+        let mut runtime = self.clone();
+        runtime.scribe_role = None;
+        runtime.with_scribe_role(registry, registered)
     }
 
     /// Returns the Gate mounted by gRPC and HTTP ingest routes.
@@ -384,26 +473,55 @@ impl BifrostIngestRuntime {
     ///
     /// # Cancellation
     ///
-    /// Cancellation after Gate closes can leave accepted Scribe work draining;
-    /// callers should retry shutdown until the server lifecycle completes.
-    pub async fn shutdown(&self) {
-        if let Err(error) = self.begin_shutdown().await {
-            tracing::warn!(%error, "failed to remove Scribe readiness before shutdown");
-        }
+    /// Cancellation after Gate closes can leave accepted Scribe work for
+    /// durable recovery. Cleanup is best-effort and never extends the
+    /// caller-owned process deadline.
+    pub async fn shutdown(&self, deadline: Instant) {
+        self.shutdown_owner(deadline).await;
+        self.shutdown_registry(deadline).await;
+    }
+
+    /// Closes and drains Scribe-owned work and retained role tasks within `deadline`.
+    ///
+    /// Gate admission closes first; Scribe may flush work accepted before that
+    /// transition while budget remains. Every later join shares `deadline`, and
+    /// timed-out retained handles are aborted before this method returns.
+    pub(crate) async fn shutdown_owner(&self, deadline: Instant) {
+        self.gate.close();
         if let Some(role) = &self.scribe_role {
             role.lifecycle.begin_stopping();
             role.shutdown.cancel();
-            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        }
+        self.scribe.shutdown(deadline).await;
+        if let Some(role) = &self.scribe_role {
             await_role_task(&role.heartbeat, deadline, "scribe heartbeat").await;
             await_role_task(&role.snapshot_poller, deadline, "scribe snapshot poller").await;
         }
-        self.gate.close();
-        self.scribe.shutdown().await;
+    }
+
+    /// Unregisters the exact Scribe fence within `deadline`.
+    ///
+    /// The exact retained fence is removed only while budget remains. Timeout,
+    /// cancellation, or registry failure leaves lifecycle completion unset and
+    /// starts no post-deadline retry.
+    pub(crate) async fn shutdown_registry(&self, deadline: Instant) {
         if let Some(role) = &self.scribe_role {
-            if let Err(error) = role.registry.shutdown_role(role.registered.clone()).await {
-                tracing::warn!(%error, "failed to unregister the Scribe role during shutdown");
+            if tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline) {
+                match timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    role.registry.shutdown_role(role.registered.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => role.lifecycle.finish(),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "failed to unregister the Scribe role during shutdown")
+                    }
+                    Err(_) => tracing::warn!("Scribe role unregister exceeded shutdown deadline"),
+                }
+            } else {
+                tracing::warn!("skipping Scribe role unregister after shutdown deadline");
             }
-            role.lifecycle.finish();
         }
     }
 
@@ -411,6 +529,18 @@ impl BifrostIngestRuntime {
     #[must_use]
     pub fn has_dedicated_coordination_runtime(&self) -> bool {
         self.coordination_runtime.is_some()
+    }
+
+    /// Returns whether both retained Scribe role tasks have reached termination.
+    #[cfg(all(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn role_tasks_finished_for_test(&self) -> Option<(bool, bool)> {
+        self.scribe_role.as_ref().map(|role| {
+            (
+                role.heartbeat_abort.is_finished(),
+                role.snapshot_poller_abort.is_finished(),
+            )
+        })
     }
 }
 
@@ -420,9 +550,18 @@ async fn await_role_task(
     deadline: Instant,
     task_name: &'static str,
 ) {
-    let Some(mut task) = task.lock().await.take() else {
+    let Ok(mut guard) = timeout_at(tokio::time::Instant::from_std(deadline), task.lock()).await
+    else {
+        tracing::warn!(
+            task = task_name,
+            "role task lock exceeded shutdown deadline"
+        );
         return;
     };
+    let Some(mut task) = guard.take() else {
+        return;
+    };
+    drop(guard);
     if timeout_at(tokio::time::Instant::from_std(deadline), &mut task)
         .await
         .is_err()

@@ -1569,7 +1569,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pg_tests {
+/// Postgres-backed boot fixtures and regressions shared by crate tests.
+pub(crate) mod pg_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::default_table_source::provider_as_source;
@@ -1780,7 +1781,7 @@ mod pg_tests {
     ///
     /// Panics when the shared fixture cannot seed the peer role, auth handles,
     /// or production-shaped service token.
-    async fn with_test_oracle_peer_credentials(
+    pub(crate) async fn with_test_oracle_peer_credentials(
         state: AppState,
         config: &crate::config::WyrdServerConfig,
         signing_key: &SecretString,
@@ -2140,7 +2141,9 @@ mod pg_tests {
                 !ingest.gate().is_closed_for_test(),
                 "Gate remains available to accepted transports during drain"
             );
-            ingest.shutdown().await;
+            ingest
+                .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                .await;
             assert!(ingest.gate().is_closed_for_test());
             assert!(!ingest.is_ready());
             let replacement_scribe = cluster

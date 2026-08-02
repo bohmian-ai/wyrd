@@ -349,6 +349,8 @@ pub struct PersistenceRuntime {
     queued: Arc<AtomicUsize>,
     queued_bytes: Arc<AtomicUsize>,
     drained: Arc<Notify>,
+    /// Retained worker handles aborted when the process deadline ends graceful persistence.
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for PersistenceRuntime {
@@ -375,14 +377,16 @@ impl PersistenceRuntime {
             queued: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         });
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
         let worker = Arc::new(PersistenceWorker::new(config.postgres, context));
+        let mut tasks = Vec::with_capacity(config.workers);
         for _ in 0..config.workers {
             let receiver = Arc::clone(&receiver);
             let worker = Arc::clone(&worker);
             let state = Arc::clone(&runtime_state);
-            runtime.spawn(async move {
+            tasks.push(runtime.spawn(async move {
                 loop {
                     let job = receiver.lock().await.recv().await;
                     let Some(job) = job else { break };
@@ -406,7 +410,10 @@ impl PersistenceRuntime {
                     );
                     state.drained.notify_waiters();
                 }
-            });
+            }));
+        }
+        if let Ok(mut retained) = runtime_state.tasks.lock() {
+            *retained = tasks;
         }
         runtime_state
     }
@@ -448,17 +455,36 @@ impl PersistenceRuntime {
         }
     }
 
-    /// Stop accepting jobs and wait for queued jobs to finish.
-    pub(crate) async fn close_and_drain(&self) {
+    /// Stops accepting persistence jobs without awaiting worker progress.
+    ///
+    /// Already accepted jobs remain owned by retained worker handles until
+    /// graceful drain completes or [`Self::abort_retained`] cancels them.
+    pub(crate) fn close(&self) {
         if let Ok(mut sender) = self.sender.lock() {
             sender.take();
         }
+    }
+
+    /// Waits for queued persistence jobs after [`Self::close`] has run.
+    ///
+    /// Dropping this future leaves worker ownership in the runtime so the
+    /// caller can still invoke [`Self::abort_retained`] at its deadline.
+    pub(crate) async fn drain(&self) {
         loop {
             let notified = self.drained.notified();
             if self.queued.load(Ordering::Acquire) == 0 {
                 return;
             }
             notified.await;
+        }
+    }
+
+    /// Aborts and drops every retained persistence worker that has not completed.
+    pub(crate) fn abort_retained(&self) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
         }
     }
 

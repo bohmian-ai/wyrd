@@ -75,6 +75,10 @@ pub struct ScribeIngressCpuPool {
 }
 
 impl ScribeIngressCpuPool {
+    /// Closes admission to the ingress lane without waiting for active Rayon work.
+    pub(crate) fn close(&self) {
+        self.permits.close();
+    }
     /// Build the fixed ingress pool with named worker threads.
     #[cfg(test)]
     pub(crate) fn new(worker_count: usize) -> Self {
@@ -613,6 +617,10 @@ pub struct ScribePersistenceCpuPool {
 }
 
 impl ScribePersistenceCpuPool {
+    /// Closes admission to the persistence CPU lane without waiting for active Rayon work.
+    pub(crate) fn close(&self) {
+        self.permits.close();
+    }
     /// Build the fixed persistence CPU lane.
     pub(crate) fn new(worker_count: usize) -> Self {
         Self::new_with_capacity(worker_count, PERSISTENCE_QUEUE_ITEMS)
@@ -842,6 +850,10 @@ pub struct ScribeWalIoPool {
 }
 
 impl ScribeWalIoPool {
+    /// Closes admission to the WAL IO lane without waiting for active Rayon work.
+    pub(crate) fn close(&self) {
+        self.permits.close();
+    }
     /// Build the fixed WAL IO lane.
     #[cfg(test)]
     pub(crate) fn new(worker_count: usize) -> Self {

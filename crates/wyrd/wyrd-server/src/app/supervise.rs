@@ -83,18 +83,69 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let mut terminal: Option<String> = None;
+    let terminal = classify_first_exit(&mut set).await;
+    let deadline = Instant::now() + drain;
+    drain_with_shutdown(set, shutdown, deadline, before_cancel).await;
+    terminal
+}
 
-    // Phase 1 — wait for the first exit (or an empty set).
+/// Waits for and classifies the first supervised task exit.
+///
+/// This phase intentionally does not create a shutdown budget. The process
+/// owner creates its one absolute deadline immediately after this function
+/// returns, preserving the first-exit terminal result independently of cleanup.
+pub async fn classify_first_exit(set: &mut JoinSet<TaskExit>) -> Option<String> {
+    let mut terminal = None;
     if let Some(joined) = set.join_next().await {
         classify_first(joined, &mut terminal);
     }
-    let deadline = Instant::now() + drain;
+    terminal
+}
+
+/// Removes readiness, cancels transports, and drains tasks until `deadline`.
+///
+/// The readiness hook is first-polled before cancellation. If it or transport
+/// drain consumes the remaining budget, retained tasks are aborted and no new
+/// external work is started.
+pub async fn drain_with_shutdown<F, Fut>(
+    set: JoinSet<TaskExit>,
+    shutdown: CancellationToken,
+    deadline: Instant,
+    before_cancel: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    drain_with_shutdown_hooks(set, shutdown, deadline, before_cancel, || async { false }).await;
+}
+
+/// Drains supervision with ordered hooks immediately before and after cancellation.
+///
+/// The caller supplies one absolute deadline. Readiness is first-polled before
+/// cancellation; the post-cancel hook may request immediate owned-task abort for
+/// deterministic test support. Deadline expiry always aborts retained tasks,
+/// starts no later await, and does not replace the separately classified first exit.
+pub async fn drain_with_shutdown_hooks<F, Fut, C, CFut>(
+    mut set: JoinSet<TaskExit>,
+    shutdown: CancellationToken,
+    deadline: Instant,
+    before_cancel: F,
+    after_cancel: C,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = bool>,
+{
     match timeout_at(deadline, before_cancel()).await {
         Ok(()) => {}
         Err(_) => tracing::warn!("readiness removal hook exceeded shutdown deadline"),
     }
     shutdown.cancel();
+    if Instant::now() < deadline && timeout_at(deadline, after_cancel()).await.unwrap_or(false) {
+        set.abort_all();
+        return;
+    }
 
     // Phase 2 — drain within budget, then abort.
     loop {
@@ -108,7 +159,6 @@ where
             }
         }
     }
-    terminal
 }
 
 fn classify_first(joined: Result<TaskExit, tokio::task::JoinError>, terminal: &mut Option<String>) {
@@ -225,6 +275,30 @@ mod tests {
 
         assert!(terminal.is_none());
         assert!(assertion_shutdown.is_cancelled());
+    }
+
+    /// Proves the caller-owned deadline bounds a stalled transport drain and preserves terminal classification.
+    #[tokio::test(start_paused = true)]
+    async fn caller_deadline_bounds_drain_and_preserves_first_exit() {
+        let shutdown = CancellationToken::new();
+        let mut set: JoinSet<TaskExit> = JoinSet::new();
+        set.spawn(fallible_task(TaskId::Http, async {
+            Err::<(), &'static str>("terminal transport failure")
+        }));
+        set.spawn(worker_task(TaskId::Worker("stalled_transport"), async {
+            std::future::pending::<()>().await;
+        }));
+
+        let terminal = classify_first_exit(&mut set).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        drain_with_shutdown(set, shutdown.clone(), deadline, || async {}).await;
+
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert!(shutdown.is_cancelled());
+        assert_eq!(
+            terminal.as_deref(),
+            Some("Http failed: terminal transport failure")
+        );
     }
 
     #[tokio::test]

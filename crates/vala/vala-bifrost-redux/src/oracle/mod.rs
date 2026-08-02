@@ -1834,9 +1834,13 @@ impl Oracle {
         &self.vala
     }
 
-    /// Cancels lifecycle maintenance and waits for no further work.
+    /// Cancels lifecycle maintenance and drains owned cleanup until `deadline`.
+    ///
+    /// Maintenance is aborted at expiry and queued lease releases retain their
+    /// recovery fallback. Dropping this future can leave partial cleanup, but
+    /// [`Self::begin_shutdown`] has already synchronously rejected new work.
     pub async fn shutdown(&self, deadline: Instant) {
-        self.shutdown.cancel();
+        self.begin_shutdown();
         let maintenance = self
             .maintenance
             .lock()
@@ -1854,6 +1858,14 @@ impl Oracle {
             }
         }
         self.admission.drain_lease_releases(deadline).await;
+    }
+
+    /// Cancels Oracle lifecycle work without awaiting cleanup progress.
+    ///
+    /// This no-await operation is safe at an exhausted process deadline. It
+    /// starts no external cleanup and leaves durable lease recovery authoritative.
+    pub fn begin_shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     /// Lowers one complete SQL statement against exact pinned table providers.

@@ -20,6 +20,8 @@ pub(crate) mod test_support;
 pub use app::metrics::{TelemetryRuntimeError, WyrdTelemetryRuntime};
 #[cfg(feature = "test-support")]
 pub use app::metrics::{install_capture_runtime, start_capture_forge_role};
+#[cfg(feature = "test-support")]
+pub use app::run_forge_worker_process_for_test;
 pub use app::{BootExit, BoundServer, WyrdServer, run, serve};
 pub use boot::{ServerBootError, StateOverrides, build_state, spawn_storage_sweeper};
 #[cfg(feature = "test-support")]

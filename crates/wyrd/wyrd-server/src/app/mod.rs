@@ -129,6 +129,26 @@ async fn run_forge_worker_process(
     }
 }
 
+/// Runs the production dedicated Forge-worker process over test-built state.
+///
+/// Test clusters use this feature-gated entry to exercise the same worker
+/// construction, supervision, cancellation, and bounded drain as [`run`]
+/// without loading process-global configuration or telemetry a second time.
+/// No public HTTP or gRPC listener is constructed by this runner.
+///
+/// # Errors
+///
+/// Returns listener, worker construction, worker execution, or supervision
+/// failures through [`BootExit::Other`].
+#[cfg(feature = "test-support")]
+pub async fn run_forge_worker_process_for_test(
+    config: &WyrdServerConfig,
+    state: AppState,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+) -> Result<(), BootExit> {
+    run_forge_worker_process(config, state, metrics_handle).await
+}
+
 #[cfg(test)]
 /// Static composition assertions that keep API and dedicated-worker ownership separate.
 mod tests {

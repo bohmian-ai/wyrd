@@ -51,7 +51,9 @@ use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAud
 use wyrd_server::config::{ForgeProcessRole, IssuerEntry, ServeMode, WorkloadBindingEntry};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::BifrostIngestRuntime;
-use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
+use wyrd_server::{
+    AppState, WyrdServer, WyrdServerConfig, build_router, run_forge_worker_process_for_test,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_telemetry::TelemetryGuard;
 
@@ -314,15 +316,47 @@ impl WyrdTestServer {
     /// Shut down the server, cancelling the serve task and dropping fixtures.
     ///
     /// # Errors
-    /// Returns an error if the serve task join times out.
+    /// Returns [`WyrdTestServerError::Join`] when the serve task exceeds the
+    /// two-second drain bound, cannot be joined, or returns a server boot error.
     pub async fn shutdown(mut self) -> Result<(), WyrdTestServerError> {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
         if let Some(handle) = self.serve_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            Self::join_serve_handle(handle).await?;
         }
         Ok(())
+    }
+
+    /// Joins one API or dedicated-worker serve task within the shutdown budget.
+    ///
+    /// The task result shape is shared by both production compositions. A
+    /// timeout aborts and joins the task so a failed harness teardown cannot
+    /// leave a detached process graph retaining fixture resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdTestServerError::Join`] when the task exceeds two seconds,
+    /// panics or is cancelled, or returns a [`wyrd_server::BootExit`].
+    async fn join_serve_handle(
+        mut handle: JoinHandle<Result<(), wyrd_server::BootExit>>,
+    ) -> Result<(), WyrdTestServerError> {
+        match tokio::time::timeout(Duration::from_secs(2), &mut handle).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(exit))) => Err(WyrdTestServerError::Join(format!(
+                "serve task returned an error: {exit:?}"
+            ))),
+            Ok(Err(error)) => Err(WyrdTestServerError::Join(format!(
+                "serve task could not be joined: {error}"
+            ))),
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                Err(WyrdTestServerError::Join(
+                    "serve task exceeded the two-second shutdown bound".to_owned(),
+                ))
+            }
+        }
     }
 
     /// Cancel bound server workers without dropping the server-owned fixtures.
@@ -1118,6 +1152,20 @@ impl WyrdTestServer {
         config.serve.mode = ServeMode::Both;
         config.role = self.inner.forge_process_role;
 
+        if self.inner.forge_process_role == ForgeProcessRole::ForgeWorker {
+            let serve_handle = wyrd_runtime::runtime().spawn(async move {
+                run_forge_worker_process_for_test(&config, state, None).await
+            });
+            self.shutdown_token = Some(shutdown_token);
+            self.serve_handle = Some(serve_handle);
+            self.mode = Mode::Bound {
+                addr: None,
+                base_url: None,
+                grpc_addr: None,
+            };
+            return Ok(self);
+        }
+
         let bound = WyrdServer::new(config, state)
             .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
             .bind(ServeMode::Both)
@@ -1127,9 +1175,7 @@ impl WyrdTestServer {
         let addr = bound.http_addr();
         let grpc_addr = bound.grpc_addr();
         let base_url = addr.map(|address| format!("http://{address}"));
-        if self.inner.forge_process_role != ForgeProcessRole::ForgeWorker
-            && (addr.is_none() || grpc_addr.is_none())
-        {
+        if addr.is_none() || grpc_addr.is_none() {
             return Err(WyrdTestServerError::Bind(
                 "server role did not bind both public API listeners".to_owned(),
             ));
@@ -1314,10 +1360,11 @@ impl WyrdTestServerBuilder {
 
     /// Select the production Forge process composition for this test server.
     ///
-    /// Bound fixtures pass this value unchanged to [`WyrdServer`], so a
-    /// `ForgeWorker` fixture runs the real worker supervisor without opening
-    /// public HTTP or gRPC listeners. In-process fixtures retain their router
-    /// for focused handler tests regardless of this setting.
+    /// API-serving fixtures pass this value unchanged to [`WyrdServer`]. A
+    /// `ForgeWorker` fixture instead enters the production dedicated runner,
+    /// which supervises one worker graph without opening public HTTP or gRPC
+    /// listeners. In-process fixtures retain their router for focused handler
+    /// tests regardless of this setting.
     #[must_use]
     pub fn with_forge_process_role_for_test(mut self, role: ForgeProcessRole) -> Self {
         self.forge_process_role = role;
@@ -1991,4 +2038,61 @@ pub fn server_postgres_from_fixture(fixture: &PgFixture) -> ServerPostgres {
         fixture.wyrd_postgres().clone(),
         fixture.vala_postgres().clone(),
     )
+}
+
+#[cfg(test)]
+/// Deterministic serve-task teardown regressions.
+mod tests {
+    use super::*;
+
+    /// Produces a controlled join failure without constructing server fixtures.
+    async fn panic_serve_task() -> Result<(), wyrd_server::BootExit> {
+        panic!("controlled serve task panic")
+    }
+
+    /// A production runner error is surfaced as a harness join failure.
+    #[tokio::test]
+    async fn shutdown_join_surfaces_runner_error() {
+        let handle = tokio::spawn(async {
+            Err(wyrd_server::BootExit::Other(
+                "controlled runner failure".into(),
+            ))
+        });
+
+        let error = WyrdTestServer::join_serve_handle(handle)
+            .await
+            .expect_err("runner failure must fail teardown");
+        assert!(
+            matches!(error, WyrdTestServerError::Join(message) if message.contains("controlled runner failure")),
+            "runner error must retain its cause"
+        );
+    }
+
+    /// A panicked serve task is surfaced as a harness join failure.
+    #[tokio::test]
+    async fn shutdown_join_surfaces_task_join_error() {
+        let handle = tokio::spawn(panic_serve_task());
+
+        let error = WyrdTestServer::join_serve_handle(handle)
+            .await
+            .expect_err("task panic must fail teardown");
+        assert!(
+            matches!(error, WyrdTestServerError::Join(message) if message.contains("could not be joined")),
+            "join error must identify the failed join"
+        );
+    }
+
+    /// A non-draining serve task is aborted and reported at the unchanged bound.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_join_surfaces_timeout_without_wall_clock_sleep() {
+        let handle = tokio::spawn(std::future::pending::<Result<(), wyrd_server::BootExit>>());
+
+        let error = WyrdTestServer::join_serve_handle(handle)
+            .await
+            .expect_err("non-draining task must fail teardown");
+        assert!(
+            matches!(error, WyrdTestServerError::Join(message) if message.contains("two-second shutdown bound")),
+            "timeout must report the production drain bound"
+        );
+    }
 }

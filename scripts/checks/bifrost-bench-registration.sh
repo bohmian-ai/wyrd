@@ -63,12 +63,6 @@ if [[ "$(printf '%s\n' "$forge_reports" | sed '/^$/d' | sort -u | wc -l | tr -d 
   echo "Forge topology lanes must write three distinct WYRD_BIFROST_REPORT paths" >&2
   exit 1
 fi
-if ! rg -n -F '[tasks."bench:bifrost:forge:matrix"]' mise.toml >/dev/null || \
-  ! rg -n -F 'bifrost-forge-report-matrix.sh' mise.toml >/dev/null; then
-  echo "missing Forge topology report aggregation lane" >&2
-  exit 1
-fi
-
 for lane in \
   "bench:bifrost:scribe:slo" \
   "bench:bifrost:scribe:components" \

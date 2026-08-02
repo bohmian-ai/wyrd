@@ -68,21 +68,11 @@ const WRITE_CYCLES: usize = 3;
 /// Number of spans carried by each OTLP writer request.
 const SPANS_PER_WRITE: usize = 6;
 
-/// Exact journey assertions selected by the versioned Forge parity ledger.
-const FORGE_PARITY_ASSERTIONS: [&str; 6] = [
-    "forge.continuous-triggering",
-    "forge.dedicated-workers",
-    "forge.bin-packing",
-    "forge.snapshot-expiry",
-    "forge.orphan-cleanup",
-    "forge.failover",
-];
-
-/// Stable scheduler identity for receipt-owned lifecycle proof fixtures.
-const PARITY_MAINTENANCE_SCHEDULER_OWNER: u128 = 0x0198_39f4_2b51_7000_8000_0000_0000_0005;
+/// Stable scheduler identity for maintenance journey fixtures.
+const MAINTENANCE_JOURNEY_SCHEDULER_OWNER: u128 = 0x0198_39f4_2b51_7000_8000_0000_0000_0005;
 
 /// One bounded production scheduler and worker pair for a lifecycle proof.
-struct ParityMaintenance {
+struct JourneyMaintenance {
     /// Passive trigger driving deterministic production scheduler passes.
     scheduler_trigger: ForgeSchedulerTrigger,
     /// Observer proving which durable worker strategy completed.
@@ -97,7 +87,7 @@ struct ParityMaintenance {
     worker_task: Option<JoinHandle<Result<(), ForgeError>>>,
 }
 
-impl ParityMaintenance {
+impl JourneyMaintenance {
     /// Starts production scheduler and worker supervision for one fixture.
     ///
     /// # Panics
@@ -109,7 +99,7 @@ impl ParityMaintenance {
         config: vala_bifrost_redux::forge::ForgeConfig,
     ) -> Self {
         let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::from_u128(
-            PARITY_MAINTENANCE_SCHEDULER_OWNER,
+            MAINTENANCE_JOURNEY_SCHEDULER_OWNER,
         ));
         let worker_observer = ForgeWorkerCompletionObserver::new();
         let (forge, _) = fixture.context_with_worker_supervision(
@@ -120,7 +110,7 @@ impl ParityMaintenance {
             scheduler_trigger.clone(),
         );
         let worker = ForgeWorker::new(Arc::clone(&forge), ForgeWorkerConfig::default())
-            .expect("validated parity maintenance worker");
+            .expect("validated journey maintenance worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
         let scheduler_task = tokio::spawn({
@@ -160,13 +150,13 @@ impl ParityMaintenance {
                 .wait_for_passes_at_least(expected_passes),
         )
         .await
-        .expect("parity maintenance scheduler pass bound");
+        .expect("journey maintenance scheduler pass bound");
         tokio::time::timeout(
             Duration::from_secs(30),
             self.worker_observer.wait_for_held_attempt_for_test(),
         )
         .await
-        .expect("parity maintenance worker attempt bound");
+        .expect("journey maintenance worker attempt bound");
         assert_eq!(self.worker_observer.attempts(), expected_attempts);
         assert_eq!(self.worker_observer.returned_errors().len(), errors);
         self.stop_worker().await;
@@ -175,11 +165,11 @@ impl ParityMaintenance {
             .worker_observer
             .completed_strategies()
             .last()
-            .expect("completed parity maintenance strategy")
+            .expect("completed journey maintenance strategy")
         {
             ForgeClaimStrategy::Known(strategy) => *strategy,
             ForgeClaimStrategy::Unknown(strategy) => {
-                panic!("parity maintenance completed an unknown strategy: {strategy}")
+                panic!("journey maintenance completed an unknown strategy: {strategy}")
             }
         }
     }
@@ -192,12 +182,12 @@ impl ParityMaintenance {
     async fn stop_worker(&mut self) {
         self.worker_stop.cancel();
         self.worker_observer.release_held_attempt_for_test();
-        let task = self.worker_task.take().expect("parity worker stops once");
+        let task = self.worker_task.take().expect("journey worker stops once");
         tokio::time::timeout(Duration::from_secs(30), task)
             .await
-            .expect("parity maintenance worker shutdown bound")
-            .expect("parity maintenance worker task")
-            .expect("parity maintenance worker shutdown");
+            .expect("journey maintenance worker shutdown bound")
+            .expect("journey maintenance worker task")
+            .expect("journey maintenance worker shutdown");
     }
 
     /// Stops both production loops after the selected lifecycle observation.
@@ -212,9 +202,9 @@ impl ParityMaintenance {
         }
         tokio::time::timeout(Duration::from_secs(30), self.scheduler_task)
             .await
-            .expect("parity maintenance scheduler shutdown bound")
-            .expect("parity maintenance scheduler task")
-            .expect("parity maintenance scheduler shutdown");
+            .expect("journey maintenance scheduler shutdown bound")
+            .expect("journey maintenance scheduler task")
+            .expect("journey maintenance scheduler shutdown");
     }
 }
 
@@ -253,32 +243,6 @@ struct QueryScenarioIdentity {
     tenants: usize,
 }
 
-/// One completed assertion retained in the atomic distributed-journey receipt.
-#[derive(serde::Serialize)]
-struct ForgeParityAssertion {
-    /// Stable ledger assertion identity.
-    id: &'static str,
-    /// Whether the production-path assertion completed successfully.
-    passed: bool,
-}
-
-/// Versioned proof emitted only after all selected distributed assertions pass.
-#[derive(serde::Serialize)]
-struct ForgeParityProofReceipt {
-    /// Wire version accepted by the fail-closed parity matrix.
-    proof_version: &'static str,
-    /// Wyrd revision whose production journey produced this receipt.
-    target_commit: String,
-    /// Exact ignored integration-test identity that produced this receipt.
-    test_identity: &'static str,
-    /// Stable identity joining this receipt to every journey ledger row.
-    result_id: String,
-    /// Whether every selected assertion passed before receipt publication.
-    passed: bool,
-    /// Exact selected assertions, each recorded as a passing production proof.
-    assertions: Vec<ForgeParityAssertion>,
-}
-
 #[tokio::test]
 #[ignore = "gated journey: real bound Wyrd servers, Postgres, Scribe, Forge, and Iceberg"]
 /// Validate supported deployment shapes through the complete production path.
@@ -298,7 +262,7 @@ async fn forge_distributed_writer_matrix_preserves_rows_and_converges_once() {
     forge_distributed_writer_matrix_journey().await;
 }
 
-/// Implements the distributed writer matrix so the parity receipt can reuse its proof.
+/// Implements the distributed writer matrix for the gated product journey.
 ///
 /// # Panics
 ///
@@ -308,153 +272,6 @@ async fn forge_distributed_writer_matrix_journey() {
     for scenario in SCENARIOS {
         run_scenario(scenario).await;
     }
-}
-
-/// Run the selected distributed proofs and atomically publish their parity receipt.
-///
-/// The receipt is removed before the journey starts so a failing or interrupted
-/// pass cannot leave stale success evidence. Each invoked helper drives its
-/// existing real Postgres, Scribe, Forge, Iceberg, and public-query assertions.
-/// The receipt is written only after all six ledger-selected assertions return.
-///
-/// # Panics
-///
-/// Panics when a selected production journey fails, the mandatory target commit
-/// is absent or stale, or the receipt cannot be atomically written.
-#[tokio::test]
-#[ignore = "gated parity proof: real distributed Forge journey and atomic receipt"]
-async fn forge_parity_proof_receipt_follows_all_selected_distributed_assertions() {
-    let receipt_path = forge_parity_receipt_path();
-    let target_commit = forge_parity_target_commit();
-    if receipt_path.exists() {
-        std::fs::remove_file(&receipt_path).expect("remove stale Forge parity receipt");
-    }
-
-    let mut assertions = Vec::with_capacity(FORGE_PARITY_ASSERTIONS.len());
-    forge_distributed_writer_matrix_journey().await;
-    assertions.extend([
-        ForgeParityAssertion {
-            id: "forge.continuous-triggering",
-            passed: true,
-        },
-        ForgeParityAssertion {
-            id: "forge.bin-packing",
-            passed: true,
-        },
-    ]);
-    dedicated_forge_workers_journey().await;
-    assertions.push(ForgeParityAssertion {
-        id: "forge.dedicated-workers",
-        passed: true,
-    });
-    forge_snapshot_expiry_journey().await;
-    assertions.push(ForgeParityAssertion {
-        id: "forge.snapshot-expiry",
-        passed: true,
-    });
-    forge_orphan_cleanup_journey().await;
-    assertions.push(ForgeParityAssertion {
-        id: "forge.orphan-cleanup",
-        passed: true,
-    });
-    dedicated_unschedulable_admission_journey().await;
-    supervised_uncertain_commit_recovery_journey().await;
-    assertions.push(ForgeParityAssertion {
-        id: "forge.failover",
-        passed: true,
-    });
-    write_forge_parity_receipt(&receipt_path, &target_commit, assertions)
-        .expect("atomically write Forge parity receipt");
-}
-
-/// Resolve the required receipt path selected by the focused parity-proof task.
-///
-/// # Panics
-///
-/// Panics when the focused task does not provide the required proof path.
-fn forge_parity_receipt_path() -> std::path::PathBuf {
-    std::env::var_os("WYRD_BIFROST_PARITY_PROOF")
-        .map(std::path::PathBuf::from)
-        .expect("focused parity task sets WYRD_BIFROST_PARITY_PROOF")
-}
-
-/// Resolve the Wyrd revision selected by the focused parity-proof task.
-///
-/// # Panics
-///
-/// Panics when the focused task does not provide the current Wyrd revision.
-fn forge_parity_target_commit() -> String {
-    std::env::var("WYRD_BIFROST_PARITY_TARGET_COMMIT")
-        .expect("focused parity task sets WYRD_BIFROST_PARITY_TARGET_COMMIT")
-}
-
-/// Validate and atomically write one complete distributed-parity proof receipt.
-///
-/// The temporary file is written beside the final destination and renamed only
-/// after serialization succeeds. Invalid or incomplete assertion sets return
-/// before a destination is created, so callers cannot publish partial proof.
-///
-/// # Errors
-///
-/// Returns an error when the selected assertion set is missing, duplicated, or
-/// failed; when the destination has no parent directory; or when filesystem or
-/// serialization operations prevent the atomic rename.
-fn write_forge_parity_receipt(
-    path: &std::path::Path,
-    target_commit: &str,
-    assertions: Vec<ForgeParityAssertion>,
-) -> Result<(), String> {
-    let mut assertion_ids = assertions
-        .iter()
-        .map(|assertion| assertion.id)
-        .collect::<Vec<_>>();
-    assertion_ids.sort_unstable();
-    let mut expected = FORGE_PARITY_ASSERTIONS.to_vec();
-    expected.sort_unstable();
-    if assertion_ids != expected || assertions.iter().any(|assertion| !assertion.passed) {
-        return Err(
-            "Forge parity receipt requires every selected passing assertion exactly once"
-                .to_owned(),
-        );
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Forge parity receipt path must have a parent directory".to_owned())?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("create Forge parity receipt directory: {error}"))?;
-    let receipt = ForgeParityProofReceipt {
-        proof_version: "wyrd.bifrost.forge-parity-proof/v1",
-        target_commit: target_commit.to_owned(),
-        test_identity: "pg_bifrost_forge_distributed_journey",
-        result_id: format!("{target_commit}:pg_bifrost_forge_distributed_journey"),
-        passed: true,
-        assertions,
-    };
-    let bytes = serde_json::to_vec_pretty(&receipt)
-        .map_err(|error| format!("serialize Forge parity receipt: {error}"))?;
-    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
-    std::fs::write(&temporary, bytes)
-        .map_err(|error| format!("write temporary Forge parity receipt: {error}"))?;
-    std::fs::rename(&temporary, path)
-        .map_err(|error| format!("rename Forge parity receipt atomically: {error}"))
-}
-
-/// Refuses an injected failed assertion without creating a parity receipt.
-#[test]
-fn forge_parity_receipt_rejects_failed_assertion_without_output() {
-    let directory =
-        std::env::temp_dir().join(format!("wyrd-forge-parity-{}", uuid::Uuid::now_v7()));
-    let path = directory.join("forge-parity-proof.json");
-    let assertions = FORGE_PARITY_ASSERTIONS
-        .into_iter()
-        .map(|id| ForgeParityAssertion {
-            id,
-            passed: id != "forge.failover",
-        })
-        .collect::<Vec<_>>();
-    assert!(write_forge_parity_receipt(&path, "test-target", assertions).is_err());
-    assert!(!path.exists());
-    assert!(!directory.exists());
 }
 
 /// Return one rendered staging-fold duration count for a closed task result label.
@@ -483,7 +300,7 @@ fn rendered_staging_fold_task_duration_count(rendered: &str, result: &str) -> Op
 async fn superseded_worker_records_cancelled_duration_from_durable_state() {
     let (server, telemetry) = start_telemetry_maintenance_server().await;
     let fixture = seed_forge_group(&server, "durable_cancelled_metric").await;
-    commit_parity_staging_snapshot(&fixture).await;
+    commit_journey_staging_snapshot(&fixture).await;
     let current_snapshot = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -554,19 +371,19 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
     server.shutdown().await.expect("telemetry server shutdown");
 }
 
-/// Starts an isolated production server for one receipt-owned lifecycle proof.
+/// Starts an isolated production server for one maintenance lifecycle journey.
 ///
 /// # Panics
 ///
 /// Panics when the local Postgres, catalog, storage, or server fixture cannot
 /// start with its background Forge interval disabled for deterministic control.
-async fn start_parity_maintenance_server() -> WyrdTestServer {
+async fn start_maintenance_journey_server() -> WyrdTestServer {
     WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
         .with_forge_process_role_for_test(ForgeProcessRole::Server)
         .start_in_process()
         .await
-        .expect("in-process parity maintenance server")
+        .expect("in-process maintenance journey server")
 }
 
 /// Start an isolated maintenance server attached to the shared production telemetry capture.
@@ -594,19 +411,19 @@ async fn start_telemetry_maintenance_server()
 ///
 /// Panics when the fixture cannot create a successful staging-fold task within
 /// two bounded production passes.
-async fn commit_parity_staging_snapshot(fixture: &wyrd_testing::bifrost::ForgeFixture) {
+async fn commit_journey_staging_snapshot(fixture: &wyrd_testing::bifrost::ForgeFixture) {
     let mut config = fixture.config.clone();
     config.max_files_per_bin = 2;
     config.max_files_per_tick = 2;
     for _ in 0..2 {
-        let mut lifecycle = ParityMaintenance::start(fixture, config.clone());
+        let mut lifecycle = JourneyMaintenance::start(fixture, config.clone());
         let strategy = lifecycle.run_one_success().await;
         lifecycle.shutdown().await;
         if strategy == ForgeTaskStrategy::StagingFold {
             return;
         }
     }
-    panic!("bounded parity maintenance setup did not execute staging_fold");
+    panic!("bounded maintenance journey did not execute staging_fold");
 }
 
 /// Commits one production small-file rewrite required before maintenance proof.
@@ -615,21 +432,21 @@ async fn commit_parity_staging_snapshot(fixture: &wyrd_testing::bifrost::ForgeFi
 ///
 /// Panics when the real scheduler and worker do not complete the expected
 /// SmallFiles task needed to leave only reset-generation objects for GC.
-async fn commit_parity_live_rewrite(fixture: &wyrd_testing::bifrost::ForgeFixture) {
-    let mut lifecycle = ParityMaintenance::start(fixture, fixture.config.clone());
+async fn commit_journey_live_rewrite(fixture: &wyrd_testing::bifrost::ForgeFixture) {
+    let mut lifecycle = JourneyMaintenance::start(fixture, fixture.config.clone());
     let strategy = lifecycle.run_one_success().await;
     lifecycle.shutdown().await;
     assert_eq!(
         strategy,
         ForgeTaskStrategy::SmallFiles,
-        "parity orphan setup must drain its production live rewrite"
+        "orphan journey setup must drain its production live rewrite"
     );
 }
 
 /// Seeds one durable Reset generation whose output paths are GC-eligible.
 ///
 /// The fixture invokes the same Prepared and Reset transition writers used by
-/// the maintenance interleaving journey. The later receipt proof still drives
+/// the maintenance interleaving journey. The later product journey still drives
 /// production scheduling, worker execution, eligibility checks, deletion, and
 /// terminal orphan-GC audit; this helper only establishes the durable recovery
 /// lineage that defines an eligible never-published output.
@@ -638,7 +455,7 @@ async fn commit_parity_live_rewrite(fixture: &wyrd_testing::bifrost::ForgeFixtur
 ///
 /// Panics when the reset transition fixture cannot retain its exact input,
 /// output, lease, or operation-state evidence.
-async fn seed_parity_reset_generation(
+async fn seed_journey_reset_generation(
     fixture: &wyrd_testing::bifrost::ForgeFixture,
 ) -> Vec<String> {
     fixture.append_forge_file(2).await;
@@ -653,7 +470,7 @@ async fn seed_parity_reset_generation(
     .bind(&fixture.binding.table_name)
     .fetch_all(fixture.operator_pool.pool())
     .await
-    .expect("parity reset staging rows");
+    .expect("journey reset staging rows");
     assert_eq!(rows.len(), 2);
     let partition_day = rows[0].2;
     assert!(rows.iter().all(|row| row.2 == partition_day));
@@ -671,7 +488,7 @@ async fn seed_parity_reset_generation(
             .staging
             .write(output, Buffer::from(vec![9_u8]))
             .await
-            .expect("parity reset generation object");
+            .expect("journey reset generation object");
     }
     let input_file_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
     let operation_id = uuid::Uuid::now_v7();
@@ -685,11 +502,11 @@ async fn seed_parity_reset_generation(
         input_file_ids: input_file_ids.clone(),
         input_paths: rows
             .iter()
-            .map(|row| StoragePath::new(row.1.clone()).expect("parity reset input storage path"))
+            .map(|row| StoragePath::new(row.1.clone()).expect("journey reset input storage path"))
             .collect(),
         output_paths: outputs
             .iter()
-            .map(|path| StoragePath::new(path.clone()).expect("parity reset output storage path"))
+            .map(|path| StoragePath::new(path.clone()).expect("journey reset output storage path"))
             .collect(),
         snapshot_id: None,
         writer_recipe_version: "bifrost-writer-v1".to_owned(),
@@ -706,8 +523,8 @@ async fn seed_parity_reset_generation(
         fixture.config.lease_ttl,
     )
     .await
-    .expect("parity reset generation lease query")
-    .expect("parity reset generation lease");
+    .expect("journey reset generation lease query")
+    .expect("journey reset generation lease");
     fixture
         .forge
         .append_compaction_transition_for_test(
@@ -718,7 +535,7 @@ async fn seed_parity_reset_generation(
             "forge.file_compact.prepared",
         )
         .await
-        .expect("prepared parity reset generation");
+        .expect("prepared journey reset generation");
     fixture
         .forge
         .reset_reconciled_for_test(
@@ -729,17 +546,17 @@ async fn seed_parity_reset_generation(
             &detail,
         )
         .await
-        .expect("terminal parity reset generation");
+        .expect("terminal journey reset generation");
     lease
         .release(&fixture.operator_pool)
         .await
-        .expect("parity reset generation lease release");
+        .expect("journey reset generation lease release");
     assert_eq!(
         fixture
             .forge
             .reset_generation_paths_for_test(&fixture.binding)
             .await
-            .expect("parity Reset generation projection"),
+            .expect("journey Reset generation projection"),
         outputs
     );
     outputs
@@ -752,31 +569,33 @@ async fn seed_parity_reset_generation(
 /// Panics when two production staging commits cannot create retained history,
 /// when the dedicated SnapshotExpiry task does not complete, or when the
 /// authoritative expiry audit is absent.
+#[tokio::test]
+#[ignore = "gated journey: real Postgres, Forge maintenance, and Iceberg snapshots"]
 async fn forge_snapshot_expiry_journey() {
-    let server = start_parity_maintenance_server().await;
-    let fixture = seed_forge_group(&server, "parity_snapshot_expiry").await;
-    commit_parity_staging_snapshot(&fixture).await;
+    let server = start_maintenance_journey_server().await;
+    let fixture = seed_forge_group(&server, "journey_snapshot_expiry").await;
+    commit_journey_staging_snapshot(&fixture).await;
     fixture.append_forge_file(2).await;
     fixture.append_forge_file(3).await;
-    commit_parity_staging_snapshot(&fixture).await;
+    commit_journey_staging_snapshot(&fixture).await;
     let table = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
         .await
-        .expect("parity snapshot-expiry table");
+        .expect("journey snapshot-expiry table");
     let newest_snapshot_ms = table
         .metadata()
         .snapshots()
         .map(|snapshot| snapshot.timestamp_ms())
         .max()
-        .expect("parity snapshot-expiry retained history");
+        .expect("journey snapshot-expiry retained history");
     server
         .forge_clock()
         .set(
             chrono::DateTime::from_timestamp_millis(newest_snapshot_ms + 2)
-                .expect("parity snapshot timestamp is UTC-representable"),
+                .expect("journey snapshot timestamp is UTC-representable"),
         )
-        .expect("advance parity expiry clock");
+        .expect("advance journey expiry clock");
     let mut config = fixture.config.clone();
     config.snapshot_retention = Duration::from_millis(1);
     config.min_files = 3;
@@ -784,7 +603,7 @@ async fn forge_snapshot_expiry_journey() {
     config.max_files_per_tick = 3;
     let mut completed_expiry = false;
     for _ in 0..3 {
-        let mut lifecycle = ParityMaintenance::start(&fixture, config.clone());
+        let mut lifecycle = JourneyMaintenance::start(&fixture, config.clone());
         let strategy = lifecycle.run_one_success().await;
         lifecycle.shutdown().await;
         if strategy == ForgeTaskStrategy::SnapshotExpiry {
@@ -794,19 +613,19 @@ async fn forge_snapshot_expiry_journey() {
     }
     assert!(
         completed_expiry,
-        "production receipt journey must complete snapshot_expiry"
+        "production journey must complete snapshot_expiry"
     );
     assert!(
         fixture
             .operation_count("forge.snapshot_expire.committed")
             .await
             >= 1,
-        "production receipt journey must persist an expiry commit audit"
+        "production journey must persist an expiry commit audit"
     );
     server
         .shutdown()
         .await
-        .expect("parity expiry server shutdown");
+        .expect("journey expiry server shutdown");
 }
 
 /// Runs real orphan collection and proves an aged, unreferenced object is deleted.
@@ -816,42 +635,44 @@ async fn forge_snapshot_expiry_journey() {
 /// Panics when the production maintenance path does not complete SnapshotExpiry
 /// and its coupled orphan collector, retain the object, or omit its terminal
 /// orphan-GC audit.
+#[tokio::test]
+#[ignore = "gated journey: real Postgres, Forge maintenance, and object cleanup"]
 async fn forge_orphan_cleanup_journey() {
-    let server = start_parity_maintenance_server().await;
-    let fixture = seed_forge_group(&server, "parity_orphan_cleanup").await;
-    commit_parity_staging_snapshot(&fixture).await;
-    let orphans = seed_parity_reset_generation(&fixture).await;
-    commit_parity_staging_snapshot(&fixture).await;
-    commit_parity_live_rewrite(&fixture).await;
+    let server = start_maintenance_journey_server().await;
+    let fixture = seed_forge_group(&server, "journey_orphan_cleanup").await;
+    commit_journey_staging_snapshot(&fixture).await;
+    let orphans = seed_journey_reset_generation(&fixture).await;
+    commit_journey_staging_snapshot(&fixture).await;
+    commit_journey_live_rewrite(&fixture).await;
     let modified = fixture
         .staging
         .stat(&orphans[0])
         .await
-        .expect("parity orphan metadata")
+        .expect("journey orphan metadata")
         .last_modified()
-        .expect("parity orphan modification time")
+        .expect("journey orphan modification time")
         .into_inner()
         .as_millisecond();
     server
         .forge_clock()
         .set(
             chrono::DateTime::from_timestamp_millis(modified + 100)
-                .expect("parity orphan timestamp is UTC-representable"),
+                .expect("journey orphan timestamp is UTC-representable"),
         )
-        .expect("advance parity orphan clock");
+        .expect("advance journey orphan clock");
     let mut config = fixture.config.clone();
     config.snapshot_retention = Duration::from_millis(1);
     config.orphan_gc_ttl = Duration::from_millis(1);
     config.min_files = 3;
     config.max_files_per_bin = 3;
     config.max_files_per_tick = 3;
-    let mut lifecycle = ParityMaintenance::start(&fixture, config);
+    let mut lifecycle = JourneyMaintenance::start(&fixture, config);
     let strategy = lifecycle.run_one_success().await;
     lifecycle.shutdown().await;
     assert_eq!(
         strategy,
         ForgeTaskStrategy::SnapshotExpiry,
-        "production receipt journey must complete orphan maintenance"
+        "production journey must complete orphan maintenance"
     );
     for orphan in &orphans {
         assert!(
@@ -863,12 +684,12 @@ async fn forge_orphan_cleanup_journey() {
         fixture.operation_count("forge.orphan_gc.committed").await
             + fixture.operation_count("forge.orphan_gc.recovered").await
             >= 1,
-        "production receipt journey must persist an orphan-GC terminal audit"
+        "production journey must persist an orphan-GC terminal audit"
     );
     server
         .shutdown()
         .await
-        .expect("parity orphan server shutdown");
+        .expect("journey orphan server shutdown");
 }
 
 /// Proves Forge fixture rebuilds retain the server-owned wall clock.
@@ -920,7 +741,7 @@ async fn dedicated_forge_workers_share_dependencies_without_public_listeners() {
     dedicated_forge_workers_journey().await;
 }
 
-/// Implements the dedicated-worker journey for direct and receipt-backed proof runs.
+/// Implements the dedicated-worker product journey.
 ///
 /// # Panics
 ///
@@ -1208,7 +1029,7 @@ async fn supervised_dedicated_roles_recover_uncertain_commit_without_duplicate_r
     supervised_uncertain_commit_recovery_journey().await;
 }
 
-/// Implements the uncertain-commit recovery journey for receipt-backed failover proof.
+/// Implements the uncertain-commit recovery product journey.
 ///
 /// # Panics
 ///
@@ -1335,7 +1156,7 @@ async fn dedicated_roles_terminalize_unschedulable_work() {
     dedicated_unschedulable_admission_journey().await;
 }
 
-/// Implements the bounded planner-admission journey used by the parity proof.
+/// Implements the bounded planner-admission product journey.
 ///
 /// # Panics
 ///

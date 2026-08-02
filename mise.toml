@@ -344,19 +344,6 @@ description = "Run Forge with multiple tenants across three nodes"
 env = { WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/task16/forge-multi-tenant-multi-node.json" }
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=3 --tenants=10"
 
-[tasks."test:bifrost:forge:parity-proof"]
-description = "Run the distributed Forge parity journey and atomically write its proof receipt"
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'repository=$(git rev-parse --show-toplevel); target_commit=$(git rev-parse HEAD); receipt=$repository/target/bifrost-benchmarks/task16/forge-parity-proof.json; rm -f \"$receipt\"; mise run db:migrate:inner && WYRD_BIFROST_PARITY_TARGET_COMMIT=\"$target_commit\" WYRD_BIFROST_PARITY_PROOF=\"$receipt\" cargo test --locked -p wyrd-testing --test integration forge_parity_proof_receipt_follows_all_selected_distributed_assertions -- --ignored --test-threads=1'"
-
-[tasks."test:bifrost:forge:parity-fixtures"]
-description = "Validate Forge parity ledger, receipt, matrix, and typed telemetry negative fixtures"
-run = "bash scripts/checks/test-bifrost-forge-report-matrix.sh"
-
-[tasks."bench:bifrost:forge:matrix"]
-description = "Join selected passing Forge parity proofs with the three topology benchmarks"
-depends = ["test:bifrost:forge:parity-proof", "test:bifrost:forge:parity-fixtures", "bench:bifrost:forge:single-tenant-single-node", "bench:bifrost:forge:multi-tenant-single-node", "bench:bifrost:forge:multi-tenant-multi-node"]
-run = "bash scripts/checks/bifrost-forge-report-matrix.sh"
-
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock

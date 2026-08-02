@@ -250,8 +250,14 @@ impl AgentTool for BifrostQueryTool {
             "required": ["sql"],
             "properties": {
                 "sql": {"type": "string"},
-                "visibility": {"enum": ["published_only", "fused"]},
-                "freshness": {"enum": ["strict", "allow_degraded"]},
+                "visibility": {
+                    "enum": ["published_only", "fused"],
+                    "default": "published_only"
+                },
+                "freshness": {
+                    "enum": ["strict", "allow_degraded"],
+                    "default": "strict"
+                },
                 "max_rows": {"type": "integer", "minimum": 1},
                 "max_bytes": {"type": "integer", "minimum": 1}
             },
@@ -349,7 +355,9 @@ impl AgentTool for BifrostQueryTool {
     ///
     /// The workflow validates the MCP arguments, applies hard row and encoded-byte
     /// ceilings, delegates planning and execution to the authenticated Vala client,
-    /// validates the required terminal frame, and only then serializes Arrow rows.
+    /// validates the required schema and terminal frames, and only then serializes
+    /// the authoritative schema plus any Arrow rows. Zero-row success therefore
+    /// retains the real schema without fabricating a batch.
     /// Cancellation drops the in-flight client future; rows already collected are
     /// not returned without a validated terminal, so callers never observe partial
     /// success.
@@ -373,20 +381,13 @@ impl AgentTool for BifrostQueryTool {
             .collect_bounded(&request, limits)
             .await
             .map_err(query_tool_error)?;
-        let schema = result
-            .batches
-            .first()
-            .map(|batch| batch.schema())
-            .map(|schema| {
-                json!({
-                    "fields": schema.fields().iter().map(|field| json!({
-                        "name": field.name(),
-                        "data_type": field.data_type().to_string(),
-                        "nullable": field.is_nullable()
-                    })).collect::<Vec<_>>()
-                })
-            })
-            .unwrap_or_else(|| json!({"fields": []}));
+        let schema = json!({
+            "fields": result.schema.fields().iter().map(|field| json!({
+                "name": field.name(),
+                "data_type": field.data_type().to_string(),
+                "nullable": field.is_nullable()
+            })).collect::<Vec<_>>()
+        });
         let mut writer = ArrayWriter::new(Vec::new());
         for batch in &result.batches {
             writer
@@ -823,6 +824,18 @@ mod bifrost_tools {
             parse_freshness(Some(&json!("allow_degraded"))).expect("degraded is explicit"),
             wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded
         );
+
+        let registry = ToolRegistry::new();
+        register_bifrost_tools(&registry, Arc::new(dummy_client())).expect("tools register");
+        let schema = registry
+            .resolve("bifrost.query")
+            .expect("query tool registered")
+            .input_schema();
+        assert_eq!(
+            schema["properties"]["visibility"]["default"],
+            "published_only"
+        );
+        assert_eq!(schema["properties"]["freshness"]["default"], "strict");
     }
 
     /// The query tool publishes a closed terminal and structured error shape.

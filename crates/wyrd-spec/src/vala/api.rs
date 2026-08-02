@@ -981,7 +981,6 @@ pub struct BifrostQueryRequest {
     /// Visibility tiers requested by the caller.
     pub visibility: VisibilityMode,
     /// Required freshness behavior.
-    #[serde(default)]
     pub freshness: FreshnessPolicy,
     /// Optional caller deadline in milliseconds.
     pub deadline_ms: Option<u64>,
@@ -1419,17 +1418,35 @@ mod query_terminal_tests {
         assert!(failed.validate_emitted_rows(2).is_err());
     }
 
-    /// Query requests default to strict freshness and reject empty/zero input.
+    /// Query requests require both policies and reject empty or zero-valued input.
     #[test]
-    fn query_request_defaults_and_validation_are_closed() {
+    fn query_request_requires_policies_and_validation_is_closed() {
+        for omitted in ["visibility", "freshness"] {
+            let mut value = serde_json::json!({
+                "sql": "SELECT 1",
+                "visibility": "published_only",
+                "freshness": "strict",
+                "deadline_ms": null
+            });
+            value
+                .as_object_mut()
+                .expect("request fixture is an object")
+                .remove(omitted);
+            assert!(
+                serde_json::from_value::<BifrostQueryRequest>(value).is_err(),
+                "omitting {omitted} must fail closed"
+            );
+        }
+
         let request: BifrostQueryRequest = serde_json::from_value(serde_json::json!({
             "sql": "SELECT 1",
             "visibility": "published_only",
+            "freshness": "strict",
             "deadline_ms": null
         }))
         .expect("request deserializes");
         assert_eq!(request.freshness, FreshnessPolicy::Strict);
-        request.validate().expect("defaulted request validates");
+        request.validate().expect("explicit request validates");
 
         let invalid = BifrostQueryRequest {
             sql: " ".into(),
@@ -1440,24 +1457,38 @@ mod query_terminal_tests {
         assert!(invalid.validate().is_err());
     }
 
-    /// Explicit fused/degraded policy survives request serialization unchanged.
+    /// Every explicit safe or opt-in policy pair round-trips without inference.
     #[test]
-    fn query_request_explicit_opt_ins_are_serialized() {
-        let request = BifrostQueryRequest {
-            sql: "SELECT 1".into(),
-            visibility: VisibilityMode::Fused,
-            freshness: FreshnessPolicy::AllowDegraded,
-            deadline_ms: None,
-        };
-        assert_eq!(
-            serde_json::to_value(request).expect("request serializes"),
-            serde_json::json!({
-                "sql": "SELECT 1",
-                "visibility": "fused",
-                "freshness": "allow_degraded",
-                "deadline_ms": null
-            })
-        );
+    fn query_request_explicit_policy_pairs_round_trip() {
+        let cases = [
+            (
+                VisibilityMode::PublishedOnly,
+                FreshnessPolicy::Strict,
+                "published_only",
+                "strict",
+            ),
+            (
+                VisibilityMode::Fused,
+                FreshnessPolicy::AllowDegraded,
+                "fused",
+                "allow_degraded",
+            ),
+        ];
+
+        for (visibility, freshness, wire_visibility, wire_freshness) in cases {
+            let request = BifrostQueryRequest {
+                sql: "SELECT 1".into(),
+                visibility,
+                freshness,
+                deadline_ms: None,
+            };
+            let encoded = serde_json::to_value(&request).expect("request serializes");
+            assert_eq!(encoded["visibility"], wire_visibility);
+            assert_eq!(encoded["freshness"], wire_freshness);
+            let decoded: BifrostQueryRequest =
+                serde_json::from_value(encoded).expect("serialized request deserializes");
+            assert_eq!(decoded, request);
+        }
     }
 
     /// Failed terminals still obey settled freshness and source consistency.

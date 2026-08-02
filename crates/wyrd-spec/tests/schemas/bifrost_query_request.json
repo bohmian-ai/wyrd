@@ -4,6 +4,7 @@
   "description": "Public synchronous Oracle query request.",
   "type": "object",
   "required": [
+    "freshness",
     "sql",
     "visibility"
   ],
@@ -19,7 +20,6 @@
     },
     "freshness": {
       "description": "Required freshness behavior.",
-      "default": "strict",
       "allOf": [
         {
           "$ref": "#/definitions/FreshnessPolicy"

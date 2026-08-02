@@ -422,6 +422,10 @@ impl QueryResultStream {
 
     /// Collects this stream within explicit result ceilings.
     ///
+    /// The returned result retains the authoritative schema decoded from the
+    /// initial schema frame, including when the query produces no batches. A
+    /// successful terminal without that schema is rejected as incomplete.
+    ///
     /// # Errors
     ///
     /// Returns a stream error or [`ValaSdkError::ResultTooLarge`] before
@@ -454,7 +458,9 @@ impl QueryResultStream {
             batches.push(batch);
         }
         let terminal = self.terminal.ok_or(ValaSdkError::IncompleteQueryStream)?;
+        let schema = self.schema.ok_or(ValaSdkError::IncompleteQueryStream)?;
         Ok(CollectedQueryResult {
+            schema,
             batches,
             terminal,
             rows,
@@ -490,9 +496,11 @@ pub struct CollectedQueryLimits {
     pub max_encoded_bytes: usize,
 }
 
-/// Bounded Arrow query result with validated terminal metadata.
+/// Bounded Arrow query result with its authoritative schema and validated terminal metadata.
 #[derive(Debug)]
 pub struct CollectedQueryResult {
+    /// Schema decoded from the stream's required initial schema frame.
+    pub schema: SchemaRef,
     /// Collected record batches.
     pub batches: Vec<RecordBatch>,
     /// Terminal metadata.
@@ -859,6 +867,63 @@ mod tests {
         assert_eq!(
             result.terminal().expect("terminal retained").outcome,
             QueryTerminalOutcome::Degraded
+        );
+    }
+
+    /// Bounded zero-row collection retains the authoritative schema without a batch.
+    #[tokio::test]
+    async fn bifrost_query_zero_rows_retains_authoritative_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("optional_value", DataType::Utf8, true),
+        ]));
+        let chunks = vec![
+            encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "zero-row-fingerprint".to_owned(),
+                arrow_ipc_schema: schema_ipc(&schema),
+            })),
+            encoded(QueryStreamFrame::Terminal(success_terminal(
+                VisibilityMode::PublishedOnly,
+                0,
+            ))),
+        ];
+
+        let result = result_stream(chunks, VisibilityMode::PublishedOnly)
+            .collect_bounded(CollectedQueryLimits {
+                max_rows: 1,
+                max_encoded_bytes: usize::MAX,
+            })
+            .await
+            .expect("schema and zero-row terminal collect");
+
+        assert!(result.batches.is_empty());
+        assert_eq!(result.rows, 0);
+        assert_eq!(result.terminal.row_count, 0);
+        assert_eq!(result.schema.fields(), schema.fields());
+        assert_eq!(result.schema.field(0).name(), "id");
+        assert_eq!(result.schema.field(0).data_type(), &DataType::Int64);
+        assert!(!result.schema.field(0).is_nullable());
+        assert_eq!(result.schema.field(1).name(), "optional_value");
+        assert_eq!(result.schema.field(1).data_type(), &DataType::Utf8);
+        assert!(result.schema.field(1).is_nullable());
+    }
+
+    /// A successful terminal without the required schema never becomes a result.
+    #[tokio::test]
+    async fn bifrost_query_collection_rejects_missing_schema() {
+        let chunks = vec![encoded(QueryStreamFrame::Terminal(success_terminal(
+            VisibilityMode::PublishedOnly,
+            0,
+        )))];
+
+        assert!(
+            result_stream(chunks, VisibilityMode::PublishedOnly)
+                .collect_bounded(CollectedQueryLimits {
+                    max_rows: 1,
+                    max_encoded_bytes: usize::MAX,
+                })
+                .await
+                .is_err()
         );
     }
 

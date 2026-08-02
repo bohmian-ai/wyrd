@@ -277,6 +277,47 @@ mod pg_tests {
         assert_eq!(terminal["error"], serde_json::Value::Null);
     }
 
+    /// A real zero-match query returns its schema, no rows, and a successful terminal.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "runs in the gated Bifrost real-server journey lane"]
+    async fn bifrost_query_zero_rows_returns_authoritative_schema() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server starts");
+        let fixture = seed_query_fixture(&srv, "mcp-zero-rows")
+            .await
+            .expect("query fixture seeds");
+        let registry = ToolRegistry::new();
+        register_bifrost_tools(
+            &registry,
+            Arc::new(client_from_bearer(&fixture.endpoint, fixture.token)),
+        )
+        .expect("tools register");
+
+        let output = discover_query_tool(&registry)
+            .invoke(json!({
+                "sql": format!("SELECT id, value FROM {} WHERE id < 0", fixture.table)
+            }))
+            .await
+            .expect("zero-match query succeeds");
+
+        assert_eq!(
+            output["schema"],
+            json!({
+                "fields": [
+                    {"name": "id", "data_type": "Int64", "nullable": false},
+                    {"name": "value", "data_type": "Utf8", "nullable": false}
+                ]
+            })
+        );
+        assert_eq!(output["rows"], json!([]));
+        assert_eq!(output["terminal"]["outcome"], "success");
+        assert_eq!(output["terminal"]["freshness"], "complete");
+        assert_eq!(output["terminal"]["row_count"], 0);
+        assert_eq!(output["terminal"]["warnings"], json!([]));
+        assert_eq!(output["terminal"]["error"], serde_json::Value::Null);
+    }
+
     /// Invalid SQL preserves the exact Gate problem metadata without prose parsing.
     #[tokio::test(flavor = "multi_thread")]
     async fn bifrost_query_invalid_sql_preserves_structured_error() {

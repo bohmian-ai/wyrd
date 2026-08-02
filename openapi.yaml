@@ -48,6 +48,7 @@ components:
       required:
       - sql
       - visibility
+      - freshness
       properties:
         deadline_ms:
           type:

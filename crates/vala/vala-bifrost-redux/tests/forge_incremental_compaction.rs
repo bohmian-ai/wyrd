@@ -1740,6 +1740,150 @@ mod pg_tests {
         fixture.plan_and_claim().await
     }
 
+    /// A planning demand replaced during its acknowledgement is retried once from
+    /// the newer generation without publishing the pass as complete.
+    #[tokio::test]
+    async fn scheduler_retries_replaced_demand_generation_once() {
+        let fixture = Fixture::new().await;
+        let stop = CancellationToken::new();
+        let scheduler =
+            ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+                .expect("fixture scheduler");
+        scheduler.pause_before_demand_acknowledgement_for_test();
+        let scheduling = scheduler.schedule_once(&stop);
+        tokio::pin!(scheduling);
+        tokio::select! {
+            () = scheduler.wait_for_demand_acknowledgement_pause_for_test() => {}
+            result = &mut scheduling => panic!("scheduler returned before demand acknowledgement pause: {result:?}"),
+        }
+
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        )
+        .expect("fixture task identity");
+        ForgeTasks::new(fixture.operator_pool.clone())
+            .upsert_periodic(fixture.tenant, &identity)
+            .await
+            .expect("replace demand generation");
+        scheduler.release_demand_acknowledgement_pause_for_test();
+
+        let outcome = scheduling.await.expect("generation retry scheduling pass");
+        assert_eq!(outcome.demands_seen, 1, "outcome: {outcome:?}");
+        assert_eq!(outcome.demands_acknowledged, 1, "outcome: {outcome:?}");
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
+        assert!(
+            outcome.incomplete,
+            "generation replacement prevents completion publication"
+        );
+        assert_eq!(scheduler.complete_publications_for_test(), 0);
+
+        let durable: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3 AND strategy='staging_fold'), (SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3)",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("retried durable state");
+        assert_eq!(
+            durable,
+            (1, 0),
+            "retry must leave one task and no stale demand"
+        );
+    }
+
+    /// Cancellation after successor-demand refresh preserves the successor without
+    /// retry-side planning, acknowledgement, cursor, audit, or completion effects.
+    #[tokio::test]
+    async fn scheduler_cancellation_after_demand_refresh_preserves_successor() {
+        let fixture = Fixture::new().await;
+        let stop = CancellationToken::new();
+        let scheduler =
+            ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+                .expect("fixture scheduler");
+        let cursor_before: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+        )
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("pre-cancellation scheduler state");
+        let mut audit_conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("pre-cancellation audit connection");
+        let audits_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1")
+                .bind(fixture.tenant.as_uuid())
+                .fetch_one(&mut **audit_conn.transaction())
+                .await
+                .expect("pre-cancellation audit count");
+        scheduler.pause_before_demand_acknowledgement_for_test();
+        scheduler.pause_after_demand_refresh_for_test();
+        let scheduling = scheduler.schedule_once(&stop);
+        tokio::pin!(scheduling);
+        tokio::select! {
+            () = scheduler.wait_for_demand_acknowledgement_pause_for_test() => {}
+            result = &mut scheduling => panic!("scheduler returned before demand acknowledgement pause: {result:?}"),
+        }
+
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        )
+        .expect("fixture task identity");
+        let successor_generation = ForgeTasks::new(fixture.operator_pool.clone())
+            .upsert_periodic(fixture.tenant, &identity)
+            .await
+            .expect("replace demand generation");
+        scheduler.release_demand_acknowledgement_pause_for_test();
+        tokio::select! {
+            () = scheduler.wait_for_demand_refresh_pause_for_test() => {}
+            result = &mut scheduling => panic!("scheduler returned before successor refresh pause: {result:?}"),
+        }
+
+        stop.cancel();
+        scheduler.release_demand_refresh_pause_for_test();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), scheduling)
+            .await
+            .expect("cancelled scheduler pass must return boundedly")
+            .expect("cancelled scheduler pass");
+        assert_eq!(outcome.demands_seen, 1, "outcome: {outcome:?}");
+        assert_eq!(outcome.tasks_enqueued, 0, "outcome: {outcome:?}");
+        assert_eq!(outcome.demands_acknowledged, 0, "outcome: {outcome:?}");
+        assert!(outcome.incomplete, "outcome: {outcome:?}");
+        assert_eq!(scheduler.complete_publications_for_test(), 0);
+
+        let after: (i64, i64, Option<uuid::Uuid>) = sqlx::query_as(
+            "SELECT (SELECT generation FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3), (SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3), last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("post-cancellation scheduler state");
+        let mut audit_conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("post-cancellation audit connection");
+        let audits_after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1")
+                .bind(fixture.tenant.as_uuid())
+                .fetch_one(&mut **audit_conn.transaction())
+                .await
+                .expect("post-cancellation audit count");
+        assert_eq!(after, (successor_generation, 0, cursor_before));
+        assert_eq!(audits_after, audits_before);
+    }
+
     /// Authority loss injected at a maintenance catalog boundary.
     #[derive(Clone, Copy)]
     enum MaintenanceAuthorityLoss {

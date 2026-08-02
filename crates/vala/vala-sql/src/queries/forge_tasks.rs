@@ -150,6 +150,41 @@ impl ForgeTasks {
         Ok((demands, overflowed))
     }
 
+    /// Reloads one exact demand while validating the scheduler's current fence.
+    ///
+    /// A writer or terminal worker can advance this demand after a scheduler
+    /// has planned it but before its acknowledgement transaction commits.
+    /// Returning the newest row lets the scheduler coalesce that optimistic
+    /// race without relaxing its owner or generation checks.
+    ///
+    /// # Errors
+    /// Returns a stale-fence conflict or SQL and persisted-row decoding errors.
+    ///
+    /// # Cancellation
+    /// This read has no durable partial progress.
+    pub async fn refresh_demand(
+        &self,
+        owner: Uuid,
+        scheduler_fence: i64,
+        demand: &ForgePlanningDemand,
+    ) -> Result<Option<ForgePlanningDemand>, SqlError> {
+        let row = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT singleton FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation FROM vala.forge_planning_demands d CROSS JOIN scheduler WHERE d.data_tenant_id=$3 AND d.catalog_name=$4 AND d.namespace_name=$5 AND d.table_name=$6")
+            .bind(owner).bind(scheduler_fence).bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table)
+            .fetch_optional(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        if let Some(row) = row {
+            return row.try_into().map(Some);
+        }
+        let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp())")
+            .bind(owner).bind(scheduler_fence).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        if live {
+            Ok(None)
+        } else {
+            Err(SqlError::Conflict {
+                detail: "Forge scheduler fence is stale".to_owned(),
+            })
+        }
+    }
+
     /// Atomically enqueues all exact plans and CAS-acknowledges their source demand.
     ///
     /// The scheduler fence is revalidated before any insert. A concurrent newer
@@ -223,10 +258,7 @@ impl ForgeTasks {
         let deleted = sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND generation=$5")
             .bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table).bind(demand.generation).execute(&mut *tx).await.map_err(SqlError::from)?.rows_affected();
         if deleted != 1 {
-            return Err(SqlError::Conflict {
-                detail: "Forge planning demand generation changed before acknowledgement"
-                    .to_owned(),
-            });
+            return Err(SqlError::ForgeDemandGenerationChanged);
         }
         {
             let advanced = sqlx::query("UPDATE vala.forge_scheduler_state SET last_tenant_id=$3,updated_at=statement_timestamp() WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()")

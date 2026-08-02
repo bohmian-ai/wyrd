@@ -11,6 +11,7 @@ use chrono::Utc;
 use num_traits::ToPrimitive;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::SqlError;
 use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
     ForgePlanningDemand, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
@@ -70,6 +71,12 @@ pub struct ForgeScheduler<'forge> {
     /// Deterministic pause before the post-roster renewal in scheduler tests.
     #[cfg(feature = "test-support")]
     renewal_gate: Arc<SchedulerRenewalGate>,
+    /// Deterministic pause before demand acknowledgement in scheduler tests.
+    #[cfg(feature = "test-support")]
+    demand_ack_gate: Arc<SchedulerDemandAckGate>,
+    /// Deterministic pause after a refreshed demand is read in scheduler tests.
+    #[cfg(feature = "test-support")]
+    demand_refresh_gate: Arc<SchedulerDemandRefreshGate>,
     /// Complete-only publication count observed by scheduler tests.
     #[cfg(feature = "test-support")]
     complete_publications: Arc<AtomicUsize>,
@@ -86,6 +93,34 @@ struct SchedulerRenewalGate {
     /// Signals that the scheduling pass reached the renewal boundary.
     reached: tokio::sync::Notify,
     /// Releases the paused pass after the test changes durable leadership.
+    release: tokio::sync::Notify,
+}
+
+/// Deterministic coordination around acknowledgement of one demand generation.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct SchedulerDemandAckGate {
+    /// Arms exactly one pause after planning and before the atomic acknowledgement.
+    armed: AtomicBool,
+    /// Records that the pass is currently stopped before acknowledgement.
+    paused: AtomicBool,
+    /// Signals that planning reached the acknowledgement boundary.
+    reached: tokio::sync::Notify,
+    /// Releases the paused pass after the test replaces the demand generation.
+    release: tokio::sync::Notify,
+}
+
+/// Deterministic coordination immediately after a demand refresh read.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct SchedulerDemandRefreshGate {
+    /// Arms exactly one pause after the scheduler reads a successor generation.
+    armed: AtomicBool,
+    /// Records that the pass is stopped before retry-side effects.
+    paused: AtomicBool,
+    /// Signals that the successor generation has been read.
+    reached: tokio::sync::Notify,
+    /// Releases the paused pass after the test cancels or permits the retry.
     release: tokio::sync::Notify,
 }
 
@@ -123,6 +158,10 @@ impl<'forge> ForgeScheduler<'forge> {
             #[cfg(feature = "test-support")]
             renewal_gate: Arc::new(SchedulerRenewalGate::default()),
             #[cfg(feature = "test-support")]
+            demand_ack_gate: Arc::new(SchedulerDemandAckGate::default()),
+            #[cfg(feature = "test-support")]
+            demand_refresh_gate: Arc::new(SchedulerDemandRefreshGate::default()),
+            #[cfg(feature = "test-support")]
             complete_publications: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -145,6 +184,48 @@ impl<'forge> ForgeScheduler<'forge> {
     #[cfg(feature = "test-support")]
     pub fn release_demand_renewal_pause_for_test(&self) {
         self.renewal_gate.release.notify_one();
+    }
+
+    /// Arms a deterministic pause before one demand acknowledgement transaction.
+    #[cfg(feature = "test-support")]
+    pub fn pause_before_demand_acknowledgement_for_test(&self) {
+        self.demand_ack_gate.armed.store(true, Ordering::Release);
+    }
+
+    /// Waits until a scheduling pass reaches the armed acknowledgement boundary.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_demand_acknowledgement_pause_for_test(&self) {
+        while !self.demand_ack_gate.paused.load(Ordering::Acquire) {
+            self.demand_ack_gate.reached.notified().await;
+        }
+    }
+
+    /// Releases one scheduling pass paused before demand acknowledgement.
+    #[cfg(feature = "test-support")]
+    pub fn release_demand_acknowledgement_pause_for_test(&self) {
+        self.demand_ack_gate.release.notify_one();
+    }
+
+    /// Arms a deterministic pause immediately after one successor generation read.
+    #[cfg(feature = "test-support")]
+    pub fn pause_after_demand_refresh_for_test(&self) {
+        self.demand_refresh_gate
+            .armed
+            .store(true, Ordering::Release);
+    }
+
+    /// Waits until a scheduling pass reads the successor generation while paused.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_demand_refresh_pause_for_test(&self) {
+        while !self.demand_refresh_gate.paused.load(Ordering::Acquire) {
+            self.demand_refresh_gate.reached.notified().await;
+        }
+    }
+
+    /// Releases one scheduling pass paused after a successor generation read.
+    #[cfg(feature = "test-support")]
+    pub fn release_demand_refresh_pause_for_test(&self) {
+        self.demand_refresh_gate.release.notify_one();
     }
 
     /// Returns complete-only status and telemetry publications by this scheduler.
@@ -190,10 +271,14 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     /// Returns scheduler lease, roster, catalog, planning, or durable SQL errors.
     /// Planning and cancellation failures retain the observed demand generation.
+    /// A generation replaced during its atomic acknowledgement is refreshed and
+    /// retried once, while keeping the pass incomplete so complete-only status
+    /// is never published from a raced view.
     ///
     /// # Cancellation
     ///
-    /// Caller cancellation stops before the next bounded roster or demand unit.
+    /// Caller cancellation returns an incomplete outcome before the next bounded
+    /// roster or demand unit and skips later fence renewal or publication.
     /// Fence loss returns immediately without later enqueue, status, or metrics.
     pub async fn schedule_once(
         &self,
@@ -217,35 +302,65 @@ impl<'forge> ForgeScheduler<'forge> {
         outcome.incomplete |= overflowed;
         outcome.demands_seen = demands.len();
         let mut admitted_by_tenant = BTreeMap::<_, usize>::new();
-        for demand in demands {
+        for mut demand in demands {
             if stop.is_cancelled() {
                 outcome.incomplete = true;
                 break;
             }
-            self.renew_fence(fence).await?;
-            match self.plan_demand(&demand, fence).await {
-                Ok(planned) => {
-                    outcome.tasks_enqueued = outcome
-                        .tasks_enqueued
-                        .saturating_add(planned.tasks_enqueued);
-                    outcome.unschedulable =
-                        outcome.unschedulable.saturating_add(planned.unschedulable);
-                    outcome.demands_acknowledged = outcome
-                        .demands_acknowledged
-                        .saturating_add(usize::from(planned.acknowledged));
-                    if planned.acknowledged {
-                        admitted_by_tenant
-                            .entry(demand.data_tenant_id)
-                            .and_modify(|count| {
-                                *count = count.saturating_add(planned.tasks_enqueued);
-                            })
-                            .or_insert(planned.tasks_enqueued);
-                    }
-                    outcome.incomplete |= !planned.acknowledged;
-                }
-                Err(error) => {
+            let mut generation_retries = 0_u8;
+            loop {
+                if stop.is_cancelled() {
                     outcome.incomplete = true;
-                    tracing::warn!(data_tenant_id = %demand.data_tenant_id, table = %demand.table_ref.table, error = %error, "Forge demand planning failed; retaining demand and continuing tenant page");
+                    break;
+                }
+                self.renew_fence(fence).await?;
+                match self.plan_demand(&demand, fence).await {
+                    Ok(planned) => {
+                        outcome.tasks_enqueued = outcome
+                            .tasks_enqueued
+                            .saturating_add(planned.tasks_enqueued);
+                        outcome.unschedulable =
+                            outcome.unschedulable.saturating_add(planned.unschedulable);
+                        outcome.demands_acknowledged = outcome
+                            .demands_acknowledged
+                            .saturating_add(usize::from(planned.acknowledged));
+                        if planned.acknowledged {
+                            admitted_by_tenant
+                                .entry(demand.data_tenant_id)
+                                .and_modify(|count| {
+                                    *count = count.saturating_add(planned.tasks_enqueued);
+                                })
+                                .or_insert(planned.tasks_enqueued);
+                        }
+                        outcome.incomplete |= !planned.acknowledged;
+                        break;
+                    }
+                    Err(ForgeError::Sql(SqlError::ForgeDemandGenerationChanged))
+                        if generation_retries == 0 && !stop.is_cancelled() =>
+                    {
+                        generation_retries = generation_retries.saturating_add(1);
+                        outcome.incomplete = true;
+                        let Some(refreshed) = self
+                            .tasks
+                            .refresh_demand(self.owner, fence, &demand)
+                            .await
+                            .map_err(ForgeError::Sql)?
+                        else {
+                            break;
+                        };
+                        #[cfg(feature = "test-support")]
+                        self.pause_after_demand_refresh_if_armed().await;
+                        if stop.is_cancelled() {
+                            outcome.incomplete = true;
+                            break;
+                        }
+                        demand = refreshed;
+                    }
+                    Err(error) => {
+                        outcome.incomplete = true;
+                        tracing::warn!(data_tenant_id = %demand.data_tenant_id, table = %demand.table_ref.table, error = %error, "Forge demand planning failed; retaining demand and continuing tenant page");
+                        break;
+                    }
                 }
             }
         }
@@ -254,6 +369,10 @@ impl<'forge> ForgeScheduler<'forge> {
             .min()
             .zip(admitted_by_tenant.values().max())
             .map_or(0, |(minimum, maximum)| maximum.saturating_sub(*minimum));
+        if stop.is_cancelled() {
+            outcome.incomplete = true;
+            return Ok(outcome);
+        }
         self.renew_fence(fence).await?;
         self.publish_status(&mut outcome, fence).await?;
         metrics::counter!("bifrost_forge_scheduling_total", "result" => if outcome.incomplete { "incomplete" } else { "complete" }).increment(1);
@@ -392,6 +511,24 @@ impl<'forge> ForgeScheduler<'forge> {
         let result = DemandPlanningResult {
             tasks_enqueued: executable.len().saturating_add(unschedulable.len()),
             unschedulable: unschedulable.len(),
+            #[cfg(feature = "test-support")]
+            acknowledged: {
+                self.pause_before_demand_acknowledgement_if_armed().await;
+                self.tasks
+                    .enqueue_and_acknowledge(
+                        self.owner,
+                        fence,
+                        demand,
+                        ForgeEnqueueBatch {
+                            executable: &executable,
+                            unschedulable: &unschedulable,
+                        },
+                        unschedulable_event,
+                    )
+                    .await
+                    .map_err(ForgeError::Sql)?
+            },
+            #[cfg(not(feature = "test-support"))]
             acknowledged: self
                 .tasks
                 .enqueue_and_acknowledge(
@@ -408,6 +545,32 @@ impl<'forge> ForgeScheduler<'forge> {
                 .map_err(ForgeError::Sql)?,
         };
         Ok(result)
+    }
+
+    /// Pauses once after planning and before the exact demand-generation CAS.
+    #[cfg(feature = "test-support")]
+    async fn pause_before_demand_acknowledgement_if_armed(&self) {
+        if self.demand_ack_gate.armed.swap(false, Ordering::AcqRel) {
+            self.demand_ack_gate.paused.store(true, Ordering::Release);
+            self.demand_ack_gate.reached.notify_waiters();
+            self.demand_ack_gate.release.notified().await;
+            self.demand_ack_gate.paused.store(false, Ordering::Release);
+        }
+    }
+
+    /// Pauses once after a successor generation refresh and before retry effects.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_demand_refresh_if_armed(&self) {
+        if self.demand_refresh_gate.armed.swap(false, Ordering::AcqRel) {
+            self.demand_refresh_gate
+                .paused
+                .store(true, Ordering::Release);
+            self.demand_refresh_gate.reached.notify_waiters();
+            self.demand_refresh_gate.release.notified().await;
+            self.demand_refresh_gate
+                .paused
+                .store(false, Ordering::Release);
+        }
     }
 
     /// Reconstructs the deterministic task candidates for one current table snapshot.

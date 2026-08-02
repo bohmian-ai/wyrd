@@ -128,6 +128,16 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// A newer Forge planning-demand generation superseded the scheduler read.
+    #[wyrd_error(
+        code = "WYRD_SQL_409_FORGE_DEMAND_GENERATION_CHANGED",
+        status = 409,
+        title = "Forge planning demand changed",
+        remediation = "Retry planning from the newest durable demand generation."
+    )]
+    #[error("Forge planning demand generation changed before acknowledgement")]
+    ForgeDemandGenerationChanged,
+
     /// Stored SQL data violated an invariant guaranteed by Wyrd migrations.
     #[wyrd_error(
         code = "WYRD_SQL_500_INVARIANT_VIOLATION",

@@ -606,15 +606,33 @@ fn default_embedded_data_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{env, sync::Mutex};
 
     use secrecy::ExposeSecret;
+    use sqlx::PgPool;
+    use url::Url;
 
     use super::{
         APP_DSN_ENV, BootError, CATALOG_APP_PASSWORD_ENV, DsnError, EmbeddedConfig,
         EmbeddedRoleCredentials, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV, PostgresBoot,
         SecretString, write_embedded_postgres_config,
     };
+    use crate::{PoolConfig, dsn::ResolvedDsns, pool::build_pool};
+
+    /// Normalized managed-role catalog state shared by both bootstrap owners.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ManagedCatalogSnapshot {
+        /// Exact managed role attributes ordered by role name.
+        attributes: Vec<(String, bool, bool, bool, bool)>,
+        /// Exact managed-to-managed membership edges.
+        memberships: Vec<(String, String)>,
+        /// Exact direct managed database ACL entries.
+        database_acl: Vec<(String, String)>,
+        /// Successful password-login outcomes for the four login roles.
+        login_outcomes: Vec<bool>,
+        /// Whether the group-only catalog role correctly rejects login.
+        catalog_login_denied: bool,
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -625,6 +643,53 @@ mod tests {
     const EXPECTED_MIGRATOR_DSN: &str = "postgres://wyrd_migrator:migrator-secret@localhost/wyrd";
     const EXPECTED_ADMIN_DSN: &str = "postgres://wyrd_platform_admin:admin-secret@localhost/wyrd";
     const EXPECTED_CATALOG_DSN: &str = "postgres://wyrd_catalog_app:catalog-secret@localhost/wyrd?options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog";
+
+    /// A fresh managed embedded lifecycle produces the same complete role
+    /// catalog as the independently bootstrapped external Postgres owner.
+    #[tokio::test]
+    async fn fresh_embedded_and_external_catalog_snapshots_match() {
+        let Some(external_dsns) =
+            crate::dsn::resolve_external_dsns_from_env().expect("external test DSNs resolve")
+        else {
+            return;
+        };
+        let external_admin_url = env::var("WYRD_TEST_DATABASE_ADMIN_URL")
+            .expect("neutral external administrator URL is configured");
+        let external_admin = build_pool(&external_admin_url, PoolConfig::migrator_defaults())
+            .await
+            .expect("external administrator connects");
+        let external_snapshot = managed_catalog_snapshot(&external_admin, &external_dsns).await;
+        external_admin.close().await;
+
+        let root = test_dir("fresh-embedded-role-catalog");
+        let _ = std::fs::remove_dir_all(&root);
+        let boot = PostgresBoot::embedded(EmbeddedConfig {
+            data_dir: root.join("pg"),
+            port: 0,
+            superuser: "wyrd_embedded_owner".to_owned(),
+            superuser_password: Some(SecretString::from("embeddedOwnerPassword123")),
+            max_connections: 30,
+        })
+        .await
+        .expect("fresh embedded lifecycle starts");
+        let embedded_dsns = boot.dsns().expect("embedded role DSNs resolve");
+        let embedded_admin = build_pool(
+            embedded_dsns
+                .platform_admin
+                .as_ref()
+                .expect("embedded platform administrator DSN exists")
+                .expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .expect("embedded platform administrator connects");
+        let embedded_snapshot = managed_catalog_snapshot(&embedded_admin, &embedded_dsns).await;
+        embedded_admin.close().await;
+
+        assert_eq!(embedded_snapshot, external_snapshot);
+        drop(boot);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[tokio::test]
     async fn external_with_app_and_migrator_password_allows_dedicated_mode() {
@@ -896,6 +961,86 @@ mod tests {
     }
 
     use std::path::PathBuf;
+
+    /// Reads the complete managed role snapshot and verifies password login
+    /// behavior through the owner-specific role DSNs.
+    async fn managed_catalog_snapshot(
+        metadata_pool: &PgPool,
+        dsns: &ResolvedDsns,
+    ) -> ManagedCatalogSnapshot {
+        let managed = [
+            "wyrd_migrator",
+            "wyrd_app",
+            "wyrd_platform_admin",
+            "wyrd_catalog",
+            "wyrd_catalog_app",
+        ];
+        let attributes = sqlx::query_as(
+            "SELECT rolname,rolcanlogin,rolbypassrls,rolsuper,rolcreatedb FROM pg_roles \
+             WHERE rolname = ANY($1) ORDER BY rolname",
+        )
+        .bind(managed)
+        .fetch_all(metadata_pool)
+        .await
+        .expect("managed role attributes read");
+        let memberships = sqlx::query_as(
+            "SELECT granted.rolname, member.rolname FROM pg_auth_members edge \
+             JOIN pg_roles granted ON granted.oid=edge.roleid \
+             JOIN pg_roles member ON member.oid=edge.member \
+             WHERE granted.rolname = ANY($1) AND member.rolname = ANY($1) \
+             ORDER BY granted.rolname, member.rolname",
+        )
+        .bind(managed)
+        .fetch_all(metadata_pool)
+        .await
+        .expect("managed memberships read");
+        let database_acl = sqlx::query_as(
+            "SELECT role.rolname, acl.privilege_type FROM pg_database database \
+             CROSS JOIN LATERAL aclexplode(database.datacl) acl \
+             JOIN pg_roles role ON role.oid=acl.grantee \
+             WHERE database.datname='wyrd' AND role.rolname = ANY($1) \
+             ORDER BY role.rolname, acl.privilege_type",
+        )
+        .bind(managed)
+        .fetch_all(metadata_pool)
+        .await
+        .expect("managed database ACL reads");
+        let role_dsns = [
+            &dsns.migrator,
+            &dsns.app,
+            dsns.platform_admin
+                .as_ref()
+                .expect("platform administrator DSN exists"),
+            &dsns.catalog_app,
+        ];
+        let mut login_outcomes = Vec::with_capacity(role_dsns.len());
+        for dsn in role_dsns {
+            let result = build_pool(dsn.expose_secret(), PoolConfig::migrator_defaults()).await;
+            login_outcomes.push(result.is_ok());
+            if let Ok(pool) = result {
+                pool.close().await;
+            }
+        }
+        let mut catalog_url = Url::parse(dsns.app.expose_secret()).expect("application DSN parses");
+        catalog_url
+            .set_username("wyrd_catalog")
+            .expect("catalog role is valid URL userinfo");
+        catalog_url
+            .set_password(Some("catalogCannotLogin"))
+            .expect("test password is valid URL userinfo");
+        let catalog_login_denied =
+            build_pool(catalog_url.as_str(), PoolConfig::migrator_defaults())
+                .await
+                .is_err();
+
+        ManagedCatalogSnapshot {
+            attributes,
+            memberships,
+            database_acl,
+            login_outcomes,
+            catalog_login_denied,
+        }
+    }
 
     fn snapshot_env(names: &[&str]) -> Vec<(String, Option<std::ffi::OsString>)> {
         names

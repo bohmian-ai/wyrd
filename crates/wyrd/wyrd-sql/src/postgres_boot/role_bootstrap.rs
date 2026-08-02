@@ -27,8 +27,6 @@ BEGIN
         CREATE ROLE wyrd_catalog_app LOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER PASSWORD '<catalog_app_pw>';
     END IF;
 END $$;
-GRANT wyrd_catalog TO wyrd_catalog_app;
-GRANT wyrd_catalog TO wyrd_migrator;
 "#;
 
 pub(crate) const WYRD_CATALOG_APP_ROLE: &str = "wyrd_catalog_app";
@@ -62,10 +60,13 @@ ALTER ROLE {catalog_role} WITH NOLOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER;
 ALTER ROLE {catalog_app_role} WITH LOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER PASSWORD {catalog_app_pw};
 
 REVOKE ALL PRIVILEGES ON DATABASE {database} FROM {migrator_role}, {app_role}, {admin_role}, {catalog_role}, {catalog_app_role};
-REVOKE {migrator_role}, {app_role}, {admin_role}, {catalog_app_role} FROM {migrator_role}, {app_role}, {admin_role}, {catalog_role}, {catalog_app_role};
+REVOKE {migrator_role}, {app_role}, {admin_role}, {catalog_role}, {catalog_app_role} FROM {migrator_role}, {app_role}, {admin_role}, {catalog_role}, {catalog_app_role};
 
 GRANT CONNECT ON DATABASE {database} TO {migrator_role}, {app_role}, {admin_role}, {catalog_app_role};
 GRANT CREATE ON DATABASE {database} TO {migrator_role};
+
+GRANT {catalog_role} TO {catalog_app_role};
+GRANT {catalog_role} TO {migrator_role};
 "#,
         sql = sql,
         database = WYRD_DATABASE,
@@ -91,10 +92,15 @@ fn sql_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::SecretString;
+    use std::env;
+
+    use secrecy::{ExposeSecret, SecretString};
+    use sqlx::AssertSqlSafe;
+    use url::Url;
 
     use super::{ROLE_BOOTSTRAP_SQL_TEMPLATE, role_bootstrap_sql};
     use crate::postgres_boot::EmbeddedRoleCredentials;
+    use crate::{PoolConfig, pool::build_pool};
 
     /// External bootstrap source used to assert contract parity.
     const EXTERNAL_ROLE_BOOTSTRAP: &str = include_str!("../../bootstrap/roles.sql");
@@ -121,8 +127,7 @@ mod tests {
         assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains(
             "CREATE ROLE wyrd_catalog_app LOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER PASSWORD"
         ));
-        assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT wyrd_catalog TO wyrd_catalog_app"));
-        assert!(ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT wyrd_catalog TO wyrd_migrator"));
+        assert!(!ROLE_BOOTSTRAP_SQL_TEMPLATE.contains("GRANT wyrd_catalog"));
     }
 
     /// Verifies that embedded bootstrap rendering quotes role passwords.
@@ -175,7 +180,7 @@ mod tests {
             "BYPASSRLS",
             "NOBYPASSRLS",
             "REVOKE ALL PRIVILEGES ON DATABASE wyrd",
-            "REVOKE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog_app",
+            "REVOKE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app",
             "GRANT wyrd_catalog TO wyrd_catalog_app",
             "GRANT wyrd_catalog TO wyrd_migrator",
         ] {
@@ -188,5 +193,233 @@ mod tests {
                 "external bootstrap missing {shape}"
             );
         }
+        for source in [&embedded, EXTERNAL_ROLE_BOOTSTRAP] {
+            let revoke = source
+                .find("REVOKE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app")
+                .expect("five-role revoke exists");
+            let catalog_app_grant = source
+                .find("GRANT wyrd_catalog TO wyrd_catalog_app")
+                .expect("catalog application grant exists");
+            let migrator_grant = source
+                .find("GRANT wyrd_catalog TO wyrd_migrator")
+                .expect("catalog migrator grant exists");
+            assert!(revoke < catalog_app_grant);
+            assert!(revoke < migrator_grant);
+            assert_eq!(
+                source
+                    .matches("GRANT wyrd_catalog TO wyrd_catalog_app")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                source
+                    .matches("GRANT wyrd_catalog TO wyrd_migrator")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// The rendered embedded owner repairs every managed membership edge while
+    /// retaining authority that belongs to an unrelated operator role.
+    #[tokio::test]
+    async fn embedded_bootstrap_converges_real_catalog() {
+        let Some(admin_url) = env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok() else {
+            return;
+        };
+        let credentials = EmbeddedRoleCredentials {
+            superuser: SecretString::from(password_from_url(&admin_url)),
+            migrator: SecretString::from(password_from_env_url("DATABASE_URL")),
+            app: SecretString::from(password_from_env_url("WYRD_DATABASE_URL")),
+            platform_admin: SecretString::from(
+                env::var("WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD")
+                    .expect("platform administrator password is configured"),
+            ),
+            catalog_app: SecretString::from(
+                env::var("WYRD_DATABASE_CATALOG_APP_PASSWORD")
+                    .expect("catalog application password is configured"),
+            ),
+        };
+        let admin = build_pool(&admin_url, PoolConfig::migrator_defaults())
+            .await
+            .expect("neutral administrator connects");
+        sqlx::raw_sql(
+            "CREATE ROLE wyrd_embedded_operator; \
+             GRANT wyrd_embedded_operator TO wyrd_app; \
+             GRANT CONNECT ON DATABASE wyrd TO wyrd_embedded_operator; \
+             GRANT wyrd_app TO wyrd_catalog",
+        )
+        .execute(&admin)
+        .await
+        .expect("embedded drift seeds");
+        sqlx::raw_sql(AssertSqlSafe(role_bootstrap_sql(&credentials)))
+            .execute(&admin)
+            .await
+            .expect("embedded bootstrap repairs reverse drift");
+        sqlx::raw_sql("GRANT wyrd_catalog TO wyrd_app, wyrd_platform_admin")
+            .execute(&admin)
+            .await
+            .expect("omitted-direction drift seeds");
+        sqlx::raw_sql(AssertSqlSafe(role_bootstrap_sql(&credentials)))
+            .execute(&admin)
+            .await
+            .expect("embedded bootstrap repairs omitted-direction drift");
+
+        let memberships: Vec<(String, String)> = sqlx::query_as(
+            "SELECT granted.rolname, member.rolname FROM pg_auth_members edge \
+             JOIN pg_roles granted ON granted.oid=edge.roleid \
+             JOIN pg_roles member ON member.oid=edge.member \
+             WHERE granted.rolname = ANY($1) AND member.rolname = ANY($1) \
+             ORDER BY granted.rolname, member.rolname",
+        )
+        .bind([
+            "wyrd_migrator",
+            "wyrd_app",
+            "wyrd_platform_admin",
+            "wyrd_catalog",
+            "wyrd_catalog_app",
+        ])
+        .fetch_all(&admin)
+        .await
+        .expect("managed memberships read");
+        assert_eq!(
+            memberships,
+            vec![
+                ("wyrd_catalog".to_owned(), "wyrd_catalog_app".to_owned()),
+                ("wyrd_catalog".to_owned(), "wyrd_migrator".to_owned()),
+            ]
+        );
+        let attributes: Vec<(String, bool, bool, bool, bool)> = sqlx::query_as(
+            "SELECT rolname,rolcanlogin,rolbypassrls,rolsuper,rolcreatedb FROM pg_roles \
+             WHERE rolname = ANY($1) ORDER BY rolname",
+        )
+        .bind([
+            "wyrd_migrator",
+            "wyrd_app",
+            "wyrd_platform_admin",
+            "wyrd_catalog",
+            "wyrd_catalog_app",
+        ])
+        .fetch_all(&admin)
+        .await
+        .expect("managed role attributes read");
+        assert_eq!(
+            attributes,
+            vec![
+                ("wyrd_app".to_owned(), true, false, false, false),
+                ("wyrd_catalog".to_owned(), false, false, false, false),
+                ("wyrd_catalog_app".to_owned(), true, false, false, false),
+                ("wyrd_migrator".to_owned(), true, true, false, false),
+                ("wyrd_platform_admin".to_owned(), true, true, false, false),
+            ]
+        );
+        let database_acl: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role.rolname, acl.privilege_type FROM pg_database database \
+             CROSS JOIN LATERAL aclexplode(database.datacl) acl \
+             JOIN pg_roles role ON role.oid=acl.grantee \
+             WHERE database.datname='wyrd' AND role.rolname = ANY($1) \
+             ORDER BY role.rolname, acl.privilege_type",
+        )
+        .bind([
+            "wyrd_migrator",
+            "wyrd_app",
+            "wyrd_platform_admin",
+            "wyrd_catalog",
+            "wyrd_catalog_app",
+        ])
+        .fetch_all(&admin)
+        .await
+        .expect("managed database ACL reads");
+        assert_eq!(
+            database_acl,
+            vec![
+                ("wyrd_app".to_owned(), "CONNECT".to_owned()),
+                ("wyrd_catalog_app".to_owned(), "CONNECT".to_owned()),
+                ("wyrd_migrator".to_owned(), "CONNECT".to_owned()),
+                ("wyrd_migrator".to_owned(), "CREATE".to_owned()),
+                ("wyrd_platform_admin".to_owned(), "CONNECT".to_owned()),
+            ]
+        );
+        for (role, password) in [
+            ("wyrd_migrator", credentials.migrator.expose_secret()),
+            ("wyrd_app", credentials.app.expose_secret()),
+            (
+                "wyrd_platform_admin",
+                credentials.platform_admin.expose_secret(),
+            ),
+            ("wyrd_catalog_app", credentials.catalog_app.expose_secret()),
+        ] {
+            let role_pool = build_pool(
+                &role_url(&admin_url, role, password),
+                PoolConfig::migrator_defaults(),
+            )
+            .await
+            .expect("managed login role connects with converged password");
+            let current_role: String = sqlx::query_scalar("SELECT current_user")
+                .fetch_one(&role_pool)
+                .await
+                .expect("managed login identity reads");
+            assert_eq!(current_role, role);
+            role_pool.close().await;
+        }
+        assert!(
+            build_pool(
+                &role_url(&admin_url, "wyrd_catalog", "cannot-login"),
+                PoolConfig::migrator_defaults(),
+            )
+            .await
+            .is_err(),
+            "the catalog owner remains a no-login role"
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT pg_has_role('wyrd_app','wyrd_embedded_operator','member')",
+            )
+            .fetch_one(&admin)
+            .await
+            .expect("unrelated membership reads")
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT has_database_privilege('wyrd_embedded_operator','wyrd','CONNECT')",
+            )
+            .fetch_one(&admin)
+            .await
+            .expect("unrelated database ACL reads")
+        );
+
+        sqlx::raw_sql(
+            "REVOKE wyrd_embedded_operator FROM wyrd_app; \
+             REVOKE ALL PRIVILEGES ON DATABASE wyrd FROM wyrd_embedded_operator; \
+             DROP ROLE wyrd_embedded_operator",
+        )
+        .execute(&admin)
+        .await
+        .expect("embedded drift fixture cleans up");
+        admin.close().await;
+    }
+
+    /// Extracts the password from a test-only Postgres URL.
+    fn password_from_url(value: &str) -> String {
+        Url::parse(value)
+            .expect("test Postgres URL parses")
+            .password()
+            .expect("test Postgres URL carries a password")
+            .to_owned()
+    }
+
+    /// Extracts a password from one required test-only Postgres URL variable.
+    fn password_from_env_url(name: &str) -> String {
+        password_from_url(&env::var(name).expect("test Postgres URL is configured"))
+    }
+
+    /// Rewrites the neutral administrator URL for one managed login role.
+    fn role_url(admin_url: &str, role: &str, password: &str) -> String {
+        let mut url = Url::parse(admin_url).expect("test Postgres URL parses");
+        url.set_username(role)
+            .expect("managed role is a valid URL username");
+        url.set_password(Some(password))
+            .expect("generated password is valid URL userinfo");
+        url.to_string()
     }
 }

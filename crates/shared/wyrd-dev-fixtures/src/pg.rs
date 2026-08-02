@@ -462,10 +462,16 @@ async fn seed_tenant(
 
 #[cfg(test)]
 mod pg_tests {
-    use super::PgFixture;
+    use secrecy::ExposeSecret;
+
+    use super::{PgFixture, database_dsn};
     use wyrd_spec::DataTenantId;
+    use wyrd_sql::PoolConfig;
+    use wyrd_sql::pool::build_pool;
     use wyrd_sql::tenant_conn::CURRENT_TENANT_GUC;
 
+    /// A real fixture migrates, binds tenants, and preserves the database
+    /// lifecycle boundary between its neutral administrator and migrator.
     #[tokio::test]
     async fn fixture_smoke() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -476,6 +482,91 @@ mod pg_tests {
         assert_seeded_tenant(&fixture, fixture.tenant_slug()).await;
         assert_current_tenant_bound(&fixture).await;
         assert_bare_app_pool_fails_loudly(&fixture).await;
+        assert_database_authority_boundary(&fixture).await;
+    }
+
+    /// The lifecycle administrator owns the database while the migrator owns
+    /// migrated schemas but cannot create or drop databases.
+    async fn assert_database_authority_boundary(fixture: &PgFixture) {
+        let admin = build_pool(
+            fixture._test_db.admin_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .expect("neutral administrator connects");
+        let owner: String = sqlx::query_scalar(
+            "SELECT owner.rolname FROM pg_database database \
+             JOIN pg_roles owner ON owner.oid=database.datdba WHERE database.datname=$1",
+        )
+        .bind(&fixture._test_db.name)
+        .fetch_one(&admin)
+        .await
+        .expect("database owner reads");
+        assert_eq!(owner, "wyrd_test_admin");
+        admin.close().await;
+
+        let fixture_admin_dsn = database_dsn(&fixture._test_db.admin_dsn, &fixture._test_db.name)
+            .expect("fixture administrator DSN rewrites");
+        let fixture_admin = build_pool(
+            fixture_admin_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .expect("neutral administrator connects to fixture database");
+        let schema_owners: Vec<(String, String)> = sqlx::query_as(
+            "SELECT namespace.nspname, owner.rolname FROM pg_namespace namespace \
+             JOIN pg_roles owner ON owner.oid=namespace.nspowner \
+             WHERE namespace.nspname IN ('platform','wyrd','vala') ORDER BY namespace.nspname",
+        )
+        .fetch_all(&fixture_admin)
+        .await
+        .expect("migration schema owners read");
+        assert_eq!(
+            schema_owners,
+            vec![
+                ("platform".to_owned(), "wyrd_migrator".to_owned()),
+                ("vala".to_owned(), "wyrd_migrator".to_owned()),
+                ("wyrd".to_owned(), "wyrd_migrator".to_owned()),
+            ]
+        );
+        let recovery_authority: (bool, bool, bool) = sqlx::query_as(
+            "SELECT has_function_privilege('wyrd_platform_admin', \
+               'vala.append_oracle_admission_recovery_audit(text,bigint,bigint,bigint,bigint,bigint)', 'EXECUTE'), \
+             NOT has_table_privilege('wyrd_platform_admin','vala.audit_chain_head','SELECT,INSERT,UPDATE,DELETE'), \
+             NOT has_table_privilege('wyrd_platform_admin','vala.audit_outbox','SELECT,INSERT,UPDATE,DELETE')",
+        )
+        .fetch_one(&fixture_admin)
+        .await
+        .expect("Oracle recovery audit authority reads");
+        assert_eq!(recovery_authority, (true, true, true));
+        fixture_admin.close().await;
+
+        let postgres_migrator_dsn =
+            database_dsn(&fixture.migrator_dsn, "postgres").expect("migrator DSN rewrites");
+        let migrator = build_pool(
+            postgres_migrator_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .expect("migrator connects to maintenance database");
+        for statement in [
+            "CREATE DATABASE wyrd_forbidden_create",
+            "DROP DATABASE wyrd",
+        ] {
+            let error = sqlx::query(statement)
+                .execute(&migrator)
+                .await
+                .expect_err("migrator database lifecycle operation is denied");
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|database| database.code())
+                    .as_deref(),
+                Some("42501"),
+                "{statement}"
+            );
+        }
+        migrator.close().await;
     }
 
     #[tokio::test]

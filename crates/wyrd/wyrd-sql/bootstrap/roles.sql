@@ -25,7 +25,7 @@ ALTER ROLE wyrd_catalog WITH NOLOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER;
 ALTER ROLE wyrd_catalog_app WITH LOGIN NOCREATEDB NOBYPASSRLS NOSUPERUSER PASSWORD :'catalog_app_password';
 
 REVOKE ALL PRIVILEGES ON DATABASE wyrd FROM wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app;
-REVOKE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog_app FROM wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app;
+REVOKE wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app FROM wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog, wyrd_catalog_app;
 
 GRANT CONNECT ON DATABASE wyrd TO wyrd_migrator, wyrd_app, wyrd_platform_admin, wyrd_catalog_app;
 GRANT CREATE ON DATABASE wyrd TO wyrd_migrator;

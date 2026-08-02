@@ -138,7 +138,9 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
         scribe.memory_snapshot().categories[5],
         stats.immutable_bytes
     );
-    scribe.shutdown().await;
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }
 
 #[tokio::test]
@@ -180,7 +182,9 @@ async fn replay_splits_three_same_key_generations_in_wal_order() {
             .immutable_generations,
         3
     );
-    scribe.shutdown().await;
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }
 
 #[tokio::test]

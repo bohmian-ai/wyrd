@@ -442,7 +442,9 @@ mod pg_tests {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-            scribe.shutdown().await;
+            scribe
+                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await;
             sqlx::query(
                 "UPDATE vala.file_list
                     SET created_at = now() - interval '3 minutes'

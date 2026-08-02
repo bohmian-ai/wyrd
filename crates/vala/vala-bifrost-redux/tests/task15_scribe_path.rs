@@ -132,7 +132,9 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     assert_eq!(hot[0].rows.schema().fields().len(), 1);
     assert_eq!(hot[0].rows.schema().field(0).name(), "value");
 
-    scribe.shutdown().await;
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }
 
 #[tokio::test]
@@ -198,7 +200,9 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         .expect("cross-day append");
     assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream).await;
     assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream).await;
-    scribe.shutdown().await;
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }
 
 async fn assert_pointer_identity(
@@ -380,5 +384,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
         .await
         .expect_err("WAL failure must fail the durable completion");
     assert!(matches!(error, ScribeError::WalDiskFull));
-    scribe.shutdown().await;
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }

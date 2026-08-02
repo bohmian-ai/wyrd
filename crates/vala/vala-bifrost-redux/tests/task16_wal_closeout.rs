@@ -165,7 +165,9 @@ async fn sync_failure_has_no_ack_or_memtable_visibility() {
         wal.bytes_on_disk() > 0,
         "record was written before sync failed"
     );
-    scribe.shutdown().await;
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }
 
 #[tokio::test]
@@ -187,7 +189,9 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
         .await
         .expect("stable batch retry");
     assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 1);
-    scribe.shutdown().await;
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 
     let replayed = replay_wal_directory(wal_root.path()).expect("replay");
     let state = replayed

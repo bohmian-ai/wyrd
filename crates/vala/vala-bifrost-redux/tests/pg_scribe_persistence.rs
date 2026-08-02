@@ -110,7 +110,9 @@ impl PersistenceFixture {
     }
 
     async fn stop(self) {
-        self.scribe.shutdown().await;
+        self.scribe
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
         drop(self.wal_root);
     }
 
@@ -171,7 +173,9 @@ impl PersistenceFixture {
         let first = first_replay_scribe(operator.clone(), wal.clone(), node_id, admission, &memory);
         first.replay_wal_async().await.expect("empty WAL replay");
         write_replay_records(&wal, table_names, generations, tenant);
-        first.shutdown().await;
+        first
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
         drop(wal);
 
         let faults = PersistenceFaults::default();

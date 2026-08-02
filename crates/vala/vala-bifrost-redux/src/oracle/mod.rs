@@ -248,6 +248,9 @@ impl OracleTelemetry {
             first_batch_recorded: false,
             stream_started: false,
             finished: false,
+            emitted_rows: 0,
+            emitted_bytes: 0,
+            explicit_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -440,6 +443,12 @@ struct QueryTelemetryGuard {
     stream_started: bool,
     /// Whether a terminal outcome was already emitted.
     finished: bool,
+    /// Number of rows carried by client-visible batch frames.
+    emitted_rows: u64,
+    /// Number of bytes in client-visible Arrow IPC schema and batch payloads.
+    emitted_bytes: u64,
+    /// Shared marker set only by an explicit stream-owner cancellation.
+    explicit_cancelled: Arc<AtomicBool>,
 }
 
 impl QueryTelemetryGuard {
@@ -460,6 +469,20 @@ impl QueryTelemetryGuard {
             "query_class" => query_class_label(self.query_class)
         )
         .record(self.started_at.elapsed().as_secs_f64());
+    }
+
+    /// Returns the explicit-cancellation marker shared with the stream owner.
+    #[must_use]
+    fn cancellation_marker(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.explicit_cancelled)
+    }
+
+    /// Accounts one client-visible Arrow IPC payload.
+    fn record_payload(&mut self, rows: u64, bytes: usize) {
+        self.emitted_rows = self.emitted_rows.saturating_add(rows);
+        self.emitted_bytes = self
+            .emitted_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
     /// Emits the final query and stream outcome exactly once.
@@ -489,6 +512,16 @@ impl QueryTelemetryGuard {
                 "freshness" => freshness
             )
             .increment(1);
+            metrics::counter!(
+                "bifrost_oracle_stream_rows_total",
+                "outcome" => outcome
+            )
+            .increment(self.emitted_rows);
+            metrics::counter!(
+                "bifrost_oracle_stream_bytes_total",
+                "outcome" => outcome
+            )
+            .increment(self.emitted_bytes);
         }
     }
 }
@@ -497,8 +530,10 @@ impl Drop for QueryTelemetryGuard {
     /// Records cancellation or a pre-stream failure and closes in-flight state.
     fn drop(&mut self) {
         if !self.finished {
-            let outcome = if self.stream_started {
+            let outcome = if self.explicit_cancelled.load(Ordering::Acquire) {
                 "cancelled"
+            } else if self.stream_started {
+                "client_drop"
             } else {
                 "failed"
             };
@@ -3116,6 +3151,66 @@ mod tests {
             observed,
             "canonical stream metric was not recorded: {snapshot:?}"
         );
+    }
+
+    /// Stream payload counters retain exact rows and Arrow IPC bytes for every
+    /// closed lifecycle outcome, including cancellation and client drop.
+    #[test]
+    fn oracle_stream_payload_metrics_close_each_outcome() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            for outcome in ["success", "failed"] {
+                let telemetry =
+                    Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+                let mut query =
+                    telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+                query.start_stream();
+                query.record_payload(0, 7);
+                query.record_payload(3, 11);
+                query.finish(outcome, "complete");
+            }
+
+            let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+            let mut cancelled =
+                telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+            cancelled.start_stream();
+            cancelled.record_payload(3, 18);
+            cancelled
+                .cancellation_marker()
+                .store(true, Ordering::Release);
+            drop(cancelled);
+
+            let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+            let mut dropped =
+                telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+            dropped.start_stream();
+            dropped.record_payload(3, 18);
+            drop(dropped);
+        });
+
+        let snapshot = recorder.snapshot();
+        for outcome in ["success", "failed", "cancelled", "client_drop"] {
+            let rows = snapshot
+                .counters
+                .iter()
+                .find(|(series, _)| {
+                    series.starts_with("bifrost_oracle_stream_rows_total{")
+                        && series.contains(&format!("outcome=\"{outcome}\""))
+                })
+                .map(|(_, value)| *value)
+                .unwrap_or_default();
+            let bytes = snapshot
+                .counters
+                .iter()
+                .find(|(series, _)| {
+                    series.starts_with("bifrost_oracle_stream_bytes_total{")
+                        && series.contains(&format!("outcome=\"{outcome}\""))
+                })
+                .map(|(_, value)| *value)
+                .unwrap_or_default();
+            assert_eq!(rows, 3);
+            assert_eq!(bytes, 18);
+        }
     }
 
     /// Equivalent Arrow UTC spellings produce one sealed-fragment schema identity.

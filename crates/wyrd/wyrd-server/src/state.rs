@@ -1068,6 +1068,15 @@ impl AppState {
         if !self.deployment_profile.is_production() {
             return Ok(());
         }
+        // Dedicated Forge workers do not expose the public serving surface and
+        // therefore do not construct Gate/authentication or Oracle peers. The
+        // closed role topology still records Forge ownership in
+        // `bifrost_roles`; only the server roles carry Scribe/Oracle markers.
+        let serves_api = self.bifrost_roles.contains(&BifrostRuntimeRole::Scribe)
+            || self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle);
+        if !serves_api {
+            return Ok(());
+        }
         if self.authz.policy_hook.is_stub_default() {
             return Err(ProductionValidationError::StubPolicyHook);
         }

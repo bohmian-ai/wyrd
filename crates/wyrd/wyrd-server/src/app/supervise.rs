@@ -83,7 +83,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let terminal = classify_first_exit(&mut set).await;
+    let terminal = classify_first_exit_with_shutdown(&mut set, &shutdown).await;
     let deadline = Instant::now() + drain;
     drain_with_shutdown(set, shutdown, deadline, before_cancel).await;
     terminal
@@ -100,6 +100,31 @@ pub async fn classify_first_exit(set: &mut JoinSet<TaskExit>) -> Option<String> 
         classify_first(joined, &mut terminal);
     }
     terminal
+}
+
+/// Waits for the first supervised task while biasing an already-requested
+/// external cancellation ahead of task completion.
+///
+/// A caller may cancel the shared token before any worker has joined. In that
+/// case the cancellation is the authoritative shutdown cause and no worker
+/// result is misclassified as a terminal startup failure. When both branches
+/// become ready together, Tokio's `biased` ordering preserves that same
+/// cancellation precedence.
+pub async fn classify_first_exit_with_shutdown(
+    set: &mut JoinSet<TaskExit>,
+    shutdown: &CancellationToken,
+) -> Option<String> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        joined = set.join_next() => {
+            let mut terminal = None;
+            if let Some(joined) = joined {
+                classify_first(joined, &mut terminal);
+            }
+            terminal
+        }
+    }
 }
 
 /// Removes readiness, cancels transports, and drains tasks until `deadline`.
@@ -275,6 +300,24 @@ mod tests {
 
         assert!(terminal.is_none());
         assert!(assertion_shutdown.is_cancelled());
+    }
+
+    /// Proves a caller cancellation wins over a concurrently ready worker exit.
+    #[tokio::test]
+    async fn external_cancellation_is_not_misclassified_as_worker_failure() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let mut set: JoinSet<TaskExit> = JoinSet::new();
+        set.spawn(fallible_task(TaskId::Worker("cancelled"), async {
+            Err::<(), &'static str>("worker failed after cancellation")
+        }));
+
+        let terminal = classify_first_exit_with_shutdown(&mut set, &shutdown).await;
+        assert!(
+            terminal.is_none(),
+            "external cancellation must remain a graceful shutdown cause"
+        );
+        set.abort_all();
     }
 
     /// Proves the caller-owned deadline bounds a stalled transport drain and preserves terminal classification.

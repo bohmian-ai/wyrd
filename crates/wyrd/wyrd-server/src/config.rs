@@ -668,7 +668,7 @@ fn calibration_evidence_value<'a>(
 }
 
 /// Role selection and nested runtime bounds for Bifrost.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostRuntimeConfig {
     /// Scribe runtime bounds.
@@ -677,15 +677,6 @@ pub struct BifrostRuntimeConfig {
     /// Oracle runtime bounds.
     #[serde(default)]
     pub oracle: OracleRuntimeConfig,
-}
-
-impl Default for BifrostRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            scribe: ScribeRuntimeConfig::default(),
-            oracle: OracleRuntimeConfig::default(),
-        }
-    }
 }
 
 fn default_scribe_coordination_threads() -> usize {
@@ -1547,46 +1538,53 @@ impl WyrdServerConfig {
     /// # Errors
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.bifrost.oracle.max_workers_per_query > 63 {
+        let serves_api = self.role.serves_api();
+        if self.forge.worker_concurrency == 0 {
             return Err(ConfigError::Invalid {
-                message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
+                message: "forge.worker_concurrency must be positive".to_owned(),
             });
         }
-        if self.bifrost.oracle.planning_permits == 0
-            || self.bifrost.oracle.admission_waiters == 0
-            || self.bifrost.oracle.max_frame_bytes == 0
-            || self.bifrost.oracle.spill_limit_bytes == 0
-            || !self.bifrost.oracle.cpu_cores.is_finite()
-            || self.bifrost.oracle.cpu_cores <= 0.0
-        {
-            return Err(ConfigError::Invalid {
-                message: "bifrost.oracle bounds must be positive and finite".to_owned(),
-            });
-        }
-        self.bifrost
-            .scribe
-            .validate()
-            .map_err(|message| ConfigError::Invalid { message })?;
-        self.validate_oracle_calibration()?;
+        if serves_api {
+            if self.bifrost.oracle.max_workers_per_query > 63 {
+                return Err(ConfigError::Invalid {
+                    message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
+                });
+            }
+            if self.bifrost.oracle.planning_permits == 0
+                || self.bifrost.oracle.admission_waiters == 0
+                || self.bifrost.oracle.max_frame_bytes == 0
+                || self.bifrost.oracle.spill_limit_bytes == 0
+                || !self.bifrost.oracle.cpu_cores.is_finite()
+                || self.bifrost.oracle.cpu_cores <= 0.0
+            {
+                return Err(ConfigError::Invalid {
+                    message: "bifrost.oracle bounds must be positive and finite".to_owned(),
+                });
+            }
+            self.bifrost
+                .scribe
+                .validate()
+                .map_err(|message| ConfigError::Invalid { message })?;
+            self.validate_oracle_calibration()?;
 
-        if self.grpc.certificate_chain_path.is_some() != self.grpc.private_key_path.is_some() {
-            return Err(ConfigError::Invalid {
-                message:
-                    "grpc certificate_chain_path and private_key_path must be configured together"
+            if self.grpc.certificate_chain_path.is_some() != self.grpc.private_key_path.is_some() {
+                return Err(ConfigError::Invalid {
+                    message: "grpc certificate_chain_path and private_key_path must be configured together"
                         .to_owned(),
-            });
-        }
-        if self.bifrost.oracle.peer_ca_certificate_path.is_some()
-            != self.bifrost.oracle.peer_server_name.is_some()
-        {
-            return Err(ConfigError::Invalid {
-                message: "bifrost.oracle peer_ca_certificate_path and peer_server_name must be configured together"
-                    .to_owned(),
-            });
+                });
+            }
+            if self.bifrost.oracle.peer_ca_certificate_path.is_some()
+                != self.bifrost.oracle.peer_server_name.is_some()
+            {
+                return Err(ConfigError::Invalid {
+                    message: "bifrost.oracle peer_ca_certificate_path and peer_server_name must be configured together"
+                        .to_owned(),
+                });
+            }
         }
 
         // 1. HTTP and gRPC bind addresses must differ.
-        if self.http.bind == self.grpc.bind {
+        if serves_api && self.http.bind == self.grpc.bind {
             return Err(ConfigError::BindCollision {
                 bind: self.http.bind,
             });
@@ -1603,7 +1601,7 @@ impl WyrdServerConfig {
                               no room for the auto-computed metrics port (http_port + 1)"
                                 .to_owned(),
                     })?;
-            if metrics_bind == self.http.bind || metrics_bind == self.grpc.bind {
+            if serves_api && (metrics_bind == self.http.bind || metrics_bind == self.grpc.bind) {
                 return Err(ConfigError::BindCollision { bind: metrics_bind });
             }
         }
@@ -1628,34 +1626,36 @@ impl WyrdServerConfig {
             });
         }
 
-        // 4. limits.body_bytes >= 1 MiB
-        if self.limits.body_bytes < 1_048_576 {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "limits.body_bytes must be >= 1048576 (1 MiB), got {}",
-                    self.limits.body_bytes
-                ),
-            });
-        }
+        if serves_api {
+            // 4. limits.body_bytes >= 1 MiB
+            if self.limits.body_bytes < 1_048_576 {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "limits.body_bytes must be >= 1048576 (1 MiB), got {}",
+                        self.limits.body_bytes
+                    ),
+                });
+            }
 
-        // 5. limits.timeout_ms in [1_000, 600_000]
-        if self.limits.timeout_ms < 1_000 || self.limits.timeout_ms > 600_000 {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "limits.timeout_ms must be in [1000, 600000], got {}",
-                    self.limits.timeout_ms
-                ),
-            });
-        }
+            // 5. limits.timeout_ms in [1_000, 600_000]
+            if self.limits.timeout_ms < 1_000 || self.limits.timeout_ms > 600_000 {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "limits.timeout_ms must be in [1000, 600000], got {}",
+                        self.limits.timeout_ms
+                    ),
+                });
+            }
 
-        // 6. limits.concurrency in [1, 1_048_576]
-        if self.limits.concurrency < 1 || self.limits.concurrency > 1_048_576 {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "limits.concurrency must be in [1, 1048576], got {}",
-                    self.limits.concurrency
-                ),
-            });
+            // 6. limits.concurrency in [1, 1_048_576]
+            if self.limits.concurrency < 1 || self.limits.concurrency > 1_048_576 {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "limits.concurrency must be in [1, 1048576], got {}",
+                        self.limits.concurrency
+                    ),
+                });
+            }
         }
 
         // 7. shutdown.drain_ms in [1_000, 60_000]
@@ -1668,28 +1668,30 @@ impl WyrdServerConfig {
             });
         }
 
-        // 8. readiness.tick_ms in [500, 60_000]
-        if self.readiness.tick_ms < 500 || self.readiness.tick_ms > 60_000 {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "readiness.tick_ms must be in [500, 60000], got {}",
-                    self.readiness.tick_ms
-                ),
-            });
-        }
+        if serves_api {
+            // 8. readiness.tick_ms in [500, 60_000]
+            if self.readiness.tick_ms < 500 || self.readiness.tick_ms > 60_000 {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "readiness.tick_ms must be in [500, 60000], got {}",
+                        self.readiness.tick_ms
+                    ),
+                });
+            }
 
-        // 9. readiness.probe_timeout_ms in [100, 10_000]
-        if self.readiness.probe_timeout_ms < 100 || self.readiness.probe_timeout_ms > 10_000 {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "readiness.probe_timeout_ms must be in [100, 10000], got {}",
-                    self.readiness.probe_timeout_ms
-                ),
-            });
+            // 9. readiness.probe_timeout_ms in [100, 10_000]
+            if self.readiness.probe_timeout_ms < 100 || self.readiness.probe_timeout_ms > 10_000 {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "readiness.probe_timeout_ms must be in [100, 10000], got {}",
+                        self.readiness.probe_timeout_ms
+                    ),
+                });
+            }
         }
 
         // 10. Production profile hardening.
-        if self.deployment_profile.is_production() {
+        if serves_api && self.deployment_profile.is_production() {
             if self.grpc.reflection_enabled {
                 return Err(ConfigError::Invalid {
                     message: "grpc.reflection_enabled must be false in production profile"
@@ -1757,68 +1759,70 @@ impl WyrdServerConfig {
 
         // 16. Each trusted_issuers entry must have non-empty required fields and
         //     coherent client_auth (secret present iff secret_basic/secret_post).
-        for (idx, issuer) in self.trusted_issuers.iter().enumerate() {
-            let loc = |field: &str| format!("trusted_issuers[{idx}].{field}");
+        if serves_api {
+            for (idx, issuer) in self.trusted_issuers.iter().enumerate() {
+                let loc = |field: &str| format!("trusted_issuers[{idx}].{field}");
 
-            if issuer.issuer.is_empty() {
-                return Err(ConfigError::Invalid {
-                    message: format!("{} must not be empty", loc("issuer")),
-                });
+                if issuer.issuer.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        message: format!("{} must not be empty", loc("issuer")),
+                    });
+                }
+                if issuer.client_id.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        message: format!("{} must not be empty", loc("client_id")),
+                    });
+                }
+                if issuer.expected_audience.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        message: format!("{} must not be empty", loc("expected_audience")),
+                    });
+                }
+                match &issuer.client_auth {
+                    ClientAuthEntry::SecretBasic(s) | ClientAuthEntry::SecretPost(s) => {
+                        if s.expose_secret().is_empty() {
+                            return Err(ConfigError::Invalid {
+                                message: format!("{} secret must not be empty", loc("client_auth")),
+                            });
+                        }
+                    }
+                    ClientAuthEntry::PrivateKeyJwt | ClientAuthEntry::Public => {}
+                }
             }
-            if issuer.client_id.is_empty() {
-                return Err(ConfigError::Invalid {
-                    message: format!("{} must not be empty", loc("client_id")),
-                });
-            }
-            if issuer.expected_audience.is_empty() {
-                return Err(ConfigError::Invalid {
-                    message: format!("{} must not be empty", loc("expected_audience")),
-                });
-            }
-            match &issuer.client_auth {
-                ClientAuthEntry::SecretBasic(s) | ClientAuthEntry::SecretPost(s) => {
-                    if s.expose_secret().is_empty() {
+
+            // 17. Each workload_bindings entry must have all card-target fields non-empty.
+            for (idx, binding) in self.workload_bindings.iter().enumerate() {
+                let loc = |field: &str| format!("workload_bindings[{idx}].{field}");
+
+                for (field, value) in [
+                    ("issuer", binding.issuer.as_str()),
+                    ("subject", binding.subject.as_str()),
+                    ("kind", binding.kind.as_str()),
+                    ("name", binding.name.as_str()),
+                    ("space", binding.space.as_str()),
+                    ("version", binding.version.as_str()),
+                ] {
+                    if value.is_empty() {
                         return Err(ConfigError::Invalid {
-                            message: format!("{} secret must not be empty", loc("client_auth")),
+                            message: format!("{} must not be empty", loc(field)),
                         });
                     }
                 }
-                ClientAuthEntry::PrivateKeyJwt | ClientAuthEntry::Public => {}
             }
-        }
 
-        // 17. Each workload_bindings entry must have all card-target fields non-empty.
-        for (idx, binding) in self.workload_bindings.iter().enumerate() {
-            let loc = |field: &str| format!("workload_bindings[{idx}].{field}");
-
-            for (field, value) in [
-                ("issuer", binding.issuer.as_str()),
-                ("subject", binding.subject.as_str()),
-                ("kind", binding.kind.as_str()),
-                ("name", binding.name.as_str()),
-                ("space", binding.space.as_str()),
-                ("version", binding.version.as_str()),
-            ] {
-                if value.is_empty() {
-                    return Err(ConfigError::Invalid {
-                        message: format!("{} must not be empty", loc(field)),
-                    });
-                }
-            }
-        }
-
-        // 18. Issuers/bindings require an explicit implicit-tenant slug. Boot
-        //     binds every issuer/binding to this tenant via the same slug path
-        //     the request handlers use; without it boot can resolve no tenant
-        //     and must fail closed, so reject the config here.
-        if (!self.trusted_issuers.is_empty() || !self.workload_bindings.is_empty())
-            && self.auth.tenant_slug.is_none()
-        {
-            return Err(ConfigError::Invalid {
-                message: "[auth] tenant_slug is required when trusted_issuers or \
+            // 18. Issuers/bindings require an explicit implicit-tenant slug. Boot
+            //     binds every issuer/binding to this tenant via the same slug path
+            //     the request handlers use; without it boot can resolve no tenant
+            //     and must fail closed, so reject the config here.
+            if (!self.trusted_issuers.is_empty() || !self.workload_bindings.is_empty())
+                && self.auth.tenant_slug.is_none()
+            {
+                return Err(ConfigError::Invalid {
+                    message: "[auth] tenant_slug is required when trusted_issuers or \
                           workload_bindings are configured"
-                    .to_string(),
-            });
+                        .to_string(),
+                });
+            }
         }
 
         // Metrics endpoint is unauthenticated; warn if it is exposed beyond
@@ -2072,6 +2076,61 @@ mod tests {
             config.bifrost_roles(),
             [BifrostRuntimeRole::Forge].into_iter().collect()
         );
+    }
+
+    /// Proves a dedicated Forge worker ignores malformed settings for services
+    /// it does not own while retaining its local concurrency guard.
+    #[test]
+    fn forge_worker_validation_ignores_api_only_settings() {
+        let mut config = WyrdServerConfig {
+            deployment_profile: DeploymentProfile::Production,
+            role: ForgeProcessRole::ForgeWorker,
+            ..WyrdServerConfig::default()
+        };
+        config.bifrost.scribe.coordination_threads = 0;
+        config.bifrost.oracle.planning_permits = 0;
+        config.bifrost.oracle.calibration_profile = PathBuf::from("/ malformed");
+        config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
+        config.http.bind = config.grpc.bind;
+        config.grpc.reflection_enabled = true;
+        config.auth.allow_preview = true;
+        config.limits.body_bytes = 0;
+        config.limits.timeout_ms = 0;
+        config.limits.concurrency = 0;
+        config.readiness.tick_ms = 0;
+        config.readiness.probe_timeout_ms = 0;
+        config.metrics.enabled = false;
+
+        config
+            .validate()
+            .expect("ForgeWorker should validate only owned Forge and metrics settings");
+    }
+
+    /// Proves API-owning roles reject the same malformed service settings.
+    #[test]
+    fn api_roles_reject_forge_worker_only_validation_bypass() {
+        for role in [ForgeProcessRole::All, ForgeProcessRole::Server] {
+            let mut config = WyrdServerConfig {
+                deployment_profile: DeploymentProfile::Production,
+                role,
+                ..WyrdServerConfig::default()
+            };
+            config.bifrost.scribe.coordination_threads = 0;
+            config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
+            config.grpc.reflection_enabled = true;
+            config.auth.allow_preview = true;
+            config.limits.body_bytes = 0;
+            config.limits.timeout_ms = 0;
+            config.limits.concurrency = 0;
+            config.readiness.tick_ms = 0;
+            config.readiness.probe_timeout_ms = 0;
+            config.metrics.enabled = false;
+
+            assert!(
+                config.validate().is_err(),
+                "{role:?} must reject malformed API-owned settings"
+            );
+        }
     }
 
     /// Proves the removed independent role environment is rejected.

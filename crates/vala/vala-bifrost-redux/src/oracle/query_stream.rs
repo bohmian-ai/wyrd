@@ -17,6 +17,8 @@ pub struct OracleQueryStream {
     pub frames: std::pin::Pin<Box<OracleFrameStream>>,
     /// Cancellation signal used by the stream owner to force awaited cleanup.
     pub(super) cancellation: CancellationToken,
+    /// Marker distinguishing explicit owner cancellation from client drop.
+    telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Query-keyed lifecycle observation used only by test-tier transports.
     #[cfg(feature = "test-support")]
     resource_probe: Option<Arc<super::admission::QueryResourceProbe>>,
@@ -218,6 +220,22 @@ fn query_stream_span(visibility: VisibilityMode, query_class: QueryClass) -> tra
     )
 }
 
+/// Selects the terminal outcome for a stream that observed a failed step.
+fn failed_stream_outcome(explicit_cancelled: &std::sync::atomic::AtomicBool) -> &'static str {
+    if explicit_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        "cancelled"
+    } else {
+        "failed"
+    }
+}
+
+/// Releases stream admission exactly once after a terminal frame is selected.
+async fn release_admitted(admitted: &mut Option<AdmittedQueryGuard>) {
+    if let Some(admitted) = admitted.take() {
+        let _ = admitted.release().await;
+    }
+}
+
 impl OracleQueryStream {
     /// Builds a synthetic stream for transport and collector tests.
     ///
@@ -234,6 +252,7 @@ impl OracleQueryStream {
             schema_fingerprint,
             frames,
             cancellation,
+            telemetry_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-support")]
             resource_probe: None,
         }
@@ -266,6 +285,8 @@ impl OracleQueryStream {
         let schema_fingerprint = schema_frame.schema_fingerprint.clone();
         let lease_cancellation = admitted.cancellation.clone();
         let cancellation = lease_cancellation.clone();
+        let telemetry_cancelled = query_telemetry.cancellation_marker();
+        let stream_telemetry_cancelled = Arc::clone(&telemetry_cancelled);
         let renewal_terminal = Arc::clone(&admitted.renewal_terminal);
         query_telemetry.start_stream();
         let _stream_span = query_stream_span(visibility, query_class);
@@ -274,6 +295,7 @@ impl OracleQueryStream {
             let mut batches = batches;
             let mut next = first;
             let mut row_count = 0_u64;
+            query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
             yield Ok(QueryStreamFrame::Schema(schema_frame));
             loop {
                 let event = if lease_cancellation.is_cancelled() {
@@ -292,41 +314,38 @@ impl OracleQueryStream {
                     QueryStreamEvent::Batch(Some(Ok(batch))) => {
                         query_telemetry.first_batch();
                         row_count = row_count.saturating_add(batch.num_rows() as u64);
-                        match encode_batch_frame(&batch) {
-                            Ok(frame) => yield Ok(QueryStreamFrame::Batch(frame)),
-                            Err(_) => {
-                                query_telemetry.finish("failed", "complete");
+                        if let Ok(frame) = encode_batch_frame(&batch) {
+                            query_telemetry.record_payload(
+                                batch.num_rows() as u64,
+                                frame.arrow_ipc_batch.len(),
+                            );
+                            yield Ok(QueryStreamFrame::Batch(frame));
+                        } else {
+                                query_telemetry.finish(failed_stream_outcome(&stream_telemetry_cancelled), "complete");
                                 let terminal = failed_terminal_for_visibility(
                                     QueryTerminalErrorCode::QueryExecutionFailed,
                                     row_count,
                                     visibility,
                                 );
-                                if let Some(admitted) = admitted.take() {
-                                    let _ = admitted.release().await;
-                                }
+                                release_admitted(&mut admitted).await;
                                 yield Ok(QueryStreamFrame::Terminal(terminal));
                                 return;
-                            }
                         }
                     }
                     QueryStreamEvent::Batch(Some(Err(error))) => {
                         let code = terminal_error_code(&error);
                         tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                        query_telemetry.finish("failed", "complete");
+                        query_telemetry.finish(failed_stream_outcome(&stream_telemetry_cancelled), "complete");
                         let terminal = failed_terminal_for_visibility(code, row_count, visibility);
-                        if let Some(admitted) = admitted.take() {
-                            let _ = admitted.release().await;
-                        }
+                        release_admitted(&mut admitted).await;
                         yield Ok(QueryStreamFrame::Terminal(terminal));
                         return;
                     }
                     QueryStreamEvent::Batch(None) => break,
                     QueryStreamEvent::Failed(code) => {
-                        query_telemetry.finish("failed", "complete");
+                        query_telemetry.finish(failed_stream_outcome(&stream_telemetry_cancelled), "complete");
                         let terminal = failed_terminal_for_visibility(code, row_count, visibility);
-                        if let Some(admitted) = admitted.take() {
-                            let _ = admitted.release().await;
-                        }
+                        release_admitted(&mut admitted).await;
                         yield Ok(QueryStreamFrame::Terminal(terminal));
                         return;
                     }
@@ -335,15 +354,14 @@ impl OracleQueryStream {
             let terminal = successful_terminal(visibility, degraded, stale_replanned, row_count);
             debug_assert!(terminal.validate(visibility).is_ok());
             query_telemetry.finish(if degraded { "degraded" } else { "success" }, if degraded { "degraded" } else { "complete" });
-            if let Some(admitted) = admitted.take() {
-                let _ = admitted.release().await;
-            }
+            release_admitted(&mut admitted).await;
             yield Ok(QueryStreamFrame::Terminal(terminal));
         };
         Ok(Self {
             schema_fingerprint,
             frames: Box::pin(frames),
             cancellation,
+            telemetry_cancelled,
             #[cfg(feature = "test-support")]
             resource_probe,
         })
@@ -369,6 +387,8 @@ impl OracleQueryStream {
     /// This method is intentionally infallible: a timeout leaves local Drop
     /// cleanup in place while durable lease expiry remains authoritative.
     pub async fn cancel(mut self) {
+        self.telemetry_cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
         self.cancellation.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while self.frames.next().await.is_some() {}
@@ -439,7 +459,9 @@ mod tests {
             .next()
             .expect("query stream production section");
         assert_eq!(
-            source.matches("admitted.release().await").count(),
+            source
+                .matches("release_admitted(&mut admitted).await")
+                .count(),
             4,
             "every stream terminal path must await admitted.release()"
         );

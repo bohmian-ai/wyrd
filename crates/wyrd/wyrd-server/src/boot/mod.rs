@@ -144,6 +144,9 @@ pub struct StateOverrides {
     pub authz: Option<ServerAuthz>,
     /// Replace the eval audit writer.
     pub eval_audit: Option<Arc<dyn EvalAuditWriter>>,
+    /// Test-only failure injected after Scribe activation to exercise rollback.
+    #[cfg(feature = "test-support")]
+    pub fail_after_scribe_activation: bool,
 }
 
 /// Holds shared and role-specific Bifrost dependencies during server boot.
@@ -163,9 +166,39 @@ struct ScribeBootParts {
     /// Recovered Scribe allocation that Gate wraps for ingest.
     scribe: Arc<ScribeImpl>,
     /// Dedicated runtime that owns Scribe coordination tasks.
-    coordination_runtime: Arc<tokio::runtime::Runtime>,
+    coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Independently fenced Scribe role registered during this boot.
     scribe_role: RegisteredRole,
+}
+
+impl BifrostBootParts {
+    /// Roll back resources that were activated before the enclosing server
+    /// state became usable.
+    ///
+    /// Scribe recovery and role registration happen before auth/Oracle
+    /// composition. Any later boot error must close the writer and release its
+    /// exact fence; this method is intentionally idempotent and never starts a
+    /// second shutdown budget.
+    async fn rollback(&mut self) {
+        if let Some(scribe) = &mut self.scribe {
+            scribe.scribe.shutdown(std::time::Instant::now()).await;
+            if let Err(error) = self
+                .cluster_registry
+                .shutdown_role(scribe.scribe_role.clone())
+                .await
+            {
+                tracing::warn!(%error, "failed to release Scribe role during boot rollback");
+            }
+            if let Some(runtime) = scribe.coordination_runtime.take()
+                && let Ok(runtime) = Arc::try_unwrap(runtime)
+            {
+                let _ = tokio::task::spawn_blocking(move || {
+                    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+                })
+                .await;
+            }
+        }
+    }
 }
 
 /// Errors raised while assembling server state.
@@ -505,7 +538,7 @@ async fn build_bifrost_parts_from_boot(
         }
         Some(ScribeBootParts {
             scribe,
-            coordination_runtime,
+            coordination_runtime: Some(coordination_runtime),
             scribe_role,
         })
     } else {
@@ -621,14 +654,58 @@ pub async fn build_state(
 
     let boot = PostgresBoot::from_env().await?;
     let roles = config.bifrost_roles();
-    let bifrost_parts = build_bifrost_parts_from_boot(&boot, &config.bifrost, &roles).await?;
-    let state = bifrost_parts.state;
-    let sealing_key = build_sealing_key(config)?;
-    let signing_key = resolve_signing_key(config)?;
+    let mut bifrost_parts = build_bifrost_parts_from_boot(&boot, &config.bifrost, &roles).await?;
+    #[cfg(feature = "test-support")]
+    if overrides.fail_after_scribe_activation {
+        bifrost_parts.rollback().await;
+        return Err(ServerBootError::Scribe(
+            "test-injected failure after Scribe activation".to_owned(),
+        ));
+    }
+    let state = bifrost_parts.state.clone();
+    // A dedicated Forge worker is intentionally a narrow process graph. It
+    // reuses the durable Forge/catalog dependencies assembled above, but does
+    // not construct auth, Gate, Scribe WAL ownership, Oracle membership, or
+    // Oracle TLS/calibration state. This branch must remain before any
+    // server-only side effect such as signing-key resolution or federation
+    // seeding.
+    if matches!(config.role, crate::config::ForgeProcessRole::ForgeWorker) {
+        let state = attach_config_fields(state, config, shutdown, telemetry)?;
+        state
+            .production_validate()
+            .map_err(ServerBootError::ProductionValidation)?;
+        return Ok(state);
+    }
+    let sealing_key = match build_sealing_key(config) {
+        Ok(key) => key,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
+    };
+    let signing_key = match resolve_signing_key(config) {
+        Ok(key) => key,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
+    };
 
-    let state = attach_config_fields(state, config, shutdown, telemetry)?;
-    let state = install_auth(state, config, &signing_key, sealing_key.clone()).await?;
-    let state = OracleRoleBuilder {
+    let state = match attach_config_fields(state, config, shutdown, telemetry) {
+        Ok(state) => state,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
+    };
+    let state = match install_auth(state, config, &signing_key, sealing_key.clone()).await {
+        Ok(state) => state,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
+    };
+    let state = match (OracleRoleBuilder {
         state,
         config,
         signing_key: &signing_key,
@@ -639,16 +716,37 @@ pub async fn build_state(
         peer_credentials: None,
     }
     .build()
-    .await?;
-    let verifier = state
+    .await)
+    {
+        Ok(state) => state,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
+    };
+    let verifier = match state
         .auth
         .token_verifier
         .clone()
-        .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
-    let bifrost_redux = state
+        .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))
+    {
+        Ok(verifier) => verifier,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
+    };
+    let bifrost_redux = match state
         .bifrost_redux
         .clone()
-        .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))?;
+        .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))
+    {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
+    };
     let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
     let state = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_parts = bifrost_parts.scribe.ok_or_else(|| {
@@ -660,7 +758,11 @@ pub async fn build_state(
                 Arc::clone(&bifrost_redux),
                 Arc::clone(&verifier),
                 limits.clone(),
-                Some(scribe_parts.coordination_runtime),
+                Some(
+                    scribe_parts
+                        .coordination_runtime
+                        .expect("Scribe coordination runtime remains during state composition"),
+                ),
             )
             .with_scribe_role(
                 Arc::clone(&bifrost_parts.cluster_registry),
@@ -691,7 +793,10 @@ pub async fn build_state(
         gate = gate.with_oracle(Arc::clone(query.oracle()));
     }
     let state = state.with_bifrost_gate(Arc::new(gate));
-    seed_federation(&state, config, sealing_key.as_deref()).await?;
+    if let Err(error) = seed_federation(&state, config, sealing_key.as_deref()).await {
+        rollback_state_roles(&state).await;
+        return Err(error);
+    }
 
     // Install the real authz audit writer as the OSS default. Callers can
     // still replace the entire ServerAuthz (policy hook + writer) via overrides.
@@ -701,10 +806,31 @@ pub async fn build_state(
     });
     let state = apply_overrides(state, overrides);
 
-    state
-        .production_validate()
-        .map_err(ServerBootError::ProductionValidation)?;
+    if let Err(error) = state.production_validate() {
+        rollback_state_roles(&state).await;
+        return Err(ServerBootError::ProductionValidation(error));
+    }
     Ok(state)
+}
+
+/// Tear down role-owned state after server-only boot stages fail.
+///
+/// Oracle and Scribe fences are activated before federation and production
+/// validation. This helper reuses their normal owner/registry shutdown phases
+/// with an already-expired deadline, ensuring cancellation and retained-task
+/// abort happen without granting a second cleanup budget.
+async fn rollback_state_roles(state: &AppState) {
+    let deadline = std::time::Instant::now();
+    if let Some(query) = state.bifrost_query() {
+        query.abort_shutdown();
+        query.shutdown_owner(deadline).await;
+        query.shutdown_registry(deadline).await;
+    }
+    if let Some(ingest) = &state.bifrost_ingest {
+        ingest.abort_shutdown();
+        ingest.shutdown_owner(deadline).await;
+        ingest.shutdown_registry(deadline).await;
+    }
 }
 
 /// Resolves the one Wyrd signing authority shared by auth and Oracle peers.
@@ -1634,6 +1760,52 @@ pub(crate) mod pg_tests {
 
     use crate::postgres::ServerPostgres;
 
+    /// A post-Scribe activation failure rolls back the exact local role fence
+    /// before returning the production boot error.
+    #[cfg(feature = "test-support")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_boot_failure_after_scribe_activation_rolls_back_roles() {
+        let mut config = crate::config::WyrdServerConfig::default();
+        config.role = crate::config::ForgeProcessRole::Server;
+        config.bifrost.oracle.allow_unapproved_profile = true;
+        let telemetry = Arc::new(wyrd_telemetry::init_test_only_no_global(
+            wyrd_telemetry::TelemetryConfig::default(),
+        ));
+        let result = build_state(
+            &config,
+            telemetry,
+            StateOverrides {
+                fail_after_scribe_activation: true,
+                ..StateOverrides::default()
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("injected post-Scribe failure must abort boot"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ServerBootError::Scribe(ref message) if message.contains("after Scribe activation")),
+            "unexpected injected failure: {error:?}"
+        );
+
+        let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
+        let cluster =
+            ClusterRegistry::new(crate::test_support::test_vala_postgres().await, node_id);
+        cluster
+            .refresh_snapshot()
+            .await
+            .expect("refresh cluster after rollback");
+        assert!(
+            cluster.snapshot().live_scribes().is_empty(),
+            "rollback must remove the activated Scribe membership and fence"
+        );
+        assert!(
+            cluster.snapshot().live_oracles().is_empty(),
+            "failure before Oracle composition must leave no Oracle membership or fence"
+        );
+    }
+
     /// Test-only peer credential that returns a production-signed access token.
     struct TestOraclePeerCredentials {
         /// Access token minted by the same issuing key installed in test auth.
@@ -2222,6 +2394,7 @@ pub(crate) mod pg_tests {
         let overrides = StateOverrides {
             authz: Some(non_stub_authz),
             eval_audit: None,
+            ..StateOverrides::default()
         };
         let patched = apply_overrides(state, overrides);
 
@@ -2250,6 +2423,7 @@ pub(crate) mod pg_tests {
         let overrides = StateOverrides {
             authz: None,
             eval_audit: Some(marker),
+            ..StateOverrides::default()
         };
         let patched = apply_overrides(state, overrides);
 

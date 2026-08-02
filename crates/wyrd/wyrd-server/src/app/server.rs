@@ -18,11 +18,12 @@ use crate::app::BootExit;
 use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{
-    TaskExit, TaskId, classify_first_exit, drain_with_shutdown_hooks, fallible_task, worker_task,
+    TaskExit, TaskId, classify_first_exit_with_shutdown, drain_with_shutdown_hooks, fallible_task,
+    worker_task,
 };
 use crate::boot::{ServerBootError, spawn_maintenance_scheduler, spawn_storage_sweeper};
 use crate::components::health::readiness_loop;
-use crate::config::{ServeMode, WyrdServerConfig};
+use crate::config::{ForgeProcessRole, ServeMode, WyrdServerConfig};
 use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener,
@@ -520,6 +521,19 @@ impl BoundServer {
                 scheduler,
             ));
         }
+        // `All` owns one bounded Forge worker in addition to the scheduler;
+        // `Server` intentionally schedules maintenance without executing it.
+        // The dedicated `ForgeWorker` process is composed by
+        // `run_forge_worker_process` and never reaches this serving owner.
+        if self.config.role == ForgeProcessRole::All {
+            let worker = crate::boot::spawn_forge_worker(
+                &self.state,
+                shutdown.clone(),
+                self.config.forge.worker_concurrency,
+            )
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
+        }
 
         // Enterprise workers.
         for (name, worker) in self.extra_workers.drain(..) {
@@ -565,7 +579,7 @@ impl BoundServer {
         let ingest = self.state.bifrost_ingest.clone();
         #[cfg(feature = "test-support")]
         let shutdown_probe = self.shutdown_probe.clone();
-        let terminal = classify_first_exit(&mut set).await;
+        let terminal = classify_first_exit_with_shutdown(&mut set, &shutdown).await;
         let deadline = tokio::time::Instant::now() + drain;
         drain_with_shutdown_hooks(set, shutdown, deadline, || {
             let ingest = ingest.clone();

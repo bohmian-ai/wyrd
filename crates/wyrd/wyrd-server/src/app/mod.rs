@@ -65,6 +65,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let result = if !config.role.serves_api() {
         run_forge_worker_process(&config, state, metrics_handle).await
     } else {
+        let _role_telemetry = metrics::ForgeRoleTelemetryGuard::started(config.role);
         WyrdServer::new_with_metrics_handle(config, state, metrics_handle)
             .map_err(|e| BootExit::Other(Box::new(e)))?
             .serve(mode)
@@ -182,6 +183,20 @@ mod tests {
         assert!(
             !production_server.contains("ForgeProcessRole::ForgeWorker"),
             "WyrdServer bind/run must not own a dedicated worker branch"
+        );
+        assert!(
+            server.contains("self.config.role == ForgeProcessRole::All"),
+            "the embedded worker must be composed only for the All role"
+        );
+        assert_eq!(
+            server.matches("spawn_maintenance_scheduler(").count(),
+            1,
+            "API roles must retain one supervised Forge scheduler"
+        );
+        assert_eq!(
+            server.matches("spawn_forge_worker(").count(),
+            1,
+            "All must compose exactly one embedded Forge worker"
         );
     }
 }

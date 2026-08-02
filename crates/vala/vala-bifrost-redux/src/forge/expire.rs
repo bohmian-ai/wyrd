@@ -29,7 +29,9 @@ use crate::namespaces::BifrostNamespace;
 use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
-use super::lease::{ForgeLease, forge_lease_key};
+use super::lease::ForgeLease;
+#[cfg(feature = "test-support")]
+use super::lease::forge_lease_key;
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 

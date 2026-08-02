@@ -41,11 +41,13 @@ use wyrd_runtime::Principal;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
+#[cfg(feature = "test-support")]
+use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::{
     AdmissionScope, AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
-    BifrostSecurityViolationKind, ClusterCapabilities, NodeId, OracleAdmissionLease,
-    QueryAuditDigest, QueryBatchFrame, QueryClass, QueryExecutionMode, QueryFreshness, QueryId,
-    QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
+    BifrostSecurityViolationKind, ClusterCapabilities, OracleAdmissionLease, QueryAuditDigest,
+    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryFreshness, QueryId, QuerySchemaFrame,
+    QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
     QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome, VisibilityMode,
 };
 #[cfg(feature = "test-support")]

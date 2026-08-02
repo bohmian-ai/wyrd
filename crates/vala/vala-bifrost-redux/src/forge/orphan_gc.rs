@@ -28,7 +28,9 @@ use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
-use super::lease::{ForgeLease, forge_lease_key};
+use super::lease::ForgeLease;
+#[cfg(feature = "test-support")]
+use super::lease::forge_lease_key;
 use super::live_reconcile::DestructiveMaintenance;
 use super::path::{catalog_path_to_object_key, validate_table_location};
 

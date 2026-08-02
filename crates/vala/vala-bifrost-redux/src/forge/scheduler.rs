@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "test-support")]
 use uuid::Uuid;
 
 use super::error::ForgeError;

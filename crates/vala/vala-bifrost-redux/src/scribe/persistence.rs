@@ -351,6 +351,8 @@ pub struct PersistenceRuntime {
     drained: Arc<Notify>,
     /// Retained worker handles aborted when the process deadline ends graceful persistence.
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Lock-independent abort handles for every spawned persistence worker.
+    abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 impl std::fmt::Debug for PersistenceRuntime {
@@ -378,6 +380,7 @@ impl PersistenceRuntime {
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            abort_handles: Arc::new(Mutex::new(Vec::new())),
         });
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
         let worker = Arc::new(PersistenceWorker::new(config.postgres, context));
@@ -386,7 +389,7 @@ impl PersistenceRuntime {
             let receiver = Arc::clone(&receiver);
             let worker = Arc::clone(&worker);
             let state = Arc::clone(&runtime_state);
-            tasks.push(runtime.spawn(async move {
+            let task = runtime.spawn(async move {
                 loop {
                     let job = receiver.lock().await.recv().await;
                     let Some(job) = job else { break };
@@ -410,10 +413,25 @@ impl PersistenceRuntime {
                     );
                     state.drained.notify_waiters();
                 }
-            }));
+            });
+            let abort_handle = task.abort_handle();
+            match runtime_state.abort_handles.lock() {
+                Ok(mut handles) => handles.push(abort_handle),
+                Err(poisoned) => {
+                    tracing::error!(
+                        "Scribe persistence abort-handle registry poisoned during startup"
+                    );
+                    poisoned.into_inner().push(abort_handle);
+                }
+            }
+            tasks.push(task);
         }
-        if let Ok(mut retained) = runtime_state.tasks.lock() {
-            *retained = tasks;
+        match runtime_state.tasks.lock() {
+            Ok(mut retained) => *retained = tasks,
+            Err(poisoned) => {
+                tracing::error!("Scribe persistence join registry poisoned during startup");
+                *poisoned.into_inner() = tasks;
+            }
         }
         runtime_state
     }
@@ -479,11 +497,46 @@ impl PersistenceRuntime {
         }
     }
 
-    /// Aborts and drops every retained persistence worker that has not completed.
-    pub(crate) fn abort_retained(&self) {
-        if let Ok(mut tasks) = self.tasks.lock() {
-            for task in tasks.drain(..) {
-                task.abort();
+    /// Aborts every retained persistence worker without touching the async join registry.
+    ///
+    /// The abort-handle registry is drained before cancellation so repeated
+    /// finalizer calls are idempotent and cannot double-count a worker.
+    /// Poisoned registry state is recovered because shutdown must remain
+    /// fail-closed after a panic in an unrelated join-registry owner.
+    pub(crate) fn abort_retained(&self) -> usize {
+        let handles = match self.abort_handles.lock() {
+            Ok(mut handles) => std::mem::take(&mut *handles),
+            Err(poisoned) => {
+                tracing::error!("Scribe persistence abort-handle registry is poisoned");
+                std::mem::take(&mut *poisoned.into_inner())
+            }
+        };
+        let mut aborted = 0;
+        for handle in handles {
+            if !handle.is_finished() {
+                handle.abort();
+                aborted += 1;
+            }
+        }
+        metrics::counter!("bifrost_scribe_persistence_worker_abort_total")
+            .increment(aborted as u64);
+        aborted
+    }
+
+    /// Drops retained join handles when the synchronous registry is available.
+    ///
+    /// This bookkeeping never controls cancellation; a contended join registry
+    /// is left for its current owner while [`Self::abort_retained`] remains
+    /// lock-independent.
+    pub(crate) fn clear_retained_join_handles(&self) {
+        match self.tasks.try_lock() {
+            Ok(mut tasks) => tasks.clear(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                tracing::error!("Scribe persistence join registry is poisoned");
+                poisoned.into_inner().clear();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::debug!("Scribe persistence join registry remained contended");
             }
         }
     }
@@ -836,5 +889,90 @@ impl PersistenceWorker {
         Err(last_error.unwrap_or_else(|| ScribeError::Internal {
             detail: "object-store PUT failed without an error".to_owned(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    /// Builds a persistence owner with empty queues for finalizer-only tests.
+    fn test_runtime() -> PersistenceRuntime {
+        let (sender, _receiver) = mpsc::channel(1);
+        PersistenceRuntime {
+            sender: Arc::new(Mutex::new(Some(sender))),
+            queued: Arc::new(AtomicUsize::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            drained: Arc::new(Notify::new()),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+            abort_handles: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Poisons a registry to prove shutdown recovers its retained state.
+    fn poison_registry<T>(registry: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = registry
+                .lock()
+                .expect("registry is healthy before poisoning");
+            panic!("intentional registry poison");
+        }));
+    }
+
+    /// Proves persistence cancellation works while the join registry is held.
+    #[tokio::test]
+    async fn abort_retained_cancels_worker_when_join_registry_is_contended() {
+        let runtime = test_runtime();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        runtime.abort_handles.lock().unwrap().push(abort.clone());
+        runtime.tasks.lock().unwrap().push(task);
+        let tasks_guard = runtime.tasks.lock().unwrap();
+
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let aborted = metrics::with_local_recorder(&recorder, || runtime.abort_retained());
+        assert_eq!(aborted, 1);
+        assert_eq!(runtime.abort_retained(), 0);
+        assert!(runtime.abort_handles.lock().unwrap().is_empty());
+        drop(tasks_guard);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+        assert_eq!(
+            recorder
+                .snapshot()
+                .counters
+                .get("bifrost_scribe_persistence_worker_abort_total"),
+            Some(&1)
+        );
+        runtime.clear_retained_join_handles();
+        assert!(runtime.tasks.lock().unwrap().is_empty());
+    }
+
+    /// Proves poisoned persistence registries still cancel and clean owners.
+    #[tokio::test]
+    async fn abort_retained_recovers_poisoned_registries() {
+        let runtime = test_runtime();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        runtime.abort_handles.lock().unwrap().push(abort.clone());
+        runtime.tasks.lock().unwrap().push(task);
+        poison_registry(&runtime.tasks);
+        poison_registry(&runtime.abort_handles);
+
+        assert_eq!(runtime.abort_retained(), 1);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+        let handles = match runtime.abort_handles.lock() {
+            Ok(handles) => handles,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(handles.is_empty());
+        runtime.clear_retained_join_handles();
+        let tasks = match runtime.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(tasks.is_empty());
     }
 }

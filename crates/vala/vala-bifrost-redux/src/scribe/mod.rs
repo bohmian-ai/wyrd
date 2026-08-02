@@ -46,7 +46,9 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use num_traits::ToPrimitive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(test, feature = "test-support"))]
+use std::time::Instant;
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
 
@@ -704,10 +706,20 @@ impl ScribeImpl {
         if graceful {
             graceful = await_shutdown_phase(deadline, self.ingress_cpu.drain()).await;
         }
-        self.shards.abort_retained();
+        let aborted_shards = self.shards.abort_retained();
+        self.shards.clear_retained_join_handles();
+        let aborted_persistence = self
+            .persistence
+            .as_ref()
+            .map_or(0, |persistence| persistence.abort_retained());
         if let Some(persistence) = &self.persistence {
-            persistence.abort_retained();
+            persistence.clear_retained_join_handles();
         }
+        tracing::debug!(
+            aborted_shards,
+            aborted_persistence,
+            "Scribe shard and persistence owners finalized"
+        );
         if !graceful {
             tracing::warn!("Scribe graceful cleanup was incomplete at shutdown deadline");
         }
@@ -723,10 +735,20 @@ impl ScribeImpl {
     pub fn abort_shutdown(&self) {
         self.begin_shutdown();
         self.close_lanes();
-        self.shards.abort_retained();
+        let aborted_shards = self.shards.abort_retained();
+        self.shards.clear_retained_join_handles();
+        let aborted_persistence = self
+            .persistence
+            .as_ref()
+            .map_or(0, |persistence| persistence.abort_retained());
         if let Some(persistence) = &self.persistence {
-            persistence.abort_retained();
+            persistence.clear_retained_join_handles();
         }
+        tracing::debug!(
+            aborted_shards,
+            aborted_persistence,
+            "Scribe shard and persistence owners finalized"
+        );
     }
 
     /// Closes external Scribe admission without cancelling internal flush lanes.

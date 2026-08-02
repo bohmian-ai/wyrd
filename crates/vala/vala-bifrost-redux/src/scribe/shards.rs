@@ -380,6 +380,11 @@ pub(crate) struct ScribeShardRuntime {
     snapshots: Vec<Arc<Mutex<ShardMemtableSnapshot>>>,
     /// Retained owner tasks that graceful shutdown joins or abort shutdown cancels.
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Abort handles used by the synchronous finalizer without acquiring the
+    /// async join registry. Keeping these handles separate ensures a caller
+    /// that has already exhausted its deadline can still cancel every owner
+    /// even when graceful shutdown currently holds `tasks`.
+    abort_handles: Mutex<Vec<tokio::task::AbortHandle>>,
     /// Accepted append commands that have not completed.
     pending: Arc<AtomicUsize>,
     /// Notification used to wake a drain when accepted work completes.
@@ -420,13 +425,39 @@ impl ScribeShardRuntime {
 
     /// Aborts every retained shard owner that remains after graceful cleanup.
     ///
-    /// This operation never awaits. Dropping an unfinished shutdown future is
-    /// safe because retained handles remain here until this method aborts them.
-    pub(crate) fn abort_retained(&self) {
-        if let Ok(mut tasks) = self.tasks.try_lock() {
-            for task in tasks.drain(..) {
-                task.abort();
+    /// This operation never awaits and does not depend on the async join
+    /// registry lock. Graceful shutdown may still be joining owners when the
+    /// process deadline expires; the retained abort handles therefore provide
+    /// a bounded, observable cancellation path instead of silently leaving an
+    /// owner alive after `try_lock` contention.
+    pub(crate) fn abort_retained(&self) -> usize {
+        let handles = match self.abort_handles.lock() {
+            Ok(mut handles) => std::mem::take(&mut *handles),
+            Err(poisoned) => {
+                tracing::error!("Scribe shard abort-handle registry is poisoned");
+                std::mem::take(&mut *poisoned.into_inner())
             }
+        };
+        let mut aborted = 0;
+        for handle in handles {
+            if !handle.is_finished() {
+                handle.abort();
+                aborted += 1;
+            }
+        }
+        metrics::counter!("bifrost_scribe_shard_abort_total").increment(aborted as u64);
+        aborted
+    }
+
+    /// Releases completed join handles when the async registry is available.
+    ///
+    /// This is bookkeeping only: owner cancellation is already guaranteed by
+    /// [`Self::abort_retained`]'s lock-independent abort handles. Contention
+    /// leaves the handles retained for their eventual owner drop and never
+    /// delays the caller's deadline-expiry path.
+    pub(crate) fn clear_retained_join_handles(&self) {
+        if let Ok(mut tasks) = self.tasks.try_lock() {
+            tasks.clear();
         }
     }
 
@@ -435,6 +466,10 @@ impl ScribeShardRuntime {
     pub(crate) async fn install_shutdown_stall_for_test(&self) -> tokio::task::AbortHandle {
         let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
+        self.abort_handles
+            .lock()
+            .expect("Scribe shard abort-handle registry must not be poisoned")
+            .push(abort.clone());
         self.tasks.lock().await.push(task);
         abort
     }
@@ -464,6 +499,7 @@ impl ScribeShardRuntime {
         let pending = Arc::new(AtomicUsize::new(0));
         let drained = Arc::new(Notify::new());
         let mut tasks = Vec::with_capacity(SCRIBE_SHARD_COUNT);
+        let abort_handles = Mutex::new(Vec::with_capacity(SCRIBE_SHARD_COUNT));
         let pressure_channels = (0..SCRIBE_SHARD_COUNT)
             .map(|_| watch::channel(None))
             .collect::<Vec<_>>();
@@ -502,13 +538,20 @@ impl ScribeShardRuntime {
                 pending: Arc::clone(&pending),
                 drained: Arc::clone(&drained),
             };
-            tasks.push(runtime.spawn(owner.run()));
+            let task = runtime.spawn(owner.run());
+            if let Ok(mut handles) = abort_handles.lock() {
+                handles.push(task.abort_handle());
+            } else {
+                panic!("Scribe shard abort-handle registry must not be poisoned at startup");
+            }
+            tasks.push(task);
         }
         Arc::new(Self {
             senders,
             pressure_senders,
             snapshots,
             tasks: tokio::sync::Mutex::new(tasks),
+            abort_handles,
             pending,
             drained,
             closed: AtomicBool::new(false),
@@ -1912,6 +1955,7 @@ mod tests {
             SCRIBE_SHARD_COUNT
         );
         assert!(scribe.shards.tasks.lock().await.is_empty());
+        assert!(scribe.shards.abort_handles.lock().unwrap().is_empty());
     }
 
     /// Proves deadline expiry aborts every retained shard owner after all admission closes.
@@ -1920,6 +1964,12 @@ mod tests {
         let scribe = crate::scribe::ScribeImpl::new();
         let stalled = tokio::spawn(std::future::pending::<()>());
         let stalled_abort = stalled.abort_handle();
+        scribe
+            .shards
+            .abort_handles
+            .lock()
+            .expect("abort registry is healthy")
+            .push(stalled_abort.clone());
         scribe.shards.tasks.lock().await.push(stalled);
 
         scribe.shutdown(std::time::Instant::now()).await;
@@ -1929,6 +1979,51 @@ mod tests {
         assert!(scribe.shards.closed.load(Ordering::Acquire));
         assert!(stalled_abort.is_finished());
         assert!(scribe.shards.tasks.lock().await.is_empty());
+        assert!(scribe.shards.abort_handles.lock().unwrap().is_empty());
+    }
+
+    /// Proves the synchronous abort finalizer cancels owners while graceful
+    /// shutdown still holds the async join-registry lock.
+    #[tokio::test]
+    async fn abort_retained_cancels_owner_when_join_registry_is_contended() {
+        let scribe = crate::scribe::ScribeImpl::new();
+        scribe.shards.abort_handles.lock().unwrap().clear();
+        let stalled = tokio::spawn(std::future::pending::<()>());
+        let stalled_abort = stalled.abort_handle();
+        scribe
+            .shards
+            .abort_handles
+            .lock()
+            .expect("abort registry is healthy")
+            .push(stalled_abort.clone());
+        scribe.shards.tasks.lock().await.push(stalled);
+
+        let tasks_guard = scribe.shards.tasks.lock().await;
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let (aborted, repeated) = metrics::with_local_recorder(&recorder, || {
+            let aborted = scribe.shards.abort_retained();
+            let repeated = scribe.shards.abort_retained();
+            (aborted, repeated)
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(aborted, 1);
+        assert_eq!(repeated, 0);
+        assert!(stalled_abort.is_finished());
+        assert!(scribe.shards.abort_handles.lock().unwrap().is_empty());
+        assert_eq!(
+            recorder
+                .snapshot()
+                .counters
+                .get("bifrost_scribe_shard_abort_total"),
+            Some(&1)
+        );
+        drop(tasks_guard);
+        scribe.shards.close();
+        scribe
+            .shards
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
     }
 
     #[test]

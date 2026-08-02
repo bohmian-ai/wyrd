@@ -4,6 +4,7 @@
 //! processes. `PostgreSQL` claims assign compute, while the table-scoped
 //! [`ForgeLease`] remains the only publication fence.
 
+use std::str::FromStr;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,7 +38,10 @@ use super::live_replace::{
     IcebergRewriteDisposition, TaskLiveRewriteRequest, TaskLiveRewriteResult,
 };
 use super::maintenance::{ForgeMaintenance, ForgeMaintenanceResult};
-use super::metrics::{ForgeLeaseResult, ForgeMetricStage};
+use super::metrics::{
+    ForgeCleanupKind, ForgeConflictKind, ForgeLeaseResult, ForgeMetricStage,
+    ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
+};
 use super::path::catalog_path_to_object_key;
 use super::{Forge, ForgeCapacity};
 use crate::catalog::TenantTableBinding;
@@ -906,7 +910,7 @@ impl ForgeWorker {
             self.forge
                 .core
                 .telemetry
-                .record_conflict("lease_contention");
+                .record_conflict(ForgeConflictKind::LeaseContention);
             return Err(ForgeError::FenceLost {
                 lease_key: format!("forge:table:{}:{}", task.data_tenant_id, binding.table_ref),
             });
@@ -932,7 +936,8 @@ impl ForgeWorker {
         )
         .await;
         let elapsed = started.elapsed();
-        self.record_task_execution_telemetry(task, &task_span, &result, elapsed);
+        self.record_task_execution_telemetry(task, &task_span, elapsed)
+            .await;
         self.forge
             .core
             .telemetry
@@ -942,7 +947,10 @@ impl ForgeWorker {
                 .core
                 .telemetry
                 .record_lease(ForgeLeaseResult::FenceLost);
-            self.forge.core.telemetry.record_conflict("fence_lost");
+            self.forge
+                .core
+                .telemetry
+                .record_conflict(ForgeConflictKind::FenceLost);
         }
         if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
             tracing::warn!(task_id = %task.task_id, error = %error, "Forge table lease release failed");
@@ -950,25 +958,67 @@ impl ForgeWorker {
         result
     }
 
-    /// Record the terminal production task observation after the durable attempt returns.
-    fn record_task_execution_telemetry(
+    /// Records the task-duration observation from the durable task lifecycle state.
+    ///
+    /// The worker never infers a terminal metric result from the Rust return
+    /// value: successful execution can durably cancel a superseded task, and
+    /// an error can leave the task retryable. Nonterminal states intentionally
+    /// produce no terminal duration observation.
+    async fn record_task_execution_telemetry(
         &self,
         task: &ForgeTaskClaim,
         span: &tracing::Span,
-        result: &Result<(), ForgeError>,
         elapsed: Duration,
     ) {
-        let task_result = if result.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
+        let Ok(Some(task_result)) = self.durable_task_metric_result(task).await else {
+            return;
         };
-        span.record("result", task_result);
-        self.forge.core.telemetry.record_task_terminal(
-            task.strategy.as_str(),
-            task_result,
-            elapsed,
-        );
+        span.record("result", task_result.as_str());
+        let strategy = match task.strategy {
+            ForgeClaimStrategy::Known(strategy) => ForgeTaskMetricStrategy::try_from(strategy)
+                .expect("invariant: validated Forge execution strategy has a task metric label"),
+            ForgeClaimStrategy::Unknown(_) => {
+                unreachable!("invariant: unknown Forge strategy is rejected before execution")
+            }
+        };
+        self.forge
+            .core
+            .telemetry
+            .record_task_terminal(strategy, task_result, elapsed);
+    }
+
+    /// Reads the authoritative post-attempt state and maps it into telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns tenant-connection, SQL, or durable-state parsing errors. The
+    /// caller treats an observation failure as diagnostic-only because the
+    /// underlying task transition has already committed independently.
+    async fn durable_task_metric_result(
+        &self,
+        task: &ForgeTaskClaim,
+    ) -> Result<Option<ForgeTaskTerminalResult>, ForgeError> {
+        let mut conn = self
+            .forge
+            .core
+            .vala
+            .tenant_conn(task.data_tenant_id)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM vala.forge_tasks WHERE task_id = $1 AND data_tenant_id = $2",
+        )
+        .bind(task.task_id)
+        .bind(task.data_tenant_id.as_uuid())
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(vala_sql::SqlError::from)
+        .map_err(ForgeError::Sql)?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        let state = ForgeTaskState::from_str(&state).map_err(ForgeError::Sql)?;
+        Ok(ForgeTaskTerminalResult::try_from(state).ok())
     }
 
     /// Reconciles one taken-over Prepared attempt from its exact stored evidence.
@@ -1321,7 +1371,7 @@ impl ForgeWorker {
             self.forge
                 .core
                 .telemetry
-                .record_conflict("snapshot_changed");
+                .record_conflict(ForgeConflictKind::SnapshotChanged);
             self.cancel_superseded(claim).await?;
             return Ok(());
         }
@@ -1576,7 +1626,7 @@ impl ForgeWorker {
                         self.forge
                             .core
                             .telemetry
-                            .record_task_spill(claim.strategy.as_str(), spill_bytes);
+                            .record_task_spill(ForgeTaskMetricStrategy::SmallFiles, spill_bytes);
                         Ok(ForgeDispatchResult::Committed(table))
                     }
                     (
@@ -1810,7 +1860,7 @@ impl ForgeWorker {
         self.forge
             .core
             .telemetry
-            .record_cleanup("expired", started.elapsed());
+            .record_cleanup(ForgeCleanupKind::Expired, started.elapsed());
     }
 
     /// Resumes the undeleted suffix of exact Prepared cleanup evidence.

@@ -6,6 +6,7 @@ use std::time::Duration;
 use metrics::{Counter, Gauge, Histogram};
 use num_traits::ToPrimitive;
 use uuid::Uuid;
+use vala_sql::row_types::forge_tasks::{ForgeTaskState, ForgeTaskStrategy};
 use wyrd_spec::vala::api::StoragePath;
 
 use crate::catalog::TenantTableBinding;
@@ -53,8 +54,11 @@ pub(super) enum ForgeMetricSource {
 }
 
 impl ForgeMetricSource {
+    /// Every source label registered for Forge operation and rewrite series.
+    const ALL: [Self; 2] = [Self::Staging, Self::Iceberg];
+
     /// Returns the only metric label value emitted for this source.
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Staging => "staging",
             Self::Iceberg => "iceberg",
@@ -82,8 +86,19 @@ pub(super) enum ForgeMetricStage {
 }
 
 impl ForgeMetricStage {
+    /// Every stage label registered for Forge duration and failure series.
+    const ALL: [Self; 7] = [
+        Self::ReconcileStaging,
+        Self::ReconcileIceberg,
+        Self::StagingFold,
+        Self::ManifestDiscovery,
+        Self::IcebergRewrite,
+        Self::SnapshotExpiry,
+        Self::OrphanGc,
+    ];
+
     /// Returns the only metric label value emitted for this stage.
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::ReconcileStaging => "reconcile_staging",
             Self::ReconcileIceberg => "reconcile_iceberg",
@@ -135,6 +150,17 @@ pub(super) enum ForgeOperationResult {
 }
 
 impl ForgeOperationResult {
+    /// Every result label registered for Forge operation series.
+    const ALL: [Self; 7] = [
+        Self::Committed,
+        Self::Recovered,
+        Self::Reset,
+        Self::Noop,
+        Self::Budget,
+        Self::FenceLost,
+        Self::Failed,
+    ];
+
     /// Returns the only metric label value emitted for this result.
     const fn as_str(self) -> &'static str {
         match self {
@@ -161,12 +187,177 @@ pub(super) enum ForgeLeaseResult {
 }
 
 impl ForgeLeaseResult {
+    /// Every result label registered for Forge lease-boundary series.
+    const ALL: [Self; 3] = [Self::Contention, Self::Takeover, Self::FenceLost];
+
     /// Returns the only metric label value emitted for this result.
     const fn as_str(self) -> &'static str {
         match self {
             Self::Contention => "contention",
             Self::Takeover => "takeover",
             Self::FenceLost => "fence_lost",
+        }
+    }
+}
+
+/// Closed strategy labels retained by the task-duration and spill metric schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum ForgeTaskMetricStrategy {
+    /// Fold staging files into an Iceberg snapshot.
+    StagingFold,
+    /// Compact current Iceberg small files.
+    SmallFiles,
+    /// Expire retained Iceberg snapshots.
+    SnapshotExpiry,
+}
+
+impl ForgeTaskMetricStrategy {
+    /// Every strategy label eagerly registered for task-duration and spill series.
+    const ALL: [Self; 3] = [Self::StagingFold, Self::SmallFiles, Self::SnapshotExpiry];
+
+    /// Returns the stable task metric label for this strategy.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StagingFold => "staging_fold",
+            Self::SmallFiles => "small_files",
+            Self::SnapshotExpiry => "snapshot_expiry",
+        }
+    }
+}
+
+impl TryFrom<ForgeTaskStrategy> for ForgeTaskMetricStrategy {
+    type Error = ForgeTaskStrategy;
+
+    /// Converts executable durable strategies to the fixed task-metric vocabulary.
+    ///
+    /// Full-identity repair, manifest rewrite, and cleanup rows deliberately have
+    /// no task-duration series: the worker rejects them before execution. The
+    /// explicit error preserves that invariant instead of silently discarding an
+    /// unexpected durable strategy.
+    fn try_from(strategy: ForgeTaskStrategy) -> Result<Self, Self::Error> {
+        match strategy {
+            ForgeTaskStrategy::StagingFold => Ok(Self::StagingFold),
+            ForgeTaskStrategy::SmallFiles => Ok(Self::SmallFiles),
+            ForgeTaskStrategy::SnapshotExpiry => Ok(Self::SnapshotExpiry),
+            ForgeTaskStrategy::FullIdentity
+            | ForgeTaskStrategy::ManifestRewrite
+            | ForgeTaskStrategy::ExpiredCleanup
+            | ForgeTaskStrategy::OrphanCleanup => Err(strategy),
+        }
+    }
+}
+
+/// Closed terminal result labels retained by the task-duration metric schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum ForgeTaskTerminalResult {
+    /// The task committed or otherwise terminalized successfully.
+    Succeeded,
+    /// The task remains eligible for a later attempt.
+    Retryable,
+    /// The task failed permanently.
+    Failed,
+    /// The task was superseded or cancelled before a durable effect.
+    Cancelled,
+    /// The task permanently exceeded configured execution capacity.
+    Unschedulable,
+}
+
+impl ForgeTaskTerminalResult {
+    /// Every terminal result label eagerly registered for task-duration series.
+    const ALL: [Self; 5] = [
+        Self::Succeeded,
+        Self::Retryable,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Unschedulable,
+    ];
+
+    /// Returns the stable task metric label for this terminal result.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Retryable => "retryable",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unschedulable => "unschedulable",
+        }
+    }
+}
+
+impl TryFrom<ForgeTaskState> for ForgeTaskTerminalResult {
+    type Error = ForgeTaskState;
+
+    /// Converts terminal durable task states to metric labels.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original non-terminal state when a caller attempts to
+    /// publish task-duration telemetry before terminalization.
+    fn try_from(state: ForgeTaskState) -> Result<Self, Self::Error> {
+        match state {
+            ForgeTaskState::Succeeded => Ok(Self::Succeeded),
+            ForgeTaskState::Retryable => Ok(Self::Retryable),
+            ForgeTaskState::Failed => Ok(Self::Failed),
+            ForgeTaskState::Cancelled => Ok(Self::Cancelled),
+            ForgeTaskState::Unschedulable => Ok(Self::Unschedulable),
+            ForgeTaskState::Ready
+            | ForgeTaskState::Claimed
+            | ForgeTaskState::Running
+            | ForgeTaskState::Prepared => Err(state),
+        }
+    }
+}
+
+/// Closed durable conflict labels emitted at Forge rejection boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum ForgeConflictKind {
+    /// Another owner retains the table lease.
+    LeaseContention,
+    /// The executing owner lost its lease fence.
+    FenceLost,
+    /// The task's base snapshot no longer matches the current table snapshot.
+    SnapshotChanged,
+}
+
+impl ForgeConflictKind {
+    /// Every conflict label eagerly registered for the conflict counter.
+    const ALL: [Self; 3] = [
+        Self::LeaseContention,
+        Self::FenceLost,
+        Self::SnapshotChanged,
+    ];
+
+    /// Returns the stable conflict metric label for this durable rejection.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseContention => "lease_contention",
+            Self::FenceLost => "fence_lost",
+            Self::SnapshotChanged => "snapshot_changed",
+        }
+    }
+}
+
+/// Closed cleanup provenance labels retained by the cleanup-duration schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum ForgeCleanupKind {
+    /// Cleanup proved one expired object can be removed.
+    Expired,
+    /// Cleanup proved one never-published object can be removed.
+    Orphan,
+    /// Cleanup accounted for one temporary spill artifact.
+    Spill,
+}
+
+impl ForgeCleanupKind {
+    /// Every provenance label eagerly registered for cleanup-duration series.
+    const ALL: [Self; 3] = [Self::Expired, Self::Orphan, Self::Spill];
+
+    /// Returns the stable cleanup metric label for this provenance.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Orphan => "orphan",
+            Self::Spill => "spill",
         }
     }
 }
@@ -209,13 +400,13 @@ pub struct ForgeTelemetry {
     /// Committed/recovered replacement output-byte counters.
     rewrite_output_bytes: BTreeMap<ForgeMetricSource, Counter>,
     /// One terminal duration series for each closed strategy/result pair.
-    task_duration: BTreeMap<(&'static str, &'static str), Histogram>,
+    task_duration: BTreeMap<(ForgeTaskMetricStrategy, ForgeTaskTerminalResult), Histogram>,
     /// Final spill observations partitioned by closed Forge strategy.
-    task_spill: BTreeMap<&'static str, Histogram>,
+    task_spill: BTreeMap<ForgeTaskMetricStrategy, Histogram>,
     /// Conflict counters emitted exactly at durable rejection boundaries.
-    conflicts: BTreeMap<&'static str, Counter>,
+    conflicts: BTreeMap<ForgeConflictKind, Counter>,
     /// Completed cleanup obligation duration by closed cleanup provenance.
-    cleanup_duration: BTreeMap<&'static str, Histogram>,
+    cleanup_duration: BTreeMap<ForgeCleanupKind, Histogram>,
     /// Scheduler pass duration retained by the injected production handle.
     scheduler_duration: Histogram,
 }
@@ -254,40 +445,29 @@ impl ForgeTelemetry {
         self.scheduler_duration.record(elapsed.as_secs_f64());
     }
 
-    /// Record one terminal worker attempt with closed strategy and result labels.
-    pub(crate) fn record_task_terminal(&self, strategy: &str, result: &str, elapsed: Duration) {
-        let Some(strategy) = closed_strategy(strategy) else {
-            return;
-        };
-        let Some(result) = closed_task_result(result) else {
-            return;
-        };
-        if let Some(histogram) = self.task_duration.get(&(strategy, result)) {
-            histogram.record(elapsed.as_secs_f64());
-        }
+    /// Records one terminal worker attempt through its typed label inventory.
+    pub(super) fn record_task_terminal(
+        &self,
+        strategy: ForgeTaskMetricStrategy,
+        result: ForgeTaskTerminalResult,
+        elapsed: Duration,
+    ) {
+        self.task_duration[&(strategy, result)].record(elapsed.as_secs_f64());
     }
 
     /// Record final `DataFusion` spill accounting for one completed Forge attempt.
-    pub(crate) fn record_task_spill(&self, strategy: &str, bytes: u64) {
-        if let Some(strategy) = closed_strategy(strategy)
-            && let Some(histogram) = self.task_spill.get(strategy)
-        {
-            histogram.record(bytes.to_f64().unwrap_or(f64::MAX));
-        }
+    pub(super) fn record_task_spill(&self, strategy: ForgeTaskMetricStrategy, bytes: u64) {
+        self.task_spill[&strategy].record(bytes.to_f64().unwrap_or(f64::MAX));
     }
 
     /// Record one exact durable conflict before its caller returns the rejection.
-    pub(crate) fn record_conflict(&self, kind: &'static str) {
-        if let Some(counter) = self.conflicts.get(kind) {
-            counter.increment(1);
-        }
+    pub(super) fn record_conflict(&self, kind: ForgeConflictKind) {
+        self.conflicts[&kind].increment(1);
     }
 
     /// Record completion of one durable cleanup obligation.
-    pub(crate) fn record_cleanup(&self, kind: &'static str, elapsed: Duration) {
-        if let Some(histogram) = self.cleanup_duration.get(kind) {
-            histogram.record(elapsed.as_secs_f64());
-        }
+    pub(super) fn record_cleanup(&self, kind: ForgeCleanupKind, elapsed: Duration) {
+        self.cleanup_duration[&kind].record(elapsed.as_secs_f64());
     }
 
     /// Publish the complete scheduler-owned backlog and fairness state.
@@ -371,45 +551,18 @@ impl Default for ForgeTelemetry {
     }
 }
 
-/// Convert a durable strategy tag to the fixed telemetry label vocabulary.
-fn closed_strategy(strategy: &str) -> Option<&'static str> {
-    match strategy {
-        "staging_fold" => Some("staging_fold"),
-        "small_files" => Some("small_files"),
-        "snapshot_expiry" => Some("snapshot_expiry"),
-        _ => None,
-    }
-}
-
-/// Convert an execution result to the fixed telemetry label vocabulary.
-fn closed_task_result(result: &str) -> Option<&'static str> {
-    match result {
-        "succeeded" => Some("succeeded"),
-        "retryable" => Some("retryable"),
-        "failed" => Some("failed"),
-        "cancelled" => Some("cancelled"),
-        "unschedulable" => Some("unschedulable"),
-        _ => None,
-    }
-}
-
 /// Registers every closed strategy/result task-duration series eagerly.
-fn task_duration_histograms() -> BTreeMap<(&'static str, &'static str), Histogram> {
+fn task_duration_histograms()
+-> BTreeMap<(ForgeTaskMetricStrategy, ForgeTaskTerminalResult), Histogram> {
     let mut histograms = BTreeMap::new();
-    for strategy in ["staging_fold", "small_files", "snapshot_expiry"] {
-        for result in [
-            "succeeded",
-            "retryable",
-            "failed",
-            "cancelled",
-            "unschedulable",
-        ] {
+    for strategy in ForgeTaskMetricStrategy::ALL {
+        for result in ForgeTaskTerminalResult::ALL {
             histograms.insert(
                 (strategy, result),
                 metrics::histogram!(
                     "bifrost_forge_task_duration_seconds",
-                    "strategy" => strategy,
-                    "result" => result
+                    "strategy" => strategy.as_str(),
+                    "result" => result.as_str()
                 ),
             );
         }
@@ -418,34 +571,39 @@ fn task_duration_histograms() -> BTreeMap<(&'static str, &'static str), Histogra
 }
 
 /// Register one histogram for every strategy accepted by the v1 worker.
-fn strategy_histograms(name: &'static str) -> BTreeMap<&'static str, Histogram> {
-    ["staging_fold", "small_files", "snapshot_expiry"]
+fn strategy_histograms(name: &'static str) -> BTreeMap<ForgeTaskMetricStrategy, Histogram> {
+    ForgeTaskMetricStrategy::ALL
         .into_iter()
-        .map(|strategy| (strategy, metrics::histogram!(name, "strategy" => strategy)))
+        .map(|strategy| {
+            (
+                strategy,
+                metrics::histogram!(name, "strategy" => strategy.as_str()),
+            )
+        })
         .collect()
 }
 
 /// Register one counter for every stable Forge conflict classification.
-fn conflict_counters() -> BTreeMap<&'static str, Counter> {
-    ["lease_contention", "fence_lost", "snapshot_changed"]
+fn conflict_counters() -> BTreeMap<ForgeConflictKind, Counter> {
+    ForgeConflictKind::ALL
         .into_iter()
         .map(|kind| {
             (
                 kind,
-                metrics::counter!("bifrost_forge_conflicts_total", "kind" => kind),
+                metrics::counter!("bifrost_forge_conflicts_total", "kind" => kind.as_str()),
             )
         })
         .collect()
 }
 
 /// Register cleanup duration histograms for the closed cleanup provenance set.
-fn cleanup_histograms() -> BTreeMap<&'static str, Histogram> {
-    ["expired", "orphan", "spill"]
+fn cleanup_histograms() -> BTreeMap<ForgeCleanupKind, Histogram> {
+    ForgeCleanupKind::ALL
         .into_iter()
         .map(|kind| {
             (
                 kind,
-                metrics::histogram!("bifrost_forge_cleanup_duration_seconds", "kind" => kind),
+                metrics::histogram!("bifrost_forge_cleanup_duration_seconds", "kind" => kind.as_str()),
             )
         })
         .collect()
@@ -525,10 +683,15 @@ mod tests {
     #[cfg(test)]
     use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
     #[cfg(test)]
+    use vala_sql::row_types::forge_tasks::{ForgeTaskState, ForgeTaskStrategy};
+    #[cfg(test)]
     use wyrd_bench::{BenchmarkMetricSnapshot, BenchmarkRecorder};
 
     #[cfg(test)]
-    use super::{ForgeMetricSource, ForgeTelemetry};
+    use super::{
+        ForgeCleanupKind, ForgeConflictKind, ForgeMetricSource, ForgeTaskMetricStrategy,
+        ForgeTaskTerminalResult, ForgeTelemetry,
+    };
     #[cfg(test)]
     use crate::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
 
@@ -614,17 +777,52 @@ mod tests {
             .expect("production metrics recorder installs once");
         let telemetry = ForgeTelemetry::new();
         telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 0, 0, 0, 0);
-        telemetry.record_task_terminal("staging_fold", "succeeded", Duration::ZERO);
-        telemetry.record_task_spill("staging_fold", 0);
-        for kind in ["lease_contention", "fence_lost", "snapshot_changed"] {
+        for strategy in ForgeTaskMetricStrategy::ALL {
+            for result in ForgeTaskTerminalResult::ALL {
+                telemetry.record_task_terminal(strategy, result, Duration::ZERO);
+            }
+            telemetry.record_task_spill(strategy, 0);
+        }
+        for kind in ForgeConflictKind::ALL {
             telemetry.record_conflict(kind);
         }
-        telemetry.record_cleanup("expired", Duration::ZERO);
+        for kind in ForgeCleanupKind::ALL {
+            telemetry.record_cleanup(kind, Duration::ZERO);
+        }
         telemetry.record_planning_status(Duration::from_secs(1), 1);
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let pool: Arc<dyn MemoryPool> = Arc::new(BifrostDataFusionMemoryPool::new(governor));
         let reservation = MemoryConsumer::new("forge-owner-proof").register(&pool);
         reservation.try_grow(0).expect("zero-sized Forge reserve");
+
+        let snapshot = recorder.snapshot();
+        let task_durations = snapshot
+            .histograms
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_task_duration_seconds{"))
+            .count();
+        let spills = snapshot
+            .histograms
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_task_spill_bytes{"))
+            .count();
+        let cleanups = snapshot
+            .histograms
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_cleanup_duration_seconds{"))
+            .count();
+        let conflicts = snapshot
+            .counters
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_conflicts_total{"))
+            .count();
+        assert_eq!(
+            task_durations,
+            ForgeTaskMetricStrategy::ALL.len() * ForgeTaskTerminalResult::ALL.len()
+        );
+        assert_eq!(spills, ForgeTaskMetricStrategy::ALL.len());
+        assert_eq!(cleanups, ForgeCleanupKind::ALL.len());
+        assert_eq!(conflicts, ForgeConflictKind::ALL.len());
 
         assert_owner_transition(
             &recorder,
@@ -632,7 +830,11 @@ mod tests {
             || telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 1, 64, 1, 32),
         );
         assert_owner_transition(&recorder, "bifrost_forge_task_duration_seconds", || {
-            telemetry.record_task_terminal("staging_fold", "succeeded", Duration::from_millis(2));
+            telemetry.record_task_terminal(
+                ForgeTaskMetricStrategy::StagingFold,
+                ForgeTaskTerminalResult::Succeeded,
+                Duration::from_millis(2),
+            );
         });
         assert_owner_transition(&recorder, "bifrost_forge_oldest_backlog_seconds", || {
             telemetry.record_planning_status(Duration::from_secs(2), 1);
@@ -641,36 +843,92 @@ mod tests {
             telemetry.record_planning_status(Duration::from_secs(2), 2);
         });
         assert_owner_transition(&recorder, "bifrost_forge_task_spill_bytes", || {
-            telemetry.record_task_spill("staging_fold", 4096);
+            telemetry.record_task_spill(ForgeTaskMetricStrategy::StagingFold, 4096);
         });
-        for kind in ["lease_contention", "fence_lost", "snapshot_changed"] {
+        for kind in ForgeConflictKind::ALL {
             assert_owner_transition(&recorder, "bifrost_forge_conflicts_total", || {
                 telemetry.record_conflict(kind);
             });
         }
         assert_owner_transition(&recorder, "bifrost_forge_cleanup_duration_seconds", || {
-            telemetry.record_cleanup("expired", Duration::from_millis(3));
+            telemetry.record_cleanup(ForgeCleanupKind::Expired, Duration::from_millis(3));
         });
 
         assert_owner_transition(&recorder, "bifrost_memory_reserved_bytes", || {
             reservation.try_grow(4096).expect("Forge memory reserve");
         });
     }
+
+    /// Maps every durable Forge strategy and task state without a string fallback.
+    #[test]
+    fn forge_durable_labels_are_exhaustive() {
+        assert_eq!(
+            ForgeTaskTerminalResult::ALL.map(ForgeTaskTerminalResult::as_str),
+            [
+                "succeeded",
+                "retryable",
+                "failed",
+                "cancelled",
+                "unschedulable",
+            ]
+        );
+        assert_eq!(
+            ForgeTaskMetricStrategy::try_from(ForgeTaskStrategy::StagingFold),
+            Ok(ForgeTaskMetricStrategy::StagingFold)
+        );
+        assert_eq!(
+            ForgeTaskMetricStrategy::try_from(ForgeTaskStrategy::SmallFiles),
+            Ok(ForgeTaskMetricStrategy::SmallFiles)
+        );
+        assert_eq!(
+            ForgeTaskMetricStrategy::try_from(ForgeTaskStrategy::SnapshotExpiry),
+            Ok(ForgeTaskMetricStrategy::SnapshotExpiry)
+        );
+        for strategy in [
+            ForgeTaskStrategy::FullIdentity,
+            ForgeTaskStrategy::ManifestRewrite,
+            ForgeTaskStrategy::ExpiredCleanup,
+            ForgeTaskStrategy::OrphanCleanup,
+        ] {
+            assert_eq!(ForgeTaskMetricStrategy::try_from(strategy), Err(strategy));
+        }
+        for (state, result) in [
+            (
+                ForgeTaskState::Succeeded,
+                ForgeTaskTerminalResult::Succeeded,
+            ),
+            (
+                ForgeTaskState::Retryable,
+                ForgeTaskTerminalResult::Retryable,
+            ),
+            (ForgeTaskState::Failed, ForgeTaskTerminalResult::Failed),
+            (
+                ForgeTaskState::Cancelled,
+                ForgeTaskTerminalResult::Cancelled,
+            ),
+            (
+                ForgeTaskState::Unschedulable,
+                ForgeTaskTerminalResult::Unschedulable,
+            ),
+        ] {
+            assert_eq!(ForgeTaskTerminalResult::try_from(state), Ok(result));
+        }
+        for state in [
+            ForgeTaskState::Ready,
+            ForgeTaskState::Claimed,
+            ForgeTaskState::Running,
+            ForgeTaskState::Prepared,
+        ] {
+            assert_eq!(ForgeTaskTerminalResult::try_from(state), Err(state));
+        }
+    }
 }
 
 /// Registers every closed source/result operation counter.
 fn operation_counters() -> BTreeMap<(ForgeMetricSource, ForgeOperationResult), Counter> {
     let mut counters = BTreeMap::new();
-    for source in [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg] {
-        for result in [
-            ForgeOperationResult::Committed,
-            ForgeOperationResult::Recovered,
-            ForgeOperationResult::Reset,
-            ForgeOperationResult::Noop,
-            ForgeOperationResult::Budget,
-            ForgeOperationResult::FenceLost,
-            ForgeOperationResult::Failed,
-        ] {
+    for source in ForgeMetricSource::ALL {
+        for result in ForgeOperationResult::ALL {
             counters.insert(
                 (source, result),
                 metrics::counter!(
@@ -686,40 +944,23 @@ fn operation_counters() -> BTreeMap<(ForgeMetricSource, ForgeOperationResult), C
 
 /// Registers every closed lease-result counter.
 fn lease_counters() -> BTreeMap<ForgeLeaseResult, Counter> {
-    [
-        ForgeLeaseResult::Contention,
-        ForgeLeaseResult::Takeover,
-        ForgeLeaseResult::FenceLost,
-    ]
-    .into_iter()
-    .map(|result| {
-        (
-            result,
-            metrics::counter!(
-                "bifrost_forge_lease_events_total",
-                "result" => result.as_str()
-            ),
-        )
-    })
-    .collect()
-}
-
-/// Returns every closed owning-stage label.
-fn stages() -> [ForgeMetricStage; 7] {
-    [
-        ForgeMetricStage::ReconcileStaging,
-        ForgeMetricStage::ReconcileIceberg,
-        ForgeMetricStage::StagingFold,
-        ForgeMetricStage::ManifestDiscovery,
-        ForgeMetricStage::IcebergRewrite,
-        ForgeMetricStage::SnapshotExpiry,
-        ForgeMetricStage::OrphanGc,
-    ]
+    ForgeLeaseResult::ALL
+        .into_iter()
+        .map(|result| {
+            (
+                result,
+                metrics::counter!(
+                    "bifrost_forge_lease_events_total",
+                    "result" => result.as_str()
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Registers failure counters for every closed owning stage.
 fn stage_failure_counters() -> BTreeMap<ForgeMetricStage, Counter> {
-    stages()
+    ForgeMetricStage::ALL
         .into_iter()
         .map(|stage| {
             (
@@ -735,7 +976,7 @@ fn stage_failure_counters() -> BTreeMap<ForgeMetricStage, Counter> {
 
 /// Registers duration histograms for every closed owning stage.
 fn stage_histograms() -> BTreeMap<ForgeMetricStage, Histogram> {
-    stages()
+    ForgeMetricStage::ALL
         .into_iter()
         .map(|stage| {
             (
@@ -751,7 +992,7 @@ fn stage_histograms() -> BTreeMap<ForgeMetricStage, Histogram> {
 
 /// Registers one counter handle for each closed source value.
 fn source_counters(name: &'static str) -> BTreeMap<ForgeMetricSource, Counter> {
-    [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg]
+    ForgeMetricSource::ALL
         .into_iter()
         .map(|source| (source, metrics::counter!(name, "source" => source.as_str())))
         .collect()

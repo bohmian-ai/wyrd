@@ -51,8 +51,8 @@ pub struct ForgeTelemetryDelta {
 pub struct ForgeGaugeSampler {
     /// Cancellation signal for the production-render polling task.
     stop: tokio_util::sync::CancellationToken,
-    /// Gauge snapshots collected only from the production render handle.
-    snapshots: Arc<Mutex<Vec<BTreeMap<String, f64>>>>,
+    /// Per-series maxima accumulated only from production-rendered gauges.
+    maxima: Arc<Mutex<BTreeMap<String, f64>>>,
     /// Task that owns bounded polling until delta construction drains it.
     task: tokio::task::JoinHandle<()>,
 }
@@ -155,6 +155,15 @@ impl ForgeTelemetryCapture {
         })
     }
 
+    /// Render the current production Prometheus exposition for integration assertions.
+    ///
+    /// This returns the installed process recorder's text unchanged. It does not
+    /// retain a scrape or add any fixture-derived metric values.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.metrics.render()
+    }
+
     /// Build one checked delta from the checkpointed production exporter state.
     ///
     /// Gauge maxima include the baseline and end snapshot. A caller that needs
@@ -230,29 +239,30 @@ impl ForgeTelemetryCapture {
         _checkpoint: &ForgeTelemetryCheckpoint,
     ) -> Result<ForgeGaugeSampler, ForgeTelemetryReportError> {
         let initial = rendered_values(&self.metrics.render())?;
-        let snapshots = Arc::new(Mutex::new(vec![initial]));
+        let mut initial_maxima = BTreeMap::new();
+        merge_gauge_maxima(&mut initial_maxima, &initial);
+        let maxima = Arc::new(Mutex::new(initial_maxima));
         let stop = tokio_util::sync::CancellationToken::new();
         let sampler_stop = stop.clone();
-        let sampler_snapshots = Arc::clone(&snapshots);
+        let sampler_maxima = Arc::clone(&maxima);
         let metrics = self.metrics.clone();
         let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(25));
+            // Forge's production reservation can cover a sub-25ms rewrite. Sample at a
+            // millisecond cadence so the benchmark's peak remains an observed exporter
+            // value rather than a coincidental final zero.
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     () = sampler_stop.cancelled() => return,
                     _ = interval.tick() => if let Ok(snapshot) = rendered_values(&metrics.render())
-                        && let Ok(mut values) = sampler_snapshots.lock() {
-                        values.push(snapshot);
+                        && let Ok(mut values) = sampler_maxima.lock() {
+                        merge_gauge_maxima(&mut values, &snapshot);
                     },
                 }
             }
         });
-        Ok(ForgeGaugeSampler {
-            stop,
-            snapshots,
-            task,
-        })
+        Ok(ForgeGaugeSampler { stop, maxima, task })
     }
 
     /// Build one checked production delta after stopping its gauge sampler.
@@ -269,21 +279,12 @@ impl ForgeTelemetryCapture {
         sampler.stop.cancel();
         let _ = sampler.task.await;
         let mut delta = self.delta_without_sampler(checkpoint)?;
-        let snapshots = sampler
-            .snapshots
+        let sampled_maxima = sampler
+            .maxima
             .lock()
-            .map_err(|_| ForgeTelemetryReportError::ReusedWindow)?;
-        let mut maxima = BTreeMap::<String, f64>::new();
-        for snapshot in snapshots.iter() {
-            for (series, value) in snapshot {
-                if !is_monotonic_series(series) {
-                    maxima
-                        .entry(series.clone())
-                        .and_modify(|maximum| *maximum = maximum.max(*value))
-                        .or_insert(*value);
-                }
-            }
-        }
+            .map_err(|_| ForgeTelemetryReportError::ReusedWindow)?
+            .clone();
+        let mut maxima = sampled_maxima;
         for sample in &delta.gauge_maxima {
             let series = rendered_series(sample);
             maxima
@@ -296,6 +297,22 @@ impl ForgeTelemetryCapture {
             .map(|(series, value)| parse_sample(&series, value))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(delta)
+    }
+}
+
+/// Merge one rendered production scrape into its bounded non-monotonic maxima.
+///
+/// Counters and histogram buckets are excluded because their window deltas are
+/// calculated from the checkpoint and final scrape. The map retains one number
+/// per gauge series regardless of the number of polling ticks.
+fn merge_gauge_maxima(maxima: &mut BTreeMap<String, f64>, rendered: &BTreeMap<String, f64>) {
+    for (series, value) in rendered {
+        if !is_monotonic_series(series) {
+            maxima
+                .entry(series.clone())
+                .and_modify(|maximum| *maximum = maximum.max(*value))
+                .or_insert(*value);
+        }
     }
 }
 
@@ -1225,6 +1242,22 @@ mod tests {
             ],
             interval_seconds: 2.0,
         }
+    }
+
+    /// Retains an in-window production gauge peak in one entry per series.
+    #[test]
+    fn gauge_maximum_accumulator_retains_transient_peak_without_tick_history() {
+        let series = "bifrost_memory_reserved_bytes{consumer=\"forge\"}";
+        let mut maxima = BTreeMap::new();
+        merge_gauge_maxima(&mut maxima, &BTreeMap::from([(series.to_owned(), 4.0)]));
+        merge_gauge_maxima(&mut maxima, &BTreeMap::from([(series.to_owned(), 32.0)]));
+        merge_gauge_maxima(&mut maxima, &BTreeMap::from([(series.to_owned(), 1.0)]));
+        merge_gauge_maxima(
+            &mut maxima,
+            &BTreeMap::from([("bifrost_forge_operations_total".to_owned(), 99.0)]),
+        );
+
+        assert_eq!(maxima, BTreeMap::from([(series.to_owned(), 32.0)]));
     }
 
     /// Prove every report projection responds only to its production delta field.

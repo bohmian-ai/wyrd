@@ -37,7 +37,7 @@ use super::Forge;
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::metrics::{ForgeCatalogCommitStrategy, ForgeTelemetry};
+use super::metrics::{ForgeCatalogCommitStrategy, ForgeTaskMetricStrategy, ForgeTelemetry};
 use super::planner::ForgePlanCandidate;
 use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
@@ -626,7 +626,7 @@ impl Forge {
             .await?;
         self.core
             .telemetry
-            .record_task_spill("staging_fold", commit.spill_bytes);
+            .record_task_spill(ForgeTaskMetricStrategy::StagingFold, commit.spill_bytes);
         Ok(commit.committed_table)
     }
 

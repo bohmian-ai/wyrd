@@ -1,0 +1,19 @@
+{
+  "fixture_version": "wyrd.bifrost.forge-parity-fixtures/v1",
+  "valid": "complete selected ledger, receipt, topology reports, and query reports",
+  "negative_cases": [
+    "missing-concern",
+    "missing-source",
+    "missing-proof",
+    "failed-result",
+    "duplicate-concern",
+    "duplicate-proof",
+    "unknown-classification",
+    "unknown-concern",
+    "extra-row",
+    "stale-target",
+    "missing-assertion",
+    "unselected-proof",
+    "stale-success-removal"
+  ]
+}

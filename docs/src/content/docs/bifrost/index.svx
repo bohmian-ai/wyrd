@@ -42,16 +42,33 @@ Key properties:
 
 ## Architecture
 
-Bifrost runs as four components:
+Bifrost runs as four internal components:
 
 - **Gate.** Stateless entry point. Authenticates every request, resolves Principal + DataTenantId + TableRef, dispatches writes to Scribe or reads to Oracle.
 - **Scribe.** Durable write tier. Appends to local WAL (Arrow IPC, fsync), accumulates in memtables keyed by (tenant, table, event_day), seals to Parquet, registers in `vala.file_list`, writes audit rows atomically.
 - **Oracle.** Stateless query tier. Builds DataFusion session with fused scan across Iceberg snapshots, un-compacted Parquet files (from `vala.file_list`), and live Scribe data (Phase 2).
 - **Forge.** Stateless compaction. Postgres-leased bin-packing of small Parquet files into large ones, Iceberg snapshot commits via Mitari REPLACE, snapshot expiration, orphan garbage collection.
 
-**Deployment model:** One binary can run all four roles by default. Optional role specialization via `WYRD_ROLES` env flag for separated deployments (e.g., fast-disk Scribe pods, memory-heavy Oracle pods).
+## Process roles
 
-For a component-level system diagram (Gate, Scribe, Oracle, Forge on one pod plus the shared Postgres and object-store substrate), see [System diagram](/bifrost/architecture#system-diagram) on the architecture page.
+`WYRD_ROLES` is a closed process-role setting with exactly three values:
+
+| Value | Listeners | Forge responsibility |
+| --- | --- | --- |
+| `all` | HTTP, gRPC, and optional Prometheus metrics | Scheduler plus one embedded bounded worker pool. |
+| `server` | HTTP, gRPC, and optional Prometheus metrics | Scheduler only; it never executes Forge tasks. |
+| `forge-worker` | Optional Prometheus metrics only; no HTTP or gRPC API socket | One bounded Forge worker pool; it never schedules work. |
+
+Use `all` for the embedded topology. For dedicated workers, run one `server`
+process and one or more `forge-worker` processes; the server schedules work and
+each worker process owns exactly one bounded executor graph. All roles observe
+the configured shutdown drain budget before forceful cancellation.
+
+For listener behavior, concurrency controls, and embedded/dedicated examples,
+see [deployment modes](/bifrost/architecture#deployment-modes). For a
+component-level system diagram (Gate, Scribe, Oracle, Forge on one pod plus the
+shared Postgres and object-store substrate), see
+[System diagram](/bifrost/architecture#system-diagram) on the architecture page.
 
 ## Write path
 

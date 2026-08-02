@@ -255,6 +255,14 @@ pub(crate) enum ShardCommand {
     FlushExpired {
         now: std::time::Instant,
     },
+    /// Retire committed generations and acknowledge completion for test control.
+    #[cfg(any(test, feature = "test-support"))]
+    RetireCommittedForTest {
+        /// Monotonic instant used for retention decisions.
+        now: std::time::Instant,
+        /// Completes after the owner handles the retirement pass.
+        response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
+    },
     PersistenceComplete {
         completion: Box<PersistenceCompletion>,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -649,6 +657,35 @@ impl ScribeShardRuntime {
         }
     }
 
+    /// Run one acknowledged committed-generation retirement pass for every shard in tests.
+    ///
+    /// Unlike the production coalescing signal, this waits until every owner
+    /// has observed `now`. It lets integration journeys establish an exact
+    /// hot-tail retirement boundary without changing production scheduling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngressClosed`] when an owner has stopped or an
+    /// owner-reported retirement error when one shard cannot process the pass.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn retire_committed_for_test(
+        &self,
+        now: std::time::Instant,
+    ) -> Result<(), ScribeError> {
+        for sender in &self.senders {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .sender
+                .send(ShardCommand::RetireCommittedForTest { now, response })
+                .await
+                .map_err(|_| ScribeError::IngressClosed)?;
+            result.await.map_err(|_| ScribeError::Internal {
+                detail: "shard dropped test expiry response".to_owned(),
+            })??;
+        }
+        Ok(())
+    }
+
     /// Replace one coalescing pressure signal per fixed shard owner.
     pub(crate) fn request_pressure_flush(&self, keys: Vec<crate::scribe::seal_key::SealKey>) {
         let mut by_shard = vec![Vec::new(); SCRIBE_SHARD_COUNT];
@@ -867,6 +904,19 @@ impl ShardOwner {
                     tracing::warn!(error = %error, shard = self.id, "age flush failed");
                 }
                 self.retire_committed(now).await;
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            ShardCommand::RetireCommittedForTest { now, response } => {
+                self.retire_committed(now).await;
+                let result = self
+                    .memtable
+                    .sweep_once_for_test(now)
+                    .and_then(|retired_bytes| {
+                        self.admission.release_immutable(retired_bytes);
+                        self.memory_ledger.release_immutable(retired_bytes)?;
+                        Ok(())
+                    });
+                let _ = response.send(result);
             }
             ShardCommand::FlushAll { response } => {
                 let _ = response.send(self.flush_all());

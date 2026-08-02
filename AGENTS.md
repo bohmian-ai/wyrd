@@ -489,7 +489,7 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 - `wyrd-spec` is foundational but it not a dumping grounds for all contracts. If it's not spec-related, it doesn't go in `wyrd-spec`. Find another place for it.
 - `wyrd-sql` is the durable Postgres layer.
 - `wyrd-storage` is the durable storage layer that provides storage functionality for wyrd and vala.
-- Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly.
+- Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly. "Single-server" means one logical serving surface, not a single process or pod: a topology may horizontally scale `wyrd-server` into multiple replicas and targeted pods (selected by `WYRD_TARGET`) behind one gateway, each activating a subset of subsystems. `wyrd-server` remains the only serving surface.
 - Wyrd is open source and independently publishable. It contains no private
   enterprise licensing keys, feature gates, startup hooks, or product contracts.
   A future private `wyrd-enterprise` repository may depend on and extend public

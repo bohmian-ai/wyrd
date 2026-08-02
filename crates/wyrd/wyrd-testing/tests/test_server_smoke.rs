@@ -37,6 +37,51 @@ async fn server_bound_real_socket_serves_healthz() {
     srv.shutdown().await.expect("shutdown");
 }
 
+/// A readiness failure tears down the real bound task before another process starts.
+///
+/// # Panics
+///
+/// Panics when injected readiness rollback leaves a process-local pool or
+/// listener task alive enough to prevent a fresh bound server from serving.
+#[tokio::test]
+async fn readiness_failure_rolls_back_before_fresh_bound_server_starts() {
+    if !e2e_enabled() {
+        return;
+    }
+    let result = WyrdTestServer::builder()
+        .with_readiness_failure_for_test()
+        .start_bound()
+        .await;
+    let error = match result {
+        Ok(server) => {
+            server
+                .shutdown()
+                .await
+                .expect("unexpectedly ready server shutdown");
+            panic!("injected readiness failure must fail startup");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, wyrd_testing::WyrdTestServerError::Bind(message) if message.contains("injected readiness failure")),
+        "readiness error must remain primary after rollback"
+    );
+
+    let fresh = WyrdTestServer::start_bound()
+        .await
+        .expect("fresh process after readiness rollback");
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/healthz",
+            fresh.base_url().expect("fresh base url")
+        ))
+        .send()
+        .await
+        .expect("fresh process local pool and listener");
+    assert_eq!(response.status(), 200);
+    fresh.shutdown().await.expect("fresh server shutdown");
+}
+
 #[tokio::test]
 async fn server_in_process_auth_token_round_trip() {
     if !e2e_enabled() {

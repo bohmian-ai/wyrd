@@ -315,6 +315,18 @@ pub fn init_test_capture(
     ))
 }
 
+/// Install the production-shaped telemetry pipeline with in-memory capture.
+///
+/// This name is retained for Forge/Scribe callers while the Oracle test
+/// harness uses [`init_test_capture`]. Both paths share one exporter and
+/// provider implementation.
+#[cfg(feature = "test-support")]
+pub fn init_capture(
+    config: TelemetryConfig,
+) -> Result<(TelemetryGuard, TestTraceCapture), WyrdError> {
+    init_test_capture(config)
+}
+
 /// Build the process resource shared by production and test exporters.
 fn telemetry_resource(config: &TelemetryConfig) -> opentelemetry_sdk::Resource {
     let service_name = config.service_name.as_deref().unwrap_or("wyrd").to_owned();

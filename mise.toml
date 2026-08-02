@@ -319,6 +319,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."bench:bifrost:forge:single-tenant-single-node:inner"]
 hide = true
 description = "Run Forge with one tenant on one node"
+env = { WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/forge-single-tenant-single-node.json" }
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=1 --tenants=1"
 
 [tasks."bench:bifrost:forge:multi-tenant-single-node"]
@@ -328,6 +329,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."bench:bifrost:forge:multi-tenant-single-node:inner"]
 hide = true
 description = "Run Forge with multiple tenants on one node"
+env = { WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/forge-multi-tenant-single-node.json" }
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=1 --tenants=10"
 
 [tasks."bench:bifrost:forge:multi-tenant-multi-node"]
@@ -337,6 +339,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."bench:bifrost:forge:multi-tenant-multi-node:inner"]
 hide = true
 description = "Run Forge with multiple tenants across three nodes"
+env = { WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/forge-multi-tenant-multi-node.json" }
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=3 --tenants=10"
 
 [tasks."test:unit"]

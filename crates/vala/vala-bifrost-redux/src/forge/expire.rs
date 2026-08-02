@@ -4,9 +4,16 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use sqlx::Row;
+use iceberg::transaction::{
+    ApplyTransactionAction, CleanupTraversalLimits, ExpiredFileSet, Transaction,
+    expired_files_between,
+};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use vala_sql::row_types::forge_tasks::{ForgeTaskTableIdentity, SnapshotWatermark};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -16,12 +23,13 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::catalog::{TableRef, TenantTableBinding};
+#[cfg(test)]
 use crate::namespaces::BifrostNamespace;
 
 use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
-use super::lease::ForgeLease;
+use super::lease::{ForgeLease, forge_lease_key};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -35,6 +43,46 @@ pub struct SnapshotSummary {
     pub parent_id: Option<i64>,
     /// Creation time in Unix milliseconds.
     pub timestamp_ms: i64,
+}
+
+/// Bounded snapshot-expiry reconciliation evidence for one table pass.
+#[derive(Debug)]
+pub(crate) struct ExpiryReconciliationOutcome {
+    /// Prepared operations completed or proven externally complete.
+    pub(crate) recovered: usize,
+    /// Young prepared operations retained inside the uncertainty bound.
+    pub(crate) pending: usize,
+    /// Prepared selections no longer safe to replay.
+    pub(crate) unresolved: usize,
+    /// Fail-closed destructive-maintenance disposition.
+    pub(crate) destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
+    /// Exact metadata-derived paths made unreachable by this pass.
+    pub(crate) expired_files: ExpiredFileSet,
+    /// Terminal expiry transitions delayed until task evidence is durable.
+    pub(crate) terminals: Vec<PendingExpiryTerminal>,
+}
+
+/// One committed expiry operation awaiting its terminal audit transition.
+#[derive(Debug)]
+pub(crate) struct PendingExpiryTerminal {
+    /// Canonical Prepared detail retained by the operation projection.
+    pub(crate) detail: AuditDetail,
+    /// Whether reconciliation, rather than the first caller, proved the commit.
+    pub(crate) recovered: bool,
+}
+
+impl Default for ExpiryReconciliationOutcome {
+    /// Starts one expiry reconciliation in the allowed, empty state.
+    fn default() -> Self {
+        Self {
+            recovered: 0,
+            pending: 0,
+            unresolved: 0,
+            destructive_maintenance: super::live_reconcile::DestructiveMaintenance::Allowed,
+            expired_files: ExpiredFileSet::default(),
+            terminals: Vec::new(),
+        }
+    }
 }
 
 /// Selects only snapshots older than `cutoff_ms` that are not current, ref
@@ -91,64 +139,153 @@ impl Forge {
     /// # Errors
     ///
     /// Returns lease, catalog, SQL, audit, or reconciliation failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops before the next effect. If it races the catalog
+    /// commit, the Prepared operation remains open and reconciliation is required.
     pub(super) async fn run_snapshot_expiry_for_table(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-    ) -> Result<usize, ForgeError> {
-        self.run_snapshot_expiry_for_table_inner(lease, key, binding)
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
+        self.run_snapshot_expiry_for_table_inner(lease, key, binding, now, stop)
             .await
+    }
+
+    /// Runs one table-scoped snapshot-expiry pass for integration fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, catalog, SQL, audit, or reconciliation failures from the
+    /// unchanged production expiry owner.
+    #[cfg(feature = "test-support")]
+    pub async fn run_snapshot_expiry_for_test(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<usize, ForgeError> {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let lease_key = forge_lease_key(
+            binding.tenant,
+            &binding.logical_namespace,
+            &binding.table_name,
+        );
+        let mut lease = ForgeLease::acquire(
+            &self.core.operator_pool,
+            lease_key,
+            Uuid::now_v7(),
+            self.core.config.lease_ttl,
+        )
+        .await?
+        .ok_or_else(|| ForgeError::FenceLost {
+            lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
+        })?;
+        let mut outcome = self
+            .run_snapshot_expiry_for_table(
+                &mut lease,
+                &key,
+                binding,
+                self.core.clock.now()?,
+                &CancellationToken::new(),
+            )
+            .await;
+        if let Ok(value) = &mut outcome {
+            self.finalize_expiry_terminals(
+                &mut lease,
+                binding.tenant,
+                std::mem::take(&mut value.terminals),
+            )
+            .await?;
+        }
+        lease.release(&self.core.operator_pool).await?;
+        outcome.map(|outcome| outcome.recovered)
+    }
+
+    /// Stops at the injected post-commit/pre-task-evidence boundary.
+    ///
+    /// The returned counts prove that exact metadata candidates and an open
+    /// expiry transition survive together before the worker may close either.
+    ///
+    /// # Errors
+    ///
+    /// Returns the production lease, catalog, watermark, expiry, and traversal
+    /// failures. The committed expiry deliberately remains Prepared for replay.
+    #[cfg(feature = "test-support")]
+    pub async fn run_snapshot_expiry_commit_boundary_for_test(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<(usize, usize), ForgeError> {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let lease_key = forge_lease_key(
+            binding.tenant,
+            &binding.logical_namespace,
+            &binding.table_name,
+        );
+        let mut lease = ForgeLease::acquire(
+            &self.core.operator_pool,
+            lease_key,
+            Uuid::now_v7(),
+            self.core.config.lease_ttl,
+        )
+        .await?
+        .ok_or_else(|| ForgeError::FenceLost {
+            lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
+        })?;
+        let outcome = self
+            .run_snapshot_expiry_for_table(
+                &mut lease,
+                &key,
+                binding,
+                self.core.clock.now()?,
+                &CancellationToken::new(),
+            )
+            .await?;
+        let candidates = outcome.expired_files.data_files.len()
+            + outcome.expired_files.delete_files.len()
+            + outcome.expired_files.manifests.len()
+            + outcome.expired_files.manifest_lists.len()
+            + outcome.expired_files.statistics.len()
+            + outcome.expired_files.metadata_logs.len();
+        let terminals = outcome.terminals.len();
+        lease.release(&self.core.operator_pool).await?;
+        Ok((candidates, terminals))
     }
 }
 
-/// Discover tenant/table pairs represented in the server-owned file list.
+/// Discover tenant/table pairs from active durable catalog registrations.
 ///
 /// Invalid rows are counted and skipped so one malformed table identity does
 /// not prevent maintenance for the remaining tables.
 impl Forge {
     async fn discover_tables_inner(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        let rows = sqlx::query(
-            r"SELECT DISTINCT data_tenant_id, namespace, table_name
-             FROM vala.file_list
-            ORDER BY data_tenant_id, namespace, table_name",
+        let rows = vala_sql::queries::forge_catalog_operator::list_active_tables_for_operator(
+            &self.core.operator_pool,
         )
-        .fetch_all(self.core.operator_pool.pool())
         .await
-        .map_err(|error| ForgeError::Sql(error.into()))?;
+        .map_err(ForgeError::Sql)?;
         let mut failures = 0;
         let mut tables = Vec::new();
         for row in rows {
             let table: Result<ForgeTableKey, ForgeError> = (|| {
-                let tenant_uuid: Uuid =
-                    row.try_get("data_tenant_id")
-                        .map_err(|error| ForgeError::SnapshotExpiry {
-                            detail: error.to_string(),
-                        })?;
-                let tenant = DataTenantId::try_from(tenant_uuid).map_err(|error| {
+                let tenant = DataTenantId::try_from(row.data_tenant_id).map_err(|error| {
                     ForgeError::SnapshotExpiry {
                         detail: error.to_string(),
                     }
                 })?;
-                let namespace: String =
-                    row.try_get("namespace")
-                        .map_err(|error| ForgeError::SnapshotExpiry {
-                            detail: error.to_string(),
-                        })?;
-                let table_name: String =
-                    row.try_get("table_name")
-                        .map_err(|error| ForgeError::SnapshotExpiry {
-                            detail: error.to_string(),
-                        })?;
-                let namespace = BifrostNamespace::from_wire(&namespace).ok_or_else(|| {
-                    ForgeError::SnapshotExpiry {
-                        detail: format!("unknown Bifrost namespace `{namespace}`"),
-                    }
-                })?;
-                Ok(ForgeTableKey {
-                    tenant,
-                    table_ref: TableRef::new(namespace, table_name),
-                })
+                let table_ref =
+                    TableRef::parse_fqn(&row.fqn).ok_or_else(|| ForgeError::SnapshotExpiry {
+                        detail: format!("invalid registered Bifrost FQN `{}`", row.fqn),
+                    })?;
+                Ok(ForgeTableKey { tenant, table_ref })
             })();
             match table {
                 Ok(table) => tables.push(table),
@@ -164,17 +301,35 @@ impl Forge {
     /// Reconcile prepared snapshot-expiry audits, then expire eligible snapshots.
     ///
     /// Current and reference heads, plus their retained ancestry, are protected by
-    /// [`select_expirable_snapshots`]. Iceberg metadata is reloaded before the
-    /// commit so a stale prepared selection cannot delete a newly protected head.
+    /// [`select_expirable_snapshots`]. Recovery of an accepted Prepared operation
+    /// ends the pass so a successor never submits a second expiry effect from the
+    /// same metadata load. New selections reload metadata before commit.
     async fn run_snapshot_expiry_for_table_inner(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-    ) -> Result<usize, ForgeError> {
-        let mut recovered = self.reconcile_expiry(lease, key, binding).await?;
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
+        require_running(stop)?;
+        let mut outcome = self
+            .reconcile_expiry(lease, key, binding, now, stop)
+            .await?;
+        if outcome.recovered > 0 {
+            return Ok(outcome);
+        }
+        if outcome.destructive_maintenance == super::live_reconcile::DestructiveMaintenance::Blocked
+        {
+            return Ok(outcome);
+        }
+        require_running(stop)?;
+        lease.require_fence(&self.core.operator_pool).await?;
         let table = self.load_table(&binding.table_ident()).await?;
-        let cutoff_ms = expiry_cutoff_ms(self.core.config.snapshot_retention)?;
+        let retention_cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
+        let cutoff_ms = self
+            .validated_expiry_cutoff(key, &table, retention_cutoff_ms)
+            .await?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
         let selected = select_expirable_snapshots(
             &summaries,
@@ -184,28 +339,216 @@ impl Forge {
             self.core.config.retain_last,
         );
         if selected.is_empty() {
-            return Ok(recovered);
+            return Ok(outcome);
         }
         let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
+        require_running(stop)?;
+        lease.require_fence(&self.core.operator_pool).await?;
         self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
             .await?;
-        self.complete_expiry(lease, key, binding, &detail, false)
+        require_running(stop)?;
+        outcome.expired_files = self
+            .complete_expiry(lease, key, binding, &detail, stop)
             .await?;
-        recovered += 1;
-        Ok(recovered)
+        outcome.terminals.push(PendingExpiryTerminal {
+            detail,
+            recovered: false,
+        });
+        outcome.recovered = outcome.recovered.saturating_add(1);
+        Ok(outcome)
+    }
+}
+
+impl Forge {
+    /// Loads bounded active-task watermarks and derives the oldest safe expiry cutoff.
+    ///
+    /// Every persisted ID must resolve to the exact persisted timestamp in the
+    /// currently retained ancestry. Missing, malformed, or overflowed state
+    /// fails closed before an expiry transaction is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, identity, or snapshot-expiry errors when active protection
+    /// cannot be proven complete and internally consistent.
+    async fn validated_expiry_cutoff(
+        &self,
+        key: &ForgeTableKey,
+        table: &iceberg::table::Table,
+        retention_cutoff_ms: i64,
+    ) -> Result<i64, ForgeError> {
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            key.table_ref.namespace.as_str(),
+            key.table_ref.name.as_str(),
+        )
+        .map_err(ForgeError::Sql)?;
+        let cap = u32::try_from(self.core.config.max_open_operations_per_table).map_err(|_| {
+            ForgeError::InvalidConfig {
+                detail: "Forge active-watermark cap exceeds u32".to_owned(),
+            }
+        })?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let (watermarks, overflowed) = ForgeTasks::new(self.core.operator_pool.clone())
+            .watermarks(&mut conn, &identity, cap)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if overflowed {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: "active Forge watermark set exceeded its bounded query".to_owned(),
+            });
+        }
+        let (summaries, ref_heads) = snapshot_summaries(table)?;
+        validate_watermarks(
+            &summaries,
+            table.metadata().current_snapshot_id(),
+            &ref_heads,
+            &watermarks,
+            retention_cutoff_ms,
+            self.core.config.max_retained_snapshots_per_table,
+        )
+    }
+}
+
+/// Validates watermark identity/timestamp parity and returns a timestamp cutoff.
+///
+/// Snapshot identifiers are used only for ancestry lookup; ordering is based
+/// exclusively on timestamps so non-monotonic Iceberg IDs remain valid.
+///
+/// # Errors
+///
+/// Returns snapshot-expiry failure when a watermark is absent from retained
+/// ancestry, the ancestry graph is malformed or over its bound, or its
+/// persisted timestamp does not match Iceberg metadata.
+fn validate_watermarks(
+    snapshots: &[SnapshotSummary],
+    current_snapshot_id: Option<i64>,
+    ref_heads: &[i64],
+    watermarks: &[SnapshotWatermark],
+    retention_cutoff_ms: i64,
+    traversal_limit: usize,
+) -> Result<i64, ForgeError> {
+    let by_id = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.id, *snapshot))
+        .collect::<HashMap<_, _>>();
+    let mut heads = ref_heads.iter().copied().collect::<HashSet<_>>();
+    if let Some(current) = current_snapshot_id {
+        heads.insert(current);
+    }
+    let table_is_empty = snapshots.is_empty() && heads.is_empty();
+    if table_is_empty {
+        return watermarks
+            .iter()
+            .try_fold(retention_cutoff_ms, |cutoff, watermark| {
+                if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 {
+                    Ok(cutoff.min(0))
+                } else {
+                    Err(ForgeError::SnapshotExpiry {
+                        detail: "non-sentinel watermark protects an empty Iceberg table".to_owned(),
+                    })
+                }
+            });
+    }
+    if watermarks
+        .iter()
+        .any(|watermark| watermark.snapshot_id == 0 || watermark.timestamp_ms == 0)
+    {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "sentinel watermark is invalid for a non-empty Iceberg table".to_owned(),
+        });
+    }
+    let mut reachable = HashSet::new();
+    for head in heads {
+        let mut path = HashSet::new();
+        let mut cursor = Some(head);
+        while let Some(id) = cursor {
+            if !path.insert(id) {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: format!("Iceberg snapshot ancestry contains a cycle at {id}"),
+                });
+            }
+            if reachable.len() >= traversal_limit && !reachable.contains(&id) {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: "Iceberg snapshot ancestry exceeded its traversal bound".to_owned(),
+                });
+            }
+            reachable.insert(id);
+            let snapshot = by_id.get(&id).ok_or_else(|| ForgeError::SnapshotExpiry {
+                detail: format!("Iceberg snapshot ancestry is missing snapshot {id}"),
+            })?;
+            cursor = snapshot.parent_id;
+        }
+    }
+    watermarks
+        .iter()
+        .try_fold(retention_cutoff_ms, |cutoff, watermark| {
+            let snapshot =
+                by_id
+                    .get(&watermark.snapshot_id)
+                    .ok_or_else(|| ForgeError::SnapshotExpiry {
+                        detail: format!(
+                            "active Forge watermark snapshot {} is not retained",
+                            watermark.snapshot_id
+                        ),
+                    })?;
+            if !reachable.contains(&watermark.snapshot_id) {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: format!(
+                        "active Forge watermark snapshot {} is detached from approved heads",
+                        watermark.snapshot_id
+                    ),
+                });
+            }
+            if snapshot.timestamp_ms != watermark.timestamp_ms {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: format!(
+                        "active Forge watermark {} timestamp does not match Iceberg ancestry",
+                        watermark.snapshot_id
+                    ),
+                });
+            }
+            Ok(cutoff.min(watermark.timestamp_ms))
+        })
+}
+
+/// Rejects entry into a new expiry effect after operation authority is cancelled.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Shutdown`] when the shared claim/lease/shutdown token is cancelled.
+fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
+    if stop.is_cancelled() {
+        Err(ForgeError::Shutdown)
+    } else {
+        Ok(())
     }
 }
 
 /// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.
-fn expiry_cutoff_ms(retention: Duration) -> Result<i64, ForgeError> {
+fn expiry_cutoff_ms(now: DateTime<Utc>, retention: Duration) -> Result<i64, ForgeError> {
     let retention_ms =
         i64::try_from(retention.as_millis()).map_err(|_| ForgeError::InvalidConfig {
             detail: "snapshot_retention exceeds an i64 millisecond timestamp".to_owned(),
         })?;
-    Ok(Utc::now().timestamp_millis().saturating_sub(retention_ms))
+    now.timestamp_millis()
+        .checked_sub(retention_ms)
+        .ok_or_else(|| ForgeError::InvalidConfig {
+            detail: "snapshot retention cutoff overflows UTC milliseconds".to_owned(),
+        })
 }
 
-/// Extract snapshot timestamps, parent links, and metadata reference heads.
+/// Extract snapshot timestamps, parent links, and every metadata reference head.
+///
+/// # Errors
+///
+/// Returns snapshot-expiry failure when metadata serialization fails or any
+/// named reference does not carry a resolvable snapshot head.
 fn snapshot_summaries(
     table: &iceberg::table::Table,
 ) -> Result<(Vec<SnapshotSummary>, Vec<i64>), ForgeError> {
@@ -227,14 +570,19 @@ fn snapshot_summaries(
         .and_then(serde_json::Value::as_object)
         .map(|refs| {
             refs.values()
-                .filter_map(|value| {
+                .map(|value| {
                     value
                         .get("snapshot-id")
                         .or_else(|| value.get("snapshot_id"))
                         .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| ForgeError::SnapshotExpiry {
+                            detail: "Iceberg metadata reference has no resolvable snapshot head"
+                                .to_owned(),
+                        })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, ForgeError>>()
         })
+        .transpose()?
         .unwrap_or_default();
     Ok((summaries, ref_heads))
 }
@@ -269,41 +617,65 @@ fn expiry_detail(
     })
 }
 
-/// Commit an expiry selection after rechecking metadata and the lease fence.
+/// Validates and borrows the canonical selection encoded by expiry audit detail.
 ///
-/// `recovered` selects the terminal audit phase used when completing a
-/// prepared operation left by an earlier Forge process.
+/// # Errors
+///
+/// Returns [`ForgeError::SnapshotExpiry`] when `detail` is not snapshot-expiry
+/// evidence for `key`, or when its selected snapshot identifiers are not a
+/// non-empty strictly increasing sequence.
+fn expiry_selection<'detail>(
+    detail: &'detail AuditDetail,
+    key: &ForgeTableKey,
+) -> Result<(&'detail [i64], i64), ForgeError> {
+    let AuditDetail::ForgeSnapshotExpire {
+        operation_id: _,
+        selected_snapshot_ids,
+        cutoff_ms,
+        group,
+        ..
+    } = detail
+    else {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expiry audit detail has the wrong kind".to_owned(),
+        });
+    };
+    if group != &table_resource_for_key(key)
+        || selected_snapshot_ids.is_empty()
+        || selected_snapshot_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expiry audit detail is not canonical".to_owned(),
+        });
+    }
+    Ok((selected_snapshot_ids, *cutoff_ms))
+}
+
+/// Commit an expiry selection after rechecking metadata and the lease fence.
 impl Forge {
+    /// Submits the canonical expiry transaction while preserving uncertain acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, lease, catalog, traversal, or reconciliation failures.
+    /// Timeout or cancellation after submission returns reconciliation-required
+    /// and deliberately leaves the caller's Prepared operation open.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation is raced against the in-flight catalog commit. The future's
+    /// cancellation is never treated as proof that the remote commit was rejected.
     async fn complete_expiry(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         detail: &AuditDetail,
-        recovered: bool,
-    ) -> Result<(), ForgeError> {
-        let AuditDetail::ForgeSnapshotExpire {
-            operation_id: _,
-            selected_snapshot_ids,
-            cutoff_ms,
-            group,
-            ..
-        } = detail
-        else {
-            return Err(ForgeError::SnapshotExpiry {
-                detail: "expiry audit detail has the wrong kind".to_owned(),
-            });
-        };
-        if group != &table_resource_for_key(key)
-            || selected_snapshot_ids.is_empty()
-            || selected_snapshot_ids
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
-        {
-            return Err(ForgeError::SnapshotExpiry {
-                detail: "expiry audit detail is not canonical".to_owned(),
-            });
-        }
+        stop: &CancellationToken,
+    ) -> Result<ExpiredFileSet, ForgeError> {
+        let (selected_snapshot_ids, cutoff_ms) = expiry_selection(detail, key)?;
         if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
@@ -318,7 +690,7 @@ impl Forge {
         if !selected_ids_are_eligible(
             &table,
             selected_snapshot_ids,
-            *cutoff_ms,
+            cutoff_ms,
             self.core.config.retain_last,
         )? {
             return Err(ForgeError::SnapshotExpiry {
@@ -330,7 +702,7 @@ impl Forge {
         let action = tx
             .expire_snapshots()
             .expire_snapshot_ids(selected_snapshot_ids.iter().copied())
-            .expire_older_than_ms(*cutoff_ms)
+            .expire_older_than_ms(cutoff_ms)
             .retain_last(self.core.config.retain_last.max(1));
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
         lease.require_fence(&self.core.operator_pool).await?;
@@ -339,36 +711,144 @@ impl Forge {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        tokio::time::timeout(
-            self.core.config.iceberg_total_retry_timeout,
-            transaction.commit(self.core.catalog.as_ref()),
+        require_running(stop)?;
+        let commit = transaction.commit(self.core.catalog.as_ref());
+        tokio::pin!(commit);
+        let committed = tokio::select! {
+            response = tokio::time::timeout(
+                self.core.config.iceberg_total_retry_timeout,
+                &mut commit,
+            ) => match response {
+                Ok(Ok(table)) => table,
+                Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
+                Err(_) => return Err(ForgeError::Reconciliation {
+                    detail: "Iceberg snapshot expiry commit timed out with unknown acceptance"
+                        .to_owned(),
+                }),
+            },
+            () = stop.cancelled() => return Err(ForgeError::Reconciliation {
+                detail: "Iceberg snapshot expiry commit was cancelled with unknown acceptance"
+                    .to_owned(),
+            }),
+        };
+        #[cfg(feature = "test-support")]
+        if self
+            .core
+            .maintenance_controls
+            .pause_expiry_accepted(stop)
+            .await
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "Iceberg snapshot expiry commit was accepted before cancellation"
+                    .to_owned(),
+            });
+        }
+        let expired_files = derive_expired_files(
+            &table,
+            &committed,
+            cleanup_traversal_items(&self.core.config)?,
+            self.core.config.max_bytes_per_tick,
+            self.core.config.max_gc_candidates_per_batch,
         )
-        .await
-        .map_err(|_| ForgeError::Timeout {
-            operation: "Iceberg snapshot expiry commit",
-        })?
-        .map_err(ForgeError::Catalog)?;
+        .await?;
         lease.require_fence(&self.core.operator_pool).await?;
-        let terminal = terminal_expiry_detail(
-            detail,
-            if recovered {
-                ForgeSnapshotExpirePhase::Recovered
-            } else {
-                ForgeSnapshotExpirePhase::Committed
-            },
-        );
-        self.append_expiry_audit(
-            lease,
-            key.tenant,
-            &terminal,
-            if recovered {
-                "forge.snapshot_expire.recovered"
-            } else {
-                "forge.snapshot_expire.committed"
-            },
-        )
-        .await
+        Ok(expired_files)
     }
+}
+
+/// Derives a complete bounded cleanup set after a successful expiry commit.
+///
+/// # Errors
+///
+/// Returns catalog failures or fails closed when traversal exhausts a bound.
+async fn derive_expired_files(
+    before: &iceberg::table::Table,
+    after: &iceberg::table::Table,
+    max_items: usize,
+    max_bytes: u64,
+    max_candidates: usize,
+) -> Result<ExpiredFileSet, ForgeError> {
+    let files = expired_files_between(
+        before.file_io(),
+        before.metadata(),
+        after.metadata(),
+        CleanupTraversalLimits {
+            max_items,
+            max_bytes,
+        },
+    )
+    .await
+    .map_err(ForgeError::Catalog)?;
+    validate_expired_files(&files, max_candidates)?;
+    Ok(files)
+}
+
+/// Validates that a completed traversal remains within the deletion cap.
+///
+/// # Errors
+///
+/// Returns snapshot-expiry failure when traversal was incomplete or its exact
+/// candidate set exceeds the configured deletion bound.
+fn validate_expired_files(files: &ExpiredFileSet, max_candidates: usize) -> Result<(), ForgeError> {
+    if files.limit_exhausted {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expired-file traversal exceeded its configured bound".to_owned(),
+        });
+    }
+    let candidate_count = files.data_files.len()
+        + files.delete_files.len()
+        + files.manifests.len()
+        + files.manifest_lists.len()
+        + files.statistics.len()
+        + files.metadata_logs.len();
+    if candidate_count > max_candidates {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expired-file candidate set exceeded its configured bound".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Derives a bounded metadata traversal ceiling from retained-history limits.
+///
+/// # Errors
+///
+/// Returns invalid configuration when the multiplication overflows.
+fn cleanup_traversal_items(config: &super::compact::ForgeConfig) -> Result<usize, ForgeError> {
+    config
+        .max_gc_candidates_per_batch
+        .checked_mul(config.max_retained_snapshots_per_table)
+        .ok_or_else(|| ForgeError::InvalidConfig {
+            detail: "expired-file traversal item bound overflowed".to_owned(),
+        })
+}
+
+/// Reconstructs exact cleanup evidence for an expiry already visible in metadata.
+///
+/// # Errors
+///
+/// Returns catalog, traversal-bound, candidate-bound, or configuration failures.
+pub(super) async fn derive_recovered_files(
+    table: &iceberg::table::Table,
+    base_metadata_location: &str,
+    config: &super::compact::ForgeConfig,
+) -> Result<ExpiredFileSet, ForgeError> {
+    let before = iceberg::spec::TableMetadata::read_from(table.file_io(), base_metadata_location)
+        .await
+        .map_err(ForgeError::Catalog)?;
+    let files = expired_files_between(
+        table.file_io(),
+        &before,
+        table.metadata(),
+        CleanupTraversalLimits {
+            max_items: cleanup_traversal_items(config)?,
+            max_bytes: config.max_bytes_per_tick,
+        },
+    )
+    .await
+    .map_err(ForgeError::Catalog)?;
+    validate_expired_files(&files, config.max_gc_candidates_per_batch)?;
+    Ok(files)
 }
 
 /// Check that every selected snapshot is still eligible under current metadata.
@@ -402,123 +882,156 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-    ) -> Result<usize, ForgeError> {
-        let (prepared, terminal) = self.load_expiry_audits(key).await?;
-        let mut recovered = 0;
-        for (operation_id, (detail, created_at)) in prepared {
-            if terminal.contains(&operation_id) {
-                continue;
-            }
-            let AuditDetail::ForgeSnapshotExpire {
-                selected_snapshot_ids,
-                ..
-            } = &detail
-            else {
-                continue;
-            };
-            let table = self.load_table(&binding.table_ident()).await?;
-            let all_absent = selected_snapshot_ids
-                .iter()
-                .all(|id| table.metadata().snapshot_by_id(*id).is_none());
-            if all_absent {
-                lease.require_fence(&self.core.operator_pool).await?;
-                self.append_expiry_audit(
-                    lease,
-                    key.tenant,
-                    &terminal_expiry_detail(&detail, ForgeSnapshotExpirePhase::Recovered),
-                    "forge.snapshot_expire.recovered",
-                )
-                .await?;
-                recovered += 1;
-                continue;
-            }
-            if Utc::now()
-                .signed_duration_since(created_at)
-                .to_std()
-                .unwrap_or_default()
-                < self.core.config.uncertainty_bound
-            {
-                continue;
-            }
-            self.complete_expiry(lease, key, binding, &detail, true)
-                .await?;
-            recovered += 1;
-        }
-        Ok(recovered)
-    }
-}
-
-/// Read the latest prepared and terminal expiry audit state for one table.
-impl Forge {
-    async fn load_expiry_audits(
-        &self,
-        key: &ForgeTableKey,
-    ) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
+        let resource = table_resource_for_key(key);
         let mut conn = self
             .core
             .vala
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let mut after_seq = 0_i64;
-        let mut prepared = HashMap::new();
-        let mut terminal = HashSet::new();
-        loop {
-            let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
-                &mut conn,
-                &table_resource_for_key(key),
-                after_seq,
-                self.core.config.audit_page_size,
-            )
+        let page = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
             .await
             .map_err(ForgeError::Sql)?;
-            let page_len = page.len();
-            for row in page {
-                after_seq = row.seq;
-                let Some(detail) = row.detail else { continue };
-                let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
-                    ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    }
-                })?;
-                let AuditDetail::ForgeSnapshotExpire {
-                    operation_id,
-                    phase,
-                    group,
-                    selected_snapshot_ids,
-                    ..
-                } = &detail
-                else {
-                    continue;
-                };
-                if group != &table_resource_for_key(key)
-                    || selected_snapshot_ids.is_empty()
-                    || selected_snapshot_ids
-                        .windows(2)
-                        .any(|pair| pair[0] >= pair[1])
-                {
-                    return Err(ForgeError::Reconciliation {
-                        detail: "snapshot-expiry audit detail is not canonical".to_owned(),
-                    });
-                }
-                match phase {
-                    ForgeSnapshotExpirePhase::Prepared => {
-                        prepared.insert(*operation_id, (detail, row.created_at));
-                    }
-                    ForgeSnapshotExpirePhase::Committed | ForgeSnapshotExpirePhase::Recovered => {
-                        terminal.insert(*operation_id);
-                    }
-                }
-            }
-            if page_len < usize::try_from(self.core.config.audit_page_size).unwrap_or(usize::MAX) {
-                break;
-            }
-        }
         conn.commit().await.map_err(ForgeError::Sql)?;
-        Ok((prepared, terminal))
+        let mut outcome = ExpiryReconciliationOutcome::default();
+        if page.overflowed {
+            outcome.destructive_maintenance =
+                super::live_reconcile::DestructiveMaintenance::Blocked;
+            return Ok(outcome);
+        }
+        for row in page.operations {
+            let detail = row.prepared_detail;
+            let AuditDetail::ForgeSnapshotExpire {
+                selected_snapshot_ids,
+                cutoff_ms,
+                base_metadata_location,
+                ..
+            } = &detail
+            else {
+                record_malformed_expiry(&mut outcome);
+                continue;
+            };
+            require_running(stop)?;
+            lease.require_fence(&self.core.operator_pool).await?;
+            let table = self.load_table(&binding.table_ident()).await?;
+            let all_absent = selected_snapshot_ids
+                .iter()
+                .all(|id| table.metadata().snapshot_by_id(*id).is_none());
+            if all_absent {
+                let recovered_files = derive_recovered_files(
+                    &table,
+                    base_metadata_location.as_str(),
+                    &self.core.config,
+                )
+                .await?;
+                merge_expired_files(&mut outcome.expired_files, recovered_files);
+                outcome.terminals.push(PendingExpiryTerminal {
+                    detail,
+                    recovered: true,
+                });
+                outcome.recovered = outcome.recovered.saturating_add(1);
+                continue;
+            }
+            if now
+                .signed_duration_since(row.prepared_at)
+                .to_std()
+                .unwrap_or_default()
+                < self.core.config.uncertainty_bound
+            {
+                outcome.pending = outcome.pending.saturating_add(1);
+                continue;
+            }
+            if !selected_ids_are_eligible(
+                &table,
+                selected_snapshot_ids,
+                *cutoff_ms,
+                self.core.config.retain_last,
+            )? {
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
+                continue;
+            }
+            let expired = self
+                .complete_expiry(lease, key, binding, &detail, stop)
+                .await?;
+            merge_expired_files(&mut outcome.expired_files, expired);
+            outcome.terminals.push(PendingExpiryTerminal {
+                detail,
+                recovered: true,
+            });
+            outcome.recovered = outcome.recovered.saturating_add(1);
+        }
+        if outcome.pending > 0 || outcome.unresolved > 0 {
+            outcome.destructive_maintenance =
+                super::live_reconcile::DestructiveMaintenance::Blocked;
+        }
+        Ok(outcome)
     }
+}
 
-    /// Append a fenced snapshot-expiry audit event in the tenant transaction.
+impl Forge {
+    /// Closes committed expiry operations only after exact task evidence is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, SQL, audit, or operation-state failures. A partial close
+    /// remains idempotently replayable from the still-Prepared operation rows.
+    pub(crate) async fn finalize_expiry_terminals(
+        &self,
+        lease: &mut ForgeLease,
+        tenant: DataTenantId,
+        terminals: Vec<PendingExpiryTerminal>,
+    ) -> Result<(), ForgeError> {
+        for pending in terminals {
+            let phase = if pending.recovered {
+                ForgeSnapshotExpirePhase::Recovered
+            } else {
+                ForgeSnapshotExpirePhase::Committed
+            };
+            let operation = if pending.recovered {
+                "forge.snapshot_expire.recovered"
+            } else {
+                "forge.snapshot_expire.committed"
+            };
+            self.append_expiry_audit(
+                lease,
+                tenant,
+                &terminal_expiry_detail(&pending.detail, phase),
+                operation,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Merges typed expired-file sets while preserving category provenance.
+fn merge_expired_files(target: &mut ExpiredFileSet, source: ExpiredFileSet) {
+    target.data_files.extend(source.data_files);
+    target.delete_files.extend(source.delete_files);
+    target.manifests.extend(source.manifests);
+    target.manifest_lists.extend(source.manifest_lists);
+    target.statistics.extend(source.statistics);
+    target.metadata_logs.extend(source.metadata_logs);
+}
+
+/// Mark a wrong-family open expiry row as unresolved and fail closed later.
+fn record_malformed_expiry(outcome: &mut ExpiryReconciliationOutcome) {
+    outcome.unresolved = outcome.unresolved.saturating_add(1);
+}
+
+impl Forge {
+    /// Append a fenced snapshot-expiry audit and projection transition atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a detail-validation, lease, SQL, operation-state, audit, fence,
+    /// or commit error. The caller-owned transaction rolls back both durable
+    /// rows.
     async fn append_expiry_audit(
         &self,
         lease: &mut ForgeLease,
@@ -556,11 +1069,39 @@ impl Forge {
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
-            .await
-            .map_err(ForgeError::Sql)?;
+        let operations =
+            ForgeOperations::new(&event.resource, ForgeOperationFamily::SnapshotExpire)
+                .map_err(ForgeError::Sql)?;
+        let transition = if operation == "forge.snapshot_expire.prepared" {
+            operations.append_prepared(&mut conn, &event).await
+        } else {
+            operations.append_terminal(&mut conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+        }
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Drive the production expiry transition writer from DB integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, lease, SQL, transition, audit, fence, and
+    /// commit errors as the production expiry and reconciliation paths.
+    #[cfg(feature = "test-support")]
+    pub async fn append_expiry_transition_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        tenant: DataTenantId,
+        detail: &AuditDetail,
+        operation: &str,
+    ) -> Result<(), ForgeError> {
+        self.append_expiry_audit(lease, tenant, detail, operation)
+            .await
     }
 }
 
@@ -617,6 +1158,22 @@ fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) ->
 mod tests {
     use super::*;
 
+    /// Wrong-family expiry state contributes unresolved evidence that blocks GC.
+    #[test]
+    fn malformed_expiry_blocks_gc() {
+        let mut outcome = ExpiryReconciliationOutcome::default();
+        record_malformed_expiry(&mut outcome);
+        if outcome.unresolved > 0 {
+            outcome.destructive_maintenance =
+                super::super::live_reconcile::DestructiveMaintenance::Blocked;
+        }
+        assert_eq!(outcome.unresolved, 1);
+        assert_eq!(
+            outcome.destructive_maintenance,
+            super::super::live_reconcile::DestructiveMaintenance::Blocked
+        );
+    }
+
     #[test]
     fn snapshot_selection_never_includes_current_or_retained_head() {
         let snapshots = vec![
@@ -663,6 +1220,54 @@ mod tests {
         assert_eq!(selected, vec![100]);
     }
 
+    /// Active watermark ordering follows timestamps even when IDs move backward.
+    #[test]
+    fn watermark_cutoff_uses_timestamps_not_snapshot_ids() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 900,
+                parent_id: None,
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(900),
+                timestamp_ms: 20,
+            },
+        ];
+        let watermarks = vec![SnapshotWatermark {
+            snapshot_id: 900,
+            timestamp_ms: 10,
+        }];
+        let cutoff = validate_watermarks(&snapshots, Some(2), &[], &watermarks, 100, 2)
+            .expect("valid non-monotonic watermark");
+        assert_eq!(cutoff, 10);
+    }
+
+    /// A persisted timestamp mismatch fails closed before expiry selection.
+    #[test]
+    fn watermark_timestamp_mismatch_fails_closed() {
+        let snapshots = vec![SnapshotSummary {
+            id: 7,
+            parent_id: None,
+            timestamp_ms: 20,
+        }];
+        let error = validate_watermarks(
+            &snapshots,
+            Some(7),
+            &[],
+            &[SnapshotWatermark {
+                snapshot_id: 7,
+                timestamp_ms: 19,
+            }],
+            100,
+            1,
+        )
+        .expect_err("mismatched watermark must fail");
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    /// Stable expiry identities bind an exact ordered selection and cutoff.
     #[test]
     fn maintenance_operation_id_is_stable_for_sorted_targets() {
         let key = ForgeTableKey {
@@ -672,5 +1277,126 @@ mod tests {
         let left = expiry_operation_id(&key, 10, &[3, 8]);
         let right = expiry_operation_id(&key, 10, &[3, 8]);
         assert_eq!(left, right);
+    }
+
+    /// A timestamp-correct sibling cannot authorize expiry from another branch.
+    #[test]
+    fn detached_sibling_watermark_fails_closed() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 1,
+                parent_id: None,
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(1),
+                timestamp_ms: 20,
+            },
+            SnapshotSummary {
+                id: 3,
+                parent_id: Some(1),
+                timestamp_ms: 30,
+            },
+        ];
+        let error = validate_watermarks(
+            &snapshots,
+            Some(2),
+            &[],
+            &[SnapshotWatermark {
+                snapshot_id: 3,
+                timestamp_ms: 30,
+            }],
+            100,
+            3,
+        )
+        .expect_err("detached sibling must fail");
+        assert!(error.to_string().contains("detached"));
+    }
+
+    /// An approved head with a missing parent fails before any watermark can authorize expiry.
+    #[test]
+    fn missing_parent_fails_closed() {
+        let snapshots = vec![SnapshotSummary {
+            id: 2,
+            parent_id: Some(1),
+            timestamp_ms: 20,
+        }];
+        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 100, 2)
+            .expect_err("missing parent must fail");
+        assert!(error.to_string().contains("missing snapshot 1"));
+    }
+
+    /// Cyclic ancestry is rejected even when the watermark timestamp is exact.
+    #[test]
+    fn cycle_fails_closed() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 1,
+                parent_id: Some(2),
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(1),
+                timestamp_ms: 20,
+            },
+        ];
+        let error = validate_watermarks(
+            &snapshots,
+            Some(2),
+            &[],
+            &[SnapshotWatermark {
+                snapshot_id: 1,
+                timestamp_ms: 10,
+            }],
+            100,
+            2,
+        )
+        .expect_err("cycle must fail");
+        assert!(error.to_string().contains("cycle"));
+    }
+
+    /// Sentinel watermarks are reserved for tables without snapshots or references.
+    #[test]
+    fn sentinel_on_non_empty_table_fails_closed() {
+        let snapshots = vec![SnapshotSummary {
+            id: 1,
+            parent_id: None,
+            timestamp_ms: 10,
+        }];
+        let error = validate_watermarks(
+            &snapshots,
+            Some(1),
+            &[],
+            &[SnapshotWatermark {
+                snapshot_id: 0,
+                timestamp_ms: 0,
+            }],
+            100,
+            1,
+        )
+        .expect_err("sentinel must fail for a non-empty table");
+        assert!(error.to_string().contains("sentinel"));
+    }
+
+    /// Traversal stops at the configured retained-history ceiling.
+    #[test]
+    fn ancestry_traversal_overflow_fails_closed() {
+        let snapshots = vec![
+            SnapshotSummary {
+                id: 1,
+                parent_id: None,
+                timestamp_ms: 10,
+            },
+            SnapshotSummary {
+                id: 2,
+                parent_id: Some(1),
+                timestamp_ms: 20,
+            },
+        ];
+        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 100, 1)
+            .expect_err("ancestry beyond the bound must fail");
+        assert!(error.to_string().contains("traversal bound"));
     }
 }

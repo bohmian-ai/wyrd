@@ -1879,6 +1879,10 @@ impl WyrdTestServerBuilder {
                     hints: forge_inbox,
                     config: forge_config,
                     maintenance_interval: self.forge_interval,
+                    clock: vala_bifrost_redux::forge::ForgeClock::system(),
+                    completion_observer: None,
+                    scheduler_trigger: None,
+                    telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
                 })
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
             ))

@@ -101,6 +101,23 @@ impl PgFixture {
         &self.vala
     }
 
+    /// Build independent runtime pools for one simulated Wyrd process.
+    ///
+    /// Cluster fixtures share the migrated database and durable data, but each
+    /// simulated process must own its own app, platform-admin, and Vala SQLx
+    /// pools just as separately started production processes do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the fixture database DSNs cannot be resolved
+    /// or either fresh runtime pool graph cannot connect.
+    pub async fn fresh_runtime_handles(&self) -> Result<(WyrdPostgres, ValaPostgres), SqlError> {
+        let dsns = self._test_db.resolved_dsns()?;
+        let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
+        let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
+        Ok((wyrd, vala))
+    }
+
     /// Borrow the runtime `wyrd_app` pool.
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {

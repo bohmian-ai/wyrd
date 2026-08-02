@@ -21,12 +21,13 @@ driving the work, or inspect the current `vala-bifrost` crate plus
 `architecture/wyrd-design.md` and this reference for the durable
 contracts. Do not improvise architecture from scratch.
 
-## Four Roles, One Binary
+## Four Components, Three Process Roles
 
-Bifrost is a single binary with four internal roles running per pod. No
-per-role ownership; autoscaling is per-pod (HPA on CPU/memory). Optional
-`WYRD_ROLES` env flag restricts a pod to a subset (narrow use case for
-large SaaS).
+Bifrost has four internal components, while `wyrd-server` has exactly three
+closed process-role values selected by `WYRD_ROLES`: `all`, `server`, and
+`forge-worker`. Comma-separated component subsets are not supported. The
+server remains the only public serving surface; the dedicated worker is a
+metrics-only process with no HTTP or gRPC API listener.
 
 | Role | Function |
 |---|---|
@@ -34,6 +35,16 @@ large SaaS).
 | **Scribe** | WAL append → fsync ack; memtable buffer; seal to Parquet + `file_list` + audit outbox in one tx. |
 | **Forge** | Bin-pack small Parquet → big Parquet; Iceberg REPLACE; expire snapshots; orphan GC. Single-writer Iceberg committer. |
 | **Oracle** | Fused scan (Iceberg + `file_list` + live Scribe WAL Phase 2); admission; distributed lane fan-out; read audit. |
+
+| Process role | Listeners | Scheduler | Forge executor |
+|---|---|---|---|
+| `all` | HTTP, gRPC, optional loopback metrics | Yes | One bounded shared worker pool |
+| `server` | HTTP, gRPC, optional loopback metrics | Yes | No |
+| `forge-worker` | Optional loopback metrics only | No | One bounded shared worker pool |
+
+`WYRD_FORGE_WORKER_CONCURRENCY` bounds the shared pool in `all` and
+`forge-worker`; every process owns exactly one worker graph. Every role drains
+for the configured shutdown budget before remaining tasks are cancelled.
 
 `wyrd-server` remains the only serving surface — Gate registers handlers
 under the existing `wyrd-server` router. `vala-*` crates are engines, not

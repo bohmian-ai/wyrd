@@ -46,7 +46,7 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use num_traits::ToPrimitive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
 
@@ -781,6 +781,22 @@ impl ScribeImpl {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn flush_writable_for_test(&self) -> Result<(), ScribeError> {
         self.shards.flush_all().await
+    }
+
+    /// Retire committed generations through an acknowledged test-only age pass.
+    ///
+    /// Production lifecycle scheduling uses [`Self::check_age`] as a
+    /// coalescing best-effort signal. Tests use this control only when they
+    /// need to prove the public read path after every eligible hot generation
+    /// has been retired.
+    ///
+    /// # Errors
+    ///
+    /// Returns the owner error when a shard cannot run the expiry or retirement
+    /// pass, including when a shard has stopped.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn retire_committed_for_test(&self, now: Instant) -> Result<(), ScribeError> {
+        self.shards.retire_committed_for_test(now).await
     }
 
     /// Return the bounded persistence queue depth for test-tier drain checks.

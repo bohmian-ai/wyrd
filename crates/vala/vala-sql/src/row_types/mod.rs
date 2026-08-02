@@ -8,6 +8,7 @@ pub mod audit_outbox;
 pub mod cluster_nodes;
 pub mod file_list;
 pub mod forge_operations;
+pub mod forge_tasks;
 pub mod maintenance;
 pub mod monitor;
 pub mod olap_catalog;

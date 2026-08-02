@@ -38,7 +38,7 @@ planning files.
 Enforced by `check:client-tier`:
 
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`,
-  or `deltalake`.
+  or `iceberg`.
 - Shared shells stay `pyo3`- and `sqlx`-free.
 - Skald crates keep locked Wyrd edges — no server-tier imports.
 
@@ -80,6 +80,15 @@ Enterprise is a deployment topology, not a commercial edition. Wyrd is
 open source and independently publishable; a future private
 `wyrd-enterprise` repo may depend on and extend public Wyrd crates, but
 Wyrd never depends on that private repo.
+
+**"Single-server" denotes one logical serving surface and deployment
+authority — not a single process or pod.** `wyrd-server` stays the only
+serving surface (see Product Boundaries), but a topology may run it as
+multiple horizontally-scaled replicas and as targeted pods that each
+activate a subset of its subsystems (selected by `WYRD_TARGET`; see the
+targeted-deployments spec). Multi-pod targeted deployment is an intended
+elaboration of these topologies — the same binary scaled out behind one
+gateway — not a departure from the single-serving-surface rule.
 
 ## Observation Identity
 

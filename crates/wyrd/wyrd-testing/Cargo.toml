@@ -75,7 +75,7 @@ wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
-wyrd-telemetry = { workspace = true, features = ["test-support"] }
+wyrd-telemetry = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
 wyrd-tls = { workspace = true }
 

@@ -305,6 +305,18 @@ pub struct IcebergCandidateFile {
 }
 
 impl IcebergCandidateFile {
+    /// Returns the immutable catalog path persisted in an exact task plan.
+    #[must_use]
+    pub(crate) fn catalog_path(&self) -> &str {
+        &self.catalog_path
+    }
+
+    /// Returns the compressed physical size used for admission.
+    #[must_use]
+    pub(crate) const fn file_size_bytes(&self) -> u64 {
+        self.file_size_bytes
+    }
+
     /// Return the canonical planner order for this file.
     pub(crate) fn sort_key(&self) -> (i32, NaiveDate, DateTime<Utc>, DateTime<Utc>, &str) {
         (
@@ -328,6 +340,20 @@ impl IcebergCandidateFile {
     #[must_use]
     pub fn catalog_path_for_test(&self) -> &str {
         &self.catalog_path
+    }
+
+    /// Return the compressed physical size used by right-size planning.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn file_size_bytes_for_test(&self) -> u64 {
+        self.file_size_bytes
+    }
+
+    /// Return the snapshot that added this candidate for scheduler-fence tests.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn source_snapshot_id_for_test(&self) -> i64 {
+        self.source_snapshot_id
     }
 
     /// Return the complete planner key used to order test-support inputs.
@@ -365,6 +391,12 @@ pub struct IcebergRewriteGroup {
 }
 
 impl IcebergRewriteGroup {
+    /// Borrows the exact ordered files selected from one stable snapshot.
+    #[must_use]
+    pub(crate) fn files(&self) -> &[IcebergCandidateFile] {
+        &self.files
+    }
+
     /// Return the ordered candidate inputs for catalog integration assertions.
     #[cfg(feature = "test-support")]
     #[must_use]
@@ -411,6 +443,17 @@ pub struct IcebergTablePlan {
 }
 
 impl IcebergTablePlan {
+    /// Returns the stable snapshot identity shared by every group.
+    #[must_use]
+    pub(crate) const fn base_snapshot_id(&self) -> i64 {
+        self.base_snapshot_id
+    }
+
+    /// Borrows the deterministic groups selected from the snapshot.
+    #[must_use]
+    pub(crate) fn groups(&self) -> &[IcebergRewriteGroup] {
+        &self.groups
+    }
     /// Return the table snapshot explicitly captured before live-file discovery.
     #[cfg(feature = "test-support")]
     #[must_use]

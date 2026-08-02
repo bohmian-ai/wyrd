@@ -4,6 +4,10 @@
 //! is carried into tenant transactions so an expired or superseded owner cannot
 //! commit a durable state transition after another Forge process takes over.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
@@ -27,8 +31,13 @@ pub struct ForgeLease {
     pub owner: Uuid,
     /// Monotonic token asserted by every durable transition.
     pub fencing_token: i64,
+    /// Whether this acquisition replaced an expired different owner.
+    takeover: bool,
     ttl: Duration,
-    confirmed_at: Instant,
+    /// Shared monotonic origin used by every clone of this lease generation.
+    clock_started: Instant,
+    /// Shared nanosecond offset of the most recent successful renewal.
+    confirmed_at_nanos: Arc<AtomicU64>,
 }
 
 impl ForgeLease {
@@ -47,7 +56,7 @@ impl ForgeLease {
         let seconds = i64::try_from(ttl.as_secs()).map_err(|_| ForgeError::InvalidConfig {
             detail: "lease TTL is too large".to_owned(),
         })?;
-        let fencing_token = vala_sql::queries::maintenance_leases::try_acquire_lease(
+        let acquisition = vala_sql::queries::maintenance_leases::try_acquire_lease(
             operator_pool,
             &lease_key,
             owner,
@@ -55,13 +64,24 @@ impl ForgeLease {
         )
         .await
         .map_err(ForgeError::Lease)?;
-        Ok(fencing_token.map(|fencing_token| Self {
-            lease_key,
-            owner,
-            fencing_token,
-            ttl,
-            confirmed_at: Instant::now(),
+        Ok(acquisition.map(|acquisition| {
+            let clock_started = Instant::now();
+            Self {
+                lease_key,
+                owner,
+                fencing_token: acquisition.fencing_token,
+                takeover: acquisition.takeover,
+                ttl,
+                clock_started,
+                confirmed_at_nanos: Arc::new(AtomicU64::new(0)),
+            }
         }))
+    }
+
+    /// Reports whether acquisition replaced an expired row owned by another owner.
+    #[must_use]
+    pub const fn takeover(&self) -> bool {
+        self.takeover
     }
 
     /// Renew this lease and refresh its local confirmation time.
@@ -81,7 +101,8 @@ impl ForgeLease {
         .await
         .map_err(ForgeError::Lease)?;
         if renewed {
-            self.confirmed_at = Instant::now();
+            self.confirmed_at_nanos
+                .store(self.elapsed_nanos(), Ordering::Release);
         }
         Ok(renewed)
     }
@@ -100,7 +121,10 @@ impl ForgeLease {
 
     /// Return the locally estimated time remaining before the lease expires.
     pub fn remaining(&self) -> Duration {
-        self.ttl.saturating_sub(self.confirmed_at.elapsed())
+        let confirmed_at = self.confirmed_at_nanos.load(Ordering::Acquire);
+        self.ttl.saturating_sub(Duration::from_nanos(
+            self.elapsed_nanos().saturating_sub(confirmed_at),
+        ))
     }
 
     /// Check whether the remaining lease covers a required commit window.
@@ -145,6 +169,11 @@ impl ForgeLease {
             }),
             Err(error) => Err(ForgeError::Sql(error)),
         }
+    }
+
+    /// Returns the saturated monotonic nanosecond offset for shared renewal state.
+    fn elapsed_nanos(&self) -> u64 {
+        u64::try_from(self.clock_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 }
 

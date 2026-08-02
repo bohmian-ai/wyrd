@@ -14,7 +14,8 @@ use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
@@ -302,13 +303,13 @@ pub async fn build_app_state_from_boot_with_config(
     scribe_config: crate::config::ScribeRuntimeConfig,
 ) -> Result<AppState, ServerBootError> {
     let bifrost_config = crate::config::BifrostRuntimeConfig {
-        roles: [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Forge]
-            .into_iter()
-            .collect(),
         scribe: scribe_config,
         ..crate::config::BifrostRuntimeConfig::default()
     };
-    Ok(build_bifrost_parts_from_boot(boot, &bifrost_config)
+    let roles = [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Forge]
+        .into_iter()
+        .collect();
+    Ok(build_bifrost_parts_from_boot(boot, &bifrost_config, &roles)
         .await?
         .state)
 }
@@ -322,8 +323,9 @@ pub async fn build_app_state_from_boot_with_config(
 async fn build_bifrost_parts_from_boot(
     boot: &PostgresBoot,
     bifrost_config: &crate::config::BifrostRuntimeConfig,
+    roles: &std::collections::BTreeSet<BifrostRuntimeRole>,
 ) -> Result<BifrostBootParts, ServerBootError> {
-    if bifrost_config.roles.contains(&BifrostRuntimeRole::Scribe) {
+    if roles.contains(&BifrostRuntimeRole::Scribe) {
         bifrost_config
             .scribe
             .validate()
@@ -392,7 +394,7 @@ async fn build_bifrost_parts_from_boot(
     let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
-    let scribe = if bifrost_config.roles.contains(&BifrostRuntimeRole::Scribe) {
+    let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_role = cluster_registry
             .reserve_scribe(
                 &advertise_addr,
@@ -510,7 +512,7 @@ async fn build_bifrost_parts_from_boot(
         None
     };
 
-    let forge = if bifrost_config.roles.contains(&BifrostRuntimeRole::Forge) {
+    let forge = if roles.contains(&BifrostRuntimeRole::Forge) {
         let forge_config = ForgeConfig::default();
         let rewrite_runtime = ForgeRewriteRuntime::new(
             bifrost_datafusion_memory_pool.clone(),
@@ -530,6 +532,10 @@ async fn build_bifrost_parts_from_boot(
             hints: staging_file_inbox,
             config: forge_config,
             maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            clock: ForgeClock::system(),
+            completion_observer: None,
+            scheduler_trigger: None,
+            telemetry: Arc::new(ForgeTelemetry::new()),
         })?))
     } else {
         None
@@ -547,6 +553,33 @@ async fn build_bifrost_parts_from_boot(
         cluster_registry,
         node_id: ClusterNodeId::new(node_id.as_uuid()),
     })
+}
+
+/// Build the bounded Forge worker future shared by embedded and worker roles.
+///
+/// # Errors
+/// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge is absent or
+/// [`ServerBootError::Forge`] when the requested worker bound is invalid.
+pub fn spawn_forge_worker(
+    state: &AppState,
+    shutdown: CancellationToken,
+    worker_concurrency: usize,
+) -> Result<
+    impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
+    + Send
+    + 'static,
+    ServerBootError,
+> {
+    let forge =
+        state
+            .forge_handle()
+            .cloned()
+            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+                detail: "AppState has no shared Forge for worker execution".to_owned(),
+            })?;
+    let worker = ForgeWorker::new(forge, ForgeWorkerConfig { worker_concurrency })
+        .map_err(ServerBootError::Forge)?;
+    Ok(async move { worker.run(shutdown).await })
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -587,7 +620,8 @@ pub async fn build_state(
     let shutdown = CancellationToken::new();
 
     let boot = PostgresBoot::from_env().await?;
-    let bifrost_parts = build_bifrost_parts_from_boot(&boot, &config.bifrost).await?;
+    let roles = config.bifrost_roles();
+    let bifrost_parts = build_bifrost_parts_from_boot(&boot, &config.bifrost, &roles).await?;
     let state = bifrost_parts.state;
     let sealing_key = build_sealing_key(config)?;
     let signing_key = resolve_signing_key(config)?;
@@ -616,7 +650,7 @@ pub async fn build_state(
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))?;
     let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
-    let state = if config.bifrost.roles.contains(&BifrostRuntimeRole::Scribe) {
+    let state = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_parts = bifrost_parts.scribe.ok_or_else(|| {
             ServerBootError::Scribe("selected Scribe role was not constructed".to_owned())
         })?;
@@ -728,7 +762,7 @@ fn attach_config_fields(
 ) -> Result<AppState, ServerBootError> {
     Ok(state
         .with_deployment_profile(config.deployment_profile)
-        .with_bifrost_roles(config.bifrost.roles.clone())
+        .with_bifrost_roles(config.bifrost_roles())
         .with_shutdown_token(shutdown)
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state()))
@@ -815,8 +849,7 @@ impl<'a> OracleRoleBuilder<'a> {
     async fn build(self) -> Result<AppState, ServerBootError> {
         if !self
             .config
-            .bifrost
-            .roles
+            .bifrost_roles()
             .contains(&BifrostRuntimeRole::Oracle)
         {
             return Ok(self.state);
@@ -1630,7 +1663,7 @@ pub(crate) mod pg_tests {
     }
 
     /// Compose one real Forge from the retained test fixture resources.
-    async fn composed_test_state() -> (
+    pub(crate) async fn composed_test_state() -> (
         AppState,
         vala_bifrost_redux::maintenance::StagingFilePublisher,
     ) {
@@ -1664,6 +1697,10 @@ pub(crate) mod pg_tests {
                 hints: inbox,
                 config,
                 maintenance_interval: Duration::from_millis(10),
+                clock: ForgeClock::system(),
+                completion_observer: None,
+                scheduler_trigger: None,
+                telemetry: Arc::new(ForgeTelemetry::new()),
             })
             .expect("Forge"),
         );

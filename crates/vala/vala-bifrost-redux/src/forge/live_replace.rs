@@ -11,13 +11,17 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
 use wyrd_spec::vala::api::{AuditDetail, ForgeIcebergRewritePhase, StoragePath};
 
 use super::Forge;
 use super::binpack::ForgeGroupKey;
+use super::compact::forge_transition_event;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
+use super::metrics::{ForgeCatalogCommitStrategy, ForgeTelemetry};
+use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::IcebergRewriteGroup;
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
@@ -25,6 +29,10 @@ use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 #[cfg(feature = "test-support")]
 /// Injects one pre-`Prepared` audit failure for the real catalog integration seam.
 static FAIL_NEXT_PREPARED_LIVE_AUDIT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "test-support")]
+/// Injects one terminal live-rewrite audit failure before its transaction becomes durable.
+static FAIL_NEXT_TERMINAL_LIVE_AUDIT: AtomicBool = AtomicBool::new(false);
 
 /// Result of attempting one plan-fenced live Iceberg replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +51,8 @@ pub enum IcebergRewriteDisposition {
         input_files: usize,
         /// Exact output file count.
         output_files: usize,
+        /// Exact byte total across committed output files.
+        output_bytes: u64,
         /// Rows read from the exact input set.
         input_rows: u64,
         /// Rows written into the exact output set.
@@ -50,6 +60,54 @@ pub enum IcebergRewriteDisposition {
         /// Peak bounded sort spill observed during the rewrite.
         spill_bytes: u64,
     },
+}
+
+/// Exact task-dispatch result retaining the table returned by the commit.
+pub(crate) struct TaskLiveRewriteResult {
+    /// Existing operation outcome consumed by metrics and compatibility tests.
+    pub(crate) disposition: IcebergRewriteDisposition,
+    /// Exact committed table used to derive task evidence without reloading.
+    pub(crate) committed_table: Option<Table>,
+}
+
+/// Exact claimed live-rewrite payload with its publication authority.
+pub(crate) struct TaskLiveRewriteRequest<'a> {
+    /// Mutable table publication fence.
+    pub(crate) lease: &'a mut ForgeLease,
+    /// Server-resolved physical table binding.
+    pub(crate) binding: &'a TenantTableBinding,
+    /// Table loaded and preflighted by the worker.
+    pub(crate) table: &'a Table,
+    /// Exact snapshot observed by durable planning.
+    pub(crate) base_snapshot_id: i64,
+    /// Exact current-snapshot input group.
+    pub(crate) group: &'a IcebergRewriteGroup,
+    /// Stable durable task identity.
+    pub(crate) task_id: Uuid,
+    /// Attempt generation that owns every output path.
+    pub(crate) attempt_id: Uuid,
+    /// Cancellation source shared with claim heartbeats.
+    pub(crate) stop: &'a CancellationToken,
+}
+
+/// Shared live-rewrite workflow inputs for compatibility and task callers.
+struct LiveRewriteRequest<'a> {
+    /// Mutable table publication fence.
+    lease: &'a mut ForgeLease,
+    /// Server-resolved physical table binding.
+    binding: &'a TenantTableBinding,
+    /// Table loaded by the caller for the first snapshot check.
+    table: &'a Table,
+    /// Exact snapshot observed by planning.
+    base_snapshot_id: i64,
+    /// Exact current-snapshot input group.
+    group: &'a IcebergRewriteGroup,
+    /// Attempt-owned output generation.
+    attempt_generation: ForgeAttemptGeneration,
+    /// Optional durable task and attempt snapshot identity.
+    task_identity: Option<(Uuid, Uuid)>,
+    /// Cancellation source checked around external effects.
+    stop: &'a CancellationToken,
 }
 
 /// Prepared in-memory state for one live replacement after output writes finish.
@@ -112,20 +170,69 @@ impl Forge {
         group: &IcebergRewriteGroup,
         stop: &CancellationToken,
     ) -> Result<IcebergRewriteDisposition, ForgeError> {
-        let Some(operation) = self
-            .prepare_live_rewrite(lease, binding, table, base_snapshot_id, group, stop)
+        Ok(self
+            .replace_live_group_inner(LiveRewriteRequest {
+                lease,
+                binding,
+                table,
+                base_snapshot_id,
+                group,
+                attempt_generation: ForgeAttemptGeneration::now_v7(),
+                task_identity: None,
+                stop,
+            })
             .await?
-        else {
-            return Ok(if group.files.len() < 2 {
-                IcebergRewriteDisposition::NoWork
-            } else {
-                IcebergRewriteDisposition::SnapshotChanged
+            .disposition)
+    }
+
+    /// Executes a claimed exact group using its attempt generation and retains
+    /// the exact table returned by the Iceberg commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, rewrite, fencing, catalog, and audit errors
+    /// as [`Self::replace_live_group`].
+    pub(crate) async fn replace_live_group_for_task(
+        &self,
+        request: TaskLiveRewriteRequest<'_>,
+    ) -> Result<TaskLiveRewriteResult, ForgeError> {
+        self.replace_live_group_inner(LiveRewriteRequest {
+            lease: request.lease,
+            binding: request.binding,
+            table: request.table,
+            base_snapshot_id: request.base_snapshot_id,
+            group: request.group,
+            attempt_generation: ForgeAttemptGeneration::from_attempt(request.attempt_id),
+            task_identity: Some((request.task_id, request.attempt_id)),
+            stop: request.stop,
+        })
+        .await
+    }
+
+    /// Shared exact replacement workflow for legacy and durable-task callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, rewrite, fencing, catalog, and audit errors at the
+    /// durable boundary where execution stopped.
+    async fn replace_live_group_inner(
+        &self,
+        mut request: LiveRewriteRequest<'_>,
+    ) -> Result<TaskLiveRewriteResult, ForgeError> {
+        let Some(operation) = self.prepare_live_rewrite(&mut request).await? else {
+            return Ok(TaskLiveRewriteResult {
+                disposition: if request.group.files.is_empty() {
+                    IcebergRewriteDisposition::NoWork
+                } else {
+                    IcebergRewriteDisposition::SnapshotChanged
+                },
+                committed_table: None,
             });
         };
         let prepared = match operation.detail(ForgeIcebergRewritePhase::Prepared, None) {
             Ok(detail) => {
                 self.append_live_audit(
-                    lease,
+                    request.lease,
                     &operation.key,
                     "forge.iceberg_rewrite.prepared",
                     detail,
@@ -139,16 +246,23 @@ impl Forge {
                 .rewrite
                 .cleanup_unprepared_outputs(
                     &operation.rewrite.object_paths,
-                    binding,
-                    stop,
-                    lease,
+                    request.binding,
+                    request.stop,
+                    request.lease,
                     &self.core.operator_pool,
                 )
                 .await;
             return Err(error);
         }
-        self.commit_live_rewrite(lease, binding, base_snapshot_id, operation, stop)
-            .await
+        self.commit_live_rewrite(
+            request.lease,
+            request.binding,
+            request.base_snapshot_id,
+            operation,
+            request.task_identity,
+            request.stop,
+        )
+        .await
     }
 
     /// Validate and rewrite exact live inputs without publishing an Iceberg transition.
@@ -158,17 +272,22 @@ impl Forge {
     /// Returns [`ForgeError`] when the group is malformed or bounded rewrite IO fails.
     async fn prepare_live_rewrite(
         &self,
-        lease: &mut ForgeLease,
-        binding: &TenantTableBinding,
-        table: &Table,
-        base_snapshot_id: i64,
-        group: &IcebergRewriteGroup,
-        stop: &CancellationToken,
+        request: &mut LiveRewriteRequest<'_>,
     ) -> Result<Option<LiveRewrite>, ForgeError> {
-        if group.files.len() < 2 || table.metadata().current_snapshot_id() != Some(base_snapshot_id)
+        let binding = request.binding;
+        let base_snapshot_id = request.base_snapshot_id;
+        let group = request.group;
+        let table = request.table;
+        if group.files.is_empty()
+            || table.metadata().current_snapshot_id() != Some(base_snapshot_id)
         {
             return Ok(None);
         }
+        let current = self.load_table(&binding.table_ident()).await?;
+        if current.metadata().current_snapshot_id() != Some(base_snapshot_id) {
+            return Ok(None);
+        }
+        let table = &current;
         let first = group.files.first().ok_or_else(|| ForgeError::Invariant {
             detail: "non-empty live rewrite group lost its first input".to_owned(),
         })?;
@@ -221,7 +340,7 @@ impl Forge {
             .rewrite
             .rewrite(
                 RewriteRequest {
-                    operation_id,
+                    attempt_generation: request.attempt_generation,
                     binding,
                     schema,
                     iceberg_schema: table.metadata().current_schema().clone(),
@@ -235,8 +354,8 @@ impl Forge {
                         })?,
                     target_file_size_bytes,
                 },
-                stop,
-                lease,
+                request.stop,
+                request.lease,
                 &self.core.operator_pool,
             )
             .await?;
@@ -262,8 +381,21 @@ impl Forge {
         binding: &TenantTableBinding,
         base_snapshot_id: i64,
         operation: LiveRewrite,
+        task_identity: Option<(Uuid, Uuid)>,
         stop: &CancellationToken,
-    ) -> Result<IcebergRewriteDisposition, ForgeError> {
+    ) -> Result<TaskLiveRewriteResult, ForgeError> {
+        let output_bytes = operation
+            .rewrite
+            .files
+            .iter()
+            .try_fold(0_u64, |total, file| {
+                total.checked_add(file.file_size_in_bytes()).ok_or_else(|| {
+                    ForgeError::InvalidConfig {
+                        detail: "live rewrite output bytes overflow the Forge tick outcome"
+                            .to_owned(),
+                    }
+                })
+            })?;
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
@@ -275,7 +407,10 @@ impl Forge {
         }
         let current = self.load_table(&binding.table_ident()).await?;
         if current.metadata().current_snapshot_id() != Some(base_snapshot_id) {
-            return Ok(IcebergRewriteDisposition::SnapshotChanged);
+            return Ok(TaskLiveRewriteResult {
+                disposition: IcebergRewriteDisposition::SnapshotChanged,
+                committed_table: None,
+            });
         }
         let mut properties = HashMap::new();
         properties.insert("forge.workflow".to_owned(), "iceberg-rewrite".to_owned());
@@ -284,6 +419,10 @@ impl Forge {
             operation.operation_id.to_string(),
         );
         properties.insert("forge.group".to_owned(), operation.key.audit_resource());
+        if let Some((task_id, attempt_id)) = task_identity {
+            properties.insert("forge.task_id".to_owned(), task_id.to_string());
+            properties.insert("forge.task_attempt".to_owned(), attempt_id.to_string());
+        }
         let tx = Transaction::new(&current);
         let action = tx
             .rewrite_files()
@@ -302,22 +441,9 @@ impl Forge {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        let commit = transaction.commit_once(self.core.catalog.as_ref());
-        tokio::pin!(commit);
-        let response = tokio::select! {
-            response = tokio::time::timeout(self.core.config.iceberg_total_retry_timeout, &mut commit) => response,
-            () = stop.cancelled() => return Err(ForgeError::Shutdown),
-        };
-        match response {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
-            Err(_) => {
-                return Err(ForgeError::Timeout {
-                    operation: "Iceberg live replacement commit",
-                });
-            }
-        }
-        let committed = self.load_table(&binding.table_ident()).await?;
+        let committed = self
+            .commit_catalog_transaction(transaction, task_identity, stop)
+            .await?;
         let snapshot_id = committed.metadata().current_snapshot_id().ok_or_else(|| {
             ForgeError::Reconciliation {
                 detail: "Iceberg live replacement committed without a current snapshot".to_owned(),
@@ -330,15 +456,68 @@ impl Forge {
             operation.detail(ForgeIcebergRewritePhase::Committed, Some(snapshot_id))?,
         )
         .await?;
-        Ok(IcebergRewriteDisposition::Committed {
-            operation_id: operation.operation_id,
-            snapshot_id,
-            input_files: operation.source_files.len(),
-            output_files: operation.rewrite.files.len(),
-            input_rows: operation.rewrite.input_rows,
-            output_rows: operation.rewrite.output_rows,
-            spill_bytes: operation.rewrite.spill_bytes,
+        Ok(TaskLiveRewriteResult {
+            disposition: IcebergRewriteDisposition::Committed {
+                operation_id: operation.operation_id,
+                snapshot_id,
+                input_files: operation.source_files.len(),
+                output_files: operation.rewrite.files.len(),
+                output_bytes,
+                input_rows: operation.rewrite.input_rows,
+                output_rows: operation.rewrite.output_rows,
+                spill_bytes: operation.rewrite.spill_bytes,
+            },
+            committed_table: Some(committed),
         })
+    }
+
+    /// Commit one prepared Iceberg transaction under the production trace boundary.
+    ///
+    /// Durable task callers attach only their scrubbed task and attempt UUIDs;
+    /// tenant, table, SQL, object-path, and error details never enter span fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns shutdown, catalog, or bounded commit-timeout failures. Cancellation
+    /// may leave an uncertain catalog result for normal reconciliation.
+    async fn commit_catalog_transaction(
+        &self,
+        transaction: Transaction,
+        task_identity: Option<(Uuid, Uuid)>,
+        stop: &CancellationToken,
+    ) -> Result<Table, ForgeError> {
+        let span = ForgeTelemetry::catalog_commit_span(
+            ForgeCatalogCommitStrategy::SmallFiles,
+            task_identity,
+        );
+        let commit = transaction.commit_once(self.core.catalog.as_ref());
+        tokio::pin!(commit);
+        let response = tokio::select! {
+            response = tracing::Instrument::instrument(
+                tokio::time::timeout(self.core.config.iceberg_total_retry_timeout, &mut commit),
+                span.clone(),
+            ) => response,
+            () = stop.cancelled() => {
+                span.record("result", "cancelled");
+                return Err(ForgeError::Shutdown);
+            },
+        };
+        match response {
+            Ok(Ok(table)) => {
+                span.record("result", "succeeded");
+                Ok(table)
+            }
+            Ok(Err(error)) => {
+                span.record("result", "failed");
+                Err(ForgeError::Catalog(error))
+            }
+            Err(_) => {
+                span.record("result", "timed_out");
+                Err(ForgeError::Timeout {
+                    operation: "Iceberg live replacement commit",
+                })
+            }
+        }
     }
 
     /// Execute one explicit-base live replacement through the test-support seam.
@@ -373,13 +552,23 @@ impl Forge {
         FAIL_NEXT_PREPARED_LIVE_AUDIT.store(true, Ordering::Release);
     }
 
-    /// Append one live-replacement audit transition in its own fenced tenant transaction.
+    /// Fail the next test-support terminal live-replacement audit append.
+    ///
+    /// This single-use integration seam rejects the transaction before either
+    /// the terminal audit or operation-state transition becomes durable.
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_terminal_live_audit_for_test(&self) {
+        FAIL_NEXT_TERMINAL_LIVE_AUDIT.store(true, Ordering::Release);
+    }
+
+    /// Append one live-replacement audit and projection transition atomically.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError`] when lease renewal, tenant transaction creation,
-    /// audit append, or transaction commit fails.
-    async fn append_live_audit(
+    /// operation-state transition, audit append, fence assertion, or transaction
+    /// commit fails. The caller-owned transaction rolls back both durable rows.
+    pub(super) async fn append_live_audit(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeGroupKey,
@@ -406,8 +595,28 @@ impl Forge {
                 detail: "injected Prepared audit append failure".to_owned(),
             });
         }
-        self.append_system_audit(&mut conn, key, operation, detail)
-            .await?;
+        #[cfg(feature = "test-support")]
+        if operation != "forge.iceberg_rewrite.prepared"
+            && FAIL_NEXT_TERMINAL_LIVE_AUDIT.swap(false, Ordering::AcqRel)
+        {
+            return Err(ForgeError::Invariant {
+                detail: "injected live terminal audit append failure".to_owned(),
+            });
+        }
+        let resource = key.audit_resource();
+        let event = forge_transition_event(operation, resource.clone(), detail);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
+            .map_err(ForgeError::Sql)?;
+        let transition = if operation == "forge.iceberg_rewrite.prepared" {
+            operations.append_prepared(&mut conn, &event).await
+        } else {
+            operations.append_terminal(&mut conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+        }
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }

@@ -5,20 +5,55 @@
 //! it, and `/metrics` renders the current snapshot on a dedicated listener.
 
 use std::future::ready;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 use axum::{Router, routing::get};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use wyrd_telemetry::{TelemetryConfig, TelemetryGuard};
+
+use crate::config::ForgeProcessRole;
 
 /// Histogram buckets (seconds) for request-duration metrics.
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Forge and Bifrost-query duration buckets shared by deployed processes and
+/// the read-only benchmark capture.
+const BIFROST_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    600.0, 1800.0,
+];
+
+/// Forge spill-size buckets shared by deployed processes and capture.
+const FORGE_SPILL_BUCKETS: &[f64] = &[
+    65_536.0,
+    1_048_576.0,
+    16_777_216.0,
+    67_108_864.0,
+    268_435_456.0,
+    1_073_741_824.0,
+    2_147_483_648.0,
+    4_294_967_296.0,
+    8_589_934_592.0,
+];
+
 /// Wyrd metric names. Keep these stable — dashboards depend on them.
 pub const HTTP_REQUESTS_TOTAL: &str = "wyrd_http_requests_total";
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "wyrd_http_request_duration_seconds";
+
+/// Production-facing query duration metric.
+pub const BIFROST_QUERY_DURATION_SECONDS: &str = "bifrost_query_duration_seconds";
+/// Production-facing Forge task duration metric.
+pub const BIFROST_FORGE_TASK_DURATION_SECONDS: &str = "bifrost_forge_task_duration_seconds";
+/// Production-facing Forge cleanup duration metric.
+pub const BIFROST_FORGE_CLEANUP_DURATION_SECONDS: &str = "bifrost_forge_cleanup_duration_seconds";
+/// Production-facing Forge spill metric.
+pub const BIFROST_FORGE_TASK_SPILL_BYTES: &str = "bifrost_forge_task_spill_bytes";
 
 /// Errors installing the Prometheus recorder.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +64,130 @@ pub enum MetricsError {
     /// A global recorder was already installed in this process.
     #[error("failed to install metrics recorder")]
     Install(#[source] metrics_exporter_prometheus::BuildError),
+}
+
+/// Error returned while composing Wyrd's process-wide telemetry runtime.
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryRuntimeError {
+    /// The production tracing provider could not be installed.
+    #[error("failed to install Wyrd tracing provider")]
+    Tracing(#[source] wyrd_spec::error::WyrdError),
+    /// The production Prometheus recorder could not be installed.
+    #[error("failed to install Wyrd Prometheus recorder")]
+    Metrics(#[source] MetricsError),
+}
+
+/// Server-owned composition of canonical tracing and Prometheus backends.
+///
+/// The runtime is installed once before server or standalone Forge role
+/// composition. `AppState` retains only [`TelemetryGuard`]; the enclosing
+/// lifecycle retains this owner and its read-only render handle.
+pub struct WyrdTelemetryRuntime {
+    /// Guard that owns the process tracing provider lifetime.
+    guard: Arc<TelemetryGuard>,
+    /// Handle for the one process-global production Prometheus recorder.
+    prometheus: PrometheusHandle,
+}
+
+impl WyrdTelemetryRuntime {
+    /// Install the production tracing subscriber and Prometheus recorder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryRuntimeError`] when either process-global backend
+    /// cannot be installed. Callers must retain the returned runtime until
+    /// every role has stopped.
+    pub fn install(config: TelemetryConfig) -> Result<Self, TelemetryRuntimeError> {
+        let guard = Arc::new(wyrd_telemetry::init(config).map_err(TelemetryRuntimeError::Tracing)?);
+        let prometheus = install_recorder().map_err(TelemetryRuntimeError::Metrics)?;
+        Ok(Self { guard, prometheus })
+    }
+
+    /// Return the tracing-provider lifetime guard passed into application state.
+    #[must_use]
+    pub fn guard(&self) -> Arc<TelemetryGuard> {
+        Arc::clone(&self.guard)
+    }
+
+    /// Return the production Prometheus render handle retained by lifecycle owners.
+    #[must_use]
+    pub fn prometheus(&self) -> PrometheusHandle {
+        self.prometheus.clone()
+    }
+}
+
+/// Install the same production runtime with a test-only read-only span capture.
+///
+/// # Errors
+///
+/// Returns [`TelemetryRuntimeError`] when either process-global backend cannot
+/// be installed.
+#[cfg(feature = "test-support")]
+pub fn install_capture_runtime(
+    config: TelemetryConfig,
+) -> Result<(WyrdTelemetryRuntime, wyrd_telemetry::TestTraceCapture), TelemetryRuntimeError> {
+    let (guard, traces) =
+        wyrd_telemetry::init_capture(config).map_err(TelemetryRuntimeError::Tracing)?;
+    let prometheus = install_recorder().map_err(TelemetryRuntimeError::Metrics)?;
+    Ok((
+        WyrdTelemetryRuntime {
+            guard: Arc::new(guard),
+            prometheus,
+        },
+        traces,
+    ))
+}
+
+/// Lifecycle guard for one successfully composed Forge process role.
+///
+/// The active gauge describes live role concurrency, while the companion
+/// counter retains replacement history without inflating that gauge.
+pub(crate) struct ForgeRoleTelemetryGuard {
+    /// Active-role gauge decremented only when this owner drops after drain.
+    active: metrics::Gauge,
+}
+
+/// Opaque test-support owner for one production role-lifecycle observation.
+#[cfg(feature = "test-support")]
+pub struct TestForgeRoleTelemetryGuard {
+    /// Production lifecycle guard retained until the test role drains.
+    _inner: ForgeRoleTelemetryGuard,
+}
+
+impl ForgeRoleTelemetryGuard {
+    /// Record that one configured Forge role completed process composition.
+    #[must_use]
+    pub(crate) fn started(role: ForgeProcessRole) -> Self {
+        let role = match role {
+            ForgeProcessRole::All => "all",
+            ForgeProcessRole::Server => "server",
+            ForgeProcessRole::ForgeWorker => "forge_worker",
+        };
+        let active = metrics::gauge!("bifrost_forge_role_processes", "role" => role);
+        active.increment(1.0);
+        metrics::counter!("bifrost_forge_role_process_started_total", "role" => role).increment(1);
+        Self { active }
+    }
+}
+
+/// Start one test/benchmark role against the production lifecycle instruments.
+///
+/// The returned guard must be retained until the represented scheduler or
+/// worker role has drained. Dropping it records the same active-role shutdown
+/// transition used by [`crate::app::BoundServer`].
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn start_capture_forge_role(role: ForgeProcessRole) -> TestForgeRoleTelemetryGuard {
+    TestForgeRoleTelemetryGuard {
+        _inner: ForgeRoleTelemetryGuard::started(role),
+    }
+}
+
+impl Drop for ForgeRoleTelemetryGuard {
+    /// Remove this process from active topology after its role has drained.
+    fn drop(&mut self) {
+        self.active.decrement(1.0);
+    }
 }
 
 /// Install the process-global Prometheus recorder and return its render handle.
@@ -45,8 +204,42 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
             REQUEST_DURATION_BUCKETS,
         )
         .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(BIFROST_QUERY_DURATION_SECONDS.to_owned()),
+            BIFROST_DURATION_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(BIFROST_FORGE_TASK_DURATION_SECONDS.to_owned()),
+            BIFROST_DURATION_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(BIFROST_FORGE_CLEANUP_DURATION_SECONDS.to_owned()),
+            BIFROST_DURATION_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(BIFROST_FORGE_TASK_SPILL_BYTES.to_owned()),
+            FORGE_SPILL_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
         .install_recorder()
         .map_err(MetricsError::Install)
+}
+
+/// Shared test-only Prometheus handle that installs the process recorder once.
+///
+/// Production composition receives its handle from [`WyrdTelemetryRuntime`].
+/// Tests that exercise a real listener use this helper so they retain the same
+/// one-recorder invariant without attempting a second global installation.
+#[cfg(test)]
+pub(crate) fn test_prometheus_handle() -> PrometheusHandle {
+    /// Holds the one test-process recorder used by listener and middleware tests.
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| install_recorder().expect("test recorder installs exactly once"))
+        .clone()
 }
 
 /// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.
@@ -101,8 +294,6 @@ mod tests {
     // recorder exactly once via `OnceLock`.
 
     use super::*;
-    use std::sync::OnceLock;
-
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -113,11 +304,10 @@ mod tests {
 
     use crate::http::middleware::metrics::track_metrics;
 
-    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-
     fn get_handle() -> &'static PrometheusHandle {
-        HANDLE
-            .get_or_init(|| install_recorder().expect("recorder installs exactly once per process"))
+        /// Holds the recorder shared by the metrics module's rendering tests.
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE.get_or_init(test_prometheus_handle)
     }
 
     #[test]

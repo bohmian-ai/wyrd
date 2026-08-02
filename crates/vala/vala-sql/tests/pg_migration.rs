@@ -75,7 +75,7 @@ mod pg_tests {
         .await
         .expect("pre-11 Scribe row inserts");
         sqlx::raw_sql(include_str!(
-            "../migrations/20260910000011_oracle_coordination.sql"
+            "../migrations/20260910000013_oracle_coordination.sql"
         ))
         .execute(&pool)
         .await

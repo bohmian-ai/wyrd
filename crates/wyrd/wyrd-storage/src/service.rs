@@ -1297,7 +1297,8 @@ pub fn map_sql_error(error: &wyrd_sql::SqlError) -> WyrdError {
         wyrd_sql::SqlError::UniqueViolation { .. }
         | wyrd_sql::SqlError::FkViolation { .. }
         | wyrd_sql::SqlError::CheckViolation { .. }
-        | wyrd_sql::SqlError::Conflict { .. } => conflict_error(&message, details),
+        | wyrd_sql::SqlError::Conflict { .. }
+        | wyrd_sql::SqlError::ForgeDemandGenerationChanged => conflict_error(&message, details),
         wyrd_sql::SqlError::RlsDenied { .. } => {
             WyrdError::PermissionDeniedRbac { message, details }
         }

@@ -9,12 +9,18 @@ mod peer_authority;
 mod peer_credentials;
 mod peer_service;
 mod query_audit;
+mod tail_audit;
+mod tail_authority;
+mod tail_discovery;
 
 pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerOraclePeerCredentials;
 pub use peer_service::OraclePeerGrpc;
 pub use query_audit::ServerOracleAudit;
+pub use tail_audit::PostgresTailSecurityAudit;
+pub use tail_authority::ScribeTailAuthority;
+pub use tail_discovery::RegistryTailStreamDiscovery;
 
 /// Readiness-qualified private peer runtime retained by [`crate::AppState`].
 pub struct OraclePeerRuntime {

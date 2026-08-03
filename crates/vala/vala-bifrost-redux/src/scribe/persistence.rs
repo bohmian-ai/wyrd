@@ -25,6 +25,7 @@ use crate::scribe::execution_lanes::{
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
 use crate::scribe::memory::{MemoryCategory, ScribeMemoryBudget};
 use crate::scribe::memtable::FrozenMemtable;
+use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
@@ -742,6 +743,14 @@ impl PersistenceWorker {
             }
         };
         let path = object_path(binding, &generation.seal_key, &self.node_id)?;
+        let file_size = encoded.bytes.len();
+        let row_encoded = ParquetEncoded {
+            bytes: Vec::new(),
+            row_group_stats: encoded.row_group_stats.clone(),
+            partition_day: encoded.partition_day.clone(),
+            audit_events: Vec::new(),
+            append_metas: encoded.append_metas.clone(),
+        };
         #[cfg(any(test, feature = "test-support"))]
         let _object_write_guard = self.faults.begin_object_write().await;
         #[cfg(any(test, feature = "test-support"))]
@@ -755,11 +764,12 @@ impl PersistenceWorker {
             .await?;
         let row = file_list_writer::build_insert(
             &frozen,
-            &encoded,
+            &row_encoded,
             binding,
             &self.node_id,
             self.writer_epoch,
             &path,
+            Some(file_size),
         )?;
         let mut conn = self
             .postgres

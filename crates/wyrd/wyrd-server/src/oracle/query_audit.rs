@@ -330,6 +330,8 @@ mod tests {
                     key_id: "test".to_owned(),
                 },
             ),
+            tail_ticket_minter: None,
+            tail_discovery: None,
             peer_transports: None,
             config: OracleConfig {
                 tenant_interactive_slots: 16,

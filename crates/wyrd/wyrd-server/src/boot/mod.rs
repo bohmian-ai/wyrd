@@ -752,6 +752,11 @@ pub async fn build_state(
         let scribe_parts = bifrost_parts.scribe.ok_or_else(|| {
             ServerBootError::Scribe("selected Scribe role was not constructed".to_owned())
         })?;
+        let tail_audit = Arc::new(
+            crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
+                .await
+                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        );
         let ingest = Arc::new(
             BifrostIngestRuntime::new(
                 scribe_parts.scribe,
@@ -764,6 +769,10 @@ pub async fn build_state(
                         .expect("Scribe coordination runtime remains during state composition"),
                 ),
             )
+            .with_tail_authority(Arc::new(
+                crate::oracle::ScribeTailAuthority::from_pem(&signing_key, tail_audit)
+                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+            ))
             .with_scribe_role(
                 Arc::clone(&bifrost_parts.cluster_registry),
                 scribe_parts.scribe_role,
@@ -1101,7 +1110,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 "Oracle peer credential lacks platform service authority".to_owned(),
             ));
         }
-        let remote_transport = if let (Some(ca_path), Some(server_name)) = (
+        let tail_tls = if let (Some(ca_path), Some(server_name)) = (
             &config.bifrost.oracle.peer_ca_certificate_path,
             &config.bifrost.oracle.peer_server_name,
         ) {
@@ -1111,15 +1120,20 @@ impl<'a> OracleRoleBuilder<'a> {
                     ca_path.display()
                 ))
             })?;
+            Some(OraclePeerTls::new(ca_certificate_pem, server_name.clone()))
+        } else {
+            None
+        };
+        let remote_transport = if let Some(tls) = tail_tls.clone() {
             Arc::new(TonicOraclePeerTransport::with_credentials_and_tls(
                 Arc::clone(&cluster),
-                peer_credentials,
-                OraclePeerTls::new(ca_certificate_pem, server_name.clone()),
+                Arc::clone(&peer_credentials),
+                tls,
             ))
         } else {
             Arc::new(TonicOraclePeerTransport::with_credentials(
                 Arc::clone(&cluster),
-                peer_credentials,
+                Arc::clone(&peer_credentials),
             ))
         };
         let reconciliation_limit_bytes = memory_budget
@@ -1129,6 +1143,24 @@ impl<'a> OracleRoleBuilder<'a> {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
         let audit = Arc::new(ServerOracleAudit::new(state.postgres.vala().clone()));
+        let tail_audit = Arc::new(
+            crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
+                .await
+                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+        );
+        let tail_authority = Arc::new(
+            crate::oracle::ScribeTailAuthority::from_pem(signing_key, tail_audit)
+                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+        );
+        let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
+            Arc::clone(&cluster),
+            Arc::clone(&peer_credentials),
+            tail_tls,
+            Arc::clone(&tail_authority)
+                as Arc<dyn vala_bifrost_redux::scribe::tail_rpc::TailTicketMinter>,
+            node_id,
+            None,
+        ));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();
         let peer_ticket_minter: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketMinter> =
@@ -1172,6 +1204,8 @@ impl<'a> OracleRoleBuilder<'a> {
             tails: Arc::new(TailTransportDirectory::default()),
             audit,
             peer_ticket_minter,
+            tail_ticket_minter: Some(tail_authority),
+            tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
             config: OracleConfig {
                 planning_permits: config.bifrost.oracle.planning_permits,

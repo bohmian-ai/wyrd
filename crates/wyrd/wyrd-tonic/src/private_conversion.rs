@@ -140,6 +140,7 @@ impl TryFrom<proto::AcquireTailFenceRequest> for domain::AcquireTailFenceRequest
         })?;
         protocol_v1(version, "tail_protocol_version")?;
         Ok(Self {
+            query_id: uuid_bytes(&value.query_id, "query_id")?,
             binding: value
                 .binding
                 .ok_or(PrivateConversionError::Missing("binding"))?
@@ -165,12 +166,14 @@ impl From<domain::AcquireTailFenceRequest> for proto::AcquireTailFenceRequest {
     /// Encodes a validated tail-fence acquisition request.
     fn from(value: domain::AcquireTailFenceRequest) -> Self {
         Self {
+            query_id: value.query_id.as_bytes().to_vec(),
             binding: Some(value.binding.into()),
             event_day: value.event_day.as_str().to_owned(),
             exclusive_sealed: Some(value.exclusive_sealed.into()),
             deadline_unix_ms: unix_millis(value.deadline),
             schema_fingerprint: value.schema_fingerprint.as_str().to_owned(),
             tail_protocol_version: u32::from(value.tail_protocol_version),
+            tail_ticket: Vec::new(),
         }
     }
 }
@@ -245,6 +248,7 @@ impl From<domain::TailReadFence> for proto::TailReadFence {
             schema_fingerprint: value.schema_fingerprint.as_str().to_owned(),
             tail_protocol_version: u32::from(value.tail_protocol_version),
             expires_at_unix_ms: unix_millis(value.expires_at),
+            capability: Vec::new(),
         }
     }
 }
@@ -261,6 +265,7 @@ impl TryFrom<proto::TailPageRequest> for domain::TailPageRequest {
         positive(value.max_rows, "max_rows")?;
         positive(value.max_encoded_bytes, "max_encoded_bytes")?;
         Ok(Self {
+            query_id: uuid_bytes(&value.query_id, "query_id")?,
             fence_id: domain::TailFenceId::new(uuid_bytes(&value.fence_id, "fence_id")?),
             after: value
                 .after_cursor
@@ -278,6 +283,7 @@ impl From<domain::TailPageRequest> for proto::TailPageRequest {
     /// Encodes one validated bounded tail-page request.
     fn from(value: domain::TailPageRequest) -> Self {
         Self {
+            query_id: value.query_id.as_bytes().to_vec(),
             fence_id: value.fence_id.as_uuid().as_bytes().to_vec(),
             after_cursor: value
                 .after
@@ -285,6 +291,7 @@ impl From<domain::TailPageRequest> for proto::TailPageRequest {
                 .map(proto::tail_page_request::AfterCursor::After),
             max_rows: value.max_rows,
             max_encoded_bytes: value.max_encoded_bytes,
+            tail_capability: Vec::new(),
         }
     }
 }
@@ -334,6 +341,7 @@ impl TryFrom<proto::ReleaseTailFenceRequest> for domain::ReleaseTailFenceRequest
     /// Returns [`PrivateConversionError`] when the fence identifier is not a UUID.
     fn try_from(value: proto::ReleaseTailFenceRequest) -> Result<Self, Self::Error> {
         Ok(Self {
+            query_id: uuid_bytes(&value.query_id, "query_id")?,
             fence_id: domain::TailFenceId::new(uuid_bytes(&value.fence_id, "fence_id")?),
         })
     }
@@ -343,7 +351,9 @@ impl From<domain::ReleaseTailFenceRequest> for proto::ReleaseTailFenceRequest {
     /// Encodes the exact fence identity to release.
     fn from(value: domain::ReleaseTailFenceRequest) -> Self {
         Self {
+            query_id: value.query_id.as_bytes().to_vec(),
             fence_id: value.fence_id.as_uuid().as_bytes().to_vec(),
+            tail_capability: Vec::new(),
         }
     }
 }
@@ -862,6 +872,7 @@ mod tests {
             row_ordinal: 12,
         };
         let acquire = domain::AcquireTailFenceRequest {
+            query_id: uuid::Uuid::now_v7(),
             binding: binding.clone(),
             event_day: domain::EventDay::new("2026-07-30").expect("valid event day"),
             exclusive_sealed: cursor.clone(),
@@ -903,6 +914,7 @@ mod tests {
         );
 
         let page_request = domain::TailPageRequest {
+            query_id: uuid::Uuid::nil(),
             fence_id: fence.fence_id,
             after: Some(cursor.clone()),
             max_rows: 10,
@@ -924,6 +936,7 @@ mod tests {
             page
         );
         let release = domain::ReleaseTailFenceRequest {
+            query_id: uuid::Uuid::nil(),
             fence_id: fence.fence_id,
         };
         assert_eq!(

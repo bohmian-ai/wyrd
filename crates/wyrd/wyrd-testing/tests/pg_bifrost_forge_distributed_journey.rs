@@ -31,6 +31,8 @@ use wyrd_testing::bifrost::{
 };
 use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_tonic::frame_codec::FrameDecoder;
+use wyrd_tonic::wyrd::v1 as proto;
 
 /// One deployment and writer-concurrency shape exercised by the journey.
 #[derive(Clone, Copy)]
@@ -835,6 +837,23 @@ async fn dedicated_forge_workers_journey() {
         .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
         .await
         .expect("retire committed Scribe generations");
+    let oracle = scheduler_server
+        .state()
+        .bifrost_query()
+        .expect("server-role Oracle runtime");
+    let readiness = oracle.oracle().readiness_snapshot();
+    assert!(
+        readiness.startup_reconciled,
+        "dedicated worker Oracle startup reconciliation was lost before query: {readiness:?}"
+    );
+    assert!(
+        readiness.live_oracles > 0,
+        "dedicated worker Oracle membership disappeared before query: {readiness:?}"
+    );
+    assert!(
+        readiness.running_capacity > 0,
+        "dedicated worker Oracle has no local query capacity before query: {readiness:?}"
+    );
     let expected_rows =
         u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded dedicated journey row count");
     for tenant in &tenants {
@@ -1985,6 +2004,10 @@ async fn run_scenario(scenario: Scenario) {
             scenario.name,
             response.status()
         );
+        response
+            .bytes()
+            .await
+            .unwrap_or_else(|error| panic!("{} query response body: {error}", scenario.name));
     }
     wait_for_compaction(control, &tenants, &completion, &first_workload, scenario).await;
     assert!(
@@ -2807,22 +2830,35 @@ async fn query_response(server: &WyrdTestServer, jwt: &str) -> reqwest::Response
         .expect("public query request")
 }
 
-/// Return the exact row count from the public same-table query.
+/// Return the terminal row count from the public same-table query stream.
 ///
 /// # Panics
 ///
-/// Panics when the query fails or omits its row-count header.
+/// Panics when the query fails, framing is invalid, or the terminal is missing.
 async fn query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
-    let response = query_response(server, jwt)
-        .await
-        .error_for_status()
-        .expect("public query response");
-    response
-        .headers()
-        .get("x-wyrd-row-count")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .expect("row-count header")
+    let response = query_response(server, jwt).await;
+    if !response.status().is_success() {
+        let status = response.status();
+        let readiness = server
+            .state()
+            .bifrost_query()
+            .map(|runtime| runtime.oracle().readiness_snapshot());
+        let body = response.text().await.expect("query error body");
+        panic!("public query response: {status}; readiness={readiness:?}; body={body}");
+    }
+    let body = response.bytes().await.expect("query response body");
+    let mut decoder = FrameDecoder::new(32 * 1024 * 1024);
+    let frames = decoder
+        .push::<proto::QueryStreamFrame>(&body)
+        .expect("query frames");
+    decoder.finish().expect("query frame boundary");
+    frames
+        .into_iter()
+        .find_map(|frame| match frame.frame {
+            Some(proto::query_stream_frame::Frame::Terminal(terminal)) => Some(terminal.row_count),
+            _ => None,
+        })
+        .expect("query terminal frame")
 }
 
 /// Wait for Scribe's committed-generation grace window to retire overlap.

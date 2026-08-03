@@ -116,6 +116,8 @@ pub struct BifrostIngestRuntime {
     scribe: Arc<ScribeImpl>,
     /// One fence registry shared by every local and authenticated tonic tail read.
     tail_reader: Arc<ScribeTailReader>,
+    /// Optional domain-separated authority for private tail RPCs.
+    tail_authority: Option<Arc<crate::oracle::ScribeTailAuthority>>,
     /// Protocol and policy boundary built around [`Self::scribe`].
     gate: Arc<ServerGate>,
     /// Optional dedicated runtime that owns Scribe coordination tasks in production.
@@ -370,10 +372,27 @@ impl BifrostIngestRuntime {
         Self {
             scribe,
             tail_reader,
+            tail_authority: None,
             gate,
             coordination_runtime,
             scribe_role: None,
         }
+    }
+
+    /// Injects the server-owned private Scribe-tail authority.
+    #[must_use]
+    pub fn with_tail_authority(
+        mut self,
+        authority: Arc<crate::oracle::ScribeTailAuthority>,
+    ) -> Self {
+        self.tail_authority = Some(authority);
+        self
+    }
+
+    /// Returns the private tail authority used by the gRPC adapter.
+    #[must_use]
+    pub fn tail_authority(&self) -> Option<Arc<crate::oracle::ScribeTailAuthority>> {
+        self.tail_authority.clone()
     }
 
     /// Starts the independently fenced Scribe role lifecycle on the active server runtime.
@@ -491,6 +510,9 @@ impl BifrostIngestRuntime {
         if let Some(role) = &self.scribe_role {
             role.lifecycle.begin_stopping();
             role.shutdown.cancel();
+        }
+        if let Some(authority) = &self.tail_authority {
+            authority.clear_replay_state();
         }
         self.scribe.shutdown(deadline).await;
         if let Some(role) = &self.scribe_role {
@@ -989,6 +1011,15 @@ impl AppState {
     #[must_use]
     pub fn bifrost_scribe_for_test(&self) -> Option<&Arc<ScribeImpl>> {
         self.bifrost_ingest.as_ref().map(|runtime| runtime.scribe())
+    }
+
+    /// Borrow the private Scribe tail reader for observation-only journey checks.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn bifrost_tail_reader_for_test(&self) -> Option<Arc<ScribeTailReader>> {
+        self.bifrost_ingest
+            .as_ref()
+            .map(|runtime| runtime.tail_reader())
     }
 
     /// Flush the private Scribe runtime for the test harness only.

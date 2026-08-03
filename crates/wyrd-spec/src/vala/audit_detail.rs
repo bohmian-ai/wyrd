@@ -185,6 +185,14 @@ pub enum BifrostSecurityViolationKind {
     PeerManifest,
     /// Peer fragment digest mismatch.
     PeerFragment,
+    /// Invalid Scribe-tail ticket audience.
+    TailAudience,
+    /// Scribe-tail tenant or table binding mismatch.
+    TailBinding,
+    /// Scribe-tail fence or writer epoch mismatch.
+    TailFence,
+    /// Replayed Scribe-tail ticket or capability.
+    TailReplay,
 }
 
 fn is_secret_like(value: &str) -> bool {

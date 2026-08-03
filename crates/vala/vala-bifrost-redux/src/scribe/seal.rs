@@ -180,6 +180,7 @@ impl SealDriver {
             node_id,
             writer_epoch,
             &parquet_path,
+            None,
         )?;
         let insert_outcome = file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
             .await

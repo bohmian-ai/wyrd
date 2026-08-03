@@ -24,6 +24,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
@@ -68,7 +69,7 @@ use wyrd_server::state::BifrostIngestRuntime;
 use wyrd_server::state::{QueryStreamFault, QueryStreamFaultController};
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{NodeId, ScribeCapabilitiesV1};
 use wyrd_telemetry::TelemetryGuard;
 
 /// Production-shaped object-store seam for the embedded Forge fixture.
@@ -810,6 +811,15 @@ impl WyrdTestServer {
     #[must_use]
     pub fn state(&self) -> &AppState {
         &self.inner.state
+    }
+
+    /// Injects a private Scribe discovery outage for one test-tier journey.
+    pub fn set_tail_discovery_unavailable_for_test(&self, unavailable: bool) {
+        if let Some(query) = self.inner.state.bifrost_query() {
+            query
+                .oracle()
+                .set_tail_discovery_unavailable_for_test(unavailable);
+        }
     }
 
     /// Return the production Forge process role selected for this server.
@@ -2139,12 +2149,35 @@ impl WyrdTestServerBuilder {
         } else {
             self.scribe_wal_root
         };
+        let scribe_registration = if scribe_wal_root.is_some() {
+            let registry = Arc::new(ClusterRegistry::new(postgres.vala().clone(), node_id));
+            let advertise_addr = self.bind_addrs.map_or_else(
+                || "http://127.0.0.1:0".to_owned(),
+                |(_, grpc)| format!("http://{grpc}"),
+            );
+            let registered = registry
+                .reserve_scribe(
+                    &advertise_addr,
+                    ScribeCapabilitiesV1 {
+                        tail_protocol_version:
+                            vala_bifrost_redux::scribe::tail_rpc::TAIL_PROTOCOL_VERSION,
+                    },
+                )
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            Some((registry, registered))
+        } else {
+            None
+        };
+        let writer_epoch = scribe_registration.as_ref().map_or(1, |(_, registered)| {
+            i64::try_from(registered.fencing_token).expect("Scribe fence fits WAL epoch")
+        });
         let scribe = if let Some(wal_root) = &scribe_wal_root {
             let wal = Arc::new(
                 WalWriter::new(
                     wal_root.path(),
                     *node_id.as_uuid().as_bytes(),
-                    1,
+                    writer_epoch,
                     WalConfig::default(),
                 )
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
@@ -2155,11 +2188,18 @@ impl WyrdTestServerBuilder {
                     Arc::new(storage.operator().clone()),
                     wal,
                     &node_name,
-                    1,
+                    writer_epoch,
                     vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
                         lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
                         admission: scribe_admission,
                         coordination_runtime: tokio::runtime::Handle::current(),
+                        persistence: Some(
+                            vala_bifrost_redux::scribe::ScribePersistenceConfig::new(
+                                Arc::new(postgres.vala().clone()),
+                                64,
+                                2,
+                            ),
+                        ),
                         memory_budget: Some(bifrost_memory.scribe_budget()),
                         staging_file_publisher: Some(forge_publisher.clone()),
                     },
@@ -2169,12 +2209,19 @@ impl WyrdTestServerBuilder {
                     Arc::new(storage.operator().clone()),
                     wal,
                     &node_name,
-                    1,
+                    writer_epoch,
                     self.wal_sync_delay,
                     vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
                         lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::resolved(),
                         admission: scribe_admission,
                         coordination_runtime: tokio::runtime::Handle::current(),
+                        persistence: Some(
+                            vala_bifrost_redux::scribe::ScribePersistenceConfig::new(
+                                Arc::new(postgres.vala().clone()),
+                                64,
+                                2,
+                            ),
+                        ),
                         memory_budget: Some(bifrost_memory.scribe_budget()),
                         staging_file_publisher: Some(forge_publisher.clone()),
                     },
@@ -2185,14 +2232,32 @@ impl WyrdTestServerBuilder {
         } else {
             None
         };
-        let ingest = scribe.as_ref().map(|scribe| {
-            Arc::new(BifrostIngestRuntime::new(
+        let tail_authority = if scribe.is_some() {
+            let audit = wyrd_server::oracle::PostgresTailSecurityAudit::try_new(&postgres)
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            Some(Arc::new(
+                wyrd_server::oracle::ScribeTailAuthority::from_pem(
+                    &SecretString::from(crate::keys::private_key_pem().to_owned()),
+                    Arc::new(audit),
+                )
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+            ))
+        } else {
+            None
+        };
+        let mut ingest = scribe.as_ref().map(|scribe| {
+            let runtime = BifrostIngestRuntime::new(
                 Arc::clone(scribe),
                 Arc::clone(&bifrost_redux),
                 Arc::clone(&verifier),
                 vala_bifrost_redux::gate::limits::IngestLimits::default(),
                 None,
-            ))
+            );
+            match &tail_authority {
+                Some(authority) => Arc::new(runtime.with_tail_authority(Arc::clone(authority))),
+                None => Arc::new(runtime),
+            }
         });
         let query_stream_fault = QueryStreamFaultController::default();
         let mut state = AppState::new(postgres, storage, bifrost)
@@ -2212,8 +2277,28 @@ impl WyrdTestServerBuilder {
         if let Some(forge) = forge {
             state = state.with_forge(forge);
         }
-        if let Some(ingest) = &ingest {
-            state = state.with_bifrost_ingest(Arc::clone(ingest));
+        if let Some(ingest_arc) = ingest.take() {
+            let (registry, registered) =
+                scribe_registration.expect("Scribe registration is reserved with a Scribe runtime");
+            registry
+                .activate(&registered)
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let registered_ingest = Arc::new(
+                Arc::try_unwrap(ingest_arc)
+                    .map_err(|_| {
+                        WyrdTestServerError::Start(
+                            "Scribe runtime has unexpected shared owners".to_owned(),
+                        )
+                    })?
+                    .with_scribe_role(registry, registered),
+            );
+            ingest = Some(registered_ingest);
+            state = state.with_bifrost_ingest(Arc::clone(
+                ingest
+                    .as_ref()
+                    .expect("Scribe runtime is retained after role registration"),
+            ));
         }
         if let Some(telemetry) = self.telemetry {
             state = state.with_telemetry(telemetry);

@@ -144,6 +144,16 @@ fn extract_event_time_range(
 }
 
 /// Build the `FileListInsert` row from freeze metadata and its canonical binding.
+///
+/// Persistence workers may move the encoded bytes into object storage before
+/// constructing the SQL row; `file_size_override` preserves the original byte
+/// count in that path. The direct seal path passes `None` and derives the size
+/// from the retained payload.
+///
+/// # Errors
+/// Returns [`ScribeError`] when the binding does not match the frozen seal key,
+/// metadata cannot be represented in the SQL types, or the writer identity is
+/// not a UUID.
 pub fn build_insert<'a>(
     frozen: &'a FrozenMemtable,
     encoded: &'a ParquetEncoded,
@@ -151,6 +161,7 @@ pub fn build_insert<'a>(
     node_id: &str,
     writer_epoch: i64,
     file_path: &'a str,
+    file_size_override: Option<usize>,
 ) -> Result<FileListInsert<'a>, ScribeError> {
     if binding.tenant != frozen.seal_key.tenant || binding.table_ref != frozen.seal_key.table {
         return Err(ScribeError::Internal {
@@ -170,9 +181,12 @@ pub fn build_insert<'a>(
     let row_count = i64::try_from(frozen.row_count()).map_err(|_| ScribeError::Internal {
         detail: "row_count exceeds i64::MAX (invariant violation)".to_string(),
     })?;
-    let file_size = i64::try_from(encoded.bytes.len()).map_err(|_| ScribeError::Internal {
-        detail: "file_size exceeds i64::MAX (invariant violation)".to_string(),
-    })?;
+    let file_size =
+        i64::try_from(file_size_override.unwrap_or(encoded.bytes.len())).map_err(|_| {
+            ScribeError::Internal {
+                detail: "file_size exceeds i64::MAX (invariant violation)".to_string(),
+            }
+        })?;
 
     let node_uuid = Uuid::parse_str(node_id).map_err(|e| ScribeError::Internal {
         detail: format!("invalid node_id UUID: {e}"),

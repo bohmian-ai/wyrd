@@ -102,6 +102,7 @@ fn fence_request(binding: &TenantTableBinding, stream: StreamIdentity) -> Acquir
         false,
     )]));
     AcquireTailFenceRequest {
+        query_id: Uuid::nil(),
         binding: WireBinding {
             tenant_id: binding.tenant,
             namespace: "bifrost".to_owned(),
@@ -287,6 +288,7 @@ async fn page_continuation_is_row_precise() {
         .expect("acquires metadata only");
     let first = reader
         .read_page(&TailPageRequest {
+            query_id: uuid::Uuid::nil(),
             fence_id: fence.fence_id,
             after: None,
             max_rows: 1,
@@ -297,6 +299,7 @@ async fn page_continuation_is_row_precise() {
     assert!(!first.complete);
     let second = reader
         .read_page(&TailPageRequest {
+            query_id: uuid::Uuid::nil(),
             fence_id: fence.fence_id,
             after: first.next,
             max_rows: 1,
@@ -387,6 +390,7 @@ async fn single_oversize_row_fails_empty() {
         .expect("fence acquires before paging");
     let error = reader
         .read_page(&TailPageRequest {
+            query_id: uuid::Uuid::nil(),
             fence_id: fence.fence_id,
             after: None,
             max_rows: 1,
@@ -424,6 +428,7 @@ async fn seal_and_rotation_preserve_fence() {
     let frozen = memtable.freeze(&key).expect("active generation seals");
     let first = reader
         .read_page(&TailPageRequest {
+            query_id: uuid::Uuid::nil(),
             fence_id: fence.fence_id,
             after: None,
             max_rows: 1,
@@ -455,6 +460,7 @@ async fn seal_and_rotation_preserve_fence() {
 
     let second = reader
         .read_page(&TailPageRequest {
+            query_id: uuid::Uuid::nil(),
             fence_id: fence.fence_id,
             after: first.next,
             max_rows: 1,

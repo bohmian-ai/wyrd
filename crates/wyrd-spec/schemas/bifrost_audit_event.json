@@ -1253,6 +1253,34 @@
           "enum": [
             "peer_fragment"
           ]
+        },
+        {
+          "description": "Invalid Scribe-tail ticket audience.",
+          "type": "string",
+          "enum": [
+            "tail_audience"
+          ]
+        },
+        {
+          "description": "Scribe-tail tenant or table binding mismatch.",
+          "type": "string",
+          "enum": [
+            "tail_binding"
+          ]
+        },
+        {
+          "description": "Scribe-tail fence or writer epoch mismatch.",
+          "type": "string",
+          "enum": [
+            "tail_fence"
+          ]
+        },
+        {
+          "description": "Replayed Scribe-tail ticket or capability.",
+          "type": "string",
+          "enum": [
+            "tail_replay"
+          ]
         }
       ]
     },

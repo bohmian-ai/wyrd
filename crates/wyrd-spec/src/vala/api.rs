@@ -2011,6 +2011,8 @@ pub struct TailStreamIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct AcquireTailFenceRequest {
+    /// Query identity bound into the private signed tail ticket.
+    pub query_id: uuid::Uuid,
     /// Tenant/table binding.
     pub binding: TenantTableBinding,
     /// UTC event-day string.
@@ -2053,6 +2055,8 @@ pub struct TailReadFence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct TailPageRequest {
+    /// Query identity authorized to read the fence.
+    pub query_id: uuid::Uuid,
     /// Fence identity.
     pub fence_id: TailFenceId,
     /// Cursor after which reading resumes.
@@ -2082,6 +2086,8 @@ pub struct TailPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ReleaseTailFenceRequest {
+    /// Query identity authorized to release the fence.
+    pub query_id: uuid::Uuid,
     /// Fence identity.
     pub fence_id: TailFenceId,
 }

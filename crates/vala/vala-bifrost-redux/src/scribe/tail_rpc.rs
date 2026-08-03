@@ -32,6 +32,261 @@ use crate::scribe::wal::WalLsn;
 /// The only tail protocol revision understood by the Scribe v1 reader.
 pub const TAIL_PROTOCOL_VERSION: u16 = 1;
 
+/// Operation audience carried by a private Scribe-tail ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailTicketAudience {
+    /// Metadata-only active-stream discovery.
+    List,
+    /// One-shot exact-fence allocation.
+    Acquire,
+    /// Reusable retained-fence page access.
+    Page,
+    /// Idempotent retained-fence release.
+    Release,
+}
+
+/// Transport-neutral claims signed by the server tail authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailTicketClaims {
+    /// Query identity owning the private operation.
+    pub query_id: uuid::Uuid,
+    /// Tenant bound by the authenticated query context.
+    pub tenant_id: DataTenantId,
+    /// Canonical tenant table name.
+    pub canonical_table: String,
+    /// Exact Scribe node and writer epoch selected by discovery.
+    pub node_id: uuid::Uuid,
+    /// Current writer epoch for stale-incarnation rejection.
+    pub writer_epoch: u64,
+    /// Absolute query deadline in UTC.
+    pub deadline: chrono::DateTime<chrono::Utc>,
+    /// Narrow operation audience.
+    pub audience: TailTicketAudience,
+    /// Single-use replay identity retained through expiry.
+    pub nonce: Vec<u8>,
+}
+
+impl TailTicketClaims {
+    /// Validates the signed claims against one operation's exact request tuple.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::Authorization`] when query, tenant, table,
+    /// stream, epoch, or deadline differs from the signed request.
+    pub fn validate_binding(
+        &self,
+        query_id: uuid::Uuid,
+        tenant_id: DataTenantId,
+        canonical_table: &str,
+        node_id: uuid::Uuid,
+        writer_epoch: u64,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), TailReadError> {
+        if self.query_id != query_id
+            || self.tenant_id != tenant_id
+            || self.canonical_table != canonical_table
+            || self.node_id != node_id
+            || self.writer_epoch != writer_epoch
+            || self.deadline < deadline
+        {
+            return Err(TailReadError::Authorization {
+                detail: "tail ticket binding is invalid".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exact request tuple a signed tail ticket must authorize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailTicketBinding {
+    /// Query identity selected by Oracle.
+    pub query_id: uuid::Uuid,
+    /// Tenant identity selected by the authenticated request.
+    pub tenant_id: DataTenantId,
+    /// Canonical table selected by the catalog cut.
+    pub canonical_table: String,
+    /// Scribe node selected by discovery.
+    pub node_id: uuid::Uuid,
+    /// Writer epoch selected by discovery.
+    pub writer_epoch: u64,
+    /// Request deadline the ticket must cover.
+    pub deadline: chrono::DateTime<chrono::Utc>,
+}
+
+/// Reusable exact-fence capability returned by a successful acquire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailFenceCapability {
+    /// Opaque signed capability bytes.
+    pub encoded: Vec<u8>,
+    /// Exact retained fence identity bound by the signer.
+    pub fence_id: tail::TailFenceId,
+}
+
+/// Narrow signer for private list/acquire tickets and returned fence capabilities.
+pub trait TailTicketMinter: Send + Sync {
+    /// Signs one operation-scoped claim set.
+    ///
+    /// # Errors
+    /// Returns a closed authority error when claims cannot be encoded or signed.
+    fn mint_tail_ticket(&self, claims: &TailTicketClaims) -> Result<Vec<u8>, TailReadError>;
+
+    /// Signs a reusable exact-fence capability after allocation.
+    ///
+    /// # Errors
+    /// Returns a closed authority error when the capability cannot be encoded
+    /// or signed.
+    fn mint_tail_capability(
+        &self,
+        _claims: &TailTicketClaims,
+        _fence: &tail::TailReadFence,
+    ) -> Result<Vec<u8>, TailReadError> {
+        Err(TailReadError::Authorization {
+            detail: "tail authority does not mint fence capabilities".to_owned(),
+        })
+    }
+}
+
+/// Durable audit collaborator required before returning a tail authorization
+/// rejection.  The server maps these narrow reasons to its audit catalog.
+#[async_trait]
+pub trait TailSecurityAudit: Send + Sync {
+    /// Records a failure whose tenant claim is not trusted.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError`] when the durable audit append is unavailable.
+    async fn append_unverified_tail_rejection(&self, reason: &str) -> Result<(), TailReadError>;
+
+    /// Records a failure after the signed tenant claim is verified.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError`] when the durable audit append is unavailable.
+    async fn append_verified_tail_violation(
+        &self,
+        tenant_id: DataTenantId,
+        reason: &str,
+    ) -> Result<(), TailReadError>;
+}
+
+/// No-op audit used only by isolated transport tests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopTailSecurityAudit;
+
+#[async_trait]
+impl TailSecurityAudit for NoopTailSecurityAudit {
+    /// Accepts the isolated unverified rejection.
+    ///
+    /// # Errors
+    /// This test-only sink never fails.
+    async fn append_unverified_tail_rejection(&self, _reason: &str) -> Result<(), TailReadError> {
+        Ok(())
+    }
+
+    /// Accepts the isolated tenant violation.
+    ///
+    /// # Errors
+    /// This test-only sink never fails.
+    async fn append_verified_tail_violation(
+        &self,
+        _tenant_id: DataTenantId,
+        _reason: &str,
+    ) -> Result<(), TailReadError> {
+        Ok(())
+    }
+}
+
+/// Narrow verifier for private tickets and exact-fence capabilities.
+#[async_trait]
+pub trait TailTicketVerifier: Send + Sync {
+    /// Records a rejection whose signed tenant tuple is not trusted.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError`] when durable audit cannot append the rejection.
+    async fn audit_unverified_rejection(&self, _reason: &str) -> Result<(), TailReadError> {
+        Ok(())
+    }
+
+    /// Records a rejection after a signed tenant tuple has been decoded.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError`] when durable audit cannot append the rejection.
+    async fn audit_verified_violation(
+        &self,
+        _tenant_id: DataTenantId,
+        _reason: &str,
+    ) -> Result<(), TailReadError> {
+        Ok(())
+    }
+
+    /// Validates one decoded ticket against the exact operation tuple.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::Authorization`] for any tuple mismatch or
+    /// [`TailReadError`] when the rejection audit fails.
+    async fn verify_tail_ticket_binding(
+        &self,
+        claims: &TailTicketClaims,
+        binding: &TailTicketBinding,
+    ) -> Result<(), TailReadError> {
+        claims.validate_binding(
+            binding.query_id,
+            binding.tenant_id,
+            &binding.canonical_table,
+            binding.node_id,
+            binding.writer_epoch,
+            binding.deadline,
+        )
+    }
+
+    /// Verifies signature, key, expiry, audience, and consumes the nonce before
+    /// the caller checks operation-specific bindings.
+    async fn verify_tail_ticket_unbound(
+        &self,
+        _encoded: &[u8],
+        _audience: TailTicketAudience,
+    ) -> Result<TailTicketClaims, TailReadError> {
+        Err(TailReadError::Authorization {
+            detail: "tail authority does not expose unbound claims".to_owned(),
+        })
+    }
+
+    /// Decodes a capability's signed owner tuple before exact fence checks.
+    async fn decode_tail_capability(
+        &self,
+        _encoded: &[u8],
+        _audience: TailTicketAudience,
+    ) -> Result<(uuid::Uuid, DataTenantId, String), TailReadError> {
+        Err(TailReadError::Authorization {
+            detail: "tail authority does not decode capabilities".to_owned(),
+        })
+    }
+
+    /// Verifies claims before Scribe state is listed or mutated.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError`] for signature, audience, expiry, binding,
+    /// epoch, replay, or audit failures.
+    async fn verify_tail_ticket(
+        &self,
+        encoded: &[u8],
+        expected: &TailTicketClaims,
+    ) -> Result<(), TailReadError>;
+
+    /// Verifies a reusable capability against an exact retained fence tuple.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError`] when the capability is expired, malformed,
+    /// cross-query, cross-tenant, or bound to another fence.
+    async fn verify_tail_capability(
+        &self,
+        encoded: &[u8],
+        query_id: uuid::Uuid,
+        tenant_id: DataTenantId,
+        canonical_table: &str,
+        fence: &tail::TailReadFence,
+        audience: TailTicketAudience,
+    ) -> Result<(), TailReadError>;
+}
+
 /// Maximum expired fences reclaimed while servicing one foreground operation.
 const OPPORTUNISTIC_EXPIRY_LIMIT: usize = 64;
 
@@ -73,9 +328,41 @@ pub struct LocalTailPage {
     pub complete: bool,
 }
 
+/// One active event-day scope returned by private Scribe discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTailStream {
+    /// Event day whose live rows remain in Scribe memory.
+    pub event_day: tail::EventDay,
+    /// Exact Scribe stream incarnation serving that day.
+    pub stream: tail::TailStreamIdentity,
+}
+
+/// Fence metadata plus the Scribe-minted reusable capability returned by acquire.
+#[derive(Debug, Clone)]
+pub struct TailFenceLease {
+    /// Exact retained interval metadata.
+    pub fence: tail::TailReadFence,
+    /// Signed capability bound to the retained fence tuple.
+    pub capability: Vec<u8>,
+}
+
 /// Tail-read boundary with local shallow and remote owned-frame implementations.
 #[async_trait]
 pub trait TailReadTransport: Send + Sync {
+    /// Lists active event-day scopes for one tenant/table without allocating a
+    /// fence.
+    async fn list_active_streams(
+        &self,
+        binding: tail::TenantTableBinding,
+        _query_id: uuid::Uuid,
+        _ticket: Vec<u8>,
+    ) -> Result<Vec<ActiveTailStream>, TailReadError> {
+        let _ = binding;
+        Err(TailReadError::State {
+            detail: "tail transport does not support active-stream discovery".to_owned(),
+        })
+    }
+
     /// Acquires metadata for one immutable tail interval.
     ///
     /// # Errors
@@ -87,6 +374,27 @@ pub trait TailReadTransport: Send + Sync {
         request: tail::AcquireTailFenceRequest,
     ) -> Result<tail::TailReadFence, TailReadError>;
 
+    /// Acquires and returns the Scribe-issued capability for the exact fence.
+    async fn acquire_fence_with_capability(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        ticket: Vec<u8>,
+    ) -> Result<TailFenceLease, TailReadError> {
+        Ok(TailFenceLease {
+            fence: self.acquire_fence_with_ticket(request, ticket).await?,
+            capability: Vec::new(),
+        })
+    }
+
+    /// Authorized variant used by production query-scoped discovery.
+    async fn acquire_fence_with_ticket(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        _ticket: Vec<u8>,
+    ) -> Result<tail::TailReadFence, TailReadError> {
+        self.acquire_fence(request).await
+    }
+
     /// Reads one locally consumable row-precise page.
     ///
     /// # Errors
@@ -97,6 +405,15 @@ pub trait TailReadTransport: Send + Sync {
         &self,
         request: tail::TailPageRequest,
     ) -> Result<LocalTailPage, TailReadError>;
+
+    /// Authorized page variant bound to one exact reusable capability.
+    async fn read_page_with_capability(
+        &self,
+        request: tail::TailPageRequest,
+        _capability: Vec<u8>,
+    ) -> Result<LocalTailPage, TailReadError> {
+        self.read_page(request).await
+    }
 
     /// Idempotently releases a retained interval.
     ///
@@ -114,31 +431,220 @@ pub trait TailReadTransport: Send + Sync {
     ) -> Result<FenceRelease, TailReadError> {
         self.release_fence(fence_id)
     }
+
+    /// Authorized release variant retaining idempotent capability semantics.
+    async fn release_fence_with_capability(
+        &self,
+        _query_id: uuid::Uuid,
+        fence_id: tail::TailFenceId,
+        _capability: Vec<u8>,
+    ) -> Result<FenceRelease, TailReadError> {
+        self.release_fence_async(fence_id).await
+    }
 }
 
 /// In-process transport that preserves Scribe's shallow Arrow ownership.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalTailReadTransport {
     /// The one Scribe-owned reader that retains interval state.
     reader: Arc<ScribeTailReader>,
+    /// Optional verifier enforcing the same private ticket contract as tonic.
+    authority: Option<Arc<dyn TailTicketVerifier>>,
+    /// Server-owned signer used to return the capability after local retention.
+    minter: Option<Arc<dyn TailTicketMinter>>,
+}
+
+impl std::fmt::Debug for LocalTailReadTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalTailReadTransport")
+            .field("authority_configured", &self.authority.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalTailReadTransport {
     /// Wraps the local Scribe reader without introducing an IPC encode/decode hop.
     #[must_use]
     pub fn new(reader: Arc<ScribeTailReader>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            authority: None,
+            minter: None,
+        }
+    }
+
+    /// Wraps the local reader with the server-owned tail verifier.
+    #[must_use]
+    pub fn with_authority(
+        reader: Arc<ScribeTailReader>,
+        authority: Arc<dyn TailTicketVerifier>,
+    ) -> Self {
+        Self {
+            reader,
+            authority: Some(authority),
+            minter: None,
+        }
+    }
+
+    /// Wraps the local reader with verifier and signer capabilities.
+    #[must_use]
+    pub fn with_authority_and_minter(
+        reader: Arc<ScribeTailReader>,
+        authority: Arc<dyn TailTicketVerifier>,
+        minter: Arc<dyn TailTicketMinter>,
+    ) -> Self {
+        Self {
+            reader,
+            authority: Some(authority),
+            minter: Some(minter),
+        }
     }
 }
 
 #[async_trait]
 impl TailReadTransport for LocalTailReadTransport {
+    /// Delegates metadata-only active-stream discovery to Scribe.
+    async fn list_active_streams(
+        &self,
+        binding: tail::TenantTableBinding,
+        query_id: uuid::Uuid,
+        ticket: Vec<u8>,
+    ) -> Result<Vec<ActiveTailStream>, TailReadError> {
+        if let Some(authority) = &self.authority {
+            let claims = authority
+                .verify_tail_ticket_unbound(&ticket, TailTicketAudience::List)
+                .await?;
+            let stream = self.reader.stream_identity();
+            let canonical = canonical_table_name(&binding.namespace, &binding.table);
+            authority
+                .verify_tail_ticket_binding(
+                    &claims,
+                    &TailTicketBinding {
+                        query_id,
+                        tenant_id: binding.tenant_id,
+                        canonical_table: canonical,
+                        node_id: stream.node_id.as_uuid(),
+                        writer_epoch: u64::try_from(stream.writer_epoch.as_i64()).unwrap_or(0),
+                        deadline: claims.deadline,
+                    },
+                )
+                .await?;
+        }
+        self.reader.list_active_streams(&binding).map(|streams| {
+            streams
+                .into_iter()
+                .map(|(event_day, stream)| ActiveTailStream { event_day, stream })
+                .collect()
+        })
+    }
+
     /// Delegates metadata-only acquisition to the Scribe-owned reader.
     async fn acquire_fence(
         &self,
         request: tail::AcquireTailFenceRequest,
     ) -> Result<tail::TailReadFence, TailReadError> {
         self.reader.acquire_fence(request).await
+    }
+
+    /// Reads a local page only after exact capability verification.
+    async fn read_page_with_capability(
+        &self,
+        request: tail::TailPageRequest,
+        capability: Vec<u8>,
+    ) -> Result<LocalTailPage, TailReadError> {
+        if let Some(authority) = &self.authority {
+            let (_cap_query_id, tenant, table) = authority
+                .decode_tail_capability(&capability, TailTicketAudience::Page)
+                .await?;
+            let fence = match self.reader.fence_metadata(request.fence_id) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    authority.audit_verified_violation(tenant, "fence").await?;
+                    return Err(error);
+                }
+            };
+            authority
+                .verify_tail_capability(
+                    &capability,
+                    request.query_id,
+                    tenant,
+                    &table,
+                    &fence,
+                    TailTicketAudience::Page,
+                )
+                .await?;
+            return self.reader.read_page_for_tenant(tenant, request);
+        }
+        self.reader.read_page(&request)
+    }
+
+    /// Delegates acquisition after validating the explicit signed ticket.
+    async fn acquire_fence_with_ticket(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        ticket: Vec<u8>,
+    ) -> Result<tail::TailReadFence, TailReadError> {
+        if let Some(authority) = &self.authority {
+            let claims = authority
+                .verify_tail_ticket_unbound(&ticket, TailTicketAudience::Acquire)
+                .await?;
+            let stream = self.reader.stream_identity();
+            let canonical =
+                canonical_table_name(&request.binding.namespace, &request.binding.table);
+            authority
+                .verify_tail_ticket_binding(
+                    &claims,
+                    &TailTicketBinding {
+                        query_id: request.query_id,
+                        tenant_id: request.binding.tenant_id,
+                        canonical_table: canonical,
+                        node_id: stream.node_id.as_uuid(),
+                        writer_epoch: u64::try_from(stream.writer_epoch.as_i64()).unwrap_or(0),
+                        deadline: request.deadline,
+                    },
+                )
+                .await?;
+        }
+        self.reader.acquire_fence(request).await
+    }
+
+    /// Acquires local metadata and returns a signer-produced capability.
+    async fn acquire_fence_with_capability(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        ticket: Vec<u8>,
+    ) -> Result<TailFenceLease, TailReadError> {
+        let claims = if let Some(authority) = &self.authority {
+            let claims = authority
+                .verify_tail_ticket_unbound(&ticket, TailTicketAudience::Acquire)
+                .await?;
+            let stream = self.reader.stream_identity();
+            let canonical =
+                canonical_table_name(&request.binding.namespace, &request.binding.table);
+            authority
+                .verify_tail_ticket_binding(
+                    &claims,
+                    &TailTicketBinding {
+                        query_id: request.query_id,
+                        tenant_id: request.binding.tenant_id,
+                        canonical_table: canonical,
+                        node_id: stream.node_id.as_uuid(),
+                        writer_epoch: u64::try_from(stream.writer_epoch.as_i64()).unwrap_or(0),
+                        deadline: request.deadline,
+                    },
+                )
+                .await?;
+            Some(claims)
+        } else {
+            None
+        };
+        let fence = self.reader.acquire_fence(request).await?;
+        let capability = match (&self.minter, claims) {
+            (Some(minter), Some(claims)) => minter.mint_tail_capability(&claims, &fence)?,
+            _ => Vec::new(),
+        };
+        Ok(TailFenceLease { fence, capability })
     }
 
     /// Delegates local shallow page reads to the Scribe-owned reader.
@@ -151,6 +657,39 @@ impl TailReadTransport for LocalTailReadTransport {
 
     /// Delegates idempotent local release to the Scribe-owned reader.
     fn release_fence(&self, fence_id: tail::TailFenceId) -> Result<FenceRelease, TailReadError> {
+        self.reader.release_fence(fence_id)
+    }
+
+    /// Releases a local fence only after exact capability verification.
+    async fn release_fence_with_capability(
+        &self,
+        query_id: uuid::Uuid,
+        fence_id: tail::TailFenceId,
+        capability: Vec<u8>,
+    ) -> Result<FenceRelease, TailReadError> {
+        if let Some(authority) = &self.authority {
+            let (_cap_query_id, tenant, table) = authority
+                .decode_tail_capability(&capability, TailTicketAudience::Page)
+                .await?;
+            let fence = match self.reader.fence_metadata(fence_id) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    authority.audit_verified_violation(tenant, "fence").await?;
+                    return Err(error);
+                }
+            };
+            authority
+                .verify_tail_capability(
+                    &capability,
+                    query_id,
+                    tenant,
+                    &table,
+                    &fence,
+                    TailTicketAudience::Page,
+                )
+                .await?;
+            return self.reader.release_fence_for_tenant(tenant, fence_id);
+        }
         self.reader.release_fence(fence_id)
     }
 }
@@ -172,6 +711,53 @@ pub struct TonicTailReadTransport {
 const TAIL_RPC_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024 + 64 * 1024;
 
 impl TonicTailReadTransport {
+    /// Discovers active event-day scopes through the private Scribe RPC.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] for transport, conversion, or server
+    /// status failures.
+    pub async fn list_active_streams(
+        &self,
+        binding: tail::TenantTableBinding,
+        query_id: uuid::Uuid,
+        ticket: Vec<u8>,
+    ) -> Result<Vec<ActiveTailStream>, TailReadError> {
+        let mut client = self.client.clone();
+        let response = client
+            .list_active_streams(self.authenticated_request(
+                wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
+                    tail_ticket: ticket,
+                    binding: Some(binding.into()),
+                    query_id: query_id.as_bytes().to_vec(),
+                },
+            ))
+            .await
+            .map_err(|status| tonic_error(&status))?;
+        response
+            .into_inner()
+            .streams
+            .into_iter()
+            .map(|stream| {
+                let event_day =
+                    tail::EventDay::new(stream.event_day).map_err(|_| TailReadError::Binding)?;
+                let stream = stream.stream.ok_or_else(|| TailReadError::State {
+                    detail: "active tail stream omitted identity".to_owned(),
+                })?;
+                let node_id =
+                    uuid::Uuid::parse_str(&stream.node_id).map_err(|_| TailReadError::State {
+                        detail: "active tail stream node id is invalid".to_owned(),
+                    })?;
+                Ok(ActiveTailStream {
+                    event_day,
+                    stream: tail::TailStreamIdentity {
+                        node_id: tail::NodeId::new(node_id),
+                        writer_epoch: stream.writer_epoch,
+                    },
+                })
+            })
+            .collect()
+    }
+
     /// Creates a remote transport using the authenticated private Scribe channel.
     ///
     /// # Errors
@@ -203,9 +789,20 @@ impl TonicTailReadTransport {
         &self,
         request: tail::AcquireTailFenceRequest,
     ) -> Result<tail::TailReadFence, TailReadError> {
+        self.acquire_fence_with_ticket(request, Vec::new()).await
+    }
+
+    /// Acquires immutable remote fence metadata with an explicit signed ticket.
+    pub async fn acquire_fence_with_ticket(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        ticket: Vec<u8>,
+    ) -> Result<tail::TailReadFence, TailReadError> {
         let mut client = self.client.clone();
+        let mut message: wyrd_tonic::wyrd::v1::AcquireTailFenceRequest = request.into();
+        message.tail_ticket = ticket;
         let response = client
-            .acquire_fence(self.authenticated_request(request.into()))
+            .acquire_fence(self.authenticated_request(message))
             .await
             .map_err(|status| tonic_error(&status))?;
         response.into_inner().try_into().map_err(
@@ -213,6 +810,29 @@ impl TonicTailReadTransport {
                 detail: error.to_string(),
             },
         )
+    }
+
+    /// Acquires metadata and preserves the Scribe-issued reusable capability.
+    pub async fn acquire_fence_with_capability(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        ticket: Vec<u8>,
+    ) -> Result<TailFenceLease, TailReadError> {
+        let mut client = self.client.clone();
+        let mut message: wyrd_tonic::wyrd::v1::AcquireTailFenceRequest = request.into();
+        message.tail_ticket = ticket;
+        let response = client
+            .acquire_fence(self.authenticated_request(message))
+            .await
+            .map_err(|status| tonic_error(&status))?;
+        let response = response.into_inner();
+        let capability = response.capability.clone();
+        let fence = response.try_into().map_err(
+            |error: wyrd_tonic::private_conversion::PrivateConversionError| TailReadError::State {
+                detail: error.to_string(),
+            },
+        )?;
+        Ok(TailFenceLease { fence, capability })
     }
 
     /// Reads one remote page and decodes its owned Arrow IPC frames.
@@ -225,9 +845,20 @@ impl TonicTailReadTransport {
         &self,
         request: tail::TailPageRequest,
     ) -> Result<LocalTailPage, TailReadError> {
+        self.read_page_with_capability(request, Vec::new()).await
+    }
+
+    /// Reads one remote page with an explicit reusable exact-fence capability.
+    pub async fn read_page_with_capability(
+        &self,
+        request: tail::TailPageRequest,
+        capability: Vec<u8>,
+    ) -> Result<LocalTailPage, TailReadError> {
         let mut client = self.client.clone();
+        let mut message: wyrd_tonic::wyrd::v1::TailPageRequest = request.into();
+        message.tail_capability = capability;
         let response = client
-            .read_fence_page(self.authenticated_request(request.into()))
+            .read_fence_page(self.authenticated_request(message))
             .await
             .map_err(|status| tonic_error(&status))?;
         let page: tail::TailPage = response.into_inner().try_into().map_err(
@@ -253,14 +884,27 @@ impl TonicTailReadTransport {
     ///
     /// Returns [`TailReadError::State`] when the private RPC fails.
     pub async fn release_fence(&self, fence_id: tail::TailFenceId) -> Result<(), TailReadError> {
+        self.release_fence_with_capability(uuid::Uuid::nil(), fence_id, Vec::new())
+            .await
+            .map(|_| ())
+    }
+
+    /// Releases a remote fence with an explicit reusable capability.
+    pub async fn release_fence_with_capability(
+        &self,
+        query_id: uuid::Uuid,
+        fence_id: tail::TailFenceId,
+        capability: Vec<u8>,
+    ) -> Result<FenceRelease, TailReadError> {
         let mut client = self.client.clone();
+        let mut message: wyrd_tonic::wyrd::v1::ReleaseTailFenceRequest =
+            tail::ReleaseTailFenceRequest { query_id, fence_id }.into();
+        message.tail_capability = capability;
         client
-            .release_fence(
-                self.authenticated_request(tail::ReleaseTailFenceRequest { fence_id }.into()),
-            )
+            .release_fence(self.authenticated_request(message))
             .await
             .map_err(|status| tonic_error(&status))?;
-        Ok(())
+        Ok(FenceRelease { released: true })
     }
 
     /// Adds the required private workload credential before a remote lookup.
@@ -275,6 +919,16 @@ impl TonicTailReadTransport {
 
 #[async_trait]
 impl TailReadTransport for TonicTailReadTransport {
+    /// Discovers active streams through the authenticated private RPC.
+    async fn list_active_streams(
+        &self,
+        binding: tail::TenantTableBinding,
+        query_id: uuid::Uuid,
+        ticket: Vec<u8>,
+    ) -> Result<Vec<ActiveTailStream>, TailReadError> {
+        TonicTailReadTransport::list_active_streams(self, binding, query_id, ticket).await
+    }
+
     /// Acquire a remote immutable fence through the authenticated tonic client.
     async fn acquire_fence(
         &self,
@@ -283,12 +937,39 @@ impl TailReadTransport for TonicTailReadTransport {
         TonicTailReadTransport::acquire_fence(self, request).await
     }
 
+    /// Acquires through the explicit signed ticket path.
+    async fn acquire_fence_with_ticket(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        ticket: Vec<u8>,
+    ) -> Result<tail::TailReadFence, TailReadError> {
+        TonicTailReadTransport::acquire_fence_with_ticket(self, request, ticket).await
+    }
+
+    /// Acquires the Scribe-issued capability without synthesizing one in Oracle.
+    async fn acquire_fence_with_capability(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+        ticket: Vec<u8>,
+    ) -> Result<TailFenceLease, TailReadError> {
+        TonicTailReadTransport::acquire_fence_with_capability(self, request, ticket).await
+    }
+
     /// Read and decode one remote owned-frame page.
     async fn read_page(
         &self,
         request: tail::TailPageRequest,
     ) -> Result<LocalTailPage, TailReadError> {
         TonicTailReadTransport::read_page(self, request).await
+    }
+
+    /// Reads through the explicit signed capability path.
+    async fn read_page_with_capability(
+        &self,
+        request: tail::TailPageRequest,
+        capability: Vec<u8>,
+    ) -> Result<LocalTailPage, TailReadError> {
+        TonicTailReadTransport::read_page_with_capability(self, request, capability).await
     }
 
     /// Declines synchronous remote release from a drop boundary.
@@ -306,8 +987,24 @@ impl TailReadTransport for TonicTailReadTransport {
         &self,
         fence_id: tail::TailFenceId,
     ) -> Result<FenceRelease, TailReadError> {
-        TonicTailReadTransport::release_fence(self, fence_id).await?;
-        Ok(FenceRelease { released: true })
+        TonicTailReadTransport::release_fence_with_capability(
+            self,
+            uuid::Uuid::nil(),
+            fence_id,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Releases through the explicit signed capability path.
+    async fn release_fence_with_capability(
+        &self,
+        query_id: uuid::Uuid,
+        fence_id: tail::TailFenceId,
+        capability: Vec<u8>,
+    ) -> Result<FenceRelease, TailReadError> {
+        TonicTailReadTransport::release_fence_with_capability(self, query_id, fence_id, capability)
+            .await
     }
 }
 
@@ -365,6 +1062,9 @@ pub struct ExpiryReport {
 /// Errors local to tail retention and paging before tonic maps them to statuses.
 #[derive(Debug, thiserror::Error)]
 pub enum TailReadError {
+    /// A private ticket or capability failed cryptographic or tuple validation.
+    #[error("tail authorization failed: {detail}")]
+    Authorization { detail: String },
     /// The requested tail protocol is not served by this Scribe.
     #[error("unsupported tail protocol version {version}")]
     UnsupportedProtocol { version: u16 },
@@ -427,6 +1127,15 @@ fn binding_from_wire(
         crate::catalog::TableRef::new(namespace, &binding.table),
     ))
     .map_err(|_| TailReadError::Binding)
+}
+
+/// Builds the domain-qualified table identity used by signed private tickets.
+fn canonical_table_name(namespace: &str, table: &str) -> String {
+    if namespace.starts_with("vala.") {
+        format!("{namespace}.{table}")
+    } else {
+        format!("vala.{namespace}.{table}")
+    }
 }
 
 /// Parses the validated wire event-day into the local memtable partition key.
@@ -572,6 +1281,9 @@ fn encode_record_batch(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u
 struct FenceRegistry {
     /// Fences currently retaining shallow Scribe Arrow arrays.
     retained: HashMap<tail::TailFenceId, RetainedFence>,
+    /// Released ownership tombstones retained until the original fence expiry.
+    /// A tombstone makes duplicate release idempotent without reopening state.
+    released: HashMap<tail::TailFenceId, (Instant, tail::TailReadFence)>,
     /// Aggregate Arrow array bytes retained by every live fence.
     retained_bytes: usize,
 }
@@ -613,9 +1325,96 @@ impl ScribeTailReader {
             },
             fences: Mutex::new(FenceRegistry {
                 retained: HashMap::new(),
+                released: HashMap::new(),
                 retained_bytes: 0,
             }),
         }
+    }
+
+    /// Returns the exact local stream incarnation used for ticket validation.
+    #[must_use]
+    pub fn stream_identity(&self) -> StreamIdentity {
+        self.source.stream()
+    }
+
+    /// Returns retained immutable metadata for capability verification.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::CursorOutOfRange`] when the fence is unknown or
+    /// has already expired.
+    pub fn fence_metadata(
+        &self,
+        fence_id: tail::TailFenceId,
+    ) -> Result<tail::TailReadFence, TailReadError> {
+        let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
+            detail: format!("tail fence registry lock poisoned: {error}"),
+        })?;
+        Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
+        registry
+            .retained
+            .get(&fence_id)
+            .map(|retained| retained.fence.clone())
+            .or_else(|| {
+                registry
+                    .released
+                    .get(&fence_id)
+                    .map(|(_, fence)| fence.clone())
+            })
+            .ok_or(TailReadError::CursorOutOfRange)
+    }
+
+    /// Lists active event-day scopes for one authenticated tenant/table.
+    ///
+    /// This is intentionally metadata-only.  It does not allocate a fence or
+    /// expose row state; callers must acquire an exact fence for every returned
+    /// day before reading data.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::Binding`] for an invalid wire binding and
+    /// [`TailReadError::State`] when the Scribe snapshot cannot be read.
+    pub fn list_active_streams(
+        &self,
+        binding: &tail::TenantTableBinding,
+    ) -> Result<Vec<(tail::EventDay, tail::TailStreamIdentity)>, TailReadError> {
+        let binding = binding_from_wire(binding)?;
+        let keys = self
+            .source
+            .active_seal_keys_for_tenant(binding.tenant)
+            .map_err(|error| TailReadError::State {
+                detail: error.to_string(),
+            })?;
+        tracing::debug!(
+            tenant = %binding.tenant,
+            table = %binding.table_ref,
+            active_key_count = keys.len(),
+            active_keys = ?keys,
+            "listed active Scribe tail keys"
+        );
+        let stream = self.source.stream();
+        let writer_epoch =
+            u64::try_from(stream.writer_epoch.as_i64()).map_err(|_| TailReadError::State {
+                detail: "Scribe writer epoch is negative".to_owned(),
+            })?;
+        let mut days = keys
+            .into_iter()
+            .filter(|key| key.table == binding.table_ref)
+            .map(|key| key.day.as_string())
+            .collect::<Vec<_>>();
+        days.sort();
+        days.dedup();
+        Ok(days
+            .into_iter()
+            .filter_map(|day| tail::EventDay::new(day).ok())
+            .map(|day| {
+                (
+                    day,
+                    tail::TailStreamIdentity {
+                        node_id: tail::NodeId::new(stream.node_id.as_uuid()),
+                        writer_epoch,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Acquires metadata for one exact `(exclusive, inclusive]` shallow interval.
@@ -707,7 +1506,11 @@ impl ScribeTailReader {
             detail: format!("tail fence registry lock poisoned: {error}"),
         })?;
         Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
-        if registry.retained.len() >= self.config.max_fences
+        let ownership_count = registry
+            .retained
+            .len()
+            .saturating_add(registry.released.len());
+        if ownership_count >= self.config.max_fences
             || registry.retained_bytes.saturating_add(retained_bytes)
                 > self.config.max_retained_bytes
         {
@@ -773,6 +1576,7 @@ impl ScribeTailReader {
         request: tail::TailPageRequest,
     ) -> Result<LocalTailPage, TailReadError> {
         let tail::TailPageRequest {
+            query_id: _,
             fence_id,
             after,
             max_rows,
@@ -895,12 +1699,22 @@ impl ScribeTailReader {
         }) {
             return Err(TailReadError::AccessDenied);
         }
-        let Some(retained) = registry.retained.remove(&fence_id) else {
+        let Some(_retained) = registry.retained.get(&fence_id) else {
+            if registry.released.contains_key(&fence_id) {
+                return Ok(FenceRelease { released: true });
+            }
             return Ok(FenceRelease { released: false });
         };
+        let retained = registry
+            .retained
+            .remove(&fence_id)
+            .expect("retained fence remains present while registry lock is held");
         registry.retained_bytes = registry
             .retained_bytes
             .saturating_sub(retained.retained_bytes);
+        registry
+            .released
+            .insert(fence_id, (retained.expires_at, retained.fence));
         metrics::counter!("bifrost_tail_fences_total", "outcome" => "released").increment(1);
         Ok(FenceRelease { released: true })
     }
@@ -935,6 +1749,15 @@ impl ScribeTailReader {
                     .retained_bytes
                     .saturating_sub(retained.retained_bytes);
             }
+        }
+        let expired_tombstones = registry
+            .released
+            .iter()
+            .filter_map(|(fence_id, (expiry, _))| (*expiry <= now).then_some(*fence_id))
+            .take(max)
+            .collect::<Vec<_>>();
+        for fence_id in expired_tombstones {
+            registry.released.remove(&fence_id);
         }
         if !expired.is_empty() {
             metrics::counter!("bifrost_tail_fences_total", "outcome" => "expired")
@@ -1074,6 +1897,29 @@ impl FetchLiveTailService {
     #[must_use]
     pub fn stream(&self) -> StreamIdentity {
         self.stream
+    }
+
+    /// Lists the tenant-owned table/day scopes that still have live Scribe
+    /// state.  The list is a point-in-time discovery cut; retirement is driven
+    /// by the durable file-list commit and therefore naturally removes a key
+    /// from subsequent cuts.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when a shard inspection snapshot or test
+    /// memtable lock cannot be read.
+    pub fn active_seal_keys_for_tenant(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
+        if let Some(memtable) = &self.memtable {
+            return memtable.seal_keys_for_tenant(tenant);
+        }
+        self.shards
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "tail source has no shard runtime".to_owned(),
+            })?
+            .active_seal_keys_for_tenant(tenant)
     }
 
     /// Return the canonical pod-local shard for a live-tail scope.
@@ -1269,19 +2115,27 @@ fn encode_arrow_batch(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::{FetchLiveTailService, ScribeTailReader, TailFenceConfig, cursor_cmp};
+    use super::{
+        FetchLiveTailService, LocalTailReadTransport, ScribeTailReader, TailFenceConfig,
+        TailReadError, TailReadTransport, TailTicketAudience, TailTicketBinding, TailTicketClaims,
+        TailTicketVerifier, cursor_cmp,
+    };
     use crate::scribe::memtable::Memtable;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::vala::api as tail;
     use wyrd_spec::vala::api::{
-        AcquireTailFenceRequest, EventDay, SchemaFingerprint, TailCursor, TenantTableBinding,
+        AcquireTailFenceRequest, EventDay, SchemaFingerprint, TailCursor, TailPageRequest,
+        TenantTableBinding,
     };
 
     /// Builds one valid empty-interval request for opportunistic registry tests.
     fn empty_fence_request(tenant: DataTenantId) -> AcquireTailFenceRequest {
         AcquireTailFenceRequest {
+            query_id: uuid::Uuid::nil(),
             binding: TenantTableBinding {
                 tenant_id: tenant,
                 namespace: "bifrost".to_owned(),
@@ -1301,6 +2155,108 @@ mod tests {
         }
     }
 
+    /// Test verifier that records query-binding failures before allocation.
+    struct BindingProbe {
+        /// Claims returned by the synthetic ticket decoder.
+        claims: TailTicketClaims,
+        /// Number of binding failures observed by the audit hook.
+        audited: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TailTicketVerifier for BindingProbe {
+        async fn verify_tail_ticket_unbound(
+            &self,
+            _encoded: &[u8],
+            _audience: TailTicketAudience,
+        ) -> Result<TailTicketClaims, TailReadError> {
+            Ok(self.claims.clone())
+        }
+
+        async fn verify_tail_ticket_binding(
+            &self,
+            claims: &TailTicketClaims,
+            binding: &TailTicketBinding,
+        ) -> Result<(), TailReadError> {
+            if claims
+                .validate_binding(
+                    binding.query_id,
+                    binding.tenant_id,
+                    &binding.canonical_table,
+                    binding.node_id,
+                    binding.writer_epoch,
+                    binding.deadline,
+                )
+                .is_err()
+            {
+                self.audited.fetch_add(1, Ordering::SeqCst);
+                return Err(TailReadError::Authorization {
+                    detail: "query binding mismatch".to_owned(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn verify_tail_ticket(
+            &self,
+            _encoded: &[u8],
+            _expected: &TailTicketClaims,
+        ) -> Result<(), TailReadError> {
+            Ok(())
+        }
+
+        async fn verify_tail_capability(
+            &self,
+            _encoded: &[u8],
+            _query_id: uuid::Uuid,
+            _tenant_id: DataTenantId,
+            _canonical_table: &str,
+            _fence: &tail::TailReadFence,
+            _audience: TailTicketAudience,
+        ) -> Result<(), TailReadError> {
+            Ok(())
+        }
+    }
+
+    /// Local acquire rejects query-B against a query-A ticket before allocation.
+    #[tokio::test]
+    async fn local_acquire_query_binding_rejects_without_allocation() {
+        let tenant = DataTenantId::new_v7();
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let reader = Arc::new(ScribeTailReader::new(
+            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            TailFenceConfig::default(),
+        ));
+        let claims = TailTicketClaims {
+            query_id: uuid::Uuid::now_v7(),
+            tenant_id: tenant,
+            canonical_table: "vala.bifrost.events".to_owned(),
+            node_id: stream.node_id.as_uuid(),
+            writer_epoch: 1,
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+            audience: TailTicketAudience::Acquire,
+            nonce: vec![7; 16],
+        };
+        let audited = Arc::new(AtomicUsize::new(0));
+        let transport = LocalTailReadTransport::with_authority(
+            Arc::clone(&reader),
+            Arc::new(BindingProbe {
+                claims,
+                audited: Arc::clone(&audited),
+            }),
+        );
+        let mut request = empty_fence_request(tenant);
+        request.query_id = uuid::Uuid::now_v7();
+        assert!(
+            transport
+                .acquire_fence_with_ticket(request, Vec::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(audited.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.expire_due(Instant::now(), 64).retained, 0);
+    }
+
     /// Rejects cursor ordering across two independent writer epochs.
     #[test]
     fn cursor_rejects_cross_epoch_comparison() {
@@ -1317,6 +2273,34 @@ mod tests {
             row_ordinal: 0,
         };
         assert!(cursor_cmp(&first, &second).is_err());
+    }
+
+    /// Rejects a signed ticket tuple when the caller changes the tenant binding.
+    #[test]
+    fn ticket_binding_rejects_cross_tenant_request() {
+        let signed_tenant = DataTenantId::new_v7();
+        let requested_tenant = DataTenantId::new_v7();
+        let claims = TailTicketClaims {
+            query_id: uuid::Uuid::new_v4(),
+            tenant_id: signed_tenant,
+            canonical_table: "vala.bifrost.events".to_owned(),
+            node_id: uuid::Uuid::new_v4(),
+            writer_epoch: 7,
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+            audience: TailTicketAudience::Acquire,
+            nonce: vec![1; 16],
+        };
+        assert!(matches!(
+            claims.validate_binding(
+                claims.query_id,
+                requested_tenant,
+                &claims.canonical_table,
+                claims.node_id,
+                claims.writer_epoch,
+                claims.deadline,
+            ),
+            Err(TailReadError::Authorization { .. })
+        ));
     }
 
     /// Reclaims abandoned expired capacity during a later production acquisition.
@@ -1354,5 +2338,105 @@ mod tests {
         assert_eq!(registry.retained.len(), 1);
         assert!(!registry.retained.contains_key(&first.fence_id));
         assert!(registry.retained.contains_key(&second.fence_id));
+    }
+
+    /// Counts active fences and valid tombstones against one ownership budget.
+    #[tokio::test]
+    async fn release_tombstones_respect_configured_capacity() {
+        let tenant = DataTenantId::new_v7();
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let reader = ScribeTailReader::new(
+            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            TailFenceConfig {
+                max_fences: 2,
+                ..TailFenceConfig::default()
+            },
+        );
+        let first = reader
+            .acquire_fence(empty_fence_request(tenant))
+            .await
+            .expect("first fence acquires");
+        let second = reader
+            .acquire_fence(empty_fence_request(tenant))
+            .await
+            .expect("second fence acquires");
+        reader
+            .release_fence(first.fence_id)
+            .expect("first release creates tombstone");
+        let second_release = reader
+            .release_fence(second.fence_id)
+            .expect("active release succeeds at ownership saturation");
+        assert!(second_release.released);
+        assert!(
+            reader
+                .release_fence(second.fence_id)
+                .expect("duplicate release remains idempotent")
+                .released
+        );
+        let registry = reader.fences.lock().expect("registry lock");
+        assert!(!registry.retained.contains_key(&second.fence_id));
+        assert_eq!(registry.retained_bytes, 0);
+        assert_eq!(registry.released.len(), 2);
+        assert!(
+            registry.released.contains_key(&first.fence_id),
+            "oldest valid tombstone remains idempotent"
+        );
+        drop(registry);
+        assert!(
+            reader
+                .release_fence(first.fence_id)
+                .expect("oldest tombstone duplicate release")
+                .released
+        );
+        assert!(matches!(
+            reader.acquire_fence(empty_fence_request(tenant)).await,
+            Err(TailReadError::Capacity)
+        ));
+        let mut registry = reader.fences.lock().expect("registry lock");
+        for (expiry, _) in registry.released.values_mut() {
+            *expiry = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("one second is within monotonic range");
+        }
+        drop(registry);
+        reader
+            .acquire_fence(empty_fence_request(tenant))
+            .await
+            .expect("expired tombstones permit a new fence");
+    }
+
+    /// Concurrent duplicate page reads observe the same immutable fence snapshot.
+    #[tokio::test]
+    async fn concurrent_duplicate_pages_are_equal() {
+        let tenant = DataTenantId::new_v7();
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let reader = Arc::new(ScribeTailReader::new(
+            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            TailFenceConfig::default(),
+        ));
+        let fence = reader
+            .acquire_fence(empty_fence_request(tenant))
+            .await
+            .expect("fence acquires");
+        let request = TailPageRequest {
+            query_id: uuid::Uuid::nil(),
+            fence_id: fence.fence_id,
+            after: None,
+            max_rows: 16,
+            max_encoded_bytes: 4096,
+        };
+        let left_reader = Arc::clone(&reader);
+        let right_reader = Arc::clone(&reader);
+        let left_request = request.clone();
+        let right_request = request;
+        let (left, right) = tokio::join!(
+            tokio::task::spawn_blocking(move || left_reader.read_page(&left_request)),
+            tokio::task::spawn_blocking(move || right_reader.read_page(&right_request)),
+        );
+        let left = left.expect("left task").expect("left page");
+        let right = right.expect("right task").expect("right page");
+        assert_eq!(left.complete, right.complete);
+        assert_eq!(left.next, right.next);
+        assert_eq!(left.batches, right.batches);
     }
 }

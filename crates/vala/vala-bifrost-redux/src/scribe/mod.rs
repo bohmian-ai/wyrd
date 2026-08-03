@@ -245,6 +245,8 @@ pub struct ScribeEmbeddedConfig {
     pub admission: AdmissionConfig,
     /// Runtime used for Scribe coordination tasks.
     pub coordination_runtime: Handle,
+    /// Optional tenant-scoped immutable persistence runtime.
+    pub persistence: Option<ScribePersistenceConfig>,
     /// Optional server-provisioned Scribe child budget.
     pub memory_budget: Option<memory::ScribeMemoryBudget>,
     /// Optional bounded publisher for post-commit Forge wake-ups.
@@ -314,6 +316,7 @@ impl ScribeImpl {
                 lane_config: ScribeLaneConfig::resolved(),
                 admission,
                 coordination_runtime: Handle::current(),
+                persistence: None,
                 memory_budget: None,
                 staging_file_publisher: None,
             },
@@ -366,7 +369,7 @@ impl ScribeImpl {
             admission: config.admission,
             coordination_runtime: config.coordination_runtime,
             execution_pools,
-            persistence: None,
+            persistence: config.persistence,
             memory_budget: config.memory_budget,
             staging_file_publisher: None,
         }))
@@ -447,6 +450,7 @@ impl ScribeImpl {
                 lane_config,
                 admission,
                 coordination_runtime,
+                persistence: None,
                 memory_budget: None,
                 staging_file_publisher: None,
             },
@@ -490,7 +494,7 @@ impl ScribeImpl {
                 ),
                 ScribeWalIoPool::new_with_capacity(config.lane_config.wal_io_threads, 256),
             ),
-            persistence: None,
+            persistence: config.persistence,
             memory_budget: config.memory_budget,
             staging_file_publisher: config.staging_file_publisher,
         })
@@ -687,13 +691,19 @@ impl ScribeImpl {
         } else {
             false
         };
-        self.close_lanes();
         if graceful {
             graceful = await_shutdown_phase(deadline, self.shards.drain()).await;
+        }
+        // Stop new persistence submissions only after the final shard flush.
+        // Keep the CPU and WAL lanes open while already-queued generations
+        // finish encoding and publish their file-list rows.
+        if graceful && let Some(persistence) = &self.persistence {
+            persistence.close();
         }
         if graceful && let Some(persistence) = &self.persistence {
             graceful = await_shutdown_phase(deadline, persistence.drain()).await;
         }
+        self.close_lanes();
         if graceful {
             graceful = await_shutdown_phase(deadline, self.shards.shutdown(deadline)).await;
         }

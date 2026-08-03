@@ -64,10 +64,16 @@ where
         .add_service(query.into_server())
         .add_service(bifrost_query.into_server());
     let router = if let Some(ingest_runtime) = &state.bifrost_ingest {
-        router.add_service(
-            scribe_tail::ScribeTailGrpc::new(state.clone(), ingest_runtime.tail_reader())
+        router.add_service(match ingest_runtime.tail_authority() {
+            Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
+                state.clone(),
+                ingest_runtime.tail_reader(),
+                authority,
+            )
+            .into_server(),
+            None => scribe_tail::ScribeTailGrpc::new(state.clone(), ingest_runtime.tail_reader())
                 .into_server(),
-        )
+        })
     } else {
         router
     };

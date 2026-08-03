@@ -18,12 +18,14 @@ mod pg_tests {
     use std::time::{Duration, Instant};
 
     use chrono::{Duration as ChronoDuration, NaiveDate};
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::catalog::TableRef;
     use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
+    use vala_bifrost_redux::scribe::tail_rpc::{
+        TailTicketAudience, TailTicketClaims, TailTicketMinter,
+    };
     use vala_bifrost_redux::scribe::{
         ScribeImpl,
         tail_rpc::{LocalTailReadTransport, TailReadTransport, TonicTailReadTransport},
@@ -38,10 +40,10 @@ mod pg_tests {
     use wyrd_server::AppState;
     use wyrd_server::components::auth::ServerAuth;
     use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
-    use wyrd_server::postgres::ServerPostgres;
+    use wyrd_server::oracle::{PostgresTailSecurityAudit, ScribeTailAuthority};
     use wyrd_server::state::BifrostIngestRuntime;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -66,11 +68,8 @@ mod pg_tests {
 
     /// Builds one process fixture and returns the temporary roots that keep its IO live.
     async fn test_state() -> (AppState, tempfile::TempDir, tempfile::TempDir) {
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let postgres = Arc::new(ServerPostgres::from_parts(
-            wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
-            vala_sql::ValaPostgres::from_pool(app_pool.clone()),
-        ));
+        let postgres = support::test_server_postgres().await;
+        let app_pool = postgres.app_pool().clone();
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let issuing_key = Arc::new(
@@ -115,13 +114,28 @@ mod pg_tests {
             &uuid::Uuid::now_v7().to_string(),
             1,
         ));
-        let ingest = Arc::new(BifrostIngestRuntime::new(
-            scribe,
-            Arc::clone(&redux_catalog),
-            Arc::clone(&verifier),
-            vala_bifrost_redux::gate::limits::IngestLimits::default(),
-            None,
-        ));
+        let tail_audit = Arc::new(
+            PostgresTailSecurityAudit::try_new(postgres.as_ref())
+                .await
+                .expect("tail audit requires the system sentinel"),
+        );
+        let tail_authority = Arc::new(
+            ScribeTailAuthority::from_pem(
+                &secrecy::SecretString::from(PRIVATE_KEY_PEM.to_owned()),
+                tail_audit,
+            )
+            .expect("tail authority loads"),
+        );
+        let ingest = Arc::new(
+            BifrostIngestRuntime::new(
+                scribe,
+                Arc::clone(&redux_catalog),
+                Arc::clone(&verifier),
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
+                None,
+            )
+            .with_tail_authority(tail_authority),
+        );
         let gate = ingest.gate();
         (
             AppState::new(postgres, storage, catalog)
@@ -214,6 +228,7 @@ mod pg_tests {
             false,
         )]));
         DomainAcquireTailFenceRequest {
+            query_id: uuid::Uuid::now_v7(),
             binding: TenantTableBinding {
                 tenant_id: tenant,
                 namespace: "bifrost".to_owned(),
@@ -231,6 +246,31 @@ mod pg_tests {
                 .expect("fixture fingerprint is valid"),
             tail_protocol_version: 1,
         }
+    }
+
+    /// Mints the private acquire ticket bound to the fixture's exact stream tuple.
+    fn mint_tail_ticket(state: &AppState, request: &DomainAcquireTailFenceRequest) -> Vec<u8> {
+        let ingest = state
+            .bifrost_ingest
+            .as_ref()
+            .expect("fixture retains ingest runtime");
+        let authority = ingest
+            .tail_authority()
+            .expect("fixture retains tail authority");
+        let stream = ingest.tail_reader().stream_identity();
+        authority
+            .mint_tail_ticket(&TailTicketClaims {
+                query_id: request.query_id,
+                tenant_id: request.binding.tenant_id,
+                canonical_table: "vala.bifrost.events".to_owned(),
+                node_id: stream.node_id.as_uuid(),
+                writer_epoch: u64::try_from(stream.writer_epoch.as_i64())
+                    .expect("fixture epoch is non-negative"),
+                deadline: request.deadline,
+                audience: TailTicketAudience::Acquire,
+                nonce: vec![7; 16],
+            })
+            .expect("fixture tail ticket signs")
     }
 
     /// Creates the server-verified identity used to seed the embedded Scribe.
@@ -452,14 +492,17 @@ mod pg_tests {
             &mint_service_jwt(&state, tenant),
         )
         .expect("workload token configures remote transport");
-        let remote_fence = remote
-            .acquire_fence(request)
+        let query_id = request.query_id;
+        let remote_lease = remote
+            .acquire_fence_with_capability(request.clone(), mint_tail_ticket(&state, &request))
             .await
-            .expect("remote metadata fence acquires");
+            .expect("remote metadata fence and capability acquire");
+        let remote_fence = remote_lease.fence.clone();
         assert_eq!(local_fence.inclusive_live, remote_fence.inclusive_live);
 
         let local_first = local
             .read_page(DomainTailPageRequest {
+                query_id,
                 fence_id: local_fence.fence_id,
                 after: None,
                 max_rows: 1,
@@ -468,12 +511,16 @@ mod pg_tests {
             .await
             .expect("local first page reads");
         let remote_first = remote
-            .read_page(DomainTailPageRequest {
-                fence_id: remote_fence.fence_id,
-                after: None,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            })
+            .read_page_with_capability(
+                DomainTailPageRequest {
+                    query_id,
+                    fence_id: remote_fence.fence_id,
+                    after: None,
+                    max_rows: 1,
+                    max_encoded_bytes: 1024 * 1024,
+                },
+                remote_lease.capability.clone(),
+            )
             .await
             .expect("remote first page reads");
         assert_eq!(local_first.batches, remote_first.batches);
@@ -483,6 +530,7 @@ mod pg_tests {
 
         let local_second = local
             .read_page(DomainTailPageRequest {
+                query_id,
                 fence_id: local_fence.fence_id,
                 after: local_first.next,
                 max_rows: 1,
@@ -491,12 +539,16 @@ mod pg_tests {
             .await
             .expect("local continuation reads");
         let remote_second = remote
-            .read_page(DomainTailPageRequest {
-                fence_id: remote_fence.fence_id,
-                after: remote_first.next,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            })
+            .read_page_with_capability(
+                DomainTailPageRequest {
+                    query_id,
+                    fence_id: remote_fence.fence_id,
+                    after: remote_first.next,
+                    max_rows: 1,
+                    max_encoded_bytes: 1024 * 1024,
+                },
+                remote_lease.capability.clone(),
+            )
             .await
             .expect("remote continuation reads");
         assert_eq!(local_second.batches, remote_second.batches);
@@ -511,7 +563,7 @@ mod pg_tests {
                 .released
         );
         remote
-            .release_fence(remote_fence.fence_id)
+            .release_fence_with_capability(query_id, remote_fence.fence_id, remote_lease.capability)
             .await
             .expect("remote fence release succeeds");
         shutdown.cancel();
@@ -523,6 +575,8 @@ mod pg_tests {
         let (state, _storage_root, _wal_root) = test_state().await;
         let owner_tenant = DataTenantId::new_v7();
         let other_tenant = DataTenantId::new_v7();
+        support::seed_test_tenant(owner_tenant, "tail-owner").await;
+        support::seed_test_tenant(other_tenant, "tail-other").await;
         seed_tail_rows(&state, owner_tenant).await;
 
         let (_, health_service) = health_reporter();
@@ -545,15 +599,40 @@ mod pg_tests {
             &mint_service_jwt(&state, owner_tenant),
         )
         .expect("owner transport configures");
-        let fence = owner
-            .acquire_fence(non_empty_tail_request(owner_tenant))
+        let owner_request = non_empty_tail_request(owner_tenant);
+        let owner_query_id = owner_request.query_id;
+        let owner_lease = owner
+            .acquire_fence_with_capability(
+                owner_request.clone(),
+                mint_tail_ticket(&state, &owner_request),
+            )
             .await
             .expect("owner fence acquires");
+        let fence = owner_lease.fence.clone();
+        let assertion_pool = support::test_superuser_pool().await;
+
+        let (owner_seq_before, owner_count_before): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
+        )
+        .bind(owner_tenant.as_uuid())
+        .fetch_one(&assertion_pool)
+        .await
+        .expect("owner tail-security audit baseline");
+        let system_seq_before: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .fetch_one(&assertion_pool)
+        .await
+        .expect("system audit-chain baseline");
 
         let other_jwt = mint_service_jwt(&state, other_tenant);
         let mut client = ScribeTailServiceClient::new(channel);
-        let mut page = Request::new(
+        let mut page: Request<wyrd_tonic::wyrd::v1::TailPageRequest> = Request::new(
             DomainTailPageRequest {
+                query_id: owner_query_id,
                 fence_id: fence.fence_id,
                 after: None,
                 max_rows: 1,
@@ -561,6 +640,7 @@ mod pg_tests {
             }
             .into(),
         );
+        page.get_mut().tail_capability = owner_lease.capability.clone();
         page.metadata_mut().insert(
             "x-wyrd-access-token",
             format!("Bearer {other_jwt}")
@@ -573,8 +653,34 @@ mod pg_tests {
             .expect_err("foreign tenant cannot read retained rows");
         assert_eq!(page_status.code(), Code::PermissionDenied);
 
+        let owner_jwt = mint_service_jwt(&state, owner_tenant);
+        let mut wrong_query_page: Request<wyrd_tonic::wyrd::v1::TailPageRequest> = Request::new(
+            DomainTailPageRequest {
+                query_id: uuid::Uuid::now_v7(),
+                fence_id: fence.fence_id,
+                after: None,
+                max_rows: 1,
+                max_encoded_bytes: 1024 * 1024,
+            }
+            .into(),
+        );
+        wrong_query_page.get_mut().tail_capability = owner_lease.capability.clone();
+        wrong_query_page.metadata_mut().insert(
+            "x-wyrd-access-token",
+            format!("Bearer {owner_jwt}")
+                .parse()
+                .expect("metadata value"),
+        );
+        let wrong_query_status = client
+            .read_fence_page(wrong_query_page)
+            .await
+            .expect_err("query mismatch cannot read retained rows");
+        assert_eq!(wrong_query_status.code(), Code::PermissionDenied);
+
         let mut release = Request::new(ReleaseTailFenceRequest {
+            query_id: owner_query_id.as_bytes().to_vec(),
             fence_id: fence.fence_id.as_uuid().as_bytes().to_vec(),
+            tail_capability: owner_lease.capability.clone(),
         });
         release.metadata_mut().insert(
             "x-wyrd-access-token",
@@ -588,18 +694,110 @@ mod pg_tests {
             .expect_err("foreign tenant cannot remove retained rows");
         assert_eq!(release_status.code(), Code::PermissionDenied);
 
+        let mut wrong_query_release = Request::new(ReleaseTailFenceRequest {
+            query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            fence_id: fence.fence_id.as_uuid().as_bytes().to_vec(),
+            tail_capability: owner_lease.capability.clone(),
+        });
+        wrong_query_release.metadata_mut().insert(
+            "x-wyrd-access-token",
+            format!("Bearer {owner_jwt}")
+                .parse()
+                .expect("metadata value"),
+        );
+        let wrong_query_release_status = client
+            .release_fence(wrong_query_release)
+            .await
+            .expect_err("query mismatch cannot release retained rows");
+        assert_eq!(wrong_query_release_status.code(), Code::PermissionDenied);
+
+        let security_rows: Vec<(
+            uuid::Uuid,
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT data_tenant_id, principal_id, principal_kind, auth_method, permission, \
+                    decision, result, detail::text \
+             FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security' AND seq > $2 \
+             ORDER BY seq",
+        )
+        .bind(owner_tenant.as_uuid())
+        .bind(owner_seq_before)
+        .fetch_all(&assertion_pool)
+        .await
+        .expect("durable tail-security audit rows");
+        assert_eq!(
+            security_rows.len() as i64,
+            4,
+            "one committed TailBinding row per denied page/release request"
+        );
+        let owner_count_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
+        )
+        .bind(owner_tenant.as_uuid())
+        .fetch_one(&assertion_pool)
+        .await
+        .expect("owner tail-security audit observation");
+        assert_eq!(owner_count_after - owner_count_before, 4);
+        for (
+            data_tenant_id,
+            principal_id,
+            principal_kind,
+            auth_method,
+            permission,
+            decision,
+            result,
+            detail,
+        ) in security_rows
+        {
+            assert_eq!(data_tenant_id, owner_tenant.as_uuid());
+            assert_eq!(principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
+            assert_eq!(principal_kind, "service");
+            assert_eq!(auth_method, "internal");
+            assert_eq!(permission, "bifrost:query:tail");
+            assert_eq!(decision, "deny");
+            assert_eq!(result, "failure");
+            let detail: serde_json::Value =
+                serde_json::from_str(&detail.expect("security detail is present"))
+                    .expect("security detail is valid JSON");
+            assert_eq!(detail["kind"], "bifrost_security_violation");
+            assert_eq!(detail["violation"], "tail_binding");
+            assert_eq!(detail["phase"], "peer");
+            assert!(detail["query_digest"].is_null());
+        }
+        let system_seq_after: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .fetch_one(&assertion_pool)
+        .await
+        .expect("system audit-chain observation");
+        assert_eq!(system_seq_after, system_seq_before);
+
         let owner_page = owner
-            .read_page(DomainTailPageRequest {
-                fence_id: fence.fence_id,
-                after: None,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            })
+            .read_page_with_capability(
+                DomainTailPageRequest {
+                    query_id: owner_query_id,
+                    fence_id: fence.fence_id,
+                    after: None,
+                    max_rows: 1,
+                    max_encoded_bytes: 1024 * 1024,
+                },
+                owner_lease.capability.clone(),
+            )
             .await
             .expect("denied release leaves the owner fence readable");
         assert_eq!(owner_page.batches.len(), 1);
         owner
-            .release_fence(fence.fence_id)
+            .release_fence_with_capability(owner_query_id, fence.fence_id, owner_lease.capability)
             .await
             .expect("owner can still release its fence");
         shutdown.cancel();

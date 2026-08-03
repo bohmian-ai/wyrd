@@ -480,8 +480,17 @@ fn register_session_table(
             .map_err(|error| map_datafusion_error(&error))?;
         schema
     };
+    let alias = Arc::clone(&provider);
     schema
         .register_table(binding.table_name.clone(), provider)
+        .map_err(|error| map_datafusion_error(&error))?;
+    // Keep the canonical three-part hierarchy while also accepting the
+    // public quoted-FQN form (`"vala.traces.spans"`). DataFusion resolves a
+    // quoted dotted identifier as one table under its default
+    // `datafusion.public` catalog; this alias preserves that SQL spelling
+    // without changing the canonical 1/2/3-part identifier resolution.
+    session
+        .register_table(TableReference::bare(binding.table_ref.fqn()), alias)
         .map_err(|error| map_datafusion_error(&error))?;
     Ok(())
 }
@@ -493,9 +502,41 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::execution::context::SessionContext;
+    use std::sync::Arc;
 
-    use super::OraclePlanner;
+    use super::{OraclePlanner, register_session_table};
+    use crate::catalog::{TableRef, TenantTableBinding};
+    use crate::namespaces::BifrostNamespace;
     use crate::oracle::BifrostError;
+    use wyrd_spec::DataTenantId;
+
+    /// Both canonical hierarchy and quoted dotted-FQN SQL resolve identically.
+    #[tokio::test]
+    async fn quoted_dotted_identifier_resolves_alongside_canonical_name() {
+        let session = SessionContext::new();
+        let binding = TenantTableBinding::resolve((
+            DataTenantId::new(uuid::Uuid::now_v7()).expect("test tenant identity"),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("test table binding");
+        let provider = MemTable::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Vec::new()],
+        )
+        .expect("schema-only provider");
+        register_session_table(&session, &binding, Arc::new(provider))
+            .expect("register canonical and quoted aliases");
+
+        for sql in [
+            "SELECT * FROM vala.traces.spans",
+            "SELECT * FROM \"vala.traces.spans\"",
+        ] {
+            session
+                .sql(sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql} must resolve: {error}"));
+        }
+    }
 
     /// Rejects a typed plan whose scan was not replaced by an authenticated provider.
     #[tokio::test]

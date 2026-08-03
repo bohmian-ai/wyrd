@@ -418,6 +418,30 @@ pub(crate) struct ScribeShardStartConfig {
 }
 
 impl ScribeShardRuntime {
+    /// Returns every writable or pending immutable seal key for one tenant.
+    ///
+    /// The result is assembled from owner-published snapshots, so discovery
+    /// never traverses another shard's mutable state and remains safe for the
+    /// private list-active-streams RPC.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when an owner inspection snapshot is
+    /// poisoned or unavailable.
+    pub(crate) fn active_seal_keys_for_tenant(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
+        let mut keys = self
+            .memtable_snapshots()?
+            .into_iter()
+            .flat_map(|snapshot| snapshot.bucket_memory)
+            .filter_map(|bucket| (bucket.seal_key.tenant == tenant).then_some(bucket.seal_key))
+            .collect::<Vec<_>>();
+        keys.sort_by_key(ToString::to_string);
+        keys.dedup();
+        Ok(keys)
+    }
+
     /// Closes shard admission before any potentially stalled graceful wait.
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);

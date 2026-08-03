@@ -6,6 +6,36 @@
 
 use super::*;
 
+/// One query-scoped live-tail route discovered from an authoritative Scribe.
+pub struct DiscoveredTailRoute {
+    /// Event day retained by the Scribe stream.
+    pub event_day: wyrd_spec::vala::api::EventDay,
+    /// Exact node and writer epoch returned by discovery.
+    pub stream: wyrd_spec::vala::api::TailStreamIdentity,
+    /// Authorized transport to that exact Scribe incarnation.
+    pub transport: Arc<dyn TailReadTransport>,
+}
+
+/// Query-scoped resolver for live Scribe streams.
+#[async_trait::async_trait]
+pub trait TailStreamDiscovery: Send + Sync {
+    /// Refreshes authoritative membership and lists active streams for one binding.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryVisibilityUnavailable`] for stale membership,
+    /// authorization, TLS, discovery, or audit failures.
+    async fn discover(
+        &self,
+        binding: &wyrd_spec::vala::api::TenantTableBinding,
+        query_id: uuid::Uuid,
+        deadline: Instant,
+    ) -> Result<Vec<DiscoveredTailRoute>, crate::scribe::tail_rpc::TailReadError>;
+
+    /// Toggles a test-tier discovery outage without changing production behavior.
+    #[cfg(feature = "test-support")]
+    fn set_unavailable_for_test(&self, _unavailable: bool) {}
+}
+
 /// Maximum joined cleanup time for every fence after the query deadline has failed.
 ///
 /// Cleanup receives a fresh private budget so an expired query deadline cannot
@@ -34,6 +64,14 @@ pub(super) struct TailFenceDrainer<'a> {
     pub(super) cancellation: CancellationToken,
     /// Caller-selected strict or degraded live-source failure policy.
     pub(super) freshness: wyrd_spec::vala::api::FreshnessPolicy,
+    /// Query identity bound into private Scribe-tail tickets.
+    pub(super) query_id: uuid::Uuid,
+    /// Server-owned domain-separated ticket signer.
+    pub(super) ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
+    /// Authoritative role membership used for each query discovery cut.
+    pub(super) cluster: Option<Arc<crate::cluster::ClusterRegistry>>,
+    /// Production query-scoped stream resolver; absent only in unit fixtures.
+    pub(super) discovery: Option<Arc<dyn TailStreamDiscovery>>,
 }
 
 /// One metadata-only acquired fence retained until its post-audit drain.
@@ -44,6 +82,8 @@ pub(super) struct AcquiredTailFence {
     pub(super) transport: Arc<dyn TailReadTransport>,
     /// Immutable fence metadata returned by Scribe.
     pub(super) fence: wyrd_spec::vala::api::TailReadFence,
+    /// Reusable exact-fence capability returned by the tail authority.
+    pub(super) capability: Vec<u8>,
     /// Successful acquisition time used by the hold-duration histogram.
     pub(super) acquired_at: Instant,
     /// Whether every requested page completed before automatic release.
@@ -58,6 +98,8 @@ pub(super) struct TailFenceAcquisition {
     pub(super) transport: Arc<dyn TailReadTransport>,
     /// Validated private request pinning cursor, schema, and deadline metadata.
     pub(super) request: wyrd_spec::vala::api::AcquireTailFenceRequest,
+    /// Single-use signed ticket for this exact query/table/node/epoch scope.
+    pub(super) ticket: Vec<u8>,
 }
 
 /// Bounded live rows and their parent-governor reservations.
@@ -81,26 +123,113 @@ pub(super) struct DrainedTailFence {
     pub(super) reservations: Vec<AccountedMemoryReservation>,
 }
 
+/// Query-scoped dependencies and limits used by [`TailFenceDrainer`].
+pub(super) struct TailFenceDrainerConfig {
+    /// Query telemetry retaining live-tail memory accounting.
+    pub(super) telemetry: Arc<OracleTelemetry>,
+    /// Immutable admission class applied to live-tail memory metrics.
+    pub(super) query_class: QueryClass,
+    /// Absolute deadline shared by fence acquisition and every page read.
+    pub(super) deadline: Instant,
+    /// Admission lifecycle cancellation shared with renewal and streaming.
+    pub(super) cancellation: CancellationToken,
+    /// Caller-selected strict or degraded live-source failure policy.
+    pub(super) freshness: wyrd_spec::vala::api::FreshnessPolicy,
+    /// Query identity bound into private Scribe-tail tickets.
+    pub(super) query_id: uuid::Uuid,
+    /// Server-owned domain-separated ticket signer.
+    pub(super) ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
+    /// Authoritative role membership used for each query discovery cut.
+    pub(super) cluster: Option<Arc<crate::cluster::ClusterRegistry>>,
+    /// Production query-scoped stream resolver; absent only in unit fixtures.
+    pub(super) discovery: Option<Arc<dyn TailStreamDiscovery>>,
+}
+
 impl TailFenceDrainer<'_> {
+    /// Returns the currently live Scribe node identities for route fencing.
+    fn live_scribe_nodes(&self) -> Option<std::collections::HashSet<uuid::Uuid>> {
+        self.cluster.as_ref().and_then(|cluster| {
+            let nodes = cluster
+                .snapshot()
+                .live_scribes()
+                .into_iter()
+                .map(|lease| lease.key.node_id.as_uuid())
+                .collect::<std::collections::HashSet<_>>();
+            (!nodes.is_empty()).then_some(nodes)
+        })
+    }
+
+    /// Converts a pinned catalog binding to the private discovery wire shape.
+    ///
+    /// # Errors
+    /// Returns visibility unavailable when the catalog namespace is malformed.
+    fn wire_binding(
+        cut: &PinnedSealedTable,
+    ) -> Result<wyrd_spec::vala::api::TenantTableBinding, BifrostError> {
+        Ok(wyrd_spec::vala::api::TenantTableBinding {
+            tenant_id: cut.binding.tenant,
+            namespace: cut
+                .binding
+                .logical_namespace
+                .strip_prefix("vala.")
+                .ok_or(BifrostError::QueryVisibilityUnavailable)?
+                .to_owned(),
+            table: cut.binding.table_name.clone(),
+        })
+    }
+
+    /// Mints one query-scoped ticket for an exact Scribe stream.
+    ///
+    /// # Errors
+    /// Returns visibility unavailable when the configured signer rejects the
+    /// claims. Unit fixtures without a signer use an empty ticket.
+    fn mint_tail_ticket(
+        &self,
+        tenant_id: wyrd_spec::DataTenantId,
+        canonical_table: &str,
+        node_id: uuid::Uuid,
+        writer_epoch: u64,
+        deadline: chrono::DateTime<chrono::Utc>,
+        audience: crate::scribe::tail_rpc::TailTicketAudience,
+    ) -> Result<Vec<u8>, BifrostError> {
+        self.ticket_minter
+            .as_ref()
+            .map(|minter| {
+                minter.mint_tail_ticket(&crate::scribe::tail_rpc::TailTicketClaims {
+                    query_id: self.query_id,
+                    tenant_id,
+                    canonical_table: canonical_table.to_owned(),
+                    node_id,
+                    writer_epoch,
+                    deadline,
+                    audience,
+                    nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
+                })
+            })
+            .transpose()
+            .map_err(|_| BifrostError::QueryVisibilityUnavailable)
+            .map(Option::unwrap_or_default)
+    }
+
     /// Creates one query-attempt owner for live-tail acquisition and draining.
     #[must_use]
     pub(super) fn new<'a>(
         tails: &'a TailTransportDirectory,
         memory: &'a OracleMemoryResources,
-        telemetry: Arc<OracleTelemetry>,
-        query_class: QueryClass,
-        deadline: Instant,
-        cancellation: CancellationToken,
-        freshness: wyrd_spec::vala::api::FreshnessPolicy,
+        config: TailFenceDrainerConfig,
     ) -> TailFenceDrainer<'a> {
         TailFenceDrainer {
             tails,
             memory,
-            telemetry,
-            query_class,
-            deadline,
-            cancellation,
-            freshness,
+            telemetry: config.telemetry,
+            query_class: config.query_class,
+            deadline: config.deadline,
+            cancellation: config.cancellation,
+            freshness: config.freshness,
+            query_id: config.query_id,
+            ticket_minter: config.ticket_minter,
+            cluster: config.cluster,
+            discovery: config.discovery,
         }
     }
 
@@ -128,13 +257,24 @@ impl TailFenceDrainer<'_> {
         &self,
         cuts: &[PinnedSealedTable],
     ) -> Result<Vec<AcquiredTailFence>, BifrostError> {
+        if let Some(cluster) = &self.cluster {
+            cluster
+                .refresh_snapshot()
+                .await
+                .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
+        }
         let remaining = self
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(BifrostError::QueryTimeout)?;
         let wire_deadline = chrono::Utc::now()
             + chrono::Duration::from_std(remaining).map_err(|_| BifrostError::QueryTimeout)?;
-        let work = self.plan_acquisitions(cuts, wire_deadline)?;
+        let work = if let Some(discovery) = &self.discovery {
+            self.plan_discovered_acquisitions(cuts, wire_deadline, discovery)
+                .await?
+        } else {
+            self.plan_acquisitions(cuts, wire_deadline)?
+        };
         let mut results = Vec::with_capacity(work.len());
         let mut pending = FuturesUnordered::new();
         for acquisition in work {
@@ -278,6 +418,7 @@ impl TailFenceDrainer<'_> {
         wire_deadline: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<TailFenceAcquisition>, BifrostError> {
         let mut work = Vec::new();
+        let live_nodes = self.live_scribe_nodes();
         for cut in cuts {
             let table = cut.binding.table_ref.fqn();
             let mut streams = std::collections::BTreeMap::<
@@ -320,6 +461,12 @@ impl TailFenceDrainer<'_> {
                     .or_insert((event_day, cursor, transport));
             }
             for route in self.tails.live_streams(&table, cut.binding.tenant) {
+                if live_nodes
+                    .as_ref()
+                    .is_some_and(|nodes| !nodes.contains(&route.node_id))
+                {
+                    continue;
+                }
                 let key = (
                     route.node_id,
                     route.event_day.as_str().to_owned(),
@@ -341,12 +488,125 @@ impl TailFenceDrainer<'_> {
             if streams.is_empty() {
                 return Err(BifrostError::QueryVisibilityUnavailable);
             }
-            for (_, (event_day, exclusive_sealed, transport)) in streams {
-                let request = tail_fence_request(cut, event_day, exclusive_sealed, wire_deadline)?;
+            for ((stream_node_id, _, _), (event_day, exclusive_sealed, transport)) in streams {
+                let request = tail_fence_request(
+                    cut,
+                    event_day,
+                    exclusive_sealed,
+                    wire_deadline,
+                    self.query_id,
+                )?;
+                let ticket = self.mint_tail_ticket(
+                    cut.binding.tenant,
+                    &table,
+                    stream_node_id,
+                    request.exclusive_sealed.writer_epoch,
+                    wire_deadline,
+                    crate::scribe::tail_rpc::TailTicketAudience::Acquire,
+                )?;
                 work.push(TailFenceAcquisition {
                     table: table.clone(),
                     transport,
                     request,
+                    ticket,
+                });
+            }
+        }
+        Ok(work)
+    }
+
+    /// Builds acquisitions from the fresh query-scoped discovery result.
+    async fn plan_discovered_acquisitions(
+        &self,
+        cuts: &[PinnedSealedTable],
+        wire_deadline: chrono::DateTime<chrono::Utc>,
+        discovery: &Arc<dyn TailStreamDiscovery>,
+    ) -> Result<Vec<TailFenceAcquisition>, BifrostError> {
+        let mut work = Vec::new();
+        for cut in cuts {
+            let binding = Self::wire_binding(cut)?;
+            let routes = match discovery
+                .discover(&binding, self.query_id, self.deadline)
+                .await
+            {
+                Ok(routes) => routes,
+                Err(crate::scribe::tail_rpc::TailReadError::State { detail })
+                    if detail.contains("stale") || detail.contains("epoch") =>
+                {
+                    // A lease can rotate between the registry cut and the private
+                    // list RPC.  Allow exactly one fresh resolver cut; never
+                    // silently degrade to an older directory route.
+                    match discovery
+                        .discover(&binding, self.query_id, self.deadline)
+                        .await
+                    {
+                        Ok(routes) => routes,
+                        Err(error) => {
+                            tracing::warn!(
+                                query_id = %self.query_id,
+                                table = %binding.table,
+                                error = ?error,
+                                "query-scoped Scribe tail rediscovery failed"
+                            );
+                            return Err(BifrostError::QueryVisibilityUnavailable);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        query_id = %self.query_id,
+                        table = %binding.table,
+                        error = ?error,
+                        "query-scoped Scribe tail discovery failed"
+                    );
+                    return Err(BifrostError::QueryVisibilityUnavailable);
+                }
+            };
+            for route in routes {
+                let exclusive = cut
+                    .hot_files
+                    .iter()
+                    .filter(|file| {
+                        file.node_id == route.stream.node_id.as_uuid()
+                            && u64::try_from(file.writer_epoch).ok()
+                                == Some(route.stream.writer_epoch)
+                            && file.partition_day.format("%Y-%m-%d").to_string()
+                                == route.event_day.as_str()
+                    })
+                    .map(|file| u64::try_from(file.wal_lsn_max).unwrap_or_default())
+                    .max()
+                    .map(|wal_lsn| wyrd_spec::vala::api::TailCursor {
+                        writer_epoch: route.stream.writer_epoch,
+                        wal_lsn,
+                        batch_id: uuid::Uuid::from_u128(u128::MAX),
+                        row_ordinal: u32::MAX,
+                    })
+                    .unwrap_or(wyrd_spec::vala::api::TailCursor {
+                        writer_epoch: route.stream.writer_epoch,
+                        wal_lsn: 0,
+                        batch_id: uuid::Uuid::nil(),
+                        row_ordinal: 0,
+                    });
+                let request = tail_fence_request(
+                    cut,
+                    route.event_day,
+                    exclusive,
+                    wire_deadline,
+                    self.query_id,
+                )?;
+                let ticket = self.mint_tail_ticket(
+                    cut.binding.tenant,
+                    &cut.binding.table_ref.fqn(),
+                    route.stream.node_id.as_uuid(),
+                    route.stream.writer_epoch,
+                    wire_deadline,
+                    crate::scribe::tail_rpc::TailTicketAudience::Acquire,
+                )?;
+                work.push(TailFenceAcquisition {
+                    table: cut.binding.table_ref.fqn(),
+                    transport: route.transport,
+                    request,
+                    ticket,
                 });
             }
         }
@@ -376,6 +636,7 @@ impl TailFenceDrainer<'_> {
             table,
             transport,
             request,
+            ticket,
         } = acquisition;
         let remaining = self
             .deadline
@@ -385,10 +646,12 @@ impl TailFenceDrainer<'_> {
             () = self.cancellation.cancelled() => {
                 return Err(BifrostError::QueryExecutionFailed);
             }
-            result = tokio::time::timeout(remaining, transport.acquire_fence(request)) => result,
+            result = tokio::time::timeout(remaining, transport.acquire_fence_with_capability(request, ticket)) => result,
         };
         match acquisition {
-            Ok(Ok(fence)) => {
+            Ok(Ok(lease)) => {
+                let fence = lease.fence;
+                let capability = lease.capability;
                 metrics::counter!(
                     "bifrost_oracle_tail_fences_total",
                     "locality" => "local",
@@ -399,6 +662,7 @@ impl TailFenceDrainer<'_> {
                     table,
                     transport,
                     fence,
+                    capability,
                     acquired_at: Instant::now(),
                     drain_succeeded: false,
                 })
@@ -459,12 +723,16 @@ impl TailFenceDrainer<'_> {
                 }
                 result = tokio::time::timeout(
                     remaining,
-                    acquired.transport.read_page(wyrd_spec::vala::api::TailPageRequest {
-                        fence_id: acquired.fence.fence_id,
-                        after: after.clone(),
-                        max_rows: 4_096,
-                        max_encoded_bytes: 16 * 1024 * 1024,
-                    }),
+                    acquired.transport.read_page_with_capability(
+                        wyrd_spec::vala::api::TailPageRequest {
+                            query_id: self.query_id,
+                            fence_id: acquired.fence.fence_id,
+                            after: after.clone(),
+                            max_rows: 4_096,
+                            max_encoded_bytes: 16 * 1024 * 1024,
+                        },
+                        acquired.capability.clone(),
+                    ),
                 ) => result,
             };
             let page_outcome = if matches!(&page_result, Ok(Ok(_))) {
@@ -561,9 +829,11 @@ impl TailFenceDrainer<'_> {
     ) -> bool {
         let released = tokio::time::timeout(
             timeout,
-            acquired
-                .transport
-                .release_fence_async(acquired.fence.fence_id),
+            acquired.transport.release_fence_with_capability(
+                self.query_id,
+                acquired.fence.fence_id,
+                acquired.capability.clone(),
+            ),
         )
         .await
         .is_ok_and(|result| result.is_ok_and(|response| response.released));
@@ -603,14 +873,30 @@ fn tail_fence_request(
     event_day: wyrd_spec::vala::api::EventDay,
     exclusive_sealed: wyrd_spec::vala::api::TailCursor,
     deadline: chrono::DateTime<chrono::Utc>,
+    query_id: uuid::Uuid,
 ) -> Result<wyrd_spec::vala::api::AcquireTailFenceRequest, BifrostError> {
     let arrow_schema =
         iceberg::arrow::schema_to_arrow_schema(cut.iceberg_table.metadata().current_schema())
             .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
-    let fingerprint = crate::contracts::projected_source_schema_fingerprint(&arrow_schema);
+    let normalized_fields = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let data_type = match field.data_type() {
+                DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "+00:00" => {
+                    DataType::Timestamp(*unit, Some("UTC".into()))
+                }
+                data_type => data_type.clone(),
+            };
+            Field::new(field.name(), data_type, field.is_nullable())
+        })
+        .collect::<Vec<_>>();
+    let normalized_schema = Schema::new(normalized_fields);
+    let fingerprint = crate::contracts::projected_source_schema_fingerprint(&normalized_schema);
     let fingerprint = wyrd_spec::vala::api::SchemaFingerprint::new(hex::encode(fingerprint.0))
         .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
     Ok(wyrd_spec::vala::api::AcquireTailFenceRequest {
+        query_id,
         binding: wyrd_spec::vala::api::TenantTableBinding {
             tenant_id: cut.binding.tenant,
             namespace: cut
@@ -735,11 +1021,17 @@ mod tests {
         TailFenceDrainer::new(
             tails,
             memory,
-            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
-            QueryClass::Interactive,
-            Instant::now() + Duration::from_secs(1),
-            CancellationToken::new(),
-            wyrd_spec::vala::api::FreshnessPolicy::Strict,
+            TailFenceDrainerConfig {
+                telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                query_class: QueryClass::Interactive,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: CancellationToken::new(),
+                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+                query_id: uuid::Uuid::nil(),
+                ticket_minter: None,
+                cluster: None,
+                discovery: None,
+            },
         )
     }
 
@@ -774,6 +1066,7 @@ mod tests {
                 tail_protocol_version: TAIL_PROTOCOL_VERSION,
                 expires_at: chrono::Utc::now() + chrono::Duration::seconds(1),
             },
+            capability: Vec::new(),
             acquired_at: Instant::now(),
             drain_succeeded: false,
         }

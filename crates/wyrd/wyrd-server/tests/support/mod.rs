@@ -9,11 +9,13 @@
 use std::sync::Arc;
 
 use secrecy::ExposeSecret;
+use sqlx::PgPool;
 use tempfile::TempDir;
 use tokio::sync::OnceCell;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use wyrd_dev_fixtures::pg::PgFixture;
+use wyrd_server::postgres::ServerPostgres;
 use wyrd_storage::StorageHandle;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 
@@ -78,4 +80,34 @@ pub async fn test_catalog() -> Arc<WyrdCatalog> {
 /// Return the independent Redux catalog used by Gate and Forge.
 pub async fn test_redux_catalog() -> Arc<BifrostCatalog> {
     Arc::clone(&shared().await.redux_catalog)
+}
+
+/// Return the shared production-shaped Postgres handles, including the
+/// platform-admin pool required by durable security-audit assertions.
+pub async fn test_server_postgres() -> Arc<ServerPostgres> {
+    let shared = shared().await;
+    Arc::new(ServerPostgres::from_parts(
+        shared._fixture.wyrd_postgres().clone(),
+        shared._fixture.vala_postgres().clone(),
+    ))
+}
+
+/// Return a migrator-backed read pool for durable cross-tenant assertions.
+pub async fn test_superuser_pool() -> PgPool {
+    shared()
+        .await
+        ._fixture
+        .superuser_pool()
+        .await
+        .expect("shared fixture has a migrator assertion pool")
+}
+
+/// Seed an additional tenant for a gRPC security-boundary journey.
+pub async fn seed_test_tenant(tenant: wyrd_spec::DataTenantId, slug: &str) {
+    shared()
+        .await
+        ._fixture
+        .seed_additional_tenant_with_uuid(tenant, slug)
+        .await
+        .expect("shared fixture seeds the requested tenant");
 }

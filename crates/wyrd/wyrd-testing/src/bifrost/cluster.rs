@@ -16,11 +16,7 @@ use vala_bifrost_redux::oracle::dispatcher::{
     OraclePeerCredentials, OraclePeerTls, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::scribe::tail_rpc::TonicTailReadTransport;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
-use wyrd_client::WyrdClient;
-use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_dev_fixtures::pg::PgFixture;
 #[cfg(test)]
 use wyrd_runtime::{Permission, PermissionSet};
@@ -28,12 +24,10 @@ use wyrd_server::app::metrics::install_recorder;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_server::config::ForgeProcessRole;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 use wyrd_telemetry::{CapturedSpan, TelemetryConfig, TelemetryGuard, TestTraceCapture};
-use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
-use crate::Bootstrap;
 use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
 use crate::bifrost::telemetry::ForgeTelemetryCapture;
 use crate::server::{
@@ -1199,7 +1193,7 @@ impl WyrdTestCluster {
         })
     }
 
-    /// Register every running Scribe stream with every running Oracle via authenticated tonic.
+    /// Observe that every running Scribe exposes the requested live stream.
     ///
     /// Journeys call this after registering a table and before a Fused query so
     /// the real Oracle fence/page workflow crosses the bound private gRPC service.
@@ -1208,16 +1202,16 @@ impl WyrdTestCluster {
     ///
     /// Returns an error when service bootstrap, token exchange, tonic connect,
     /// stream inspection, or transport construction fails.
-    pub async fn register_live_tail(
+    pub async fn observe_live_tail(
         &self,
         table: &str,
         event_day: wyrd_spec::vala::api::EventDay,
     ) -> Result<(), ClusterError> {
-        self.register_live_tail_for_tenant(self.data_tenant_id(), table, event_day)
+        self.observe_live_tail_for_tenant(self.data_tenant_id(), table, event_day)
             .await
     }
 
-    /// Register one tenant's running Scribe streams with every running Oracle.
+    /// Observe one tenant's running Scribe streams without creating a route.
     ///
     /// The private bearer and route are scoped to the same tenant so identical
     /// logical table names cannot cross tenant boundaries.
@@ -1226,92 +1220,63 @@ impl WyrdTestCluster {
     ///
     /// Returns an error when service bootstrap, token exchange, tonic connect,
     /// stream inspection, or transport construction fails.
-    pub async fn register_live_tail_for_tenant(
+    pub async fn observe_live_tail_for_tenant(
         &self,
         tenant: wyrd_spec::DataTenantId,
         table: &str,
         event_day: wyrd_spec::vala::api::EventDay,
     ) -> Result<(), ClusterError> {
-        for (index, scribe_server) in self
-            .servers()
-            .filter(|server| server.bifrost_scribe().is_some())
-            .enumerate()
-        {
-            let bootstrap = scribe_server
-                .bootstrap_service_in_tenant(tenant, &format!("oracle-tail-{index}"), &["admin"])
-                .await
-                .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            let api_key = match bootstrap {
-                Bootstrap::Machine { api_key, .. } => api_key,
-                Bootstrap::User { .. } => {
-                    return Err(ClusterError::Resource(
-                        "tail service bootstrap returned a user".to_owned(),
-                    ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.observe_live_tail_once(tenant, table, &event_day) {
+                Ok(()) => return Ok(()),
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    tokio::task::yield_now().await;
+                    let _ = error;
                 }
-            };
-            let grpc_endpoint = scribe_server
-                .grpc_url()
-                .ok_or_else(|| ClusterError::Resource("Scribe gRPC endpoint missing".to_owned()))?;
-            let http_endpoint = scribe_server
-                .base_url()
-                .ok_or_else(|| ClusterError::Resource("Scribe HTTP endpoint missing".to_owned()))?;
-            let client = WyrdClient::with_config(ClientConfig {
-                grpc: GrpcConfig {
-                    endpoint: grpc_endpoint.clone(),
-                    connect_retries: 0,
-                    ..GrpcConfig::default()
-                },
-                http: HttpConfig {
-                    base_url: http_endpoint.to_owned(),
-                    ..HttpConfig::default()
-                },
-                api_key: Some(api_key),
-                ..ClientConfig::default()
-            })
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            let bearer = client
-                .auth()
-                .bearer()
-                .await
-                .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(grpc_endpoint)
-                .map_err(|error| ClusterError::Resource(error.to_string()))?
-                .connect()
-                .await
-                .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            let transport = Arc::new(
-                TonicTailReadTransport::new(ScribeTailServiceClient::new(channel), bearer.expose())
-                    .map_err(|error| ClusterError::Resource(error.to_string()))?,
-            );
-            let stream = scribe_server
-                .bifrost_scribe()
-                .ok_or_else(|| ClusterError::Resource("Scribe disappeared".to_owned()))?
-                .tail_service()
-                .map_err(|error| ClusterError::Resource(error.to_string()))?
-                .stream();
-            let writer_epoch = u64::try_from(stream.writer_epoch.as_i64())
-                .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            for query_server in self
-                .servers()
-                .filter(|server| server.state().bifrost_query().is_some())
-            {
-                query_server
-                    .state()
-                    .bifrost_query()
-                    .expect("filtered Oracle runtime remains present")
-                    .oracle()
-                    .tail_transports()
-                    .insert_live_stream_for_tenant(
-                        tenant,
-                        table,
-                        NodeId::new(stream.node_id.as_uuid()),
-                        writer_epoch,
-                        event_day.clone(),
-                        transport.clone(),
-                    );
+                Err(error) => return Err(error),
             }
         }
-        Ok(())
+    }
+
+    /// Checks the current Scribe-owned stream snapshot without mutating routes.
+    fn observe_live_tail_once(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: &str,
+        event_day: &wyrd_spec::vala::api::EventDay,
+    ) -> Result<(), ClusterError> {
+        let canonical = table.strip_prefix("vala.").unwrap_or(table);
+        let (namespace, table_name) = canonical.split_once('.').ok_or_else(|| {
+            ClusterError::Resource("tail observation table must be namespace-qualified".to_owned())
+        })?;
+        let binding = TenantTableBinding {
+            tenant_id: tenant,
+            namespace: namespace.to_owned(),
+            table: table_name.to_owned(),
+        };
+        let mut found = false;
+        for scribe_server in self
+            .servers()
+            .filter(|server| server.bifrost_scribe().is_some())
+        {
+            let reader = scribe_server
+                .state()
+                .bifrost_tail_reader_for_test()
+                .ok_or_else(|| ClusterError::Resource("Scribe tail reader missing".to_owned()))?;
+            let streams = reader
+                .list_active_streams(&binding)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            if streams.iter().any(|(day, _)| day == event_day) {
+                found = true;
+            }
+        }
+        found.then_some(()).ok_or_else(|| {
+            ClusterError::Resource(format!(
+                "no Scribe has an active stream for {}",
+                event_day.as_str()
+            ))
+        })
     }
 
     /// Stop one node while retaining its stable identity and local roots.

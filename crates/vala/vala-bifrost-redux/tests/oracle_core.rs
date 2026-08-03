@@ -581,6 +581,8 @@ impl OracleFixture {
                     key_id: "test".to_owned(),
                 },
             ),
+            tail_ticket_minter: None,
+            tail_discovery: None,
             peer_transports,
             config,
         })

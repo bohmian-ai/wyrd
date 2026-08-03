@@ -82,7 +82,8 @@ use planner::OracleClassification;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
 use query_stream::QueryStreamInput;
-use tail_fence::{DrainedTails, TailFenceDrainer};
+pub use tail_fence::{DiscoveredTailRoute, TailStreamDiscovery};
+use tail_fence::{DrainedTails, TailFenceDrainer, TailFenceDrainerConfig};
 
 /// Default maximum SQL request size accepted by the synchronous query floor.
 pub const DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
@@ -187,6 +188,18 @@ pub struct OracleMemoryResources {
     pub governor: BifrostMemoryGovernor,
     /// Maximum bytes reserved by one query for reconciliation state.
     pub reconciliation_limit_bytes: usize,
+}
+
+/// Point-in-time readiness inputs used by role-separated lifecycle journeys.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleReadinessSnapshot {
+    /// Whether Oracle startup reconciliation completed and remains uncancelled.
+    pub startup_reconciled: bool,
+    /// Number of live Oracle memberships in the local immutable cluster snapshot.
+    pub live_oracles: usize,
+    /// Configured local running slot capacity available to query admission.
+    pub running_capacity: usize,
 }
 
 /// Bounded local admission slots for one Oracle process.
@@ -505,6 +518,13 @@ impl QueryTelemetryGuard {
             "outcome" => outcome
         )
         .record(self.started_at.elapsed().as_secs_f64());
+        let result = match outcome {
+            "success" => "success",
+            "rejected" => "rejected",
+            _ => "failed",
+        };
+        metrics::histogram!("bifrost_query_duration_seconds", "result" => result)
+            .record(self.started_at.elapsed().as_secs_f64());
         if self.stream_started {
             metrics::counter!(
                 "bifrost_oracle_streams_total",
@@ -1076,6 +1096,10 @@ pub struct OracleBuildConfig {
     pub audit: Arc<dyn OracleAudit>,
     /// Server-owned narrow peer-ticket authority.
     pub peer_ticket_minter: Arc<dyn peer::PeerTicketMinter>,
+    /// Server-owned domain-separated Scribe-tail ticket signer.
+    pub tail_ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
+    /// Query-scoped live Scribe discovery owner.
+    pub tail_discovery: Option<Arc<dyn tail_fence::TailStreamDiscovery>>,
     /// Optional node-aware local/tonic directory used for immutable sealed leaves.
     pub peer_transports: Option<dispatcher::OraclePeerTransportDirectory>,
     /// Engine limits and lifecycle values.
@@ -1215,8 +1239,8 @@ struct CutAuditInput<'a> {
     retry_ordinal: u8,
     /// Absolute query deadline.
     deadline: Instant,
-    /// Admission lifecycle cancellation shared with lease renewal and streaming.
-    cancellation: &'a CancellationToken,
+    /// Admitted query owner supplying cancellation and durable query identity.
+    admitted: &'a AdmittedQueryGuard,
 }
 
 /// Retained local query engine owner.
@@ -1233,6 +1257,10 @@ pub struct Oracle {
     memory: OracleMemoryResources,
     /// Table-local Scribe tail transport directory.
     tails: Arc<TailTransportDirectory>,
+    /// Query-scoped Scribe-tail ticket signer, when the server has a Scribe role.
+    tail_ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
+    /// Query-scoped live Scribe discovery owner.
+    tail_discovery: Option<Arc<dyn tail_fence::TailStreamDiscovery>>,
     /// Mandatory immutable read/security audit collaborator.
     audit: Arc<dyn OracleAudit>,
     /// Optional distributed fragment owner assembled from server capabilities.
@@ -1373,6 +1401,14 @@ impl Oracle {
         &self.tails
     }
 
+    /// Injects a private Scribe discovery outage for test-tier journeys.
+    #[cfg(feature = "test-support")]
+    pub fn set_tail_discovery_unavailable_for_test(&self, unavailable: bool) {
+        if let Some(discovery) = &self.tail_discovery {
+            discovery.set_unavailable_for_test(unavailable);
+        }
+    }
+
     /// Constructs a retained Oracle owner from explicit dependency handles.
     ///
     /// # Errors
@@ -1430,6 +1466,8 @@ impl Oracle {
             vala: config.vala,
             memory: config.memory,
             tails: config.tails,
+            tail_ticket_minter: config.tail_ticket_minter,
+            tail_discovery: config.tail_discovery,
             audit: config.audit,
             fragment_dispatcher,
             telemetry,
@@ -1591,7 +1629,7 @@ impl Oracle {
                     self.shutdown.child_token(),
                 )
                 .await?;
-            let drained = self
+            let drained = match self
                 .audit_and_drain_cut(CutAuditInput {
                     context: &context,
                     request: &request,
@@ -1599,9 +1637,21 @@ impl Oracle {
                     query_class,
                     retry_ordinal,
                     deadline,
-                    cancellation: &admitted.cancellation,
+                    admitted: &admitted,
                 })
-                .await?;
+                .await
+            {
+                Ok(drained) => drained,
+                Err(error) => {
+                    if let Err(release_error) = admitted.release().await {
+                        tracing::error!(
+                            error = %release_error,
+                            "Oracle admission cleanup failed after audit rejection"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             let degraded = drained.degraded;
             admitted.live_reservations = drained.reservations;
             let execution = self
@@ -1623,9 +1673,23 @@ impl Oracle {
                     continue;
                 }
                 Err(OracleExecutionError::StaleObject) => {
+                    if let Err(release_error) = admitted.release().await {
+                        tracing::error!(
+                            error = %release_error,
+                            "Oracle admission cleanup failed after final stale attempt"
+                        );
+                    }
                     return Err(BifrostError::QueryExecutionFailed);
                 }
-                Err(OracleExecutionError::Public(error)) => return Err(error),
+                Err(OracleExecutionError::Public(error)) => {
+                    if let Err(release_error) = admitted.release().await {
+                        tracing::error!(
+                            error = %release_error,
+                            "Oracle admission cleanup failed after execution rejection"
+                        );
+                    }
+                    return Err(error);
+                }
             };
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -1695,11 +1759,17 @@ impl Oracle {
         let drainer = TailFenceDrainer::new(
             &self.tails,
             &self.memory,
-            Arc::clone(&self.telemetry),
-            input.query_class,
-            input.deadline,
-            input.cancellation.clone(),
-            input.request.freshness,
+            TailFenceDrainerConfig {
+                telemetry: Arc::clone(&self.telemetry),
+                query_class: input.query_class,
+                deadline: input.deadline,
+                cancellation: input.admitted.cancellation.clone(),
+                freshness: input.request.freshness,
+                query_id: input.admitted.query_id.into(),
+                ticket_minter: self.tail_ticket_minter.clone(),
+                cluster: Some(Arc::clone(&self.admission.cluster)),
+                discovery: self.tail_discovery.clone(),
+            },
         );
         let mut degraded = false;
         let acquired = if input.request.visibility == VisibilityMode::Fused {
@@ -1852,11 +1922,17 @@ impl Oracle {
         let fence_owner = TailFenceDrainer::new(
             &self.tails,
             &self.memory,
-            Arc::clone(&self.telemetry),
-            class,
-            options.deadline,
-            admitted.cancellation.clone(),
-            wyrd_spec::vala::api::FreshnessPolicy::Strict,
+            TailFenceDrainerConfig {
+                telemetry: Arc::clone(&self.telemetry),
+                query_class: class,
+                deadline: options.deadline,
+                cancellation: admitted.cancellation.clone(),
+                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+                query_id: admitted.query_id.into(),
+                ticket_minter: self.tail_ticket_minter.clone(),
+                cluster: Some(Arc::clone(&self.admission.cluster)),
+                discovery: self.tail_discovery.clone(),
+            },
         );
         let acquired = if options.visibility == VisibilityMode::Fused {
             fence_owner.acquire(&cuts).await?
@@ -1971,6 +2047,17 @@ impl Oracle {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.startup_reconciled() && self.admission.is_available()
+    }
+
+    /// Captures every local readiness input without performing network or SQL IO.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn readiness_snapshot(&self) -> OracleReadinessSnapshot {
+        OracleReadinessSnapshot {
+            startup_reconciled: self.startup_reconciled(),
+            live_oracles: self.admission.cluster.snapshot().live_oracles().len(),
+            running_capacity: self.admission.slots.running_capacity(),
+        }
     }
 
     /// Reports whether local startup reconciliation completed before membership activation.
@@ -2454,8 +2541,16 @@ fn register_session_table(
             .map_err(|error| map_datafusion_error(&error))?;
         schema
     };
+    let alias = Arc::clone(&provider);
     schema
         .register_table(binding.table_name.clone(), provider)
+        .map_err(|error| map_datafusion_error(&error))?;
+    // DataFusion treats a quoted dotted identifier (`"vala.traces.spans"`)
+    // as one table in its default `datafusion.public` catalog. Keep this
+    // private alias alongside the canonical `vala.traces.spans` hierarchy so
+    // both public SQL spellings resolve to the same authenticated provider.
+    session
+        .register_table(TableReference::bare(binding.table_ref.fqn()), alias)
         .map_err(|error| map_datafusion_error(&error))?;
     Ok(())
 }
@@ -2915,10 +3010,14 @@ where
         .ok_or(BifrostError::QueryTimeout)?;
     match tokio::time::timeout(remaining, release).await {
         Err(_) => Err(BifrostError::QueryTimeout),
-        Ok(Ok(AdmissionReleaseStatus::Released)) => Ok(()),
-        Ok(Ok(AdmissionReleaseStatus::NotReleased) | Err(_)) => {
-            Err(BifrostError::QueryExecutionFailed)
+        Ok(Ok(status)) => {
+            if matches!(status, AdmissionReleaseStatus::Released) {
+                Ok(())
+            } else {
+                Err(BifrostError::QueryExecutionFailed)
+            }
         }
+        Ok(Err(_)) => Err(BifrostError::QueryExecutionFailed),
     }
 }
 

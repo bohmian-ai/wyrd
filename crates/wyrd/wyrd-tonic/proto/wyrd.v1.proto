@@ -46,6 +46,7 @@ message QueryStreamFrame {
 }
 
 service ScribeTailService {
+  rpc ListActiveStreams(ListActiveStreamsRequest) returns (ListActiveStreamsResponse);
   rpc AcquireFence(AcquireTailFenceRequest) returns (TailReadFence);
   rpc ReadFencePage(TailPageRequest) returns (TailPage);
   rpc ReleaseFence(ReleaseTailFenceRequest) returns (ReleaseTailFenceResponse);
@@ -61,17 +62,23 @@ message TailStreamIdentity { string node_id = 1; uint64 writer_epoch = 2; }
 message AcquireTailFenceRequest {
   TenantTableBinding binding = 1; string event_day = 2; TailCursor exclusive_sealed = 3;
   uint64 deadline_unix_ms = 4; string schema_fingerprint = 5; uint32 tail_protocol_version = 6;
+  // Private server-to-server authorization envelope.  The field is intentionally
+  // opaque to public SDKs and is verified by the Scribe tail authority.
+  bytes tail_ticket = 7; bytes query_id = 8;
 }
 message TailReadFence {
   bytes fence_id = 1; TenantTableBinding binding = 2; string event_day = 3;
   TailStreamIdentity stream = 4; TailCursor exclusive_sealed = 5;
   TailCursor inclusive_live = 6; string schema_fingerprint = 7;
-  uint32 tail_protocol_version = 8; uint64 expires_at_unix_ms = 9;
+  uint32 tail_protocol_version = 8; uint64 expires_at_unix_ms = 9; bytes capability = 10;
 }
-message TailPageRequest { bytes fence_id = 1; oneof after_cursor { TailCursor after = 2; } uint32 max_rows = 3; uint32 max_encoded_bytes = 4; }
+message TailPageRequest { bytes fence_id = 1; oneof after_cursor { TailCursor after = 2; } uint32 max_rows = 3; uint32 max_encoded_bytes = 4; bytes tail_capability = 5; bytes query_id = 6; }
 message TailPage { repeated bytes arrow_ipc_batches = 1; oneof next_cursor { TailCursor next = 2; } bool complete = 3; }
-message ReleaseTailFenceRequest { bytes fence_id = 1; }
+message ReleaseTailFenceRequest { bytes fence_id = 1; bytes tail_capability = 2; bytes query_id = 3; }
 message ReleaseTailFenceResponse {}
+message ListActiveStreamsRequest { bytes tail_ticket = 1; TenantTableBinding binding = 2; bytes query_id = 3; }
+message ActiveTailStream { string event_day = 1; TailStreamIdentity stream = 2; }
+message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
 message ReserveNodeSlotsRequest {
   bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;

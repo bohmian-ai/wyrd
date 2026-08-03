@@ -170,7 +170,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         for (index, tenant) in tenants.iter().copied().enumerate() {
             ingest_server.flush_bifrost_for_tenant(tenant).await?;
             cluster
-                .register_live_tail_for_tenant(tenant, &table_fqn, day.clone())
+                .observe_live_tail_for_tenant(tenant, &table_fqn, day.clone())
                 .await?;
             let writer = authenticated_client_for_tenant(
                 ingest_server,

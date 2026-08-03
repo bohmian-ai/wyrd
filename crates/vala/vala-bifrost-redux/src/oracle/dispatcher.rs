@@ -818,6 +818,18 @@ impl OraclePeerTls {
             server_name,
         }
     }
+
+    /// Returns the immutable CA trust bytes for sibling private services.
+    #[must_use]
+    pub fn ca_certificate_pem(&self) -> &[u8] {
+        &self.ca_certificate_pem
+    }
+
+    /// Returns the certificate DNS identity shared by sibling private services.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
 }
 
 /// Supplies short-lived authorization for private Oracle peer RPCs.
@@ -1590,7 +1602,7 @@ impl FragmentDispatcher {
         while let Some(frame) = tokio::select! {
             () = context.cancellation.cancelled() => Some(Err(DispatchError::Retryable)),
             () = tokio::time::sleep_until(context.deadline) => Some(Err(DispatchError::Retryable)),
-            frame = frames.next() => frame.map(|result| result.map_err(|_| DispatchError::Retryable)),
+            frame = frames.next() => frame,
         } {
             buffer
                 .push(frame.inspect_err(|error| {

@@ -747,7 +747,7 @@ impl PersistenceWorker {
         let row_encoded = ParquetEncoded {
             bytes: Vec::new(),
             row_group_stats: encoded.row_group_stats.clone(),
-            partition_day: encoded.partition_day.clone(),
+            partition_day: encoded.partition_day,
             audit_events: Vec::new(),
             append_metas: encoded.append_metas.clone(),
         };

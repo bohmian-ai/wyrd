@@ -69,6 +69,13 @@ pub mod fragment;
 pub mod peer;
 mod planner;
 mod query_stream;
+
+/// Return the process-local query lifecycle observer used by test journeys.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn query_lifecycle_observer_for_test() -> std::sync::Arc<query_stream::QueryLifecycleObserver> {
+    query_stream::query_lifecycle_observer_for_test()
+}
 mod tail_fence;
 pub mod telemetry;
 
@@ -82,6 +89,7 @@ use planner::OracleClassification;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
 use query_stream::QueryStreamInput;
+pub(crate) use query_stream::QueryStreamLifecycle;
 pub use tail_fence::{DiscoveredTailRoute, TailStreamDiscovery};
 use tail_fence::{DrainedTails, TailFenceDrainer, TailFenceDrainerConfig};
 
@@ -1243,6 +1251,22 @@ struct CutAuditInput<'a> {
     admitted: &'a AdmittedQueryGuard,
 }
 
+/// Immutable inputs shared by one complete SQL execution attempt.
+struct SqlAttemptInput<'a> {
+    /// Authenticated request context.
+    context: &'a AuthorizedQueryContext,
+    /// Original validated query request.
+    request: &'a BifrostQueryRequest,
+    /// Tables parsed from the validated SQL statement.
+    tables: &'a [TableRef],
+    /// Absolute whole-query deadline shared across retry attempts.
+    deadline: Instant,
+    /// Zero-based stale-replan attempt ordinal.
+    retry_ordinal: u8,
+    /// Optional Gate request lifecycle transferred into a returned stream.
+    gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
+}
+
 /// Retained local query engine owner.
 pub struct Oracle {
     /// Planner and floor configuration.
@@ -1600,6 +1624,25 @@ impl Oracle {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
+        self.query_sql_with_gate_lifecycle(context, request, None)
+            .await
+    }
+
+    /// Starts a SQL query while retaining an optional Gate lifecycle owner.
+    ///
+    /// The lifecycle owner is attached before the first frame is emitted, so
+    /// Gate duration and active-stream accounting remain truthful through
+    /// terminal consumption or client cancellation.
+    ///
+    /// # Errors
+    /// Returns the same stable query, catalog, admission, visibility, audit,
+    /// timeout, or execution errors as [`Self::query_sql`].
+    pub(crate) async fn query_sql_with_gate_lifecycle(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
+    ) -> Result<OracleQueryStream, BifrostError> {
         self.validate_query(&request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -1613,117 +1656,154 @@ impl Oracle {
         let tables = parse_select_tables(&request.sql)?;
         let mut query_telemetry = None;
         for retry_ordinal in 0_u8..=1 {
-            let planned = self
-                .plan_sql_attempt(&context, &request.sql, &tables, deadline)
-                .await?;
-            let query_class = planned.query_class;
-            if query_telemetry.is_none() {
-                query_telemetry = Some(self.telemetry.start_query(request.visibility, query_class));
-            }
-            let mut admitted = self
-                .admission
-                .admit(
-                    context.data_tenant_id,
-                    query_class,
-                    deadline,
-                    self.shutdown.child_token(),
-                )
-                .await?;
-            let drained = match self
-                .audit_and_drain_cut(CutAuditInput {
-                    context: &context,
-                    request: &request,
-                    cuts: &planned.cuts,
-                    query_class,
-                    retry_ordinal,
-                    deadline,
-                    admitted: &admitted,
-                })
-                .await
-            {
-                Ok(drained) => drained,
-                Err(error) => {
-                    if let Err(release_error) = admitted.release().await {
-                        tracing::error!(
-                            error = %release_error,
-                            "Oracle admission cleanup failed after audit rejection"
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            let degraded = drained.degraded;
-            admitted.live_reservations = drained.reservations;
-            let execution = self
-                .execute_sql_cut(SqlCutInput {
-                    context: &context,
-                    sql: &request.sql,
-                    cuts: planned.cuts,
-                    live_batches: drained.batches,
-                    query_class,
-                    admitted: &admitted,
-                    deadline,
-                })
-                .await;
-            let (schema, mut batches) = match execution {
-                Ok(execution) => execution,
-                Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
-                    await_stale_release(deadline, admitted.release()).await?;
-                    record_stale_replan();
-                    continue;
-                }
-                Err(OracleExecutionError::StaleObject) => {
-                    if let Err(release_error) = admitted.release().await {
-                        tracing::error!(
-                            error = %release_error,
-                            "Oracle admission cleanup failed after final stale attempt"
-                        );
-                    }
-                    return Err(BifrostError::QueryExecutionFailed);
-                }
-                Err(OracleExecutionError::Public(error)) => {
-                    if let Err(release_error) = admitted.release().await {
-                        tracing::error!(
-                            error = %release_error,
-                            "Oracle admission cleanup failed after execution rejection"
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(BifrostError::QueryTimeout)?;
-            match tokio::time::timeout(remaining, batches.next())
-                .await
-                .map_err(|_| BifrostError::QueryTimeout)?
-            {
-                Some(Err(error)) if retry_ordinal == 0 && is_stale_file_error(&error) => {
-                    #[cfg(feature = "test-support")]
-                    self.pause_stale_release_for_test().await;
-                    await_stale_release(deadline, admitted.release()).await?;
-                    record_stale_replan();
-                }
-                first => {
-                    let query_telemetry = query_telemetry
-                        .take()
-                        .ok_or(BifrostError::QueryExecutionFailed)?;
-                    return OracleQueryStream::new(QueryStreamInput {
-                        schema,
-                        batches,
-                        first,
-                        admitted,
+            if let Some(stream) = self
+                .run_sql_attempt(
+                    SqlAttemptInput {
+                        context: &context,
+                        request: &request,
+                        tables: &tables,
                         deadline,
-                        visibility: request.visibility,
-                        query_class,
-                        degraded,
-                        stale_replanned: retry_ordinal == 1,
-                        query_telemetry,
-                    });
-                }
+                        retry_ordinal,
+                        gate_lifecycle: gate_lifecycle.as_ref().map(Arc::clone),
+                    },
+                    &mut query_telemetry,
+                )
+                .await?
+            {
+                return Ok(stream);
             }
         }
         Err(BifrostError::QueryExecutionFailed)
+    }
+
+    /// Execute one bounded plan/admit/audit/scan attempt for a SQL query.
+    ///
+    /// A stale first attempt returns `Ok(None)` only after releasing its full
+    /// admission owner. A completed attempt transfers that owner into the
+    /// returned stream so terminal consumption or cancellation releases it.
+    ///
+    /// # Errors
+    /// Returns stable planning, admission, audit, timeout, execution, or
+    /// cleanup errors. Failed attempts release admitted state before return.
+    async fn run_sql_attempt(
+        &self,
+        input: SqlAttemptInput<'_>,
+        query_telemetry: &mut Option<QueryTelemetryGuard>,
+    ) -> Result<Option<OracleQueryStream>, BifrostError> {
+        let SqlAttemptInput {
+            context,
+            request,
+            tables,
+            deadline,
+            retry_ordinal,
+            gate_lifecycle,
+        } = input;
+        let planned = self
+            .plan_sql_attempt(context, &request.sql, tables, deadline)
+            .await?;
+        let query_class = planned.query_class;
+        query_telemetry
+            .get_or_insert_with(|| self.telemetry.start_query(request.visibility, query_class));
+        let mut admitted = self.admit_sql_query(context, query_class, deadline).await?;
+        let drained = match self
+            .audit_and_drain_cut(CutAuditInput {
+                context,
+                request,
+                cuts: &planned.cuts,
+                query_class,
+                retry_ordinal,
+                deadline,
+                admitted: &admitted,
+            })
+            .await
+        {
+            Ok(drained) => drained,
+            Err(error) => {
+                release_admission_after_error(admitted, "audit rejection").await;
+                return Err(error);
+            }
+        };
+        let degraded = drained.degraded;
+        admitted.live_reservations = drained.reservations;
+        let execution = self
+            .execute_sql_cut(SqlCutInput {
+                context,
+                sql: &request.sql,
+                cuts: planned.cuts,
+                live_batches: drained.batches,
+                query_class,
+                admitted: &admitted,
+                deadline,
+            })
+            .await;
+        let (schema, mut batches) = match execution {
+            Ok(execution) => execution,
+            Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
+                await_stale_release(deadline, admitted.release()).await?;
+                record_stale_replan();
+                return Ok(None);
+            }
+            Err(OracleExecutionError::StaleObject) => {
+                release_admission_after_error(admitted, "final stale attempt").await;
+                return Err(BifrostError::QueryExecutionFailed);
+            }
+            Err(OracleExecutionError::Public(error)) => {
+                release_admission_after_error(admitted, "execution rejection").await;
+                return Err(error);
+            }
+        };
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(BifrostError::QueryTimeout)?;
+        let first = tokio::time::timeout(remaining, batches.next())
+            .await
+            .map_err(|_| BifrostError::QueryTimeout)?;
+        if first.as_ref().is_some_and(|result| {
+            retry_ordinal == 0 && result.as_ref().is_err_and(is_stale_file_error)
+        }) {
+            #[cfg(feature = "test-support")]
+            self.pause_stale_release_for_test().await;
+            await_stale_release(deadline, admitted.release()).await?;
+            record_stale_replan();
+            return Ok(None);
+        }
+        let query_telemetry = query_telemetry
+            .take()
+            .ok_or(BifrostError::QueryExecutionFailed)?;
+        OracleQueryStream::new(QueryStreamInput {
+            schema,
+            batches,
+            first,
+            admitted,
+            deadline,
+            visibility: request.visibility,
+            degraded,
+            stale_replanned: retry_ordinal == 1,
+            query_telemetry,
+            gate_lifecycle,
+        })
+        .map(Some)
+    }
+
+    /// Acquire the local and durable admission owner for one SQL attempt.
+    ///
+    /// # Errors
+    /// Returns the stable admission, timeout, cancellation, or SQL error from
+    /// the retained Oracle admission owner.
+    async fn admit_sql_query(
+        &self,
+        context: &AuthorizedQueryContext,
+        query_class: QueryClass,
+        deadline: Instant,
+    ) -> Result<AdmittedQueryGuard, BifrostError> {
+        self.admission
+            .admit(
+                context.data_tenant_id,
+                query_class,
+                deadline,
+                self.shutdown.child_token(),
+            )
+            .await
     }
 
     /// Delegates one SQL metadata attempt to the planner owner.
@@ -1879,8 +1959,8 @@ impl Oracle {
         let class = QueryClass::Analytical;
         let query_telemetry = self.telemetry.start_query(options.visibility, class);
         OracleTelemetry::record_classification(OracleClassification {
-            query_class: class,
             reason: "typed_plan",
+            query_class: class,
             predicted_scan_seconds: 0.0,
         });
         let admitted = self
@@ -1984,10 +2064,10 @@ impl Oracle {
             admitted,
             deadline: options.deadline,
             visibility: options.visibility,
-            query_class: class,
             degraded: drained.degraded,
             stale_replanned: false,
             query_telemetry,
+            gate_lifecycle: None,
         })
     }
 
@@ -2989,6 +3069,16 @@ fn record_stale_replan() {
         "outcome" => "retried"
     )
     .increment(1);
+}
+
+/// Release an admitted query after an attempt-local terminal error.
+///
+/// Cleanup failure is logged without replacing the stable public error that
+/// caused the attempt to terminate.
+async fn release_admission_after_error(admitted: AdmittedQueryGuard, phase: &'static str) {
+    if let Err(error) = admitted.release().await {
+        tracing::error!(error = %error, phase, "Oracle admission cleanup failed");
+    }
 }
 
 /// Awaits proof that stale-attempt capacity is durably free before readmission.

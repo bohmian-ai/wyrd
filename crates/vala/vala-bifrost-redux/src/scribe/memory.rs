@@ -132,6 +132,24 @@ struct MemoryGovernorInner {
 }
 
 impl BifrostMemoryGovernor {
+    /// Construct a test-tier governor with a deliberately small Scribe child limit.
+    ///
+    /// This bypasses production minimums only for deterministic admission tests;
+    /// callers must keep the pod limit valid and use the resulting governor only
+    /// in test-support server construction.
+    #[cfg(feature = "test-support")]
+    pub fn new_with_test_scribe_limit(
+        pod_limit_bytes: usize,
+        scribe_limit_bytes: usize,
+    ) -> Result<Self, ScribeError> {
+        let mut governor = Self::new_with_scribe_limit(pod_limit_bytes, Some(MIN_SCRIBE_BYTES))?;
+        let inner = Arc::get_mut(&mut governor.inner).ok_or_else(|| ScribeError::Internal {
+            detail: "test memory governor unexpectedly shared during construction".to_owned(),
+        })?;
+        inner.scribe_limit_bytes = scribe_limit_bytes;
+        Ok(governor)
+    }
+
     /// Construct a governor from detected cgroup memory `P`.
     pub fn new(pod_limit_bytes: usize) -> Result<Self, ScribeError> {
         Self::new_with_scribe_limit(pod_limit_bytes, None)

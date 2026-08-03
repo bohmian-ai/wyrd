@@ -144,6 +144,8 @@ fn value_as_display(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     #[test]
@@ -185,5 +187,32 @@ mod tests {
             })],
             &ExpectedRowShape::default(),
         );
+    }
+
+    /// The matrix owner keeps the seeded cross-tenant regression beside the
+    /// assertion it protects, rather than in a callback-only journey.
+    #[test]
+    fn seeded_cross_tenant_rows_include_offending_values() {
+        let principal = DataTenantId::new_v7();
+        let leaked = DataTenantId::new_v7();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            assert_no_cross_tenant_leak(
+                principal,
+                &[serde_json::json!({
+                    "row_id": "seeded-leak",
+                    "data_tenant_id": leaked.to_string(),
+                })],
+                &ExpectedRowShape::default(),
+            );
+        }))
+        .expect_err("seeded tenant leak must fail");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic>");
+        assert!(message.contains("seeded-leak"));
+        assert!(message.contains(&principal.to_string()));
+        assert!(message.contains(&leaked.to_string()));
     }
 }

@@ -1337,6 +1337,24 @@ impl ScribeTailReader {
         self.source.stream()
     }
 
+    /// Return the exact number of live fences retained by this Scribe reader.
+    ///
+    /// This test-support inspection reads the production fence registry after
+    /// bounded expiry reclamation; it does not infer ownership from metrics.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the fence registry lock is poisoned.
+    #[cfg(feature = "test-support")]
+    pub fn active_fence_count_for_test(&self) -> Result<u64, TailReadError> {
+        let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
+            detail: format!("tail fence registry lock poisoned: {error}"),
+        })?;
+        Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
+        u64::try_from(registry.retained.len()).map_err(|error| TailReadError::State {
+            detail: format!("active tail fence count does not fit u64: {error}"),
+        })
+    }
+
     /// Returns retained immutable metadata for capability verification.
     ///
     /// # Errors

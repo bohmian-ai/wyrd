@@ -7,9 +7,11 @@ pub mod limits;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use tracing::Instrument;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::PermissionCheck;
@@ -40,7 +42,9 @@ pub use crate::gate::collector::{
 pub use crate::gate::error::{CatalogError, IngestError};
 pub use crate::gate::limits::IngestLimits;
 use crate::namespaces::BifrostNamespace;
-use crate::oracle::{AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions};
+use crate::oracle::{
+    AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions, QueryStreamLifecycle,
+};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::routing::shard_for;
 use wyrd_spec::vala::api::BifrostQueryRequest;
@@ -117,6 +121,72 @@ fn record_gate_rows(accepted: i64, rejected: i64) {
         .increment(u64::try_from(rejected).unwrap_or(0));
 }
 
+/// Record the bounded-cardinality Gate request families used by D24.
+fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: Duration) {
+    metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
+        .increment(1);
+    metrics::histogram!(
+        "bifrost_gate_request_duration_seconds",
+        "operation" => operation,
+        "outcome" => outcome
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+/// Owns exactly one terminal Gate request metric across return or cancellation.
+struct GateRequestLifecycle {
+    /// Closed D24 operation label for this request.
+    operation: &'static str,
+    /// Monotonic request start used by the duration owner.
+    started: std::time::Instant,
+    /// Whether a normal return already emitted the terminal metric.
+    completed: bool,
+}
+
+impl GateRequestLifecycle {
+    /// Begin one request lifecycle at the transport entry point.
+    fn begin(operation: &'static str) -> Self {
+        Self {
+            operation,
+            started: std::time::Instant::now(),
+            completed: false,
+        }
+    }
+
+    /// Emit the normal terminal outcome and disarm cancellation-on-drop.
+    fn complete(mut self, outcome: &'static str) {
+        record_gate_request(self.operation, outcome, self.started.elapsed());
+        self.completed = true;
+    }
+}
+
+impl Drop for GateRequestLifecycle {
+    /// Emit cancellation when the transport drops the in-flight service future.
+    fn drop(&mut self) {
+        if !self.completed {
+            record_gate_request(self.operation, "cancelled", self.started.elapsed());
+        }
+    }
+}
+
+/// Describe and initialize the D24 Gate families at process boot.
+fn initialize_gate_metrics() {
+    metrics::describe_counter!(
+        "bifrost_gate_requests_total",
+        "Total Bifrost Gate requests by operation and terminal outcome."
+    );
+    metrics::describe_histogram!(
+        "bifrost_gate_request_duration_seconds",
+        metrics::Unit::Seconds,
+        "Bifrost Gate request duration by operation and terminal outcome."
+    );
+    metrics::describe_gauge!(
+        "bifrost_gate_active_streams",
+        "Current authorized and admitted Bifrost Gate query streams."
+    );
+    metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
+}
+
 /// The concrete Bifrost write boundary.
 ///
 /// Gate owns authentication, request bounds, and transport response ordering.
@@ -148,6 +218,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
+        initialize_gate_metrics();
         Self {
             catalog,
             scribe: Some(scribe),
@@ -185,6 +256,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
+        initialize_gate_metrics();
         Self {
             catalog,
             scribe: None,
@@ -272,6 +344,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
+        let started = std::time::Instant::now();
         let Some(oracle) = &self.oracle else {
             metrics::counter!(
                 "bifrost_gate_role_unavailable_total",
@@ -279,6 +352,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 "reason" => "not_configured"
             )
             .increment(1);
+            record_gate_request("query", "rejected", started.elapsed());
             return Err(BifrostError::OracleRoleUnavailable);
         };
         if !oracle.is_ready() {
@@ -288,9 +362,25 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 "reason" => "not_ready"
             )
             .increment(1);
+            record_gate_request("query", "rejected", started.elapsed());
             return Err(BifrostError::OracleRoleUnavailable);
         }
-        oracle.query_sql(context, request).await
+        metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").increment(1.0);
+        let lifecycle = Arc::new(QueryStreamLifecycle::new(|outcome, elapsed| {
+            record_gate_request("query", outcome, elapsed);
+            metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").decrement(1.0);
+        }));
+        let result = oracle
+            .query_sql_with_gate_lifecycle(context, request, Some(Arc::clone(&lifecycle)))
+            .instrument(tracing::info_span!(
+                "bifrost.gate.query",
+                operation = "query"
+            ))
+            .await;
+        if result.is_err() {
+            lifecycle.finish("failed");
+        }
+        result
     }
 
     /// Dispatches an authorized typed logical plan only to a ready local Oracle.
@@ -614,6 +704,10 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngestError::from_scribe(error)
             })?;
         metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
+        record_gate_rows(
+            i64::try_from(admission.rows_accepted).unwrap_or(i64::MAX),
+            0,
+        );
         metrics::histogram!("bifrost_gate_resolution_seconds")
             .record(resolution_started.elapsed().as_secs_f64());
         Ok(admission.rows_accepted)
@@ -643,29 +737,64 @@ fn map_otlp_error(error: IngestError) -> Status {
 impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
     BifrostIngestService for Gate<C, R, I>
 {
+    #[tracing::instrument(name = "bifrost.gate.write", skip_all, fields(operation = "write"))]
     async fn insert_batch(
         &self,
         request: Request<InsertBatchRequest>,
     ) -> Result<Response<InsertBatchResponse>, Status> {
-        let auth = self
-            .authenticate(request.metadata())
-            .await
-            .map_err(Status::from)?;
-        let frame = request.into_inner();
-        validate_batch(&frame, &self.limits).map_err(Status::from)?;
-        self.dispatch_native_frame(&self.limits, &auth, frame.clone())
-            .await
-            .inspect_err(|_error| record_gate_event("native_rejection"))
-            .map_err(Status::from)?;
-        let mut response = Response::new(InsertBatchResponse {
-            wyrd_batch_id: frame.wyrd_batch_id,
-        });
-        if let Ok(value) = auth.request_id.as_str().parse() {
-            response
-                .metadata_mut()
-                .insert(WYRD_REQUEST_ID_METADATA, value);
+        let lifecycle = GateRequestLifecycle::begin("write");
+        let result: Result<Response<InsertBatchResponse>, Status> = async {
+            let auth = self
+                .authenticate(request.metadata())
+                .await
+                .map_err(Status::from)?;
+            let frame = request.into_inner();
+            validate_batch(&frame, &self.limits).map_err(Status::from)?;
+            self.dispatch_native_frame(&self.limits, &auth, frame.clone())
+                .await
+                .inspect_err(|_error| record_gate_event("native_rejection"))
+                .map_err(Status::from)?;
+            let mut response = Response::new(InsertBatchResponse {
+                wyrd_batch_id: frame.wyrd_batch_id,
+            });
+            if let Ok(value) = auth.request_id.as_str().parse() {
+                response
+                    .metadata_mut()
+                    .insert(WYRD_REQUEST_ID_METADATA, value);
+            }
+            Ok(response)
         }
-        Ok(response)
+        .await;
+        // Scribe admission pressure is projected as ResourceExhausted (429)
+        // by the canonical ingest error mapping. Count that response as one
+        // rejected write request at this outer lifecycle owner, immediately
+        // before returning to the transport. Keeping the accounting here
+        // avoids a second increment in the Gate→Scribe seam.
+        let outcome = ingest_request_outcome(&result);
+        lifecycle.complete(outcome);
+        result
+    }
+}
+
+/// Classify one completed native write request for the bounded D24 metric.
+///
+/// The transport status is already the canonical projection of the Gate
+/// taxonomy. Resource exhaustion includes Scribe's explicit admission/busy
+/// response, so it is a rejection rather than an internal failure.
+fn ingest_request_outcome(result: &Result<Response<InsertBatchResponse>, Status>) -> &'static str {
+    match result {
+        Ok(_) => "success",
+        Err(status) if status.code() == wyrd_tonic::tonic::Code::Cancelled => "cancelled",
+        Err(status)
+            if matches!(
+                status.code(),
+                wyrd_tonic::tonic::Code::PermissionDenied
+                    | wyrd_tonic::tonic::Code::ResourceExhausted
+            ) =>
+        {
+            "rejected"
+        }
+        Err(_) => "failed",
     }
 }
 
@@ -765,6 +894,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::collector::{IngestOutcome, ProjectedExport, ProjectionExecutor};
@@ -785,6 +915,155 @@ mod tests {
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+
+    /// Recorder that observes boot descriptions while retaining normal metric behavior.
+    #[derive(Debug, Default)]
+    struct GateBootRecorder {
+        /// Standard recorder used to verify family registration and initial values.
+        metrics: wyrd_bench::BenchmarkRecorder,
+        /// Exact kind, family, unit, and help text emitted during initialization.
+        descriptions: Mutex<Vec<(String, String, Option<metrics::Unit>, String)>>,
+    }
+
+    impl metrics::Recorder for GateBootRecorder {
+        /// Retain one counter description exactly as emitted at boot.
+        fn describe_counter(
+            &self,
+            key: metrics::KeyName,
+            unit: Option<metrics::Unit>,
+            description: metrics::SharedString,
+        ) {
+            self.descriptions
+                .lock()
+                .expect("description registry")
+                .push((
+                    "counter".to_owned(),
+                    key.as_str().to_owned(),
+                    unit,
+                    description.to_string(),
+                ));
+        }
+
+        /// Retain one gauge description exactly as emitted at boot.
+        fn describe_gauge(
+            &self,
+            key: metrics::KeyName,
+            unit: Option<metrics::Unit>,
+            description: metrics::SharedString,
+        ) {
+            self.descriptions
+                .lock()
+                .expect("description registry")
+                .push((
+                    "gauge".to_owned(),
+                    key.as_str().to_owned(),
+                    unit,
+                    description.to_string(),
+                ));
+        }
+
+        /// Retain one histogram description exactly as emitted at boot.
+        fn describe_histogram(
+            &self,
+            key: metrics::KeyName,
+            unit: Option<metrics::Unit>,
+            description: metrics::SharedString,
+        ) {
+            self.descriptions
+                .lock()
+                .expect("description registry")
+                .push((
+                    "histogram".to_owned(),
+                    key.as_str().to_owned(),
+                    unit,
+                    description.to_string(),
+                ));
+        }
+
+        /// Delegate counter registration to the behavioral recorder.
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Recorder::register_counter(&self.metrics, key, metadata)
+        }
+
+        /// Delegate gauge registration to the behavioral recorder.
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Recorder::register_gauge(&self.metrics, key, metadata)
+        }
+
+        /// Delegate histogram registration to the behavioral recorder.
+        fn register_histogram(
+            &self,
+            key: &metrics::Key,
+            metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Recorder::register_histogram(&self.metrics, key, metadata)
+        }
+    }
+
+    /// D24 describes every Gate family at boot and registers the active gauge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a required description, canonical help text, terminal label,
+    /// or the initialized query gauge is absent.
+    #[test]
+    fn d24_gate_metric_families_are_described_and_registered_at_boot() {
+        let recorder = GateBootRecorder::default();
+        metrics::with_local_recorder(&recorder, super::initialize_gate_metrics);
+        assert_eq!(
+            *recorder.descriptions.lock().expect("description registry"),
+            [
+                (
+                    "counter".to_owned(),
+                    "bifrost_gate_requests_total".to_owned(),
+                    None,
+                    "Total Bifrost Gate requests by operation and terminal outcome.".to_owned(),
+                ),
+                (
+                    "histogram".to_owned(),
+                    "bifrost_gate_request_duration_seconds".to_owned(),
+                    Some(metrics::Unit::Seconds),
+                    "Bifrost Gate request duration by operation and terminal outcome.".to_owned(),
+                ),
+                (
+                    "gauge".to_owned(),
+                    "bifrost_gate_active_streams".to_owned(),
+                    None,
+                    "Current authorized and admitted Bifrost Gate query streams.".to_owned(),
+                ),
+            ]
+        );
+        assert_eq!(
+            recorder
+                .metrics
+                .snapshot()
+                .gauges
+                .get("bifrost_gate_active_streams{operation=\"query\"}"),
+            Some(&0.0)
+        );
+    }
+
+    /// Admission pressure is counted once as a rejected write request.
+    #[test]
+    fn admission_status_maps_to_one_rejected_write_outcome() {
+        let status = wyrd_tonic::tonic::Status::new(
+            wyrd_tonic::tonic::Code::ResourceExhausted,
+            "ingest writer busy",
+        );
+        let result: Result<
+            wyrd_tonic::tonic::Response<wyrd_tonic::wyrd::v1::InsertBatchResponse>,
+            wyrd_tonic::tonic::Status,
+        > = Err(status);
+        assert_eq!(super::ingest_request_outcome(&result), "rejected");
+    }
 
     #[derive(Debug)]
     struct TestCatalog;

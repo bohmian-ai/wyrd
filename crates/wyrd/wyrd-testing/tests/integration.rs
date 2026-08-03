@@ -10,8 +10,6 @@ mod genai_derivation_journey;
 mod genai_derivation_recovery;
 #[path = "interleaving_smoke.rs"]
 mod interleaving_smoke;
-#[path = "load_smoke.rs"]
-mod load_smoke;
 #[path = "oracle_peer.rs"]
 mod oracle_peer;
 #[path = "otlp_logs_export.rs"]
@@ -28,16 +26,14 @@ mod otlp_support;
 mod otlp_trace_export;
 #[path = "otlp_trace_export_http.rs"]
 mod otlp_trace_export_http;
+#[path = "pg_bifrost_cluster_load.rs"]
+mod pg_bifrost_cluster_load;
 #[path = "pg_bifrost_e2e_closeout_journey.rs"]
 mod pg_bifrost_e2e_closeout_journey;
 #[path = "pg_bifrost_forge_distributed_journey.rs"]
 mod pg_bifrost_forge_distributed_journey;
 #[path = "pg_bifrost_oracle_journeys.rs"]
 mod pg_bifrost_oracle_journeys;
-#[path = "pg_bifrost_scribe_multipod_journey.rs"]
-mod pg_bifrost_scribe_multipod_journey;
-#[path = "pg_bifrost_sustained_journey.rs"]
-mod pg_bifrost_sustained_journey;
 #[path = "pg_grpc_mount.rs"]
 mod pg_grpc_mount;
 #[path = "task15_inspection.rs"]

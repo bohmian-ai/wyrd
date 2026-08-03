@@ -1,27 +1,31 @@
 use std::sync::Arc;
 
+use crate::catalog::{TableRef, TenantTableBinding};
+use crate::contracts::Scribe;
+use crate::contracts::ScribeError;
+use crate::namespaces::BifrostNamespace;
+use crate::schema::SchemaFingerprint;
+use crate::scribe::ScribeAppend;
+use crate::scribe::ScribeImpl;
+use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
+use crate::scribe::tail_rpc::FetchLiveTailRequest;
+use crate::scribe::wal::{WalConfig, WalLsn, WalWriter};
 use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
 use tempfile::TempDir;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
-use vala_bifrost_redux::contracts::Scribe;
-use vala_bifrost_redux::contracts::ScribeError;
-use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::schema::SchemaFingerprint;
-use vala_bifrost_redux::scribe::ScribeAppend;
-use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
-use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
-use vala_bifrost_redux::scribe::wal::{WalConfig, WalLsn, WalWriter};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 
+/// Build the fixed one-row event-time batch for Scribe path tests.
+///
+/// # Panics
+/// Panics when static time or Arrow fixture construction fails.
 fn batch(day: NaiveDate) -> RecordBatch {
     let timestamp = day
         .and_hms_opt(12, 0, 0)
@@ -45,6 +49,7 @@ fn batch(day: NaiveDate) -> RecordBatch {
     .expect("task 15 batch")
 }
 
+/// Build the tenant principal used by public-shaped append cases.
 fn principal(tenant: DataTenantId) -> Principal {
     Principal {
         id: PrincipalId::new(Uuid::now_v7()),
@@ -56,6 +61,7 @@ fn principal(tenant: DataTenantId) -> Principal {
 }
 
 #[tokio::test]
+/// Production shards expose exact projections and WAL bounds to tail readers.
 async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "task15_tail");
@@ -138,6 +144,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
 }
 
 #[tokio::test]
+/// Oracle hot snapshots retain Arrow identity and isolate event days.
 async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     let tenant = DataTenantId::new_v7();
     let pointer_table = TableRef::new(BifrostNamespace::Bifrost, "task16_pointer_identity");
@@ -205,6 +212,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         .await;
 }
 
+/// Assert a returned hot batch shares the expected Arrow allocation.
 async fn assert_pointer_identity(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
@@ -230,6 +238,10 @@ async fn assert_pointer_identity(
     assert!(Arc::ptr_eq(source_value, hot[0].rows.column(0)));
 }
 
+/// Build one batch spanning two event-day partitions.
+///
+/// # Panics
+/// Panics when the static cross-day Arrow fixture cannot be built.
 fn cross_day_batch(schema: Arc<Schema>, day_one: NaiveDate, day_two: NaiveDate) -> RecordBatch {
     RecordBatch::try_new(
         schema,
@@ -252,6 +264,7 @@ fn cross_day_batch(schema: Arc<Schema>, day_one: NaiveDate, day_two: NaiveDate) 
     .expect("cross-day batch")
 }
 
+/// Assert cross-day materialization preserves row ownership and ordering.
 async fn assert_cross_day_materialization(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
@@ -288,6 +301,10 @@ async fn assert_cross_day_materialization(
     assert_eq!(hot_value(&day_two_hot[0].rows), 202);
 }
 
+/// Read the fixture's single hot value.
+///
+/// # Panics
+/// Panics when the fixture column is not the expected Int64 shape.
 fn hot_value(rows: &RecordBatch) -> i64 {
     rows.column(0)
         .as_any()
@@ -296,6 +313,7 @@ fn hot_value(rows: &RecordBatch) -> i64 {
         .value(0)
 }
 
+/// Assert a distinct tenant cannot observe the retained hot batch.
 async fn assert_other_tenant_isolated(
     scribe: &ScribeImpl,
     table: &TableRef,
@@ -320,6 +338,7 @@ async fn assert_other_tenant_isolated(
 }
 
 #[test]
+/// A concrete WAL disk fault rejects before mutating the segment.
 fn concrete_wal_disk_failure_rejects_before_file_mutation() {
     let temp_dir = TempDir::new().expect("WAL temp dir");
     let writer = WalWriter::new(
@@ -344,6 +363,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
 }
 
 #[tokio::test]
+/// A shard WAL failure reaches the caller's durable completion boundary.
 async fn shard_wal_failure_reaches_the_durable_completion() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "task15_wal_failure");

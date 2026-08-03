@@ -196,9 +196,8 @@ pub struct WyrdTestServer {
 
 struct WyrdTestServerInner {
     fixture: Arc<PgFixture>,
-    // Lifetime guard: only set for local-backend servers; cloud backends need no tempdir.
-    #[allow(dead_code)]
-    storage_root: Option<Arc<tempfile::TempDir>>,
+    /// Lifetime guard retained only for local storage-backed servers.
+    _storage_root: Option<Arc<tempfile::TempDir>>,
     _scribe_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for the Forge DataFusion spill directory.
     _forge_spill_root: Option<Arc<tempfile::TempDir>>,
@@ -224,6 +223,17 @@ struct WyrdTestServerInner {
     query_stream_fault: QueryStreamFaultController,
     /// Current notification-backed schema stall used by cancellation journeys.
     query_stream_stall: std::sync::Mutex<Option<Arc<wyrd_server::state::QueryStreamStall>>>,
+}
+
+/// Concrete lifecycle evidence returned after one test server stops.
+#[derive(Debug)]
+pub struct ServerShutdownInspection {
+    /// Final Scribe ownership snapshot when this process hosted Scribe.
+    pub scribe: Option<vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot>,
+    /// Whether the bound listener supervisor joined successfully.
+    pub listeners_stopped: bool,
+    /// Supervisor join handles still retained after shutdown.
+    pub supervised_tasks: u64,
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.
@@ -466,6 +476,45 @@ impl WyrdTestServer {
         Ok(())
     }
 
+    /// Shut down the bound workers and return concrete owner lifecycle evidence.
+    ///
+    /// # Errors
+    /// Returns an error if the serve task join times out or the final Scribe
+    /// inspection cannot be read.
+    pub async fn shutdown_and_inspect(
+        mut self,
+    ) -> Result<ServerShutdownInspection, WyrdTestServerError> {
+        if let Some(scribe) = self.inner.state.bifrost_scribe_for_test() {
+            scribe
+                .shutdown(std::time::Instant::now() + Duration::from_secs(60))
+                .await;
+        }
+        if let Some(token) = self.shutdown_token.take() {
+            token.cancel();
+        }
+        let listeners_stopped = if let Some(handle) = self.serve_handle.take() {
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .map_err(|_| WyrdTestServerError::Start("server shutdown timed out".to_owned()))?
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
+                .map_err(|error| WyrdTestServerError::Start(format!("server exited: {error:?}")))?;
+            true
+        } else {
+            !matches!(self.mode, Mode::Bound { .. })
+        };
+        let scribe = self
+            .inner
+            .state
+            .bifrost_scribe_for_test()
+            .map(|_| self.scribe_inspection_snapshot())
+            .transpose()?;
+        Ok(ServerShutdownInspection {
+            scribe,
+            listeners_stopped,
+            supervised_tasks: self.supervised_task_count_for_test() as u64,
+        })
+    }
+
     /// Cancel bound server workers without dropping the server-owned fixtures.
     ///
     /// Gated journeys use this to verify worker cleanup and then inspect or
@@ -474,6 +523,12 @@ impl WyrdTestServer {
         if let Some(token) = &self.shutdown_token {
             token.cancel();
         }
+    }
+
+    /// Return the number of bound supervisor tasks still owned by this server.
+    #[must_use]
+    pub fn supervised_task_count_for_test(&self) -> usize {
+        usize::from(self.serve_handle.is_some())
     }
 
     /// Flush the server-owned Scribe through its normal post-commit seal path.
@@ -656,22 +711,10 @@ impl WyrdTestServer {
         query_id: &str,
         baseline: BifrostQueryResourceSnapshot,
     ) -> Result<BifrostQueryResourceSnapshot, WyrdTestServerError> {
-        let stall = self
-            .inner
-            .query_stream_stall
-            .lock()
-            .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
-            .clone()
-            .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
         let probe = self.query_resource_probe(query_id)?;
         let mut releases = probe.subscribe();
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(WyrdServerConfig::default().shutdown.drain_ms);
-        tokio::time::timeout_at(deadline, stall.wait_dropped())
-            .await
-            .map_err(|_| {
-                WyrdTestServerError::Start("query body drop deadline elapsed".to_owned())
-            })?;
         loop {
             let snapshot = self.bifrost_query_resource_snapshot(query_id)?;
             if snapshot == baseline {
@@ -731,6 +774,29 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
+    /// Count non-terminal Forge tasks for one tenant after Scribe publication.
+    ///
+    /// This read-only probe tells a matrix caller whether a typed Forge
+    /// completion wait is causally required; a Scribe flush alone does not
+    /// imply that Forge compaction has been scheduled.
+    ///
+    /// # Errors
+    /// Returns an error when the fixture pool cannot be acquired or the
+    /// tenant-scoped Forge task query fails.
+    pub async fn bifrost_pending_forge_tasks_for_tenant(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<i64, WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND state IN ('ready', 'claimed', 'running', 'prepared')",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .map_err(sql)
+    }
+
     /// Count Bifrost read-decision audit rows for the fixture tenant.
     ///
     /// Agent-surface denial journeys use this test-only probe to prove Gate
@@ -740,15 +806,71 @@ impl WyrdTestServer {
     /// Returns an error when the fixture's superuser pool cannot be acquired
     /// or the tenant-scoped audit query fails.
     pub async fn bifrost_read_decision_count(&self) -> Result<i64, WyrdTestServerError> {
+        self.bifrost_read_decision_count_for_tenant(self.data_tenant_id())
+            .await
+    }
+
+    /// Count tenant-bound Bifrost read-decision audit rows.
+    ///
+    /// # Errors
+    /// Returns an error when the fixture's superuser pool cannot be acquired
+    /// or the tenant-scoped audit query fails.
+    pub async fn bifrost_read_decision_count_for_tenant(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<i64, WyrdTestServerError> {
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision'",
         )
-        .bind(self.data_tenant_id().as_uuid())
+        .bind(tenant.as_uuid())
         .fetch_one(&pool)
         .await
         .map_err(sql)?;
         Ok(count)
+    }
+
+    /// Count the exact tenant-bound read-decision audit row for one request ID.
+    ///
+    /// # Errors
+    /// Returns an error when the fixture's superuser pool cannot be acquired
+    /// or the request-scoped audit query fails.
+    pub async fn bifrost_read_decision_for_request(
+        &self,
+        tenant: DataTenantId,
+        request_id: &str,
+    ) -> Result<i64, WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND request_id = $2 AND operation = 'bifrost.query.read_decision'",
+        )
+        .bind(tenant.as_uuid())
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(sql)
+    }
+
+    /// Return the newest tenant-bound Bifrost read-decision request ID.
+    ///
+    /// Callers bracket one serialized public query with the tenant count, then
+    /// use this read-only probe to join that exact newly committed audit row.
+    ///
+    /// # Errors
+    /// Returns an error when the fixture's superuser pool cannot be acquired
+    /// or the tenant-scoped audit query fails.
+    pub async fn latest_bifrost_read_decision_request_id(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Option<String>, WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT request_id FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision' ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_optional(&pool)
+        .await
+        .map_err(sql)
     }
 
     /// Trip the server-owned WAL breaker for a deterministic benchmark probe.
@@ -767,6 +889,18 @@ impl WyrdTestServer {
         self.inner
             .state
             .scribe_inspection_snapshot_for_test()
+            .map_err(WyrdTestServerError::Start)
+    }
+
+    /// Return the exact live-tail fences retained by this server's Scribe.
+    ///
+    /// # Errors
+    /// Returns an error when the server has no Scribe or the production fence
+    /// registry cannot be inspected.
+    pub fn active_bifrost_tail_fences(&self) -> Result<u64, WyrdTestServerError> {
+        self.inner
+            .state
+            .active_scribe_tail_fences_for_test()
             .map_err(WyrdTestServerError::Start)
     }
 
@@ -882,6 +1016,18 @@ impl WyrdTestServer {
     #[must_use]
     pub fn bifrost_scribe(&self) -> Option<Arc<ScribeImpl>> {
         self.inner.state.bifrost_scribe_for_test().cloned()
+    }
+
+    /// Install a deterministic barrier at the public Bifrost write seam.
+    ///
+    /// # Errors
+    /// Returns an error when this server was started without a Bifrost Scribe.
+    pub fn stall_next_bifrost_write(
+        &self,
+    ) -> Result<Arc<vala_bifrost_redux::scribe::IngestStall>, WyrdTestServerError> {
+        self.bifrost_scribe()
+            .map(|scribe| scribe.stall_next_ingest_for_test())
+            .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 
     /// Return the fixture tenant id.
@@ -2078,6 +2224,17 @@ impl WyrdTestServerBuilder {
             scribe_admission.memory_limit_bytes,
             scribe_admission.scribe_memory_limit_bytes,
         )
+        .or_else(|error| {
+            if let Some(limit) = scribe_admission.scribe_memory_limit_bytes
+                && limit < 256 * 1024 * 1024
+            {
+                return BifrostMemoryGovernor::new_with_test_scribe_limit(
+                    scribe_admission.memory_limit_bytes,
+                    limit,
+                );
+            }
+            Err(error)
+        })
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
@@ -2380,7 +2537,7 @@ impl WyrdTestServerBuilder {
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
                 fixture,
-                storage_root,
+                _storage_root: storage_root,
                 _scribe_wal_root: scribe_wal_root,
                 _forge_spill_root: spill_root,
                 state,

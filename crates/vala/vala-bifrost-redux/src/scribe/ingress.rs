@@ -56,6 +56,9 @@ impl ScribeImpl {
             })?;
         memory.attach_shard(self.memory.shard_accounting(), shard);
 
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_admitted_ingest_for_test().await;
+
         let rows = self
             .ingress_cpu
             .decode(
@@ -122,5 +125,20 @@ impl ScribeImpl {
             batch_id: frame.batch_id,
             rows_accepted,
         })
+    }
+
+    /// Pause one admitted write at the deterministic test-support barrier.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn pause_admitted_ingest_for_test(&self) {
+        if let Some(stall) = self
+            .ingest_stall
+            .lock()
+            .ok()
+            .and_then(|mut current| current.take())
+        {
+            stall.entered.notify_waiters();
+            let _completion = super::IngestStallCompletion(&stall);
+            stall.release.notified().await;
+        }
     }
 }

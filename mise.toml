@@ -106,7 +106,6 @@ so they stay out of the fast lane) against live Postgres."""
 run = """
 cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_e2e_closeout_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_scribe_multipod_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_forge_distributed_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_published_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_fused_reconcile_journey --ignored --test-threads=1
@@ -163,6 +162,15 @@ cargo test --locked -p wyrd-testing --test integration -- forge_compaction_inter
 cargo test --locked -p wyrd-testing --test integration -- forge_maintenance_interleaving --ignored --test-threads=1
 """
 
+[tasks."test:bifrost:cluster"]
+description = "Run the deterministic public-Gate Bifrost cluster matrix"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:cluster:inner'"
+
+[tasks."test:bifrost:cluster:inner"]
+hide = true
+description = "Run only the named deterministic Rust cluster matrix journeys"
+run = "cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_three_server_three_worker_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- pressured_tenant_does_not_starve_peers --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_telemetry_reconciles_all_pillars --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_cancellation_and_shutdown_release_all_owners --ignored --test-threads=1"
+
 [tasks."test:bifrost:sustained"]
 description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
 
@@ -171,8 +179,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
 run = """
-cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_sustained_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test integration -- load_smoke --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1
 """
 
 [tasks."bench:bifrost:slo"]

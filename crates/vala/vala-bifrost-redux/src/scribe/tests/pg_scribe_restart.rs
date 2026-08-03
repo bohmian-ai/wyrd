@@ -1,5 +1,12 @@
 //! Restart/replay coverage for the Task-15 Scribe WAL and immutable path.
 
+use crate::catalog::TableRef;
+use crate::namespaces::BifrostNamespace;
+use crate::scribe::ScribeImpl;
+use crate::scribe::audit_envelope::encode_audit_event;
+use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::stream_identity::NodeId;
+use crate::scribe::wal::{WalConfig, WalWriter};
 use arrow::array::{Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
@@ -9,13 +16,6 @@ use opendal::services::Memory;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
-use vala_bifrost_redux::scribe::stream_identity::NodeId;
-use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -63,6 +63,7 @@ fn large_batch_bytes(value: i64) -> Vec<u8> {
     bytes
 }
 
+/// Build one tenant-bound replay audit event.
 fn audit_event(operation: &str, tenant: DataTenantId) -> AuditEvent {
     AuditEvent {
         request_id: RequestId::now_v7(),
@@ -81,6 +82,7 @@ fn audit_event(operation: &str, tenant: DataTenantId) -> AuditEvent {
     }
 }
 
+/// Build one deterministic tenant/table replay scope.
 fn seal_key(tenant: DataTenantId, table: &str) -> SealKey {
     SealKey::new(
         tenant,
@@ -90,6 +92,7 @@ fn seal_key(tenant: DataTenantId, table: &str) -> SealKey {
 }
 
 #[tokio::test]
+/// Replay applies owner backpressure before exceeding its memory budget.
 async fn replay_memory_is_bounded_by_owner_backpressure() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -144,6 +147,7 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
 }
 
 #[tokio::test]
+/// Same-key generations replay in durable WAL order without coalescing.
 async fn replay_splits_three_same_key_generations_in_wal_order() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -188,6 +192,7 @@ async fn replay_splits_three_same_key_generations_in_wal_order() {
 }
 
 #[tokio::test]
+/// A replay failure leaves Scribe unready and closed to new ingest.
 async fn replay_failure_keeps_scribe_unready() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());

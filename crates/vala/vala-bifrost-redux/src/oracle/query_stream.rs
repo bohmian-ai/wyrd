@@ -4,6 +4,10 @@
 //! physical batches until exactly one terminal outcome releases owned resources.
 
 use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 
@@ -22,6 +26,113 @@ pub struct OracleQueryStream {
     /// Query-keyed lifecycle observation used only by test-tier transports.
     #[cfg(feature = "test-support")]
     resource_probe: Option<Arc<super::admission::QueryResourceProbe>>,
+}
+
+/// Exactly-once lifecycle owner for a public Gate query stream.
+///
+/// Gate creates this owner before Oracle admission and attaches it to the
+/// returned stream. The owner records the terminal outcome when the stream
+/// emits its terminal frame; dropping it before then records cancellation.
+pub struct QueryStreamLifecycle {
+    started_at: Instant,
+    finished: AtomicBool,
+    finish_callback: Arc<dyn Fn(&'static str, Duration) + Send + Sync>,
+    #[cfg(feature = "test-support")]
+    observer: Arc<QueryLifecycleObserver>,
+}
+
+/// Process-local test observer notified after Gate lifecycle accounting commits.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct QueryLifecycleObserver {
+    /// Number of terminal lifecycle outcomes recorded.
+    completed: std::sync::atomic::AtomicU64,
+    /// Number of outcomes normalized to the canonical cancelled label.
+    cancelled: std::sync::atomic::AtomicU64,
+    /// Wakes test waiters after record-before-notify completion.
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl QueryLifecycleObserver {
+    /// Return the number of completed query lifecycle outcomes.
+    #[must_use]
+    pub fn completed(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
+    }
+
+    /// Return the number of lifecycle owners that recorded cancellation.
+    #[must_use]
+    pub fn cancelled(&self) -> u64 {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Wait until at least `target` outcomes have committed.
+    pub async fn wait_for_at_least(&self, target: u64) {
+        while self.completed() < target {
+            self.notify.notified().await;
+        }
+    }
+
+    /// Wait until at least `target` query lifecycles record cancellation.
+    pub async fn wait_for_cancelled_at_least(&self, target: u64) {
+        while self.cancelled() < target {
+            self.notify.notified().await;
+        }
+    }
+
+    /// Publish one completed lifecycle outcome and wake bounded waiters.
+    fn record(&self, outcome: &'static str) {
+        if outcome == "cancelled" {
+            self.cancelled.fetch_add(1, Ordering::AcqRel);
+        }
+        self.completed.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+#[cfg(feature = "test-support")]
+static QUERY_LIFECYCLE_OBSERVER: OnceLock<Arc<QueryLifecycleObserver>> = OnceLock::new();
+
+/// Return the shared test observer for completed Gate query lifecycles.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn query_lifecycle_observer_for_test() -> Arc<QueryLifecycleObserver> {
+    Arc::clone(QUERY_LIFECYCLE_OBSERVER.get_or_init(|| Arc::new(QueryLifecycleObserver::default())))
+}
+
+impl QueryStreamLifecycle {
+    /// Create a lifecycle owner with a callback for the Gate metric family.
+    #[must_use]
+    pub fn new(finish_callback: impl Fn(&'static str, Duration) + Send + Sync + 'static) -> Self {
+        Self {
+            started_at: Instant::now(),
+            finished: AtomicBool::new(false),
+            finish_callback: Arc::new(finish_callback),
+            #[cfg(feature = "test-support")]
+            observer: query_lifecycle_observer_for_test(),
+        }
+    }
+
+    /// Record one terminal outcome; repeated calls are ignored.
+    pub fn finish(&self, outcome: &'static str) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            (self.finish_callback)(outcome, self.started_at.elapsed());
+            #[cfg(feature = "test-support")]
+            self.observer.record(outcome);
+        }
+    }
+}
+
+impl Drop for QueryStreamLifecycle {
+    /// Records cancellation when the client drops before a terminal frame.
+    fn drop(&mut self) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            (self.finish_callback)("cancelled", self.started_at.elapsed());
+            #[cfg(feature = "test-support")]
+            self.observer.record("cancelled");
+        }
+    }
 }
 
 impl std::fmt::Debug for OracleQueryStream {
@@ -49,14 +160,14 @@ pub(super) struct QueryStreamInput {
     pub(super) deadline: Instant,
     /// Requested visibility contract.
     pub(super) visibility: VisibilityMode,
-    /// Immutable admission class.
-    pub(super) query_class: QueryClass,
     /// Whether live visibility degraded.
     pub(super) degraded: bool,
     /// Whether the one stale-cut replan was consumed.
     pub(super) stale_replanned: bool,
     /// Production query telemetry retained through terminal emission.
     pub(super) query_telemetry: QueryTelemetryGuard,
+    /// Optional Gate lifecycle retained through frame consumption.
+    pub(super) gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
 }
 
 /// One cancellation-, timeout-, or batch-aware stream step.
@@ -211,21 +322,25 @@ fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTermi
     }
 }
 
-/// Creates the low-cardinality span retained across one lazy query stream.
-fn query_stream_span(visibility: VisibilityMode, query_class: QueryClass) -> tracing::Span {
-    tracing::info_span!(
-        "bifrost.oracle.stream",
-        visibility = super::visibility_label(visibility),
-        query_class = query_class_label(query_class)
-    )
-}
-
 /// Selects the terminal outcome for a stream that observed a failed step.
 fn failed_stream_outcome(explicit_cancelled: &std::sync::atomic::AtomicBool) -> &'static str {
     if explicit_cancelled.load(std::sync::atomic::Ordering::Acquire) {
         "cancelled"
     } else {
         "failed"
+    }
+}
+
+/// Finish production query telemetry and the optional Gate lifecycle together.
+fn finish_stream(
+    telemetry: &mut QueryTelemetryGuard,
+    lifecycle: Option<&Arc<QueryStreamLifecycle>>,
+    outcome: &'static str,
+    status: &'static str,
+) {
+    telemetry.finish(outcome, status);
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.finish(outcome);
     }
 }
 
@@ -271,14 +386,16 @@ impl OracleQueryStream {
             schema,
             batches,
             first,
-            mut admitted,
+            admitted,
             deadline,
             visibility,
-            query_class,
             degraded,
             stale_replanned,
             mut query_telemetry,
+            gate_lifecycle,
         } = input;
+        #[cfg(feature = "test-support")]
+        let mut admitted = admitted;
         let schema_frame = encode_schema_frame(&schema)?;
         #[cfg(feature = "test-support")]
         let resource_probe = Some(admitted.attach_resource_probe());
@@ -289,7 +406,6 @@ impl OracleQueryStream {
         let stream_telemetry_cancelled = Arc::clone(&telemetry_cancelled);
         let renewal_terminal = Arc::clone(&admitted.renewal_terminal);
         query_telemetry.start_stream();
-        let _stream_span = query_stream_span(visibility, query_class);
         let frames = async_stream::stream! {
             let mut admitted = Some(admitted);
             let mut batches = batches;
@@ -297,6 +413,16 @@ impl OracleQueryStream {
             let mut row_count = 0_u64;
             query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
             yield Ok(QueryStreamFrame::Schema(schema_frame));
+            macro_rules! finish_failed_stream {
+                ($code:expr) => {{
+                    let outcome = failed_stream_outcome(&stream_telemetry_cancelled);
+                    finish_stream(&mut query_telemetry, gate_lifecycle.as_ref(), outcome, "complete");
+                    let terminal = failed_terminal_for_visibility($code, row_count, visibility);
+                    release_admitted(&mut admitted).await;
+                    yield Ok(QueryStreamFrame::Terminal(terminal));
+                    return;
+                }};
+            }
             loop {
                 let event = if lease_cancellation.is_cancelled() {
                     QueryStreamEvent::Failed(renewal_terminal_code(&renewal_terminal))
@@ -321,50 +447,67 @@ impl OracleQueryStream {
                             );
                             yield Ok(QueryStreamFrame::Batch(frame));
                         } else {
-                                query_telemetry.finish(failed_stream_outcome(&stream_telemetry_cancelled), "complete");
-                                let terminal = failed_terminal_for_visibility(
-                                    QueryTerminalErrorCode::QueryExecutionFailed,
-                                    row_count,
-                                    visibility,
-                                );
-                                release_admitted(&mut admitted).await;
-                                yield Ok(QueryStreamFrame::Terminal(terminal));
-                                return;
+                            finish_failed_stream!(QueryTerminalErrorCode::QueryExecutionFailed);
                         }
                     }
                     QueryStreamEvent::Batch(Some(Err(error))) => {
                         let code = terminal_error_code(&error);
                         tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                        query_telemetry.finish(failed_stream_outcome(&stream_telemetry_cancelled), "complete");
-                        let terminal = failed_terminal_for_visibility(code, row_count, visibility);
-                        release_admitted(&mut admitted).await;
-                        yield Ok(QueryStreamFrame::Terminal(terminal));
-                        return;
+                        finish_failed_stream!(code);
                     }
                     QueryStreamEvent::Batch(None) => break,
                     QueryStreamEvent::Failed(code) => {
-                        query_telemetry.finish(failed_stream_outcome(&stream_telemetry_cancelled), "complete");
-                        let terminal = failed_terminal_for_visibility(code, row_count, visibility);
-                        release_admitted(&mut admitted).await;
-                        yield Ok(QueryStreamFrame::Terminal(terminal));
-                        return;
+                        finish_failed_stream!(code);
                     }
                 }
             }
             let terminal = successful_terminal(visibility, degraded, stale_replanned, row_count);
             debug_assert!(terminal.validate(visibility).is_ok());
-            query_telemetry.finish(if degraded { "degraded" } else { "success" }, if degraded { "degraded" } else { "complete" });
+            finish_stream(
+                &mut query_telemetry,
+                gate_lifecycle.as_ref(),
+                "success",
+                if degraded { "degraded" } else { "complete" },
+            );
             release_admitted(&mut admitted).await;
             yield Ok(QueryStreamFrame::Terminal(terminal));
         };
-        Ok(Self {
+        let stream = Self::assemble(
             schema_fingerprint,
-            frames: Box::pin(frames),
+            Box::pin(frames),
+            cancellation,
+            telemetry_cancelled,
+        );
+        #[cfg(feature = "test-support")]
+        let stream = stream.with_resource_probe(resource_probe);
+        Ok(stream)
+    }
+
+    /// Assemble the stream owner from its schema, frame source, and cancellation edge.
+    fn assemble(
+        schema_fingerprint: String,
+        frames: std::pin::Pin<Box<super::OracleFrameStream>>,
+        cancellation: CancellationToken,
+        telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            schema_fingerprint,
+            frames,
             cancellation,
             telemetry_cancelled,
             #[cfg(feature = "test-support")]
-            resource_probe,
-        })
+            resource_probe: None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Attach query-keyed resource evidence without changing stream behavior.
+    fn with_resource_probe(
+        mut self,
+        resource_probe: Option<Arc<super::admission::QueryResourceProbe>>,
+    ) -> Self {
+        self.resource_probe = resource_probe;
+        self
     }
 
     /// Returns this stream's query-identity-keyed lifecycle probe for tests.
@@ -404,7 +547,7 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
 
-    use super::OracleQueryStream;
+    use super::{OracleQueryStream, QueryStreamLifecycle};
     use crate::oracle::{BifrostError, QuerySchemaFrame, QueryStreamFrame};
 
     /// Synthetic owner state mirroring admission's local-slot, durable-release,
@@ -532,5 +675,43 @@ mod tests {
             assert!(cancellation.is_cancelled());
             assert_owner_released(&owner);
         }
+    }
+
+    /// Terminal completion records one Gate outcome even when the owner drops later.
+    #[test]
+    fn gate_lifecycle_records_terminal_once() {
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&outcomes);
+        let lifecycle = QueryStreamLifecycle::new(move |outcome, _elapsed| {
+            observed
+                .lock()
+                .expect("lifecycle outcomes lock")
+                .push(outcome);
+        });
+        lifecycle.finish("success");
+        lifecycle.finish("failed");
+        drop(lifecycle);
+        assert_eq!(
+            *outcomes.lock().expect("lifecycle outcomes lock"),
+            vec!["success"]
+        );
+    }
+
+    /// Dropping a stream lifecycle before terminal emission records cancellation.
+    #[test]
+    fn gate_lifecycle_drop_records_cancelled_once() {
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&outcomes);
+        let lifecycle = QueryStreamLifecycle::new(move |outcome, _elapsed| {
+            observed
+                .lock()
+                .expect("lifecycle outcomes lock")
+                .push(outcome);
+        });
+        drop(lifecycle);
+        assert_eq!(
+            *outcomes.lock().expect("lifecycle outcomes lock"),
+            vec!["cancelled"]
+        );
     }
 }

@@ -903,10 +903,11 @@ fn rendered_series(sample: &ForgeMetricSample) -> String {
 
 /// Identify rendered counters and histogram internals that must never regress.
 fn is_monotonic_series(series: &str) -> bool {
-    series
-        .split_once('{')
-        .map_or(series, |(name, _)| name)
-        .ends_with("_total")
+    let name = series.split_once('{').map_or(series, |(name, _)| name);
+    if name == "bifrost_oracle_slots_total" {
+        return false;
+    }
+    name.ends_with("_total")
         || series
             .split_once('{')
             .map_or(series, |(name, _)| name)
@@ -1139,6 +1140,14 @@ mod tests {
                 .collect(),
             duration_nanos: 1,
         }
+    }
+
+    /// Slot capacity is an up/down gauge even though its legacy family ends in `_total`.
+    #[test]
+    fn oracle_slot_capacity_is_not_monotonic() {
+        assert!(!is_monotonic_series(
+            "bifrost_oracle_slots_total{role=\"leader\"}"
+        ));
     }
 
     /// Construct one complete three-worker production delta without a fixture value path.

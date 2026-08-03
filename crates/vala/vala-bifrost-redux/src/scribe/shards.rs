@@ -486,7 +486,7 @@ impl ScribeShardRuntime {
     }
 
     /// Retains one never-completing owner and returns its abort probe.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn install_shutdown_stall_for_test(&self) -> tokio::task::AbortHandle {
         let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();

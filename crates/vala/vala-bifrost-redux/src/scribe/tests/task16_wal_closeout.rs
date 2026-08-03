@@ -2,6 +2,16 @@
 
 use std::sync::Arc;
 
+use crate::catalog::TableRef;
+use crate::contracts::{Scribe, ScribeAppend, ScribeError};
+use crate::namespaces::BifrostNamespace;
+use crate::schema::fingerprint::SchemaFingerprint;
+use crate::scribe::audit_envelope::encode_audit_event;
+use crate::scribe::memory::{BifrostMemoryGovernor, MIN_MEMORY_BYTES, MemoryCategory};
+use crate::scribe::replay::replay_wal_directory;
+use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::stream_identity::NodeId;
+use crate::scribe::wal::{SegmentHeader, WalConfig, WalWriter};
 use arrow::array::{Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -9,22 +19,13 @@ use chrono::NaiveDate;
 use opendal::services::Memory;
 use tempfile::TempDir;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::contracts::{Scribe, ScribeAppend, ScribeError};
-use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
-use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
-use vala_bifrost_redux::scribe::memory::{BifrostMemoryGovernor, MIN_MEMORY_BYTES, MemoryCategory};
-use vala_bifrost_redux::scribe::replay::replay_wal_directory;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
-use vala_bifrost_redux::scribe::stream_identity::NodeId;
-use vala_bifrost_redux::scribe::wal::{SegmentHeader, WalConfig, WalWriter};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
+/// Build one deterministic WAL closeout scope.
 fn key(tenant: DataTenantId, table: &str) -> SealKey {
     SealKey::new(
         tenant,
@@ -33,6 +34,10 @@ fn key(tenant: DataTenantId, table: &str) -> SealKey {
     )
 }
 
+/// Encode the fixed closeout audit payload.
+///
+/// # Panics
+/// Panics when the static audit event cannot be encoded.
 fn audit() -> Vec<u8> {
     encode_audit_event(&AuditEvent {
         request_id: RequestId::now_v7(),
@@ -52,6 +57,10 @@ fn audit() -> Vec<u8> {
     .expect("audit")
 }
 
+/// Build the fixed one-row closeout batch.
+///
+/// # Panics
+/// Panics when static date or Arrow fixture construction fails.
 fn batch() -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -80,6 +89,7 @@ fn batch() -> RecordBatch {
     .expect("batch")
 }
 
+/// Build the tenant principal used by durable append cases.
 fn principal(tenant: DataTenantId) -> Principal {
     Principal {
         id: PrincipalId::new(Uuid::now_v7()),
@@ -90,10 +100,11 @@ fn principal(tenant: DataTenantId) -> Principal {
     }
 }
 
-fn scribe(
-    wal_root: &TempDir,
-    node: NodeId,
-) -> (Arc<WalWriter>, vala_bifrost_redux::scribe::ScribeImpl) {
+/// Construct a Scribe and WAL sharing one explicit owner root.
+///
+/// # Panics
+/// Panics when the local WAL or memory object store cannot be built.
+fn scribe(wal_root: &TempDir, node: NodeId) -> (Arc<WalWriter>, crate::scribe::ScribeImpl) {
     let wal = Arc::new(
         WalWriter::new(wal_root.path(), *node.as_bytes(), 1, WalConfig::default())
             .expect("WAL writer"),
@@ -103,7 +114,7 @@ fn scribe(
             .expect("memory object store")
             .finish(),
     );
-    let scribe = vala_bifrost_redux::scribe::ScribeImpl::new_for_embedded_with_deps(
+    let scribe = crate::scribe::ScribeImpl::new_for_embedded_with_deps(
         operator,
         Arc::clone(&wal),
         &node.to_string(),
@@ -112,8 +123,12 @@ fn scribe(
     (wal, scribe)
 }
 
+/// Append one fixed batch through Scribe's durable production seam.
+///
+/// # Errors
+/// Returns the exact Scribe append error from the durable owner.
 async fn append(
-    scribe: &vala_bifrost_redux::scribe::ScribeImpl,
+    scribe: &crate::scribe::ScribeImpl,
     tenant: DataTenantId,
     table: &str,
     batch_id: Uuid,
@@ -133,7 +148,84 @@ async fn append(
         .map(|_| ())
 }
 
+/// Concurrent and sequential shutdown callers share one completed drain.
+#[tokio::test]
+/// Repeated shutdown shares one completion and releases every retained owner.
+async fn duplicate_shutdown_is_idempotent_and_closes_owners() {
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let (_wal, scribe) = scribe(&wal_root, node);
+    let scribe = Arc::new(scribe);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let first = {
+        let scribe = Arc::clone(&scribe);
+        tokio::spawn(async move { scribe.shutdown(deadline).await })
+    };
+    let second = {
+        let scribe = Arc::clone(&scribe);
+        tokio::spawn(async move { scribe.shutdown(deadline).await })
+    };
+    first.await.expect("first shutdown owner");
+    second.await.expect("second shutdown waiter");
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+    let snapshot = scribe.inspection_snapshot().expect("shutdown inspection");
+    assert_eq!(snapshot.queued_items, 0);
+    assert_eq!(snapshot.open_wal_stream_count, 0);
+}
+
+/// Cancelling the graceful owner cannot strand Scribe in its draining state.
+///
+/// # Panics
+///
+/// Panics if the fixture cannot start, draining is not observed, cancellation
+/// fails to run the synchronous finalizer, or later shutdown paths exceed their
+/// bounded deadlines or retain a worker owner.
+#[tokio::test]
+async fn cancelled_shutdown_owner_is_recovered_by_abort_finalizer() {
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let (_wal, scribe) = scribe(&wal_root, node);
+    let scribe = Arc::new(scribe);
+    let stalled = scribe.install_shutdown_stall_for_test().await;
+    let first = {
+        let scribe = Arc::clone(&scribe);
+        tokio::spawn(async move {
+            scribe
+                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(30))
+                .await;
+        })
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        scribe.wait_shutdown_draining_for_test(),
+    )
+    .await
+    .expect("shutdown reaches draining");
+    first.abort();
+    first.await.expect_err("first shutdown future is cancelled");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        scribe.shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+    )
+    .await
+    .expect("subsequent shutdown observes stopped state");
+    scribe.abort_shutdown();
+    assert!(stalled.is_finished());
+    assert_eq!(
+        scribe
+            .inspection_snapshot()
+            .expect("shutdown inspection")
+            .open_wal_stream_count,
+        0
+    );
+}
+
 #[test]
+/// A future WAL header version fails with its typed compatibility error.
 fn wal_v2_header_fails_with_typed_unsupported_version() {
     let mut header = SegmentHeader::new([3_u8; 16], 1, 0, 0);
     header.version = 2;
@@ -148,6 +240,7 @@ fn wal_v2_header_fails_with_typed_unsupported_version() {
 }
 
 #[tokio::test]
+/// A sync failure produces neither acknowledgement nor memtable visibility.
 async fn sync_failure_has_no_ack_or_memtable_visibility() {
     let wal_root = tempfile::tempdir().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -171,6 +264,7 @@ async fn sync_failure_has_no_ack_or_memtable_visibility() {
 }
 
 #[tokio::test]
+/// A post-fsync response failure reuses the stable batch exactly once.
 async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
     let wal_root = tempfile::tempdir().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -206,6 +300,7 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
 }
 
 #[test]
+/// Multi-segment replay preserves order while deduplicating stable batches.
 fn multi_segment_replay_preserves_order_and_deduplicates() {
     let wal_root = tempfile::tempdir().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -236,6 +331,7 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
 }
 
 #[test]
+/// Parent and Scribe hard limits reject before any WAL mutation.
 fn parent_scribe_and_wal_hard_limits_reject_before_append() {
     let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES).expect("memory governor");
     let parent = governor

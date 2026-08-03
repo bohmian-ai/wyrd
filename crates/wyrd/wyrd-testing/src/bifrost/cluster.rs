@@ -48,6 +48,8 @@ pub enum BifrostTopology {
     SixPod,
     /// Run one API/scheduler process with three dedicated Forge workers.
     DedicatedForgeWorkers,
+    /// Run exactly three public Server processes and three dedicated workers.
+    ThreeServersThreeForgeWorkers,
 }
 
 impl BifrostTopology {
@@ -59,6 +61,9 @@ impl BifrostTopology {
             Self::RoleSeparated => BifrostClusterSpec::role_separated(),
             Self::SixPod => BifrostClusterSpec::six_capacity(),
             Self::DedicatedForgeWorkers => BifrostClusterSpec::dedicated_forge_workers(),
+            Self::ThreeServersThreeForgeWorkers => {
+                BifrostClusterSpec::three_servers_three_forge_workers()
+            }
         }
     }
 
@@ -162,6 +167,30 @@ impl BifrostClusterSpec {
             ],
         )];
         nodes.extend((2..=4).map(|id| Self::node(id, [BifrostRuntimeRole::Forge])));
+        Self { nodes }
+    }
+
+    /// Construct the deterministic three-Server/three-ForgeWorker matrix.
+    ///
+    /// The first three nodes carry the complete public Server role set. The
+    /// remaining three nodes carry only Forge, which the server harness maps
+    /// to the closed `ForgeWorker` process role. Keeping the descriptor
+    /// explicit prevents a mixed role from accidentally satisfying this lane.
+    #[must_use]
+    pub fn three_servers_three_forge_workers() -> Self {
+        let mut nodes = (1..=3)
+            .map(|id| {
+                Self::node(
+                    id,
+                    [
+                        BifrostRuntimeRole::Scribe,
+                        BifrostRuntimeRole::Forge,
+                        BifrostRuntimeRole::Oracle,
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        nodes.extend((4..=6).map(|id| Self::node(id, [BifrostRuntimeRole::Forge])));
         Self { nodes }
     }
 
@@ -315,12 +344,49 @@ pub struct OracleInspection {
     pub active_leases: u64,
     /// Sum of durable admission accounting slots.
     pub slots_in_use: u64,
+    /// Live-tail fences retained across every Scribe process.
+    pub active_tail_fences: u64,
     /// Number of durable audit rows observed across tenants.
     pub audit_rows: u64,
+    /// Durable Oracle read-decision audit rows observed across tenants.
+    pub read_audit_rows: u64,
+    /// Forge tasks still holding a durable claim.
+    pub forge_active_claims: u64,
+    /// Distinct Forge attempts still in a non-terminal claimed execution state.
+    pub forge_active_attempts: u64,
+    /// Forge tasks retaining historical attempt identifiers for diagnostics.
+    pub forge_historical_attempts: u64,
+    /// Forge tasks in a terminal state with durable evidence.
+    pub forge_terminal_tasks: u64,
     /// Metric families present in the production recorder snapshot.
     pub metric_families: BTreeSet<String>,
     /// Finished span names present in the production tracing capture.
     pub span_names: BTreeSet<String>,
+}
+
+/// Concrete result of stopping every server/listener in a test cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterShutdownInspection {
+    /// Every server stop operation completed successfully.
+    pub servers_stopped: bool,
+    /// Every bound HTTP/gRPC listener was joined by its server stop operation.
+    pub listeners_stopped: bool,
+    /// Scribe queued commands remaining after every server drain completed.
+    pub scribe_queued: u64,
+    /// Scribe append commands remaining after every server drain completed.
+    pub scribe_inflight: u64,
+    /// Persistent WAL streams remaining after server shutdown.
+    pub scribe_wal_streams: u64,
+    /// Durable Oracle leases remaining at the final pre-stop drain checkpoint.
+    pub oracle_leases: u64,
+    /// Durable Oracle admission slots remaining at the final pre-stop drain checkpoint.
+    pub oracle_slots: u64,
+    /// Forge claims remaining at the final pre-stop drain checkpoint.
+    pub forge_active_claims: u64,
+    /// Forge attempts remaining at the final pre-stop drain checkpoint.
+    pub forge_active_attempts: u64,
+    /// Supervised server tasks retained after every server owner is dropped.
+    pub supervised_tasks: u64,
 }
 
 /// One parsed production Prometheus series.
@@ -560,6 +626,8 @@ pub struct WyrdTestCluster {
     wal_sync_delay: Duration,
     /// Optional deterministic Scribe admission configuration.
     scribe_admission: Option<AdmissionConfig>,
+    /// Optional node receiving the deterministic admission override.
+    scribe_admission_node: Option<NodeId>,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
@@ -766,6 +834,79 @@ impl WyrdTestCluster {
         .await
     }
 
+    /// Start an explicit descriptor with admission pressure on one Server.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, or role-supervision error when the
+    /// selected node cannot be booted with the requested bounds.
+    pub async fn start_spec_with_admission_on_node(
+        spec: BifrostClusterSpec,
+        node_index: usize,
+        admission: AdmissionConfig,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            spec,
+            Duration::ZERO,
+            Some(admission),
+            Some(node_index),
+            false,
+            false,
+            ForgeHarnessOptions::default(),
+        )
+        .await
+    }
+
+    /// Start an explicit descriptor with a shared Forge completion observer.
+    ///
+    /// The observer is passive production-worker evidence used by deterministic
+    /// publication waits; it does not alter Forge scheduling or task state.
+    ///
+    /// # Errors
+    /// Returns the same topology, resource, and role-supervision errors as
+    /// [`Self::start_spec`].
+    pub async fn start_spec_with_forge_completion_observer(
+        spec: BifrostClusterSpec,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            spec,
+            Duration::ZERO,
+            None,
+            None,
+            false,
+            false,
+            ForgeHarnessOptions {
+                completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                ..ForgeHarnessOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start an explicit descriptor with admission pressure and Forge observer.
+    ///
+    /// # Errors
+    /// Returns the same topology, resource, and role-supervision errors as
+    /// [`Self::start_spec_with_admission_on_node`].
+    pub async fn start_spec_with_admission_and_forge_completion_observer_on_node(
+        spec: BifrostClusterSpec,
+        node_index: usize,
+        admission: AdmissionConfig,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            spec,
+            Duration::ZERO,
+            Some(admission),
+            Some(node_index),
+            false,
+            false,
+            ForgeHarnessOptions {
+                completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                ..ForgeHarnessOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start one server process with three dedicated Forge workers.
     ///
     /// # Errors
@@ -803,6 +944,7 @@ impl WyrdTestCluster {
             BifrostClusterSpec::one_mixed(),
             Duration::ZERO,
             None,
+            None,
             false,
             false,
             ForgeHarnessOptions {
@@ -822,6 +964,7 @@ impl WyrdTestCluster {
         Self::start_spec_with_all_options(
             BifrostClusterSpec::dedicated_forge_workers(),
             Duration::ZERO,
+            None,
             None,
             false,
             false,
@@ -859,6 +1002,7 @@ impl WyrdTestCluster {
             spec,
             wal_sync_delay,
             scribe_admission,
+            None,
             enable_oracle_peer_tls,
             delay_last_node,
             ForgeHarnessOptions::default(),
@@ -871,6 +1015,7 @@ impl WyrdTestCluster {
         spec: BifrostClusterSpec,
         wal_sync_delay: Duration,
         scribe_admission: Option<AdmissionConfig>,
+        scribe_admission_node: Option<usize>,
         enable_oracle_peer_tls: bool,
         delay_last_node: bool,
         options: ForgeHarnessOptions,
@@ -948,6 +1093,8 @@ impl WyrdTestCluster {
             None
         };
         let topology = classify_topology(&spec);
+        let scribe_admission_node =
+            scribe_admission_node.and_then(|index| spec.nodes.get(index).map(|node| node.node_id));
         let node_count = spec.nodes.len();
         let mut nodes = BTreeMap::new();
         for node in spec.nodes {
@@ -1003,6 +1150,7 @@ impl WyrdTestCluster {
             topology,
             wal_sync_delay,
             scribe_admission,
+            scribe_admission_node,
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
             oracle_peer_credentials,
@@ -1050,7 +1198,9 @@ impl WyrdTestCluster {
         if let Some(catalog) = &self.commit_uncertainty_catalog {
             builder = builder.with_forge_catalog_for_test(catalog.clone());
         }
-        if let Some(admission) = self.scribe_admission {
+        if let Some(admission) = self.scribe_admission
+            && (self.scribe_admission_node.is_none() || self.scribe_admission_node == Some(node_id))
+        {
             builder = builder.with_scribe_admission_for_test(admission);
         }
         if let Some((_, tls)) = &self.oracle_peer_tls {
@@ -1180,13 +1330,58 @@ impl WyrdTestCluster {
             .fetch_one(pool)
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        let read_audit_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        let (
+            forge_active_claims,
+            forge_active_attempts,
+            forge_historical_attempts,
+            forge_terminal_tasks,
+        ): (i64, i64, i64, i64) =
+            sqlx::query_as(
+                "SELECT
+                    COUNT(*) FILTER (WHERE state IN ('claimed', 'running', 'prepared'))::bigint,
+                    COUNT(DISTINCT attempt_id) FILTER (WHERE state IN ('claimed', 'running', 'prepared'))::bigint,
+                    COUNT(*) FILTER (WHERE attempt_id IS NOT NULL)::bigint,
+                    COUNT(*) FILTER (WHERE state IN ('succeeded', 'failed', 'cancelled', 'unschedulable') AND evidence IS NOT NULL)::bigint
+                 FROM vala.forge_tasks",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        let active_tail_fences = self
+            .servers
+            .values()
+            .filter_map(Option::as_ref)
+            .filter(|server| server.bifrost_scribe().is_some())
+            .map(|server| server.active_bifrost_tail_fences())
+            .try_fold(0_u64, |total, count| {
+                count
+                    .map(|count| total.saturating_add(count))
+                    .map_err(|error| ClusterError::Resource(error.to_string()))
+            })?;
         Ok(OracleInspection {
             memberships,
             active_leases: u64::try_from(active_leases)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
             slots_in_use: u64::try_from(slots_in_use)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            active_tail_fences,
             audit_rows: u64::try_from(audit_rows)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            read_audit_rows: u64::try_from(read_audit_rows)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            forge_active_claims: u64::try_from(forge_active_claims)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            forge_active_attempts: u64::try_from(forge_active_attempts)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            forge_historical_attempts: u64::try_from(forge_historical_attempts)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            forge_terminal_tasks: u64::try_from(forge_terminal_tasks)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
             metric_families: self.telemetry.families(),
             span_names: self.telemetry.span_names(),
@@ -1388,6 +1583,15 @@ impl WyrdTestCluster {
         }
     }
 
+    /// Count currently retained bound supervisor tasks across running servers.
+    #[must_use]
+    pub fn supervised_task_count_for_test(&self) -> u64 {
+        self.servers()
+            .map(WyrdTestServer::supervised_task_count_for_test)
+            .map(|count| count as u64)
+            .sum()
+    }
+
     /// Return one running pod by stable order index.
     #[must_use]
     pub fn server(&self, index: usize) -> Option<&WyrdTestServer> {
@@ -1420,17 +1624,75 @@ impl WyrdTestCluster {
     /// # Errors
     ///
     /// Returns the first teardown error after attempting every running node.
-    pub async fn shutdown(mut self) -> Result<(), ClusterError> {
+    pub async fn shutdown(self) -> Result<(), ClusterError> {
+        self.shutdown_and_inspect().await.map(|_| ())
+    }
+
+    /// Stop every server and return concrete listener/server teardown evidence.
+    ///
+    /// # Errors
+    /// Returns the first teardown error after attempting every running node.
+    pub async fn shutdown_and_inspect(mut self) -> Result<ClusterShutdownInspection, ClusterError> {
         let mut first_error = None;
-        let node_ids = self.servers.keys().copied().collect::<Vec<_>>();
-        for node_id in node_ids {
-            if self.servers.get(&node_id).is_some_and(Option::is_some)
-                && let Err(error) = self.stop_node(node_id).await
-            {
-                first_error.get_or_insert(error.to_string());
+        let mut scribe_queued = 0_u64;
+        let mut scribe_inflight = 0_u64;
+        let mut scribe_wal_streams = 0_u64;
+        let mut listeners_stopped = true;
+        let mut supervised_tasks = 0_u64;
+        for server in self.servers.values().filter_map(Option::as_ref) {
+            if server.bifrost_scribe().is_some() {
+                if let Err(error) = server.flush_bifrost().await {
+                    first_error.get_or_insert(error.to_string());
+                }
+                if let Some(scribe) = server.bifrost_scribe() {
+                    scribe_inflight =
+                        scribe_inflight.saturating_add(scribe.inflight_items_for_test() as u64);
+                }
             }
         }
-        first_error.map_or(Ok(()), |error| Err(ClusterError::Shutdown(error)))
+        let inspection = self.oracle_inspection().await?;
+        let node_ids = self.servers.keys().copied().collect::<Vec<_>>();
+        let expected_servers = node_ids.len();
+        let mut stopped_servers = 0_usize;
+        for node_id in node_ids {
+            if let Some(slot) = self.servers.get_mut(&node_id)
+                && let Some(server) = slot.take()
+            {
+                match server.shutdown_and_inspect().await {
+                    Ok(server_inspection) => {
+                        stopped_servers = stopped_servers.saturating_add(1);
+                        listeners_stopped &= server_inspection.listeners_stopped;
+                        supervised_tasks =
+                            supervised_tasks.saturating_add(server_inspection.supervised_tasks);
+                        if let Some(snapshot) = server_inspection.scribe {
+                            scribe_queued =
+                                scribe_queued.saturating_add(snapshot.queued_items as u64);
+                            scribe_wal_streams = scribe_wal_streams
+                                .saturating_add(snapshot.open_wal_stream_count as u64);
+                        }
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(ClusterError::Shutdown(error))
+        } else {
+            Ok(ClusterShutdownInspection {
+                servers_stopped: stopped_servers == expected_servers,
+                listeners_stopped,
+                scribe_queued,
+                scribe_inflight,
+                scribe_wal_streams,
+                oracle_leases: inspection.active_leases,
+                oracle_slots: inspection.slots_in_use,
+                forge_active_claims: inspection.forge_active_claims,
+                forge_active_attempts: inspection.forge_active_attempts,
+                supervised_tasks,
+            })
+        }
     }
 }
 
@@ -1446,6 +1708,15 @@ fn has_full_server_roles(roles: &BTreeSet<BifrostRuntimeRole>) -> bool {
 fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
     match spec.nodes.len() {
         1 => BifrostTopology::OnePod,
+        6 if spec.nodes[..3]
+            .iter()
+            .all(|node| has_full_server_roles(&node.roles))
+            && spec.nodes[3..].iter().all(|node| {
+                node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge)
+            }) =>
+        {
+            BifrostTopology::ThreeServersThreeForgeWorkers
+        }
         4 if spec.nodes.first().is_some_and(|node| {
             node.roles.contains(&BifrostRuntimeRole::Scribe)
                 && node.roles.contains(&BifrostRuntimeRole::Forge)
@@ -1559,6 +1830,29 @@ fn parse_metric_sample(series: &str, value: f64) -> Result<OracleMetricSample, C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The six-process matrix contains exactly three complete Servers and
+    /// three Forge-only workers, with no mixed or partial role descriptors.
+    #[test]
+    fn three_servers_three_workers_descriptor_is_exact() {
+        let spec = BifrostClusterSpec::three_servers_three_forge_workers();
+        spec.validate().expect("matrix descriptor validates");
+        assert_eq!(spec.nodes.len(), 6);
+        assert!(
+            spec.nodes[..3]
+                .iter()
+                .all(|node| has_full_server_roles(&node.roles))
+        );
+        assert!(
+            spec.nodes[3..]
+                .iter()
+                .all(|node| node.roles == BTreeSet::from([BifrostRuntimeRole::Forge]))
+        );
+        assert_eq!(
+            classify_topology(&spec),
+            BifrostTopology::ThreeServersThreeForgeWorkers
+        );
+    }
 
     /// A stopped node retains its physical roots and restarts into the same slot.
     #[tokio::test]

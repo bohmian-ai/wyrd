@@ -1,5 +1,13 @@
 //! Concrete WAL/manifest crash-seam coverage for Task 15.
 
+use crate::catalog::TableRef;
+use crate::namespaces::BifrostNamespace;
+use crate::scribe::audit_envelope::encode_audit_event;
+use crate::scribe::manifest::{Manifest, read_manifest, write_atomic};
+use crate::scribe::replay::replay_wal_directory;
+use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
+use crate::scribe::wal::{WalConfig, WalLsn, WalRecord, WalWriter};
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
@@ -10,19 +18,15 @@ use std::io::Write;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
-use vala_bifrost_redux::scribe::manifest::{Manifest, read_manifest, write_atomic};
-use vala_bifrost_redux::scribe::replay::replay_wal_directory;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
-use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::wal::{WalConfig, WalLsn, WalRecord, WalWriter};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
+/// Encode one deterministic WAL replay batch.
+///
+/// # Panics
+/// Panics when the static Arrow fixture cannot be encoded.
 fn data_bytes(value: i64) -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -41,6 +45,10 @@ fn data_bytes(value: i64) -> Vec<u8> {
     bytes
 }
 
+/// Encode the fixed audit envelope persisted beside a crash fixture.
+///
+/// # Panics
+/// Panics when the static audit fixture cannot be encoded.
 fn audit() -> Vec<u8> {
     encode_audit_event(&AuditEvent {
         request_id: RequestId::now_v7(),
@@ -60,6 +68,7 @@ fn audit() -> Vec<u8> {
     .expect("audit")
 }
 
+/// Build the stable seal scope shared by crash-recovery cases.
 fn key() -> SealKey {
     SealKey::new(
         DataTenantId::new_v7(),
@@ -69,6 +78,7 @@ fn key() -> SealKey {
 }
 
 #[test]
+/// A torn suffix is truncated while every acknowledged prefix record replays.
 fn torn_wal_tail_is_truncated_and_prior_records_replay() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -84,7 +94,7 @@ fn torn_wal_tail_is_truncated_and_prior_records_replay() {
         .join("1")
         .join(format!(
             "shard-{:02}",
-            vala_bifrost_redux::scribe::routing::shard_for(key.tenant, &key.table)
+            crate::scribe::routing::shard_for(key.tenant, &key.table)
         ))
         .join("0.wal");
     let valid_len = std::fs::metadata(&path).expect("WAL metadata").len();
@@ -104,6 +114,7 @@ fn torn_wal_tail_is_truncated_and_prior_records_replay() {
 }
 
 #[test]
+/// A partial frame never becomes an acknowledged replay record.
 fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -119,7 +130,7 @@ fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
         .join("1")
         .join(format!(
             "shard-{:02}",
-            vala_bifrost_redux::scribe::routing::shard_for(key.tenant, &key.table)
+            crate::scribe::routing::shard_for(key.tenant, &key.table)
         ))
         .join("0.wal");
     let valid_len = std::fs::metadata(&path).expect("WAL metadata").len();
@@ -142,6 +153,7 @@ fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
 }
 
 #[test]
+/// Segment rotation preserves every complete acknowledged record.
 fn segment_roll_keeps_all_complete_records_replayable() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -163,6 +175,7 @@ fn segment_roll_keeps_all_complete_records_replayable() {
 }
 
 #[test]
+/// A crashed temporary manifest replacement cannot supersede the atomic owner.
 fn atomic_manifest_ignores_a_crashed_temporary_replacement() {
     let temp_dir = TempDir::new().expect("manifest directory");
     let identity = StreamIdentity::new(NodeId::new(Uuid::now_v7()), WriterEpoch::new(1));

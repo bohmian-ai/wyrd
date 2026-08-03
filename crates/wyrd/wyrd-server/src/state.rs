@@ -1065,6 +1065,21 @@ impl AppState {
             .inspection_snapshot()
             .map_err(|error| error.to_string())
     }
+
+    /// Return the exact active fence count from this server's Scribe owner.
+    ///
+    /// # Errors
+    /// Returns an error when Scribe is absent or its fence registry cannot be read.
+    #[cfg(feature = "test-support")]
+    pub fn active_scribe_tail_fences_for_test(&self) -> Result<u64, String> {
+        let Some(runtime) = &self.bifrost_ingest else {
+            return Err("Scribe is not configured".to_owned());
+        };
+        runtime
+            .tail_reader()
+            .active_fence_count_for_test()
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Errors raised by [`AppState::production_validate`].

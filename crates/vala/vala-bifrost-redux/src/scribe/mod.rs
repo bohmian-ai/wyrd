@@ -22,6 +22,19 @@ pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;
 pub mod wal;
+
+#[cfg(test)]
+#[path = "tests/pg_scribe_crash_injection.rs"]
+mod pg_scribe_crash_injection;
+#[cfg(test)]
+#[path = "tests/pg_scribe_restart.rs"]
+mod pg_scribe_restart;
+#[cfg(test)]
+#[path = "tests/task15_scribe_path.rs"]
+mod task15_scribe_path;
+#[cfg(test)]
+#[path = "tests/task16_wal_closeout.rs"]
+mod task16_wal_closeout;
 use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
@@ -203,12 +216,106 @@ pub struct ScribeImpl {
     shards: Arc<shards::ScribeShardRuntime>,
     /// Lifecycle gate closed before shard draining begins.
     closed: AtomicBool,
+    /// Coordinates the recoverable running/draining/finalizing/stopped lifecycle.
+    shutdown_state: std::sync::atomic::AtomicU8,
+    /// Wakes callers waiting for the shutdown owner to finish.
+    shutdown_notify: tokio::sync::Notify,
+    /// Wakes test-tier observers after the owner enters draining.
+    #[cfg(any(test, feature = "test-support"))]
+    shutdown_draining_notify: tokio::sync::Notify,
     /// False while startup WAL recovery is active or has failed.
     recovery_ready: AtomicBool,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
     /// Optional local wake-up publisher retained for caller-owned commits.
     staging_file_publisher: Option<StagingFilePublisher>,
+    #[cfg(any(test, feature = "test-support"))]
+    ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
+}
+
+/// Scribe is accepting work and no shutdown owner exists.
+const SHUTDOWN_RUNNING: u8 = 0;
+/// One graceful owner is draining accepted work and remains recoverable on drop.
+const SHUTDOWN_DRAINING: u8 = 1;
+/// One synchronous finalizer owns closure of every retained worker.
+const SHUTDOWN_FINALIZING: u8 = 2;
+/// Every retained Scribe owner has been closed or aborted.
+const SHUTDOWN_STOPPED: u8 = 3;
+
+/// Cancellation finalizer for the caller-owned graceful shutdown future.
+struct ShutdownCancellationFinalizer<'a> {
+    /// Scribe whose draining state must never be stranded by cancellation.
+    scribe: &'a ScribeImpl,
+    /// False only after graceful shutdown or a competing finalizer completes.
+    armed: bool,
+}
+
+impl ShutdownCancellationFinalizer<'_> {
+    /// Disarm the guard after the Scribe reaches its stopped state.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ShutdownCancellationFinalizer<'_> {
+    /// Recover an interrupted graceful drain through the synchronous abort path.
+    fn drop(&mut self) {
+        if self.armed {
+            self.scribe.abort_shutdown();
+        }
+    }
+}
+
+/// Deterministic test-tier barrier held at the public Scribe ingest seam.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct IngestStall {
+    /// Signals the caller after a public write reaches the barrier.
+    entered: tokio::sync::Notify,
+    /// Signals a waiting write to continue when the test releases it.
+    release: tokio::sync::Notify,
+    /// Records that the stalled write future released its Scribe owner.
+    completed: AtomicBool,
+    /// Wakes lifecycle assertions after normal release or cancellation.
+    completed_notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl IngestStall {
+    /// Wait until one public write is blocked at this barrier.
+    pub async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Release a blocked public write without changing its outcome.
+    pub fn release(&self) {
+        self.release.notify_waiters();
+    }
+
+    /// Wait until the stalled write future releases its Scribe owner.
+    pub async fn wait_completed(&self) {
+        while !self.completed.load(Ordering::Acquire) {
+            self.completed_notify.notified().await;
+        }
+    }
+
+    /// Publish the exact completion edge owned by the stalled write future.
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.completed_notify.notify_waiters();
+    }
+}
+
+/// Drop guard that publishes release of one stalled public write owner.
+#[cfg(any(test, feature = "test-support"))]
+struct IngestStallCompletion<'a>(&'a IngestStall);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for IngestStallCompletion<'_> {
+    /// Publish completion whether the write resumes or its transport is cancelled.
+    fn drop(&mut self) {
+        self.0.complete();
+    }
 }
 
 /// Complete server-provisioned dependencies used to construct one Scribe graph.
@@ -597,9 +704,15 @@ impl ScribeImpl {
             ingress_cpu,
             shards,
             closed: AtomicBool::new(false),
+            shutdown_state: std::sync::atomic::AtomicU8::new(SHUTDOWN_RUNNING),
+            shutdown_notify: tokio::sync::Notify::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            shutdown_draining_notify: tokio::sync::Notify::new(),
             recovery_ready: AtomicBool::new(true),
             persistence,
             staging_file_publisher,
+            #[cfg(any(test, feature = "test-support"))]
+            ingest_stall: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -673,9 +786,34 @@ impl ScribeImpl {
     ///
     /// Cancellation may leave durable accepted work for normal recovery. Every
     /// phase is first closed, then awaited only while the caller's process-wide
-    /// shutdown budget remains. Dropped or timed-out graceful futures retain
-    /// their task handles until the finalizer aborts them before returning.
+    /// shutdown budget remains. A cancellation guard synchronously aborts retained
+    /// owners if the caller drops this future while it owns the draining state.
     pub async fn shutdown(&self, deadline: std::time::Instant) {
+        if self
+            .shutdown_state
+            .compare_exchange(
+                SHUTDOWN_RUNNING,
+                SHUTDOWN_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            while self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_STOPPED {
+                let notified = self.shutdown_notify.notified();
+                if self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_STOPPED {
+                    break;
+                }
+                notified.await;
+            }
+            return;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.shutdown_draining_notify.notify_waiters();
+        let mut cancellation_finalizer = ShutdownCancellationFinalizer {
+            scribe: self,
+            armed: true,
+        };
         let started = std::time::Instant::now();
         self.begin_shutdown();
         let mut graceful = if tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline)
@@ -716,25 +854,32 @@ impl ScribeImpl {
         if graceful {
             graceful = await_shutdown_phase(deadline, self.ingress_cpu.drain()).await;
         }
-        let aborted_shards = self.shards.abort_retained();
-        self.shards.clear_retained_join_handles();
-        let aborted_persistence = self
-            .persistence
-            .as_ref()
-            .map_or(0, |persistence| persistence.abort_retained());
-        if let Some(persistence) = &self.persistence {
-            persistence.clear_retained_join_handles();
+        if self
+            .shutdown_state
+            .compare_exchange(
+                SHUTDOWN_DRAINING,
+                SHUTDOWN_FINALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.finalize_shutdown_owners();
+        } else {
+            while self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_STOPPED {
+                let notified = self.shutdown_notify.notified();
+                if self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_STOPPED {
+                    break;
+                }
+                notified.await;
+            }
         }
-        tracing::debug!(
-            aborted_shards,
-            aborted_persistence,
-            "Scribe shard and persistence owners finalized"
-        );
         if !graceful {
             tracing::warn!("Scribe graceful cleanup was incomplete at shutdown deadline");
         }
         metrics::histogram!("bifrost_scribe_shutdown_seconds")
             .record(started.elapsed().as_secs_f64());
+        cancellation_finalizer.disarm();
     }
 
     /// Closes external admission and aborts every retained Tokio worker without waiting.
@@ -743,8 +888,31 @@ impl ScribeImpl {
     /// closes execution lanes, and leaves any unfinished durable work to WAL
     /// recovery. No external await or detached cleanup is started.
     pub fn abort_shutdown(&self) {
+        loop {
+            let state = self.shutdown_state.load(Ordering::Acquire);
+            if matches!(state, SHUTDOWN_FINALIZING | SHUTDOWN_STOPPED) {
+                return;
+            }
+            if self
+                .shutdown_state
+                .compare_exchange(
+                    state,
+                    SHUTDOWN_FINALIZING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
         self.begin_shutdown();
         self.close_lanes();
+        self.finalize_shutdown_owners();
+    }
+
+    /// Abort retained async owners and publish the terminal stopped state.
+    fn finalize_shutdown_owners(&self) {
         let aborted_shards = self.shards.abort_retained();
         self.shards.clear_retained_join_handles();
         let aborted_persistence = self
@@ -759,6 +927,9 @@ impl ScribeImpl {
             aborted_persistence,
             "Scribe shard and persistence owners finalized"
         );
+        self.shutdown_state
+            .store(SHUTDOWN_STOPPED, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
     }
 
     /// Closes external Scribe admission without cancelling internal flush lanes.
@@ -789,9 +960,21 @@ impl ScribeImpl {
     ///
     /// The returned abort handle lets the production-owner test prove the real
     /// Scribe finalizer cancelled the task rather than merely dropping its wait.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn install_shutdown_stall_for_test(&self) -> tokio::task::AbortHandle {
         self.shards.install_shutdown_stall_for_test().await
+    }
+
+    /// Wait until graceful shutdown owns the draining state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn wait_shutdown_draining_for_test(&self) {
+        while self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_DRAINING {
+            let notified = self.shutdown_draining_notify.notified();
+            if self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_DRAINING {
+                break;
+            }
+            notified.await;
+        }
     }
 
     /// Return whether Scribe has completed recovery and still accepts writes.
@@ -838,6 +1021,16 @@ impl ScribeImpl {
         self.persistence
             .as_ref()
             .map_or(0, |persistence| persistence.queue_depth())
+    }
+
+    /// Return the exact admitted request count still owned by Scribe.
+    ///
+    /// This test-support inspection reads the production admission owner; it
+    /// does not infer in-flight work from shard queue depth.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inflight_items_for_test(&self) -> usize {
+        self.admission.snapshot().items
     }
 
     /// Publish one coalescing lifecycle age tick to every shard owner.
@@ -974,6 +1167,15 @@ impl Scribe for ScribeImpl {
 }
 
 impl ScribeImpl {
+    /// Install a one-shot test barrier at the public write seam.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stall_next_ingest_for_test(&self) -> Arc<IngestStall> {
+        let stall = Arc::new(IngestStall::default());
+        if let Ok(mut current) = self.ingest_stall.lock() {
+            *current = Some(Arc::clone(&stall));
+        }
+        stall
+    }
     /// Sum of pending (un-fsynced or un-truncated) WAL bytes on this pod.
     #[must_use]
     pub fn wal_pending_bytes(&self) -> u64 {

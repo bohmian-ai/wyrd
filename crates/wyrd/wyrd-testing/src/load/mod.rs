@@ -2,6 +2,7 @@
 
 mod assertions;
 mod harness;
+mod matrix;
 mod workload;
 
 pub use assertions::{
@@ -11,6 +12,10 @@ pub use assertions::{
 pub use harness::{
     IngestRequest, LoadError, QueryResponse, SustainedLoadHarness, SustainedLoadReport,
     TenantLoadReport,
+};
+pub use matrix::{
+    BifrostClusterLoad, BifrostClusterLoadSummary, ClusterCleanupSnapshot, ClusterLoadError,
+    ClusterLoadProfile, ClusterTelemetryCapture, PillarTelemetryDelta, TenantLoadResult,
 };
 pub use workload::{
     ExpectedRowShape, QueryGenerator, QueryRequest, TenantIdentity, TenantWorkload,

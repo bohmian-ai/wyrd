@@ -1,6 +1,5 @@
 //! Distributed product journey for the real Scribe-to-Forge publication path.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,10 +24,7 @@ use wyrd_spec::vala::api::{
     VisibilityMode,
 };
 use wyrd_testing::bifrost::forge_harness::seed_forge_group;
-use wyrd_testing::bifrost::{
-    BifrostQueryTelemetryReport, BifrostTopology, WyrdTestCluster,
-    shared_process_telemetry_for_test,
-};
+use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster, shared_process_telemetry_for_test};
 use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 use wyrd_tonic::frame_codec::FrameDecoder;
@@ -39,30 +35,9 @@ use wyrd_tonic::wyrd::v1 as proto;
 struct Scenario {
     /// Diagnostic name included in assertion failures.
     name: &'static str,
-    /// Number of bound Wyrd server processes sharing durable state.
-    pods: usize,
     /// Number of isolated tenants writing concurrently.
     tenants: usize,
 }
-
-/// Product deployment shapes that Forge must support.
-const SCENARIOS: [Scenario; 3] = [
-    Scenario {
-        name: "single-node-single-tenant",
-        pods: 1,
-        tenants: 1,
-    },
-    Scenario {
-        name: "single-node-multi-tenant-multi-writer",
-        pods: 1,
-        tenants: 10,
-    },
-    Scenario {
-        name: "multi-node-multi-tenant-multi-writer",
-        pods: 3,
-        tenants: 10,
-    },
-];
 
 /// Number of independent flush cycles produced by every pod for every tenant.
 ///
@@ -228,55 +203,6 @@ struct RoleTopologyEvidence {
     watermark_rows: Vec<i64>,
     /// Remaining table-scoped Forge leases after Scribe retirement.
     cleanup_leases: i64,
-}
-
-/// Typed server-integrated query artifact joined with Forge reports by scenario.
-#[derive(serde::Serialize)]
-struct QueryTelemetryArtifact {
-    /// Immutable process and tenant identity shared with the Forge benchmark.
-    scenario: QueryScenarioIdentity,
-    /// Production query histogram mapped by the server-only report owner.
-    query: BifrostQueryTelemetryReport,
-}
-
-/// Exact scenario join key shared by independent maintenance and query artifacts.
-#[derive(serde::Serialize)]
-struct QueryScenarioIdentity {
-    /// Number of serving/scheduling pods in the integrated journey.
-    pods: usize,
-    /// Number of isolated tenants queried in the integrated journey.
-    tenants: usize,
-}
-
-#[tokio::test]
-#[ignore = "gated journey: real bound Wyrd servers, Postgres, Scribe, Forge, and Iceberg"]
-/// Validate supported deployment shapes through the complete production path.
-///
-/// Every case drives concurrent authenticated OTLP writers into server-owned
-/// Scribe instances, flushes through the normal durable seal path, competes
-/// server-owned Forge handles over shared leases, and reads the resulting
-/// Iceberg table through the public query API. The assertions cover exact
-/// tenant row isolation, terminal audit reconciliation, ordered output paths,
-/// snapshots, lease cleanup, and supervised shutdown.
-///
-/// # Panics
-///
-/// Panics when infrastructure cannot start or any production-path invariant
-/// diverges or the supervised harness cannot shut down cleanly.
-async fn forge_distributed_writer_matrix_preserves_rows_and_converges_once() {
-    forge_distributed_writer_matrix_journey().await;
-}
-
-/// Implements the distributed writer matrix for the gated product journey.
-///
-/// # Panics
-///
-/// Panics when a supported deployment shape violates the real production-path
-/// row, audit, snapshot, lease, or shutdown assertions.
-async fn forge_distributed_writer_matrix_journey() {
-    for scenario in SCENARIOS {
-        run_scenario(scenario).await;
-    }
 }
 
 /// Return one rendered staging-fold duration count for a closed task result label.
@@ -784,7 +710,6 @@ async fn dedicated_forge_workers_journey() {
         .expect("dedicated worker completion observer");
     let scenario = Scenario {
         name: "dedicated-forge-workers",
-        pods: 1,
         tenants: 3,
     };
     let tenants = provision_tenants(scheduler_server, scenario).await;
@@ -940,7 +865,6 @@ async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows()
         .expect("shared supervised observer");
     let scenario = Scenario {
         name: "supervised-worker-reclaim",
-        pods: 1,
         tenants: 3,
     };
     let tenants = provision_tenants(server, scenario).await;
@@ -1076,7 +1000,6 @@ async fn supervised_uncertain_commit_recovery_journey() {
         .expect("shared commit uncertainty catalog");
     let scenario = Scenario {
         name: "supervised-uncertain-commit",
-        pods: 1,
         tenants: 1,
     };
     let tenants = provision_tenants(server, scenario).await;
@@ -1205,7 +1128,6 @@ async fn dedicated_unschedulable_admission_journey() {
     let server = cluster.server(0).expect("scheduler server");
     let scenario = Scenario {
         name: "large-lane",
-        pods: 1,
         tenants: 2,
     };
     let tenants = provision_tenants(server, scenario).await;
@@ -1350,7 +1272,6 @@ async fn dedicated_unschedulable_admission_journey() {
     let server = cluster.server(0).expect("scheduler server");
     let scenario = Scenario {
         name: "unschedulable",
-        pods: 1,
         tenants: 1,
     };
     let tenants = provision_tenants(server, scenario).await;
@@ -1400,7 +1321,6 @@ async fn scheduler_renewal_loss_stops_every_later_effect() {
     let server = cluster.server(0).expect("scheduler server");
     let scenario = Scenario {
         name: "renewal-loss",
-        pods: 1,
         tenants: 1,
     };
     let tenants = provision_tenants(server, scenario).await;
@@ -1487,7 +1407,6 @@ async fn run_supervised_role_fixture(
         .expect("shared supervised completion observer");
     let scenario = Scenario {
         name,
-        pods: 1,
         tenants: worker_count.max(3),
     };
     let tenants = provision_tenants(server, scenario).await;
@@ -1913,253 +1832,12 @@ async fn trigger_supervised_scheduler(server: &WyrdTestServer, scenario: Scenari
     });
 }
 
-/// Run one deployment shape from authenticated ingest through query readback.
-///
-/// # Panics
-///
-/// Panics when tenant provisioning, OTLP ingestion, Scribe flush, Forge
-/// maintenance, durable inspection, or public query validation fails.
-async fn run_scenario(scenario: Scenario) {
-    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers()
-        .await
-        .unwrap_or_else(|error| panic!("{} dedicated Forge cluster: {error}", scenario.name));
-    let telemetry = cluster.telemetry().clone();
-    let checkpoint = telemetry
-        .checkpoint()
-        .unwrap_or_else(|error| panic!("{} query telemetry checkpoint: {error}", scenario.name));
-    let sampler = telemetry
-        .begin_gauge_sampling(&checkpoint)
-        .await
-        .unwrap_or_else(|error| panic!("{} query telemetry sampler: {error}", scenario.name));
-    let servers = cluster.servers();
-    assert_eq!(cluster.topology(), BifrostTopology::DedicatedForgeWorkers);
-    assert_eq!(servers[0].forge_process_role(), ForgeProcessRole::Server);
-    assert!(servers[0].base_url().is_some());
-    assert!(servers[0].grpc_url().is_some());
-    assert_eq!(servers.len(), 4, "{} dedicated role count", scenario.name);
-    assert!(servers[1..].iter().all(|worker| {
-        worker.forge_process_role() == ForgeProcessRole::ForgeWorker
-            && worker.base_url().is_none()
-            && worker.grpc_url().is_none()
-            && worker.bound_addr().is_none()
-    }));
-    let control = &servers[0];
-    let completion = cluster
-        .forge_completion_observer()
-        .expect("dedicated Forge worker completion observer");
-    let tenants = provision_tenants(control, scenario).await;
-    assert_active_traces_roster(control, &tenants, scenario).await;
-
-    let first_workload_baseline = capture_compaction_workload(control, &tenants).await;
-    let completed_before = completion.completed();
-    for writer_shard in 0..scenario.pods {
-        for cycle in 0..WRITE_CYCLES {
-            let cycle = writer_shard * WRITE_CYCLES + cycle;
-            write_cycle(std::slice::from_ref(control), &tenants, cycle, scenario).await;
-            for tenant in &tenants {
-                control
-                    .flush_bifrost_for_tenant(tenant.id)
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("{} tenant {} flush: {error}", scenario.name, tenant.id)
-                    });
-            }
-        }
-    }
-    let first_workload = wait_for_published_workload(
-        control,
-        &tenants,
-        first_workload_baseline,
-        scenario.pods * WRITE_CYCLES,
-        scenario,
-    )
-    .await;
-    control
-        .forge_clock()
-        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
-        .unwrap_or_else(|error| panic!("{} advance Forge clock: {error}", scenario.name));
-
-    let expected_rows = u64::try_from((scenario.pods * WRITE_CYCLES + 2) * SPANS_PER_WRITE)
-        .expect("bounded journey row count");
-    let pending_before = pending_files(control, &tenants).await;
-    let first_workload_completed =
-        workload_has_terminal_effect(&inspect_workload_progress(control, &first_workload).await);
-    if !first_workload_completed {
-        assert_pending_files_are_old_enough(control, &tenants, scenario).await;
-    }
-    assert!(
-        pending_before
-            .iter()
-            .all(|(_, count)| *count >= i64::try_from(WRITE_CYCLES).expect("cycles fit i64"))
-            || first_workload_completed,
-        "{} Scribe did not create independent durable files: {pending_before:?}",
-        scenario.name
-    );
-
-    for tenant in &tenants {
-        let response = query_response(control, &tenant.jwt).await;
-        assert!(
-            response.status().is_success(),
-            "{} query must not use an Oracle publication fence: {}",
-            scenario.name,
-            response.status()
-        );
-        response
-            .bytes()
-            .await
-            .unwrap_or_else(|error| panic!("{} query response body: {error}", scenario.name));
-    }
-    wait_for_compaction(control, &tenants, &completion, &first_workload, scenario).await;
-    assert!(
-        completion.completed() > completed_before,
-        "{} dedicated workers did not complete the first durable Forge pass",
-        scenario.name
-    );
-    let retained_workload_baseline = capture_compaction_workload(control, &tenants).await;
-    let completed_before_retention = completion.completed();
-    for cycle in WRITE_CYCLES..(WRITE_CYCLES + 2) {
-        write_cycle(std::slice::from_ref(control), &tenants, cycle, scenario).await;
-        for tenant in &tenants {
-            control
-                .flush_bifrost_for_tenant(tenant.id)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "{} tenant {} retained-history flush: {error}",
-                        scenario.name, tenant.id
-                    )
-                });
-        }
-    }
-    let retained_workload =
-        wait_for_published_workload(control, &tenants, retained_workload_baseline, 2, scenario)
-            .await;
-    control
-        .forge_clock()
-        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
-        .unwrap_or_else(|error| {
-            panic!("{} advance retained-history clock: {error}", scenario.name)
-        });
-    let tails =
-        wait_for_compaction(control, &tenants, &completion, &retained_workload, scenario).await;
-    assert!(
-        completion.completed() > completed_before_retention,
-        "{} dedicated workers did not complete retained-history Forge work",
-        scenario.name
-    );
-    let scribe = control.bifrost_scribe().expect("server-owned Scribe");
-    scribe
-        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
-        .await
-        .expect("Scribe retirement pass");
-    let inspection = control
-        .scribe_inspection_snapshot()
-        .expect("Scribe inspection after retirement");
-    assert_eq!(
-        inspection.immutable_bucket_count, 0,
-        "{} retained Scribe hot buckets after explicit retirement",
-        scenario.name
-    );
-    for tenant in &tenants {
-        assert_eq!(
-            wait_for_query_rows(control, &tenant.jwt, expected_rows, scenario).await,
-            expected_rows,
-            "{} tenant {} exact rows",
-            scenario.name,
-            tenant.id
-        );
-        if tails
-            .iter()
-            .any(|(tail_tenant, _, _)| *tail_tenant == tenant.id)
-        {
-            assert_no_compaction_audits(control, tenant.id, scenario).await;
-        } else {
-            assert_terminal_audits(control, tenant.id, scenario).await;
-            assert_snapshot(control, tenant.id, scenario).await;
-        }
-    }
-    let delta = telemetry
-        .delta_since_with_sampler(checkpoint, sampler)
-        .await
-        .unwrap_or_else(|error| panic!("{} query telemetry delta: {error}", scenario.name));
-    let query = BifrostQueryTelemetryReport::from_server_delta(&delta)
-        .unwrap_or_else(|error| panic!("{} query telemetry report: {error}", scenario.name));
-    write_query_telemetry_artifact(scenario, query);
-
-    cluster
-        .shutdown()
-        .await
-        .unwrap_or_else(|error| panic!("{} shutdown: {error}", scenario.name));
-}
-
-/// Write one server-only query artifact without copying any Forge maintenance field.
-///
-/// # Panics
-///
-/// Panics when the report directory cannot be created or typed JSON cannot be
-/// serialized and written.
-fn write_query_telemetry_artifact(scenario: Scenario, query: BifrostQueryTelemetryReport) {
-    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .expect("wyrd-testing manifest is nested below the repository root");
-    let directory = repository.join("target/bifrost-benchmarks/task16");
-    std::fs::create_dir_all(&directory).expect("create Task 16 query report directory");
-    let artifact = QueryTelemetryArtifact {
-        scenario: QueryScenarioIdentity {
-            pods: scenario.pods,
-            tenants: scenario.tenants,
-        },
-        query,
-    };
-    let path = directory.join(format!("query-{}-{}.json", scenario.pods, scenario.tenants));
-    std::fs::write(
-        path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&artifact).expect("serialize typed query artifact")
-        ),
-    )
-    .expect("write typed query artifact");
-}
-
 /// Authenticated tenant identity used by concurrent writers and query checks.
 struct TenantWriter {
     /// Durable tenant isolation key.
     id: DataTenantId,
     /// Tenant-scoped access token accepted by OTLP and query endpoints.
     jwt: String,
-}
-
-/// One durable Forge demand and its pre-workload evidence baseline.
-#[derive(Debug)]
-struct ForgeCompactionTenantTarget {
-    /// Tenant owning the canonical traces table.
-    tenant: DataTenantId,
-    /// Exact durable planning generation emitted by the completed writer workload.
-    demand_generation: Option<i64>,
-    /// Tasks that existed before this workload was offered to Forge.
-    task_ids_before: BTreeSet<uuid::Uuid>,
-    /// Terminal compaction audits that existed before this workload was offered.
-    terminal_audits_before: i64,
-}
-
-/// Exact durable effects expected from one completed Scribe writer workload.
-#[derive(Debug)]
-struct ForgeCompactionWorkload {
-    /// Per-tenant demand generations and pre-workload durable evidence.
-    tenants: Vec<ForgeCompactionTenantTarget>,
-}
-
-/// One observed target task, restricted to work created by the current workload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ForgeCompactionTargetTask {
-    /// Durable task identity assigned atomically with the target demand acknowledgement.
-    task_id: uuid::Uuid,
-    /// Current worker-visible durable state.
-    state: String,
-    /// Whether the worker recorded terminal compaction evidence.
-    has_evidence: bool,
 }
 
 /// Provision the requested number of isolated tenants and writer identities.
@@ -2320,492 +1998,6 @@ async fn write_cycle(
     }
 }
 
-/// Return uncompacted durable Scribe file counts for every tenant.
-///
-/// # Panics
-///
-/// Panics when tenant-scoped Postgres inspection fails.
-async fn pending_files(
-    server: &WyrdTestServer,
-    tenants: &[TenantWriter],
-) -> Vec<(DataTenantId, i64)> {
-    let mut counts = Vec::with_capacity(tenants.len());
-    for tenant in tenants {
-        let mut conn = server
-            .state()
-            .postgres
-            .vala()
-            .tenant_conn(tenant.id)
-            .await
-            .expect("pending Scribe tenant connection");
-        let count = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted",
-        )
-        .bind(tenant.id.as_uuid())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("pending Scribe files");
-        counts.push((tenant.id, count));
-    }
-    counts
-}
-
-/// Wait until a completed writer workload has published stable Forge demand state.
-///
-/// Scribe persistence publishes files and advances the coalesced demand
-/// generation asynchronously. The scheduler must not be triggered until every
-/// tenant has the expected durable files and two consecutive demand snapshots
-/// agree; otherwise an acknowledgement can correctly reject a newer generation.
-///
-/// # Panics
-///
-/// Panics when durable file or demand inspection fails, or when publication
-/// does not quiesce within the bounded journey deadline.
-async fn wait_for_published_workload(
-    server: &WyrdTestServer,
-    tenants: &[TenantWriter],
-    mut workload: ForgeCompactionWorkload,
-    minimum_files: usize,
-    scenario: Scenario,
-) -> ForgeCompactionWorkload {
-    let minimum_files = i64::try_from(minimum_files).expect("bounded workload file count");
-    let tenant_ids = tenants
-        .iter()
-        .map(|tenant| tenant.id.as_uuid())
-        .collect::<Vec<_>>();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut previous_demands = None;
-    loop {
-        let files = pending_files(server, tenants).await;
-        let inspection = server
-            .scribe_inspection_snapshot()
-            .expect("published workload Scribe inspection");
-        let demands: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
-            "SELECT data_tenant_id, generation FROM vala.forge_planning_demands WHERE data_tenant_id = ANY($1) ORDER BY data_tenant_id, catalog_name, namespace_name, table_name",
-        )
-        .bind(&tenant_ids)
-        .fetch_all(
-            server
-                .state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool")
-                .pool(),
-        )
-        .await
-        .expect("published Forge demand generations");
-        bind_workload_demands(server, &mut workload).await;
-        let progress = inspect_workload_progress(server, &workload).await;
-        if inspection.queued_items == 0
-            && ((files.iter().all(|(_, count)| *count >= minimum_files)
-                && previous_demands.as_ref() == Some(&demands))
-                || workload_has_terminal_effect(&progress))
-        {
-            return workload;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} published workload did not stabilize: files={files:?} queued_items={} immutable_buckets={} demands={demands:?}; {}",
-            scenario.name,
-            inspection.queued_items,
-            inspection.immutable_bucket_count,
-            format_workload_progress(&progress),
-        );
-        previous_demands = Some(demands);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Captures the durable evidence baseline immediately before a writer workload.
-///
-/// A later scheduler pass must acknowledge a generation produced after this
-/// snapshot, create a new staging-fold task, record terminal evidence, and leave
-/// at most one open file per partition. Periodic expiry or orphan work is
-/// deliberately outside this workload contract.
-///
-/// # Panics
-///
-/// Panics when durable baseline inspection fails.
-async fn capture_compaction_workload(
-    server: &WyrdTestServer,
-    tenants: &[TenantWriter],
-) -> ForgeCompactionWorkload {
-    let mut targets = Vec::with_capacity(tenants.len());
-    for tenant in tenants {
-        let mut conn = server
-            .state()
-            .postgres
-            .vala()
-            .tenant_conn(tenant.id)
-            .await
-            .expect("workload target tenant connection");
-        let task_ids_before: Vec<uuid::Uuid> = sqlx::query_scalar(
-            "SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name='vala.traces' AND table_name='spans' AND strategy='staging_fold'",
-        )
-        .bind(tenant.id.as_uuid())
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("workload Forge task baseline");
-        let terminal_audits_before: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation IN ('forge.file_compact.committed','forge.file_compact.recovered','forge.file_compact.reset')",
-        )
-        .bind(tenant.id.as_uuid())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("workload Forge audit baseline");
-        targets.push(ForgeCompactionTenantTarget {
-            tenant: tenant.id,
-            demand_generation: None,
-            task_ids_before: task_ids_before.into_iter().collect(),
-            terminal_audits_before,
-        });
-    }
-    ForgeCompactionWorkload { tenants: targets }
-}
-
-/// Binds each pre-write baseline to the first durable generation emitted later.
-///
-/// # Panics
-///
-/// Panics when tenant-scoped demand inspection fails.
-async fn bind_workload_demands(server: &WyrdTestServer, workload: &mut ForgeCompactionWorkload) {
-    for target in &mut workload.tenants {
-        if target.demand_generation.is_some() {
-            continue;
-        }
-        let mut conn = server
-            .state()
-            .postgres
-            .vala()
-            .tenant_conn(target.tenant)
-            .await
-            .expect("workload demand tenant connection");
-        target.demand_generation = sqlx::query_scalar(
-            "SELECT generation FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name='vala.traces' AND table_name='spans'",
-        )
-        .bind(target.tenant.as_uuid())
-        .fetch_optional(&mut **conn.transaction())
-        .await
-        .expect("workload Forge demand generation");
-    }
-}
-
-/// Return the remaining logical staging tails for the journey's canonical table.
-///
-/// A tail is the at-most-one uncompacted file for one tenant, table, and
-/// partition day after bounded Forge convergence.
-///
-/// # Panics
-///
-/// Panics when tenant-scoped Postgres inspection fails.
-async fn pending_tail_groups(
-    server: &WyrdTestServer,
-    tenants: &[TenantWriter],
-) -> Vec<(DataTenantId, chrono::NaiveDate, i64)> {
-    let mut tails = Vec::new();
-    for tenant in tenants {
-        let mut conn = server
-            .state()
-            .postgres
-            .vala()
-            .tenant_conn(tenant.id)
-            .await
-            .expect("pending staging-tail tenant connection");
-        let rows = sqlx::query_as::<_, (chrono::NaiveDate, i64)>(
-            "SELECT partition_day, count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted GROUP BY partition_day ORDER BY partition_day",
-        )
-        .bind(tenant.id.as_uuid())
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("pending staging tails");
-        tails.extend(
-            rows.into_iter()
-                .map(|(partition_day, files)| (tenant.id, partition_day, files)),
-        );
-    }
-    tails
-}
-
-/// Assert the manual Forge clock has moved past the staging age guard.
-///
-/// # Panics
-///
-/// Panics when tenant-scoped Postgres inspection fails or a journey file remains too
-/// new for periodic Forge discovery.
-async fn assert_pending_files_are_old_enough(
-    server: &WyrdTestServer,
-    tenants: &[TenantWriter],
-    scenario: Scenario,
-) {
-    let cutoff = server.forge_clock().now().expect("Forge clock") - chrono::Duration::minutes(2);
-    for tenant in tenants {
-        let mut conn = server
-            .state()
-            .postgres
-            .vala()
-            .tenant_conn(tenant.id)
-            .await
-            .expect("pending-file-age tenant connection");
-        let newest: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            "SELECT max(created_at) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted",
-        )
-        .bind(tenant.id.as_uuid())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("pending file age");
-        assert!(
-            newest.is_some_and(|created_at| created_at < cutoff),
-            "{} tenant {} pending files are younger than the Forge cutoff {cutoff}: {newest:?}",
-            scenario.name,
-            tenant.id
-        );
-    }
-}
-
-/// Wait until every tenant's durable files have a committed Forge snapshot.
-///
-/// # Panics
-///
-/// Panics when SQL inspection fails or the bounded convergence deadline
-/// expires.
-async fn wait_for_compaction(
-    control: &WyrdTestServer,
-    tenants: &[TenantWriter],
-    completion: &ForgeWorkerCompletionObserver,
-    workload: &ForgeCompactionWorkload,
-    scenario: Scenario,
-) -> Vec<(DataTenantId, chrono::NaiveDate, i64)> {
-    let completed_at_start = completion.completed();
-    let started = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() >= deadline {
-            panic!(
-                "{} Forge workload did not converge after {:?}; completion_delta={}; {}",
-                scenario.name,
-                started.elapsed(),
-                completion.completed().saturating_sub(completed_at_start),
-                workload_convergence_diagnostics(control, tenants, workload).await,
-            );
-        }
-        let tails = pending_tail_groups(control, tenants).await;
-        let progress = inspect_workload_progress(control, workload).await;
-        if workload_has_converged(&tails, &progress) {
-            return tails;
-        }
-        let completed_before = completion.completed();
-        trigger_supervised_scheduler(control, scenario).await;
-        let progress_deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let progress = inspect_workload_progress(control, workload).await;
-            if completion.completed() > completed_before || workload_has_terminal_effect(&progress)
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < progress_deadline,
-                "{} supervised Forge pass made no workload progress: {}",
-                scenario.name,
-                format_workload_progress(&progress),
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-}
-
-/// Describe every durable convergence component when a bounded journey expires.
-///
-/// # Panics
-///
-/// Panics when cross-tenant diagnostic inspection fails.
-async fn workload_convergence_diagnostics(
-    server: &WyrdTestServer,
-    tenants: &[TenantWriter],
-    workload: &ForgeCompactionWorkload,
-) -> String {
-    let tails = pending_tail_groups(server, tenants).await;
-    let progress = inspect_workload_progress(server, workload).await;
-    format!("tails={tails:?}; {}", format_workload_progress(&progress))
-}
-
-/// Returns target task state, acknowledgement, and audit evidence for one workload.
-///
-/// # Panics
-///
-/// Panics when durable target inspection fails.
-async fn inspect_workload_progress(
-    server: &WyrdTestServer,
-    workload: &ForgeCompactionWorkload,
-) -> Vec<(DataTenantId, bool, Vec<ForgeCompactionTargetTask>, i64, i64)> {
-    let mut progress = Vec::with_capacity(workload.tenants.len());
-    for target in &workload.tenants {
-        let mut conn = server
-            .state()
-            .postgres
-            .vala()
-            .tenant_conn(target.tenant)
-            .await
-            .expect("target progress tenant connection");
-        let demand_is_pending = if let Some(generation) = target.demand_generation {
-            sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name='vala.traces' AND table_name='spans' AND generation=$2)",
-            )
-            .bind(target.tenant.as_uuid())
-            .bind(generation)
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("target demand inspection")
-        } else {
-            false
-        };
-        let task_rows: Vec<(uuid::Uuid, String, bool)> = sqlx::query_as(
-            "SELECT task_id, state, evidence IS NOT NULL FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name='vala.traces' AND table_name='spans' AND strategy='staging_fold'",
-        )
-        .bind(target.tenant.as_uuid())
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("target task inspection");
-        let tasks = task_rows
-            .into_iter()
-            .filter(|(task_id, _, _)| !target.task_ids_before.contains(task_id))
-            .map(|(task_id, state, has_evidence)| ForgeCompactionTargetTask {
-                task_id,
-                state,
-                has_evidence,
-            })
-            .collect();
-        let terminal_audits: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation IN ('forge.file_compact.committed','forge.file_compact.recovered','forge.file_compact.reset')",
-        )
-        .bind(target.tenant.as_uuid())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("target audit inspection");
-        progress.push((
-            target.tenant,
-            demand_is_pending,
-            tasks,
-            terminal_audits,
-            target.terminal_audits_before,
-        ));
-    }
-    progress
-}
-
-/// Returns whether a target workload made a durable terminal transition.
-fn workload_has_terminal_effect(
-    progress: &[(DataTenantId, bool, Vec<ForgeCompactionTargetTask>, i64, i64)],
-) -> bool {
-    progress.iter().any(|(_, demand_is_pending, tasks, _, _)| {
-        !*demand_is_pending
-            && tasks.iter().any(|task| {
-                matches!(
-                    task.state.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "unschedulable"
-                )
-            })
-    })
-}
-
-/// Returns whether the exact workload, rather than unrelated maintenance, converged.
-fn workload_has_converged(
-    tails: &[(DataTenantId, chrono::NaiveDate, i64)],
-    progress: &[(DataTenantId, bool, Vec<ForgeCompactionTargetTask>, i64, i64)],
-) -> bool {
-    tails.iter().all(|(_, _, files)| *files <= 1)
-        && progress.iter().all(
-            |(_, demand_is_pending, tasks, terminal_audits, terminal_audits_before)| {
-                !*demand_is_pending
-                    && !tasks.is_empty()
-                    && tasks
-                        .iter()
-                        .all(|task| task.state == "succeeded" && task.has_evidence)
-                    && *terminal_audits > *terminal_audits_before
-            },
-        )
-}
-
-/// Renders exact workload convergence state for bounded timeout failures.
-fn format_workload_progress(
-    progress: &[(DataTenantId, bool, Vec<ForgeCompactionTargetTask>, i64, i64)],
-) -> String {
-    format!("targets={progress:?}")
-}
-
-/// Target convergence ignores unrelated later Ready maintenance but rejects a
-/// target task that has not succeeded with durable evidence.
-#[test]
-fn workload_convergence_tracks_only_captured_compaction_tasks() {
-    let tenant = DataTenantId::new_v7();
-    let tails = Vec::new();
-    let succeeded = ForgeCompactionTargetTask {
-        task_id: uuid::Uuid::now_v7(),
-        state: "succeeded".to_owned(),
-        has_evidence: true,
-    };
-    let target_complete = vec![(tenant, false, vec![succeeded.clone()], 4, 3)];
-
-    // A later Ready snapshot-expiry task is intentionally not in the captured
-    // staging-fold task set, so it cannot keep this writer workload open.
-    assert!(workload_has_converged(&tails, &target_complete));
-
-    let target_ready = vec![(
-        tenant,
-        false,
-        vec![ForgeCompactionTargetTask {
-            state: "ready".to_owned(),
-            ..succeeded.clone()
-        }],
-        4,
-        3,
-    )];
-    assert!(!workload_has_converged(&tails, &target_ready));
-
-    let target_failed = vec![(
-        tenant,
-        false,
-        vec![ForgeCompactionTargetTask {
-            state: "failed".to_owned(),
-            ..succeeded
-        }],
-        4,
-        3,
-    )];
-    assert!(!workload_has_converged(&tails, &target_failed));
-}
-
-/// Assert an accepted open-partition tail has not created durable Forge work.
-///
-/// # Panics
-///
-/// Panics when audit inspection fails or Forge recorded a compaction operation
-/// for a tail that the planner accepted without a rewrite.
-async fn assert_no_compaction_audits(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    scenario: Scenario,
-) {
-    let mut conn = server
-        .state()
-        .postgres
-        .vala()
-        .tenant_conn(tenant)
-        .await
-        .expect("Forge audit tenant connection");
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation LIKE 'forge.file_compact.%'",
-    )
-    .bind(tenant.as_uuid())
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("Forge audit count");
-    assert_eq!(
-        count, 0,
-        "{} accepted tail for tenant {tenant} recorded Forge compaction work",
-        scenario.name
-    );
-}
-
 /// Send the public same-table query used before and after Forge publication.
 ///
 /// # Panics
@@ -2859,33 +2051,6 @@ async fn query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
             _ => None,
         })
         .expect("query terminal frame")
-}
-
-/// Wait for Scribe's committed-generation grace window to retire overlap.
-///
-/// # Panics
-///
-/// Panics when the public query does not converge to the exact expected row
-/// count before the bounded deadline.
-async fn wait_for_query_rows(
-    server: &WyrdTestServer,
-    jwt: &str,
-    expected: u64,
-    scenario: Scenario,
-) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let rows = query_rows(server, jwt).await;
-        if rows == expected {
-            return rows;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} query did not retire Scribe/Iceberg overlap: expected {expected}, observed {rows}",
-            scenario.name
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// Return one public read while retaining the exact failure payload for role-loss diagnosis.
@@ -3036,4 +2201,68 @@ async fn forge_lease_count(server: &WyrdTestServer) -> i64 {
 async fn assert_no_forge_leases(server: &WyrdTestServer, scenario: Scenario) {
     let leases = forge_lease_count(server).await;
     assert_eq!(leases, 0, "{} stale Forge leases", scenario.name);
+}
+
+/// Captured task evidence used by the workload convergence predicate test.
+#[derive(Clone)]
+struct CapturedCompactionTask {
+    /// Durable Forge terminal state.
+    state: &'static str,
+    /// Whether committed output evidence exists for the task.
+    has_evidence: bool,
+}
+
+/// Return whether the captured workload has no open tails and all target tasks
+/// have terminal committed evidence; unrelated later tasks are ignored.
+fn workload_has_converged(
+    tails: &[DataTenantId],
+    targets: &[(DataTenantId, bool, Vec<CapturedCompactionTask>, i64, i64)],
+) -> bool {
+    tails.is_empty()
+        && targets
+            .iter()
+            .all(|(_, active, tasks, audits, audits_before)| {
+                !active
+                    && audits > audits_before
+                    && tasks
+                        .iter()
+                        .all(|task| task.state == "succeeded" && task.has_evidence)
+            })
+}
+
+/// Target convergence ignores unrelated later Ready maintenance but rejects a
+/// target task that has not succeeded with durable evidence.
+#[test]
+fn workload_convergence_tracks_only_captured_compaction_tasks() {
+    let tenant = DataTenantId::new_v7();
+    let succeeded = CapturedCompactionTask {
+        state: "succeeded",
+        has_evidence: true,
+    };
+    let target_complete = vec![(tenant, false, vec![succeeded.clone()], 4, 3)];
+    assert!(workload_has_converged(&[], &target_complete));
+
+    let target_ready = vec![(
+        tenant,
+        false,
+        vec![CapturedCompactionTask {
+            state: "ready",
+            ..succeeded.clone()
+        }],
+        4,
+        3,
+    )];
+    assert!(!workload_has_converged(&[], &target_ready));
+
+    let target_failed = vec![(
+        tenant,
+        false,
+        vec![CapturedCompactionTask {
+            state: "failed",
+            ..succeeded
+        }],
+        4,
+        3,
+    )];
+    assert!(!workload_has_converged(&[], &target_failed));
 }

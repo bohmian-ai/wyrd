@@ -911,7 +911,11 @@ impl ShardOwner {
             if !group.is_empty() {
                 let group_len = group.len();
                 if let Err(error) = self.process_group(group).await {
-                    tracing::error!(error = %error, shard = self.id, "Scribe shard group failed");
+                    if is_expected_wal_capacity(&error) {
+                        tracing::warn!(error = %error, shard = self.id, "Scribe shard reached its WAL capacity");
+                    } else {
+                        tracing::error!(error = %error, shard = self.id, "Scribe shard group failed");
+                    }
                 }
                 self.publish_snapshot();
                 self.pending.fetch_sub(group_len, Ordering::AcqRel);
@@ -1924,6 +1928,14 @@ impl ShardOwner {
     }
 }
 
+/// Classifies the one expected shard-group capacity boundary.
+///
+/// WAL exhaustion has already tripped the admission breaker before this
+/// classification. Every other group failure remains an unexpected error.
+fn is_expected_wal_capacity(error: &ScribeError) -> bool {
+    matches!(error, ScribeError::WalDiskFull)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,6 +1949,26 @@ mod tests {
     use std::sync::Arc;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+
+    /// Only typed WAL exhaustion is downgraded from an unexpected shard failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when WAL exhaustion or another shard failure is classified under
+    /// the wrong operational severity.
+    #[test]
+    fn only_wal_disk_full_is_expected_shard_capacity() {
+        assert!(is_expected_wal_capacity(&ScribeError::WalDiskFull));
+        assert!(!is_expected_wal_capacity(&ScribeError::Internal {
+            detail: "unexpected failure".to_owned(),
+        }));
+        assert!(!is_expected_wal_capacity(
+            &ScribeError::ObjectStorePutFailed(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "object failure"
+            ),)
+        ));
+    }
 
     #[derive(Debug)]
     struct Item {

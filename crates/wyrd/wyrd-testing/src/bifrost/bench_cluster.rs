@@ -1299,7 +1299,10 @@ fn elapsed_us(planned: tokio::time::Instant) -> u64 {
 
 /// Classify only explicit stable admission/backpressure responses.
 fn is_backpressure(error: &str) -> bool {
-    error.contains("backpressure") || error.contains("busy") || error.contains("admission rejected")
+    error.contains("backpressure")
+        || error.contains("busy")
+        || error.contains("admission rejected")
+        || error.contains("WYRD_VALA_507_WAL_DISK_FULL")
 }
 
 /// Classify only bounded transient publication/admission responses.
@@ -1620,6 +1623,25 @@ mod tests {
         let error = "query admission rejected";
         assert!(is_backpressure(error));
         assert!(is_retryable(error));
+    }
+
+    /// Stable WAL capacity stops calibration while unrelated server errors stay fatal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stable WAL-capacity code is not classified as
+    /// backpressure or an unrelated server failure is misclassified.
+    #[test]
+    fn wal_disk_full_is_backpressure_but_other_server_errors_are_not() {
+        assert!(is_backpressure(
+            "server error: WAL disk full; code=WYRD_VALA_507_WAL_DISK_FULL"
+        ));
+        assert!(!is_backpressure(
+            "server error: internal failure; code=WYRD_VALA_500_INTERNAL"
+        ));
+        assert!(!is_backpressure(
+            "server error: upstream failure; code=WYRD_VALA_502_UPSTREAM"
+        ));
     }
 
     /// Proves locked package identities are extracted without invoking Cargo.

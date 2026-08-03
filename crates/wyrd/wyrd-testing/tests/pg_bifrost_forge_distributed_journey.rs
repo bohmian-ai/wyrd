@@ -1371,7 +1371,10 @@ async fn scheduler_renewal_loss_stops_every_later_effect() {
         scheduler.release_demand_renewal_pause_for_test();
         before
     });
-    assert!(result.is_err(), "renewal loss must fail schedule_once");
+    assert!(
+        matches!(result, Err(ForgeError::FenceLost { .. })),
+        "renewal loss must retain the acquired-fence failure class: {result:?}"
+    );
     let after: (i64, i64, Option<uuid::Uuid>) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM vala.forge_tasks), (SELECT count(*) FROM vala.forge_planning_demands), last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
     )

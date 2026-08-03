@@ -156,6 +156,21 @@ async fn duplicate_shutdown_is_idempotent_and_closes_owners() {
     let node = NodeId::new(Uuid::now_v7());
     let (_wal, scribe) = scribe(&wal_root, node);
     let scribe = Arc::new(scribe);
+    append(
+        &scribe,
+        DataTenantId::new(Uuid::now_v7()).expect("tenant ID"),
+        "shutdown_owner",
+        Uuid::now_v7(),
+    )
+    .await
+    .expect("durable append opens one WAL stream");
+    assert_eq!(
+        scribe
+            .inspection_snapshot()
+            .expect("pre-shutdown inspection")
+            .open_wal_stream_count,
+        1
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let first = {
         let scribe = Arc::clone(&scribe);

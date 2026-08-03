@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::error::ForgeError;
+use super::metrics::ForgeLeaseResult;
 use super::{Forge, ForgeScheduler, ForgeTickOutcome};
 use crate::maintenance::StagingFileCommitted;
 
@@ -195,10 +196,27 @@ impl Forge {
         };
         match result {
             Ok(outcome) => {
-                pass_span.record("result", "succeeded");
+                pass_span.record(
+                    "result",
+                    if outcome.standby {
+                        "standby"
+                    } else {
+                        "succeeded"
+                    },
+                );
                 self.core
                     .telemetry
                     .record_scheduler_pass(&outcome, started.elapsed());
+                if outcome.standby {
+                    self.core
+                        .telemetry
+                        .record_lease(ForgeLeaseResult::Contention);
+                    tracing::debug!(triggered, "Forge scheduler remains on standby");
+                    if let Some(trigger) = &self.core.scheduler_trigger {
+                        trigger.record_completed_pass();
+                    }
+                    return true;
+                }
                 tracing::debug!(
                     demands_seen = outcome.demands_seen,
                     tasks_enqueued = outcome.tasks_enqueued,

@@ -922,6 +922,9 @@ impl ScribeImpl {
         if let Some(persistence) = &self.persistence {
             persistence.clear_retained_join_handles();
         }
+        if let Err(error) = self.wal.close_all_streams() {
+            tracing::error!(error = %error, "Scribe shutdown could not close every WAL stream owner");
+        }
         tracing::debug!(
             aborted_shards,
             aborted_persistence,

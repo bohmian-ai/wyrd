@@ -127,6 +127,9 @@ fn map_dispatch_error(error: &dispatcher::DispatchError) -> OracleExecutionError
         dispatcher::DispatchError::Retryable | dispatcher::DispatchError::Exhausted => {
             OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
         }
+        dispatcher::DispatchError::Capacity => {
+            OracleExecutionError::Public(BifrostError::QueryAdmissionRejected)
+        }
     }
 }
 

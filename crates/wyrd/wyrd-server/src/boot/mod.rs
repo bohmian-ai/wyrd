@@ -1210,7 +1210,6 @@ impl<'a> OracleRoleBuilder<'a> {
             config: OracleConfig {
                 planning_permits: config.bifrost.oracle.planning_permits,
                 max_workers_per_query: config.bifrost.oracle.max_workers_per_query,
-                attempt_max_bytes: config.bifrost.oracle.max_frame_bytes,
                 attempt_memory_bytes: config.bifrost.oracle.max_frame_bytes.min(8 * 1024 * 1024),
                 ..OracleConfig::default()
             },

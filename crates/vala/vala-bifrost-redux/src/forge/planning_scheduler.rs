@@ -32,6 +32,8 @@ use crate::maintenance::StagingFileCommitted;
 /// Complete classification from one bounded durable scheduler pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeScheduleOutcome {
+    /// Whether another live scheduler owned the singleton planning lease.
+    pub standby: bool,
     /// Durable demands observed in the bounded page.
     pub demands_seen: usize,
     /// Demands whose complete exact task set was acknowledged.
@@ -286,7 +288,12 @@ impl<'forge> ForgeScheduler<'forge> {
         stop: &CancellationToken,
     ) -> Result<ForgeScheduleOutcome, ForgeError> {
         let started = std::time::Instant::now();
-        let fence = self.acquire_fence().await?;
+        let Some(fence) = self.acquire_fence().await? else {
+            return Ok(ForgeScheduleOutcome {
+                standby: true,
+                ..ForgeScheduleOutcome::default()
+            });
+        };
         self.renew_fence(fence).await?;
         let mut outcome = ForgeScheduleOutcome {
             incomplete: self.repair_roster(stop, fence).await?,
@@ -427,7 +434,7 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     ///
     /// Returns invalid configuration, SQL, or fence-loss errors.
-    async fn acquire_fence(&self) -> Result<i64, ForgeError> {
+    async fn acquire_fence(&self) -> Result<Option<i64>, ForgeError> {
         let lease_seconds =
             u32::try_from(self.forge.core.config.lease_ttl.as_secs()).map_err(|_| {
                 ForgeError::InvalidConfig {
@@ -437,10 +444,7 @@ impl<'forge> ForgeScheduler<'forge> {
         self.tasks
             .acquire_scheduler(self.owner, lease_seconds)
             .await
-            .map_err(ForgeError::Sql)?
-            .ok_or_else(|| ForgeError::FenceLost {
-                lease_key: "forge:scheduler:v1".to_owned(),
-            })
+            .map_err(ForgeError::Sql)
     }
 
     /// Renews the exact scheduler generation without minting a replacement token.
@@ -455,10 +459,17 @@ impl<'forge> ForgeScheduler<'forge> {
     /// The single renewal statement either extends the exact generation or
     /// returns without durable partial progress.
     async fn renew_fence(&self, fence: i64) -> Result<(), ForgeError> {
-        self.tasks
+        match self
+            .tasks
             .renew_scheduler(self.owner, fence, self.forge.core.config.lease_ttl)
             .await
-            .map_err(ForgeError::Sql)
+        {
+            Ok(()) => Ok(()),
+            Err(SqlError::Conflict { .. }) => Err(ForgeError::FenceLost {
+                lease_key: "forge:scheduler:v1".to_owned(),
+            }),
+            Err(error) => Err(ForgeError::Sql(error)),
+        }
     }
 
     /// Repairs periodic demand from the authoritative registered-table roster.

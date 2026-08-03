@@ -183,10 +183,11 @@ fn conversion_status(error: PrivateConversionError) -> Status {
     Status::invalid_argument(error.to_string())
 }
 
-/// Maps retryable peer failures separately from terminal security/contract failures.
+/// Maps peer pressure, retryable failures, and terminal contract failures separately.
 fn dispatch_status(error: DispatchError) -> Status {
     match error {
         DispatchError::Retryable => Status::unavailable(error.to_string()),
+        DispatchError::Capacity => Status::resource_exhausted(error.to_string()),
         DispatchError::StaleObject => Status::not_found(error.to_string()),
         DispatchError::Terminal => Status::permission_denied(error.to_string()),
         DispatchError::Exhausted => Status::aborted(error.to_string()),

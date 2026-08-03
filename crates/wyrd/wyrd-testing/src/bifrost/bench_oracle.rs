@@ -237,7 +237,10 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
             if probe_shutdown.is_cancelled() {
                 return Ok::<_, super::cluster::ClusterError>((memory, slots));
             }
-            for sample in probe_telemetry.snapshot()? {
+            for sample in probe_telemetry
+                .snapshot()
+                .map_err(|error| super::cluster::ClusterError::Telemetry(error.to_string()))?
+            {
                 if matches!(
                     sample.family.as_str(),
                     "bifrost_oracle_memory_bytes" | "bifrost_oracle_class_memory_bytes"

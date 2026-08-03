@@ -88,7 +88,7 @@ enum AttemptPayload {
 }
 
 /// Attempt validation failure; no partial data is exposed.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptError {
     /// A frame arrived after completion.
     #[error("attempt footer must be last")]
@@ -102,6 +102,9 @@ pub enum AttemptError {
     /// The configured bounded attempt budget was exceeded.
     #[error("attempt buffer limit exceeded")]
     Capacity,
+    /// The shared Bifrost parent could not admit the in-memory attempt tier.
+    #[error("attempt parent memory capacity unavailable")]
+    ParentCapacity,
     /// Spill IO failed; no partial attempt is exposed.
     #[error("attempt spill failed")]
     Spill,
@@ -160,7 +163,7 @@ impl AttemptBuffer {
     ///
     /// # Errors
     ///
-    /// Returns [`AttemptError::Capacity`] when the process-wide parent cannot
+    /// Returns [`AttemptError::ParentCapacity`] when the process-wide parent cannot
     /// reserve the configured in-memory threshold.
     pub fn with_memory_governor(
         limit: usize,
@@ -171,7 +174,7 @@ impl AttemptBuffer {
         buffer.memory_reservation = Some(
             governor
                 .try_reserve_parent(buffer.memory_limit)
-                .map_err(|_| AttemptError::Capacity)?,
+                .map_err(|_| AttemptError::ParentCapacity)?,
         );
         Ok(buffer)
     }

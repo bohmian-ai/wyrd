@@ -182,18 +182,33 @@ run = """
 cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1
 """
 
-[tasks."bench:bifrost:slo"]
-description = "Run the bounded real Scribe and Forge baseline workload"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:slo:inner'"
-[tasks."bench:bifrost:slo:inner"]
-hide = true
-description = "Run the bounded real Scribe and Forge baseline workload"
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=3 --tenants=10"
-
 [tasks."bench:bifrost:baseline"]
 description = "Capture a fresh immutable pre-change Bifrost benchmark stage"
 run = "bash scripts/benchmarks/capture-bifrost-stage.sh pre-change"
+
+[tasks."bench:bifrost:cluster:reference"]
+description = "Run the controlled six-scenario Bifrost reference qualification"
+env = { WYRD_BIFROST_REFERENCE_PROFILE = "1", WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:cluster:reference:inner'"
+
+[tasks."bench:bifrost:cluster:reference:inner"]
+hide = true
+description = "Run the real public-cluster reference adapter inside a controlled Postgres lifecycle"
+run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster"
+
+[tasks."bench:bifrost:cluster:capture"]
+description = "Capture a diagnostic full-cluster report without promoting the checked-in reference"
+env = { WYRD_BIFROST_REFERENCE_PROFILE = "1", WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-candidate.json" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:cluster:reference:inner'"
+
+[tasks."bench:bifrost:cluster:smoke"]
+description = "Run the shortened real public-cluster adapter without asserting wall-clock SLOs"
+env = { WYRD_BIFROST_CLUSTER_SMOKE = "1", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-smoke.json" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster'"
+
+[tasks."bench:bifrost:cluster:compare"]
+description = "Compare two compatible controlled full-cluster report manifests"
+run = "cargo run --locked -p wyrd-bench --bin bifrost_compare --"
 
 [tasks."bench:bifrost:preflight"]
 description = "Verify one real Scribe append, seal, object write, and file-list commit"
@@ -203,15 +218,6 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Verify one real Scribe append, seal, object write, and file-list commit"
 run = "WYRD_BIFROST_BENCH_MODE=preflight cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=1 --measured-seconds=1 --items-per-request=1"
-
-[tasks."bench:bifrost:scribe:slo"]
-description = "Run the complete real Scribe SDK-to-server matrix and emit JSON plus Markdown"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:scribe:slo:inner'"
-[tasks."bench:bifrost:scribe:slo:inner"]
-hide = true
-description = "Run the complete real Scribe SDK-to-server matrix and emit JSON plus Markdown"
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=3 --tenants=10 --measured-seconds=5"
 
 [tasks."bench:bifrost:scribe:components"]
 description = "Measure the seven independent production Scribe components"
@@ -224,22 +230,22 @@ description = "Measure the seven independent production Scribe components"
 env = { WYRD_BIFROST_CLOSEOUT = "1" }
 run = "WYRD_BIFROST_BENCH_MODE=components cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=1 --measured-seconds=1 --items-per-request=1"
 
-[tasks."bench:bifrost:forge:slo"]
-description = "Run the bounded real Forge object-store rewrite and Postgres commit workload"
+[tasks."bench:bifrost:forge:components"]
+description = "Run subordinate Forge rewrite and Postgres commit diagnostics"
 
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:forge:slo:inner'"
-[tasks."bench:bifrost:forge:slo:inner"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:forge:components:inner'"
+[tasks."bench:bifrost:forge:components:inner"]
 hide = true
-description = "Run the bounded real Forge object-store rewrite and Postgres commit workload"
+description = "Run subordinate Forge rewrite and Postgres commit diagnostics"
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=3 --tenants=10"
 
-[tasks."bench:bifrost:oracle:slo"]
-description = "Run the real authenticated Oracle query smoke path"
+[tasks."bench:bifrost:oracle:components"]
+description = "Run subordinate authenticated Oracle query diagnostics"
 
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:oracle:slo:inner'"
-[tasks."bench:bifrost:oracle:slo:inner"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:oracle:components:inner'"
+[tasks."bench:bifrost:oracle:components:inner"]
 hide = true
-description = "Run the real authenticated Oracle query smoke path"
+description = "Run subordinate authenticated Oracle query diagnostics"
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --pods=3"
 
 [tasks."bench:bifrost:oracle:calibrate"]
@@ -257,59 +263,6 @@ run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifro
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
 run = "cargo test --locked -p wyrd-testing bifrost_deployment_contract -- --nocapture"
 
-[tasks."bench:bifrost:capacity"]
-description = "Run the complete real Scribe and Forge capacity workload"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:capacity:inner'"
-[tasks."bench:bifrost:capacity:inner"]
-hide = true
-description = "Run the complete real Scribe and Forge capacity workload"
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=3 --tenants=10"
-
-[tasks."bench:bifrost:scribe:single-tenant-single-node"]
-description = "Run Scribe with one tenant on one node"
-env = { WYRD_BIFROST_CASES = "64k-w64-t1-p1-tbl1-same" }
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:scribe:single-tenant-single-node:inner'"
-[tasks."bench:bifrost:scribe:single-tenant-single-node:inner"]
-hide = true
-description = "Run Scribe with one tenant on one node"
-env = { WYRD_BIFROST_CASES = "64k-w64-t1-p1-tbl1-same" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=1"
-
-[tasks."bench:bifrost:scribe:multi-tenant-single-node"]
-description = "Run Scribe with multiple tenants on one node"
-env = { WYRD_BIFROST_CASES = "64k-w64-t10-p3-tbl1-same" }
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:scribe:multi-tenant-single-node:inner'"
-[tasks."bench:bifrost:scribe:multi-tenant-single-node:inner"]
-hide = true
-description = "Run Scribe with multiple tenants on one node"
-env = { WYRD_BIFROST_CASES = "64k-w64-t10-p3-tbl1-same" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=10"
-
-[tasks."bench:bifrost:scribe:multi-tenant-multi-node"]
-description = "Run Scribe with multiple tenants across three nodes"
-env = { WYRD_BIFROST_CASES = "64k-w64-t10-p3-tbl8-dispersed" }
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:scribe:multi-tenant-multi-node:inner'"
-[tasks."bench:bifrost:scribe:multi-tenant-multi-node:inner"]
-hide = true
-description = "Run Scribe with multiple tenants across three nodes"
-env = { WYRD_BIFROST_CASES = "64k-w64-t10-p3-tbl8-dispersed" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=3 --tenants=10"
-
-[tasks."bench:bifrost:scribe:sustained"]
-description = "Run the gated sustained multi-tenant Scribe characterization"
-env = { WYRD_BIFROST_CLOSEOUT = "1", WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/task16/scribe-sustained.json" }
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:scribe:sustained:inner'"
-[tasks."bench:bifrost:scribe:sustained:inner"]
-hide = true
-description = "Run the gated sustained multi-tenant Scribe characterization"
-env = { WYRD_BIFROST_CLOSEOUT = "1", WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/task16/scribe-sustained.json" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=3 --tenants=100 --measured-seconds=60 --target-items-per-second=10000 --items-per-request=100"
-
 [tasks."bench:bifrost:otlp:ingest"]
 description = "Load-test realistic OTLP span ingestion through Gate and Scribe"
 
@@ -318,36 +271,6 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Load-test realistic OTLP span ingestion through Gate and Scribe"
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_otlp -- --pods=3 --tenants=10 --target-items-per-second=10000 --items-per-request=100 --warmup-seconds=5 --measured-seconds=60 --max-in-flight=256 --verify-samples=3"
-
-[tasks."bench:bifrost:forge:single-tenant-single-node"]
-description = "Run Forge with one tenant on one node"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:forge:single-tenant-single-node:inner'"
-[tasks."bench:bifrost:forge:single-tenant-single-node:inner"]
-hide = true
-description = "Run Forge with one tenant on one node"
-env = { WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/forge-single-tenant-single-node.json" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=1 --tenants=1"
-
-[tasks."bench:bifrost:forge:multi-tenant-single-node"]
-description = "Run Forge with multiple tenants on one node"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:forge:multi-tenant-single-node:inner'"
-[tasks."bench:bifrost:forge:multi-tenant-single-node:inner"]
-hide = true
-description = "Run Forge with multiple tenants on one node"
-env = { WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/forge-multi-tenant-single-node.json" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=1 --tenants=10"
-
-[tasks."bench:bifrost:forge:multi-tenant-multi-node"]
-description = "Run Forge with multiple tenants across three nodes"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:forge:multi-tenant-multi-node:inner'"
-[tasks."bench:bifrost:forge:multi-tenant-multi-node:inner"]
-hide = true
-description = "Run Forge with multiple tenants across three nodes"
-env = { WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/forge-multi-tenant-multi-node.json" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=3 --tenants=10"
 
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.

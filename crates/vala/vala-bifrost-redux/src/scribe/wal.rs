@@ -1679,6 +1679,27 @@ impl WalWriter {
             .count()
     }
 
+    /// Close every fixed-shard active segment after Scribe has stopped WAL IO.
+    ///
+    /// Shutdown retains segment files for normal replay but must release every
+    /// in-memory active-stream owner. A later process recovery, rather than the
+    /// stopped Scribe instance, decides which segment to reopen.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when a shard WAL-state lock is
+    /// poisoned. States closed before the poisoned shard remain closed.
+    pub(crate) fn close_all_streams(&self) -> Result<(), ScribeError> {
+        for state in self.states.iter() {
+            let mut state = state.lock().map_err(|_| ScribeError::Internal {
+                detail: "WAL state lock poisoned (shutdown close)".to_owned(),
+            })?;
+            state.current_segment = None;
+            state.current_segment_size = 0;
+            state.current_segment_records = 0;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn append_frame_for_test(
         &self,

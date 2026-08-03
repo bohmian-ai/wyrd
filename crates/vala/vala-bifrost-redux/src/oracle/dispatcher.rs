@@ -57,6 +57,9 @@ pub enum DispatchError {
     /// Worker or transport failed and may be retried.
     #[error("peer attempt unavailable")]
     Retryable,
+    /// The selected attempt could not reserve bounded parent memory.
+    #[error("peer attempt capacity unavailable")]
+    Capacity,
     /// A pinned immutable object disappeared and requires a whole-query replan.
     #[error("peer fragment references a stale object")]
     StaleObject,
@@ -83,8 +86,11 @@ struct PendingReservation {
     query_class: QueryClass,
     /// Pending expiry used for eager reclamation.
     expires_at: DateTime<Utc>,
-    /// Pending slot permit held until execute or release.
-    _permit: OwnedSemaphorePermit,
+    /// Remote pending slot permit held until execute or release.
+    ///
+    /// Leader-local work reuses the already-admitted query capacity and keeps
+    /// this empty.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Running worker reservation retained through attempt-stream completion.
@@ -142,6 +148,40 @@ impl ReservationRegistry {
             .slots
             .try_pending()
             .map_err(|_| DispatchError::Retryable)?;
+        self.insert(request, now, Some(permit))
+    }
+
+    /// Reserves tuple-bound leader-local work under admitted query capacity.
+    ///
+    /// The local query already owns this process's admission budget. The
+    /// reservation retains expiry, registry-capacity, and ownership checks
+    /// without charging the shared pending semaphore a second time.
+    ///
+    /// # Errors
+    /// Returns terminal for invalid demand or expiry and retryable when the
+    /// bounded registry is unavailable or full.
+    fn reserve_local(
+        &self,
+        request: &ReserveNodeSlotsRequest,
+        now: DateTime<Utc>,
+    ) -> Result<PendingNodeReservation, DispatchError> {
+        self.insert(request, now, None)
+    }
+
+    /// Inserts one validated reservation with its explicit capacity owner.
+    ///
+    /// # Errors
+    /// Returns terminal for invalid demand or expiry and retryable when the
+    /// bounded registry is unavailable or full.
+    fn insert(
+        &self,
+        request: &ReserveNodeSlotsRequest,
+        now: DateTime<Utc>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<PendingNodeReservation, DispatchError> {
+        if request.slot_units == 0 || request.expires_at <= now {
+            return Err(DispatchError::Terminal);
+        }
         let mut entries = self.entries.lock().map_err(|_| DispatchError::Retryable)?;
         retain_live(&mut entries, now);
         if entries.len() >= self.capacity {
@@ -281,7 +321,7 @@ impl ReservationRegistry {
 fn pending_reservation(
     request: &ReserveNodeSlotsRequest,
     expires_at: DateTime<Utc>,
-    permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> PendingReservation {
     PendingReservation {
         query_id: request.query_id,
@@ -693,7 +733,7 @@ impl LocalOraclePeerTransport {
 
 #[async_trait]
 impl OraclePeerTransport for LocalOraclePeerTransport {
-    /// Reserves through the same registry used by the tonic path.
+    /// Reserves tuple-bound local work under the leader's admitted query capacity.
     ///
     /// # Errors
     /// This adapter returns the worker's typed reservation outcome.
@@ -702,7 +742,17 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
         _worker: NodeId,
         request: ReserveNodeSlotsRequest,
     ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
-        Ok(self.worker.reserve(&request))
+        Ok(
+            if let Ok(pending) = self.worker.reservations.reserve_local(&request, Utc::now()) {
+                record_slot(request.query_class, SlotOutcome::Pending);
+                ReserveNodeSlotsResponse::Pending(pending)
+            } else {
+                record_slot(request.query_class, SlotOutcome::Rejected);
+                ReserveNodeSlotsResponse::Rejected(ReservationRejected {
+                    retry_after_ms: RESERVATION_RETRY_MS,
+                })
+            },
+        )
     }
 
     /// Releases through the same tuple check used by the tonic path.
@@ -1521,7 +1571,7 @@ impl FragmentDispatcher {
             self.release_pending(candidate, release, context).await;
             if matches!(
                 result,
-                Err(DispatchError::Terminal | DispatchError::StaleObject)
+                Err(DispatchError::Terminal | DispatchError::StaleObject | DispatchError::Capacity)
             ) {
                 return result;
             }
@@ -1625,15 +1675,21 @@ impl FragmentDispatcher {
 }
 
 /// Invalid or incomplete attempts are retryable because no bytes were admitted.
-fn attempt_error(_error: AttemptError) -> DispatchError {
+fn attempt_error(error: AttemptError) -> DispatchError {
     record_peer_attempt(FragmentOutcome::Failed, PeerErrorClass::Attempt);
-    DispatchError::Retryable
+    if error == AttemptError::ParentCapacity {
+        DispatchError::Capacity
+    } else {
+        DispatchError::Retryable
+    }
 }
 
 /// Maps internal retry classes to closed metric labels.
 fn dispatch_error_label(error: &DispatchError) -> PeerErrorClass {
     match error {
-        DispatchError::Retryable | DispatchError::StaleObject => PeerErrorClass::Availability,
+        DispatchError::Retryable | DispatchError::StaleObject | DispatchError::Capacity => {
+            PeerErrorClass::Availability
+        }
         DispatchError::Terminal => PeerErrorClass::Security,
         DispatchError::Exhausted => PeerErrorClass::Exhausted,
     }
@@ -1981,17 +2037,18 @@ mod tests {
         drop(running);
     }
 
-    /// Leader-local execution consumes its reservation while reusing one admitted slot.
+    /// Leader-local execution reuses admitted pending and running capacity.
     #[test]
     fn oracle_peer_local_transition_does_not_double_charge_leader_slot() {
         let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let pending_slot = slots.try_pending().expect("admitted leader pending slot");
         let leader_slot = slots.try_running(1).expect("admitted leader slot");
         let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
         let pending = registry
-            .reserve(
+            .reserve_local(
                 &reserve_request(query, leader, 11, now + ChronoDuration::seconds(2)),
                 now,
             )
@@ -2002,8 +2059,11 @@ mod tests {
             .expect("leader-local transition");
 
         assert!(running.permit.is_none());
+        assert!(slots.try_pending().is_err());
         assert!(slots.try_running(1).is_err());
+        drop(pending_slot);
         drop(leader_slot);
+        assert!(slots.try_pending().is_ok());
         assert!(slots.try_running(1).is_ok());
     }
 
@@ -2250,6 +2310,19 @@ mod tests {
         ));
         assert!(matches!(
             status_error(&Status::unavailable("storage outage")),
+            DispatchError::Retryable
+        ));
+    }
+
+    /// Parent-memory pressure remains distinct from a malformed or oversized attempt.
+    #[test]
+    fn oracle_attempt_capacity_preserves_admission_classification() {
+        assert!(matches!(
+            attempt_error(AttemptError::ParentCapacity),
+            DispatchError::Capacity
+        ));
+        assert!(matches!(
+            attempt_error(AttemptError::Capacity),
             DispatchError::Retryable
         ));
     }

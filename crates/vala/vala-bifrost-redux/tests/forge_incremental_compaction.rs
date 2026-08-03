@@ -10,7 +10,8 @@ mod pg_tests {
     use std::time::Duration;
 
     use arrow::array::{
-        FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+        FixedSizeBinaryBuilder, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::memory_pool::GreedyMemoryPool;
@@ -679,7 +680,7 @@ mod pg_tests {
                         )),
                         Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
                         Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
-                        Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
+                        Arc::new(StringArray::from(vec!["principal"; row_count_usize])),
                         Arc::new(StringArray::from(vec!["request"; row_count_usize])),
                         Arc::new(
                             TimestampMicrosecondArray::from(
@@ -698,6 +699,10 @@ mod pg_tests {
                             .with_timezone("UTC"),
                         ),
                         Arc::new(batch_ids.finish()),
+                        Arc::new(Int32Array::from_iter_values(
+                            (0..row_count_usize)
+                                .map(|row| i32::try_from(row).expect("row ordinal fits i32")),
+                        )),
                         Arc::new(StringArray::from(vec![
                             self.tenant.to_string();
                             row_count_usize
@@ -1738,6 +1743,38 @@ mod pg_tests {
             .await
             .expect("periodic maintenance demand");
         fixture.plan_and_claim().await
+    }
+
+    /// A second scheduler remains a successful standby while the leader lease is live.
+    #[tokio::test]
+    async fn scheduler_contention_is_a_standby_outcome() {
+        let fixture = Fixture::new().await;
+        let stop = CancellationToken::new();
+        let leader = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("leader scheduler");
+        let standby = ForgeScheduler::with_owner_for_test(&fixture.forge, uuid::Uuid::now_v7())
+            .expect("standby scheduler");
+
+        let leader_outcome = leader.schedule_once(&stop).await.expect("leader pass");
+        assert!(
+            !leader_outcome.standby,
+            "leader outcome: {leader_outcome:?}"
+        );
+        let standby_outcome = standby
+            .schedule_once(&stop)
+            .await
+            .expect("live lease contention is not a scheduler failure");
+        assert!(
+            standby_outcome.standby,
+            "contending scheduler must report standby: {standby_outcome:?}"
+        );
+        assert_eq!(
+            standby_outcome,
+            ForgeScheduleOutcome {
+                standby: true,
+                ..ForgeScheduleOutcome::default()
+            }
+        );
     }
 
     /// A planning demand replaced during its acknowledgement is retried once from

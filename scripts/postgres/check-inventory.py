@@ -28,12 +28,11 @@ pre = {
     "test:bifrost:journey", "test:bifrost:ingest-runtime", "test:bifrost:inspection", "test:fuzz:bifrost",
     "test:bifrost:sustained", "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
-    "bench", "bench:workload", "bench:bifrost:slo", "bench:bifrost:preflight", "bench:bifrost:capacity",
-    "bench:bifrost:otlp:ingest", "bench:bifrost:scribe:slo", "bench:bifrost:scribe:components",
-    "bench:bifrost:scribe:single-tenant-single-node", "bench:bifrost:scribe:multi-tenant-single-node",
-    "bench:bifrost:scribe:multi-tenant-multi-node", "bench:bifrost:scribe:sustained", "bench:bifrost:forge:slo",
-    "bench:bifrost:forge:single-tenant-single-node", "bench:bifrost:forge:multi-tenant-single-node",
-    "bench:bifrost:forge:multi-tenant-multi-node", "bench:bifrost:oracle:slo", "bench:bifrost:oracle:calibrate",
+    "bench", "bench:workload", "bench:bifrost:preflight", "bench:bifrost:otlp:ingest",
+    "bench:bifrost:scribe:components", "bench:bifrost:forge:components",
+    "bench:bifrost:oracle:components", "bench:bifrost:oracle:calibrate",
+    "bench:bifrost:cluster:reference", "bench:bifrost:cluster:capture",
+    "bench:bifrost:cluster:smoke",
 }
 aggregates = {"test:unit", "pre-pr", "test:storage:matrix", "test:storage:cloud:matrix"}
 for name in empty | migrated | pre:

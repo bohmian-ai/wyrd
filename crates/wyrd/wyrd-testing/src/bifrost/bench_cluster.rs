@@ -1118,7 +1118,7 @@ fn begin_probe(probes: &mut Vec<AttemptedProbe>, scenario_id: String, rate: u64)
 fn complete_current_probe(probes: &mut [AttemptedProbe], stop_reasons: &[CapacityLimit]) {
     if let Some(probe) = probes.last_mut() {
         probe.completed = true;
-        probe.stop_reasons.clone_from_slice(stop_reasons);
+        probe.stop_reasons = stop_reasons.to_vec();
     }
 }
 
@@ -3754,9 +3754,11 @@ mod tests {
     fn mid_curve_progress_is_retained() {
         let mut probes = Vec::new();
         begin_probe(&mut probes, "scenario-a".to_owned(), 8);
-        complete_current_probe(&mut probes, &[]);
+        let reasons = [CapacityLimit::Backpressure, CapacityLimit::DependencySlo];
+        complete_current_probe(&mut probes, &reasons);
         begin_probe(&mut probes, "scenario-a".to_owned(), 16);
         assert!(probes[0].completed);
+        assert_eq!(probes[0].stop_reasons, reasons);
         assert!(!probes[1].completed);
     }
 

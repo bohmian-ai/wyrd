@@ -67,12 +67,112 @@ struct StandaloneForgeRoles {
 
 /// One dedicated production worker supervisor and its process-lifecycle evidence.
 struct StandaloneForgeWorkerRole {
+    /// Configured physical node identity used by claims and role telemetry.
+    node_id: uuid::Uuid,
     /// Cancellation boundary for this exact worker process replacement unit.
     stop: CancellationToken,
     /// Running production worker loop.
     task: JoinHandle<Result<(), ForgeError>>,
     /// Dedicated-worker role guard; embedded execution uses the shared `all` guard.
     guard: Option<wyrd_server::app::metrics::TestForgeRoleTelemetryGuard>,
+}
+
+/// Configured physical identities shared by role telemetry and durable worker claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForgeTopologyIdentities {
+    /// Physical node that owns the embedded `All` or dedicated `Server` role.
+    coordinator: uuid::Uuid,
+    /// Physical owner for each worker slot in stable topology order.
+    workers: Vec<uuid::Uuid>,
+}
+
+impl ForgeTopologyIdentities {
+    /// Plan stable physical identities for one embedded or dedicated topology.
+    ///
+    /// Embedded composition colocates its sole worker on coordinator node 1.
+    /// Dedicated composition keeps Server on node 1 and assigns workers 2..N+1.
+    ///
+    /// # Errors
+    /// Returns an error for a zero-worker topology or an index that cannot fit
+    /// the deterministic UUID payload.
+    fn plan(worker_count: usize) -> Result<Self, BenchError> {
+        if worker_count == 0 {
+            return Err("Forge benchmark needs at least one executed pod".into());
+        }
+        let coordinator = configured_benchmark_node_id(1)?;
+        let workers = if worker_count == 1 {
+            vec![coordinator]
+        } else {
+            (0..worker_count)
+                .map(|index| {
+                    let identity = index
+                        .checked_add(2)
+                        .ok_or("Forge benchmark topology identity overflowed")?;
+                    configured_benchmark_node_id(identity)
+                })
+                .collect::<Result<Vec<_>, BenchError>>()?
+        };
+        Ok(Self {
+            coordinator,
+            workers,
+        })
+    }
+
+    /// Return the stable physical identity reused when one worker slot restarts.
+    #[cfg(test)]
+    #[must_use]
+    fn replacement(&self, index: usize) -> Option<uuid::Uuid> {
+        self.workers.get(index).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// Pins embedded colocation, dedicated uniqueness, stability, and replacement reuse.
+    #[test]
+    fn topology_identities_match_configured_role_owners() {
+        let node = |value| uuid::Uuid::from_u128(value);
+        let embedded = ForgeTopologyIdentities::plan(1).expect("embedded topology identities");
+        assert_eq!(embedded.coordinator, node(1));
+        assert_eq!(embedded.workers, vec![node(1)]);
+        assert_eq!(embedded.replacement(0), Some(node(1)));
+
+        let dedicated = ForgeTopologyIdentities::plan(3).expect("dedicated topology identities");
+        assert_eq!(dedicated.coordinator, node(1));
+        assert_eq!(dedicated.workers, vec![node(2), node(3), node(4)]);
+        assert_eq!(dedicated.replacement(1), Some(node(3)));
+        assert_eq!(dedicated.replacement(3), None);
+        assert_eq!(
+            dedicated
+                .workers
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            dedicated.workers.len()
+        );
+        assert!(!dedicated.workers.contains(&dedicated.coordinator));
+        assert_eq!(
+            ForgeTopologyIdentities::plan(3).expect("stable topology identities"),
+            dedicated
+        );
+        assert!(ForgeTopologyIdentities::plan(0).is_err());
+    }
+}
+
+/// Resolve one deterministic configured physical identity for benchmark topology composition.
+///
+/// This mirrors the cluster harness: topology descriptors own stable UUIDs,
+/// and the same identity is passed to durable worker claims and role telemetry.
+///
+/// # Errors
+/// Returns a conversion error when the configured topology index cannot fit a UUID payload.
+fn configured_benchmark_node_id(index: usize) -> Result<uuid::Uuid, BenchError> {
+    Ok(uuid::Uuid::from_u128(u128::try_from(index)?))
 }
 
 impl StandaloneForgeWorkerRole {
@@ -83,13 +183,19 @@ impl StandaloneForgeWorkerRole {
     /// Returns invalid worker configuration before the supervisor starts.
     fn start(
         forge: Arc<Forge>,
+        node_id: uuid::Uuid,
         guard: Option<wyrd_server::app::metrics::TestForgeRoleTelemetryGuard>,
     ) -> Result<Self, BenchError> {
-        let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default(), uuid::Uuid::now_v7())?;
+        let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default(), node_id)?;
         let stop = CancellationToken::new();
         let worker_stop = stop.clone();
         let task = tokio::spawn(async move { worker.run(worker_stop).await });
-        Ok(Self { stop, task, guard })
+        Ok(Self {
+            node_id,
+            stop,
+            task,
+            guard,
+        })
     }
 
     /// Cancel and join this production worker before releasing its role gauge.
@@ -124,9 +230,7 @@ impl StandaloneForgeRoles {
         completion_observer: ForgeWorkerCompletionObserver,
     ) -> Result<Self, BenchError> {
         let worker_count = usize::try_from(pods)?;
-        if worker_count == 0 {
-            return Err("Forge benchmark needs at least one executed pod".into());
-        }
+        let identities = ForgeTopologyIdentities::plan(worker_count)?;
         let scheduler_stop = CancellationToken::new();
         let scheduler_shutdown = scheduler_stop.clone();
         let scheduler_forge = Arc::clone(&forge);
@@ -135,7 +239,10 @@ impl StandaloneForgeRoles {
         let (expected, all_guard, server_guard) = if worker_count == 1 {
             (
                 BTreeMap::from([("all".to_owned(), 1)]),
-                Some(start_capture_forge_role(ForgeProcessRole::All)),
+                Some(start_capture_forge_role(
+                    ForgeProcessRole::All,
+                    identities.coordinator,
+                )),
                 None,
             )
         } else {
@@ -145,14 +252,19 @@ impl StandaloneForgeRoles {
                     ("forge_worker".to_owned(), u64::from(pods)),
                 ]),
                 None,
-                Some(start_capture_forge_role(ForgeProcessRole::Server)),
+                Some(start_capture_forge_role(
+                    ForgeProcessRole::Server,
+                    identities.coordinator,
+                )),
             )
         };
-        let workers = (0..worker_count)
-            .map(|_| {
+        let workers = identities
+            .workers
+            .into_iter()
+            .map(|node_id| {
                 let guard = (worker_count > 1)
-                    .then(|| start_capture_forge_role(ForgeProcessRole::ForgeWorker));
-                StandaloneForgeWorkerRole::start(Arc::clone(&forge), guard)
+                    .then(|| start_capture_forge_role(ForgeProcessRole::ForgeWorker, node_id));
+                StandaloneForgeWorkerRole::start(Arc::clone(&forge), node_id, guard)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -218,10 +330,16 @@ impl StandaloneForgeRoles {
         if index >= self.workers.len() {
             return Err("Forge replacement worker index is outside the topology".into());
         }
-        self.workers.swap_remove(index).stop().await?;
+        let replaced = self.workers.swap_remove(index);
+        let node_id = replaced.node_id;
+        replaced.stop().await?;
         self.workers.push(StandaloneForgeWorkerRole::start(
             Arc::clone(&self.forge),
-            Some(start_capture_forge_role(ForgeProcessRole::ForgeWorker)),
+            node_id,
+            Some(start_capture_forge_role(
+                ForgeProcessRole::ForgeWorker,
+                node_id,
+            )),
         )?);
         Ok(())
     }

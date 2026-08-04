@@ -28,7 +28,7 @@ pre = {
     "test:bifrost:journey", "test:fuzz:bifrost",
     "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
-    "bench:bifrost:capacity", "bench:bifrost:qualify", "bench:bifrost:components",
+    "bench:bifrost:capacity", "bench:bifrost:qualify", "bench:bifrost:smoke", "bench:bifrost:components",
 }
 aggregates = {"test:unit", "pre-pr", "test:storage:matrix", "test:storage:cloud:matrix"}
 for name in empty | migrated | pre:
@@ -40,6 +40,33 @@ for name in empty | migrated | pre:
     deps = set(task.get("depends", []))
     if deps & {"setup:postgres", "db:migrate"}:
         raise SystemExit(f"{name} still has setup-only Postgres dependencies")
+
+def check_bifrost_benchmark_lifecycle(task_map):
+    """Require best-effort descriptor raise followed by Rust benchmark preflight."""
+    for name in ("bench:bifrost:capacity", "bench:bifrost:qualify", "bench:bifrost:smoke"):
+        if task_map[name].get("env", {}).get("WYRD_BIFROST_REFERENCE_PROFILE") != "1":
+            raise SystemExit(f"{name} must enable the canonical reference profile")
+        expected_raise = "ulimit -n 8192 2>/dev/null || true;"
+        if expected_raise not in task_map[name].get("run", ""):
+            raise SystemExit(f"{name} must attempt the canonical open-file limit before Rust preflight")
+        if task_map[name].get("env", {}).get("WYRD_POSTGRES_COMPOSE_FILE") != "benches/bifrost/docker-compose.reference.yml":
+            raise SystemExit(f"{name} must use the canonical reference compose file")
+        if "mise run db:migrate:inner" not in task_map[name].get("run", ""):
+            raise SystemExit(f"{name} must migrate before benchmark startup")
+
+
+check_bifrost_benchmark_lifecycle(tasks)
+
+smoke = tasks["bench:bifrost:smoke"]
+smoke_inner = tasks["bench:bifrost:smoke:inner"]
+if not smoke.get("hide") or not smoke_inner.get("hide"):
+    raise SystemExit("the Bifrost smoke outer and inner tasks must remain hidden")
+expected_smoke_selector = (
+    "cargo test --locked -p wyrd-testing --features bench --lib "
+    "shortened_capacity_smoke_is_reachable -- --ignored --test-threads=1"
+)
+if smoke_inner.get("run") != expected_smoke_selector:
+    raise SystemExit("the hidden Bifrost smoke inner selector drifted")
 
 def dependencies(task):
     raw = task.get("depends", [])

@@ -50,6 +50,8 @@ const PRELOAD_ROWS: u64 = 8_192;
 const ROWS_PER_WRITE: u32 = 64;
 /// Default profile-driven concurrent public-operation cap.
 const DEFAULT_MAX_IN_FLIGHT: usize = 4_096;
+/// Minimum process soft open-file limit required by the reference benchmark.
+const MINIMUM_OPEN_FILE_LIMIT: u64 = 8_192;
 /// Disjoint logical row-id space reserved for each authenticated tenant.
 const TENANT_ROW_STRIDE: u64 = 1_000_000_000_000;
 
@@ -248,7 +250,8 @@ async fn run_qualification_selected(
     selected_scenario: Option<&str>,
     matrix: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let environment = detect_reference_environment()?;
+    let path = report_path("cluster-candidate.json");
+    let environment = detect_reference_environment_or_write(&path)?;
     let rates = wyrd_bench::DEFAULT_REVIEWED_QUALIFICATION_RATES;
     wyrd_bench::qualification_preflight_seconds(rates.len(), 20, 180, 1_200)?;
     let mut reports = Vec::new();
@@ -321,7 +324,6 @@ async fn run_qualification_selected(
         .await;
         let shutdown = session.shutdown().await;
         if let Err(error) = result {
-            let path = report_path("cluster-candidate.json");
             let cleanup_error = shutdown.err().map(|cleanup| cleanup.to_string());
             let combined = cleanup_error.as_ref().map_or_else(
                 || error.to_string(),
@@ -349,7 +351,6 @@ async fn run_qualification_selected(
         scenarios: reviewed_scenario_profiles(reports, &environment_storage_identity(&environment)),
         slos: BifrostSloEnvelope::default(),
     };
-    let path = report_path("cluster-candidate.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -386,7 +387,8 @@ async fn run_capacity_selected(
     selected_scenario: Option<&str>,
     matrix: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let environment = detect_reference_environment()?;
+    let path = report_path("cluster-capacity.json");
+    let environment = detect_reference_environment_or_write(&path)?;
     let mut reports = Vec::new();
     for definition in reference_scenario_matrix() {
         if !matrix && selected_scenario != Some(definition.id) {
@@ -413,16 +415,7 @@ async fn run_capacity_selected(
                 )
                 .await
                 .map_err(|_| "capacity stage exceeded its 30-second bound")??;
-                let passed = result.client.missed_operations == 0
-                    && result.client.in_flight_cap_exhaustions == 0
-                    && result.client.backpressure == 0
-                    && result.published_rows == result.client.tenant_write_rows.iter().sum::<u64>()
-                    && result.audit_rows > 0;
-                let mut stage = capacity_stage_report(definition, plan, result, passed, 20);
-                if stage.validate_evidence().is_err() {
-                    stage.passed = false;
-                    stage.stop_reasons.push(CapacityLimit::DependencySlo);
-                }
+                let stage = assemble_capacity_stage(definition, plan, result, 20);
                 session.record_stage(plan, stage.passed)?;
                 complete_current_probe(&mut attempted_probes, &stage.stop_reasons);
                 stages.push(stage);
@@ -433,7 +426,6 @@ async fn run_capacity_selected(
         .await;
         let shutdown = session.shutdown().await;
         if let Err(error) = execution {
-            let path = report_path("cluster-capacity.json");
             let partial =
                 (!stages.is_empty()).then(|| capacity_scenario_report(definition, stages));
             let cleanup_error = shutdown.err().map(|cleanup| cleanup.to_string());
@@ -459,7 +451,6 @@ async fn run_capacity_selected(
         scenarios: reviewed_scenario_profiles(reports, &environment_storage_identity(&environment)),
         slos: BifrostSloEnvelope::default(),
     };
-    let path = report_path("cluster-capacity.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -600,6 +591,30 @@ fn capacity_stage_report(
         dependencies: capacity_dependency_evidence(&result.telemetry),
         traces: capacity_trace_evidence(&result.telemetry),
     }
+}
+
+/// Assemble and validate one completed public workload stage for capacity or smoke.
+///
+/// The helper applies the single production outcome policy before validating
+/// the existing telemetry, dependency, resource, and trace evidence shape.
+#[must_use]
+fn assemble_capacity_stage(
+    definition: ReferenceScenarioDefinition,
+    plan: CapacityStagePlan,
+    result: CapacityStageRun,
+    measured_seconds: u64,
+) -> CapacityStage {
+    let passed = result.client.missed_operations == 0
+        && result.client.in_flight_cap_exhaustions == 0
+        && result.client.backpressure == 0
+        && result.published_rows == result.client.tenant_write_rows.iter().sum::<u64>()
+        && result.audit_rows > 0;
+    let mut stage = capacity_stage_report(definition, plan, result, passed, measured_seconds);
+    if stage.validate_evidence().is_err() {
+        stage.passed = false;
+        stage.stop_reasons.push(CapacityLimit::DependencySlo);
+    }
+    stage
 }
 
 /// Derive the report identity from the same ordinal used to write public frames.
@@ -1420,7 +1435,10 @@ impl CapacityScenarioSession {
         }
         let tenants = provision_reference_tenants(&cluster, definition.tenants as usize).await?;
         provision_named_tables(&cluster, &tenants, &tables).await?;
+        provision_named_tables(&cluster, &tenants, &[REFERENCE_TABLE.to_owned()]).await?;
         let clients = reference_clients(&cluster, &tenants).await?;
+        preload_reference_rows(&cluster, &tenants, &clients).await?;
+        await_forge_convergence(&cluster, &tenants).await?;
         let expected_rows = vec![BTreeSet::new(); tenants.len()];
         Ok(Self {
             cluster: Some(cluster),
@@ -2051,8 +2069,9 @@ impl WindowRun<'_> {
             return Err("open-loop offered rate must be positive".into());
         }
         let start = tokio::time::Instant::now();
-        let operations = self.operations(start);
-        let flushes = self.flushes(start);
+        let accepted_ordinals = Arc::new(std::sync::Mutex::new(vec![None; self.tenants.len()]));
+        let operations = self.operations(start, Arc::clone(&accepted_ordinals));
+        let flushes = self.flushes(start, accepted_ordinals);
         let (mut result, flush_result) = tokio::try_join!(operations, flushes)?;
         result.measured_seconds = self.duration.as_secs();
         result.flush_us = flush_result.0;
@@ -2072,6 +2091,7 @@ impl WindowRun<'_> {
     async fn operations(
         &self,
         start: tokio::time::Instant,
+        accepted_ordinals: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
     ) -> Result<WindowResult, Box<dyn std::error::Error + Send + Sync>> {
         let interval = Duration::from_secs_f64(1.0 / self.rate as f64);
         let operation_count = self.rate.saturating_mul(self.duration.as_secs());
@@ -2086,7 +2106,9 @@ impl WindowRun<'_> {
         };
         for ordinal in 0..operation_count {
             while let Some(joined) = tasks.try_join_next() {
-                apply_operation(&mut result, joined??);
+                let operation = joined??;
+                record_latest_accepted_ordinal(&accepted_ordinals, &operation)?;
+                apply_operation(&mut result, operation);
             }
             let planned = start + interval.mul_f64(ordinal as f64);
             tokio::time::sleep_until(planned).await;
@@ -2102,10 +2124,10 @@ impl WindowRun<'_> {
             }
             let tenant_index = ordinal as usize % self.tenants.len();
             let client = self.clients[tenant_index].clone();
-            let table = self.table.to_owned();
+            let write = ordinal == 0 || is_write_operation(ordinal, self.definition.write_percent);
+            let table = operation_table(self.table, write).to_owned();
             // Each untouched measurement table begins with one public write so
             // later reads have a caller-visible working set without preload.
-            let write = ordinal == 0 || is_write_operation(ordinal, self.definition.write_percent);
             let phase_ordinal = self.phase_ordinal_base + tenant_write_ordinals[tenant_index];
             if write {
                 tenant_write_ordinals[tenant_index] =
@@ -2120,10 +2142,38 @@ impl WindowRun<'_> {
             });
         }
         while let Some(joined) = tasks.join_next().await {
-            apply_operation(&mut result, joined??);
+            let operation = joined??;
+            record_latest_accepted_ordinal(&accepted_ordinals, &operation)?;
+            apply_operation(&mut result, operation);
         }
         Ok(result)
     }
+}
+
+/// Publish the latest accepted write ordinal for concurrent visibility probes.
+///
+/// # Errors
+/// Returns an error when a prior task poisoned the shared visibility ledger.
+fn record_latest_accepted_ordinal(
+    ledger: &std::sync::Mutex<Vec<Option<u64>>>,
+    operation: &OperationResult,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let OperationResult::Write {
+        tenant, ordinal, ..
+    } = operation
+    {
+        let mut accepted = ledger
+            .lock()
+            .map_err(|_| "accepted write ledger poisoned")?;
+        accepted[*tenant] = Some(accepted[*tenant].map_or(*ordinal, |latest| latest.max(*ordinal)));
+    }
+    Ok(())
+}
+
+/// Route reads to the converged preload table and writes to the untouched phase table.
+#[must_use]
+fn operation_table(write_table: &str, write: bool) -> &str {
+    if write { write_table } else { REFERENCE_TABLE }
 }
 
 /// Execute one planned durable write and preserve stable pressure classification.
@@ -2322,6 +2372,7 @@ impl WindowRun<'_> {
     async fn flushes(
         &self,
         start: tokio::time::Instant,
+        accepted_ordinals: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
     ) -> Result<(Vec<u64>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         if !self.measured {
             return Ok((Vec::new(), 0, 0));
@@ -2337,13 +2388,22 @@ impl WindowRun<'_> {
                 continue;
             }
             let tenant_index = flush_index as usize % self.tenants.len();
+            let ordinal = accepted_ordinals
+                .lock()
+                .map_err(|_| "accepted write ledger poisoned")?[tenant_index];
+            let Some(ordinal) = ordinal else {
+                missed = missed.saturating_add(1);
+                continue;
+            };
             flush_one_tenant(self.cluster, self.tenants, tenant_index).await?;
+            await_forge_convergence(self.cluster, &self.tenants[tenant_index..=tenant_index])
+                .await?;
             let request = BifrostQueryRequest {
                 sql: format!(
                     "SELECT row_id, wyrd_event_time FROM vala.bifrost.{} WHERE row_id BETWEEN {} AND {} ORDER BY row_id LIMIT 64",
                     self.table,
-                    tenant_row_base(tenant_index),
-                    tenant_row_base(tenant_index) + 63,
+                    tenant_row_base(tenant_index) + PRELOAD_ROWS + ordinal * 64,
+                    tenant_row_base(tenant_index) + PRELOAD_ROWS + ordinal * 64 + 63,
                 ),
                 visibility: VisibilityMode::PublishedOnly,
                 freshness: FreshnessPolicy::Strict,
@@ -2354,8 +2414,8 @@ impl WindowRun<'_> {
             while let Some(batch) = stream.next_batch().await? {
                 collect_query_identities(
                     &batch,
-                    tenant_row_base(tenant_index),
-                    tenant_row_base(tenant_index) + 63,
+                    tenant_row_base(tenant_index) + PRELOAD_ROWS + ordinal * 64,
+                    tenant_row_base(tenant_index) + PRELOAD_ROWS + ordinal * 64 + 63,
                     &mut identities,
                 )?;
                 decoded_rows = decoded_rows.saturating_add(batch.num_rows() as u64);
@@ -2899,40 +2959,54 @@ fn is_retryable(error: &str) -> bool {
 /// Run the shortened real public-cluster smoke without claiming wall-clock SLOs.
 ///
 /// # Errors
-/// Returns a cluster error when Task 15's real public Gate adapter fails its
+/// Returns a cluster error when the real public Gate adapter fails its
 /// correctness, telemetry, tenant-isolation, audit, or cleanup assertions.
 pub async fn run_smoke() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let definition = reference_scenario_matrix()[2];
-    let environment = detect_reference_environment()?;
+    let path = report_path("cluster-smoke.json");
+    let environment = detect_reference_environment_or_write(&path)?;
     let mut session =
-        CapacityScenarioSession::start(definition, PathBuf::from(environment.storage_root)).await?;
+        CapacityScenarioSession::start(definition, PathBuf::from(&environment.storage_root))
+            .await?;
+    session.stages = CapacityStateMachine::for_rates(wyrd_bench::SMOKE_CAPACITY_RATES.to_vec());
+    let mut attempted_probes = Vec::new();
     let result = async {
         let mut stages = Vec::new();
-        for (slot, rate) in wyrd_bench::SMOKE_CAPACITY_RATES.iter().copied().enumerate() {
-            let plan = CapacityStagePlan {
-                slot: slot as u16,
-                offered_requests_per_second: rate,
-                kind: wyrd_bench::CapacityStageKind::Discovery,
-            };
+        while let Some(plan) = session.next_stage() {
+            begin_probe(
+                &mut attempted_probes,
+                definition.id.to_owned(),
+                plan.offered_requests_per_second,
+            );
             let run = tokio::time::timeout(
                 Duration::from_secs(20),
                 session.run_stage(plan, Duration::from_secs(10)),
             )
             .await
             .map_err(|_| "smoke stage exceeded 20 seconds")??;
-            let passed = run.client.missed_operations == 0
-                && run.client.in_flight_cap_exhaustions == 0
-                && run.published_rows == run.client.tenant_write_rows.iter().sum::<u64>();
-            stages.push(capacity_stage_report(definition, plan, run, passed, 10));
+            let stage = assemble_capacity_stage(definition, plan, run, 10);
+            session.record_stage(plan, stage.passed)?;
+            complete_current_probe(&mut attempted_probes, &stage.stop_reasons);
+            stages.push(stage);
         }
         session.reconcile_cumulative().await?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(stages)
     }
     .await;
     let shutdown = session.shutdown().await;
-    let stages = result?;
+    let stages = match result {
+        Ok(stages) => stages,
+        Err(error) => {
+            let cleanup_error = shutdown.err().map(|cleanup| cleanup.to_string());
+            let combined = cleanup_error.as_ref().map_or_else(
+                || error.to_string(),
+                |cleanup| format!("{error}; cleanup failed: {cleanup}"),
+            );
+            write_partial_capture(&path, &environment, &combined, attempted_probes, Vec::new())?;
+            return Err(error);
+        }
+    };
     shutdown?;
-    let path = report_path("cluster-smoke.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2951,12 +3025,30 @@ pub async fn run_smoke() -> Result<PathBuf, Box<dyn std::error::Error + Send + S
     Ok(path)
 }
 
+/// Detect the reference environment and persist the existing unsupported diagnostic on failure.
+///
+/// # Errors
+/// Returns the original environment error after the diagnostic is written, or the diagnostic
+/// write error when the artifact cannot be persisted.
+fn detect_reference_environment_or_write(
+    report_path: &Path,
+) -> Result<BenchmarkEnvironment, Box<dyn std::error::Error + Send + Sync>> {
+    match detect_reference_environment() {
+        Ok(environment) => Ok(environment),
+        Err(error) => {
+            write_unavailable_capture(report_path, &error.to_string())?;
+            Err(Box::new(error))
+        }
+    }
+}
+
 /// Detect the complete controlled environment from host and wrapper evidence.
 ///
 /// # Errors
 /// Returns `Unsupported` when CPU, memory, toolchain, lock, container, database,
 /// storage, Git, OS, or timestamp identity is absent or unclassifiable.
 pub fn detect_reference_environment() -> Result<BenchmarkEnvironment, ClusterBenchmarkError> {
+    validate_open_file_limit(&command_output("sh", &["-c", "ulimit -n"])?)?;
     let os = std::env::consts::OS.to_owned();
     let (cpu_vendor, cpu_model) = match os.as_str() {
         "linux" => {
@@ -3073,6 +3165,22 @@ pub fn detect_reference_environment() -> Result<BenchmarkEnvironment, ClusterBen
     Ok(environment)
 }
 
+/// Parse and validate the process soft open-file limit before cluster construction.
+///
+/// # Errors
+/// Returns `Unsupported` when the value is unreadable or below the benchmark minimum.
+fn validate_open_file_limit(rendered: &str) -> Result<u64, ClusterBenchmarkError> {
+    let limit = rendered.parse::<u64>().map_err(|error| {
+        ClusterBenchmarkError::Unsupported(format!("cannot parse process open-file limit: {error}"))
+    })?;
+    if limit < MINIMUM_OPEN_FILE_LIMIT {
+        return Err(ClusterBenchmarkError::Unsupported(format!(
+            "process open-file limit {limit} is below benchmark minimum {MINIMUM_OPEN_FILE_LIMIT}"
+        )));
+    }
+    Ok(limit)
+}
+
 /// Resolve a default or caller-selected target report path.
 fn report_path(file_name: &str) -> PathBuf {
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -3176,6 +3284,37 @@ fn lock_source_revision(lock: &str, package: &str) -> Result<String, ClusterBenc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a complete environment identity for diagnostic-assembly unit tests.
+    fn diagnostic_environment_fixture() -> BenchmarkEnvironment {
+        BenchmarkEnvironment {
+            architecture: "aarch64".to_owned(),
+            cpu_vendor: "apple".to_owned(),
+            cpu_model: "Apple M4".to_owned(),
+            logical_cores: 10,
+            host_memory_bytes: 16_000_000_000,
+            container_cpu_millis: 4_000,
+            container_memory_bytes: 4_000_000_000,
+            postgres_image: "postgres:16".to_owned(),
+            postgres_version: "16".to_owned(),
+            postgres_config: "reference".to_owned(),
+            storage_image: "local-filesystem".to_owned(),
+            storage_version: "1".to_owned(),
+            storage_config: "reference".to_owned(),
+            storage_backend_kind: "local-filesystem".to_owned(),
+            storage_root: "target/bifrost-benchmarks/storage".to_owned(),
+            storage_device_class: "apfs".to_owned(),
+            rust_major_minor: "1.90".to_owned(),
+            arrow_version: "1".to_owned(),
+            datafusion_version: "1".to_owned(),
+            iceberg_version: "1".to_owned(),
+            os: "macos".to_owned(),
+            kernel: "test".to_owned(),
+            git_sha: "deadbeef".to_owned(),
+            dirty_worktree: true,
+            captured_at: "2026-08-04T00:00:00Z".to_owned(),
+        }
+    }
 
     /// Proves the public grammar requires one mode and one selector before
     /// any cluster or database lifecycle starts.
@@ -3323,6 +3462,211 @@ mod tests {
             serde_json::to_value(identity).unwrap()["batch_ordinals"][0],
             42
         );
+    }
+
+    /// Proves mixed traffic reads only the converged preload and writes its phase table.
+    #[test]
+    fn mixed_workload_routes_reads_to_visible_preload() {
+        assert_eq!(operation_table("phase-7", false), REFERENCE_TABLE);
+        assert_eq!(operation_table("phase-7", true), "phase-7");
+    }
+
+    /// Proves concurrent visibility follows the greatest accepted write ordinal.
+    #[test]
+    fn flush_visibility_uses_latest_accepted_ordinal() {
+        let ledger = std::sync::Mutex::new(vec![None]);
+        for ordinal in [9, 4, 12] {
+            record_latest_accepted_ordinal(
+                &ledger,
+                &OperationResult::Write {
+                    tenant: 0,
+                    latency_us: 1,
+                    rows: 64,
+                    retries: 0,
+                    ordinal,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(ledger.lock().unwrap()[0], Some(12));
+    }
+
+    /// Proves the runtime open-file parser accepts the minimum and fails closed otherwise.
+    #[test]
+    fn runtime_open_file_limit_fails_closed_before_boot() {
+        assert_eq!(validate_open_file_limit("8192").unwrap(), 8_192);
+        assert!(matches!(
+            validate_open_file_limit("256"),
+            Err(ClusterBenchmarkError::Unsupported(_))
+        ));
+        assert!(matches!(
+            validate_open_file_limit("unlimited"),
+            Err(ClusterBenchmarkError::Unsupported(_))
+        ));
+    }
+
+    /// Proves a failed shell adjustment reaches the existing unsupported artifact shape.
+    #[test]
+    fn failed_limit_raise_reaches_unsupported_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unsupported.json");
+        let error = validate_open_file_limit("256").unwrap_err();
+        write_unavailable_capture(&path, &error.to_string()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["status"], "unsupported");
+        assert_eq!(value["promotable"], false);
+        assert!(value["error"].as_str().unwrap().contains("256"));
+    }
+
+    /// Proves ordinary IO diagnostics retain an incomplete probe without capacity stages.
+    #[test]
+    fn infrastructure_error_retains_incomplete_attempt_without_capacity_classification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial.json");
+        let environment = diagnostic_environment_fixture();
+        let mut probes = Vec::new();
+        begin_probe(&mut probes, "scenario-a".to_owned(), 500);
+        write_partial_capture(
+            &path,
+            &environment,
+            "ordinary IO failure",
+            probes,
+            Vec::new(),
+        )
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["attempted_probes"][0]["completed"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .contains("ordinary IO failure")
+        );
+        assert_eq!(value["scenarios"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            value["attempted_probes"][0]["stop_reasons"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// Build one completed production-shaped stage input for classification tests.
+    fn completed_stage_fixture(backpressure: u64, complete_evidence: bool) -> CapacityStageRun {
+        let metric = |family: &str| crate::bifrost::telemetry::ForgeMetricSample {
+            family: family.to_owned(),
+            labels: BTreeMap::new(),
+            value: 1.0,
+        };
+        let metrics = [
+            "bifrost_gate_requests_total",
+            "bifrost_scribe_rows_total",
+            "bifrost_oracle_stream_rows_total",
+            "postgres_pool_wait_total",
+            "storage_bytes_total",
+            "wal_fsync_total",
+        ]
+        .into_iter()
+        .map(metric)
+        .collect();
+        let spans = complete_evidence
+            .then(|| {
+                [
+                    "scribe_durable_write",
+                    "forge_publish",
+                    "oracle_first_frame",
+                    "oracle_query_total",
+                ]
+                .into_iter()
+                .map(|name| wyrd_telemetry::CapturedSpan {
+                    trace_id: format!("trace-{name}"),
+                    name: name.to_owned(),
+                    attributes: BTreeMap::new(),
+                    duration_nanos: 1_000,
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        CapacityStageRun {
+            client: WindowResult {
+                max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+                write_us: vec![1],
+                flush_us: vec![1],
+                query_ttfb_us: vec![1],
+                query_total_us: vec![1],
+                tenant_write_rows: vec![64],
+                tenant_write_ordinals: vec![BTreeSet::from([0])],
+                tenant_queries: vec![1],
+                decoded_rows: 64,
+                telemetry_decoded_rows: 128,
+                telemetry_completed_queries: 2,
+                submitted: 2,
+                accepted: 2,
+                backpressure,
+                measured_seconds: 10,
+                ..WindowResult::default()
+            },
+            telemetry: crate::bifrost::telemetry::ForgeTelemetryDelta {
+                metrics,
+                gauge_maxima: Vec::new(),
+                gauge_final: Vec::new(),
+                spans,
+                interval_seconds: 10.0,
+            },
+            published_rows: 64,
+            audit_rows: 1,
+        }
+    }
+
+    /// Proves smoke classifies completed production outcomes through the capacity helper.
+    #[tokio::test]
+    async fn smoke_completed_stage_classification_confirms_and_recovers() {
+        let definition = reference_scenario_matrix()[0];
+        let mut machine = CapacityStateMachine::for_rates(vec![100, 200]);
+        let healthy = machine.next_plan().unwrap();
+        let healthy_stage =
+            assemble_capacity_stage(definition, healthy, completed_stage_fixture(0, true), 10);
+        assert!(healthy_stage.passed);
+        machine.record(healthy, healthy_stage.passed).unwrap();
+
+        let failed = machine.next_plan().unwrap();
+        let backpressured =
+            assemble_capacity_stage(definition, failed, completed_stage_fixture(1, true), 10);
+        assert!(!backpressured.passed);
+        assert!(
+            backpressured
+                .stop_reasons
+                .contains(&CapacityLimit::Backpressure)
+        );
+        machine.record(failed, backpressured.passed).unwrap();
+
+        let confirmation = machine.next_plan().unwrap();
+        assert_eq!(
+            confirmation.kind,
+            wyrd_bench::CapacityStageKind::Confirmation
+        );
+        let incomplete_evidence = assemble_capacity_stage(
+            definition,
+            confirmation,
+            completed_stage_fixture(0, false),
+            10,
+        );
+        assert!(!incomplete_evidence.passed);
+        assert!(
+            incomplete_evidence
+                .stop_reasons
+                .contains(&CapacityLimit::DependencySlo)
+        );
+        machine
+            .record(confirmation, incomplete_evidence.passed)
+            .unwrap();
+
+        let recovery = machine.next_plan().unwrap();
+        assert_eq!(recovery.kind, wyrd_bench::CapacityStageKind::Recovery);
+        assert_eq!(recovery.offered_requests_per_second, 100);
     }
 
     /// Proves both logical topologies are truthfully attributed to the single harness process.

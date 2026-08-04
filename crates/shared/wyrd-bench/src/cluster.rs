@@ -142,6 +142,12 @@ impl CapacityStateMachine {
     pub fn canonical() -> Self {
         let mut rates = CANONICAL_CAPACITY_RATES.to_vec();
         rates.extend(OPTIONAL_CAPACITY_RATES);
+        Self::for_rates(rates)
+    }
+
+    /// Create a bounded diagnostic curve over caller-selected absolute rates.
+    #[must_use]
+    pub fn for_rates(rates: Vec<u64>) -> Self {
         Self {
             rates,
             next_rate: 0,

@@ -157,19 +157,28 @@ run = "cargo test --locked -p wyrd-testing --test integration -- single_tenant_s
 
 [tasks."bench:bifrost:capacity"]
 description = "Run the bounded absolute-rate Bifrost capacity characterization"
-env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-capacity.json" }
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:capacity:inner'"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-capacity.json", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run bench:bifrost:capacity:inner'"
 [tasks."bench:bifrost:capacity:inner"]
 hide = true
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster -- --mode capacity --matrix"
 
 [tasks."bench:bifrost:qualify"]
 description = "Run controlled three-trial Bifrost SLO qualification"
-env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-candidate.json" }
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:qualify:inner'"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-candidate.json", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run bench:bifrost:qualify:inner'"
 [tasks."bench:bifrost:qualify:inner"]
 hide = true
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster -- --mode qualification --matrix"
+
+[tasks."bench:bifrost:smoke"]
+hide = true
+description = "Run the shortened real-cluster Bifrost diagnostic smoke"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-smoke.json", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run bench:bifrost:smoke:inner'"
+[tasks."bench:bifrost:smoke:inner"]
+hide = true
+run = "cargo test --locked -p wyrd-testing --features bench --lib shortened_capacity_smoke_is_reachable -- --ignored --test-threads=1"
 
 [tasks."bench:bifrost:compare"]
 description = "Compare compatible Bifrost v2 reports at identical absolute rates"

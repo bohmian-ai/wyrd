@@ -605,6 +605,7 @@ fn assemble_capacity_stage(
     measured_seconds: u64,
 ) -> CapacityStage {
     let passed = result.client.missed_operations == 0
+        && result.client.missed_flushes == 0
         && result.client.in_flight_cap_exhaustions == 0
         && result.client.backpressure == 0
         && result.published_rows == result.client.tenant_write_rows.iter().sum::<u64>()
@@ -1965,6 +1966,14 @@ struct CapacityStageRun {
 }
 
 impl WindowResult {
+    /// Merge one measured flush cadence result into the existing client ledger.
+    fn merge_flush_result(&mut self, flush_result: (Vec<u64>, u64, u64, u64)) {
+        self.flush_us = flush_result.0;
+        self.missed_flushes = flush_result.1;
+        self.telemetry_decoded_rows = self.telemetry_decoded_rows.saturating_add(flush_result.2);
+        self.backpressure = self.backpressure.saturating_add(flush_result.3);
+    }
+
     /// Convert the complete measured ledger into report distributions and rates.
     fn metrics(&self) -> ClientTrialMetrics {
         ClientTrialMetrics {
@@ -2074,10 +2083,7 @@ impl WindowRun<'_> {
         let flushes = self.flushes(start, accepted_ordinals);
         let (mut result, flush_result) = tokio::try_join!(operations, flushes)?;
         result.measured_seconds = self.duration.as_secs();
-        result.flush_us = flush_result.0;
-        result.missed_flushes = flush_result.1;
-        result.telemetry_decoded_rows =
-            result.telemetry_decoded_rows.saturating_add(flush_result.2);
+        result.merge_flush_result(flush_result);
         result.telemetry_completed_queries = result
             .telemetry_completed_queries
             .saturating_add(result.flush_us.len() as u64);
@@ -2368,18 +2374,19 @@ impl WindowRun<'_> {
     /// Run the measured two-second flush cadence or return an empty warmup result.
     ///
     /// # Errors
-    /// Returns the first flush, strict-query, schema, or terminal-outcome error.
+    /// Returns the first flush, non-admission query, schema, or terminal-outcome error.
     async fn flushes(
         &self,
         start: tokio::time::Instant,
         accepted_ordinals: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
-    ) -> Result<(Vec<u64>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Vec<u64>, u64, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         if !self.measured {
-            return Ok((Vec::new(), 0, 0));
+            return Ok((Vec::new(), 0, 0, 0));
         }
         let mut samples = Vec::with_capacity(10);
         let mut missed = 0_u64;
         let mut decoded_rows = 0_u64;
+        let mut query_admissions = 0_u64;
         for flush_index in 0..(self.duration.as_secs() / 2) {
             let planned = start + Duration::from_secs((flush_index + 1) * 2);
             tokio::time::sleep_until(planned).await;
@@ -2409,7 +2416,16 @@ impl WindowRun<'_> {
                 freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(5_000),
             };
-            let mut stream = ancillary_query(&self.clients[tenant_index].query, &request).await?;
+            let mut stream = match self.clients[tenant_index].query.query(&request).await {
+                Ok(stream) => stream,
+                Err(error)
+                    if is_backpressure(&error.to_string()) || is_retryable(&error.to_string()) =>
+                {
+                    query_admissions = query_admissions.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let mut identities = BTreeSet::new();
             while let Some(batch) = stream.next_batch().await? {
                 collect_query_identities(
@@ -2428,7 +2444,7 @@ impl WindowRun<'_> {
             }
             samples.push(elapsed_us(planned));
         }
-        Ok((samples, missed, decoded_rows))
+        Ok((samples, missed, decoded_rows, query_admissions))
     }
 }
 
@@ -3633,8 +3649,10 @@ mod tests {
         machine.record(healthy, healthy_stage.passed).unwrap();
 
         let failed = machine.next_plan().unwrap();
-        let backpressured =
-            assemble_capacity_stage(definition, failed, completed_stage_fixture(1, true), 10);
+        let mut admission = completed_stage_fixture(0, true);
+        admission.client.merge_flush_result((Vec::new(), 0, 0, 1));
+        assert_eq!(admission.client.backpressure, 1);
+        let backpressured = assemble_capacity_stage(definition, failed, admission, 10);
         assert!(!backpressured.passed);
         assert!(
             backpressured
@@ -3667,6 +3685,20 @@ mod tests {
         let recovery = machine.next_plan().unwrap();
         assert_eq!(recovery.kind, wyrd_bench::CapacityStageKind::Recovery);
         assert_eq!(recovery.offered_requests_per_second, 100);
+
+        let mut missed_flush = completed_stage_fixture(0, true);
+        missed_flush.client.missed_flushes = 1;
+        let missed_flush_stage = assemble_capacity_stage(
+            definition,
+            CapacityStagePlan {
+                slot: 0,
+                offered_requests_per_second: 100,
+                kind: wyrd_bench::CapacityStageKind::Discovery,
+            },
+            missed_flush,
+            10,
+        );
+        assert!(!missed_flush_stage.passed);
     }
 
     /// Proves both logical topologies are truthfully attributed to the single harness process.

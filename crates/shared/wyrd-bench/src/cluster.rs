@@ -335,12 +335,27 @@ impl ReviewedScenarioProfile {
                 "reviewed qualification rates must be strictly increasing and complete".to_owned(),
             ));
         }
+        if self.workload.scenario_id != self.scenario_id {
+            return Err(ClusterBenchmarkError::Invalid(
+                "reviewed workload identity does not match its scenario".to_owned(),
+            ));
+        }
         for (rate, report) in self.offered_rates.iter().zip(&self.reports) {
             if *rate != report.scenario.offered_requests_per_second
                 || report.scenario.scenario_id != self.scenario_id
             {
                 return Err(ClusterBenchmarkError::Incompatible(
                     "candidate must replay every reviewed absolute rate exactly".to_owned(),
+                ));
+            }
+            if report.scenario.topology != self.workload.topology
+                || report.scenario.tenants != self.workload.tenants
+                || report.scenario.traffic != self.workload.traffic
+                || report.scenario.rows_per_batch != self.workload.rows_per_batch
+                || report.scenario.query_row_limit != self.workload.query_row_limit
+            {
+                return Err(ClusterBenchmarkError::Invalid(
+                    "reviewed workload identity does not match its reports".to_owned(),
                 ));
             }
         }
@@ -943,47 +958,25 @@ pub struct BifrostReferenceProfile {
     pub schema_version: String,
     /// Closed environment identity.
     pub environment: BenchmarkEnvironment,
-    /// Eighteen scenario/load results: six scenarios times three rates.
-    pub scenarios: Vec<ClusterScenarioReport>,
+    /// Six reviewed scenarios, each containing its exact absolute-rate reports.
+    pub scenarios: Vec<ReviewedScenarioProfile>,
     /// Absolute reference SLOs.
     pub slos: BifrostSloEnvelope,
 }
 
 impl BifrostReferenceProfile {
-    /// Project flat scenario reports into the reviewed-rate contract used by
-    /// controlled qualification and comparison tooling.
+    /// Return the reviewed scenario groups stored in this profile.
     #[must_use]
-    pub fn reviewed_scenarios(&self) -> Vec<ReviewedScenarioProfile> {
-        let mut grouped = BTreeMap::<String, Vec<ClusterScenarioReport>>::new();
-        for report in &self.scenarios {
-            grouped
-                .entry(report.scenario.scenario_id.clone())
-                .or_default()
-                .push(report.clone());
-        }
-        grouped
-            .into_iter()
-            .filter_map(|(scenario_id, mut reports)| {
-                reports.sort_by_key(|report| report.scenario.offered_requests_per_second);
-                let first = reports.first()?;
-                Some(ReviewedScenarioProfile {
-                    scenario_id: scenario_id.clone(),
-                    workload: ClusterWorkloadIdentity {
-                        scenario_id,
-                        topology: first.scenario.topology,
-                        tenants: first.scenario.tenants,
-                        traffic: first.scenario.traffic,
-                        rows_per_batch: first.scenario.rows_per_batch,
-                        query_row_limit: first.scenario.query_row_limit,
-                    },
-                    offered_rates: reports
-                        .iter()
-                        .map(|report| report.scenario.offered_requests_per_second)
-                        .collect(),
-                    reports,
-                })
-            })
-            .collect()
+    pub fn reviewed_scenarios(&self) -> &[ReviewedScenarioProfile] {
+        &self.scenarios
+    }
+
+    /// Iterate over every nested rate report without changing the persisted
+    /// reviewed-scenario shape.
+    pub fn reports(&self) -> impl Iterator<Item = &ClusterScenarioReport> {
+        self.scenarios
+            .iter()
+            .flat_map(|scenario| scenario.reports.iter())
     }
 
     /// Validate one selected qualification scenario without requiring the
@@ -1008,14 +1001,19 @@ impl BifrostReferenceProfile {
         let selected = self
             .scenarios
             .iter()
-            .filter(|report| report.scenario.scenario_id == scenario_id)
-            .collect::<Vec<_>>();
-        if selected.is_empty() {
+            .find(|scenario| scenario.scenario_id == scenario_id)
+            .ok_or_else(|| {
+                ClusterBenchmarkError::Invalid(format!(
+                    "selected scenario `{scenario_id}` has no reports"
+                ))
+            })?;
+        selected.validate()?;
+        if selected.reports.is_empty() {
             return Err(ClusterBenchmarkError::Invalid(format!(
                 "selected scenario `{scenario_id}` has no reports"
             )));
         }
-        for report in selected {
+        for report in &selected.reports {
             report.validate()?;
             validate_fixed_scenario(report)?;
         }
@@ -1048,7 +1046,7 @@ impl BifrostReferenceProfile {
                 "dirty worktree captures cannot be blessed as a reference".to_owned(),
             ));
         }
-        if self.scenarios.len() != 18 {
+        if self.scenarios.len() != 6 {
             return Err(ClusterBenchmarkError::Unsupported(
                 "reference requires six scenarios at three absolute rates".to_owned(),
             ));
@@ -1058,44 +1056,55 @@ impl BifrostReferenceProfile {
     }
 }
 
-/// Validate every flat scenario report and its six-scenario matrix identity.
+/// Validate every reviewed scenario and its six-scenario matrix identity.
 fn validate_report_matrix(profile: &BifrostReferenceProfile) -> Result<(), ClusterBenchmarkError> {
     let mut identities = BTreeSet::new();
-    for report in &profile.scenarios {
-        report.validate()?;
-        validate_fixed_scenario(report)?;
-        let key = (
-            report.scenario.scenario_id.as_str(),
-            report.scenario.offered_requests_per_second,
-        );
-        if !identities.insert(key) {
+    let mut scenario_ids = BTreeSet::new();
+    for reviewed in &profile.scenarios {
+        if !scenario_ids.insert(reviewed.scenario_id.as_str()) {
             return Err(ClusterBenchmarkError::Invalid(format!(
-                "duplicate scenario/rate identity {}:{}",
-                key.0, key.1
+                "duplicate reviewed scenario identity {}",
+                reviewed.scenario_id
             )));
         }
-        let median = &report.median;
-        if median.durable_write_p99_us > profile.slos.durable_write_p99_us {
-            return Err(ClusterBenchmarkError::NotReady(
-                "durable-write p99 exceeds the absolute reference SLO".to_owned(),
-            ));
-        }
-        if median.flush_to_visible_p99_us > profile.slos.flush_to_visible_p99_us {
-            return Err(ClusterBenchmarkError::NotReady(
-                "flush-to-visible p99 exceeds the absolute reference SLO".to_owned(),
-            ));
-        }
-        if median.query_ttfb_p99_us > profile.slos.query_ttfb_p99_us {
-            return Err(ClusterBenchmarkError::NotReady(
-                "query TTFB p99 exceeds the absolute reference SLO".to_owned(),
-            ));
+        reviewed.validate()?;
+        for report in &reviewed.reports {
+            report.validate()?;
+            validate_fixed_scenario(report)?;
+            let key = (
+                report.scenario.scenario_id.as_str(),
+                report.scenario.offered_requests_per_second,
+            );
+            if !identities.insert(key) {
+                return Err(ClusterBenchmarkError::Invalid(format!(
+                    "duplicate scenario/rate identity {}:{}",
+                    key.0, key.1
+                )));
+            }
+            let median = &report.median;
+            if median.durable_write_p99_us > profile.slos.durable_write_p99_us {
+                return Err(ClusterBenchmarkError::NotReady(
+                    "durable-write p99 exceeds the absolute reference SLO".to_owned(),
+                ));
+            }
+            if median.flush_to_visible_p99_us > profile.slos.flush_to_visible_p99_us {
+                return Err(ClusterBenchmarkError::NotReady(
+                    "flush-to-visible p99 exceeds the absolute reference SLO".to_owned(),
+                ));
+            }
+            if median.query_ttfb_p99_us > profile.slos.query_ttfb_p99_us {
+                return Err(ClusterBenchmarkError::NotReady(
+                    "query TTFB p99 exceeds the absolute reference SLO".to_owned(),
+                ));
+            }
         }
     }
     for (id, topology, tenants, traffic) in fixed_scenarios() {
         let reports = profile
             .scenarios
             .iter()
-            .filter(|report| report.scenario.scenario_id == id)
+            .filter(|reviewed| reviewed.scenario_id == id)
+            .flat_map(|reviewed| reviewed.reports.iter())
             .collect::<Vec<_>>();
         if reports.len() != 3
             || reports.iter().any(|report| {
@@ -1137,9 +1146,6 @@ fn validate_report_matrix(profile: &BifrostReferenceProfile) -> Result<(), Clust
                 "scenario `{id}` must contain three distinct absolute offered rates"
             )));
         }
-    }
-    for reviewed in profile.reviewed_scenarios() {
-        reviewed.validate()?;
     }
     Ok(())
 }
@@ -1544,8 +1550,7 @@ fn compare_scenario_metrics(
 /// Build the exact scenario/rate compatibility key map.
 fn scenario_map(profile: &BifrostReferenceProfile) -> BTreeMap<String, &ClusterScenarioReport> {
     profile
-        .scenarios
-        .iter()
+        .reports()
         .map(|report| {
             let scenario = &report.scenario;
             (
@@ -1646,7 +1651,7 @@ fn evaluate_scaling(
     profile: &BifrostReferenceProfile,
     comparison: &mut BifrostBenchmarkComparison,
 ) {
-    let balanced = profile.scenarios.iter().filter(|report| {
+    let balanced = profile.reports().filter(|report| {
         report.scenario.traffic == TrafficMix::Balanced
             && report.scenario.tenants == 8
             && report.scenario.offered_load_percent == 100
@@ -1800,6 +1805,36 @@ mod tests {
                 ));
             }
         }
+        let mut grouped = BTreeMap::<String, Vec<ClusterScenarioReport>>::new();
+        for scenario in scenarios {
+            grouped
+                .entry(scenario.scenario.scenario_id.clone())
+                .or_default()
+                .push(scenario);
+        }
+        let scenarios = grouped
+            .into_iter()
+            .map(|(scenario_id, mut reports)| {
+                reports.sort_by_key(|report| report.scenario.offered_requests_per_second);
+                let first = &reports[0];
+                ReviewedScenarioProfile {
+                    scenario_id: scenario_id.clone(),
+                    workload: ClusterWorkloadIdentity {
+                        scenario_id,
+                        topology: first.scenario.topology,
+                        tenants: first.scenario.tenants,
+                        traffic: first.scenario.traffic,
+                        rows_per_batch: first.scenario.rows_per_batch,
+                        query_row_limit: first.scenario.query_row_limit,
+                    },
+                    offered_rates: reports
+                        .iter()
+                        .map(|report| report.scenario.offered_requests_per_second)
+                        .collect(),
+                    reports,
+                }
+            })
+            .collect();
         BifrostReferenceProfile {
             schema_version: CLUSTER_REPORT_VERSION.to_owned(),
             environment: fixture_environment(),
@@ -1969,11 +2004,13 @@ mod tests {
         knee: u64,
         provenance: KneeProvenance,
     ) {
-        for report in &mut profile.scenarios {
-            if report.scenario.scenario_id == scenario_id {
-                report.discovered_knee_requests_per_second = knee;
-                report.discovered_knee_provenance = provenance;
-                report.scenario.knee_provenance = provenance;
+        for reviewed in &mut profile.scenarios {
+            for report in &mut reviewed.reports {
+                if report.scenario.scenario_id == scenario_id {
+                    report.discovered_knee_requests_per_second = knee;
+                    report.discovered_knee_provenance = provenance;
+                    report.scenario.knee_provenance = provenance;
+                }
             }
         }
     }
@@ -2009,6 +2046,8 @@ mod tests {
             Err(ClusterBenchmarkError::Incompatible(_))
         ));
         let mut json = serde_json::to_value(profile()).unwrap();
+        assert!(json["scenarios"][0].get("reports").is_some());
+        assert!(json["scenarios"][0].get("scenario").is_none());
         json.as_object_mut()
             .unwrap()
             .insert("unknown".to_owned(), serde_json::Value::Bool(true));
@@ -2044,7 +2083,10 @@ mod tests {
     #[test]
     fn insufficient_samples_are_unsupported() {
         let mut report = profile();
-        report.scenarios[0].trials[0].client.durable_write.samples = 199;
+        report.scenarios[0].reports[0].trials[0]
+            .client
+            .durable_write
+            .samples = 199;
         assert!(matches!(
             report.validate_reference(),
             Err(ClusterBenchmarkError::Unsupported(_))
@@ -2055,7 +2097,9 @@ mod tests {
     #[test]
     fn first_probe_failure_cannot_become_reference() {
         let mut report = profile();
-        report.scenarios[0].trials[0].production.correctness = EvidenceStatus::Failed;
+        report.scenarios[0].reports[0].trials[0]
+            .production
+            .correctness = EvidenceStatus::Failed;
         assert!(matches!(
             report.validate_reference(),
             Err(ClusterBenchmarkError::NotReady(_))
@@ -2068,7 +2112,9 @@ mod tests {
     fn candidate_must_replay_exact_reference_rate() {
         let before = profile();
         let mut after = profile();
-        after.scenarios[0].scenario.offered_requests_per_second += 1;
+        after.scenarios[0].reports[0]
+            .scenario
+            .offered_requests_per_second += 1;
         let comparison = compare_cluster_profiles(&before, &after);
         assert_eq!(comparison.compatibility, ProfileCompatibility::Incompatible);
         assert!(!comparison.ready);
@@ -2085,14 +2131,16 @@ mod tests {
         ));
 
         let mut mismatched = profile();
-        mismatched.scenarios[0].scenario.traffic = TrafficMix::ReadHeavy;
+        mismatched.scenarios[0].reports[0].scenario.traffic = TrafficMix::ReadHeavy;
         assert!(matches!(
             mismatched.validate_reference(),
             Err(ClusterBenchmarkError::Invalid(_))
         ));
 
         let mut forged_median = profile();
-        forged_median.scenarios[0].median.queries_per_second += 1.0;
+        forged_median.scenarios[0].reports[0]
+            .median
+            .queries_per_second += 1.0;
         assert!(matches!(
             forged_median.validate_reference(),
             Err(ClusterBenchmarkError::Invalid(_))
@@ -2104,7 +2152,7 @@ mod tests {
     fn workload_shape_drift_is_incompatible() {
         let before = profile();
         let mut after = profile();
-        after.scenarios[0].scenario.seed += 1;
+        after.scenarios[0].reports[0].scenario.seed += 1;
         let comparison = compare_cluster_profiles(&before, &after);
         assert_eq!(comparison.compatibility, ProfileCompatibility::Incompatible);
         assert!(!comparison.ready);
@@ -2142,24 +2190,28 @@ mod tests {
     fn regression_threshold_boundaries_are_inclusive() {
         let before = profile();
         let mut boundary = profile();
-        for report in &mut boundary.scenarios {
-            report.median.durable_rows_per_second = 900.0;
-            report.median.queries_per_second = 90.0;
-            report.median.durable_write_p95_us = 23_000;
-            report.median.durable_write_p99_us = 34_500;
-            report.median.query_ttfb_p95_us = 23_000;
-            report.median.query_ttfb_p99_us = 34_500;
-            report.median.total_query_p95_us = 23_000;
-            report.median.total_query_p99_us = 34_500;
-            report.median.retry_ratio = 0.03;
-            report.median.backpressure_ratio = 0.03;
-            report.median.write_fairness = 0.95;
-            report.median.read_fairness = 0.95;
-            synchronize_fixture_trials(report);
+        for reviewed in &mut boundary.scenarios {
+            for report in &mut reviewed.reports {
+                report.median.durable_rows_per_second = 900.0;
+                report.median.queries_per_second = 90.0;
+                report.median.durable_write_p95_us = 23_000;
+                report.median.durable_write_p99_us = 34_500;
+                report.median.query_ttfb_p95_us = 23_000;
+                report.median.query_ttfb_p99_us = 34_500;
+                report.median.total_query_p95_us = 23_000;
+                report.median.total_query_p99_us = 34_500;
+                report.median.retry_ratio = 0.03;
+                report.median.backpressure_ratio = 0.03;
+                report.median.write_fairness = 0.95;
+                report.median.read_fairness = 0.95;
+                synchronize_fixture_trials(report);
+            }
         }
         assert!(compare_cluster_profiles(&before, &boundary).ready);
-        boundary.scenarios[0].median.durable_rows_per_second = 899.9;
-        synchronize_fixture_trials(&mut boundary.scenarios[0]);
+        boundary.scenarios[0].reports[0]
+            .median
+            .durable_rows_per_second = 899.9;
+        synchronize_fixture_trials(&mut boundary.scenarios[0].reports[0]);
         assert!(!compare_cluster_profiles(&before, &boundary).ready);
     }
 

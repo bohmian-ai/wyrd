@@ -1,6 +1,6 @@
 //! Controlled full-cluster benchmark adapter and versioned v2 diagnostics.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -18,9 +18,9 @@ use wyrd_bench::{
     BenchmarkEnvironment, BifrostReferenceProfile, BifrostSloEnvelope, CALIBRATION_RATE_CAP,
     CLUSTER_REPORT_VERSION, CLUSTER_WORKLOAD_VERSION, ClientTrialMetrics, ClusterBenchmarkError,
     ClusterBenchmarkScenario, ClusterBenchmarkTrial, ClusterScenarioReport, ClusterTopology,
-    EvidenceStatus, FIRST_PROBE_RATE, KneeProvenance, ProductionTelemetryEvidence, TrafficMix,
-    TrialDistribution, derive_trial_median, extract_linux_cpu_identity, extract_macos_cpu_identity,
-    jain_fairness,
+    ClusterWorkloadIdentity, EvidenceStatus, FIRST_PROBE_RATE, KneeProvenance,
+    ProductionTelemetryEvidence, ReviewedScenarioProfile, TrafficMix, TrialDistribution,
+    derive_trial_median, extract_linux_cpu_identity, extract_macos_cpu_identity, jain_fairness,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -346,7 +346,7 @@ async fn run_reference_selected(
     let profile = BifrostReferenceProfile {
         schema_version: CLUSTER_REPORT_VERSION.to_owned(),
         environment,
-        scenarios: reports,
+        scenarios: reviewed_scenario_profiles(reports),
         slos: BifrostSloEnvelope::default(),
     };
     let path = report_path(if capacity {
@@ -372,6 +372,44 @@ async fn run_reference_selected(
         }
     }
     Ok(path)
+}
+
+/// Group flat trial reports into the persisted reviewed-scenario contract.
+///
+/// Reports are sorted by absolute offered rate inside each fixed scenario so
+/// qualification replay and comparison consume one deterministic shape.
+#[must_use]
+fn reviewed_scenario_profiles(reports: Vec<ClusterScenarioReport>) -> Vec<ReviewedScenarioProfile> {
+    let mut grouped = BTreeMap::<String, Vec<ClusterScenarioReport>>::new();
+    for report in reports {
+        grouped
+            .entry(report.scenario.scenario_id.clone())
+            .or_default()
+            .push(report);
+    }
+    grouped
+        .into_iter()
+        .filter_map(|(scenario_id, mut reports)| {
+            reports.sort_by_key(|report| report.scenario.offered_requests_per_second);
+            let first = reports.first()?;
+            Some(ReviewedScenarioProfile {
+                scenario_id: scenario_id.clone(),
+                workload: ClusterWorkloadIdentity {
+                    scenario_id,
+                    topology: first.scenario.topology,
+                    tenants: first.scenario.tenants,
+                    traffic: first.scenario.traffic,
+                    rows_per_batch: first.scenario.rows_per_batch,
+                    query_row_limit: first.scenario.query_row_limit,
+                },
+                offered_rates: reports
+                    .iter()
+                    .map(|report| report.scenario.offered_requests_per_second)
+                    .collect(),
+                reports,
+            })
+        })
+        .collect()
 }
 
 /// Persist a machine-readable non-promotable qualification result beside a capture.
@@ -471,11 +509,13 @@ fn qualification_diagnostic(
     let deficiencies = profile
         .scenarios
         .iter()
-        .flat_map(|report| {
-            report
-                .trials
-                .iter()
-                .filter_map(|trial| trial_deficiency(report, trial))
+        .flat_map(|reviewed| {
+            reviewed.reports.iter().flat_map(|report| {
+                report
+                    .trials
+                    .iter()
+                    .filter_map(|trial| trial_deficiency(report, trial))
+            })
         })
         .collect::<Vec<_>>();
     serde_json::json!({
@@ -735,16 +775,17 @@ async fn run_live_trial(
     provision_reference_tables(cluster, &tenants).await?;
     let clients = reference_clients(cluster, &tenants).await?;
     preload_reference_rows(cluster, &tenants, &clients).await?;
-    let warmup = run_window(
+    let warmup = WindowRun {
         cluster,
-        &tenants,
-        &clients,
+        tenants: &tenants,
+        clients: &clients,
         definition,
-        spec.rate,
-        spec.warmup,
-        false,
-        spec.max_in_flight,
-    )
+        rate: spec.rate,
+        duration: spec.warmup,
+        measured: false,
+        max_in_flight: spec.max_in_flight,
+    }
+    .run()
     .await?;
     flush_tenant_writers(cluster, &tenants).await?;
     await_forge_convergence(cluster, &tenants).await?;
@@ -761,16 +802,17 @@ async fn run_live_trial(
     prove_wrong_tenant_query(cluster, &tenants, &clients).await?;
     let checkpoint = cluster.telemetry().checkpoint()?;
     let audit_before = audit_rows(cluster, &tenants).await?;
-    let measured = run_window(
+    let measured = WindowRun {
         cluster,
-        &tenants,
-        &clients,
+        tenants: &tenants,
+        clients: &clients,
         definition,
-        spec.rate,
-        spec.measured,
-        true,
-        spec.max_in_flight,
-    )
+        rate: spec.rate,
+        duration: spec.measured,
+        measured: true,
+        max_in_flight: spec.max_in_flight,
+    }
+    .run()
     .await?;
     flush_tenant_writers(cluster, &tenants).await?;
     await_forge_convergence(cluster, &tenants).await?;
@@ -922,93 +964,99 @@ enum OperationResult {
     Retry,
 }
 
-/// Drive one warmup or measured open-loop window and optional fixed flushes.
-async fn run_window(
-    cluster: &WyrdTestCluster,
-    tenants: &[DataTenantId],
-    clients: &[ReferenceClient],
+/// Own one warmup or measured open-loop window and its fixed flush cadence.
+struct WindowRun<'a> {
+    /// Live cluster used for flush and visibility operations.
+    cluster: &'a WyrdTestCluster,
+    /// Tenant identities distributed round-robin across operations.
+    tenants: &'a [DataTenantId],
+    /// Tenant-bound public SDK handles.
+    clients: &'a [ReferenceClient],
+    /// Fixed scenario traffic mix.
     definition: ReferenceScenarioDefinition,
+    /// Absolute offered operation rate.
     rate: u64,
+    /// Window duration.
     duration: Duration,
+    /// Whether measured-only counters and flushes are enabled.
     measured: bool,
+    /// Bounded public operation concurrency.
     max_in_flight: usize,
-) -> Result<WindowResult, Box<dyn std::error::Error + Send + Sync>> {
-    if rate == 0 {
-        return Err("open-loop offered rate must be positive".into());
-    }
-    let start = tokio::time::Instant::now();
-    let operations = operation_window(
-        start,
-        tenants,
-        clients,
-        definition,
-        rate,
-        duration,
-        measured,
-        max_in_flight,
-    );
-    let flushes = flush_window(start, cluster, tenants, clients, duration, measured);
-    let (mut result, flush_result) = tokio::try_join!(operations, flushes)?;
-    result.measured_seconds = duration.as_secs();
-    result.flush_us = flush_result.0;
-    result.missed_flushes = flush_result.1;
-    result.telemetry_decoded_rows = result.telemetry_decoded_rows.saturating_add(flush_result.2);
-    result.telemetry_completed_queries = result
-        .telemetry_completed_queries
-        .saturating_add(result.flush_us.len() as u64);
-    Ok(result)
 }
 
-/// Schedule public writes/queries from immutable planned instants with bounded work.
-async fn operation_window(
-    start: tokio::time::Instant,
-    tenants: &[DataTenantId],
-    clients: &[ReferenceClient],
-    definition: ReferenceScenarioDefinition,
-    rate: u64,
-    duration: Duration,
-    measured: bool,
-    max_in_flight: usize,
-) -> Result<WindowResult, Box<dyn std::error::Error + Send + Sync>> {
-    let interval = Duration::from_secs_f64(1.0 / rate as f64);
-    let operation_count = rate.saturating_mul(duration.as_secs());
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut result = WindowResult {
-        tenant_write_rows: vec![0; tenants.len()],
-        tenant_queries: vec![0; tenants.len()],
-        ..WindowResult::default()
-    };
-    for ordinal in 0..operation_count {
-        while let Some(joined) = tasks.try_join_next() {
+impl WindowRun<'_> {
+    /// Drive scheduled operations and optional fixed flushes from one start instant.
+    ///
+    /// # Errors
+    /// Returns the first public SDK, strict-query, flush, or task-join error.
+    async fn run(&self) -> Result<WindowResult, Box<dyn std::error::Error + Send + Sync>> {
+        if self.rate == 0 {
+            return Err("open-loop offered rate must be positive".into());
+        }
+        let start = tokio::time::Instant::now();
+        let operations = self.operations(start);
+        let flushes = self.flushes(start);
+        let (mut result, flush_result) = tokio::try_join!(operations, flushes)?;
+        result.measured_seconds = self.duration.as_secs();
+        result.flush_us = flush_result.0;
+        result.missed_flushes = flush_result.1;
+        result.telemetry_decoded_rows =
+            result.telemetry_decoded_rows.saturating_add(flush_result.2);
+        result.telemetry_completed_queries = result
+            .telemetry_completed_queries
+            .saturating_add(result.flush_us.len() as u64);
+        Ok(result)
+    }
+
+    /// Schedule public writes and strict queries at immutable planned instants.
+    ///
+    /// # Errors
+    /// Returns a public SDK or task-join error from one scheduled operation.
+    async fn operations(
+        &self,
+        start: tokio::time::Instant,
+    ) -> Result<WindowResult, Box<dyn std::error::Error + Send + Sync>> {
+        let interval = Duration::from_secs_f64(1.0 / self.rate as f64);
+        let operation_count = self.rate.saturating_mul(self.duration.as_secs());
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut result = WindowResult {
+            tenant_write_rows: vec![0; self.tenants.len()],
+            tenant_queries: vec![0; self.tenants.len()],
+            ..WindowResult::default()
+        };
+        for ordinal in 0..operation_count {
+            while let Some(joined) = tasks.try_join_next() {
+                apply_operation(&mut result, joined??);
+            }
+            let planned = start + interval.mul_f64(ordinal as f64);
+            tokio::time::sleep_until(planned).await;
+            result.submitted = result.submitted.saturating_add(1);
+            if tokio::time::Instant::now() > planned + interval {
+                result.missed_operations = result.missed_operations.saturating_add(1);
+                continue;
+            }
+            if tasks.len() >= self.max_in_flight {
+                result.in_flight_cap_exhaustions =
+                    result.in_flight_cap_exhaustions.saturating_add(1);
+                continue;
+            }
+            let tenant_index = ordinal as usize % self.tenants.len();
+            let client = self.clients[tenant_index].clone();
+            let write = is_write_operation(ordinal, self.definition.write_percent);
+            let phase_ordinal = ordinal + if self.measured { 2_000_000 } else { 1_000_000 };
+            tasks.spawn(async move {
+                if write {
+                    scheduled_write(client, tenant_index, phase_ordinal, planned).await
+                } else {
+                    scheduled_query(client, tenant_index, ordinal, planned).await
+                }
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
             apply_operation(&mut result, joined??);
         }
-        let planned = start + interval.mul_f64(ordinal as f64);
-        tokio::time::sleep_until(planned).await;
-        result.submitted = result.submitted.saturating_add(1);
-        if tokio::time::Instant::now() > planned + interval {
-            result.missed_operations = result.missed_operations.saturating_add(1);
-            continue;
-        }
-        if tasks.len() >= max_in_flight {
-            result.in_flight_cap_exhaustions = result.in_flight_cap_exhaustions.saturating_add(1);
-            continue;
-        }
-        let tenant_index = ordinal as usize % tenants.len();
-        let client = clients[tenant_index].clone();
-        let write = is_write_operation(ordinal, definition.write_percent);
-        let phase_ordinal = ordinal + if measured { 2_000_000 } else { 1_000_000 };
-        tasks.spawn(async move {
-            if write {
-                scheduled_write(client, tenant_index, phase_ordinal, planned).await
-            } else {
-                scheduled_query(client, tenant_index, ordinal, planned).await
-            }
-        });
+        Ok(result)
     }
-    while let Some(joined) = tasks.join_next().await {
-        apply_operation(&mut result, joined??);
-    }
-    Ok(result)
 }
 
 /// Execute one planned durable write and preserve stable pressure classification.
@@ -1195,59 +1243,61 @@ fn apply_operation(result: &mut WindowResult, operation: OperationResult) {
 }
 
 /// Execute ten immutable flush instants and strict visibility confirmations.
-async fn flush_window(
-    start: tokio::time::Instant,
-    cluster: &WyrdTestCluster,
-    tenants: &[DataTenantId],
-    clients: &[ReferenceClient],
-    duration: Duration,
-    measured: bool,
-) -> Result<(Vec<u64>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
-    if !measured {
-        return Ok((Vec::new(), 0, 0));
+impl WindowRun<'_> {
+    /// Run the measured two-second flush cadence or return an empty warmup result.
+    ///
+    /// # Errors
+    /// Returns the first flush, strict-query, schema, or terminal-outcome error.
+    async fn flushes(
+        &self,
+        start: tokio::time::Instant,
+    ) -> Result<(Vec<u64>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.measured {
+            return Ok((Vec::new(), 0, 0));
+        }
+        let mut samples = Vec::with_capacity(10);
+        let mut missed = 0_u64;
+        let mut decoded_rows = 0_u64;
+        for flush_index in 0..(self.duration.as_secs() / 2) {
+            let planned = start + Duration::from_secs((flush_index + 1) * 2);
+            tokio::time::sleep_until(planned).await;
+            if tokio::time::Instant::now() > planned + Duration::from_secs(2) {
+                missed = missed.saturating_add(1);
+                continue;
+            }
+            let tenant_index = flush_index as usize % self.tenants.len();
+            flush_one_tenant(self.cluster, self.tenants, tenant_index).await?;
+            let request = BifrostQueryRequest {
+                sql: format!(
+                    "SELECT row_id, wyrd_event_time FROM vala.bifrost.{REFERENCE_TABLE} WHERE row_id BETWEEN {} AND {} ORDER BY row_id LIMIT 64",
+                    tenant_row_base(tenant_index),
+                    tenant_row_base(tenant_index) + 63,
+                ),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            };
+            let mut stream = ancillary_query(&self.clients[tenant_index].query, &request).await?;
+            let mut identities = BTreeSet::new();
+            while let Some(batch) = stream.next_batch().await? {
+                collect_query_identities(
+                    &batch,
+                    tenant_row_base(tenant_index),
+                    tenant_row_base(tenant_index) + 63,
+                    &mut identities,
+                )?;
+                decoded_rows = decoded_rows.saturating_add(batch.num_rows() as u64);
+            }
+            let terminal = stream
+                .terminal()
+                .ok_or("flush visibility query omitted terminal")?;
+            if terminal.outcome != QueryTerminalOutcome::Success || identities.len() != 64 {
+                return Err("flush visibility query did not complete".into());
+            }
+            samples.push(elapsed_us(planned));
+        }
+        Ok((samples, missed, decoded_rows))
     }
-    let mut samples = Vec::with_capacity(10);
-    let mut missed = 0_u64;
-    let mut decoded_rows = 0_u64;
-    for flush_index in 0..(duration.as_secs() / 2) {
-        let planned = start + Duration::from_secs((flush_index + 1) * 2);
-        tokio::time::sleep_until(planned).await;
-        if tokio::time::Instant::now() > planned + Duration::from_secs(2) {
-            missed = missed.saturating_add(1);
-            continue;
-        }
-        let tenant_index = flush_index as usize % tenants.len();
-        flush_one_tenant(cluster, tenants, tenant_index).await?;
-        let request = BifrostQueryRequest {
-            sql: format!(
-                "SELECT row_id, wyrd_event_time FROM vala.bifrost.{REFERENCE_TABLE} WHERE row_id BETWEEN {} AND {} ORDER BY row_id LIMIT 64",
-                tenant_row_base(tenant_index),
-                tenant_row_base(tenant_index) + 63,
-            ),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(5_000),
-        };
-        let mut stream = ancillary_query(&clients[tenant_index].query, &request).await?;
-        let mut identities = BTreeSet::new();
-        while let Some(batch) = stream.next_batch().await? {
-            collect_query_identities(
-                &batch,
-                tenant_row_base(tenant_index),
-                tenant_row_base(tenant_index) + 63,
-                &mut identities,
-            )?;
-            decoded_rows = decoded_rows.saturating_add(batch.num_rows() as u64);
-        }
-        let terminal = stream
-            .terminal()
-            .ok_or("flush visibility query omitted terminal")?;
-        if terminal.outcome != QueryTerminalOutcome::Success || identities.len() != 64 {
-            return Err("flush visibility query did not complete".into());
-        }
-        samples.push(elapsed_us(planned));
-    }
-    Ok((samples, missed, decoded_rows))
 }
 
 /// Create the isolated tenant roster for one fresh trial.
@@ -2104,6 +2154,7 @@ mod tests {
             discovered_knee_provenance: KneeProvenance::Discovered,
             trials: Vec::new(),
             median: Default::default(),
+            capacity_stages: Vec::new(),
         };
         let trial = ClusterBenchmarkTrial {
             trial: 1,
@@ -2167,9 +2218,21 @@ mod tests {
                 dirty_worktree: false,
                 captured_at: "2026-08-03T00:00:00Z".to_owned(),
             },
-            scenarios: vec![ClusterScenarioReport {
-                trials: vec![trial],
-                ..report
+            scenarios: vec![ReviewedScenarioProfile {
+                scenario_id: report.scenario.scenario_id.clone(),
+                workload: ClusterWorkloadIdentity {
+                    scenario_id: report.scenario.scenario_id.clone(),
+                    topology: report.scenario.topology,
+                    tenants: report.scenario.tenants,
+                    traffic: report.scenario.traffic,
+                    rows_per_batch: report.scenario.rows_per_batch,
+                    query_row_limit: report.scenario.query_row_limit,
+                },
+                offered_rates: vec![report.scenario.offered_requests_per_second],
+                reports: vec![ClusterScenarioReport {
+                    trials: vec![trial],
+                    ..report
+                }],
             }],
             slos: BifrostSloEnvelope::default(),
         };

@@ -184,6 +184,36 @@ data-loss behavior, prohibited material boundaries, or acceptance criteria.
 When one must change, set the task to `Blocked`, preserve the conflict
 evidence, and request authority before implementation.
 
+### Orchestrator-owned remediation revisions
+
+Review findings are diagnostic input, not executable instructions. Before an
+implementation agent is resumed, replaced, or dispatched to fix review or
+integration findings, the root orchestrator must append a `Remediation
+revision RR<N>` under `Completion evidence`. The revision is part of the
+canonical task and must be decision-complete at the same density as the
+original task.
+
+Each revision must identify its review attempt and every finding, then specify:
+
+- the violated requirement or invariant and current defective behavior;
+- the exact correction and behavior that remains unchanged;
+- target paths, owners, symbols, callers, consumers, and tests;
+- typed interface stubs or an explicit statement that interfaces do not change;
+- normative pseudocode when ordering, state, IO, errors, concurrency, or side
+  effects affect correctness;
+- negative and edge behavior, including durable effects;
+- named tests with setup, action, and critical assertions;
+- exact focused verification and required features;
+- allowed scope, prohibited fixes, and material escalation boundaries;
+- one source condition and regression assertion that closes each finding;
+- the existing decision authority or approved material revision.
+
+Use `Not applicable: <reason>` for disproportionate fields in a mechanical
+fix, but still name the exact symbol, edit outcome, and assertion. Do not
+resume implementation while a reasonable implementor would still need to
+choose behavior, architecture, ownership, contracts, ordering, failure
+semantics, features, scope, or proof.
+
 ## Complete example
 
 This example demonstrates the required implementation density. Its symbols and

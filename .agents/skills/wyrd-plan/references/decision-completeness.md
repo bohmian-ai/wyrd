@@ -5,6 +5,13 @@ implementation specification for the assigned Luna, Terra, or Sol model.
 Decision-complete means the implementation model performs coding and local
 adaptation, not design.
 
+This standard applies to every implementation dispatch, not only the original
+task. A review remediation, same-agent correction, reopened task, or integrated
+fix must be compiled to the same decision completeness before an implementor
+receives it. Prior context, a current diff, reviewer findings, and a desired
+outcome do not reduce the required specification detail. This invariant is
+what permits safe routing to small implementation models.
+
 ## Contents
 
 - [Evidence and intent](#evidence-and-intent)
@@ -246,3 +253,7 @@ Before approval, confirm:
 
 If any item fails, keep the plan `Draft` and continue investigation or
 decision resolution.
+
+For remediation, keep the controller in `REMEDIATING` and continue root-owned
+specification until the remediation revision passes the same test. The
+implementor must not be asked to select the fix.

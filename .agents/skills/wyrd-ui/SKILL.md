@@ -127,6 +127,18 @@ Load these only when relevant. They are Wyrd-native and should be enough to use 
 - Use icons from the existing enabled icon stack when available; do not invent custom inline icons for common actions.
 - Preserve accessibility basics: semantic elements, keyboard behavior, visible focus, useful empty/loading/error states, and responsive layouts.
 
+## Plan Remediation
+
+When `$wyrd-implement-plan` resumes UI work after review, require an active
+orchestrator-owned `Remediation revision RR<N>` in the canonical task. Treat
+the original task plus that revision as the executable assignment. It must be
+decision-complete at the same density as the original task: exact correction,
+owners and symbols, interfaces, consequential control flow, UI states and edge
+behavior, tests and critical assertions, verification, allowed/prohibited
+scope, escalation boundaries, and finding closure. Reviewer findings, a diff,
+or a desired visual outcome alone are not implementation instructions. Stop
+before editing rather than choosing a material fix that the revision omits.
+
 ## Editing Order
 
 When making UI changes, inspect in this order:

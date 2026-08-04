@@ -51,6 +51,16 @@ Build a checklist from required changes, acceptance criteria, required tests,
 focused commands, and completion evidence. Continue until every item is
 checked or a material boundary prevents it.
 
+When resuming after review, require an active orchestrator-owned `Remediation
+revision RR<N>` in the canonical task. Treat the original task plus that
+revision as the executable assignment. The revision must be decision-complete
+at the same level as the original task: exact correction, owners and symbols,
+interfaces, consequential pseudocode, edge behavior, tests and assertions,
+verification, scope, prohibited fixes, escalation boundaries, and finding
+closure. Findings, review prose, a diff, or a desired outcome alone are not an
+implementation assignment. Return `BLOCKED` for missing specification before
+guessing at the fix.
+
 ### Architecture reference routing
 
 | Reference | Load when the task touches |
@@ -100,6 +110,9 @@ replaced with equivalent non-weaker proof.
   material contracts, acceptance criteria, tests, features, and commands.
 - Reconstruct prior progress from the task, current diff, and verification
   evidence after any interruption or context compaction.
+- For remediation, map every active finding to its prescribed correction and
+  closure assertion. Stop before editing when any finding lacks a
+  decision-complete remediation revision or leaves a material choice open.
 
 ### Localize
 

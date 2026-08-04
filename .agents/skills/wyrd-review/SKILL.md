@@ -48,6 +48,13 @@ integrated plan, this mode overrides conflicting standalone instructions:
   status, invoke another skill, create a remediation plan, or communicate with
   the user.
 
+For every finding, provide the violated requirement and invariant, affected
+owners and consumers, observable required outcome, and the source condition
+plus regression assertion that would close it. These are diagnostic inputs to
+the orchestrator. Do not instruct an implementor directly or imply that the
+finding itself is a decision-complete remediation packet; the orchestrator
+must compile the selected fix before implementation resumes.
+
 For first review, operate as a fresh independent agent. For focused re-review,
 verify prior findings first and inspect affected seams without reopening
 accepted decisions absent new evidence. The `$wyrd-implement-plan`
@@ -166,6 +173,14 @@ current source and tests and report:
 - the exact test assertion that exercises the claimed production boundary;
 - recorded verification evidence and whether it actually selected that test;
 - `PASS`, `FAIL`, or `UNVERIFIED`.
+
+For each blocking finding, also report:
+
+- the violated requirement or acceptance criterion and invariant;
+- affected owners, callers, consumers, and error/cleanup paths;
+- the observable outcome a valid correction must produce;
+- the exact source condition and regression assertion required for closure;
+- any material uncertainty the orchestrator must resolve.
 
 A path, symbol, test name, command result, or restatement of the requirement is
 not an explanation of correctness. State how the implementation enforces the

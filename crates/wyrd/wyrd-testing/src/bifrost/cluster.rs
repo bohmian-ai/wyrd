@@ -645,7 +645,7 @@ pub struct WyrdTestCluster {
     /// Shared real storage handle.
     storage: Arc<StorageHandle>,
     /// Shared local storage lifetime guard.
-    storage_root: Arc<tempfile::TempDir>,
+    storage_root: Arc<ClusterStorageRoot>,
     /// Shared legacy Iceberg catalog.
     catalog: Arc<WyrdCatalog>,
     /// Shared Redux Bifrost catalog.
@@ -674,6 +674,24 @@ pub struct WyrdTestCluster {
     forge_config: Option<ForgeConfig>,
     /// Interval used by supervised scheduler roles.
     forge_interval: Duration,
+}
+
+/// Lifetime owner for temporary or caller-declared local cluster storage.
+enum ClusterStorageRoot {
+    /// Automatically removed test-only storage.
+    Temporary(tempfile::TempDir),
+    /// Persistent benchmark storage rooted at the declared absolute path.
+    Dedicated(std::path::PathBuf),
+}
+
+impl ClusterStorageRoot {
+    /// Return the exact runtime local-filesystem root.
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Temporary(root) => root.path(),
+            Self::Dedicated(root) => root,
+        }
+    }
 }
 
 /// Stable read-only view of all currently running server slots.
@@ -986,7 +1004,7 @@ impl WyrdTestCluster {
             Some(node_index),
             false,
             false,
-            ForgeHarnessOptions::default(),
+            (ForgeHarnessOptions::default(), None),
         )
         .await
     }
@@ -1009,12 +1027,49 @@ impl WyrdTestCluster {
             None,
             false,
             false,
-            ForgeHarnessOptions {
-                completion_observer: Some(ForgeWorkerCompletionObserver::new()),
-                ..ForgeHarnessOptions::default()
-            },
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                    ..ForgeHarnessOptions::default()
+                },
+                None,
+            ),
         )
         .await
+    }
+
+    /// Start an observed topology against one caller-declared filesystem root.
+    ///
+    /// # Errors
+    /// Returns the same topology, resource, and role-supervision errors as
+    /// [`Self::start_spec_with_forge_completion_observer`], plus filesystem
+    /// creation or canonicalization failures for the dedicated root.
+    pub async fn start_spec_with_forge_observer_and_storage_root(
+        spec: BifrostClusterSpec,
+        storage_root: std::path::PathBuf,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            spec,
+            Duration::ZERO,
+            None,
+            None,
+            false,
+            false,
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                    ..ForgeHarnessOptions::default()
+                },
+                Some(storage_root),
+            ),
+        )
+        .await
+    }
+
+    /// Return the canonical local-filesystem root used by the live cluster.
+    #[must_use]
+    pub fn storage_root(&self) -> &std::path::Path {
+        self.storage_root.path()
     }
 
     /// Start an explicit descriptor with admission pressure and Forge observer.
@@ -1034,10 +1089,13 @@ impl WyrdTestCluster {
             Some(node_index),
             false,
             false,
-            ForgeHarnessOptions {
-                completion_observer: Some(ForgeWorkerCompletionObserver::new()),
-                ..ForgeHarnessOptions::default()
-            },
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                    ..ForgeHarnessOptions::default()
+                },
+                None,
+            ),
         )
         .await
     }
@@ -1082,10 +1140,13 @@ impl WyrdTestCluster {
             None,
             false,
             false,
-            ForgeHarnessOptions {
-                completion_observer: Some(observer),
-                ..ForgeHarnessOptions::default()
-            },
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(observer),
+                    ..ForgeHarnessOptions::default()
+                },
+                None,
+            ),
         )
         .await
     }
@@ -1103,12 +1164,15 @@ impl WyrdTestCluster {
             None,
             false,
             false,
-            ForgeHarnessOptions {
-                completion_observer: Some(observer),
-                config: forge_config,
-                inject_uncertainty: uncertainty.unwrap_or(false),
-                interval: forge_interval.unwrap_or(Duration::from_secs(60)),
-            },
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(observer),
+                    config: forge_config,
+                    inject_uncertainty: uncertainty.unwrap_or(false),
+                    interval: forge_interval.unwrap_or(Duration::from_secs(60)),
+                },
+                None,
+            ),
         )
         .await
     }
@@ -1147,7 +1211,7 @@ impl WyrdTestCluster {
             None,
             enable_oracle_peer_tls,
             delay_last_node,
-            ForgeHarnessOptions::default(),
+            (ForgeHarnessOptions::default(), None),
         )
         .await
     }
@@ -1160,8 +1224,9 @@ impl WyrdTestCluster {
         scribe_admission_node: Option<usize>,
         enable_oracle_peer_tls: bool,
         delay_last_node: bool,
-        options: ForgeHarnessOptions,
+        harness: (ForgeHarnessOptions, Option<std::path::PathBuf>),
     ) -> Result<Self, ClusterError> {
+        let (options, dedicated_storage_root) = harness;
         spec.validate()?;
         let process = process_telemetry()?;
         let fixture = Arc::new(
@@ -1181,9 +1246,19 @@ impl WyrdTestCluster {
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
 
-        let storage_root = Arc::new(
-            tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
-        );
+        let storage_root = Arc::new(match dedicated_storage_root {
+            Some(root) => {
+                std::fs::create_dir_all(&root)
+                    .map_err(|error| ClusterError::Resource(error.to_string()))?;
+                ClusterStorageRoot::Dedicated(
+                    root.canonicalize()
+                        .map_err(|error| ClusterError::Resource(error.to_string()))?,
+                )
+            }
+            None => ClusterStorageRoot::Temporary(
+                tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
+            ),
+        });
         let storage = StorageHandle::from_settings(StorageSettings {
             backend: BackendConfig::Local {
                 root: storage_root.path().to_path_buf(),
@@ -1354,7 +1429,7 @@ impl WyrdTestCluster {
                 Arc::clone(&self.storage),
                 Arc::clone(&self.catalog),
                 Arc::clone(&self.redux_catalog),
-                Some(Arc::clone(&self.storage_root)),
+                None,
             )
             .await?
             .bind()

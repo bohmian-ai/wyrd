@@ -67,6 +67,8 @@ pub struct TelemetryGuard {
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedSpan {
+    /// W3C trace identifier from the production span context.
+    pub trace_id: String,
     /// Exact instrumentation span name.
     pub name: String,
     /// Scrubbed span attributes keyed by their production field names.
@@ -104,6 +106,7 @@ impl TestTraceCapture {
                     .iter()
                     .skip(checkpoint)
                     .map(|span| CapturedSpan {
+                        trace_id: span.span_context.trace_id().to_string(),
                         name: span.name.to_string(),
                         attributes: span
                             .attributes

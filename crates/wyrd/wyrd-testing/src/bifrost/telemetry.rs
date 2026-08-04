@@ -1133,6 +1133,7 @@ mod tests {
     /// Construct one normalized captured production span for mapper tests.
     fn captured_span(name: &str, attributes: &[(&str, &str)]) -> CapturedSpan {
         CapturedSpan {
+            trace_id: "00000000000000000000000000000001".to_owned(),
             name: name.to_owned(),
             attributes: attributes
                 .iter()

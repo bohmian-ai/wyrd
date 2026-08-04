@@ -4,7 +4,7 @@
 //! Gate-to-Oracle workload remains in `wyrd-testing` so this crate stays free
 //! of server, SQL, storage, and runtime dependencies.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use num_traits::ToPrimitive;
@@ -27,6 +27,27 @@ pub const SMOKE_CAPACITY_RATES: [u64; 4] = [100, 300, 500, 1_000];
 pub const DEFAULT_REVIEWED_QUALIFICATION_RATES: [u64; 3] = [100, 1_000, 2_000];
 /// Maximum wall-clock duration for a six-scenario matrix, including lifecycle.
 pub const MATRIX_DURATION_CAP: Duration = Duration::from_mins(40);
+/// Production authentication-cache TTL compared by every v2 report.
+pub const AUTH_CACHE_TTL_SECONDS: u64 = 5;
+/// Production listener-backed revocation behavior compared by every v2 report.
+pub const AUTH_INVALIDATION_MODE: &str = "listener-backed";
+/// Production writer lifecycle compared by every v2 report.
+pub const FLUSH_POLICY: &str = "staggered-production-writer-v1";
+/// Public Gate routing contract compared by every v2 report.
+pub const ROUTING_POLICY: &str = "public-gate-live-route-v1";
+/// Public Arrow batching contract compared by every v2 report.
+pub const BATCHING_POLICY: &str = "arrow-64-rows-max-64-kib-v1";
+/// Deterministic phase-table allocation contract compared by every v2 report.
+pub const ALLOCATION_POLICY: &str = "per-phase-preprovisioned-v1";
+/// Exact capacity allocation including warmup, base, optional, confirmation,
+/// and recovery slots.
+pub const CAPACITY_TABLES_PER_TENANT: u32 = 14;
+/// Exact capacity conditioning duration before each measured stage.
+pub const CAPACITY_CONDITIONING_SECONDS: u32 = 3;
+/// Exact capacity initial warmup duration.
+pub const CAPACITY_WARMUP_SECONDS: u32 = 10;
+/// Exact capacity measured-stage duration.
+pub const CAPACITY_MEASURED_SECONDS: u32 = 20;
 
 /// Return the canonical bounded rate sequence in execution order.
 #[must_use]
@@ -65,6 +86,152 @@ pub fn capacity_stage_rates(outcomes: &[bool]) -> Vec<u64> {
         rates.push(base[healthy]);
     }
     rates
+}
+
+/// Execution role assigned to a deterministic capacity stage slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityStageKind {
+    /// One canonical or optional discovery rate.
+    Discovery,
+    /// A repeat of the first failed discovery rate.
+    Confirmation,
+    /// A fresh-identity replay of the highest healthy rate.
+    Recovery,
+}
+
+/// Next stage selected by the capacity state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityStagePlan {
+    /// Stable zero-based measured-table slot.
+    pub slot: u16,
+    /// Absolute offered request rate.
+    pub offered_requests_per_second: u64,
+    /// Role of this stage in saturation classification.
+    pub kind: CapacityStageKind,
+}
+
+/// Benchmark-only capacity lifecycle that preserves every discovery,
+/// confirmation, and recovery transition without provisioning decisions.
+#[derive(Debug)]
+pub struct CapacityStateMachine {
+    rates: Vec<u64>,
+    next_rate: usize,
+    slot: u16,
+    first_failed_rate: Option<u64>,
+    highest_healthy_rate: Option<u64>,
+    confirmation: ConfirmationState,
+    recovery_pending: bool,
+    finished: bool,
+}
+
+/// Single-use confirmation lifecycle for the bounded capacity curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmationState {
+    /// No failure has consumed the one confirmation.
+    Available,
+    /// The next stage repeats the first failed rate.
+    Pending,
+    /// The one permitted confirmation has completed.
+    Used,
+}
+
+impl CapacityStateMachine {
+    /// Create the canonical bounded v2 capacity state machine.
+    #[must_use]
+    pub fn canonical() -> Self {
+        let mut rates = CANONICAL_CAPACITY_RATES.to_vec();
+        rates.extend(OPTIONAL_CAPACITY_RATES);
+        Self {
+            rates,
+            next_rate: 0,
+            slot: 0,
+            first_failed_rate: None,
+            highest_healthy_rate: None,
+            confirmation: ConfirmationState::Available,
+            recovery_pending: false,
+            finished: false,
+        }
+    }
+
+    /// Return the next deterministic stage plan, if the curve is complete.
+    #[must_use]
+    pub fn next_plan(&mut self) -> Option<CapacityStagePlan> {
+        if self.finished || self.slot >= 13 {
+            return None;
+        }
+        let (rate, kind) = if self.confirmation == ConfirmationState::Pending {
+            self.confirmation = ConfirmationState::Used;
+            (self.first_failed_rate?, CapacityStageKind::Confirmation)
+        } else if self.recovery_pending {
+            self.recovery_pending = false;
+            self.finished = true;
+            (self.highest_healthy_rate?, CapacityStageKind::Recovery)
+        } else {
+            let rate = *self.rates.get(self.next_rate)?;
+            self.next_rate += 1;
+            (rate, CapacityStageKind::Discovery)
+        };
+        let plan = CapacityStagePlan {
+            slot: self.slot,
+            offered_requests_per_second: rate,
+            kind,
+        };
+        self.slot += 1;
+        Some(plan)
+    }
+
+    /// Record the completed stage and advance confirmation/recovery state.
+    ///
+    /// # Errors
+    /// Returns [`ClusterBenchmarkError::Invalid`] when a recovery stage fails
+    /// or a result is recorded after the state machine has completed.
+    pub fn record(
+        &mut self,
+        plan: CapacityStagePlan,
+        passed: bool,
+    ) -> Result<(), ClusterBenchmarkError> {
+        if self.finished && plan.kind != CapacityStageKind::Recovery {
+            return Err(ClusterBenchmarkError::Invalid(
+                "capacity result arrived after terminal recovery".to_owned(),
+            ));
+        }
+        match plan.kind {
+            CapacityStageKind::Discovery if passed => {
+                self.highest_healthy_rate = Some(plan.offered_requests_per_second);
+                if self.next_rate == self.rates.len() {
+                    self.recovery_pending = true;
+                }
+            }
+            CapacityStageKind::Discovery => {
+                self.first_failed_rate = Some(plan.offered_requests_per_second);
+                if self.confirmation == ConfirmationState::Used {
+                    self.recovery_pending = self.highest_healthy_rate.is_some();
+                    self.finished = !self.recovery_pending;
+                } else {
+                    self.confirmation = ConfirmationState::Pending;
+                }
+            }
+            CapacityStageKind::Confirmation if passed => {
+                self.first_failed_rate = None;
+                if self.next_rate == self.rates.len() {
+                    self.recovery_pending = self.highest_healthy_rate.is_some();
+                    self.finished = !self.recovery_pending;
+                }
+            }
+            CapacityStageKind::Confirmation => {
+                self.recovery_pending = self.highest_healthy_rate.is_some();
+                self.finished = !self.recovery_pending;
+            }
+            CapacityStageKind::Recovery if passed => {}
+            CapacityStageKind::Recovery => {
+                return Err(ClusterBenchmarkError::NotReady(
+                    "highest healthy rate did not recover after saturation".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 /// First open-loop calibration probe in public operations per second.
 pub const FIRST_PROBE_RATE: u64 = 8;
@@ -241,6 +408,10 @@ pub struct TenantStageRows {
     pub row_id_start: u64,
     /// Exclusive final row identity.
     pub row_id_end_exclusive: u64,
+    /// Exact accepted batch ordinals; gaps represent rejected scheduled writes.
+    pub batch_ordinals: Vec<u64>,
+    /// Exact accepted row identities.
+    pub row_ids: Vec<u64>,
 }
 
 /// Identity for one measured capacity stage.
@@ -282,7 +453,45 @@ pub struct CapacityStage {
     /// Dependency evidence.
     pub dependencies: DependencyTelemetryEvidence,
     /// Representative traces.
-    pub traces: TraceManifest,
+    pub traces: Vec<TraceManifest>,
+}
+
+impl CapacityStage {
+    /// Validate that a retained stage can explain readiness or saturation.
+    ///
+    /// # Errors
+    /// Returns [`ClusterBenchmarkError::NotReady`] when required pillar,
+    /// dependency, node/resource, or four-operation trace evidence is absent.
+    pub fn validate_evidence(&self) -> Result<(), ClusterBenchmarkError> {
+        let operations = self
+            .traces
+            .iter()
+            .map(|trace| trace.operation)
+            .collect::<HashSet<_>>();
+        if !self.telemetry.complete
+            || !self.dependencies.complete
+            || self.resources.is_empty()
+            || self
+                .resources
+                .iter()
+                .any(|resource| resource.roles.is_empty())
+            || operations.len() != 4
+            || self.traces.iter().any(|trace| {
+                trace.representative_trace_ids.is_empty()
+                    || trace.critical_path_spans.is_empty()
+                    || trace
+                        .critical_path_spans
+                        .iter()
+                        .any(|span| span.samples == 0)
+            })
+        {
+            return Err(ClusterBenchmarkError::NotReady(
+                "capacity stage lacks complete bounded telemetry, resource, dependency, or trace evidence"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A qualification workload identity and its reviewed absolute rates.
@@ -301,6 +510,77 @@ pub struct ClusterWorkloadIdentity {
     pub rows_per_batch: u32,
     /// Query row limit.
     pub query_row_limit: u32,
+    /// Exact production authentication-cache TTL.
+    pub auth_cache_ttl_seconds: u64,
+    /// Exact production revocation invalidation mechanism.
+    pub auth_invalidation_mode: String,
+    /// Exact production writer flush lifecycle.
+    pub flush_policy: String,
+    /// Exact public Gate routing policy.
+    pub routing_policy: String,
+    /// Exact public Arrow frame batching policy.
+    pub batching_policy: String,
+    /// Runtime-inspected storage backend identity.
+    pub storage_runtime_identity: String,
+    /// Deterministic phase-table allocation policy.
+    pub allocation_policy: String,
+    /// Exact number of boot-provisioned tables for each tenant.
+    pub tables_per_tenant: u32,
+    /// Closed absolute offered-rate order.
+    pub ordered_rates: Vec<u64>,
+    /// Exact independent trial count.
+    pub trial_count: u8,
+    /// Exact warmup duration before a qualification measurement.
+    pub warmup_seconds: u32,
+    /// Exact conditioning duration before a measured stage or trial.
+    pub conditioning_seconds: u32,
+    /// Exact measured duration.
+    pub measured_seconds: u32,
+}
+
+impl ClusterWorkloadIdentity {
+    /// Validate the closed v2 production-faithfulness identity.
+    ///
+    /// # Errors
+    /// Returns [`ClusterBenchmarkError::Incompatible`] when any production
+    /// policy, allocation count, ordered rate, or duration is absent or does
+    /// not match the report shape.
+    pub fn validate(&self) -> Result<(), ClusterBenchmarkError> {
+        let expected_tables = self
+            .ordered_rates
+            .len()
+            .checked_mul(usize::from(self.trial_count))
+            .and_then(|pairs| pairs.checked_mul(2))
+            .and_then(|tables| u32::try_from(tables).ok())
+            .ok_or_else(|| {
+                ClusterBenchmarkError::Incompatible(
+                    "qualification allocation count overflowed".to_owned(),
+                )
+            })?;
+        if self.auth_cache_ttl_seconds != AUTH_CACHE_TTL_SECONDS
+            || self.auth_invalidation_mode != AUTH_INVALIDATION_MODE
+            || self.flush_policy != FLUSH_POLICY
+            || self.routing_policy != ROUTING_POLICY
+            || self.batching_policy != BATCHING_POLICY
+            || self.storage_runtime_identity.trim().is_empty()
+            || self.allocation_policy != ALLOCATION_POLICY
+            || self.tables_per_tenant != expected_tables
+            || self.ordered_rates.is_empty()
+            || self
+                .ordered_rates
+                .windows(2)
+                .any(|rates| rates[0] >= rates[1])
+            || self.trial_count != 3
+            || self.warmup_seconds != 10
+            || self.conditioning_seconds != 3
+            || self.measured_seconds != 20
+        {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "workload identity does not match the closed v2 production profile".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One reviewed qualification scenario and its exact reports by rate.
@@ -324,6 +604,7 @@ impl ReviewedScenarioProfile {
     /// Returns an incompatible error when rates are empty, duplicated,
     /// reordered, or do not match the report identities.
     pub fn validate(&self) -> Result<(), ClusterBenchmarkError> {
+        self.workload.validate()?;
         if self.offered_rates.is_empty()
             || self
                 .offered_rates
@@ -338,6 +619,11 @@ impl ReviewedScenarioProfile {
         if self.workload.scenario_id != self.scenario_id {
             return Err(ClusterBenchmarkError::Invalid(
                 "reviewed workload identity does not match its scenario".to_owned(),
+            ));
+        }
+        if self.workload.ordered_rates != self.offered_rates {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "workload ordered rates differ from reviewed rates".to_owned(),
             ));
         }
         for (rate, report) in self.offered_rates.iter().zip(&self.reports) {
@@ -380,7 +666,46 @@ pub struct ClusterTrialReport {
     /// Dependency evidence.
     pub dependencies: DependencyTelemetryEvidence,
     /// Trace manifest.
-    pub traces: TraceManifest,
+    pub traces: Vec<TraceManifest>,
+}
+
+impl ClusterTrialReport {
+    /// Validate complete bounded evidence for one qualification trial.
+    ///
+    /// # Errors
+    /// Returns [`ClusterBenchmarkError::NotReady`] when production telemetry,
+    /// dependencies, node resources, or any critical public-operation trace is
+    /// absent or contains an empty distribution.
+    pub fn validate_evidence(&self) -> Result<(), ClusterBenchmarkError> {
+        let operations = self
+            .traces
+            .iter()
+            .map(|trace| trace.operation)
+            .collect::<HashSet<_>>();
+        if !self.telemetry.complete
+            || !self.dependencies.complete
+            || self.resources.is_empty()
+            || self
+                .resources
+                .iter()
+                .any(|resource| resource.roles.is_empty())
+            || operations.len() != 4
+            || self.traces.iter().any(|trace| {
+                trace.representative_trace_ids.is_empty()
+                    || trace.critical_path_spans.is_empty()
+                    || trace
+                        .critical_path_spans
+                        .iter()
+                        .any(|span| span.samples == 0)
+            })
+        {
+            return Err(ClusterBenchmarkError::NotReady(
+                "qualification trial lacks complete bounded telemetry, resource, dependency, or trace evidence"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Provenance for a calibrated saturation knee.
@@ -445,7 +770,7 @@ impl ClusterBenchmarkScenario {
             || self.query_row_limit != 64
             || self.offered_requests_per_second == 0
             || !matches!(self.offered_load_percent, 0 | 50 | 75 | 100)
-            || self.warmup_seconds != 5
+            || self.warmup_seconds != 10
             || self.measured_seconds != 20
             || self.trials != 3
             || self.minimum_samples != 200
@@ -453,7 +778,7 @@ impl ClusterBenchmarkScenario {
             || self.seed != 0xB1_F057
         {
             return Err(ClusterBenchmarkError::Invalid(format!(
-                "scenario {} violates the v1 reference contract",
+                "scenario {} violates the v2 reference contract",
                 self.scenario_id
             )));
         }
@@ -788,6 +1113,9 @@ pub struct ClusterScenarioReport {
     pub discovered_knee_provenance: KneeProvenance,
     /// Three independent trials.
     pub trials: Vec<ClusterBenchmarkTrial>,
+    /// Complete bounded evidence corresponding one-for-one with `trials`.
+    #[serde(default)]
+    pub trial_evidence: Vec<ClusterTrialReport>,
     /// Median of the three independent trial summaries.
     pub median: MedianMetrics,
     /// Capacity stages retained for bounded capacity mode. Qualification
@@ -808,6 +1136,16 @@ impl ClusterScenarioReport {
             return Err(ClusterBenchmarkError::Unsupported(
                 "scenario does not contain exactly three trials".to_owned(),
             ));
+        }
+        if self.capacity_stages.is_empty() {
+            if self.trial_evidence.len() != self.trials.len() {
+                return Err(ClusterBenchmarkError::Unsupported(
+                    "qualification report lacks one complete evidence record per trial".to_owned(),
+                ));
+            }
+            for evidence in &self.trial_evidence {
+                evidence.validate_evidence()?;
+            }
         }
         let needs_write = true;
         let needs_read = true;
@@ -962,6 +1300,72 @@ pub struct BifrostReferenceProfile {
     pub scenarios: Vec<ReviewedScenarioProfile>,
     /// Absolute reference SLOs.
     pub slos: BifrostSloEnvelope,
+}
+
+/// Closed terminal status for a non-promotable v2 diagnostic capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticStatus {
+    /// Required host, runtime, or dependency identity was unavailable.
+    Unsupported,
+    /// A probe, stage, correctness gate, or cleanup predicate failed.
+    NotReady,
+}
+
+/// One attempted capacity or calibration probe retained on failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptedProbe {
+    /// Stable scenario identifier, when startup reached scenario selection.
+    pub scenario_id: Option<String>,
+    /// Absolute rate offered by the attempted probe.
+    pub offered_requests_per_second: u64,
+    /// Whether the probe completed its measurement window.
+    pub completed: bool,
+    /// Every simultaneously observed stop reason.
+    pub stop_reasons: Vec<CapacityLimit>,
+}
+
+/// Strict v2 diagnostic emitted by every unsuccessful benchmark invocation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BifrostDiagnosticReport {
+    /// Exact cluster report schema version; diagnostics never invent a side schema.
+    pub schema_version: String,
+    /// Diagnostics are never eligible for baseline promotion.
+    pub promotable: bool,
+    /// Typed terminal readiness state.
+    pub status: DiagnosticStatus,
+    /// Complete terminal error text.
+    pub error: String,
+    /// Environment identity when discovery completed.
+    pub environment: Option<BenchmarkEnvironment>,
+    /// Every attempted probe in execution order, including the first failure.
+    pub attempted_probes: Vec<AttemptedProbe>,
+    /// Complete scenario reports produced before failure.
+    pub scenarios: Vec<ReviewedScenarioProfile>,
+}
+
+impl BifrostDiagnosticReport {
+    /// Build a strict, explicitly non-promotable v2 diagnostic.
+    #[must_use]
+    pub fn failure(
+        status: DiagnosticStatus,
+        error: String,
+        environment: Option<BenchmarkEnvironment>,
+        attempted_probes: Vec<AttemptedProbe>,
+        scenarios: Vec<ReviewedScenarioProfile>,
+    ) -> Self {
+        Self {
+            schema_version: CLUSTER_REPORT_VERSION.to_owned(),
+            promotable: false,
+            status,
+            error,
+            environment,
+            attempted_probes,
+            scenarios,
+        }
+    }
 }
 
 impl BifrostReferenceProfile {
@@ -1393,6 +1797,41 @@ pub fn measured_flush_offsets_seconds() -> [u64; 10] {
     [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
 }
 
+/// Compute the exact qualification invocation bound before cluster startup.
+///
+/// The caller supplies the reviewed rate count, three-trial measurement
+/// duration, and the declared aggregate lifecycle overhead. Each rate/trial
+/// pair owns ten seconds of warmup and three seconds of conditioning.
+///
+/// # Errors
+/// Returns [`ClusterBenchmarkError::Unsupported`] when arithmetic overflows or
+/// the declared invocation cap cannot contain the complete formula.
+pub fn qualification_preflight_seconds(
+    reviewed_rate_count: usize,
+    measured_seconds: u64,
+    lifecycle_overhead_seconds: u64,
+    invocation_cap_seconds: u64,
+) -> Result<u64, ClusterBenchmarkError> {
+    let rates = u64::try_from(reviewed_rate_count).map_err(|_| {
+        ClusterBenchmarkError::Unsupported("reviewed rate count overflowed".to_owned())
+    })?;
+    let required = rates
+        .checked_mul(3)
+        .and_then(|pairs| pairs.checked_mul(13_u64.checked_add(measured_seconds)?))
+        .and_then(|windows| windows.checked_add(lifecycle_overhead_seconds))
+        .ok_or_else(|| {
+            ClusterBenchmarkError::Unsupported(
+                "qualification duration preflight overflowed".to_owned(),
+            )
+        })?;
+    if required > invocation_cap_seconds {
+        return Err(ClusterBenchmarkError::Unsupported(format!(
+            "qualification requires {required}s but invocation cap is {invocation_cap_seconds}s"
+        )));
+    }
+    Ok(required)
+}
+
 /// Compute Jain fairness for one non-empty per-tenant vector.
 #[must_use]
 pub fn jain_fairness(values: &[u64]) -> f64 {
@@ -1652,9 +2091,7 @@ fn evaluate_scaling(
     comparison: &mut BifrostBenchmarkComparison,
 ) {
     let balanced = profile.reports().filter(|report| {
-        report.scenario.traffic == TrafficMix::Balanced
-            && report.scenario.tenants == 8
-            && report.scenario.offered_load_percent == 100
+        report.scenario.traffic == TrafficMix::Balanced && report.scenario.tenants == 8
     });
     let mut one = None;
     let mut three = None;
@@ -1718,6 +2155,104 @@ mod tests {
             capacity_stage_rates(&[true, false]),
             vec![100, 200, 200, 100]
         );
+    }
+
+    /// Proves the concrete state machine confirms the first failure and then
+    /// replays the highest healthy rate under a fresh stage identity.
+    #[test]
+    fn capacity_state_machine_confirms_and_recovers() {
+        let mut machine = CapacityStateMachine::canonical();
+        let first = machine.next_plan().expect("first discovery exists");
+        assert_eq!(first.offered_requests_per_second, 100);
+        machine.record(first, true).expect("healthy stage records");
+        let second = machine.next_plan().expect("second discovery exists");
+        assert_eq!(second.offered_requests_per_second, 200);
+        machine.record(second, false).expect("failure records");
+        let confirmation = machine.next_plan().expect("confirmation exists");
+        assert_eq!(confirmation.kind, CapacityStageKind::Confirmation);
+        assert_eq!(confirmation.offered_requests_per_second, 200);
+        machine
+            .record(confirmation, false)
+            .expect("confirmation records");
+        let recovery = machine.next_plan().expect("recovery exists");
+        assert_eq!(recovery.kind, CapacityStageKind::Recovery);
+        assert_eq!(recovery.offered_requests_per_second, 100);
+        assert_ne!(recovery.slot, first.slot);
+        machine.record(recovery, true).expect("recovery records");
+        assert!(machine.next_plan().is_none());
+    }
+
+    /// Proves a passing confirmation resumes discovery at the next rate.
+    #[test]
+    fn capacity_passing_confirmation_resumes_discovery() {
+        let mut machine = CapacityStateMachine::canonical();
+        let first = machine.next_plan().unwrap();
+        machine.record(first, true).unwrap();
+        let failed = machine.next_plan().unwrap();
+        machine.record(failed, false).unwrap();
+        let confirmation = machine.next_plan().unwrap();
+        machine.record(confirmation, true).unwrap();
+        let resumed = machine.next_plan().unwrap();
+        assert_eq!(resumed.kind, CapacityStageKind::Discovery);
+        assert_eq!(resumed.offered_requests_per_second, 300);
+    }
+
+    /// Proves an all-passing curve still ends with a fresh recovery identity.
+    #[test]
+    fn capacity_all_pass_curve_replays_highest_rate() {
+        let mut machine = CapacityStateMachine::canonical();
+        let mut discoveries = Vec::new();
+        loop {
+            let plan = machine.next_plan().unwrap();
+            if plan.kind == CapacityStageKind::Recovery {
+                assert_eq!(plan.offered_requests_per_second, 4_000);
+                assert_eq!(plan.slot, 11);
+                machine.record(plan, true).unwrap();
+                break;
+            }
+            discoveries.push(plan.offered_requests_per_second);
+            machine.record(plan, true).unwrap();
+        }
+        assert_eq!(discoveries.len(), 11);
+        assert!(machine.next_plan().is_none());
+    }
+
+    /// Proves repeated transient failures consume only one confirmation and stay bounded.
+    #[test]
+    fn capacity_repeated_transient_failure_has_single_confirmation() {
+        let mut machine = CapacityStateMachine::canonical();
+        let mut plans = Vec::new();
+        while let Some(plan) = machine.next_plan() {
+            let passed = match plan.kind {
+                CapacityStageKind::Discovery => plans.len() != 1 && plans.len() != 4,
+                CapacityStageKind::Confirmation | CapacityStageKind::Recovery => true,
+            };
+            plans.push(plan);
+            machine.record(plan, passed).unwrap();
+        }
+        assert_eq!(
+            plans
+                .iter()
+                .filter(|plan| plan.kind == CapacityStageKind::Confirmation)
+                .count(),
+            1
+        );
+        assert!(plans.len() <= 13);
+        assert_eq!(
+            plans.last().map(|plan| plan.kind),
+            Some(CapacityStageKind::Recovery)
+        );
+    }
+
+    /// Proves qualification rejects an invocation cap that cannot contain all
+    /// pair-local warmup, conditioning, measurement, and lifecycle work.
+    #[test]
+    fn qualification_preflight_uses_complete_formula() {
+        assert_eq!(qualification_preflight_seconds(3, 20, 60, 400), Ok(357));
+        assert!(matches!(
+            qualification_preflight_seconds(3, 20, 60, 356),
+            Err(ClusterBenchmarkError::Unsupported(_))
+        ));
     }
 
     /// Proves D22 CPU marker and whitespace normalization is deterministic.
@@ -1826,6 +2361,23 @@ mod tests {
                         traffic: first.scenario.traffic,
                         rows_per_batch: first.scenario.rows_per_batch,
                         query_row_limit: first.scenario.query_row_limit,
+                        auth_cache_ttl_seconds: AUTH_CACHE_TTL_SECONDS,
+                        auth_invalidation_mode: AUTH_INVALIDATION_MODE.to_owned(),
+                        flush_policy: FLUSH_POLICY.to_owned(),
+                        routing_policy: ROUTING_POLICY.to_owned(),
+                        batching_policy: BATCHING_POLICY.to_owned(),
+                        storage_runtime_identity:
+                            "local-filesystem:target/bifrost-benchmarks/storage:local".to_owned(),
+                        allocation_policy: ALLOCATION_POLICY.to_owned(),
+                        tables_per_tenant: u32::try_from(reports.len() * 3 * 2).unwrap_or(u32::MAX),
+                        ordered_rates: reports
+                            .iter()
+                            .map(|report| report.scenario.offered_requests_per_second)
+                            .collect(),
+                        trial_count: 3,
+                        warmup_seconds: 10,
+                        conditioning_seconds: 3,
+                        measured_seconds: 20,
                     },
                     offered_rates: reports
                         .iter()
@@ -1897,7 +2449,7 @@ mod tests {
                 offered_requests_per_second: knee * u64::from(percent) / 100,
                 offered_load_percent: percent,
                 knee_provenance: KneeProvenance::Discovered,
-                warmup_seconds: 5,
+                warmup_seconds: 10,
                 measured_seconds: 20,
                 trials: 3,
                 minimum_samples: 200,
@@ -1930,8 +2482,98 @@ mod tests {
                 write_fairness: 1.0,
                 read_fairness: 1.0,
             },
+            trial_evidence: (1..=3).map(fixture_trial_evidence).collect(),
             capacity_stages: Vec::new(),
         }
+    }
+
+    /// Build complete bounded evidence for one fixture qualification trial.
+    fn fixture_trial_evidence(trial_index: u8) -> ClusterTrialReport {
+        let operations = [
+            BenchmarkOperation::DurableWrite,
+            BenchmarkOperation::FlushToVisible,
+            BenchmarkOperation::QueryTimeToFirstFrame,
+            BenchmarkOperation::QueryTotal,
+        ];
+        ClusterTrialReport {
+            offered_requests_per_second: 100,
+            trial_index,
+            metrics: ClientTrialMetrics::default(),
+            telemetry: PillarTelemetryDelta {
+                complete: true,
+                ..Default::default()
+            },
+            resources: vec![NodeResourceEvidence {
+                node_id: NodeId("fixture".to_owned()),
+                roles: vec![BifrostRuntimeRole::Gate],
+                cpu_seconds: 1.0,
+                peak_rss_bytes: 1,
+                runtime_busy_seconds: 1.0,
+                runtime_queue_peak: 1,
+            }],
+            dependencies: DependencyTelemetryEvidence {
+                complete: true,
+                ..Default::default()
+            },
+            traces: operations
+                .into_iter()
+                .map(|operation| TraceManifest {
+                    operation,
+                    representative_trace_ids: vec!["trace".to_owned()],
+                    critical_path_spans: vec![SpanDistribution {
+                        operation,
+                        samples: 1,
+                        p95_us: 1,
+                        p99_us: 1,
+                    }],
+                })
+                .collect(),
+        }
+    }
+
+    /// Proves every qualification evidence family gates report validation.
+    #[test]
+    fn qualification_missing_evidence_families_are_non_promotable() {
+        let fixture = || {
+            fixture_scenario(
+                "balanced-one-pod-one-tenant",
+                ClusterTopology::OnePod,
+                1,
+                TrafficMix::Balanced,
+                50,
+                100,
+            )
+        };
+        let mut report = fixture();
+        report.trial_evidence[0].telemetry.complete = false;
+        assert!(matches!(
+            report.validate(),
+            Err(ClusterBenchmarkError::NotReady(_))
+        ));
+        let mut report = fixture();
+        report.trial_evidence[0].resources.clear();
+        assert!(matches!(
+            report.validate(),
+            Err(ClusterBenchmarkError::NotReady(_))
+        ));
+        let mut report = fixture();
+        report.trial_evidence[0].dependencies.complete = false;
+        assert!(matches!(
+            report.validate(),
+            Err(ClusterBenchmarkError::NotReady(_))
+        ));
+        let mut report = fixture();
+        report.trial_evidence[0].traces.clear();
+        assert!(matches!(
+            report.validate(),
+            Err(ClusterBenchmarkError::NotReady(_))
+        ));
+        let mut report = fixture();
+        report.trial_evidence.clear();
+        assert!(matches!(
+            report.validate(),
+            Err(ClusterBenchmarkError::Unsupported(_))
+        ));
     }
 
     /// Build exact production reconciliation evidence for one fixture trial.

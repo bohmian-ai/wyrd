@@ -1,6 +1,6 @@
 ---
 name: wyrd-review
-description: Review Wyrd implementations against approved wyrd-plan plans and task packets, living-task execution updates, architecture, ownership, contracts, repository rules, tests, and verification evidence. Use standalone after or during wyrd-implement, as the static task and final-plan reviewer controlled by $wyrd-implement-plan, or as the repository integration policy loaded by terminal review-and-plan branch reviews. Binding modes return static findings and evidence to their root orchestrator without writing another artifact, running verification, or routing work.
+description: Adversarially review Wyrd implementations against approved wyrd-plan plans and task packets, living-task execution updates, architecture, ownership, contracts, repository rules, tests, and verification evidence. Use standalone after or during wyrd-implement, as the static task and final-plan reviewer controlled by $wyrd-implement-plan, or as the repository integration policy loaded by terminal review-and-plan branch reviews. Falsify correctness, proof, architecture fit, structural simplicity, consumer closure, and scope claims. Binding modes return static findings and evidence to their root orchestrator without writing another artifact, running verification, or routing work.
 ---
 
 # Wyrd Review
@@ -13,11 +13,47 @@ Use one fixed loop:
 
 ```text
 resolve diff -> map requirements/ACs -> inspect source/tests
+             -> adversarial structural probes
              -> classify adaptations/evidence -> verdict -> route
 ```
 
 Do not modify implementation source, tests, generated artifacts, or the
 reviewed plan/task. Writing the durable review is the only default mutation.
+
+## Adversarial review contract
+
+Treat the implementation, tests, completion report, and verification evidence
+as untrusted claims. Begin from the provisional assumption that the change is
+incorrect, incomplete, structurally misplaced, unnecessarily complex, or
+inconsistent with current repository architecture, then attempt to falsify
+those hypotheses from source, callers, consumers, tests, and authority.
+Approval means the change survived meaningful attempts to disprove it; a
+passing test, conforming diff, or absence of obvious defects is not proof.
+
+After requirement conformance, challenge the implementation structure:
+
+- compare every materially changed owner with the nearest repository-native
+  owner and established local pattern;
+- search for duplicated state, contracts, workflows, logic, or sources of
+  truth;
+- challenge unnecessary traits, indirection, services, registries, caches,
+  state machines, dependencies, configuration, async propagation, and parallel
+  paths;
+- construct the smallest repository-native implementation that preserves the
+  approved behavior and compare material complexity, reliability, performance,
+  ownership, and maintenance consequences;
+- try negative, failure, recovery, cleanup, cancellation, concurrency,
+  tenancy, audit, projection, and downstream-consumer hypotheses relevant to
+  the changed surface;
+- verify that test assertions would fail for the suspected defect rather than
+  merely execute the path.
+
+Raise findings only for evidence-backed violations or material consequences;
+do not manufacture stylistic preferences. Do not relitigate an approved
+material product or contract decision merely because another design is more
+elegant. Route a repository-evidenced material plan defect to the plan
+authority; route reversible implementation-local structural defects back to
+implementation.
 
 ## Plan-execution binding mode
 
@@ -214,6 +250,10 @@ command is acceptable only when it proves the same acceptance criterion,
 target, relevant features, test tier, environment behavior, negative cases,
 assertions, and consumers, and the living task records why the original recipe
 was defective.
+
+Record the meaningful adversarial probes attempted, the source evidence, and
+whether each hypothesis was disproved or became a finding. Keep this scoped to
+the changed surface rather than producing a generic checklist.
 
 ## Assign the verdict
 

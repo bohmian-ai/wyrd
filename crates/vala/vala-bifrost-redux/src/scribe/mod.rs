@@ -199,6 +199,8 @@ pub struct ScribeImpl {
     wal: Arc<wal::WalWriter>,
     /// Pod identity (`node_id`, `writer_epoch`).
     node_id: String,
+    /// Typed actor stream retained for source-filtered startup recovery.
+    stream: stream_identity::StreamIdentity,
     writer_epoch: i64,
     /// Pod-global request and shard admission counters.
     admission: AdmissionController,
@@ -231,6 +233,91 @@ pub struct ScribeImpl {
     staging_file_publisher: Option<StagingFilePublisher>,
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
+    /// Passive typed lifecycle observer populated only by production owner boundaries.
+    #[cfg(feature = "test-support")]
+    publication_observer: ScribePublicationObserver,
+}
+
+/// Typed publication evidence emitted at Scribe's production durability boundaries.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScribePublicationEvent {
+    /// The WAL owner returned a durable public acknowledgement.
+    Acknowledged {
+        /// Exact idempotency identity returned to the public writer.
+        batch_id: uuid::Uuid,
+        /// Number of rows accepted by the durable WAL owner.
+        rows: u64,
+    },
+    /// The seal owner produced an immutable object and pending catalog capability.
+    Sealed {
+        /// Local immutable-generation identity.
+        seal_id: u64,
+        /// Durable file-list identity reserved by the seal transaction.
+        file_list_row_id: uuid::Uuid,
+        /// Ordered public batch identities represented by the generation.
+        batch_ids: Vec<uuid::Uuid>,
+        /// First WAL position represented by the immutable generation.
+        wal_lsn_min: u64,
+        /// Last WAL position represented by the immutable generation.
+        wal_lsn_max: u64,
+    },
+    /// The post-commit owner published the exact file-list identity.
+    Published {
+        /// Local immutable-generation identity completed after commit.
+        seal_id: u64,
+        /// File-list row whose transaction committed before this event.
+        file_list_row_id: uuid::Uuid,
+        /// Ordered public batch identities represented by the published file.
+        batch_ids: Vec<uuid::Uuid>,
+        /// Fully-qualified table receiving the published immutable generation.
+        table: String,
+    },
+}
+
+/// Passive event stream for deterministic Scribe journey coordination.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Default)]
+pub struct ScribePublicationObserver {
+    /// Ordered events recorded synchronously by their production owners.
+    events: Arc<std::sync::Mutex<Vec<ScribePublicationEvent>>>,
+    /// Wakeup for bounded journey waiters.
+    ready: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "test-support")]
+impl ScribePublicationObserver {
+    /// Return a stable snapshot of all observed lifecycle events.
+    #[must_use]
+    pub fn events(&self) -> Vec<ScribePublicationEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Wait until an event matching `predicate` has been recorded.
+    pub async fn wait_for(
+        &self,
+        predicate: impl Fn(&ScribePublicationEvent) -> bool,
+    ) -> ScribePublicationEvent {
+        loop {
+            let notified = self.ready.notified();
+            if let Some(event) = self.events().into_iter().find(&predicate) {
+                return event;
+            }
+            notified.await;
+        }
+    }
+
+    /// Record one event after its production transition completes.
+    fn record(&self, event: ScribePublicationEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+        self.ready.notify_waiters();
+    }
 }
 
 /// Scribe is accepting work and no shutdown owner exists.
@@ -361,6 +448,12 @@ pub struct ScribeEmbeddedConfig {
 }
 
 impl ScribeImpl {
+    /// Return the registered writer epoch used by this production Scribe.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn writer_epoch_for_test(&self) -> i64 {
+        self.writer_epoch
+    }
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
     pub fn new_for_embedded_with_deps(
         operator: Arc<opendal::Operator>,
@@ -667,8 +760,7 @@ impl ScribeImpl {
                     wal: Arc::clone(&wal),
                     persistence_cpu: persistence_cpu.clone(),
                     wal_io: wal_io.clone(),
-                    node_id: node_id.clone(),
-                    writer_epoch,
+                    actor_stream: stream,
                     memory: memory.clone(),
                     staging_file_publisher: staging_file_publisher.clone(),
                     #[cfg(any(test, feature = "test-support"))]
@@ -695,6 +787,7 @@ impl ScribeImpl {
             operator,
             wal,
             node_id,
+            stream,
             writer_epoch,
             admission,
             memory,
@@ -713,6 +806,8 @@ impl ScribeImpl {
             staging_file_publisher,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "test-support")]
+            publication_observer: ScribePublicationObserver::default(),
         }
     }
 
@@ -1165,11 +1260,24 @@ impl Scribe for ScribeImpl {
         if !self.is_ready() {
             return Err(ScribeError::IngressClosed);
         }
-        self.prepare_and_dispatch(frame).await
+        let admission = self.prepare_and_dispatch(frame).await?;
+        #[cfg(feature = "test-support")]
+        self.publication_observer
+            .record(ScribePublicationEvent::Acknowledged {
+                batch_id: admission.batch_id,
+                rows: admission.rows_accepted,
+            });
+        Ok(admission)
     }
 }
 
 impl ScribeImpl {
+    /// Return the passive typed publication observer owned by this Scribe.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn publication_observer_for_test(&self) -> ScribePublicationObserver {
+        self.publication_observer.clone()
+    }
     /// Install a one-shot test barrier at the public write seam.
     #[cfg(any(test, feature = "test-support"))]
     pub fn stall_next_ingest_for_test(&self) -> Arc<IngestStall> {
@@ -1350,6 +1458,15 @@ impl ScribeImpl {
                 .await
             {
                 Ok(handle) => {
+                    #[cfg(feature = "test-support")]
+                    self.publication_observer
+                        .record(ScribePublicationEvent::Sealed {
+                            seal_id: handle.token.seal_id,
+                            file_list_row_id: handle.token.file_list_row_id,
+                            batch_ids: handle.token.batch_ids.clone(),
+                            wal_lsn_min: handle.token.wal_lsn_min.as_u64(),
+                            wal_lsn_max: handle.token.wal_lsn_max.as_u64(),
+                        });
                     tokens.push(handle.token);
                 }
                 Err(error) => {
@@ -1381,6 +1498,14 @@ impl ScribeImpl {
                     token.file_list_key,
                 )
                 .await?;
+            #[cfg(feature = "test-support")]
+            self.publication_observer
+                .record(ScribePublicationEvent::Published {
+                    seal_id: token.seal_id,
+                    file_list_row_id: token.file_list_row_id,
+                    batch_ids: token.batch_ids.clone(),
+                    table: token.seal_key.table.fqn(),
+                });
             if let Some(publisher) = &self.staging_file_publisher {
                 let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
                     binding,
@@ -1508,6 +1633,7 @@ impl ScribeImpl {
             .submit(
                 crate::scribe::execution_lanes::ScribeWalIoOp::ReplayDirectoryStream {
                     path: self.wal.base_dir().to_path_buf(),
+                    recovery_stream: self.stream,
                     shard_senders: self.shards.replay_senders(),
                     memory: self.memory.clone(),
                 },
@@ -1517,7 +1643,12 @@ impl ScribeImpl {
             Ok(crate::scribe::execution_lanes::ScribeWalIoResult::ReplayStreamCompleted {
                 restored,
             }) => {
+                if let Some(persistence) = &self.persistence {
+                    persistence.drain_result().await?;
+                    self.shards.drain().await;
+                }
                 self.memtable_stats()?;
+                tracing::info!(restored, stream = %self.stream, "Scribe WAL recovery completed");
                 Ok(restored)
             }
             Ok(_) => Err(ScribeError::Internal {

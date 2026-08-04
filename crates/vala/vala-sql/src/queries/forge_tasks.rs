@@ -72,6 +72,35 @@ impl ForgeTasks {
         Self { operator_pool }
     }
 
+    /// Resolve the durable identity assigned to one exactly persisted plan.
+    ///
+    /// This lookup uses the same immutable uniqueness fields as enqueue so a
+    /// passive lifecycle observer can correlate planning with the worker that
+    /// later claims the task without influencing task ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL errors or [`SqlError::InvariantViolation`] when the exact
+    /// acknowledged plan cannot be resolved after its enqueue transaction.
+    pub async fn task_id_for_plan(&self, task: &NewForgeTask) -> Result<Uuid, SqlError> {
+        sqlx::query_scalar(
+            "SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND strategy=$5 AND base_snapshot_id=$6 AND plan_hash=$7",
+        )
+        .bind(task.data_tenant_id.as_uuid())
+        .bind(&task.table_ref.catalog)
+        .bind(&task.table_ref.namespace)
+        .bind(&task.table_ref.table)
+        .bind(task.strategy.as_str())
+        .bind(task.base_snapshot_id)
+        .bind(task.plan_hash.as_slice())
+        .fetch_optional(self.operator_pool.pool())
+        .await
+        .map_err(SqlError::from)?
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: "acknowledged Forge plan has no durable task identity".to_owned(),
+        })
+    }
+
     /// Coalesces one tenant-authenticated Scribe hint and advances its generation.
     ///
     /// # Errors

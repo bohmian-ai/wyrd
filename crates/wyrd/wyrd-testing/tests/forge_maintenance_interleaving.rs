@@ -77,8 +77,12 @@ impl SupervisedMaintenance {
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );
-        let worker = ForgeWorker::new(Arc::clone(&forge), ForgeWorkerConfig::default())
-            .expect("validated maintenance worker");
+        let worker = ForgeWorker::new(
+            Arc::clone(&forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("validated maintenance worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
         let scheduler_task = tokio::spawn({

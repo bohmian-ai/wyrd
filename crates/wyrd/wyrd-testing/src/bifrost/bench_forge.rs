@@ -85,7 +85,7 @@ impl StandaloneForgeWorkerRole {
         forge: Arc<Forge>,
         guard: Option<wyrd_server::app::metrics::TestForgeRoleTelemetryGuard>,
     ) -> Result<Self, BenchError> {
-        let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default())?;
+        let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default(), uuid::Uuid::now_v7())?;
         let stop = CancellationToken::new();
         let worker_stop = stop.clone();
         let task = tokio::spawn(async move { worker.run(worker_stop).await });

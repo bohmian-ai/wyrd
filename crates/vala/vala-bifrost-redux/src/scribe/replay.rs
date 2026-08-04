@@ -17,6 +17,7 @@ use crate::scribe::manifest::read_manifest;
 use crate::scribe::memory::{MemoryCategory, MemoryReservation, ScribeMemoryBudget};
 use crate::scribe::preprocess::AppendSliceId;
 use crate::scribe::seal_key::SealKey;
+use crate::scribe::stream_identity::StreamIdentity;
 #[cfg(test)]
 use crate::scribe::wal::WalConfig;
 use crate::scribe::wal::{WalLsn, WalReader, WalSegmentRef, decode_slice_payload};
@@ -28,6 +29,8 @@ const REPLAY_RECORD_OVERHEAD_BYTES: usize = 1024;
 /// Replayed state for one seal-key.
 #[derive(Debug, Clone)]
 pub struct ReplayedSealKey {
+    /// Original WAL stream that owns the recovered records.
+    pub stream: StreamIdentity,
     /// The seal-key this state belongs to.
     pub seal_key: SealKey,
     /// Ordered list of `AuditEvent`s staged for the seal transaction.
@@ -107,7 +110,7 @@ pub fn replay_wal_directory_stream(
     wal_dir: impl AsRef<Path>,
     emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
-    replay_wal_directory_stream_accounted(wal_dir, None, emit)
+    replay_wal_directory_stream_accounted(wal_dir, None, None, emit)
 }
 
 /// Replay the WAL directory with a bounded decode reservation on each emitted
@@ -115,15 +118,29 @@ pub fn replay_wal_directory_stream(
 /// it when they are exercising parser ordering or deduplication in isolation.
 pub(crate) fn replay_wal_directory_stream_accounted(
     wal_dir: impl AsRef<Path>,
+    recovery_stream: Option<StreamIdentity>,
     governor: Option<&ScribeMemoryBudget>,
     mut emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
-    let sealed_lsn_map = sealed_lsn_map(wal_dir)?;
     let reader = WalReader::open_directory_unfiltered(wal_dir)?;
-    let mut accumulator = ReplayAccumulator::new(&sealed_lsn_map, governor)?;
+    let mut accumulators = HashMap::new();
 
-    reader.for_each_record(|segment_path, record| {
+    reader.for_each_stream_record(|stream, segment_path, record| {
+        if recovery_stream.is_some_and(|current| {
+            stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
+        }) {
+            return Ok(());
+        }
+        let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(stream) {
+            entry.insert(ReplayAccumulator::new(stream, sealed_lsn_map, governor)?);
+        }
+        let accumulator = accumulators
+            .get_mut(&stream)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay accumulator disappeared after insertion".to_owned(),
+            })?;
         if accumulator.append(segment_path, &record)?
             && let Some(chunk) = accumulator.take_chunk()?
         {
@@ -132,11 +149,21 @@ pub(crate) fn replay_wal_directory_stream_accounted(
         Ok(())
     })?;
 
-    if let Some(chunk) = accumulator.take_chunk()? {
-        emit(chunk)?;
+    for accumulator in accumulators.values_mut() {
+        if let Some(chunk) = accumulator.take_chunk()? {
+            emit(chunk)?;
+        }
     }
 
     Ok(())
+}
+
+/// Return the epoch-local directory containing one stream's manifest.
+#[must_use]
+pub(crate) fn stream_directory(wal_dir: &Path, stream: StreamIdentity) -> std::path::PathBuf {
+    wal_dir
+        .join(stream.node_id.as_uuid().simple().to_string())
+        .join(stream.writer_epoch.as_i64().to_string())
 }
 
 fn sealed_lsn_map(wal_dir: &Path) -> Result<HashMap<String, WalLsn>, ScribeError> {
@@ -156,7 +183,8 @@ fn sealed_lsn_map(wal_dir: &Path) -> Result<HashMap<String, WalLsn>, ScribeError
 /// Owns the dedupe index and one bounded replay batch while the WAL reader
 /// advances. The index survives batch boundaries; decoded state does not.
 struct ReplayAccumulator<'a> {
-    sealed_lsn_map: &'a HashMap<String, WalLsn>,
+    stream: StreamIdentity,
+    sealed_lsn_map: HashMap<String, WalLsn>,
     seen_slices: HashSet<AppendSliceId>,
     states: HashMap<String, ReplayedSealKey>,
     governor: Option<&'a ScribeMemoryBudget>,
@@ -167,13 +195,15 @@ struct ReplayAccumulator<'a> {
 impl<'a> ReplayAccumulator<'a> {
     /// Create an empty bounded replay batch with a zero-sized reservation.
     fn new(
-        sealed_lsn_map: &'a HashMap<String, WalLsn>,
+        stream: StreamIdentity,
+        sealed_lsn_map: HashMap<String, WalLsn>,
         governor: Option<&'a ScribeMemoryBudget>,
     ) -> Result<Self, ScribeError> {
         let memory = governor
             .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
             .transpose()?;
         Ok(Self {
+            stream,
             sealed_lsn_map,
             seen_slices: HashSet::new(),
             states: HashMap::new(),
@@ -228,6 +258,7 @@ impl<'a> ReplayAccumulator<'a> {
             .states
             .entry(seal_key_path)
             .or_insert_with(|| ReplayedSealKey {
+                stream: self.stream,
                 seal_key: seal_key.clone(),
                 audit_events: Vec::new(),
                 data_records: Vec::new(),
@@ -300,6 +331,10 @@ fn merge_replayed_state(
         replayed.insert(key, incoming);
         return;
     };
+    if existing.stream != incoming.stream {
+        replayed.insert(format!("{key}/stream={}", incoming.stream), incoming);
+        return;
+    }
     existing.audit_events.extend(incoming.audit_events);
     existing.data_records.extend(incoming.data_records);
     existing.append_metas.extend(incoming.append_metas);
@@ -423,15 +458,17 @@ mod tests {
             .expect("first append");
         wal.append_and_fsync_for_test(&second_key, [2; 16], &second_audit, b"second")
             .expect("second append");
-        let mut manifest = crate::scribe::manifest::Manifest::new(
-            crate::scribe::stream_identity::StreamIdentity::new(
-                node_id,
-                crate::scribe::stream_identity::WriterEpoch::new(1),
-            ),
+        let stream = crate::scribe::stream_identity::StreamIdentity::new(
+            node_id,
+            crate::scribe::stream_identity::WriterEpoch::new(1),
         );
+        let mut manifest = crate::scribe::manifest::Manifest::new(stream);
         manifest.update_sealed_lsn(&first_key, crate::scribe::wal::WalLsn::new(0));
-        crate::scribe::manifest::write_atomic(temp_dir.path().join("manifest"), &manifest)
-            .expect("manifest");
+        crate::scribe::manifest::write_atomic(
+            stream_directory(temp_dir.path(), stream).join("manifest"),
+            &manifest,
+        )
+        .expect("manifest");
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
         assert!(!replayed.contains_key(&first_key.as_path_components()));
@@ -444,6 +481,62 @@ mod tests {
 
         // Regression test for C1: per-seal-key sealed_lsn watermark
         //
+    }
+
+    /// Recovery selects every lower epoch for the stable node and excludes a
+    /// foreign node even when it has an otherwise valid WAL stream.
+    #[test]
+    fn recovery_filters_foreign_stream_and_preserves_epoch_ordering() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node = NodeId::generate();
+        let foreign = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let seal_key = replay_key(tenant);
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "append".to_owned(),
+            resource: "recovery-filter".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 rows".to_owned(),
+            detail: None,
+        };
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
+        for (stream_node, epoch, batch) in [(node, 1, 1_u8), (node, 2, 2), (foreign, 1, 9)] {
+            let writer = WalWriter::new(
+                temp_dir.path(),
+                *stream_node.as_bytes(),
+                epoch,
+                WalConfig::default(),
+            )
+            .expect("writer");
+            writer
+                .append_and_fsync_for_test(&seal_key, [batch; 16], &audit, &[batch])
+                .expect("append");
+        }
+
+        let current =
+            StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(3));
+        let mut recovered = Vec::new();
+        replay_wal_directory_stream_accounted(temp_dir.path(), Some(current), None, |chunk| {
+            recovered.extend(chunk.states.into_values().map(|state| state.stream));
+            Ok(())
+        })
+        .expect("recovery");
+        recovered.sort_by_key(|stream| stream.writer_epoch);
+        assert_eq!(
+            recovered,
+            vec![
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1)),
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(2)),
+            ]
+        );
     }
 
     #[test]
@@ -546,7 +639,7 @@ mod tests {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
         let budget = governor.scribe_budget();
         let mut chunks = Vec::new();
-        replay_wal_directory_stream_accounted(temp_dir.path(), Some(&budget), |chunk| {
+        replay_wal_directory_stream_accounted(temp_dir.path(), None, Some(&budget), |chunk| {
             chunks.push(chunk);
             Ok(())
         })

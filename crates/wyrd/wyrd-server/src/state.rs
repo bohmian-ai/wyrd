@@ -745,6 +745,8 @@ impl Default for LimitsConfig {
 /// runtime database pools that already survive boot.
 #[derive(Clone)]
 pub struct AppState {
+    /// Configured physical node identity shared by durable Bifrost role owners.
+    bifrost_node_id: Option<wyrd_spec::vala::api::NodeId>,
     /// Composed production Postgres handle. Single DB access path for all routes.
     pub postgres: Arc<ServerPostgres>,
     /// Process-wide artifact storage handle.
@@ -808,6 +810,7 @@ impl AppState {
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
+            bifrost_node_id: None,
             postgres,
             storage,
             bifrost,
@@ -878,6 +881,19 @@ impl AppState {
     pub fn with_bifrost_roles(mut self, roles: BTreeSet<BifrostRuntimeRole>) -> Self {
         self.bifrost_roles = roles;
         self
+    }
+
+    /// Attach the configured physical node identity used by durable role claims.
+    #[must_use]
+    pub fn with_bifrost_node_id(mut self, node_id: wyrd_spec::vala::api::NodeId) -> Self {
+        self.bifrost_node_id = Some(node_id);
+        self
+    }
+
+    /// Return the configured physical node identity for role composition.
+    #[must_use]
+    pub const fn bifrost_node_id(&self) -> Option<wyrd_spec::vala::api::NodeId> {
+        self.bifrost_node_id
     }
 
     /// Set the shared shutdown cancellation token.

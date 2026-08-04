@@ -18,6 +18,8 @@ pub struct NativeWyrdTestServer {
     server: Arc<Mutex<Option<WyrdTestServer>>>,
     /// Bound HTTP base URL.
     base_url: String,
+    /// Bound gRPC ingest URL used by public TypeScript write journeys.
+    grpc_url: String,
     /// Admin access token minted through the real auth route.
     token: String,
     /// Registered table reached by the public query journey.
@@ -30,6 +32,12 @@ impl NativeWyrdTestServer {
     #[napi(getter)]
     pub fn base_url(&self) -> String {
         self.base_url.clone()
+    }
+
+    /// Returns the bound gRPC ingest URL.
+    #[napi(getter)]
+    pub fn grpc_url(&self) -> String {
+        self.grpc_url.clone()
     }
 
     /// Returns the integration-only admin bearer.
@@ -56,6 +64,25 @@ impl NativeWyrdTestServer {
         drop(table);
         drop(rows);
         result
+    }
+
+    /// Wait for the test-tier Scribe publication barrier after a public write.
+    ///
+    /// This does not expose a production flush API; it only lets a journey
+    /// await the existing server-owned publication lifecycle before Oracle
+    /// reads the acknowledged batch.
+    #[napi]
+    pub fn wait_for_bifrost_publication(&self) -> napi::Result<()> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.flush_bifrost())
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
     /// Delegates the N-API-owned inputs without extending their ownership into
@@ -219,9 +246,14 @@ async fn start_test_server_async() -> napi::Result<NativeWyrdTestServer> {
         .base_url()
         .ok_or_else(|| napi::Error::from_reason("test server has no HTTP URL".to_owned()))?
         .to_owned();
+    let grpc_url = server
+        .grpc_url()
+        .ok_or_else(|| napi::Error::from_reason("test server has no gRPC URL".to_owned()))?
+        .to_owned();
     Ok(NativeWyrdTestServer {
         server: Arc::new(Mutex::new(Some(server))),
         base_url,
+        grpc_url,
         token,
         table_fqn: format!("vala.bifrost.{table_name}"),
     })

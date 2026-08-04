@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 
 import type {
   NativeBifrostQueryStream,
+  NativeInsertResult,
   NativeQueryRequest,
   NativeQueryStep,
 } from "../index.cjs";
@@ -20,6 +21,10 @@ export interface BifrostQueryRequest {
   visibility?: VisibilityMode;
   freshness?: FreshnessPolicy;
   deadlineMs?: number;
+}
+
+export interface BifrostInsertAck {
+  readonly batchId: Uint8Array;
 }
 
 export interface QueryTerminal {
@@ -239,20 +244,45 @@ export class BifrostClient {
     }
     return new BifrostQueryStream(stream);
   }
+
+  async insertBatch(
+    table: string,
+    batchId: Uint8Array,
+    ipc: Uint8Array,
+  ): Promise<BifrostInsertAck> {
+    const result: NativeInsertResult = await this.#native.insertBatch(
+      table,
+      Buffer.from(batchId),
+      Buffer.from(ipc),
+    );
+    const error = projectedError(result);
+    if (error !== undefined) {
+      throw error;
+    }
+    if (result.batchId === null || result.batchId === undefined) {
+      throw new WyrdError(
+        "WYRD_VALA_502_INGEST_ACK_INCOMPLETE",
+        502,
+        "Bifrost ingest acknowledgement incomplete",
+        "ingest returned without a durable batch acknowledgement",
+      );
+    }
+    return { batchId: new Uint8Array(result.batchId) };
+  }
 }
 
 export class BifrostQueryClient extends BifrostClient {
-  constructor(serverUrl: string, token: string) {
-    super(new NativeBifrostQueryClient(serverUrl, token));
+  constructor(serverUrl: string, token: string, grpcUrl?: string) {
+    super(new NativeBifrostQueryClient(serverUrl, token, grpcUrl));
   }
 }
 
 export class WyrdClient {
   readonly bifrost: BifrostClient;
 
-  constructor(serverUrl: string, token: string) {
+  constructor(serverUrl: string, token: string, grpcUrl?: string) {
     this.bifrost = new BifrostClient(
-      new NativeBifrostQueryClient(serverUrl, token),
+      new NativeBifrostQueryClient(serverUrl, token, grpcUrl),
     );
   }
 }

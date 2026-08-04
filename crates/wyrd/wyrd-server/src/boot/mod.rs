@@ -500,11 +500,18 @@ async fn build_bifrost_parts_from_boot(
             },
             coordination_runtime: coordination_runtime.handle().clone(),
             execution_pools,
-            persistence: Some(ScribePersistenceConfig::new(
-                Arc::new(postgres.vala().clone()),
-                64,
-                scribe_config.wal_io_threads,
-            )),
+            persistence: Some(
+                ScribePersistenceConfig::new(
+                    Arc::new(postgres.vala().clone()),
+                    64,
+                    scribe_config.wal_io_threads,
+                )
+                .with_operator_pool(postgres.operator_pool().ok_or_else(|| {
+                    ServerBootError::Scribe(
+                        "Scribe publication requires the platform operator pool".to_owned(),
+                    )
+                })?),
+            ),
             memory_budget: Some(bifrost_memory.scribe_budget()),
             staging_file_publisher: Some(staging_file_publisher),
         }));
@@ -575,6 +582,7 @@ async fn build_bifrost_parts_from_boot(
     };
 
     let mut state = AppState::new(postgres, storage, bifrost)
+        .with_bifrost_node_id(ClusterNodeId::new(node_id.as_uuid()))
         .with_bifrost_redux(bifrost_redux)
         .with_bifrost_memory_pool(bifrost_memory, bifrost_datafusion_memory_pool);
     if let Some(forge) = forge {
@@ -610,8 +618,18 @@ pub fn spawn_forge_worker(
             .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
                 detail: "AppState has no shared Forge for worker execution".to_owned(),
             })?;
-    let worker = ForgeWorker::new(forge, ForgeWorkerConfig { worker_concurrency })
-        .map_err(ServerBootError::Forge)?;
+    let node_id =
+        state
+            .bifrost_node_id()
+            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+                detail: "AppState has no configured physical Bifrost node identity".to_owned(),
+            })?;
+    let worker = ForgeWorker::new(
+        forge,
+        ForgeWorkerConfig { worker_concurrency },
+        node_id.as_uuid(),
+    )
+    .map_err(ServerBootError::Forge)?;
     Ok(async move { worker.run(shutdown).await })
 }
 

@@ -36,7 +36,7 @@ fn table_for_shard(
 
 #[tokio::test]
 #[ignore = "requires the embedded Postgres and object-store fixtures"]
-async fn scribe_inspection_has_fixed_topology_and_reconciled_memory() {
+async fn scribe_owner_fixed_topology_and_memory_reconciliation() {
     let harness = BifrostHarness::start(1, 1)
         .await
         .expect("one-pod Bifrost harness");
@@ -87,7 +87,7 @@ async fn scribe_inspection_has_fixed_topology_and_reconciled_memory() {
 
 #[tokio::test]
 #[ignore = "requires the embedded Postgres and object-store fixtures"]
-async fn one_thousand_dynamic_keys_do_not_change_shard_topology() {
+async fn scribe_owner_dynamic_keys_preserve_topology() {
     let harness = BifrostHarness::start(1, 3)
         .await
         .expect("one-pod, three-tenant Bifrost harness");

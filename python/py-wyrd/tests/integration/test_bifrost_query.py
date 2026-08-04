@@ -86,7 +86,7 @@ def test_bifrost_query_gate_denial_has_no_oracle_side_effect(
 def test_bifrost_query_cancellation_releases_all_resources(
     wyrd_server: WyrdTestServer,
 ) -> None:
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture(fused=True)
     baseline = {
         "admission_slots": 0,
         "memory_bytes": 0,

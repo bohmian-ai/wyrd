@@ -25,8 +25,8 @@ empty = {
 }
 migrated = {"test:vala"}
 pre = {
-    "test:bifrost:journey", "test:bifrost:ingest-runtime", "test:bifrost:inspection", "test:fuzz:bifrost",
-    "test:bifrost:sustained", "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
+    "test:bifrost:journey", "test:fuzz:bifrost",
+    "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
     "bench", "bench:workload", "bench:bifrost:preflight", "bench:bifrost:otlp:ingest",
     "bench:bifrost:scribe:components", "bench:bifrost:forge:components",

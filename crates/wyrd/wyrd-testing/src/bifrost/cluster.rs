@@ -604,6 +604,36 @@ pub enum ClusterError {
     Telemetry(String),
 }
 
+/// Configured local roots retained after an abrupt test-node termination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedNodeRoots {
+    /// Scribe WAL root retained for replay.
+    pub wal_root: Option<PathBuf>,
+    /// Oracle/Forge spill root retained for replacement startup.
+    pub spill_root: Option<PathBuf>,
+    /// HTTP address proven closed by abrupt termination.
+    pub previous_http_addr: std::net::SocketAddr,
+    /// gRPC address proven closed by abrupt termination.
+    pub previous_grpc_addr: std::net::SocketAddr,
+    /// Writer epoch retained as the restart fence baseline.
+    pub previous_writer_epoch: Option<i64>,
+}
+
+/// Identity evidence returned after a terminated node is rebound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRestartEvidence {
+    /// Stable logical node identity preserved across replacement.
+    pub node_id: NodeId,
+    /// New HTTP listener address.
+    pub http_addr: std::net::SocketAddr,
+    /// New gRPC listener address.
+    pub grpc_addr: std::net::SocketAddr,
+    /// Previous writer epoch, when the node owned Scribe.
+    pub previous_writer_epoch: Option<i64>,
+    /// Replacement writer epoch, strictly greater for Scribe nodes.
+    pub writer_epoch: Option<i64>,
+}
+
 /// A real multi-pod Bifrost test topology with restartable node slots.
 pub struct WyrdTestCluster {
     /// Stable node-keyed server slots; stopped nodes retain `None`.
@@ -673,6 +703,111 @@ impl<'a> Iterator for ServerView<'a> {
 }
 
 impl WyrdTestCluster {
+    /// Abruptly terminate one node while retaining its configured local roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node is unknown, already stopped, or its test
+    /// supervisor cannot be terminated.
+    pub async fn terminate_node_abruptly_for_test(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<RetainedNodeRoots, ClusterError> {
+        let server = self
+            .servers
+            .get_mut(&node_id)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?
+            .take()
+            .ok_or_else(|| {
+                ClusterError::Resource(format!("node {} is already stopped", node_id.as_uuid()))
+            })?;
+        let previous_writer_epoch = server
+            .bifrost_scribe()
+            .map(|scribe| scribe.writer_epoch_for_test());
+        server
+            .terminate_abruptly_for_test()
+            .await
+            .map_err(|error| ClusterError::Shutdown(error.to_string()))?;
+        let resources = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
+        Ok(RetainedNodeRoots {
+            wal_root: resources
+                .wal_root
+                .as_ref()
+                .map(|root| root.path().to_path_buf()),
+            spill_root: resources
+                .spill_root
+                .as_ref()
+                .map(|root| root.path().to_path_buf()),
+            previous_http_addr: resources.http_addr,
+            previous_grpc_addr: resources.grpc_addr,
+            previous_writer_epoch,
+        })
+    }
+
+    /// Restart an abruptly terminated node on fresh addresses and retained roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node is running, the retained roots no longer
+    /// match the configured roots, or replacement startup fails.
+    pub async fn restart_terminated_node_at_new_address(
+        &mut self,
+        node_id: NodeId,
+        roots: RetainedNodeRoots,
+    ) -> Result<NodeRestartEvidence, ClusterError> {
+        let resources = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
+        let configured = RetainedNodeRoots {
+            wal_root: resources
+                .wal_root
+                .as_ref()
+                .map(|root| root.path().to_path_buf()),
+            previous_http_addr: roots.previous_http_addr,
+            previous_grpc_addr: roots.previous_grpc_addr,
+            previous_writer_epoch: roots.previous_writer_epoch,
+            spill_root: resources
+                .spill_root
+                .as_ref()
+                .map(|root| root.path().to_path_buf()),
+        };
+        if configured != roots {
+            return Err(ClusterError::Resource(
+                "retained node roots do not match configured roots".to_owned(),
+            ));
+        }
+        self.restart_node_at_new_address(node_id).await?;
+        let resources = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
+        let replacement = self.servers.get(&node_id).and_then(Option::as_ref);
+        let writer_epoch = replacement
+            .and_then(WyrdTestServer::bifrost_scribe)
+            .map(|scribe| scribe.writer_epoch_for_test());
+        if resources.http_addr == roots.previous_http_addr
+            || resources.grpc_addr == roots.previous_grpc_addr
+            || writer_epoch
+                .zip(roots.previous_writer_epoch)
+                .is_some_and(|(new, old)| new <= old)
+        {
+            return Err(ClusterError::Resource(
+                "replacement node did not advance address and writer fences".to_owned(),
+            ));
+        }
+        Ok(NodeRestartEvidence {
+            node_id,
+            http_addr: resources.http_addr,
+            grpc_addr: resources.grpc_addr,
+            previous_writer_epoch: roots.previous_writer_epoch,
+            writer_epoch,
+        })
+    }
+
     /// Connect to one real Oracle server through the cluster's configured TLS trust.
     ///
     /// # Errors
@@ -982,6 +1117,13 @@ impl WyrdTestCluster {
     #[must_use]
     pub fn forge_completion_observer(&self) -> Option<ForgeWorkerCompletionObserver> {
         self.forge_completion_observer.clone()
+    }
+
+    /// Wake the configured production Forge scheduler without manufacturing work.
+    pub fn request_forge_scheduler_pass_for_test(&self) {
+        for server in self.servers() {
+            server.request_forge_scheduler_pass_for_test();
+        }
     }
 
     /// Return the uncertainty catalog control, when configured.

@@ -157,7 +157,7 @@ pub struct TestForgeRoleTelemetryGuard {
 impl ForgeRoleTelemetryGuard {
     /// Record that one configured Forge role completed process composition.
     #[must_use]
-    pub(crate) fn started(role: ForgeProcessRole) -> Self {
+    pub(crate) fn started(role: ForgeProcessRole, node_id: uuid::Uuid) -> Self {
         let role = match role {
             ForgeProcessRole::All => "all",
             ForgeProcessRole::Server => "server",
@@ -166,6 +166,12 @@ impl ForgeRoleTelemetryGuard {
         let active = metrics::gauge!("bifrost_forge_role_processes", "role" => role);
         active.increment(1.0);
         metrics::counter!("bifrost_forge_role_process_started_total", "role" => role).increment(1);
+        metrics::counter!(
+            "bifrost_forge_role_node_started_total",
+            "role" => role,
+            "node_id" => node_id.to_string(),
+        )
+        .increment(1);
         Self { active }
     }
 }
@@ -177,9 +183,12 @@ impl ForgeRoleTelemetryGuard {
 /// transition used by [`crate::app::BoundServer`].
 #[cfg(feature = "test-support")]
 #[must_use]
-pub fn start_capture_forge_role(role: ForgeProcessRole) -> TestForgeRoleTelemetryGuard {
+pub fn start_capture_forge_role(
+    role: ForgeProcessRole,
+    node_id: uuid::Uuid,
+) -> TestForgeRoleTelemetryGuard {
     TestForgeRoleTelemetryGuard {
-        _inner: ForgeRoleTelemetryGuard::started(role),
+        _inner: ForgeRoleTelemetryGuard::started(role, node_id),
     }
 }
 

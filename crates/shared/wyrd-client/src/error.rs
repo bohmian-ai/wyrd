@@ -179,6 +179,12 @@ fn bifrost_error_from_code(
         "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH" => BifrostError::FingerprintMismatch {
             table: table_from_message("schema fingerprint mismatch: "),
         },
+        "WYRD_VALA_400_QUERY_INVALID_SQL" => BifrostError::QueryInvalidSql {
+            detail: message
+                .strip_prefix("invalid or unsupported query SQL: ")
+                .unwrap_or(message)
+                .to_owned(),
+        },
         _ => return None,
     };
     Some(WyrdError::Vala { error })
@@ -240,6 +246,14 @@ mod tests {
             conflict.code(),
             "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
         );
+
+        let invalid_sql = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_QUERY_INVALID_SQL",
+            "detail": "invalid or unsupported query SQL: parser rejected SELECT FROM",
+            "details": {},
+        }));
+        assert_eq!(invalid_sql.status(), 400);
+        assert_eq!(invalid_sql.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
     }
 
     #[test]

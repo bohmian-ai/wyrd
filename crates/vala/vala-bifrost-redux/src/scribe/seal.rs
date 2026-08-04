@@ -32,6 +32,8 @@ pub struct PostCommitToken {
     pub file_list_key: FileListCommitKey,
     /// Durable file-list row identity.
     pub file_list_row_id: Uuid,
+    /// Ordered public batch identities represented by this immutable generation.
+    pub batch_ids: Vec<Uuid>,
     /// Inclusive minimum WAL LSN in the generation.
     pub wal_lsn_min: WalLsn,
     /// Inclusive maximum WAL LSN in the generation.
@@ -74,6 +76,7 @@ mod tests {
                 wal_lsn_max: 11,
             },
             file_list_row_id: uuid::Uuid::nil(),
+            batch_ids: Vec::new(),
             wal_lsn_min: WalLsn::new(11),
             wal_lsn_max: WalLsn::new(11),
             memtable_bytes: 0,
@@ -256,6 +259,11 @@ impl SealDriver {
                 seal_key: seal_key.clone(),
                 file_list_key: insert_outcome.commit_key,
                 file_list_row_id: insert_outcome.id,
+                batch_ids: frozen
+                    .metas
+                    .iter()
+                    .map(|meta| Uuid::from_bytes(meta.batch_id))
+                    .collect(),
                 wal_lsn_min,
                 wal_lsn_max,
                 memtable_bytes: frozen.arrow_bytes,

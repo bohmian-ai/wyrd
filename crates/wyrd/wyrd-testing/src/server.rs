@@ -476,6 +476,27 @@ impl WyrdTestServer {
         Ok(())
     }
 
+    /// Abruptly terminate the test server without running graceful Scribe drain.
+    ///
+    /// This test-tier seam aborts the bound supervisor after cancellation and
+    /// then drops the server, leaving configured WAL and storage roots owned by
+    /// the caller's cluster fixture for replay assertions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the supervisor join reports a panic. Normal
+    /// task cancellation is treated as the expected abrupt termination path.
+    pub async fn terminate_abruptly_for_test(mut self) -> Result<(), WyrdTestServerError> {
+        if let Some(token) = self.shutdown_token.take() {
+            token.cancel();
+        }
+        if let Some(handle) = self.serve_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        Ok(())
+    }
+
     /// Shut down the bound workers and return concrete owner lifecycle evidence.
     ///
     /// # Errors
@@ -774,6 +795,28 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
+    /// Wake the already-running production Forge scheduler for a test pass.
+    ///
+    /// The trigger is observation-only plumbing: planning, claims, rewrites,
+    /// and catalog commits remain owned by the configured production workers.
+    pub fn request_forge_scheduler_pass_for_test(&self) {
+        self.inner.forge_scheduler_trigger.request_pass();
+    }
+
+    /// Return completed production scheduler passes observed by the test trigger.
+    #[must_use]
+    pub fn completed_forge_scheduler_passes_for_test(&self) -> usize {
+        self.inner.forge_scheduler_trigger.completed_passes()
+    }
+
+    /// Wait for the production scheduler to return at least `expected` passes.
+    pub async fn wait_for_forge_scheduler_passes_for_test(&self, expected: usize) {
+        self.inner
+            .forge_scheduler_trigger
+            .wait_for_passes_at_least(expected)
+            .await;
+    }
+
     /// Count non-terminal Forge tasks for one tenant after Scribe publication.
     ///
     /// This read-only probe tells a matrix caller whether a typed Forge
@@ -1016,6 +1059,15 @@ impl WyrdTestServer {
     #[must_use]
     pub fn bifrost_scribe(&self) -> Option<Arc<ScribeImpl>> {
         self.inner.state.bifrost_scribe_for_test().cloned()
+    }
+
+    /// Return the passive typed lifecycle observer owned by production Scribe.
+    #[must_use]
+    pub fn scribe_publication_observer(
+        &self,
+    ) -> Option<vala_bifrost_redux::scribe::ScribePublicationObserver> {
+        self.bifrost_scribe()
+            .map(|scribe| scribe.publication_observer_for_test())
     }
 
     /// Install a deterministic barrier at the public Bifrost write seam.
@@ -2355,6 +2407,11 @@ impl WyrdTestServerBuilder {
                                 Arc::new(postgres.vala().clone()),
                                 64,
                                 2,
+                            )
+                            .with_operator_pool(
+                                postgres
+                                    .operator_pool()
+                                    .expect("test operator pool configured"),
                             ),
                         ),
                         memory_budget: Some(bifrost_memory.scribe_budget()),
@@ -2377,6 +2434,11 @@ impl WyrdTestServerBuilder {
                                 Arc::new(postgres.vala().clone()),
                                 64,
                                 2,
+                            )
+                            .with_operator_pool(
+                                postgres
+                                    .operator_pool()
+                                    .expect("test operator pool configured"),
                             ),
                         ),
                         memory_budget: Some(bifrost_memory.scribe_budget()),
@@ -2389,6 +2451,12 @@ impl WyrdTestServerBuilder {
         } else {
             None
         };
+        if let Some(scribe) = &scribe {
+            scribe
+                .replay_wal_async()
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        }
         let tail_authority = if scribe.is_some() {
             let audit = wyrd_server::oracle::PostgresTailSecurityAudit::try_new(&postgres)
                 .await
@@ -2418,6 +2486,7 @@ impl WyrdTestServerBuilder {
         });
         let query_stream_fault = QueryStreamFaultController::default();
         let mut state = AppState::new(postgres, storage, bifrost)
+            .with_bifrost_node_id(node_id)
             .with_bifrost_redux(Arc::clone(&bifrost_redux))
             .with_bifrost_memory_pool(bifrost_memory, query_memory)
             .with_bifrost_roles(self.bifrost_roles.clone())
@@ -2532,6 +2601,7 @@ impl WyrdTestServerBuilder {
         let router = build_router(state.clone());
         let forge_role_telemetry = Some(wyrd_server::start_capture_forge_role(
             self.forge_process_role,
+            node_id.as_uuid(),
         ));
 
         Ok(WyrdTestServer {

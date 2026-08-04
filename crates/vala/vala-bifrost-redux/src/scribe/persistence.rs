@@ -280,6 +280,8 @@ pub(crate) struct PersistenceJob {
 pub struct ScribePersistenceConfig {
     /// Tenant-scoped Vala Postgres pool owner.
     pub postgres: Arc<ValaPostgres>,
+    /// Operator capability used for membership-fenced durable publication.
+    pub operator_pool: Option<vala_sql::OperatorPool>,
     /// Maximum queued immutable generations.
     pub queue_items: usize,
     /// Number of asynchronous persistence workers.
@@ -305,11 +307,19 @@ impl ScribePersistenceConfig {
     pub fn new(postgres: Arc<ValaPostgres>, queue_items: usize, workers: usize) -> Self {
         Self {
             postgres,
+            operator_pool: None,
             queue_items: queue_items.max(1),
             workers: workers.max(1),
             #[cfg(any(test, feature = "test-support"))]
             faults: PersistenceFaults::default(),
         }
+    }
+
+    /// Installs the audited operator capability required by production publication.
+    #[must_use]
+    pub fn with_operator_pool(mut self, operator_pool: vala_sql::OperatorPool) -> Self {
+        self.operator_pool = Some(operator_pool);
+        self
     }
 
     /// Install concrete test-tier fault points for this persistence runtime.
@@ -330,10 +340,8 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded WAL lane used to advance manifests.
     pub(crate) wal_io: ScribeWalIoPool,
-    /// Pod identity used in staged object and file-list keys.
-    pub(crate) node_id: String,
-    /// Writer epoch used to distinguish concurrent pod writers.
-    pub(crate) writer_epoch: i64,
+    /// Replacement actor stream whose current membership fence authorizes publication.
+    pub(crate) actor_stream: StreamIdentity,
     /// Scribe child budget used for per-job workspace reservations.
     pub(crate) memory: ScribeMemoryBudget,
     /// Optional local wake-up publisher used after confirmed file-list commits.
@@ -350,6 +358,8 @@ pub struct PersistenceRuntime {
     queued: Arc<AtomicUsize>,
     queued_bytes: Arc<AtomicUsize>,
     drained: Arc<Notify>,
+    /// Persistence failures retained for startup recovery readiness checks.
+    failures: Arc<Mutex<Vec<String>>>,
     /// Retained worker handles aborted when the process deadline ends graceful persistence.
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Lock-independent abort handles for every spawned persistence worker.
@@ -380,11 +390,17 @@ impl PersistenceRuntime {
             queued: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
+            failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
         });
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
-        let worker = Arc::new(PersistenceWorker::new(config.postgres, context));
+        let worker = Arc::new(PersistenceWorker::new(
+            config.postgres,
+            config.operator_pool,
+            Arc::clone(&runtime_state.failures),
+            context,
+        ));
         let mut tasks = Vec::with_capacity(config.workers);
         for _ in 0..config.workers {
             let receiver = Arc::clone(&receiver);
@@ -498,6 +514,20 @@ impl PersistenceRuntime {
         }
     }
 
+    /// Drains accepted jobs and returns the first durable-stage failure.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when any drained publication failed.
+    pub(crate) async fn drain_result(&self) -> Result<(), ScribeError> {
+        self.drain().await;
+        let failure = self
+            .failures
+            .lock()
+            .ok()
+            .and_then(|mut failures| failures.drain(..).next());
+        failure.map_or(Ok(()), |detail| Err(ScribeError::Internal { detail }))
+    }
+
     /// Aborts every retained persistence worker without touching the async join registry.
     ///
     /// The abort-handle registry is drained before cancellation so repeated
@@ -564,6 +594,12 @@ impl PersistenceRuntime {
 struct PersistenceWorker {
     /// Vala Postgres handle used for tenant-scoped file-list transactions.
     postgres: Arc<ValaPostgres>,
+    /// Audited operator pool for atomically fenced publication.
+    operator_pool: Option<vala_sql::OperatorPool>,
+    /// Shared durable failure ledger consumed by startup recovery.
+    failures: Arc<Mutex<Vec<String>>>,
+    /// Replacement actor identity used only for publication authority.
+    actor_stream: StreamIdentity,
     /// Object-store operator used for staged Parquet writes.
     operator: Arc<opendal::Operator>,
     /// WAL writer retained for manifest location and generation recovery.
@@ -572,10 +608,6 @@ struct PersistenceWorker {
     persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded filesystem lane used for manifest advancement.
     wal_io: ScribeWalIoPool,
-    /// Pod identity embedded in object paths and file-list rows.
-    node_id: String,
-    /// Writer epoch embedded in file-list rows and manifests.
-    writer_epoch: i64,
     /// Scribe memory budget for persistence workspace reservations.
     memory: ScribeMemoryBudget,
     /// Optional local wake-up publisher used after confirmed file-list commits.
@@ -589,15 +621,21 @@ struct PersistenceWorker {
 
 impl PersistenceWorker {
     /// Builds a persistence worker from its complete durable dependencies.
-    fn new(postgres: Arc<ValaPostgres>, context: PersistenceRuntimeContext) -> Self {
+    fn new(
+        postgres: Arc<ValaPostgres>,
+        operator_pool: Option<vala_sql::OperatorPool>,
+        failures: Arc<Mutex<Vec<String>>>,
+        context: PersistenceRuntimeContext,
+    ) -> Self {
         Self {
             postgres,
+            operator_pool,
+            failures,
+            actor_stream: context.actor_stream,
             operator: context.operator,
             wal: context.wal,
             persistence_cpu: context.persistence_cpu,
             wal_io: context.wal_io,
-            node_id: context.node_id,
-            writer_epoch: context.writer_epoch,
             memory: context.memory,
             staging_file_publisher: context.staging_file_publisher,
             #[cfg(any(test, feature = "test-support"))]
@@ -665,6 +703,11 @@ impl PersistenceWorker {
             }
             "failed"
         };
+        if let Err(error) = &result
+            && let Ok(mut failures) = self.failures.lock()
+        {
+            failures.push(error.to_string());
+        }
         metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => status).increment(1);
         let published_at = std::time::Instant::now();
         metrics::histogram!("bifrost_scribe_persistence_publication_seconds").record(
@@ -742,7 +785,8 @@ impl PersistenceWorker {
                 });
             }
         };
-        let path = object_path(binding, &generation.seal_key, &self.node_id)?;
+        let source_node_id = generation.stream.node_id.to_string();
+        let path = object_path(binding, &generation.seal_key, &source_node_id)?;
         let file_size = encoded.bytes.len();
         let row_encoded = ParquetEncoded {
             bytes: Vec::new(),
@@ -766,26 +810,23 @@ impl PersistenceWorker {
             &frozen,
             &row_encoded,
             binding,
-            &self.node_id,
-            self.writer_epoch,
+            &source_node_id,
+            generation.stream.writer_epoch.as_i64(),
             &path,
             Some(file_size),
         )?;
-        let mut conn = self
-            .postgres
-            .tenant_conn(binding.tenant)
-            .await
-            .map_err(ScribeError::from)?;
-        let outcome = file_list_writer::insert_and_audit(&mut conn, &row, &encoded.audit_events)
-            .await
-            .map_err(ScribeError::from)?;
         #[cfg(any(test, feature = "test-support"))]
-        if self.faults.take_sql_commit() {
-            return Err(ScribeError::Internal {
-                detail: "test SQL commit failure".to_owned(),
-            });
-        }
-        conn.commit().await.map_err(ScribeError::from)?;
+        let fail_before_commit = self.faults.take_sql_commit();
+        #[cfg(not(any(test, feature = "test-support")))]
+        let fail_before_commit = false;
+        let outcome = self
+            .publish_row(
+                binding.tenant,
+                &row,
+                &encoded.audit_events,
+                fail_before_commit,
+            )
+            .await?;
         if let Some(publisher) = &self.staging_file_publisher {
             let event = crate::maintenance::StagingFileCommitted::new(
                 binding.clone(),
@@ -794,7 +835,9 @@ impl PersistenceWorker {
             let _ = publisher.try_publish(event);
         }
 
-        let manifest_path = self.wal.base_dir().join("manifest");
+        let manifest_path =
+            crate::scribe::replay::stream_directory(self.wal.base_dir(), generation.stream)
+                .join("manifest");
         let lsn = generation.wal_lsn_max;
         #[cfg(any(test, feature = "test-support"))]
         if self.faults.take_manifest_publication() {
@@ -818,6 +861,59 @@ impl PersistenceWorker {
             });
         }
         Ok(outcome.commit_key)
+    }
+
+    /// Publishes file-list and audit state through the configured SQL authority.
+    ///
+    /// Production uses the operator-fenced transaction; isolated owner tests
+    /// may retain the tenant transaction fallback.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when fence validation, insertion, audit append,
+    /// or transaction commit fails.
+    async fn publish_row(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        row: &file_list_writer::FileListInsert<'_>,
+        audit_events: &[AuditEvent],
+        fail_before_commit: bool,
+    ) -> Result<file_list_writer::FileListInsertOutcome, ScribeError> {
+        if let Some(operator_pool) = &self.operator_pool {
+            #[cfg(any(test, feature = "test-support"))]
+            if fail_before_commit {
+                return file_list_writer::insert_and_audit_fenced_with_commit_failure(
+                    operator_pool,
+                    self.actor_stream,
+                    row,
+                    audit_events,
+                )
+                .await
+                .map_err(ScribeError::from);
+            }
+            return file_list_writer::insert_and_audit_fenced(
+                operator_pool,
+                self.actor_stream,
+                row,
+                audit_events,
+            )
+            .await
+            .map_err(ScribeError::from);
+        }
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
+            .await
+            .map_err(ScribeError::from)?;
+        let outcome = file_list_writer::insert_and_audit(&mut conn, row, audit_events)
+            .await
+            .map_err(ScribeError::from)?;
+        if fail_before_commit {
+            return Err(ScribeError::Internal {
+                detail: "test SQL commit failure".to_owned(),
+            });
+        }
+        conn.commit().await.map_err(ScribeError::from)?;
+        Ok(outcome)
     }
 }
 
@@ -915,6 +1011,7 @@ mod tests {
             queued: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
+            failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
         }

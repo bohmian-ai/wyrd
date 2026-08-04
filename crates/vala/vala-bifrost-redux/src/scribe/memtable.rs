@@ -1226,6 +1226,10 @@ mod tests {
         let seal_key = make_test_seal_key();
         let batch_id = uuid::Uuid::now_v7();
         ReplayedSealKey {
+            stream: crate::scribe::stream_identity::StreamIdentity::new(
+                crate::scribe::stream_identity::NodeId::generate(),
+                crate::scribe::stream_identity::WriterEpoch::new(1),
+            ),
             seal_key: seal_key.clone(),
             audit_events: vec![make_test_event()],
             data_records: vec![bytes],

@@ -3,7 +3,7 @@
 /** Authenticated native query client sharing Wyrd's HTTP and auth pools. */
 export declare class NativeBifrostQueryClient {
   /** Constructs a bearer-token query client without performing IO. */
-  constructor(serverUrl: string, token: string)
+  constructor(serverUrl: string, token: string, grpcUrl?: string | undefined | null)
   /**
    * Starts one terminal-safe query through the Rust SDK owner.
    *
@@ -17,6 +17,20 @@ export declare class NativeBifrostQueryClient {
    * startup result itself.
    */
   query(request: NativeQueryRequest): Promise<NativeQueryStart>
+  /**
+   * Sends one Arrow IPC batch through the existing Bifrost ingest wire.
+   *
+   * The Rust client-tier transport owns UUID validation, authentication,
+   * retries, and stable error projection; this napi method only converts
+   * JavaScript buffers into the transport's typed frame.
+   *
+   * # Errors
+   *
+   * Returns a structured [`NativeInsertResult`] for Wyrd validation,
+   * authentication, transport, or server rejection. A napi error is
+   * returned only when the bridge cannot construct that result.
+   */
+  insertBatch(table: string, batchId: Buffer, ipc: Buffer): Promise<NativeInsertResult>
 }
 
 /** Native query stream that retains Rust terminal validation and emits raw IPC. */
@@ -52,6 +66,24 @@ export declare class NativeQueryStart {
   get errorRemediation(): string | null
   /** Returns serialized JSON-safe structured details when startup failed. */
   get errorDetailsJson(): string | null
+}
+
+/** Structured result of one public Bifrost ingest acknowledgement. */
+export interface NativeInsertResult {
+  /** Echo of the durably acknowledged `UUIDv7` batch identity. */
+  batchId?: Buffer
+  /** Stable Wyrd error code when the ingest was rejected. */
+  errorCode?: string
+  /** HTTP-equivalent status when the ingest was rejected. */
+  errorStatus?: number
+  /** Stable title when the ingest was rejected. */
+  errorTitle?: string
+  /** Scrubbed detail when the ingest was rejected. */
+  errorDetail?: string
+  /** Operator remediation when the ingest was rejected. */
+  errorRemediation?: string
+  /** JSON-safe structured details when the ingest was rejected. */
+  errorDetailsJson?: string
 }
 
 /** JavaScript query request projected onto the pure Wyrd contract. */

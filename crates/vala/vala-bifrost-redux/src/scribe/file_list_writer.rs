@@ -1,7 +1,10 @@
 //! `file_list` writer — atomic INSERT + audit fan-out per CONTRACTS §11.
 
 use uuid::Uuid;
+use vala_sql::OperatorPool;
 use vala_sql::{SqlError, TenantConn};
+
+use crate::scribe::stream_identity::StreamIdentity;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
@@ -268,6 +271,242 @@ async fn validate_replay(
         wal_lsn_max = row.wal_lsn_max,
         "replay-driven re-seal: validated existing file_list row; skipping audit fan-out",
     );
+    Ok(FileListInsertOutcome {
+        id,
+        commit_key,
+        replayed: true,
+    })
+}
+
+/// Publishes one recovered or live generation while holding the replacement
+/// Scribe actor's exact membership fence in the same operator transaction.
+///
+/// The actor fence authorizes the mutation only. The supplied row continues to
+/// carry the source WAL stream and LSN range used for replay idempotency.
+///
+/// # Errors
+/// Returns [`SqlError`] when the actor fence is stale, publication conflicts
+/// with a different identity, audit append fails, or the transaction cannot
+/// commit.
+pub async fn insert_and_audit_fenced(
+    operator_pool: &OperatorPool,
+    actor: StreamIdentity,
+    row: &FileListInsert<'_>,
+    events: &[AuditEvent],
+) -> Result<FileListInsertOutcome, SqlError> {
+    insert_and_audit_fenced_inner(
+        operator_pool,
+        actor,
+        row,
+        events,
+        false,
+        #[cfg(any(test, feature = "test-support"))]
+        None,
+    )
+    .await
+}
+
+/// Deterministic test barrier reached while the publication transaction owns its fence lock.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone)]
+pub struct PublicationFenceBarrier {
+    /// Signals that publication has acquired and validated the membership lock.
+    acquired: std::sync::Arc<tokio::sync::Notify>,
+    /// Releases publication to perform its atomic file-list and audit mutation.
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PublicationFenceBarrier {
+    /// Create one single-use publication fence barrier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            acquired: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Wait until production publication owns the membership row lock.
+    pub async fn wait_until_acquired(&self) {
+        self.acquired.notified().await;
+    }
+
+    /// Allow the paused production publication transaction to continue.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+
+    /// Pause the production transaction after fence validation and before mutation.
+    async fn pause(&self) {
+        self.acquired.notify_one();
+        self.release.notified().await;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for PublicationFenceBarrier {
+    /// Create the default single-use publication fence barrier.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Publish through the production fenced transaction with a deterministic lock barrier.
+///
+/// # Errors
+/// Returns the same fence, replay, audit, SQL, or commit errors as
+/// [`insert_and_audit_fenced`].
+#[cfg(any(test, feature = "test-support"))]
+pub async fn insert_and_audit_fenced_with_barrier(
+    operator_pool: &OperatorPool,
+    actor: StreamIdentity,
+    row: &FileListInsert<'_>,
+    events: &[AuditEvent],
+    barrier: &PublicationFenceBarrier,
+) -> Result<FileListInsertOutcome, SqlError> {
+    insert_and_audit_fenced_inner(operator_pool, actor, row, events, false, Some(barrier)).await
+}
+
+/// Inject a rollback immediately before the fenced publication commit.
+///
+/// # Errors
+///
+/// Always returns the injected commit error after validating and staging the
+/// transaction, or an earlier fence, replay, audit, or SQL error.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn insert_and_audit_fenced_with_commit_failure(
+    operator_pool: &OperatorPool,
+    actor: StreamIdentity,
+    row: &FileListInsert<'_>,
+    events: &[AuditEvent],
+) -> Result<FileListInsertOutcome, SqlError> {
+    insert_and_audit_fenced_inner(operator_pool, actor, row, events, true, None).await
+}
+
+/// Own the one atomic fenced publication transaction and optional test rollback.
+///
+/// # Errors
+///
+/// Returns fence, replay, audit, SQL, or injected pre-commit failures; every
+/// error drops the transaction without publishing partial durable state.
+async fn insert_and_audit_fenced_inner(
+    operator_pool: &OperatorPool,
+    actor: StreamIdentity,
+    row: &FileListInsert<'_>,
+    events: &[AuditEvent],
+    fail_before_commit: bool,
+    #[cfg(any(test, feature = "test-support"))] barrier: Option<&PublicationFenceBarrier>,
+) -> Result<FileListInsertOutcome, SqlError> {
+    let mut transaction = operator_pool.begin().await.map_err(SqlError::from)?;
+    let actor_live: bool =
+        sqlx::query_scalar("SELECT vala.assert_scribe_publication_fence($1, $2, $3)")
+            .bind(wyrd_spec::ids::DataTenantId::SYSTEM_OWNER.as_uuid())
+            .bind(actor.node_id.as_uuid())
+            .bind(actor.writer_epoch.as_i64())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(SqlError::from)?;
+    if !actor_live {
+        return Err(SqlError::InvariantViolation {
+            detail: format!("Scribe publication fence lost for actor {actor}"),
+        });
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(barrier) = barrier {
+        barrier.pause().await;
+    }
+
+    let result = insert_file(&mut transaction, row).await?;
+    let commit_key = row.commit_key();
+    let outcome = if result.rows_affected() == 0 {
+        validate_replay_transaction(&mut transaction, row, commit_key).await?
+    } else {
+        let mut audit = vala_sql::queries::audit_outbox::OperatorAudit::new(
+            row.data_tenant_id,
+            &mut transaction,
+        );
+        for event in events {
+            audit.append(event).await?;
+        }
+        FileListInsertOutcome {
+            id: row.id,
+            commit_key,
+            replayed: false,
+        }
+    };
+    if fail_before_commit {
+        return Err(SqlError::InvariantViolation {
+            detail: "test SQL commit failure".to_owned(),
+        });
+    }
+    transaction.commit().await.map_err(SqlError::from)?;
+    Ok(outcome)
+}
+
+/// Inserts the file-list row through an already-owned SQL transaction.
+async fn insert_file(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: &FileListInsert<'_>,
+) -> Result<sqlx::postgres::PgQueryResult, SqlError> {
+    sqlx::query(
+        r"INSERT INTO vala.file_list (
+ id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,
+ min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) DO NOTHING",
+    )
+    .bind(row.id)
+    .bind(row.data_tenant_id.as_uuid())
+    .bind(row.namespace)
+    .bind(row.table_name)
+    .bind(row.file_path)
+    .bind(row.file_size)
+    .bind(row.row_count)
+    .bind(row.min_event_time)
+    .bind(row.max_event_time)
+    .bind(row.partition_day)
+    .bind(row.node_id)
+    .bind(row.writer_epoch)
+    .bind(row.wal_lsn_min)
+    .bind(row.wal_lsn_max)
+    .execute(&mut **transaction)
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Validates an idempotent replay through an operator-owned transaction.
+async fn validate_replay_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: &FileListInsert<'_>,
+    commit_key: FileListCommitKey,
+) -> Result<FileListInsertOutcome, SqlError> {
+    let existing: Option<(Uuid, Uuid, String, String)> = sqlx::query_as(
+        "SELECT id,data_tenant_id,namespace,table_name FROM vala.file_list \
+         WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 \
+         AND wal_lsn_min=$4 AND wal_lsn_max=$5 FOR UPDATE",
+    )
+    .bind(row.data_tenant_id.as_uuid())
+    .bind(row.node_id)
+    .bind(row.writer_epoch)
+    .bind(row.wal_lsn_min)
+    .bind(row.wal_lsn_max)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(SqlError::from)?;
+    let Some((id, tenant, namespace, table_name)) = existing else {
+        return Err(SqlError::InvariantViolation {
+            detail: "file_list replay conflict has no operator-visible row".to_owned(),
+        });
+    };
+    if tenant != row.data_tenant_id.as_uuid()
+        || namespace != row.namespace
+        || table_name != row.table_name
+    {
+        return Err(SqlError::InvariantViolation {
+            detail: "file_list replay conflict identity mismatch".to_owned(),
+        });
+    }
     Ok(FileListInsertOutcome {
         id,
         commit_key,

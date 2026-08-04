@@ -2042,15 +2042,26 @@ impl WalReader {
         Ok(all_records)
     }
 
-    /// Visit records from every segment without retaining the whole WAL
-    /// directory in an intermediate vector.
-    pub(crate) fn for_each_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
+    /// Visit records together with the self-described stream that owns them.
+    ///
+    /// Recovery uses this form so records from an earlier writer epoch retain
+    /// their original publication and manifest identity.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when a segment cannot be read or its records
+    /// fail WAL validation.
+    pub(crate) fn for_each_stream_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
     where
-        F: FnMut(PathBuf, WalRecord) -> Result<(), ScribeError>,
+        F: FnMut(StreamIdentity, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
         for segment in &self.segments {
+            let header = segment.header();
+            let stream = StreamIdentity::new(
+                crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_bytes(header.node_id)),
+                crate::scribe::stream_identity::WriterEpoch::new(header.writer_epoch),
+            );
             let path = segment.path().to_path_buf();
-            segment.for_each_record(|record| visit(path.clone(), record))?;
+            segment.for_each_record(|record| visit(stream, path.clone(), record))?;
         }
         Ok(())
     }
@@ -2497,6 +2508,28 @@ mod tests {
             .retire_segments(std::slice::from_ref(&first))
             .expect("second generation retires");
         assert!(!first.path.exists());
+    }
+
+    /// A filesystem retirement failure preserves the source path for a later retry.
+    #[test]
+    fn segment_retirement_failure_preserves_retryable_source() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer =
+            WalWriter::new(temp_dir.path(), [13_u8; 16], 1, WalConfig::default()).expect("writer");
+        let blocked_path = temp_dir.path().join("closed-segment-directory");
+        std::fs::create_dir(&blocked_path).expect("blocked retirement path");
+        let segment = WalSegmentRef {
+            path: blocked_path.clone(),
+        };
+
+        let error = writer
+            .retire_segments(&[segment])
+            .expect_err("directory cannot be retired as a WAL file");
+        assert!(error.to_string().contains("retirement failed"));
+        assert!(
+            blocked_path.is_dir(),
+            "failed retirement must remain retryable"
+        );
     }
 
     #[test]

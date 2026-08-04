@@ -1064,6 +1064,7 @@ impl ShardOwner {
         &mut self,
         replayed_state: crate::scribe::replay::ReplayedSealKey,
     ) -> Result<(), ScribeError> {
+        let source_stream = replayed_state.stream;
         let seal_key = replayed_state.seal_key.clone();
         let segment_refs = replayed_state.wal_segments.clone();
         let result = self
@@ -1100,7 +1101,7 @@ impl ShardOwner {
         let generation = Arc::new(ImmutableGeneration::from_frozen(
             &frozen,
             (seal_key.tenant, seal_key.table.clone()),
-            self.stream,
+            source_stream,
             segment_refs.clone(),
             self.wal_handle.clone(),
         ));

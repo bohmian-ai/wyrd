@@ -89,8 +89,12 @@ impl JourneyMaintenance {
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );
-        let worker = ForgeWorker::new(Arc::clone(&forge), ForgeWorkerConfig::default())
-            .expect("validated journey maintenance worker");
+        let worker = ForgeWorker::new(
+            Arc::clone(&forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("validated journey maintenance worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
         let scheduler_task = tokio::spawn({
@@ -275,8 +279,12 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
         .expect("enqueue stale metric task");
     let before =
         rendered_staging_fold_task_duration_count(&telemetry.render(), "cancelled").unwrap_or(0.0);
-    let worker = ForgeWorker::new(Arc::clone(&fixture.forge), ForgeWorkerConfig::default())
-        .expect("validated production worker");
+    let worker = ForgeWorker::new(
+        Arc::clone(&fixture.forge),
+        ForgeWorkerConfig::default(),
+        uuid::Uuid::now_v7(),
+    )
+    .expect("validated production worker");
     assert!(
         worker
             .execute_one_for_test(&CancellationToken::new())
@@ -1148,6 +1156,7 @@ async fn dedicated_unschedulable_admission_journey() {
         ForgeWorkerConfig {
             worker_concurrency: 1,
         },
+        uuid::Uuid::now_v7(),
     )
     .expect("bootstrap worker");
     let bootstrap_task = tokio::spawn(bootstrap_worker.run(bootstrap_stop.clone()));

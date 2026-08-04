@@ -4,6 +4,8 @@
 export declare class NativeWyrdTestServer {
   /** Returns the bound HTTP base URL. */
   get baseUrl(): string
+  /** Returns the bound gRPC ingest URL. */
+  get grpcUrl(): string
   /** Returns the integration-only admin bearer. */
   get token(): string
   /** Returns the registered table used by the TypeScript Oracle journey. */
@@ -17,6 +19,14 @@ export declare class NativeWyrdTestServer {
    * encoding, ingest, or flushing fails.
    */
   seedBifrostRows(table: string, rows: Array<number>): Array<number>
+  /**
+   * Wait for the test-tier Scribe publication barrier after a public write.
+   *
+   * This does not expose a production flush API; it only lets a journey
+   * await the existing server-owned publication lifecycle before Oracle
+   * reads the acknowledged batch.
+   */
+  waitForBifrostPublication(): void
   /**
    * Mint an authenticated token without `bifrost_query:read`.
    *

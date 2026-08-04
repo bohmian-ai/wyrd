@@ -137,6 +137,47 @@ describe("BifrostQueryStream", () => {
 });
 
 describe("BifrostClient", () => {
+  it("projects a durable ingest acknowledgement without rewriting the wire", async () => {
+    const requests: unknown[] = [];
+    const native = {
+      async insertBatch(...request: unknown[]) {
+        requests.push(request);
+        return { batchId: Buffer.from([1, 2, 3]) };
+      },
+    };
+    const client = new BifrostClient(native as never);
+    const batchId = new Uint8Array([1, 2, 3]);
+    const ipc = new Uint8Array([4, 5]);
+    const ack = await client.insertBatch("vala.bifrost.events", batchId, ipc);
+    expect(Array.from(ack.batchId)).toEqual([1, 2, 3]);
+    expect(requests).toHaveLength(1);
+    expect((requests[0] as unknown[])[0]).toBe("vala.bifrost.events");
+  });
+
+  it("projects stable ingest errors from the native owner", async () => {
+    const native = {
+      async insertBatch() {
+        return {
+          batchId: undefined,
+          errorCode: "WYRD_PERMISSION_403_DENIED_RBAC",
+          errorStatus: 403,
+          errorTitle: "Permission denied (RBAC)",
+          errorDetail: "principal lacks bifrost_record:write",
+          errorRemediation: "Request the required role.",
+          errorDetailsJson: JSON.stringify({ required_scope: "bifrost_record:write" }),
+        };
+      },
+    };
+    const client = new BifrostClient(native as never);
+    await expect(
+      client.insertBatch("vala.bifrost.events", new Uint8Array(16), new Uint8Array()),
+    ).rejects.toMatchObject({
+      code: "WYRD_PERMISSION_403_DENIED_RBAC",
+      status: 403,
+      details: { required_scope: "bifrost_record:write" },
+    });
+  });
+
   it("serializes published-only and strict defaults while preserving opt-ins", async () => {
     const requests: unknown[] = [];
     const stream = {

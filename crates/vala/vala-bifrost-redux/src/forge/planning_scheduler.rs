@@ -27,6 +27,7 @@ use super::identity::task_table_binding;
 use super::planner::{
     ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
 };
+use super::worker::ForgeLifecycleEvent;
 use crate::maintenance::StagingFileCommitted;
 
 /// Complete classification from one bounded durable scheduler pass.
@@ -579,6 +580,22 @@ impl<'forge> ForgeScheduler<'forge> {
                 .await
                 .map_err(ForgeError::Sql)?,
         };
+        if result.acknowledged
+            && let Some(observer) = &self.forge.core.completion_observer
+        {
+            for task in &executable {
+                observer.record_lifecycle(ForgeLifecycleEvent::Planned {
+                    task_id: self
+                        .tasks
+                        .task_id_for_plan(task)
+                        .await
+                        .map_err(ForgeError::Sql)?,
+                    tenant: demand.data_tenant_id,
+                    table: demand.table_ref.table.clone(),
+                    inputs: task.plan.inputs.clone(),
+                });
+            }
+        }
         Ok(result)
     }
 

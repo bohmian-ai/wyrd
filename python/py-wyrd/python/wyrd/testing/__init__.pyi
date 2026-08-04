@@ -44,7 +44,7 @@ class WyrdTestServer:
         """
         ...
 
-    def prepare_oracle_query_fixture(self) -> tuple[str, str]:
+    def prepare_oracle_query_fixture(self, fused: bool = False) -> tuple[str, str]:
         """Create sealed and live query rows and return ``(table_fqn, access_token)``."""
         ...
 

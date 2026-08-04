@@ -1288,6 +1288,9 @@ pub struct Oracle {
     tail_ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
     /// Query-scoped live Scribe discovery owner.
     tail_discovery: Option<Arc<dyn tail_fence::TailStreamDiscovery>>,
+    /// Test-tier switch that routes fused reads through explicitly registered local transports.
+    #[cfg(feature = "test-support")]
+    prefer_local_tail_routes: std::sync::atomic::AtomicBool,
     /// Mandatory immutable read/security audit collaborator.
     audit: Arc<dyn OracleAudit>,
     /// Optional distributed fragment owner assembled from server capabilities.
@@ -1436,6 +1439,25 @@ impl Oracle {
         }
     }
 
+    /// Selects explicitly registered local tail routes for one-process language journeys.
+    #[cfg(feature = "test-support")]
+    pub fn prefer_local_tail_routes_for_test(&self) {
+        self.prefer_local_tail_routes
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns the query-scoped discovery owner unless a test selected local routes.
+    fn tail_discovery_for_query(&self) -> Option<Arc<dyn tail_fence::TailStreamDiscovery>> {
+        #[cfg(feature = "test-support")]
+        if self
+            .prefer_local_tail_routes
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        self.tail_discovery.clone()
+    }
+
     /// Constructs a retained Oracle owner from explicit dependency handles.
     ///
     /// # Errors
@@ -1495,6 +1517,8 @@ impl Oracle {
             tails: config.tails,
             tail_ticket_minter: config.tail_ticket_minter,
             tail_discovery: config.tail_discovery,
+            #[cfg(feature = "test-support")]
+            prefer_local_tail_routes: std::sync::atomic::AtomicBool::new(false),
             audit: config.audit,
             fragment_dispatcher,
             telemetry,
@@ -1851,7 +1875,7 @@ impl Oracle {
                 query_id: input.admitted.query_id.into(),
                 ticket_minter: self.tail_ticket_minter.clone(),
                 cluster: Some(Arc::clone(&self.admission.cluster)),
-                discovery: self.tail_discovery.clone(),
+                discovery: self.tail_discovery_for_query(),
             },
         );
         let mut degraded = false;
@@ -2014,7 +2038,7 @@ impl Oracle {
                 query_id: admitted.query_id.into(),
                 ticket_minter: self.tail_ticket_minter.clone(),
                 cluster: Some(Arc::clone(&self.admission.cluster)),
-                discovery: self.tail_discovery.clone(),
+                discovery: self.tail_discovery_for_query(),
             },
         );
         let acquired = if options.visibility == VisibilityMode::Fused {

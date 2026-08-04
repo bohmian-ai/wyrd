@@ -47,7 +47,9 @@ pub use rewrite::ForgeRewriteRuntime;
 #[cfg(feature = "test-support")]
 pub use rewrite::deterministic_output_path_for_test;
 pub use scheduler::ForgeSchedulerTrigger;
-pub use worker::{ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig};
+pub use worker::{
+    ForgeLifecycleEvent, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+};
 
 #[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};

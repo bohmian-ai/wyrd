@@ -439,6 +439,7 @@ mod pg_tests {
                 ForgeWorkerConfig {
                     worker_concurrency: 1,
                 },
+                uuid::Uuid::now_v7(),
             )
             .expect("fixture worker");
             let fixture = Self {
@@ -2123,8 +2124,12 @@ mod pg_tests {
         assert_eq!((states, audits), (1, 1));
         sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
             .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("expire accepted task claim");
-        let successor = ForgeWorker::new(Arc::clone(&fixture.forge), ForgeWorkerConfig::default())
-            .expect("successor worker");
+        let successor = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("successor worker");
         assert!(
             successor
                 .execute_one_for_test(&CancellationToken::new())
@@ -2347,8 +2352,12 @@ mod pg_tests {
             .to_owned();
         sqlx::query("UPDATE vala.forge_tasks SET evidence=jsonb_set(jsonb_set(evidence,'{cleanup_candidates}','[]'::jsonb),'{deleted_candidate_count}','0'::jsonb) WHERE task_id=$1")
             .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("mismatch");
-        let worker = ForgeWorker::new(Arc::clone(&fixture.forge), ForgeWorkerConfig::default())
-            .expect("worker");
+        let worker = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("worker");
         worker
             .execute_one_for_test(stop)
             .await
@@ -2424,8 +2433,12 @@ mod pg_tests {
         .execute(fixture.operator_pool.pool())
         .await
         .expect("restore exact cleanup evidence");
-        let takeover = ForgeWorker::new(Arc::clone(&fixture.forge), ForgeWorkerConfig::default())
-            .expect("takeover worker");
+        let takeover = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("takeover worker");
         assert!(
             takeover
                 .execute_one_for_test(&stop)
@@ -3311,6 +3324,7 @@ mod pg_tests {
             ForgeWorkerConfig {
                 worker_concurrency: 2,
             },
+            uuid::Uuid::now_v7(),
         )
         .expect("two-slot worker");
         let first = worker
@@ -3403,6 +3417,7 @@ mod pg_tests {
             ForgeWorkerConfig {
                 worker_concurrency: 1,
             },
+            uuid::Uuid::now_v7(),
         )
         .expect("successor worker");
         assert!(
@@ -3532,6 +3547,7 @@ mod pg_tests {
             ForgeWorkerConfig {
                 worker_concurrency: 1,
             },
+            uuid::Uuid::now_v7(),
         )
         .expect("evidence successor");
         assert!(

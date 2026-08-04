@@ -9,12 +9,15 @@ mod pg_tests {
     use vala_bifrost_redux::catalog::tenant_table::TenantTableBindingError;
     use vala_bifrost_redux::catalog::{BifrostCatalog, BifrostCatalogError, CreateTableRequest};
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+    use vala_bifrost_redux::cluster::ClusterRegistry;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::scribe::ScribeImpl;
     use vala_bifrost_redux::scribe::file_list_writer::{
-        FileListInsert, FileListInsertOutcome, insert_and_audit,
+        FileListInsert, FileListInsertOutcome, PublicationFenceBarrier, insert_and_audit,
+        insert_and_audit_fenced, insert_and_audit_fenced_with_barrier,
     };
     use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+    use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use vala_sql::queries::file_list::HotFileCatalog;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -22,6 +25,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+    use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     fn logical_table() -> TableRef {
@@ -47,6 +51,19 @@ mod pg_tests {
             .await
             .expect("tenant B");
         (fixture, tenant_a, tenant_b)
+    }
+
+    async fn register_scribe(fixture: &PgFixture, node: NodeId, epoch: i64) {
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query(
+            "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now()) ON CONFLICT (data_tenant_id,node_id,role) DO UPDATE SET fencing_token=EXCLUDED.fencing_token,heartbeat_at=now()",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(node.as_uuid())
+        .bind(epoch)
+        .execute(&pool)
+        .await
+        .expect("register Scribe fence");
     }
 
     async fn redux_catalog(
@@ -621,6 +638,126 @@ mod pg_tests {
             audit_count, 1,
             "replay must not append a duplicate audit row"
         );
+    }
+
+    /// A replacement actor may idempotently replay an already-published source epoch.
+    #[tokio::test]
+    async fn recovered_publication_replays_idempotently_under_current_actor_fence() {
+        let (fixture, tenant, _) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
+        let actor_node = NodeId::generate();
+        register_scribe(&fixture, actor_node, 4).await;
+        let source_node = Uuid::now_v7();
+        let first = insert_row(&binding, source_node, 2, 10, 20);
+        let actor = StreamIdentity::new(actor_node, WriterEpoch::new(4));
+        let first_outcome =
+            insert_and_audit_fenced(fixture.operator_pool(), actor, &first, &[audit_event()])
+                .await
+                .expect("first fenced publication");
+        let replay = insert_row(&binding, source_node, 2, 10, 20);
+        let replay_outcome =
+            insert_and_audit_fenced(fixture.operator_pool(), actor, &replay, &[audit_event()])
+                .await
+                .expect("idempotent replay");
+        assert_eq!(replay_outcome.id, first_outcome.id);
+        assert!(replay_outcome.replayed);
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=2), (SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation='test.file_list_identity')",
+        )
+        .bind(tenant.as_uuid())
+        .bind(source_node)
+        .fetch_one(&pool)
+        .await
+        .expect("durable replay counts");
+        assert_eq!(counts, (1, 1));
+    }
+
+    /// Losing the actor fence before publication rolls back file-list and audit state.
+    #[tokio::test]
+    async fn stale_recovery_writer_cannot_publish_or_audit() {
+        let (fixture, tenant, _) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
+        let actor_node = NodeId::generate();
+        register_scribe(&fixture, actor_node, 5).await;
+        let row = insert_row(&binding, Uuid::now_v7(), 3, 30, 40);
+        let stale_actor = StreamIdentity::new(actor_node, WriterEpoch::new(4));
+        insert_and_audit_fenced(fixture.operator_pool(), stale_actor, &row, &[audit_event()])
+            .await
+            .expect_err("stale recovery actor must be fenced");
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM vala.file_list WHERE id=$1), (SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$2 AND operation='test.file_list_identity')",
+        )
+        .bind(row.id)
+        .bind(tenant.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("rolled back counts");
+        assert_eq!(counts, (0, 0));
+    }
+
+    /// Fence advancement serializes behind an in-flight atomic publication lock.
+    #[tokio::test]
+    async fn concurrent_fence_advance_never_splits_file_list_and_audit() {
+        let (fixture, tenant, _) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
+        let actor_node = NodeId::generate();
+        register_scribe(&fixture, actor_node, 4).await;
+        let row = insert_row(&binding, Uuid::now_v7(), 3, 30, 40);
+        let actor = StreamIdentity::new(actor_node, WriterEpoch::new(4));
+        let barrier = PublicationFenceBarrier::new();
+        let replacement_started = Arc::new(tokio::sync::Notify::new());
+        let replacement_signal = Arc::clone(&replacement_started);
+        let replacement_registry = ClusterRegistry::new(
+            fixture.vala_postgres().clone(),
+            ClusterNodeId::new(actor_node.as_uuid()),
+        );
+        let replacement = async {
+            barrier.wait_until_acquired().await;
+            replacement_signal.notify_one();
+            replacement_registry
+                .reserve_scribe(
+                    "127.0.0.1:2",
+                    ScribeCapabilitiesV1 {
+                        tail_protocol_version:
+                            vala_bifrost_redux::scribe::tail_rpc::TAIL_PROTOCOL_VERSION,
+                    },
+                )
+                .await
+                .expect("replacement fence advance")
+                .fencing_token
+        };
+        let controller = async {
+            replacement_started.notified().await;
+            tokio::task::yield_now().await;
+            barrier.release();
+        };
+        let audit_events = [audit_event()];
+        let publication = insert_and_audit_fenced_with_barrier(
+            fixture.operator_pool(),
+            actor,
+            &row,
+            &audit_events,
+            &barrier,
+        );
+        let (published, replacement_epoch, ()) = tokio::join!(publication, replacement, controller);
+        let published = published.expect("old authority publication commits atomically");
+        assert!(!published.replayed);
+        assert_eq!(replacement_epoch, 5);
+
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM vala.file_list WHERE id=$1), (SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$2 AND operation='test.file_list_identity'), (SELECT fencing_token FROM vala.cluster_nodes WHERE data_tenant_id=$3 AND node_id=$4 AND role='scribe')",
+        )
+        .bind(row.id)
+        .bind(tenant.as_uuid())
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(actor_node.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("serialized publication state");
+        assert_eq!(counts, (1, 1, 5));
     }
 
     #[test]

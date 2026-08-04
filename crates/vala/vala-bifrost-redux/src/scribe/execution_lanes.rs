@@ -863,6 +863,8 @@ pub(crate) enum ScribeWalIoOp {
     },
     ReplayDirectoryStream {
         path: PathBuf,
+        /// Replacement actor stream whose lower same-node epochs are eligible.
+        recovery_stream: StreamIdentity,
         shard_senders: Vec<mpsc::Sender<crate::scribe::shards::ShardCommand>>,
         memory: ScribeMemoryBudget,
     },
@@ -1093,12 +1095,14 @@ fn execute_wal_io(
         }
         ScribeWalIoOp::ReplayDirectoryStream {
             path,
+            recovery_stream,
             shard_senders,
             memory,
         } => {
             let mut restored = 0_usize;
             crate::scribe::replay::replay_wal_directory_stream_accounted(
                 path,
+                Some(recovery_stream),
                 Some(&memory),
                 |chunk| {
                     let crate::scribe::replay::ReplayChunk { states, memory } = chunk;

@@ -7,7 +7,7 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
-from wyrd.bifrost import Bifrost, BifrostQueryClient
+from wyrd.bifrost import Bifrost, BifrostQueryClient, BifrostQueryError
 from wyrd.observe import record
 
 if TYPE_CHECKING:
@@ -163,14 +163,6 @@ def test_negative_bad_card_ref_raises(wyrd_server: WyrdTestServer) -> None:
 
 
 @pytest.mark.integration
-def test_negative_conflicting_schema_fingerprint_mismatch(wyrd_server: WyrdTestServer) -> None:
-    pytest.skip(
-        "Requires the public table registration helper; the write transport is covered "
-        "by the round-trip journey above."
-    )
-
-
-@pytest.mark.integration
 def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestServer) -> None:
     table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
     denied_key = wyrd_server.bootstrap_service([], name="bifrost-write-denied")
@@ -206,10 +198,18 @@ def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestSe
 
 @pytest.mark.integration
 def test_negative_invalid_sql_query(wyrd_server: WyrdTestServer) -> None:
-    pytest.skip(
-        "Requires Bifrost.sql() — query surface not yet wired in the Python SDK. "
-        "The WYRD_VALA_400_QUERY_INVALID_SQL contract is unit-covered in vala-bifrost."
-    )
+    _table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+
+    async def query() -> None:
+        with pytest.raises(BifrostQueryError) as captured:
+            await BifrostQueryClient(wyrd_server.base_url, token).query(
+                "SELECT FROM",
+            )
+        assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
+        assert captured.value.status == 400
+        assert captured.value.detail
+
+    asyncio.run(query())
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +219,15 @@ def test_negative_invalid_sql_query(wyrd_server: WyrdTestServer) -> None:
 
 @pytest.mark.integration
 def test_positive_audit_trail(wyrd_server: WyrdTestServer) -> None:
-    pytest.skip(
-        "Requires Bifrost.sql() to read vala.system.audit_log and confirm gap-free seq "
-        "with decision=allow across register/write/query kinds. Audit outbox landing is "
-        "unit-covered in vala-sql/tests/audit_outbox.rs (S3.C5)."
-    )
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    before = wyrd_server.bifrost_read_decision_count()
+
+    async def query() -> None:
+        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+            f"SELECT id FROM {table_fqn} ORDER BY id",
+        )
+        _ = [batch async for batch in stream]
+        assert stream.terminal is not None
+
+    asyncio.run(query())
+    assert wyrd_server.bifrost_read_decision_count() > before

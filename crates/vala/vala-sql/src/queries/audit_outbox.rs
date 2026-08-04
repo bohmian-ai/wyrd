@@ -37,7 +37,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
 /// This capability is intentionally crate-private and exposes only canonical
 /// audit append. It cannot be used as a general SQL executor or masquerade as
 /// a tenant connection.
-pub(crate) struct OperatorAudit<'transaction, 'connection> {
+pub struct OperatorAudit<'transaction, 'connection> {
     /// Verified tenant on whose behalf Forge is appending audit evidence.
     tenant: DataTenantId,
     /// Operator transaction shared with the fenced Forge planning workflow.
@@ -46,7 +46,7 @@ pub(crate) struct OperatorAudit<'transaction, 'connection> {
 
 impl<'transaction, 'connection> OperatorAudit<'transaction, 'connection> {
     /// Binds canonical audit append to one already verified tenant.
-    pub(crate) fn new(
+    pub fn new(
         tenant: DataTenantId,
         transaction: &'transaction mut Transaction<'connection, Postgres>,
     ) -> Self {
@@ -65,7 +65,7 @@ impl<'transaction, 'connection> OperatorAudit<'transaction, 'connection> {
     /// # Cancellation
     /// Cancellation leaves the enclosing operator transaction uncommitted, so
     /// its owner can roll back the Forge mutation and audit append together.
-    pub(crate) async fn append(&mut self, event: &AuditEvent) -> Result<i64, SqlError> {
+    pub async fn append(&mut self, event: &AuditEvent) -> Result<i64, SqlError> {
         sqlx::query(wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
             .bind(self.tenant.to_string())
             .execute(&mut **self.transaction)

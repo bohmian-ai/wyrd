@@ -14,7 +14,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
-use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::contracts::{Scribe, ScribeAppend, ScribeError};
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
@@ -128,6 +128,7 @@ impl PersistenceFixture {
             ],
         )
         .await
+        .expect("replay")
     }
 
     async fn start_after_wal_restart_with_keys(
@@ -135,7 +136,7 @@ impl PersistenceFixture {
         table_names: &[&str],
         generations: i64,
         object_write_delays: &[Duration],
-    ) -> Self {
+    ) -> Result<Self, ScribeError> {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
         let operator = Arc::new(
@@ -212,8 +213,8 @@ impl PersistenceFixture {
             memory_budget: Some(memory.scribe_budget()),
             staging_file_publisher: Some(staging_file_publisher),
         }));
-        scribe.replay_wal_async().await.expect("replay");
-        Self {
+        scribe.replay_wal_async().await?;
+        Ok(Self {
             database,
             operator,
             scribe,
@@ -222,7 +223,7 @@ impl PersistenceFixture {
             wal_root,
             _warehouse: Some(warehouse),
             tenant,
-        }
+        })
     }
 }
 
@@ -912,41 +913,30 @@ async fn wal_replay_preserves_row_identity() {
 }
 
 #[tokio::test]
-async fn replayed_generation_failure_retries_to_durable_publication() {
-    let fixture = PersistenceFixture::start_after_wal_restart(true).await;
-    let failure_deadline = Instant::now() + Duration::from_secs(10);
-    while !fixture
-        .faults
-        .last_error_for_test()
-        .is_some_and(|error| error.contains("test object-store write failure"))
+async fn replayed_generation_failure_keeps_replacement_unready() {
+    let error = match PersistenceFixture::start_after_wal_restart_with_keys(
+        true,
+        &["restart_publish_events"],
+        3,
+        &[
+            Duration::from_millis(300),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ],
+    )
+    .await
     {
-        assert!(
-            Instant::now() < failure_deadline,
-            "injected replay failure did not fire"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(rows(&fixture).await.is_empty());
-    fixture.scribe.check_age(Instant::now());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if fixture.scribe.persistence_queue_depth_for_test() == 0 && rows(&fixture).await.len() == 3
-        {
-            break;
+        Ok(fixture) => {
+            fixture.stop().await;
+            panic!("replay publication failure must fail replacement startup");
         }
-        assert!(
-            Instant::now() < deadline,
-            "replay retry stalled: {:?}",
-            fixture.faults.last_error_for_test()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        publication_order(&fixture, "restart_publish_events").await,
-        vec![0, 1, 2]
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("test object-store write failure")
     );
-    assert_eq!(audit_count(&fixture).await, 3);
-    fixture.stop().await;
 }
 
 #[tokio::test]
@@ -957,7 +947,8 @@ async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
         2,
         &[Duration::from_millis(100)],
     )
-    .await;
+    .await
+    .expect("replay");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if fixture.scribe.persistence_queue_depth_for_test() == 0

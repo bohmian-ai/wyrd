@@ -143,6 +143,8 @@ pub struct ForgeWorkerConfig {
 /// scheduling, claim ownership, publication, or terminal transitions.
 #[derive(Clone, Default)]
 pub struct ForgeWorkerCompletionObserver {
+    /// Ordered typed lifecycle events recorded by production scheduler and worker owners.
+    lifecycle_events: Arc<Mutex<Vec<ForgeLifecycleEvent>>>,
     /// Number of supervised execution attempts observed after their durable path returned.
     attempts: Arc<AtomicUsize>,
     /// Errors returned by supervised execution attempts in observation order.
@@ -189,6 +191,50 @@ pub struct ForgeWorkerCompletionObserver {
     attempt_pause_release: Arc<tokio::sync::Notify>,
 }
 
+/// Typed causal evidence from the production Forge scheduler and worker owners.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgeLifecycleEvent {
+    /// A fenced scheduler atomically enqueued the eligible inputs.
+    Planned {
+        /// Durable task identity assigned by the acknowledged enqueue transaction.
+        task_id: Uuid,
+        /// Tenant whose durable demand was acknowledged.
+        tenant: DataTenantId,
+        /// Physical table identity used by the scheduler.
+        table: String,
+        /// Sorted eligible published input identities carried by the durable plan.
+        inputs: Vec<String>,
+    },
+    /// A production worker durably claimed one task.
+    Claimed {
+        /// Durable task identity claimed from `PostgreSQL`.
+        task_id: Uuid,
+        /// Production worker owner written into the claim.
+        worker_id: Uuid,
+    },
+    /// The production rewrite path returned exact committed evidence.
+    Rewritten {
+        /// Durable task whose production dispatch returned rewrite evidence.
+        task_id: Uuid,
+        /// Exact planned input cardinality consumed by the rewrite.
+        input_count: usize,
+    },
+    /// Catalog evidence names the committed replacement snapshot.
+    CatalogCommitted {
+        /// Durable task associated with the catalog evidence.
+        task_id: Uuid,
+        /// Committed Iceberg snapshot named by the production evidence.
+        snapshot_id: i64,
+    },
+    /// The production worker returned after the durable terminal transition.
+    Terminal {
+        /// Durable task whose terminal path returned successfully.
+        task_id: Uuid,
+        /// Production worker that completed the terminal transition.
+        worker_id: Uuid,
+    },
+}
+
 /// Test-only barriers that pin the observer's race-sensitive wait boundary.
 #[cfg(test)]
 #[derive(Clone)]
@@ -223,6 +269,39 @@ impl ForgeWorkerCompletionObserver {
     #[must_use]
     pub fn completed(&self) -> usize {
         self.completed.load(Ordering::Acquire)
+    }
+
+    /// Return typed lifecycle events in production-owner publication order.
+    #[must_use]
+    pub fn lifecycle_events(&self) -> Vec<ForgeLifecycleEvent> {
+        self.lifecycle_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Wait until the typed lifecycle stream satisfies `predicate`.
+    pub async fn wait_for_lifecycle(
+        &self,
+        predicate: impl Fn(&[ForgeLifecycleEvent]) -> bool,
+    ) -> Vec<ForgeLifecycleEvent> {
+        loop {
+            let notified = self.ready.notified();
+            let events = self.lifecycle_events();
+            if predicate(&events) {
+                return events;
+            }
+            notified.await;
+        }
+    }
+
+    /// Record one scheduler- or worker-owned lifecycle transition.
+    pub(crate) fn record_lifecycle(&self, event: ForgeLifecycleEvent) {
+        self.lifecycle_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+        self.ready.notify_waiters();
     }
 
     /// Return the number of supervised execution attempts that have returned.
@@ -646,7 +725,11 @@ impl ForgeWorker {
     ///
     /// Returns invalid configuration when worker or derived claim limits are
     /// zero or cannot fit their durable integer domains.
-    pub fn new(forge: Arc<Forge>, config: ForgeWorkerConfig) -> Result<Self, ForgeError> {
+    pub fn new(
+        forge: Arc<Forge>,
+        config: ForgeWorkerConfig,
+        owner: Uuid,
+    ) -> Result<Self, ForgeError> {
         let config = config.validate()?;
         let limits = &forge.core.config;
         let capacity = ForgeCapacity::try_from(limits)?;
@@ -654,7 +737,7 @@ impl ForgeWorker {
             completion_observer: forge.core.completion_observer.clone(),
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
             forge,
-            owner: Uuid::now_v7(),
+            owner,
             config,
             capacity,
             #[cfg(feature = "test-support")]
@@ -717,6 +800,12 @@ impl ForgeWorker {
             {
                 let task_id = prepared.task.task_id;
                 let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
+                if let Some(observer) = &self.completion_observer {
+                    observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                        task_id,
+                        worker_id: self.owner,
+                    });
+                }
                 let result = self.reconcile_prepared(prepared, &shutdown).await;
                 self.record_attempt(result.as_ref().err());
                 #[cfg(feature = "test-support")]
@@ -742,6 +831,12 @@ impl ForgeWorker {
                 continue;
             };
             let task_id = claim.task_id;
+            if let Some(observer) = &self.completion_observer {
+                observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                    task_id,
+                    worker_id: self.owner,
+                });
+            }
             #[cfg(feature = "test-support")]
             if let Some(observer) = &self.completion_observer {
                 observer.pause_after_claim_for_test().await;
@@ -769,6 +864,10 @@ impl ForgeWorker {
     /// returns, so test observation cannot acknowledge or alter a task.
     fn record_completion(&self, task_id: Uuid, strategy: ForgeClaimStrategy) {
         if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Terminal {
+                task_id,
+                worker_id: self.owner,
+            });
             observer.record(self.owner, task_id, strategy);
         }
     }
@@ -1437,6 +1536,18 @@ impl ForgeWorker {
         })?;
         heartbeat_result?;
         let (evidence, state) = completion?;
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Rewritten {
+                task_id: claim.task_id,
+                input_count: claim.plan.inputs.len(),
+            });
+            if let Some(snapshot_id) = evidence.committed_snapshot_id {
+                observer.record_lifecycle(ForgeLifecycleEvent::CatalogCommitted {
+                    task_id: claim.task_id,
+                    snapshot_id,
+                });
+            }
+        }
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await
     }

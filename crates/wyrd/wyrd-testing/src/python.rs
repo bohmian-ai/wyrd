@@ -241,14 +241,15 @@ impl WyrdTestServer {
     ///
     /// Raises a Wyrd Python error when the context manager is inactive or table
     /// registration, ingest, flush, token exchange, or Arrow encoding fails.
-    fn prepare_oracle_query_fixture(&self) -> PyResult<(String, String)> {
+    #[pyo3(signature = (fused = false))]
+    fn prepare_oracle_query_fixture(&self, fused: bool) -> PyResult<(String, String)> {
         let srv = self.server.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "WyrdTestServer not started (use as context manager)",
             )
         })?;
         wyrd_runtime::runtime()
-            .block_on(prepare_oracle_query_fixture(srv))
+            .block_on(prepare_oracle_query_fixture(srv, fused))
             .map_err(wyrd_error_to_py_err)
     }
 
@@ -438,6 +439,7 @@ fn query_resource_snapshot_from_map(
 /// construction, gRPC ingest, Scribe flush, or token exchange fails.
 async fn prepare_oracle_query_fixture(
     srv: &crate::server::WyrdTestServer,
+    fused: bool,
 ) -> Result<(String, String), wyrd_spec::error::WyrdError> {
     let bootstrap = srv
         .bootstrap_service(
@@ -528,22 +530,27 @@ async fn prepare_oracle_query_fixture(
     .map_err(harness_error)?;
     let tail_transport: std::sync::Arc<dyn TailReadTransport> =
         std::sync::Arc::new(LocalTailReadTransport::new(ingest.tail_reader()));
-    srv.state()
+    let oracle = srv
+        .state()
         .bifrost_query()
         .ok_or_else(|| harness_error("Oracle runtime is unavailable"))?
-        .oracle()
-        .tail_transports()
-        .insert_live_stream_for_tenant(
-            srv.data_tenant_id(),
-            &table_fqn,
-            wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
-            writer_epoch,
-            event_day,
-            tail_transport,
-        );
-    srv.flush_bifrost()
-        .await
-        .map_err(wyrd_spec::error::WyrdError::from)?;
+        .oracle();
+    if fused {
+        oracle.prefer_local_tail_routes_for_test();
+    }
+    oracle.tail_transports().insert_live_stream_for_tenant(
+        srv.data_tenant_id(),
+        &table_fqn,
+        wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
+        writer_epoch,
+        event_day,
+        tail_transport,
+    );
+    if !fused {
+        srv.flush_bifrost()
+            .await
+            .map_err(wyrd_spec::error::WyrdError::from)?;
+    }
     let live_batch = RecordBatch::try_new(
         schema,
         vec![

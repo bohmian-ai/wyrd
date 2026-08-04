@@ -105,8 +105,12 @@ description = """Run the current Bifrost/Scribe Rust user-journey tests (marked 
 so they stay out of the fast lane) against live Postgres."""
 run = """
 cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
-cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_e2e_closeout_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_forge_distributed_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- public_write_read_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- public_write_compact_read_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- public_multitenant_write_compact_read_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- distributed_write_compact_read_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- public_ack_restart_read_exact_once_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- bifrost_ingest_runtime_journey --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_published_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_fused_reconcile_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_role_separated_journey --ignored --test-threads=1
@@ -125,28 +129,8 @@ cargo test --locked -p wyrd-testing --test integration -- oracle_production_tele
 cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_telemetry --test-threads=1
 cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey_tripwire_count_join --test-threads=1
 cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan --test-threads=1
-cargo test --locked -p wyrd-testing --test integration -- task15_inspection --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- otlp_negative_journeys --test-threads=1
 """
-
-[tasks."test:bifrost:ingest-runtime"]
-hide = true
-description = "Run the focused Gate/Scribe server-owned ingest runtime journey"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:ingest-runtime:inner'"
-[tasks."test:bifrost:ingest-runtime:inner"]
-hide = true
-description = "Run the focused Gate/Scribe server-owned ingest runtime journey"
-run = "cargo test --locked -p wyrd-testing --test integration -- bifrost_ingest_runtime_journey --test-threads=1"
-
-[tasks."test:bifrost:inspection"]
-description = "Run the fixed-shard and 1,000-key Task-15 inspection harness"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:inspection:inner'"
-[tasks."test:bifrost:inspection:inner"]
-hide = true
-description = "Run the fixed-shard and 1,000-key Task-15 inspection harness"
-run = "cargo test --locked -p wyrd-testing --test integration -- task15_inspection --ignored --test-threads=1"
 
 [tasks."test:fuzz:bifrost"]
 description = "Run the Postgres-backed Bifrost interleaving replay tests"
@@ -170,17 +154,6 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Run only the named deterministic Rust cluster matrix journeys"
 run = "cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_three_server_three_worker_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- pressured_tenant_does_not_starve_peers --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_telemetry_reconciles_all_pillars --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_cancellation_and_shutdown_release_all_owners --ignored --test-threads=1"
-
-[tasks."test:bifrost:sustained"]
-description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:sustained:inner'"
-[tasks."test:bifrost:sustained:inner"]
-hide = true
-description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
-run = """
-cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1
-"""
 
 [tasks."bench:bifrost:baseline"]
 description = "Capture a fresh immutable pre-change Bifrost benchmark stage"

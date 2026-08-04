@@ -148,6 +148,152 @@ async fn append(
         .map(|_| ())
 }
 
+/// Append one fixed batch while reporting an explicit measured wire size.
+///
+/// # Errors
+/// Returns the exact Scribe append error from the durable owner.
+async fn append_measured(
+    scribe: &crate::scribe::ScribeImpl,
+    tenant: DataTenantId,
+    table: &str,
+    batch_id: Uuid,
+    measured_wire_bytes: usize,
+) -> Result<(), ScribeError> {
+    let rows = batch();
+    scribe
+        .append_durable(ScribeAppend {
+            principal: principal(tenant),
+            table: TableRef::new(BifrostNamespace::Bifrost, table),
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
+            request_id: RequestId::now_v7(),
+            batch_id,
+            measured_wire_bytes,
+            rows,
+        })
+        .await
+        .map(|_| ())
+}
+
+/// Assert one exact Scribe rejection counter and no identity-bearing variant.
+fn assert_rejection(recorder: &wyrd_bench::BenchmarkRecorder, reason: &str, count: u64) {
+    let snapshot = recorder.snapshot();
+    assert_eq!(
+        snapshot.counters.get(&format!(
+            "bifrost_scribe_rejections_total{{reason=\"{reason}\"}}"
+        )),
+        Some(&count)
+    );
+    assert_eq!(
+        snapshot
+            .counters
+            .iter()
+            .filter(|(key, _)| key.starts_with("bifrost_scribe_rejections_total{"))
+            .map(|(_, value)| value)
+            .sum::<u64>(),
+        count,
+        "one public rejection must have one terminal reason"
+    );
+    assert!(
+        snapshot
+            .gauges
+            .get("bifrost_scribe_ingress_active")
+            .is_some_and(|value| value.abs() <= f64::EPSILON),
+        "the public ingress owner must drain after rejection"
+    );
+    assert!(!snapshot.counters.keys().any(|key| {
+        key.starts_with("bifrost_scribe_rejections_total")
+            && ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+    }));
+}
+
+/// The production memory breaker emits exactly one bounded owner rejection.
+#[tokio::test(flavor = "current_thread")]
+async fn scribe_memory_rejection_emits_exact_owner_reason() {
+    let recorder = wyrd_bench::BenchmarkRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let (_wal, scribe) = scribe(&wal_root, NodeId::new(Uuid::now_v7()));
+    let held = scribe
+        .memory
+        .try_reserve_ingress(MemoryCategory::Raw, scribe.memory.limit_bytes() * 90 / 100)
+        .expect("reserve Scribe ingress breaker capacity");
+
+    let error = append(&scribe, DataTenantId::new_v7(), "memory", Uuid::now_v7())
+        .await
+        .expect_err("memory breaker rejects append");
+    assert!(matches!(error, ScribeError::IngestBusy { .. }));
+    assert_rejection(&recorder, "memory", 1);
+    drop(held);
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// The production shard mailbox branch emits exactly one bounded queue rejection.
+#[tokio::test(flavor = "current_thread")]
+async fn scribe_queue_rejection_emits_exact_owner_reason() {
+    let recorder = wyrd_bench::BenchmarkRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let (_wal, scribe) = scribe(&wal_root, NodeId::new(Uuid::now_v7()));
+    scribe.shards.close();
+
+    append(&scribe, DataTenantId::new_v7(), "queue", Uuid::now_v7())
+        .await
+        .expect_err("closed shard mailbox rejects append");
+    assert_rejection(&recorder, "queue", 1);
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// The production lifecycle gate emits exactly one bounded closed rejection.
+#[tokio::test(flavor = "current_thread")]
+async fn scribe_closed_rejection_emits_exact_owner_reason() {
+    let recorder = wyrd_bench::BenchmarkRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let (_wal, scribe) = scribe(&wal_root, NodeId::new(Uuid::now_v7()));
+    scribe
+        .closed
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let error = append(&scribe, DataTenantId::new_v7(), "closed", Uuid::now_v7())
+        .await
+        .expect_err("closed lifecycle rejects append");
+    assert!(matches!(error, ScribeError::IngressClosed));
+    assert_rejection(&recorder, "closed", 1);
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// The production request-size branch emits exactly one bounded invalid rejection.
+#[tokio::test(flavor = "current_thread")]
+async fn scribe_invalid_rejection_emits_exact_owner_reason() {
+    let recorder = wyrd_bench::BenchmarkRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let (_wal, scribe) = scribe(&wal_root, NodeId::new(Uuid::now_v7()));
+
+    let error = append_measured(
+        &scribe,
+        DataTenantId::new_v7(),
+        "invalid",
+        Uuid::now_v7(),
+        crate::scribe::admission::MAX_REQUEST_BYTES + 1,
+    )
+    .await
+    .expect_err("oversized request rejects append");
+    assert!(matches!(error, ScribeError::PayloadTooLarge { .. }));
+    assert_rejection(&recorder, "invalid", 1);
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
 /// Concurrent and sequential shutdown callers share one completed drain.
 #[tokio::test]
 /// Repeated shutdown shares one completion and releases every retained owner.

@@ -848,7 +848,11 @@ impl OracleAdmission {
         let pending = match self.slots.try_pending() {
             Ok(pending) => pending,
             Err(error) => {
-                OracleTelemetry::record_admission_rejection("cluster", query_class);
+                OracleTelemetry::record_admission_rejection(
+                    "cluster",
+                    "pending_limit",
+                    query_class,
+                );
                 waiter.finish("cluster", "rejected");
                 return Err(error);
             }
@@ -879,7 +883,7 @@ impl OracleAdmission {
                     }
                 }
                 let scope = admission_scope_label(scope);
-                OracleTelemetry::record_admission_rejection(scope, query_class);
+                OracleTelemetry::record_admission_rejection(scope, "lease_capacity", query_class);
                 waiter.finish(scope, "rejected");
                 Err(BifrostError::QueryAdmissionRejected)
             }
@@ -899,7 +903,11 @@ impl OracleAdmission {
                     }
                     Err(error) => {
                         OracleTelemetry::record_slot_reservation(query_class, "rejected");
-                        OracleTelemetry::record_admission_rejection("cluster", query_class);
+                        OracleTelemetry::record_admission_rejection(
+                            "cluster",
+                            "local_slots",
+                            query_class,
+                        );
                         let leader = RoleFence {
                             node_id: local_node,
                             fencing_token: self.local_role.fencing_token,

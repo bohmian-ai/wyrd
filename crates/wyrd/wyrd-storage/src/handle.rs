@@ -87,6 +87,9 @@ impl StorageHandle {
 
     /// Assemble a handle from its substrate parts with default tuning.
     fn assemble(signer: BackendSigner, operator: Operator, backend_config: BackendConfig) -> Self {
+        let operator = operator.layer(crate::telemetry::StorageTelemetryLayer::new(
+            backend_config.kind(),
+        ));
         Self {
             signer,
             operator,
@@ -149,6 +152,9 @@ impl StorageHandle {
         let operator = crate::factory::build_operator(&settings.backend)?;
         crate::preflight::run(&signer).await;
 
+        let operator = operator.layer(crate::telemetry::StorageTelemetryLayer::new(
+            settings.backend.kind(),
+        ));
         Ok(Arc::new(Self {
             signer,
             operator,

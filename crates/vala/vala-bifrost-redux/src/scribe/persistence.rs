@@ -485,6 +485,7 @@ impl PersistenceRuntime {
                 self.queued.fetch_sub(1, Ordering::AcqRel);
                 self.queued_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
                 metrics::counter!("bifrost_scribe_persistence_queue_rejections_total").increment(1);
+                super::record_scribe_rejection("queue");
                 Err(job)
             }
         }

@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use arrow::array::{Array, UInt8Array, UInt32Array};
 use arrow::compute::{cast, take};
@@ -32,9 +35,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    SendableRecordBatchStream, execute_stream,
+    RecordBatchStream, SendableRecordBatchStream, execute_stream,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use iceberg::io::FileIO;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -58,6 +61,92 @@ const SOURCE_TIER_COLUMN: &str = "__wyrd_oracle_source_tier";
 const HOT_BATCH_ROWS: usize = 8_192;
 /// Fixed spill partition count bounding exact reconciliation skew.
 const RECONCILE_SPILL_PARTITIONS: usize = 32;
+
+/// Poll-enclosing lifecycle for one Oracle source or reconciliation stream.
+struct OracleStreamLifecycle<S> {
+    /// Stream whose entire poll is enclosed by the exact production span.
+    inner: Pin<Box<S>>,
+    /// Schema forwarded through the `RecordBatchStream` contract.
+    schema: SchemaRef,
+    /// Exact span entered before every child poll.
+    span: tracing::Span,
+    /// Optional closed source label for source-operation telemetry.
+    source: Option<&'static str>,
+    /// Monotonic start covering pending time and every poll.
+    started: Instant,
+    /// Whether a terminal outcome was already emitted.
+    finished: bool,
+}
+
+impl<S> OracleStreamLifecycle<S> {
+    /// Wrap one stream before its first poll.
+    fn new(
+        stream: S,
+        schema: SchemaRef,
+        span: tracing::Span,
+        source: Option<&'static str>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            schema,
+            span,
+            source,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    /// Emit one exact terminal outcome and disarm cancellation-on-drop.
+    fn finish(&mut self, outcome: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.span.record("outcome", outcome);
+        if let Some(source) = self.source {
+            metrics::histogram!("bifrost_oracle_source_operation_seconds", "source" => source, "outcome" => outcome)
+                .record(self.started.elapsed().as_secs_f64());
+        }
+        self.finished = true;
+    }
+}
+
+impl<S> Stream for OracleStreamLifecycle<S>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>>,
+{
+    type Item = DataFusionResult<RecordBatch>;
+
+    /// Poll the complete child operation inside its exact production span.
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let span = self.span.clone();
+        let polled = span.in_scope(|| self.inner.as_mut().poll_next(context));
+        match &polled {
+            Poll::Ready(Some(Err(_))) => self.finish("failed"),
+            Poll::Ready(None) => self.finish("success"),
+            Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
+        }
+        polled
+    }
+}
+
+impl<S> RecordBatchStream for OracleStreamLifecycle<S>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>> + Send,
+{
+    /// Forward the child stream schema unchanged.
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl<S> Drop for OracleStreamLifecycle<S> {
+    /// Record cancellation when the consumer drops before exhaustion or error.
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish("cancelled");
+        }
+    }
+}
 
 /// One validated immutable hot-file source selected by the pinned cut.
 #[derive(Debug, Clone)]
@@ -425,9 +514,17 @@ impl ExecutionPlan for SourceTagExec {
             columns.push(Arc::new(UInt8Array::from_value(tier, batch.num_rows())));
             RecordBatch::try_new(Arc::clone(&schema), columns).map_err(DataFusionError::from)
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema(),
+        let output_schema = self.schema();
+        let span = tracing::info_span!(
+            "bifrost.oracle.source",
+            source,
+            outcome = tracing::field::Empty
+        );
+        Ok(Box::pin(OracleStreamLifecycle::new(
             stream,
+            output_schema,
+            span,
+            Some(source),
         )))
     }
 }
@@ -732,8 +829,11 @@ impl ExecutionPlan for ReconcileExec {
         let schema = self.schema();
         let memory = self.memory.clone();
         let telemetry = self.telemetry.clone();
-        let _reconcile_span =
-            tracing::info_span!("bifrost.oracle.reconcile", operator = "exact_identity");
+        let reconcile_span = tracing::info_span!(
+            "bifrost.oracle.reconcile",
+            operator = "exact_identity",
+            outcome = tracing::field::Empty
+        );
         let stream = async_stream::try_stream! {
             let mut winners: BTreeMap<RowIdentity, ReconciledRow> = BTreeMap::new();
             let mut reservations: Vec<ReconcileMemoryReservation> = Vec::new();
@@ -807,7 +907,12 @@ impl ExecutionPlan for ReconcileExec {
             }
             drop(reservations);
         };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(Box::pin(OracleStreamLifecycle::new(
+            stream,
+            schema,
+            reconcile_span,
+            None,
+        )))
     }
 }
 
@@ -1623,6 +1728,10 @@ impl SourceTier {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use super::*;
     use crate::oracle::{BifrostQueryReadDecision, OracleSlotManager};
     use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, Int32Array, Int64Array, StringArray};
@@ -1636,6 +1745,302 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::AuthMethod;
+
+    /// Minimal single-thread subscriber exposing the currently entered span.
+    #[derive(Default)]
+    struct PollCaptureSubscriber {
+        /// Monotonic span identifier source.
+        next: AtomicU64,
+        /// Metadata retained for each live test span.
+        metadata: Mutex<HashMap<u64, &'static tracing::Metadata<'static>>>,
+        /// Entered span stack for the manually polled test thread.
+        entered: Mutex<Vec<tracing::span::Id>>,
+        /// Span names observed on subscriber entry around child polls.
+        observed: Arc<Mutex<Vec<String>>>,
+        /// Exact field updates retained with their owning span name.
+        records: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    /// Visitor retaining exact field values recorded on one Oracle span.
+    struct SpanFieldVisitor<'a> {
+        /// Owning span name resolved from the subscriber registry.
+        span: &'a str,
+        /// Shared terminal-record sink.
+        records: &'a Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl tracing::field::Visit for SpanFieldVisitor<'_> {
+        /// Retain string fields without debug quoting.
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.records.lock().expect("span records").push((
+                self.span.to_owned(),
+                field.name().to_owned(),
+                value.to_owned(),
+            ));
+        }
+
+        /// Retain non-string fields using tracing's canonical debug representation.
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.records.lock().expect("span records").push((
+                self.span.to_owned(),
+                field.name().to_owned(),
+                format!("{value:?}"),
+            ));
+        }
+    }
+
+    impl tracing::Subscriber for PollCaptureSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            self.metadata
+                .lock()
+                .expect("span metadata")
+                .insert(id, attributes.metadata());
+            tracing::span::Id::from_u64(id)
+        }
+        fn record(&self, id: &tracing::span::Id, record: &tracing::span::Record<'_>) {
+            let span = self.metadata.lock().expect("span metadata")[&id.into_u64()]
+                .name()
+                .to_owned();
+            record.record(&mut SpanFieldVisitor {
+                span: &span,
+                records: &self.records,
+            });
+        }
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, id: &tracing::span::Id) {
+            let name = self.metadata.lock().expect("span metadata")[&id.into_u64()]
+                .name()
+                .to_owned();
+            self.observed.lock().expect("observed spans").push(name);
+            self.entered.lock().expect("entered spans").push(id.clone());
+        }
+        fn exit(&self, id: &tracing::span::Id) {
+            let popped = self.entered.lock().expect("entered spans").pop();
+            assert_eq!(popped.as_ref(), Some(id));
+        }
+    }
+
+    /// Deterministic child stream that exposes one pending poll before its terminal result.
+    struct PendingChild {
+        /// Child schema forwarded by the lifecycle wrapper.
+        schema: SchemaRef,
+        /// Terminal item returned after the first pending poll.
+        item: Option<DataFusionResult<RecordBatch>>,
+        /// Whether the deliberate pending poll already occurred.
+        pending_observed: bool,
+        /// Test-controlled terminal release.
+        ready: Arc<AtomicBool>,
+    }
+
+    impl Stream for PendingChild {
+        type Item = DataFusionResult<RecordBatch>;
+
+        /// Return one pending poll, then the configured item, then EOF.
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if !self.pending_observed || !self.ready.load(Ordering::Acquire) {
+                self.pending_observed = true;
+                return Poll::Pending;
+            }
+            Poll::Ready(self.item.take())
+        }
+    }
+
+    impl RecordBatchStream for PendingChild {
+        /// Forward the deterministic child schema.
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    /// Poll one lifecycle manually without timing-dependent synchronization.
+    fn poll_lifecycle<S: Stream<Item = DataFusionResult<RecordBatch>>>(
+        lifecycle: Pin<&mut OracleStreamLifecycle<S>>,
+    ) -> Poll<Option<DataFusionResult<RecordBatch>>> {
+        let waker = futures_util::task::noop_waker();
+        lifecycle.poll_next(&mut Context::from_waker(&waker))
+    }
+
+    /// Assert one exact terminal outcome was recorded on a named Oracle span.
+    fn assert_span_outcome(
+        records: &Mutex<Vec<(String, String, String)>>,
+        span: &str,
+        outcome: &str,
+    ) {
+        assert!(
+            records.lock().expect("span records").iter().any(
+                |record| record == &(span.to_owned(), "outcome".to_owned(), outcome.to_owned())
+            ),
+            "missing {span} outcome={outcome}"
+        );
+    }
+
+    /// Pending source and reconcile children record exact success spans and elapsed work.
+    #[test]
+    fn oracle_stream_lifecycle_records_pending_source_and_reconcile_success() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = PollCaptureSubscriber {
+            observed: Arc::clone(&observed),
+            records: Arc::clone(&records),
+            ..PollCaptureSubscriber::default()
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            metrics::with_local_recorder(&recorder, || {
+                let schema = Arc::new(Schema::empty());
+                let batch = RecordBatch::new_empty(Arc::clone(&schema));
+                let source_ready = Arc::new(AtomicBool::new(false));
+                let mut successful = Box::pin(OracleStreamLifecycle::new(
+                    PendingChild {
+                        schema: Arc::clone(&schema),
+                        item: Some(Ok(batch)),
+                        pending_observed: false,
+                        ready: Arc::clone(&source_ready),
+                    },
+                    Arc::clone(&schema),
+                    tracing::info_span!("bifrost.oracle.source", outcome = tracing::field::Empty),
+                    Some("live_tail"),
+                ));
+                assert!(matches!(poll_lifecycle(successful.as_mut()), Poll::Pending));
+                source_ready.store(true, Ordering::Release);
+                assert!(matches!(
+                    poll_lifecycle(successful.as_mut()),
+                    Poll::Ready(Some(Ok(_)))
+                ));
+                assert!(matches!(
+                    poll_lifecycle(successful.as_mut()),
+                    Poll::Ready(None)
+                ));
+
+                let reconcile_ready = Arc::new(AtomicBool::new(false));
+                let mut reconciled = Box::pin(OracleStreamLifecycle::new(
+                    PendingChild {
+                        schema: Arc::clone(&schema),
+                        item: None,
+                        pending_observed: false,
+                        ready: Arc::clone(&reconcile_ready),
+                    },
+                    Arc::clone(&schema),
+                    tracing::info_span!(
+                        "bifrost.oracle.reconcile",
+                        outcome = tracing::field::Empty
+                    ),
+                    None,
+                ));
+                assert!(matches!(poll_lifecycle(reconciled.as_mut()), Poll::Pending));
+                reconcile_ready.store(true, Ordering::Release);
+                assert!(matches!(
+                    poll_lifecycle(reconciled.as_mut()),
+                    Poll::Ready(None)
+                ));
+            });
+        });
+        let observed = observed.lock().expect("observed poll spans");
+        assert!(observed.iter().any(|name| name == "bifrost.oracle.source"));
+        assert!(
+            observed
+                .iter()
+                .any(|name| name == "bifrost.oracle.reconcile")
+        );
+        assert_span_outcome(&records, "bifrost.oracle.source", "success");
+        assert_span_outcome(&records, "bifrost.oracle.reconcile", "success");
+        let snapshot = recorder.snapshot();
+        assert!(
+            snapshot
+                .histograms
+                .get("bifrost_oracle_source_operation_seconds{outcome=\"success\",source=\"live_tail\"}")
+                .is_some_and(|value| value.max > 0)
+        );
+    }
+
+    /// A pending child failure records the exact span outcome and preserves its error.
+    #[test]
+    fn oracle_stream_lifecycle_records_failed_child() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = PollCaptureSubscriber {
+            records: Arc::clone(&records),
+            ..PollCaptureSubscriber::default()
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            metrics::with_local_recorder(&recorder, || {
+                let schema = Arc::new(Schema::empty());
+                let ready = Arc::new(AtomicBool::new(false));
+                let mut failed = Box::pin(OracleStreamLifecycle::new(
+                    PendingChild {
+                        schema: Arc::clone(&schema),
+                        item: Some(Err(DataFusionError::Execution("child failure".to_owned()))),
+                        pending_observed: false,
+                        ready: Arc::clone(&ready),
+                    },
+                    schema,
+                    tracing::info_span!("bifrost.oracle.source", outcome = tracing::field::Empty),
+                    Some("hot_sealed"),
+                ));
+                assert!(matches!(poll_lifecycle(failed.as_mut()), Poll::Pending));
+                ready.store(true, Ordering::Release);
+                let error = match poll_lifecycle(failed.as_mut()) {
+                    Poll::Ready(Some(Err(error))) => error,
+                    other => panic!("expected unchanged child error, got {other:?}"),
+                };
+                assert_eq!(error.to_string(), "Execution error: child failure");
+            });
+        });
+        assert_span_outcome(&records, "bifrost.oracle.source", "failed");
+        assert_eq!(
+            recorder
+                .snapshot()
+                .histograms
+                .get("bifrost_oracle_source_operation_seconds{outcome=\"failed\",source=\"hot_sealed\"}")
+                .map(|value| value.count),
+            Some(1)
+        );
+    }
+
+    /// Dropping a polled pending child records the exact cancelled span outcome.
+    #[test]
+    fn oracle_stream_lifecycle_records_cancelled_child() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = PollCaptureSubscriber {
+            records: Arc::clone(&records),
+            ..PollCaptureSubscriber::default()
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            metrics::with_local_recorder(&recorder, || {
+                let schema = Arc::new(Schema::empty());
+                let mut cancelled = Box::pin(OracleStreamLifecycle::new(
+                    PendingChild {
+                        schema: Arc::clone(&schema),
+                        item: None,
+                        pending_observed: false,
+                        ready: Arc::new(AtomicBool::new(false)),
+                    },
+                    schema,
+                    tracing::info_span!("bifrost.oracle.source", outcome = tracing::field::Empty),
+                    Some("iceberg"),
+                ));
+                assert!(matches!(poll_lifecycle(cancelled.as_mut()), Poll::Pending));
+                drop(cancelled);
+            });
+        });
+        assert_span_outcome(&records, "bifrost.oracle.source", "cancelled");
+        assert_eq!(
+            recorder
+                .snapshot()
+                .histograms
+                .get(
+                    "bifrost_oracle_source_operation_seconds{outcome=\"cancelled\",source=\"iceberg\"}",
+                )
+                .map(|value| value.count),
+            Some(1)
+        );
+    }
 
     /// In-memory audit sink used only to inspect physical plan structure.
     struct NoopAudit;

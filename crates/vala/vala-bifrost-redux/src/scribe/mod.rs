@@ -783,6 +783,12 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
+        metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
+        for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
+            metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
+        }
+        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
+            .set(wal.bytes_on_disk().to_f64().unwrap_or(f64::MAX));
         Self {
             operator,
             wal,
@@ -1257,10 +1263,36 @@ impl Scribe for ScribeImpl {
     // Keep this method as the Gate→Scribe composition seam. It prepares the
     // request before dispatch and waits for the shard's durable completion.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
+        let active = metrics::gauge!("bifrost_scribe_ingress_active");
+        active.increment(1.0);
+        let _active = ScribeIngressTelemetryGuard(active);
         if !self.is_ready() {
+            record_scribe_rejection("closed");
             return Err(ScribeError::IngressClosed);
         }
-        let admission = self.prepare_and_dispatch(frame).await?;
+        let admission = self
+            .prepare_and_dispatch(frame)
+            .await
+            .inspect_err(|error| {
+                let reason = match error {
+                    ScribeError::UnsupportedWalVersion { .. } => Some("wal"),
+                    ScribeError::PayloadTooLarge { .. }
+                    | ScribeError::TooManyRows { .. }
+                    | ScribeError::InvalidFrame
+                    | ScribeError::FingerprintMismatch { .. }
+                    | ScribeError::CardScopeDenied
+                    | ScribeError::CardUnresolved
+                    | ScribeError::StreamMismatch { .. } => Some("invalid"),
+                    ScribeError::IngressClosed
+                    | ScribeError::WalDiskFull
+                    | ScribeError::IngestBusy { .. }
+                    | ScribeError::ObjectStorePutFailed(_)
+                    | ScribeError::Internal { .. } => None,
+                };
+                if let Some(reason) = reason {
+                    record_scribe_rejection(reason);
+                }
+            })?;
         #[cfg(feature = "test-support")]
         self.publication_observer
             .record(ScribePublicationEvent::Acknowledged {
@@ -1268,6 +1300,47 @@ impl Scribe for ScribeImpl {
                 rows: admission.rows_accepted,
             });
         Ok(admission)
+    }
+}
+
+/// Record one Scribe admission rejection using only closed owner labels.
+fn record_scribe_rejection(reason: &'static str) {
+    metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(1);
+}
+
+/// Drop guard that drains the Scribe active-ingress gauge on every exit.
+struct ScribeIngressTelemetryGuard(metrics::Gauge);
+
+impl Drop for ScribeIngressTelemetryGuard {
+    /// Release one active ingress ownership unit.
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    /// Dropping the ingress owner drains its exact active gauge without identity labels.
+    #[test]
+    fn ingress_telemetry_guard_cancellation_drains_active_zero() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let active = metrics::gauge!("bifrost_scribe_ingress_active");
+            active.increment(1.0);
+            drop(super::ScribeIngressTelemetryGuard(active));
+        });
+        let snapshot = recorder.snapshot();
+        assert!(
+            snapshot
+                .gauges
+                .get("bifrost_scribe_ingress_active")
+                .is_some_and(|value| value.abs() <= f64::EPSILON)
+        );
+        assert!(!snapshot.gauges.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
     }
 }
 

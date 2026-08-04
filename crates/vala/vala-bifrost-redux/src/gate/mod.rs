@@ -133,6 +133,12 @@ fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: 
     .record(elapsed.as_secs_f64());
 }
 
+/// Record one typed Gate rejection without exposing request identity.
+fn record_gate_rejection(operation: &'static str, reason: &'static str) {
+    metrics::counter!("bifrost_gate_rejections_total", "operation" => operation, "reason" => reason)
+        .increment(1);
+}
+
 /// Owns exactly one terminal Gate request metric across return or cancellation.
 struct GateRequestLifecycle {
     /// Closed D24 operation label for this request.
@@ -141,15 +147,20 @@ struct GateRequestLifecycle {
     started: std::time::Instant,
     /// Whether a normal return already emitted the terminal metric.
     completed: bool,
+    /// Active-request gauge drained on every terminal path.
+    active: metrics::Gauge,
 }
 
 impl GateRequestLifecycle {
     /// Begin one request lifecycle at the transport entry point.
     fn begin(operation: &'static str) -> Self {
+        let active = metrics::gauge!("bifrost_gate_active_requests", "operation" => operation);
+        active.increment(1.0);
         Self {
             operation,
             started: std::time::Instant::now(),
             completed: false,
+            active,
         }
     }
 
@@ -166,6 +177,7 @@ impl Drop for GateRequestLifecycle {
         if !self.completed {
             record_gate_request(self.operation, "cancelled", self.started.elapsed());
         }
+        self.active.decrement(1.0);
     }
 }
 
@@ -184,6 +196,17 @@ fn initialize_gate_metrics() {
         "bifrost_gate_active_streams",
         "Current authorized and admitted Bifrost Gate query streams."
     );
+    metrics::describe_gauge!(
+        "bifrost_gate_active_requests",
+        "Current Bifrost Gate requests by closed operation."
+    );
+    metrics::describe_counter!(
+        "bifrost_gate_rejections_total",
+        "Total rejected Bifrost Gate requests by operation and closed reason."
+    );
+    for operation in ["write", "query"] {
+        metrics::gauge!("bifrost_gate_active_requests", "operation" => operation).set(0.0);
+    }
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
 }
 
@@ -344,7 +367,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
-        let started = std::time::Instant::now();
+        let request_lifecycle = GateRequestLifecycle::begin("query");
         let Some(oracle) = &self.oracle else {
             metrics::counter!(
                 "bifrost_gate_role_unavailable_total",
@@ -352,7 +375,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 "reason" => "not_configured"
             )
             .increment(1);
-            record_gate_request("query", "rejected", started.elapsed());
+            record_gate_rejection("query", "role_unavailable");
+            request_lifecycle.complete("rejected");
             return Err(BifrostError::OracleRoleUnavailable);
         };
         if !oracle.is_ready() {
@@ -362,12 +386,16 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 "reason" => "not_ready"
             )
             .increment(1);
-            record_gate_request("query", "rejected", started.elapsed());
+            record_gate_rejection("query", "role_unavailable");
+            request_lifecycle.complete("rejected");
             return Err(BifrostError::OracleRoleUnavailable);
         }
         metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").increment(1.0);
         let lifecycle = Arc::new(QueryStreamLifecycle::new(|outcome, elapsed| {
-            record_gate_request("query", outcome, elapsed);
+            metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome)
+                .increment(1);
+            metrics::histogram!("bifrost_gate_query_stream_duration_seconds", "outcome" => outcome)
+                .record(elapsed.as_secs_f64());
             metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").decrement(1.0);
         }));
         let result = oracle
@@ -377,8 +405,15 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 operation = "query"
             ))
             .await;
-        if result.is_err() {
+        if matches!(&result, Err(BifrostError::QueryAdmissionRejected)) {
+            record_gate_rejection("query", "oracle_admission");
+            lifecycle.finish("rejected");
+            request_lifecycle.complete("rejected");
+        } else if result.is_err() {
             lifecycle.finish("failed");
+            request_lifecycle.complete("failed");
+        } else {
+            request_lifecycle.complete("success");
         }
         result
     }
@@ -747,12 +782,47 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             let auth = self
                 .authenticate(request.metadata())
                 .await
+                .inspect_err(|_| record_gate_rejection("write", "auth"))
                 .map_err(Status::from)?;
             let frame = request.into_inner();
-            validate_batch(&frame, &self.limits).map_err(Status::from)?;
+            validate_batch(&frame, &self.limits)
+                .inspect_err(|error| {
+                    record_gate_rejection(
+                        "write",
+                        match error {
+                            IngestError::PayloadTooLarge { .. } => "payload_limit",
+                            _ => "validation",
+                        },
+                    );
+                })
+                .map_err(Status::from)?;
             self.dispatch_native_frame(&self.limits, &auth, frame.clone())
                 .await
-                .inspect_err(|_error| record_gate_event("native_rejection"))
+                .inspect_err(|error| {
+                    record_gate_event("native_rejection");
+                    let reason = match error {
+                        IngestError::RbacDenied { .. }
+                        | IngestError::ReservedBuiltinWriteDenied { .. }
+                        | IngestError::CardScopeDenied { .. }
+                        | IngestError::CardUnresolved { .. } => "permission",
+                        IngestError::PayloadTooLarge { .. } => "payload_limit",
+                        IngestError::RequestValidation(_)
+                        | IngestError::Decode(_)
+                        | IngestError::TooManyRows { .. } => "validation",
+                        IngestError::TableNotFound { .. } | IngestError::SchemaMismatch { .. } => {
+                            "catalog"
+                        }
+                        IngestError::IngressClosed => "role_unavailable",
+                        IngestError::IngestBusy { .. } | IngestError::WalDiskFull => {
+                            "scribe_admission"
+                        }
+                        IngestError::Unauthenticated(_) | IngestError::PrincipalUnresolved => {
+                            "auth"
+                        }
+                        IngestError::Internal(_) => return,
+                    };
+                    record_gate_rejection("write", reason);
+                })
                 .map_err(Status::from)?;
             let mut response = Response::new(InsertBatchResponse {
                 wyrd_batch_id: frame.wyrd_batch_id,
@@ -916,13 +986,16 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
+    /// One exact Gate family description captured during owner initialization.
+    type GateMetricDescription = (String, String, Option<metrics::Unit>, String);
+
     /// Recorder that observes boot descriptions while retaining normal metric behavior.
     #[derive(Debug, Default)]
     struct GateBootRecorder {
         /// Standard recorder used to verify family registration and initial values.
         metrics: wyrd_bench::BenchmarkRecorder,
         /// Exact kind, family, unit, and help text emitted during initialization.
-        descriptions: Mutex<Vec<(String, String, Option<metrics::Unit>, String)>>,
+        descriptions: Mutex<Vec<GateMetricDescription>>,
     }
 
     impl metrics::Recorder for GateBootRecorder {
@@ -1038,6 +1111,19 @@ mod tests {
                     "bifrost_gate_active_streams".to_owned(),
                     None,
                     "Current authorized and admitted Bifrost Gate query streams.".to_owned(),
+                ),
+                (
+                    "gauge".to_owned(),
+                    "bifrost_gate_active_requests".to_owned(),
+                    None,
+                    "Current Bifrost Gate requests by closed operation.".to_owned(),
+                ),
+                (
+                    "counter".to_owned(),
+                    "bifrost_gate_rejections_total".to_owned(),
+                    None,
+                    "Total rejected Bifrost Gate requests by operation and closed reason."
+                        .to_owned(),
                 ),
             ]
         );
@@ -1445,5 +1531,49 @@ mod tests {
             .expect_err("Gate must fail closed while Scribe recovery is incomplete");
         assert!(matches!(error, IngestError::IngressClosed));
         assert_eq!(projection_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// Query request lifecycles emit one exact terminal and drain active work.
+    #[test]
+    fn query_request_lifecycle_reconciles_exact_terminal_outcomes() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            for outcome in ["success", "rejected", "failed"] {
+                let lifecycle = super::GateRequestLifecycle::begin("query");
+                while lifecycle.started.elapsed().as_micros() == 0 {
+                    std::hint::spin_loop();
+                }
+                lifecycle.complete(outcome);
+            }
+            let cancelled = super::GateRequestLifecycle::begin("query");
+            while cancelled.started.elapsed().as_micros() == 0 {
+                std::hint::spin_loop();
+            }
+            drop(cancelled);
+        });
+        let snapshot = recorder.snapshot();
+        for outcome in ["success", "rejected", "failed", "cancelled"] {
+            assert_eq!(
+                snapshot.counters.get(&format!(
+                    "bifrost_gate_requests_total{{operation=\"query\",outcome=\"{outcome}\"}}"
+                )),
+                Some(&1)
+            );
+            assert_eq!(
+                snapshot
+                    .histograms
+                    .get(&format!(
+                        "bifrost_gate_request_duration_seconds{{operation=\"query\",outcome=\"{outcome}\"}}"
+                    ))
+                    .map(|histogram| histogram.count),
+                Some(1)
+            );
+        }
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_gate_active_requests{operation=\"query\"}"),
+            Some(&0.0)
+        );
     }
 }

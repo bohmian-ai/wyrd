@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
@@ -31,6 +32,25 @@ use crate::contracts::ScribeError;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::stream_identity::StreamIdentity;
 
+/// Record one physical WAL append attempt while preserving its original result.
+fn record_wal_append(result: &Result<(), ScribeError>, bytes: usize, started: Instant) {
+    let outcome = if result.is_ok() { "success" } else { "failed" };
+    metrics::counter!("bifrost_scribe_wal_append_total", "outcome" => outcome).increment(1);
+    metrics::histogram!("bifrost_scribe_wal_append_seconds", "outcome" => outcome)
+        .record(started.elapsed().as_secs_f64());
+    if result.is_ok() {
+        metrics::counter!("bifrost_scribe_wal_append_bytes_total").increment(bytes as u64);
+    }
+}
+
+/// Record one physical WAL fsync attempt while preserving its original result.
+fn record_wal_fsync(result: &Result<(), ScribeError>, started: Instant) {
+    let outcome = if result.is_ok() { "success" } else { "failed" };
+    metrics::counter!("bifrost_scribe_wal_fsync_total", "outcome" => outcome).increment(1);
+    metrics::histogram!("bifrost_scribe_wal_fsync_seconds", "outcome" => outcome)
+        .record(started.elapsed().as_secs_f64());
+}
+
 #[cfg(test)]
 static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
@@ -38,6 +58,7 @@ thread_local! {
     static WAL_ENCODE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_WALK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WAL_RECOVERY_SYNC_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 static WAL_FAULT_LOCK: Mutex<()> = Mutex::new(());
@@ -1199,12 +1220,16 @@ impl WalSegment {
 
     /// Append a record to the segment without forcing it to stable storage.
     pub fn append(&self, record: &WalRecord) -> Result<(), ScribeError> {
+        let span =
+            tracing::info_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
+        let _entered = span.enter();
         let encoded = record.encode();
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (append)".to_string(),
         })?;
 
-        file.write_all(&encoded).map_err(|e| {
+        let started = Instant::now();
+        let result = file.write_all(&encoded).map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
                 ScribeError::WalDiskFull
             } else {
@@ -1212,33 +1237,53 @@ impl WalSegment {
                     detail: format!("WAL record write failed: {e}"),
                 }
             }
-        })?;
-        Ok(())
+        });
+        record_wal_append(&result, encoded.len(), started);
+        span.record("outcome", if result.is_ok() { "success" } else { "failed" });
+        result
     }
 
     fn append_encoded(&self, encoded: &[u8]) -> Result<(), ScribeError> {
+        let span =
+            tracing::info_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
+        let _entered = span.enter();
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (append)".to_string(),
         })?;
         #[cfg(test)]
         if WAL_PARTIAL_WRITE.with(|flag| flag.replace(false)) {
             let prefix = encoded.len().max(1) / 2;
-            file.write_all(&encoded[..prefix])
-                .map_err(|e| wal_io_error("WAL partial record write failed", &e))?;
-            return Err(ScribeError::Internal {
-                detail: "injected partial WAL write".to_owned(),
-            });
+            let started = Instant::now();
+            let result = file
+                .write_all(&encoded[..prefix])
+                .map_err(|e| wal_io_error("WAL partial record write failed", &e))
+                .and_then(|()| {
+                    Err(ScribeError::Internal {
+                        detail: "injected partial WAL write".to_owned(),
+                    })
+                });
+            record_wal_append(&result, encoded.len(), started);
+            span.record("outcome", "failed");
+            return result;
         }
-        file.write_all(encoded)
-            .map_err(|e| wal_io_error("WAL record write failed", &e))
+        let started = Instant::now();
+        let result = file
+            .write_all(encoded)
+            .map_err(|e| wal_io_error("WAL record write failed", &e));
+        record_wal_append(&result, encoded.len(), started);
+        span.record("outcome", if result.is_ok() { "success" } else { "failed" });
+        result
     }
 
     /// Force all appended data for this segment to stable storage.
     pub fn sync_data(&self) -> Result<(), ScribeError> {
+        let span = tracing::info_span!("bifrost.scribe.wal.fsync", outcome = tracing::field::Empty);
+        let _entered = span.enter();
         let file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (sync_data)".to_string(),
         })?;
-        file.sync_data().map_err(|e| {
+        let started = Instant::now();
+        let result = file.sync_data().map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
                 ScribeError::WalDiskFull
             } else {
@@ -1246,7 +1291,10 @@ impl WalSegment {
                     detail: format!("WAL data sync failed: {e}"),
                 }
             }
-        })
+        });
+        record_wal_fsync(&result, started);
+        span.record("outcome", if result.is_ok() { "success" } else { "failed" });
+        result
     }
 
     /// Append a record and force it to stable storage.
@@ -1297,9 +1345,14 @@ impl WalSegment {
                                     "WAL non-monotonic tail truncation failed: {error}"
                                 ),
                             })?;
-                        file.sync_data().map_err(|error| ScribeError::Internal {
+                        let started = Instant::now();
+                        #[cfg(test)]
+                        WAL_RECOVERY_SYNC_COUNT.with(|count| count.set(count.get() + 1));
+                        let sync_result = file.sync_data().map_err(|error| ScribeError::Internal {
                             detail: format!("WAL non-monotonic tail sync failed: {error}"),
-                        })?;
+                        });
+                        record_wal_fsync(&sync_result, started);
+                        sync_result?;
                         break;
                     }
                     previous_lsn = Some(record.lsn);
@@ -1311,9 +1364,14 @@ impl WalSegment {
                         .map_err(|error| ScribeError::Internal {
                             detail: format!("WAL torn-tail truncation failed: {error}"),
                         })?;
-                    file.sync_data().map_err(|error| ScribeError::Internal {
+                    let started = Instant::now();
+                    #[cfg(test)]
+                    WAL_RECOVERY_SYNC_COUNT.with(|count| count.set(count.get() + 1));
+                    let sync_result = file.sync_data().map_err(|error| ScribeError::Internal {
                         detail: format!("WAL torn-tail sync failed: {error}"),
-                    })?;
+                    });
+                    record_wal_fsync(&sync_result, started);
+                    sync_result?;
                     break;
                 }
             }
@@ -1630,6 +1688,8 @@ impl WalWriter {
             return Err(error);
         }
         self.disk.add_bytes(encoded_bytes);
+        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
+            .set(self.bytes_on_disk().to_f64().unwrap_or(f64::MAX));
         state.current_segment_size = state.current_segment_size.saturating_add(encoded_bytes);
         state.current_segment_records = state.current_segment_records.saturating_add(1);
         Ok(WalAppendResult {
@@ -1654,11 +1714,14 @@ impl WalWriter {
     }
 
     fn sync_segments_with_fault(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
+        let _ = self;
         #[cfg(any(test, feature = "test-support"))]
         if self.disk.take_sync_failure() {
-            return Err(ScribeError::Internal {
+            let result = Err(ScribeError::Internal {
                 detail: "injected WAL sync failure".to_owned(),
             });
+            record_wal_fsync(&result, Instant::now());
+            return result;
         }
         Self::sync_segments(segments)
     }
@@ -1900,6 +1963,8 @@ impl WalWriter {
                 }
             }
         }
+        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
+            .set(self.bytes_on_disk().to_f64().unwrap_or(f64::MAX));
         Ok(())
     }
 
@@ -2242,6 +2307,55 @@ mod tests {
         let decoded = decode_slice_payload(&records[0].payload).expect("slice");
         assert_eq!(decoded.audit, b"audit");
         assert_eq!(decoded.data, b"data");
+    }
+
+    /// A durable append owns one successful append and fsync observation.
+    #[test]
+    fn wal_append_and_fsync_emit_truthful_owner_metrics() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let directory = TempDir::new().expect("temporary WAL directory");
+            let writer = WalWriter::new(
+                directory.path(),
+                [7; 16],
+                1,
+                WalConfig::new(1024 * 1024).expect("valid WAL config"),
+            )
+            .expect("WAL writer");
+            writer
+                .append_and_fsync_for_test(
+                    &test_seal_key(crate::test_support::tenant()),
+                    [3; 16],
+                    b"audit",
+                    b"data",
+                )
+                .expect("durable append");
+        });
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_wal_append_total{outcome=\"success\"}"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_wal_fsync_total{outcome=\"success\"}"),
+            Some(&1)
+        );
+        assert!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_wal_append_bytes_total")
+                .is_some_and(|bytes| *bytes > 0)
+        );
+        assert!(
+            snapshot
+                .gauges
+                .get("bifrost_scribe_wal_disk_bytes")
+                .is_some_and(|bytes| *bytes > 0.0)
+        );
     }
 
     #[test]
@@ -2845,5 +2959,90 @@ mod tests {
         writer
             .append_and_fsync_for_test(&key, [7; 16], b"audit", b"data")
             .expect("state lock and later append remain usable");
+    }
+
+    /// Physical append and fsync failures retain errors and exact failed evidence.
+    #[test]
+    fn wal_injected_failures_emit_exact_failed_attempts_without_fabricated_bytes() {
+        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let directory = TempDir::new().expect("temporary WAL directory");
+            let writer = WalWriter::new(directory.path(), [26; 16], 1, WalConfig::default())
+                .expect("writer");
+            let key = test_seal_key(crate::test_support::tenant());
+            WAL_PARTIAL_WRITE.with(|flag| flag.set(true));
+            let append_error = writer
+                .append_and_fsync_for_test(&key, [1; 16], b"audit", b"data")
+                .expect_err("injected append failure");
+            assert!(matches!(append_error, ScribeError::Internal { .. }));
+            let after_append_failure = recorder.snapshot();
+            assert_eq!(
+                after_append_failure
+                    .counters
+                    .get("bifrost_scribe_wal_append_bytes_total"),
+                None
+            );
+            writer.trip_sync_failure_for_test();
+            let sync_error = writer
+                .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
+                .expect_err("injected sync failure");
+            assert!(matches!(sync_error, ScribeError::Internal { .. }));
+        });
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_wal_append_total{outcome=\"failed\"}"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_wal_fsync_total{outcome=\"failed\"}"),
+            Some(&1)
+        );
+    }
+
+    /// Torn-tail recovery emits one successful fsync for its one physical repair sync.
+    #[test]
+    fn recovery_tail_repair_reconciles_physical_and_telemetry_fsync_delta() {
+        WAL_RECOVERY_SYNC_COUNT.with(|count| count.set(0));
+        let directory = TempDir::new().expect("temporary WAL directory");
+        let writer =
+            WalWriter::new(directory.path(), [27; 16], 1, WalConfig::default()).expect("writer");
+        writer
+            .append_and_fsync_for_test(
+                &test_seal_key(crate::test_support::tenant()),
+                [1; 16],
+                b"audit",
+                b"data",
+            )
+            .expect("durable fixture");
+        let reader = WalReader::open_directory_unfiltered(directory.path()).expect("reader");
+        let path = reader.segments[0].reference().path;
+        drop(reader);
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open WAL tail")
+            .write_all(b"torn")
+            .expect("append torn tail");
+
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let repaired =
+                WalReader::open_directory_unfiltered(directory.path()).expect("repair reader");
+            repaired.read_all_records().expect("repair torn tail");
+        });
+        let physical = WAL_RECOVERY_SYNC_COUNT.with(std::cell::Cell::get);
+        assert_eq!(physical, 1);
+        assert_eq!(
+            recorder
+                .snapshot()
+                .counters
+                .get("bifrost_scribe_wal_fsync_total{outcome=\"success\"}"),
+            Some(&physical)
+        );
     }
 }

@@ -106,6 +106,7 @@ so they stay out of the fast lane) against live Postgres."""
 run = """
 cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- public_write_read_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- production_recorder_exposes_bifrost_owner_families --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- public_write_compact_read_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- public_multitenant_write_compact_read_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- distributed_write_compact_read_journey --ignored --test-threads=1

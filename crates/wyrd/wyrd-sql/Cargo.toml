@@ -13,6 +13,7 @@ embedded-postgres = ["dep:pg-embed", "dep:rand", "dep:urlencoding"]
 [dependencies]
 chrono = { workspace = true }
 regex = { workspace = true }
+metrics = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -96,6 +96,7 @@ impl AdmissionController {
     ) -> Result<InflightFrameReservation, ScribeError> {
         let table = table.into();
         if !self.inner.wal_available.load(Ordering::Acquire) {
+            super::record_scribe_rejection("wal");
             return Err(ScribeError::WalDiskFull);
         }
         let mut state = self
@@ -107,6 +108,7 @@ impl AdmissionController {
             })?;
 
         if state.items >= GLOBAL_INFLIGHT_ITEMS {
+            super::record_scribe_rejection("in_flight");
             return Err(ScribeError::IngestBusy { table });
         }
 
@@ -343,6 +345,48 @@ mod tests {
         let error = admission.try_reserve("events", 1).expect_err("busy");
         assert!(matches!(error, ScribeError::IngestBusy { .. }));
         assert_eq!(admission.snapshot().items, GLOBAL_INFLIGHT_ITEMS);
+    }
+
+    /// Actual admission branches emit their exact closed rejection reasons once.
+    #[test]
+    fn admission_rejections_emit_exact_wal_and_in_flight_reasons() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let unavailable = AdmissionController::default();
+            unavailable.trip_wal_disk_full();
+            assert!(matches!(
+                unavailable.try_reserve("events", 1),
+                Err(ScribeError::WalDiskFull)
+            ));
+
+            let bounded = AdmissionController::default();
+            let reservations = (0..GLOBAL_INFLIGHT_ITEMS)
+                .map(|_| bounded.try_reserve("events", 1).expect("bounded reserve"))
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                bounded.try_reserve("events", 1),
+                Err(ScribeError::IngestBusy { .. })
+            ));
+            drop(reservations);
+        });
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_rejections_total{reason=\"wal\"}"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_rejections_total{reason=\"in_flight\"}"),
+            Some(&1)
+        );
+        assert!(!snapshot.counters.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
     }
 
     #[test]

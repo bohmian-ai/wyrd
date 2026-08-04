@@ -285,12 +285,15 @@ impl OracleTelemetry {
     /// entry keeps the production scrape contract discoverable without
     /// fabricating an event or changing subsequent counter values.
     fn register_sparse_series(query_class: QueryClass) {
-        metrics::counter!(
-            "bifrost_oracle_admission_rejections_total",
-            "scope" => "cluster",
-            "query_class" => query_class_label(query_class)
-        )
-        .increment(0);
+        for reason in ["pending_limit", "lease_capacity", "local_slots"] {
+            metrics::counter!(
+                "bifrost_oracle_admission_rejections_total",
+                "scope" => "cluster",
+                "reason" => reason,
+                "query_class" => query_class_label(query_class)
+            )
+            .increment(0);
+        }
         metrics::counter!(
             "bifrost_oracle_spill_bytes_total",
             "role" => "leader",
@@ -349,10 +352,15 @@ impl OracleTelemetry {
     }
 
     /// Records one canonical admission rejection.
-    fn record_admission_rejection(scope: &'static str, query_class: QueryClass) {
+    fn record_admission_rejection(
+        scope: &'static str,
+        reason: &'static str,
+        query_class: QueryClass,
+    ) {
         metrics::counter!(
             "bifrost_oracle_admission_rejections_total",
             "scope" => scope,
+            "reason" => reason,
             "query_class" => query_class_label(query_class)
         )
         .increment(1);
@@ -2250,10 +2258,6 @@ impl Oracle {
         &self,
         mut input: SqlCutInput<'_>,
     ) -> Result<(SchemaRef, SendableRecordBatchStream), OracleExecutionError> {
-        let _source_span = tracing::info_span!(
-            "bifrost.oracle.source",
-            query_class = query_class_label(input.query_class)
-        );
         let session = SessionContext::new();
         for cut in input.cuts {
             let table_name = cut.binding.table_ref.fqn();

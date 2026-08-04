@@ -51,8 +51,11 @@ impl ScribeImpl {
         let mut memory = self
             .memory
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
-            .map_err(|_| ScribeError::IngestBusy {
-                table: table.clone(),
+            .map_err(|_| {
+                super::record_scribe_rejection("memory");
+                ScribeError::IngestBusy {
+                    table: table.clone(),
+                }
             })?;
         memory.attach_shard(self.memory.shard_accounting(), shard);
 
@@ -75,11 +78,12 @@ impl ScribeImpl {
             .saturating_add(frame.measured_wire_bytes)
             .saturating_add(REQUEST_OVERHEAD_BYTES);
         reservation.resize(estimated_bytes)?;
-        memory
-            .resize_ingress(estimated_bytes)
-            .map_err(|_| ScribeError::IngestBusy {
+        memory.resize_ingress(estimated_bytes).map_err(|_| {
+            super::record_scribe_rejection("memory");
+            ScribeError::IngestBusy {
                 table: table.clone(),
-            })?;
+            }
+        })?;
         memory.transfer_category(MemoryCategory::Prepared);
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
@@ -112,7 +116,9 @@ impl ScribeImpl {
                 });
             }
         };
-        self.shards.try_send(prepared)?;
+        self.shards
+            .try_send(prepared)
+            .inspect_err(|_| super::record_scribe_rejection("queue"))?;
         durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;

@@ -55,6 +55,79 @@ pub const BIFROST_FORGE_CLEANUP_DURATION_SECONDS: &str = "bifrost_forge_cleanup_
 /// Production-facing Forge spill metric.
 pub const BIFROST_FORGE_TASK_SPILL_BYTES: &str = "bifrost_forge_task_spill_bytes";
 
+/// Gate request latency observed at the public write/query boundary.
+pub const BIFROST_GATE_REQUEST_DURATION_SECONDS: &str = "bifrost_gate_request_duration_seconds";
+/// Gate query-stream lifetime from dispatch through terminal consumption.
+pub const BIFROST_GATE_QUERY_STREAM_DURATION_SECONDS: &str =
+    "bifrost_gate_query_stream_duration_seconds";
+/// Scribe durable acknowledgement latency.
+pub const BIFROST_SCRIBE_ACK_SECONDS: &str = "bifrost_scribe_ack_seconds";
+/// Scribe ingress queue wait latency.
+pub const BIFROST_SCRIBE_QUEUE_WAIT_SECONDS: &str = "bifrost_scribe_queue_wait_seconds";
+/// Scribe execution-lane job latency.
+pub const BIFROST_SCRIBE_LANE_JOB_SECONDS: &str = "bifrost_scribe_lane_job_seconds";
+/// Scribe persistence publication latency.
+pub const BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS: &str =
+    "bifrost_scribe_persistence_publication_seconds";
+/// Scribe seal-stage latency.
+pub const BIFROST_SCRIBE_SEAL_STAGE_SECONDS: &str = "bifrost_scribe_seal_stage_seconds";
+/// Scribe physical WAL append latency.
+pub const BIFROST_SCRIBE_WAL_APPEND_SECONDS: &str = "bifrost_scribe_wal_append_seconds";
+/// Scribe physical WAL fsync latency.
+pub const BIFROST_SCRIBE_WAL_FSYNC_SECONDS: &str = "bifrost_scribe_wal_fsync_seconds";
+/// Forge planning-scheduler pass latency.
+pub const BIFROST_FORGE_SCHEDULING_DURATION_SECONDS: &str =
+    "bifrost_forge_scheduling_duration_seconds";
+/// Forge scheduler orchestration latency.
+pub const BIFROST_FORGE_SCHEDULER_DURATION_SECONDS: &str =
+    "bifrost_forge_scheduler_duration_seconds";
+/// Forge stage latency, including its typed publication stage.
+pub const BIFROST_FORGE_STAGE_SECONDS: &str = "bifrost_forge_stage_seconds";
+/// Oracle admission wait latency.
+pub const BIFROST_ORACLE_ADMISSION_WAIT_SECONDS: &str = "bifrost_oracle_admission_wait_seconds";
+/// Oracle source-operation latency.
+pub const BIFROST_ORACLE_SOURCE_OPERATION_SECONDS: &str = "bifrost_oracle_source_operation_seconds";
+/// Oracle fragment execution latency.
+pub const BIFROST_ORACLE_FRAGMENT_SECONDS: &str = "bifrost_oracle_fragment_seconds";
+/// Oracle time to the first result batch.
+pub const BIFROST_ORACLE_TIME_TO_FIRST_BATCH_SECONDS: &str =
+    "bifrost_oracle_time_to_first_batch_seconds";
+/// Oracle total query latency.
+pub const BIFROST_ORACLE_QUERY_DURATION_SECONDS: &str = "bifrost_oracle_query_duration_seconds";
+/// Wyrd PostgreSQL tenant-pool acquisition latency.
+pub const WYRD_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "wyrd_postgres_pool_acquire_seconds";
+/// Vala PostgreSQL tenant-pool acquisition latency.
+pub const VALA_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "vala_postgres_pool_acquire_seconds";
+/// Shared storage operation latency.
+pub const WYRD_STORAGE_OPERATION_DURATION_SECONDS: &str = "wyrd_storage_operation_duration_seconds";
+
+/// Every production Bifrost duration family whose p99 is consumed by qualification.
+const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
+    BIFROST_QUERY_DURATION_SECONDS,
+    BIFROST_GATE_REQUEST_DURATION_SECONDS,
+    BIFROST_GATE_QUERY_STREAM_DURATION_SECONDS,
+    BIFROST_SCRIBE_ACK_SECONDS,
+    BIFROST_SCRIBE_QUEUE_WAIT_SECONDS,
+    BIFROST_SCRIBE_LANE_JOB_SECONDS,
+    BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS,
+    BIFROST_SCRIBE_SEAL_STAGE_SECONDS,
+    BIFROST_SCRIBE_WAL_APPEND_SECONDS,
+    BIFROST_SCRIBE_WAL_FSYNC_SECONDS,
+    BIFROST_FORGE_SCHEDULING_DURATION_SECONDS,
+    BIFROST_FORGE_SCHEDULER_DURATION_SECONDS,
+    BIFROST_FORGE_STAGE_SECONDS,
+    BIFROST_FORGE_TASK_DURATION_SECONDS,
+    BIFROST_FORGE_CLEANUP_DURATION_SECONDS,
+    BIFROST_ORACLE_ADMISSION_WAIT_SECONDS,
+    BIFROST_ORACLE_SOURCE_OPERATION_SECONDS,
+    BIFROST_ORACLE_FRAGMENT_SECONDS,
+    BIFROST_ORACLE_TIME_TO_FIRST_BATCH_SECONDS,
+    BIFROST_ORACLE_QUERY_DURATION_SECONDS,
+    WYRD_POSTGRES_POOL_ACQUIRE_SECONDS,
+    VALA_POSTGRES_POOL_ACQUIRE_SECONDS,
+    WYRD_STORAGE_OPERATION_DURATION_SECONDS,
+];
+
 /// Errors installing the Prometheus recorder.
 #[derive(Debug, thiserror::Error)]
 pub enum MetricsError {
@@ -207,27 +280,21 @@ impl Drop for ForgeRoleTelemetryGuard {
 /// # Errors
 /// Returns [`MetricsError`] when bucket setup or global installation fails.
 pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
-    PrometheusBuilder::new()
+    let mut builder = PrometheusBuilder::new()
         .set_buckets_for_metric(
             Matcher::Full(HTTP_REQUEST_DURATION_SECONDS.to_owned()),
             REQUEST_DURATION_BUCKETS,
         )
-        .map_err(MetricsError::Buckets)?
-        .set_buckets_for_metric(
-            Matcher::Full(BIFROST_QUERY_DURATION_SECONDS.to_owned()),
-            BIFROST_DURATION_BUCKETS,
-        )
-        .map_err(MetricsError::Buckets)?
-        .set_buckets_for_metric(
-            Matcher::Full(BIFROST_FORGE_TASK_DURATION_SECONDS.to_owned()),
-            BIFROST_DURATION_BUCKETS,
-        )
-        .map_err(MetricsError::Buckets)?
-        .set_buckets_for_metric(
-            Matcher::Full(BIFROST_FORGE_CLEANUP_DURATION_SECONDS.to_owned()),
-            BIFROST_DURATION_BUCKETS,
-        )
-        .map_err(MetricsError::Buckets)?
+        .map_err(MetricsError::Buckets)?;
+    for family in BIFROST_P99_DURATION_FAMILIES {
+        builder = builder
+            .set_buckets_for_metric(
+                Matcher::Full((*family).to_owned()),
+                BIFROST_DURATION_BUCKETS,
+            )
+            .map_err(MetricsError::Buckets)?;
+    }
+    builder
         .set_buckets_for_metric(
             Matcher::Full(BIFROST_FORGE_TASK_SPILL_BYTES.to_owned()),
             FORGE_SPILL_BUCKETS,
@@ -327,6 +394,30 @@ mod tests {
             output.is_empty() || output.contains('#'),
             "render must produce valid Prometheus text (empty or starting with # HELP/# TYPE): got {output:?}"
         );
+    }
+
+    /// Every qualification p99 family renders the configured histogram shape.
+    #[test]
+    fn bifrost_p99_families_render_bucket_count_and_sum() {
+        let handle = get_handle();
+        for family in BIFROST_P99_DURATION_FAMILIES {
+            metrics::histogram!(*family).record(0.01);
+        }
+        let output = handle.render();
+        for family in BIFROST_P99_DURATION_FAMILIES {
+            assert!(
+                output.contains(&format!("{family}_bucket")),
+                "missing buckets for {family}"
+            );
+            assert!(
+                output.contains(&format!("{family}_count")),
+                "missing count for {family}"
+            );
+            assert!(
+                output.contains(&format!("{family}_sum")),
+                "missing sum for {family}"
+            );
+        }
     }
 
     #[tokio::test]

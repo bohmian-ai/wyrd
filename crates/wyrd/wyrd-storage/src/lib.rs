@@ -31,6 +31,7 @@ pub mod sweeper;
 pub mod tenant_path;
 
 mod audit;
+mod telemetry;
 
 #[cfg(feature = "cloud")]
 pub use azure::{AzureSasMode, AzureSigner};

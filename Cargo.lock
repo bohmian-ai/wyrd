@@ -9899,6 +9899,7 @@ name = "vala-sql"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "metrics",
  "secrecy",
  "serde_json",
  "sha2 0.10.9",
@@ -10959,6 +10960,7 @@ name = "wyrd-sql"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "metrics",
  "paste",
  "pg-embed",
  "rand 0.9.5",
@@ -10996,6 +10998,7 @@ dependencies = [
  "chrono",
  "gcloud-auth",
  "gcloud-storage",
+ "metrics",
  "opendal",
  "regex",
  "reqwest 0.13.4",

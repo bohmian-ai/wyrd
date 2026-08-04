@@ -92,6 +92,7 @@ where
     let mut mode = None;
     let mut scenario = None;
     let mut matrix = false;
+    let mut cargo_bench_sentinel = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -135,6 +136,11 @@ where
                 matrix = true;
                 index += 1;
             }
+            "--bench" if !cargo_bench_sentinel => {
+                cargo_bench_sentinel = true;
+                index += 1;
+            }
+            "--bench" => return Err("Cargo benchmark sentinel may occur at most once".to_owned()),
             value => return Err(format!("unknown benchmark argument `{value}`")),
         }
     }
@@ -3347,6 +3353,27 @@ mod tests {
         assert_eq!(
             command.scenario.as_deref(),
             Some("balanced-one-pod-eight-tenants")
+        );
+        let cargo_capacity = parse_cluster_benchmark_args([
+            "--mode",
+            "capacity",
+            "--scenario",
+            "balanced-one-pod-eight-tenants",
+            "--bench",
+        ])
+        .expect("Cargo capacity command parses");
+        assert_eq!(cargo_capacity, command);
+
+        let qualification = parse_cluster_benchmark_args(["--mode", "qualification", "--matrix"])
+            .expect("canonical qualification command parses");
+        let cargo_qualification =
+            parse_cluster_benchmark_args(["--mode", "qualification", "--matrix", "--bench"])
+                .expect("Cargo qualification command parses");
+        assert_eq!(cargo_qualification, qualification);
+
+        assert!(
+            parse_cluster_benchmark_args(["--mode", "capacity", "--matrix", "--bench", "--bench"])
+                .is_err()
         );
         assert!(parse_cluster_benchmark_args(["--mode", "capacity"]).is_err());
         assert!(

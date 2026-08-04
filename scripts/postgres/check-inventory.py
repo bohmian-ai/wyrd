@@ -28,11 +28,7 @@ pre = {
     "test:bifrost:journey", "test:fuzz:bifrost",
     "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
-    "bench", "bench:workload", "bench:bifrost:preflight", "bench:bifrost:otlp:ingest",
-    "bench:bifrost:scribe:components", "bench:bifrost:forge:components",
-    "bench:bifrost:oracle:components", "bench:bifrost:oracle:calibrate",
-    "bench:bifrost:cluster:reference", "bench:bifrost:cluster:capture",
-    "bench:bifrost:cluster:smoke",
+    "bench:bifrost:capacity", "bench:bifrost:qualify", "bench:bifrost:components",
 }
 aggregates = {"test:unit", "pre-pr", "test:storage:matrix", "test:storage:cloud:matrix"}
 for name in empty | migrated | pre:

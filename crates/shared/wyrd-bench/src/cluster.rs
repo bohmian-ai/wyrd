@@ -5,15 +5,67 @@
 //! of server, SQL, storage, and runtime dependencies.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Closed schema identifier for full-cluster reference reports.
-pub const CLUSTER_REPORT_VERSION: &str = "wyrd.bifrost.cluster-report/v1";
+pub const CLUSTER_REPORT_VERSION: &str = "wyrd.bifrost.cluster-report/v2";
 /// Stable workload identifier shared by captures and comparisons.
-pub const CLUSTER_WORKLOAD_VERSION: &str = "wyrd.bifrost.cluster-workload/v1";
+pub const CLUSTER_WORKLOAD_VERSION: &str = "wyrd.bifrost.cluster-workload/v2";
+/// Canonical bounded capacity stages. Qualification replays reviewed values
+/// from this sequence as absolute rates, never as a percentage of a knee.
+pub const CANONICAL_CAPACITY_RATES: [u64; 8] = [100, 200, 300, 500, 750, 1_000, 1_500, 2_000];
+/// Optional continuation rates used only when every canonical stage is healthy.
+pub const OPTIONAL_CAPACITY_RATES: [u64; 3] = [2_500, 3_000, 4_000];
+/// Shortened smoke sequence; it makes no SLO or capacity claim.
+pub const SMOKE_CAPACITY_RATES: [u64; 4] = [100, 300, 500, 1_000];
+/// Qualification profile defaults used until a human-reviewed profile selects
+/// a compatible subset from a passing capacity report.
+pub const DEFAULT_REVIEWED_QUALIFICATION_RATES: [u64; 3] = [100, 1_000, 2_000];
+/// Maximum wall-clock duration for a six-scenario matrix, including lifecycle.
+pub const MATRIX_DURATION_CAP: Duration = Duration::from_mins(40);
+
+/// Return the canonical bounded rate sequence in execution order.
+#[must_use]
+pub fn capacity_rate_sequence(include_optional: bool) -> Vec<u64> {
+    let mut rates = CANONICAL_CAPACITY_RATES.to_vec();
+    if include_optional {
+        rates.extend(OPTIONAL_CAPACITY_RATES);
+    }
+    rates
+}
+
+/// Classify whether a stage failure requires one confirmation stage.
+#[must_use]
+pub fn requires_failure_confirmation(consecutive_failures: u8) -> bool {
+    consecutive_failures == 1
+}
+
+/// Build a deterministic capacity plan from stage outcomes.
+///
+/// The base sequence is always attempted. Optional rates are appended only
+/// when all base stages pass; the first failure receives one confirming stage,
+/// and the highest healthy rate is replayed as a recovery stage.
+#[must_use]
+pub fn capacity_stage_rates(outcomes: &[bool]) -> Vec<u64> {
+    let base = CANONICAL_CAPACITY_RATES;
+    let mut rates = base.to_vec();
+    let first_failure = outcomes.iter().position(|passed| !passed);
+    if first_failure.is_none() {
+        rates.extend(OPTIONAL_CAPACITY_RATES);
+        return rates;
+    }
+    let failure = first_failure.unwrap_or(0);
+    rates.truncate((failure + 1).min(rates.len()));
+    rates.push(base[failure.min(base.len() - 1)]);
+    if let Some(healthy) = outcomes[..failure].iter().rposition(|passed| *passed) {
+        rates.push(base[healthy]);
+    }
+    rates
+}
 /// First open-loop calibration probe in public operations per second.
 pub const FIRST_PROBE_RATE: u64 = 8;
 /// Maximum calibration probe in public operations per second.
@@ -43,6 +95,277 @@ pub enum TrafficMix {
     ReadHeavy,
     /// Simultaneous durable writes and strict reads.
     Balanced,
+}
+
+/// Closed runtime role identity used for bounded resource attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BifrostRuntimeRole {
+    /// Public request admission and routing.
+    Gate,
+    /// WAL append and acknowledgement owner.
+    Scribe,
+    /// Compaction and snapshot publication owner.
+    Forge,
+    /// Strict query and admission owner.
+    Oracle,
+}
+
+/// Closed benchmark operation identity used by trace manifests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkOperation {
+    /// Durable public write.
+    DurableWrite,
+    /// Flush acknowledgement through strict visibility.
+    FlushToVisible,
+    /// Bounded strict query first frame.
+    QueryTimeToFirstFrame,
+    /// Bounded strict query terminal completion.
+    QueryTotal,
+}
+
+/// Closed saturation reason retained on failed and censored stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityLimit {
+    /// The service rejected work at its admission boundary.
+    Backpressure,
+    /// The benchmark driver exhausted its declared in-flight budget.
+    InFlightCap,
+    /// An open-loop dispatch missed its planned deadline.
+    MissedDeadline,
+    /// A production dependency exceeded its declared SLO.
+    DependencySlo,
+    /// Exact data, tenant, or audit reconciliation failed.
+    Correctness,
+    /// The stage cleanup or resource lifecycle did not converge.
+    Cleanup,
+}
+
+/// Stable node identity retained for per-node evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeId(
+    /// Stable process/node value from the benchmark topology.
+    pub String,
+);
+
+/// HDR-derived distribution for a critical-path span family.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpanDistribution {
+    /// Span operation identity.
+    pub operation: BenchmarkOperation,
+    /// Number of spans represented by the distribution.
+    pub samples: u64,
+    /// p95 duration in microseconds.
+    pub p95_us: u64,
+    /// p99 duration in microseconds.
+    pub p99_us: u64,
+}
+
+/// Bounded critical-path trace manifest for one operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceManifest {
+    /// Operation represented by the selected traces.
+    pub operation: BenchmarkOperation,
+    /// Representative trace IDs; tenant/table values stay in trace baggage.
+    pub representative_trace_ids: Vec<String>,
+    /// Critical-path span distributions for attribution.
+    pub critical_path_spans: Vec<SpanDistribution>,
+}
+
+/// Bounded pillar telemetry delta captured at stage boundaries.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PillarTelemetryDelta {
+    /// Gate accepted public operations.
+    pub gate_accepted: u64,
+    /// Scribe WAL append and fsync bytes.
+    pub scribe_wal_bytes: u64,
+    /// Forge materialized rows.
+    pub forge_materialized_rows: u64,
+    /// Oracle decoded rows.
+    pub oracle_decoded_rows: u64,
+    /// Whether every required production family was observed.
+    pub complete: bool,
+}
+
+/// Dependency evidence used to explain a limiting stage.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyTelemetryEvidence {
+    /// Postgres pool wait time in microseconds.
+    pub postgres_pool_wait_us: u64,
+    /// Postgres transaction count.
+    pub postgres_transactions: u64,
+    /// Storage bytes and operation failures.
+    pub storage_bytes: u64,
+    /// Storage operation latency p99 in microseconds.
+    pub storage_p99_us: u64,
+    /// WAL fsync latency p99 in microseconds.
+    pub wal_fsync_p99_us: u64,
+    /// Whether all dependency families were observed.
+    pub complete: bool,
+}
+
+/// Workload resource evidence attributed to one node and its roles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeResourceEvidence {
+    /// Stable node/process identity.
+    pub node_id: NodeId,
+    /// Roles hosted by this node.
+    pub roles: Vec<BifrostRuntimeRole>,
+    /// CPU seconds consumed by the process.
+    pub cpu_seconds: f64,
+    /// Peak resident set size in bytes.
+    pub peak_rss_bytes: u64,
+    /// Runtime busy seconds.
+    pub runtime_busy_seconds: f64,
+    /// Peak runtime queue depth.
+    pub runtime_queue_peak: u64,
+}
+
+/// Deterministic row and batch identity range owned by one tenant/stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantStageRows {
+    /// Zero-based tenant ordinal.
+    pub tenant_ordinal: u32,
+    /// Seed from which deterministic batch IDs derive.
+    pub batch_id_seed: u64,
+    /// Inclusive first row identity.
+    pub row_id_start: u64,
+    /// Exclusive final row identity.
+    pub row_id_end_exclusive: u64,
+}
+
+/// Identity for one measured capacity stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityStageIdentity {
+    /// Stable scenario-local stage ID.
+    pub stage_id: String,
+    /// Strictly increasing stage ordinal.
+    pub ordinal: u16,
+    /// Non-overlapping tenant row ranges.
+    pub tenant_rows: Vec<TenantStageRows>,
+}
+
+/// One retained capacity stage, including failed probes and recovery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityStage {
+    /// Stage identity and deterministic row ledger.
+    pub identity: CapacityStageIdentity,
+    /// Absolute offered rate.
+    pub offered_requests_per_second: u64,
+    /// Completed public operations per second.
+    pub completed_requests_per_second: f64,
+    /// Measured stage duration.
+    pub duration: Duration,
+    /// Whether the stage met its readiness predicates.
+    pub passed: bool,
+    /// Number of in-flight cap exhaustions.
+    pub in_flight_cap_exhaustions: u64,
+    /// Every stop predicate observed for this stage.
+    pub stop_reasons: Vec<CapacityLimit>,
+    /// Client measurements and production evidence.
+    pub metrics: ClientTrialMetrics,
+    /// Pillar telemetry delta.
+    pub telemetry: PillarTelemetryDelta,
+    /// Per-node resource evidence.
+    pub resources: Vec<NodeResourceEvidence>,
+    /// Dependency evidence.
+    pub dependencies: DependencyTelemetryEvidence,
+    /// Representative traces.
+    pub traces: TraceManifest,
+}
+
+/// A qualification workload identity and its reviewed absolute rates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterWorkloadIdentity {
+    /// Stable scenario identity.
+    pub scenario_id: String,
+    /// Topology, traffic, and protocol shape identity.
+    pub topology: ClusterTopology,
+    /// Tenant cardinality.
+    pub tenants: u32,
+    /// Traffic mix.
+    pub traffic: TrafficMix,
+    /// Rows per write and bounded query limit.
+    pub rows_per_batch: u32,
+    /// Query row limit.
+    pub query_row_limit: u32,
+}
+
+/// One reviewed qualification scenario and its exact reports by rate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedScenarioProfile {
+    /// Stable fixed scenario identifier.
+    pub scenario_id: String,
+    /// Shape identity excluding run-specific telemetry.
+    pub workload: ClusterWorkloadIdentity,
+    /// Strictly increasing reviewed absolute rates.
+    pub offered_rates: Vec<u64>,
+    /// Exactly one report per offered rate.
+    pub reports: Vec<ClusterScenarioReport>,
+}
+
+impl ReviewedScenarioProfile {
+    /// Validate exact rate ordering and one report per reviewed absolute rate.
+    ///
+    /// # Errors
+    /// Returns an incompatible error when rates are empty, duplicated,
+    /// reordered, or do not match the report identities.
+    pub fn validate(&self) -> Result<(), ClusterBenchmarkError> {
+        if self.offered_rates.is_empty()
+            || self
+                .offered_rates
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+            || self.reports.len() != self.offered_rates.len()
+        {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "reviewed qualification rates must be strictly increasing and complete".to_owned(),
+            ));
+        }
+        for (rate, report) in self.offered_rates.iter().zip(&self.reports) {
+            if *rate != report.scenario.offered_requests_per_second
+                || report.scenario.scenario_id != self.scenario_id
+            {
+                return Err(ClusterBenchmarkError::Incompatible(
+                    "candidate must replay every reviewed absolute rate exactly".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-trial report with complete client, role, dependency, and trace evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTrialReport {
+    /// Absolute offered rate and trial ordinal.
+    pub offered_requests_per_second: u64,
+    /// One-based trial number.
+    pub trial_index: u8,
+    /// Client-derived metrics.
+    pub metrics: ClientTrialMetrics,
+    /// Pillar telemetry delta.
+    pub telemetry: PillarTelemetryDelta,
+    /// Per-node resource evidence.
+    pub resources: Vec<NodeResourceEvidence>,
+    /// Dependency evidence.
+    pub dependencies: DependencyTelemetryEvidence,
+    /// Trace manifest.
+    pub traces: TraceManifest,
 }
 
 /// Provenance for a calibrated saturation knee.
@@ -76,6 +399,7 @@ pub struct ClusterBenchmarkScenario {
     /// Absolute public operations offered each second.
     pub offered_requests_per_second: u64,
     /// Percent of the reference knee represented by the absolute rate.
+    #[serde(skip)]
     pub offered_load_percent: u8,
     /// Reference calibration provenance.
     pub knee_provenance: KneeProvenance,
@@ -87,6 +411,8 @@ pub struct ClusterBenchmarkScenario {
     pub trials: u8,
     /// Minimum write and query samples required in each relevant trial.
     pub minimum_samples: u64,
+    /// Profile-driven concurrent public operation cap.
+    pub max_in_flight: usize,
     /// Stable workload seed.
     pub seed: u64,
 }
@@ -103,11 +429,12 @@ impl ClusterBenchmarkScenario {
             || self.rows_per_batch != 64
             || self.query_row_limit != 64
             || self.offered_requests_per_second == 0
-            || !matches!(self.offered_load_percent, 50 | 75 | 100)
+            || !matches!(self.offered_load_percent, 0 | 50 | 75 | 100)
             || self.warmup_seconds != 5
             || self.measured_seconds != 20
             || self.trials != 3
             || self.minimum_samples != 200
+            || self.max_in_flight == 0
             || self.seed != 0xB1_F057
         {
             return Err(ClusterBenchmarkError::Invalid(format!(
@@ -149,6 +476,15 @@ pub struct BenchmarkEnvironment {
     pub storage_version: String,
     /// Stable storage configuration identity.
     pub storage_config: String,
+    /// Runtime storage backend kind (must be local-filesystem for qualifying runs).
+    #[serde(default)]
+    pub storage_backend_kind: String,
+    /// Dedicated benchmark storage root, scrubbed to a repository-relative path.
+    #[serde(default)]
+    pub storage_root: String,
+    /// Filesystem/device class observed for the storage root.
+    #[serde(default)]
+    pub storage_device_class: String,
     /// Rust compiler major/minor pair.
     pub rust_major_minor: String,
     /// Locked Arrow version.
@@ -185,6 +521,9 @@ impl BenchmarkEnvironment {
             self.storage_image.as_str(),
             self.storage_version.as_str(),
             self.storage_config.as_str(),
+            self.storage_backend_kind.as_str(),
+            self.storage_root.as_str(),
+            self.storage_device_class.as_str(),
             self.rust_major_minor.as_str(),
             self.arrow_version.as_str(),
             self.datafusion_version.as_str(),
@@ -200,6 +539,8 @@ impl BenchmarkEnvironment {
             || self.host_memory_bytes == 0
             || self.container_cpu_millis == 0
             || self.container_memory_bytes == 0
+            || self.storage_image.contains("memory")
+            || self.storage_backend_kind.contains("memory")
         {
             return Err(ClusterBenchmarkError::Unsupported(
                 "reference environment identity is incomplete or unclassifiable".to_owned(),
@@ -230,6 +571,9 @@ impl BenchmarkEnvironment {
             && self.storage_image == candidate.storage_image
             && self.storage_version == candidate.storage_version
             && self.storage_config == candidate.storage_config
+            && self.storage_backend_kind == candidate.storage_backend_kind
+            && self.storage_root == candidate.storage_root
+            && self.storage_device_class == candidate.storage_device_class
             && self.rust_major_minor == candidate.rust_major_minor
             && self.arrow_version == candidate.arrow_version
             && self.datafusion_version == candidate.datafusion_version
@@ -259,6 +603,20 @@ pub struct TrialDistribution {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientTrialMetrics {
+    /// Public operations planned for the fixed measured window.
+    pub planned_operations: u64,
+    /// Public operations dispatched rather than missed by the open-loop scheduler.
+    pub attempted_operations: u64,
+    /// Public operations accepted by Gate or completed by Oracle.
+    pub accepted_operations: u64,
+    /// Stable public admission or capacity rejections.
+    pub backpressure_operations: u64,
+    /// Transient public failures eligible for bounded retry.
+    pub retry_operations: u64,
+    /// Public operations rejected because the profile-driven in-flight cap was exhausted.
+    pub in_flight_cap_exhaustions: u64,
+    /// Declared profile-driven in-flight cap used by the driver.
+    pub max_in_flight: u64,
     /// Durable write acknowledgement latency.
     pub durable_write: TrialDistribution,
     /// Explicit flush acknowledgement-to-strict-visibility latency.
@@ -417,6 +775,10 @@ pub struct ClusterScenarioReport {
     pub trials: Vec<ClusterBenchmarkTrial>,
     /// Median of the three independent trial summaries.
     pub median: MedianMetrics,
+    /// Capacity stages retained for bounded capacity mode. Qualification
+    /// reports may leave this empty; omission never makes a report promotable.
+    #[serde(default)]
+    pub capacity_stages: Vec<CapacityStage>,
 }
 
 impl ClusterScenarioReport {
@@ -435,15 +797,39 @@ impl ClusterScenarioReport {
         let needs_write = true;
         let needs_read = true;
         for trial in &self.trials {
+            if trial.client.attempted_operations > trial.client.planned_operations
+                || trial.client.accepted_operations > trial.client.attempted_operations
+                || trial.client.in_flight_cap_exhaustions > trial.client.planned_operations
+            {
+                return Err(ClusterBenchmarkError::NotReady(
+                    "open-loop operation ledger is not monotonic".to_owned(),
+                ));
+            }
             if (needs_write && trial.client.durable_write.samples < self.scenario.minimum_samples)
                 || (needs_read
                     && (trial.client.query_time_to_first_frame.samples
                         < self.scenario.minimum_samples
                         || trial.client.total_query.samples < self.scenario.minimum_samples))
             {
-                return Err(ClusterBenchmarkError::Unsupported(
-                    "trial has fewer than 200 required operation samples".to_owned(),
-                ));
+                return Err(ClusterBenchmarkError::Unsupported(format!(
+                    "scenario={} load_percent={} offered_rps={} knee_rps={} knee_provenance={:?} trial={} has insufficient samples: required={}, planned={}, attempted={}, accepted={}, writes={}, query_ttfb={}, query_total={}, retries={}, backpressure={}, missed={}",
+                    self.scenario.scenario_id,
+                    self.scenario.offered_load_percent,
+                    self.scenario.offered_requests_per_second,
+                    self.discovered_knee_requests_per_second,
+                    self.discovered_knee_provenance,
+                    trial.trial,
+                    self.scenario.minimum_samples,
+                    trial.client.planned_operations,
+                    trial.client.attempted_operations,
+                    trial.client.accepted_operations,
+                    trial.client.durable_write.samples,
+                    trial.client.query_time_to_first_frame.samples,
+                    trial.client.total_query.samples,
+                    trial.client.retry_operations,
+                    trial.client.backpressure_operations,
+                    trial.client.missed_operations,
+                )));
             }
             if trial.client.flush_to_visible.samples != PLANNED_FLUSHES_PER_TRIAL
                 || trial.client.missed_flushes != 0
@@ -564,6 +950,78 @@ pub struct BifrostReferenceProfile {
 }
 
 impl BifrostReferenceProfile {
+    /// Project flat scenario reports into the reviewed-rate contract used by
+    /// controlled qualification and comparison tooling.
+    #[must_use]
+    pub fn reviewed_scenarios(&self) -> Vec<ReviewedScenarioProfile> {
+        let mut grouped = BTreeMap::<String, Vec<ClusterScenarioReport>>::new();
+        for report in &self.scenarios {
+            grouped
+                .entry(report.scenario.scenario_id.clone())
+                .or_default()
+                .push(report.clone());
+        }
+        grouped
+            .into_iter()
+            .filter_map(|(scenario_id, mut reports)| {
+                reports.sort_by_key(|report| report.scenario.offered_requests_per_second);
+                let first = reports.first()?;
+                Some(ReviewedScenarioProfile {
+                    scenario_id: scenario_id.clone(),
+                    workload: ClusterWorkloadIdentity {
+                        scenario_id,
+                        topology: first.scenario.topology,
+                        tenants: first.scenario.tenants,
+                        traffic: first.scenario.traffic,
+                        rows_per_batch: first.scenario.rows_per_batch,
+                        query_row_limit: first.scenario.query_row_limit,
+                    },
+                    offered_rates: reports
+                        .iter()
+                        .map(|report| report.scenario.offered_requests_per_second)
+                        .collect(),
+                    reports,
+                })
+            })
+            .collect()
+    }
+
+    /// Validate one selected qualification scenario without requiring the
+    /// six-scenario promotion matrix.
+    ///
+    /// # Errors
+    /// Returns an incompatible or unsupported error when the selected report
+    /// is absent, malformed, dirty, or lacks complete trial evidence.
+    pub fn validate_selected(&self, scenario_id: &str) -> Result<(), ClusterBenchmarkError> {
+        if self.schema_version != CLUSTER_REPORT_VERSION {
+            return Err(ClusterBenchmarkError::Incompatible(format!(
+                "expected {CLUSTER_REPORT_VERSION}, got {}",
+                self.schema_version
+            )));
+        }
+        self.environment.validate()?;
+        if self.environment.dirty_worktree {
+            return Err(ClusterBenchmarkError::Unsupported(
+                "dirty worktree captures cannot be blessed as a reference".to_owned(),
+            ));
+        }
+        let selected = self
+            .scenarios
+            .iter()
+            .filter(|report| report.scenario.scenario_id == scenario_id)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(ClusterBenchmarkError::Invalid(format!(
+                "selected scenario `{scenario_id}` has no reports"
+            )));
+        }
+        for report in selected {
+            report.validate()?;
+            validate_fixed_scenario(report)?;
+        }
+        Ok(())
+    }
+
     /// Validate schema, environment, matrix identity, evidence, and absolute SLOs.
     ///
     /// # Errors
@@ -577,6 +1035,14 @@ impl BifrostReferenceProfile {
             )));
         }
         self.environment.validate()?;
+        if self.environment.storage_backend_kind != "local-filesystem"
+            || self.environment.storage_root.is_empty()
+            || self.environment.storage_device_class.is_empty()
+        {
+            return Err(ClusterBenchmarkError::Unsupported(
+                "qualification requires a declared local-filesystem storage identity".to_owned(),
+            ));
+        }
         if self.environment.dirty_worktree {
             return Err(ClusterBenchmarkError::Unsupported(
                 "dirty worktree captures cannot be blessed as a reference".to_owned(),
@@ -587,76 +1053,95 @@ impl BifrostReferenceProfile {
                 "reference requires six scenarios at three absolute rates".to_owned(),
             ));
         }
-        let mut identities = BTreeSet::new();
-        for report in &self.scenarios {
-            report.validate()?;
-            validate_fixed_scenario(report)?;
-            let key = (
-                report.scenario.scenario_id.as_str(),
-                report.scenario.offered_load_percent,
-            );
-            if !identities.insert(key) {
-                return Err(ClusterBenchmarkError::Invalid(format!(
-                    "duplicate scenario/load identity {}:{}",
-                    key.0, key.1
-                )));
-            }
-            let median = &report.median;
-            if median.durable_write_p99_us > self.slos.durable_write_p99_us {
-                return Err(ClusterBenchmarkError::NotReady(
-                    "durable-write p99 exceeds the absolute reference SLO".to_owned(),
-                ));
-            }
-            if median.flush_to_visible_p99_us > self.slos.flush_to_visible_p99_us {
-                return Err(ClusterBenchmarkError::NotReady(
-                    "flush-to-visible p99 exceeds the absolute reference SLO".to_owned(),
-                ));
-            }
-            if median.query_ttfb_p99_us > self.slos.query_ttfb_p99_us {
-                return Err(ClusterBenchmarkError::NotReady(
-                    "query TTFB p99 exceeds the absolute reference SLO".to_owned(),
-                ));
-            }
-        }
-        for (id, topology, tenants, traffic) in fixed_scenarios() {
-            let reports = self
-                .scenarios
-                .iter()
-                .filter(|report| report.scenario.scenario_id == id)
-                .collect::<Vec<_>>();
-            if reports.len() != 3
-                || reports.iter().any(|report| {
-                    report.scenario.topology != topology
-                        || report.scenario.tenants != tenants
-                        || report.scenario.traffic != traffic
-                })
-            {
-                return Err(ClusterBenchmarkError::Invalid(format!(
-                    "reference matrix is missing exact scenario `{id}`"
-                )));
-            }
-            let knee = reports[0].discovered_knee_requests_per_second;
-            let provenance = reports[0].discovered_knee_provenance;
-            if knee < FIRST_PROBE_RATE
-                || (provenance == KneeProvenance::CensoredAtCap && knee != CALIBRATION_RATE_CAP)
-            {
-                return Err(ClusterBenchmarkError::Invalid(format!(
-                    "scenario `{id}` has an invalid calibrated knee"
-                )));
-            }
-            for report in reports {
-                if report.discovered_knee_requests_per_second != knee
-                    || report.discovered_knee_provenance != provenance
-                    || report.scenario.knee_provenance != provenance
-                {
-                    return Err(ClusterBenchmarkError::Invalid(format!(
-                        "scenario `{id}` has inconsistent knee or provenance"
-                    )));
-                }
-            }
-        }
+        validate_report_matrix(self)?;
         Ok(())
     }
+}
+
+/// Validate every flat scenario report and its six-scenario matrix identity.
+fn validate_report_matrix(profile: &BifrostReferenceProfile) -> Result<(), ClusterBenchmarkError> {
+    let mut identities = BTreeSet::new();
+    for report in &profile.scenarios {
+        report.validate()?;
+        validate_fixed_scenario(report)?;
+        let key = (
+            report.scenario.scenario_id.as_str(),
+            report.scenario.offered_requests_per_second,
+        );
+        if !identities.insert(key) {
+            return Err(ClusterBenchmarkError::Invalid(format!(
+                "duplicate scenario/rate identity {}:{}",
+                key.0, key.1
+            )));
+        }
+        let median = &report.median;
+        if median.durable_write_p99_us > profile.slos.durable_write_p99_us {
+            return Err(ClusterBenchmarkError::NotReady(
+                "durable-write p99 exceeds the absolute reference SLO".to_owned(),
+            ));
+        }
+        if median.flush_to_visible_p99_us > profile.slos.flush_to_visible_p99_us {
+            return Err(ClusterBenchmarkError::NotReady(
+                "flush-to-visible p99 exceeds the absolute reference SLO".to_owned(),
+            ));
+        }
+        if median.query_ttfb_p99_us > profile.slos.query_ttfb_p99_us {
+            return Err(ClusterBenchmarkError::NotReady(
+                "query TTFB p99 exceeds the absolute reference SLO".to_owned(),
+            ));
+        }
+    }
+    for (id, topology, tenants, traffic) in fixed_scenarios() {
+        let reports = profile
+            .scenarios
+            .iter()
+            .filter(|report| report.scenario.scenario_id == id)
+            .collect::<Vec<_>>();
+        if reports.len() != 3
+            || reports.iter().any(|report| {
+                report.scenario.topology != topology
+                    || report.scenario.tenants != tenants
+                    || report.scenario.traffic != traffic
+            })
+        {
+            return Err(ClusterBenchmarkError::Invalid(format!(
+                "reference matrix is missing exact scenario `{id}`"
+            )));
+        }
+        let knee = reports[0].discovered_knee_requests_per_second;
+        let provenance = reports[0].discovered_knee_provenance;
+        if knee < FIRST_PROBE_RATE
+            || (provenance == KneeProvenance::CensoredAtCap && knee != CALIBRATION_RATE_CAP)
+        {
+            return Err(ClusterBenchmarkError::Invalid(format!(
+                "scenario `{id}` has an invalid calibrated knee"
+            )));
+        }
+        if reports.iter().any(|report| {
+            report.discovered_knee_requests_per_second != knee
+                || report.discovered_knee_provenance != provenance
+                || report.scenario.knee_provenance != provenance
+        }) {
+            return Err(ClusterBenchmarkError::Invalid(format!(
+                "scenario `{id}` has inconsistent knee or provenance"
+            )));
+        }
+        let mut rates = reports
+            .iter()
+            .map(|report| report.scenario.offered_requests_per_second)
+            .collect::<Vec<_>>();
+        rates.sort_unstable();
+        rates.dedup();
+        if rates.len() != 3 {
+            return Err(ClusterBenchmarkError::Invalid(format!(
+                "scenario `{id}` must contain three distinct absolute offered rates"
+            )));
+        }
+    }
+    for reviewed in profile.reviewed_scenarios() {
+        reviewed.validate()?;
+    }
+    Ok(())
 }
 
 /// Return D22's fixed scenario identities without runtime dependencies.
@@ -1065,7 +1550,7 @@ fn scenario_map(profile: &BifrostReferenceProfile) -> BTreeMap<String, &ClusterS
             let scenario = &report.scenario;
             (
                 format!(
-                    "{}:{}:{:?}:{}:{:?}:{}:{}:{}:{}:{:?}:{}:{}:{}:{}:{}",
+                    "{}:{}:{:?}:{}:{:?}:{}:{}:{}:{:?}:{}:{}:{}:{}:{}:{}",
                     scenario.scenario_id,
                     scenario.workload_version,
                     scenario.topology,
@@ -1074,12 +1559,12 @@ fn scenario_map(profile: &BifrostReferenceProfile) -> BTreeMap<String, &ClusterS
                     scenario.rows_per_batch,
                     scenario.query_row_limit,
                     scenario.offered_requests_per_second,
-                    scenario.offered_load_percent,
                     scenario.knee_provenance,
                     scenario.warmup_seconds,
                     scenario.measured_seconds,
                     scenario.trials,
                     scenario.minimum_samples,
+                    scenario.max_in_flight,
                     scenario.seed,
                 ),
                 report,
@@ -1197,6 +1682,39 @@ fn evaluate_scaling(
 mod tests {
     use super::*;
 
+    /// Proves capacity stages use the exact absolute-rate sequence and one
+    /// confirmation after the first failed stage.
+    #[test]
+    fn capacity_sequence_is_absolute_and_bounded() {
+        assert_eq!(
+            capacity_rate_sequence(false),
+            vec![100, 200, 300, 500, 750, 1_000, 1_500, 2_000]
+        );
+        assert_eq!(
+            capacity_rate_sequence(true),
+            vec![
+                100, 200, 300, 500, 750, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000
+            ]
+        );
+        assert!(requires_failure_confirmation(1));
+        assert!(!requires_failure_confirmation(0));
+        assert!(!requires_failure_confirmation(2));
+        assert_eq!(
+            capacity_stage_rates(&[true, true]),
+            OPTIONAL_CAPACITY_RATES.iter().fold(
+                CANONICAL_CAPACITY_RATES.to_vec(),
+                |mut rates, rate| {
+                    rates.push(*rate);
+                    rates
+                }
+            )
+        );
+        assert_eq!(
+            capacity_stage_rates(&[true, false]),
+            vec![100, 200, 200, 100]
+        );
+    }
+
     /// Proves D22 CPU marker and whitespace normalization is deterministic.
     #[test]
     fn cpu_normalization_removes_only_markers_and_whitespace() {
@@ -1303,9 +1821,12 @@ mod tests {
             postgres_image: "postgres:16".to_owned(),
             postgres_version: "16.10".to_owned(),
             postgres_config: "wyrd-reference-v1".to_owned(),
-            storage_image: "in-process-memory".to_owned(),
+            storage_image: "local-filesystem".to_owned(),
             storage_version: "wyrd-storage/0.0.1".to_owned(),
             storage_config: "memory-loopback-v1".to_owned(),
+            storage_backend_kind: "local-filesystem".to_owned(),
+            storage_root: "target/bifrost-benchmarks/storage".to_owned(),
+            storage_device_class: "local".to_owned(),
             rust_major_minor: "1.95".to_owned(),
             arrow_version: "58.4.0".to_owned(),
             datafusion_version: "53.1.0".to_owned(),
@@ -1345,6 +1866,7 @@ mod tests {
                 measured_seconds: 20,
                 trials: 3,
                 minimum_samples: 200,
+                max_in_flight: 4096,
                 seed: 0xB1_F057,
             },
             discovered_knee_requests_per_second: knee,
@@ -1373,6 +1895,7 @@ mod tests {
                 write_fairness: 1.0,
                 read_fairness: 1.0,
             },
+            capacity_stages: Vec::new(),
         }
     }
 
@@ -1409,6 +1932,13 @@ mod tests {
             overflowed: false,
         };
         ClientTrialMetrics {
+            planned_operations: 400,
+            attempted_operations: 400,
+            accepted_operations: 400,
+            backpressure_operations: 0,
+            retry_operations: 0,
+            in_flight_cap_exhaustions: 0,
+            max_in_flight: 256,
             durable_write: distribution,
             flush_to_visible: TrialDistribution {
                 samples: 10,
@@ -1497,6 +2027,17 @@ mod tests {
         candidate = before.clone();
         candidate.container_cpu_millis += 1;
         assert!(!before.compatible_with(&candidate));
+    }
+
+    /// Proves in-memory/mock storage cannot qualify as a capacity reference.
+    #[test]
+    fn memory_storage_is_unsupported_for_qualification() {
+        let mut environment = profile().environment;
+        environment.storage_image = "in-process-memory".to_owned();
+        assert!(matches!(
+            environment.validate(),
+            Err(ClusterBenchmarkError::Unsupported(_))
+        ));
     }
 
     /// Proves a missing required operation sample is unsupported, never ready.

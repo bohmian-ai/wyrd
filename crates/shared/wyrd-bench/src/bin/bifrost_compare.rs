@@ -11,9 +11,7 @@ use wyrd_bench::{BifrostReferenceProfile, compare_cluster_profiles};
 /// Returns an IO or strict JSON error when inputs cannot be read/decoded or
 /// the requested output cannot be written.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let before_path = argument("before")?;
-    let after_path = argument("after")?;
-    let output_path = argument("output")?;
+    let (before_path, after_path, output_path) = parse_arguments(std::env::args().skip(1))?;
     let before: BifrostReferenceProfile =
         serde_json::from_str(&std::fs::read_to_string(before_path)?)?;
     let after: BifrostReferenceProfile =
@@ -33,24 +31,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Resolve either `--name value` or `--name=value` without positional fallbacks.
+/// Parse the exact comparator grammar and reject repeated/unknown flags.
 ///
 /// # Errors
-/// Returns an error when the required named path is absent.
-fn argument(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let prefix = format!("--{name}=");
-    let flag = format!("--{name}");
-    let mut arguments = std::env::args().skip(1);
-    while let Some(value) = arguments.next() {
-        if let Some(path) = value.strip_prefix(&prefix) {
-            return Ok(PathBuf::from(path));
+/// Returns an error for missing, repeated, unknown, or positional arguments.
+fn parse_arguments<I, S>(
+    arguments: I,
+) -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let values = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+    let mut before = None;
+    let mut after = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < values.len() {
+        let flag = values[index].as_str();
+        let slot = match flag {
+            "--before" => &mut before,
+            "--after" => &mut after,
+            "--output" => &mut output,
+            other => return Err(format!("unknown comparator argument `{other}`").into()),
+        };
+        if slot.is_some() || index + 1 >= values.len() {
+            return Err(format!("{flag} must occur exactly once with a path").into());
         }
-        if value == flag {
-            return arguments
-                .next()
-                .map(PathBuf::from)
-                .ok_or_else(|| format!("missing value after {flag}").into());
+        let value = values[index + 1].as_str();
+        if value.starts_with('-') {
+            return Err(format!("missing path after {flag}").into());
         }
+        *slot = Some(PathBuf::from(value));
+        index += 2;
     }
-    Err(format!("missing {flag} <path>").into())
+    Ok((
+        before.ok_or("missing --before <baseline.json>")?,
+        after.ok_or("missing --after <candidate.json>")?,
+        output.ok_or("missing --output <comparison.json>")?,
+    ))
 }

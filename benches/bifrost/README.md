@@ -1,56 +1,45 @@
-# Bifrost controlled reference benchmark
+# Bifrost benchmark standards
 
-`mise run bench:bifrost:cluster:reference` is the only Bifrost
-production-readiness benchmark. It drives the public Rust SDK through Gate,
-Scribe, Forge, and Oracle. The Scribe, Forge, Oracle, WAL/fsync, OTLP, plan,
-scan, and rewrite benches are component diagnostics; they do not establish a
-product SLO or headline capacity result.
+The public benchmark surface has four commands:
 
-## Reference profile v1
-
-The controlled lane records and compares this closed identity:
-
-- Rust major/minor and the locked Arrow, DataFusion, and Iceberg revisions;
-- OS, kernel, architecture, normalized CPU vendor/model, logical CPU count,
-  and total host memory;
-- the benchmark-only `postgres:16` container from
-  `docker-compose.reference.yml`, pinned to 2 CPU and 4 GiB, with tmpfs data;
-- the in-process loopback memory storage implementation and configuration;
-- Git SHA and dirty state, capture timestamp, seed `0xB1F057`, exact topology,
-  tenant count, traffic mix, 64-row write shape, bounded strict-query shape,
-  and each absolute offered request rate.
-
-Linux CPU identity comes only from `/proc/cpuinfo` `vendor_id` and `model
-name`. macOS identity comes only from `sysctl -n machdep.cpu.brand_string`.
-Missing CPU classification or Docker-inspected CPU/memory limits makes the run
-`Unsupported`. A dirty worktree may emit diagnostics but cannot bless a
-reference.
-
-The matrix contains balanced 50/50 traffic for one pod/one tenant, one
-pod/eight tenants, 3 Server + 3 ForgeWorker/eight tenants, and 3+3/32 tenants;
-plus 90/10 write-heavy and 10/90 read-heavy 3+3/eight-tenant scenarios. Each
-reference rate has three trials with a five-second warmup and 20-second measured
-window. Candidate comparisons replay the exact persisted 50/75/100-percent
-absolute reference rates.
-
-## Capture and promotion
-
-`mise run bench:bifrost:cluster:capture` writes a candidate under
-`target/bifrost-benchmarks`; it never changes this directory. Compare two
-captures with:
-
-```bash
-mise run bench:bifrost:cluster:compare -- \
-  --before benches/bifrost/reference-v1.json \
-  --after target/bifrost-benchmarks/cluster-candidate.json \
-  --output target/bifrost-benchmarks/comparison.json
+```text
+bench:bifrost:capacity
+bench:bifrost:qualify
+bench:bifrost:compare
+bench:bifrost:components
 ```
 
-Promoting `reference-v1.json` is manual. The change must include the candidate
-manifest, prior comparison, reason, exact hardware/container identity, and
-review approval. Never copy a shortened smoke, incompatible profile, dirty
-capture, censored scaling claim, or undersampled report into the reference.
+Capacity is a bounded diagnostic sweep. It runs the absolute offered-rate
+sequence `100,200,300,500,750,1000,1500,2000` and may continue at
+`2500,3000,4000` while every stage remains healthy. A failed stage is retained,
+the next stage confirms the stop predicate, and the highest healthy rate is
+replayed for recovery. The four-rate shortened smoke (`100,300,500,1000`) is
+non-promotable and makes no wall-clock or SLO claim.
 
-The initial reference file is created only by the first successful controlled
-full capture and review. It must not be synthesized from component reports or
-hand-authored measurements.
+Qualification is separately invoked and replays reviewed absolute rates for
+three trials. It enforces durable-write p99 ≤100 ms, flush-to-strict-visibility
+p99 ≤5 s, bounded-query time-to-first-frame p99 ≤500 ms, and at least 200
+samples per required operation. A report is versioned as
+`wyrd.bifrost.cluster-report/v2`; failed, partial, unsupported, dirty, or
+undersampled runs still write a non-promotable diagnostic report.
+
+The declared profile records Rust major/minor, locked Arrow/DataFusion/Iceberg
+versions, OS/kernel, architecture, normalized CPU vendor/model and logical
+cores, host memory, exact container CPU/memory limits, Postgres image/version/
+configuration, and the real local-filesystem object-store root/device class.
+Tenant/table identity remains in traces and audit evidence, never metric
+labels. Public strict queries project only `row_id, wyrd_event_time`; the
+server-managed `data_tenant_id` tripwire is never requested or returned.
+
+`bench:bifrost:compare` is the only comparator. It refuses incompatible report
+versions, topology/workload/seed/rate shape, environment identity, missing
+telemetry, censored knees, or incomplete trials. Compatible candidates must
+run the exact persisted absolute rates. Median-of-three comparisons fail on
+throughput −10%, p95/p99 +15%, retry/backpressure +2 percentage points,
+fairness below 0.95, or balanced scaling efficiency below 75%.
+
+Reports and diagnostics remain under `target/bifrost-benchmarks`. There is no
+checked-in `reference-v2.json` until a compatible full qualification capture
+passes and a human reviewer explicitly approves the baseline diff. Promotion
+is manual and records before/after manifests, reason, hardware identity, and
+review approval.

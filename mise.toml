@@ -155,95 +155,36 @@ hide = true
 description = "Run only the named deterministic Rust cluster matrix journeys"
 run = "cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_three_server_three_worker_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- pressured_tenant_does_not_starve_peers --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_telemetry_reconciles_all_pillars --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_cancellation_and_shutdown_release_all_owners --ignored --test-threads=1"
 
-[tasks."bench:bifrost:baseline"]
-description = "Capture a fresh immutable pre-change Bifrost benchmark stage"
-run = "bash scripts/benchmarks/capture-bifrost-stage.sh pre-change"
-
-[tasks."bench:bifrost:cluster:reference"]
-description = "Run the controlled six-scenario Bifrost reference qualification"
-env = { WYRD_BIFROST_REFERENCE_PROFILE = "1", WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml" }
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:cluster:reference:inner'"
-
-[tasks."bench:bifrost:cluster:reference:inner"]
+[tasks."bench:bifrost:capacity"]
+description = "Run the bounded absolute-rate Bifrost capacity characterization"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-capacity.json" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:capacity:inner'"
+[tasks."bench:bifrost:capacity:inner"]
 hide = true
-description = "Run the real public-cluster reference adapter inside a controlled Postgres lifecycle"
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster"
+run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster -- --mode capacity --matrix"
 
-[tasks."bench:bifrost:cluster:capture"]
-description = "Capture a diagnostic full-cluster report without promoting the checked-in reference"
-env = { WYRD_BIFROST_REFERENCE_PROFILE = "1", WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-candidate.json" }
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:cluster:reference:inner'"
+[tasks."bench:bifrost:qualify"]
+description = "Run controlled three-trial Bifrost SLO qualification"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-candidate.json" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:qualify:inner'"
+[tasks."bench:bifrost:qualify:inner"]
+hide = true
+run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster -- --mode qualification --matrix"
 
-[tasks."bench:bifrost:cluster:smoke"]
-description = "Run the shortened real public-cluster adapter without asserting wall-clock SLOs"
-env = { WYRD_BIFROST_CLUSTER_SMOKE = "1", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-smoke.json" }
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster'"
-
-[tasks."bench:bifrost:cluster:compare"]
-description = "Compare two compatible controlled full-cluster report manifests"
+[tasks."bench:bifrost:compare"]
+description = "Compare compatible Bifrost v2 reports at identical absolute rates"
 run = "cargo run --locked -p wyrd-bench --bin bifrost_compare --"
 
-[tasks."bench:bifrost:preflight"]
-description = "Verify one real Scribe append, seal, object write, and file-list commit"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:preflight:inner'"
-[tasks."bench:bifrost:preflight:inner"]
+[tasks."bench:bifrost:components"]
+description = "Run subordinate Bifrost component diagnostics"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:components:inner'"
+[tasks."bench:bifrost:components:inner"]
 hide = true
-description = "Verify one real Scribe append, seal, object write, and file-list commit"
-run = "WYRD_BIFROST_BENCH_MODE=preflight cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=1 --measured-seconds=1 --items-per-request=1"
-
-[tasks."bench:bifrost:scribe:components"]
-description = "Measure the seven independent production Scribe components"
-env = { WYRD_BIFROST_CLOSEOUT = "1" }
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:scribe:components:inner'"
-[tasks."bench:bifrost:scribe:components:inner"]
-hide = true
-description = "Measure the seven independent production Scribe components"
-env = { WYRD_BIFROST_CLOSEOUT = "1" }
-run = "WYRD_BIFROST_BENCH_MODE=components cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=1 --measured-seconds=1 --items-per-request=1"
-
-[tasks."bench:bifrost:forge:components"]
-description = "Run subordinate Forge rewrite and Postgres commit diagnostics"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:forge:components:inner'"
-[tasks."bench:bifrost:forge:components:inner"]
-hide = true
-description = "Run subordinate Forge rewrite and Postgres commit diagnostics"
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_forge -- --pods=3 --tenants=10"
-
-[tasks."bench:bifrost:oracle:components"]
-description = "Run subordinate authenticated Oracle query diagnostics"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:oracle:components:inner'"
-[tasks."bench:bifrost:oracle:components:inner"]
-hide = true
-description = "Run subordinate authenticated Oracle query diagnostics"
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --pods=3"
-
-[tasks."bench:bifrost:oracle:calibrate"]
-description = "Run the reproducible 1/3/6-pod Oracle calibration matrix"
-env = { WYRD_BIFROST_CALIBRATION = "1" }
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:oracle:calibrate:inner'"
-[tasks."bench:bifrost:oracle:calibrate:inner"]
-hide = true
-description = "Run the reproducible 1/3/6-pod Oracle calibration matrix"
-env = { WYRD_BIFROST_CALIBRATION = "1" }
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --pods=6 --tenants=2"
+run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=1 --measured-seconds=1 --items-per-request=1"
 
 [tasks."check:bifrost-oracle-deploy"]
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
 run = "cargo test --locked -p wyrd-testing bifrost_deployment_contract -- --nocapture"
-
-[tasks."bench:bifrost:otlp:ingest"]
-description = "Load-test realistic OTLP span ingestion through Gate and Scribe"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:otlp:ingest:inner'"
-[tasks."bench:bifrost:otlp:ingest:inner"]
-hide = true
-description = "Load-test realistic OTLP span ingestion through Gate and Scribe"
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_otlp -- --pods=3 --tenants=10 --target-items-per-second=10000 --items-per-request=100 --warmup-seconds=5 --measured-seconds=60 --max-in-flight=256 --verify-samples=3"
 
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
@@ -1257,54 +1198,6 @@ case "$cache_dir" in
     ;;
 esac
 rm -rf "$cache_dir"
-"""
-
-[tasks."bench"]
-description = """vala-bifrost criterion microbenches against docker-compose Postgres.
-Brings up a clean Postgres, provisions roles, applies migrations, then runs the
-benches. The warehouse dir is reset so a fresh catalog never disagrees with
-stale on-disk Iceberg metadata.
-"""
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:inner'"
-[tasks."bench:inner"]
-hide = true
-description = """vala-bifrost criterion microbenches against docker-compose Postgres.
-Brings up a clean Postgres, provisions roles, applies migrations, then runs the
-benches. The warehouse dir is reset so a fresh catalog never disagrees with
-stale on-disk Iceberg metadata.
-"""
-run = """
-rm -rf /tmp/vala-bifrost-bench
-cargo bench -p vala-bifrost --features bench-bin
-"""
-
-[tasks."bench:workload"]
-hide = true
-description = """vala-bifrost large-workload bench (~5 min, release) against docker-compose Postgres.
-Brings up a clean Postgres, provisions roles, and applies migrations first.
-"""
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:workload:inner'"
-[tasks."bench:workload:inner"]
-hide = true
-description = """vala-bifrost large-workload bench (~5 min, release) against docker-compose Postgres.
-Brings up a clean Postgres, provisions roles, and applies migrations first.
-"""
-run = """
-cargo run --release -p vala-bifrost --bin bench_workload --features bench-bin -- \
-  --rows 10000000 --batch-size 65536 --workload selective \
-  --postgres-url "$WYRD_BENCH_PG_URL" \
-  --output crates/vala/vala-bifrost/benches/reports/workload-selective.json
-"""
-
-[tasks."bench:check"]
-hide = true
-description = "Fail if microbenches regressed >10% vs the stage1 baseline"
-run = """
-cargo run --release -p vala-bifrost --bin bench_check --features bench-bin -- \
-  --baseline crates/vala/vala-bifrost/benches/baselines/stage1.json \
-  --criterion-dir target/criterion
 """
 
 # --- Isolated Postgres lifecycle verification ---------------------------------

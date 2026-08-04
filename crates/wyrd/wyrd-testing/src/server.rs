@@ -2242,10 +2242,12 @@ impl WyrdTestServerBuilder {
 
         let verifier = Arc::new(
             TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
-                .with_revocation(Arc::new(SqlRevocationCheck::new_with_ttl(
-                    Arc::new(runtime_wyrd.app_pool().clone()),
-                    Duration::ZERO,
-                )))
+                // Match production's five-second epoch cache. Immediate
+                // revocation remains covered by the focused auth test seam;
+                // benchmark requests must not force a SQL lookup per request.
+                .with_revocation(Arc::new(SqlRevocationCheck::new(Arc::new(
+                    runtime_wyrd.app_pool().clone(),
+                ))))
                 .with_external(
                     Arc::new(JwksCache::new(
                         reqwest::Client::new(),

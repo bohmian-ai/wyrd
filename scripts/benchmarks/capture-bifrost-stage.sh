@@ -13,18 +13,10 @@ fi
 mkdir -p "$target/diagnostics"
 
 cluster_report="$target/cluster.json"
-WYRD_BIFROST_REPORT="$cluster_report" mise run bench:bifrost:cluster:capture
+WYRD_BIFROST_REPORT="$cluster_report" mise run bench:bifrost:capacity
 
-for lane in scribe forge oracle otlp; do
-  output="$target/diagnostics/$lane.json"
-  case "$lane" in
-    scribe) task="bench:bifrost:scribe:components" ;;
-    forge) task="bench:bifrost:forge:components" ;;
-    oracle) task="bench:bifrost:oracle:components" ;;
-    otlp) task="bench:bifrost:otlp:ingest" ;;
-  esac
-  WYRD_BIFROST_REPORT="$output" mise run "$task"
-done
+diagnostics="$target/diagnostics/components.json"
+WYRD_BIFROST_REPORT="$diagnostics" mise run bench:bifrost:components
 
 git_sha="$(git rev-parse HEAD)"
 dirty_worktree=false
@@ -37,13 +29,9 @@ jq -n \
   --arg git_sha "$git_sha" \
   --argjson dirty_worktree "$dirty_worktree" \
   --slurpfile cluster "$cluster_report" \
-  --slurpfile scribe "$target/diagnostics/scribe.json" \
-  --slurpfile forge "$target/diagnostics/forge.json" \
-  --slurpfile oracle "$target/diagnostics/oracle.json" \
-  --slurpfile otlp "$target/diagnostics/otlp.json" \
+  --slurpfile components "$target/diagnostics/components.json" \
   '{stage: $stage, git_sha: $git_sha, dirty_worktree: $dirty_worktree,
-    production_readiness: $cluster[0],
-    diagnostics: {scribe: $scribe[0], forge: $forge[0], oracle: $oracle[0], otlp: $otlp[0]}}' \
+    capacity: $cluster[0], diagnostics: {components: $components[0]}}' \
   > "$target/stage.json"
 
 if [[ -n $before_manifest ]]; then

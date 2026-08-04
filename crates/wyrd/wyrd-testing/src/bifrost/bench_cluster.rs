@@ -1,7 +1,7 @@
-//! Controlled full-cluster benchmark adapter and reference preflight.
+//! Controlled full-cluster benchmark adapter and versioned v2 diagnostics.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,10 +40,104 @@ const REFERENCE_TABLE: &str = "cluster_reference_events";
 const PRELOAD_ROWS: u64 = 8_192;
 /// Rows in one public durable write request.
 const ROWS_PER_WRITE: u32 = 64;
-/// Maximum simultaneously active public operations.
-const MAX_IN_FLIGHT: usize = 64;
+/// Default profile-driven concurrent public-operation cap.
+const DEFAULT_MAX_IN_FLIGHT: usize = 4_096;
 /// Disjoint logical row-id space reserved for each authenticated tenant.
 const TENANT_ROW_STRIDE: u64 = 1_000_000_000_000;
+
+/// Public benchmark execution mode selected by the canonical command grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterBenchmarkMode {
+    /// Run the bounded absolute-rate capacity sweep.
+    Capacity,
+    /// Replay reviewed absolute rates for controlled qualification.
+    Qualification,
+}
+
+/// Parsed selector for one canonical cluster invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterBenchmarkCommand {
+    /// Selected benchmark mode.
+    pub mode: ClusterBenchmarkMode,
+    /// One fixed scenario selector, when not running the matrix.
+    pub scenario: Option<String>,
+    /// Whether all six fixed scenarios run sequentially.
+    pub matrix: bool,
+}
+
+/// Parse the exact public `bench_bifrost_cluster` grammar before startup.
+///
+/// The parser intentionally ignores lifecycle/profile/output environment
+/// variables. They are consumed only after this grammar succeeds.
+///
+/// # Errors
+/// Returns a message when mode, selector cardinality, selector identity, or
+/// an unknown flag is invalid.
+pub fn parse_cluster_benchmark_args<I, S>(args: I) -> Result<ClusterBenchmarkCommand, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let mut mode = None;
+    let mut scenario = None;
+    let mut matrix = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--mode" => {
+                if mode.is_some() || index + 1 >= args.len() {
+                    return Err(
+                        "--mode must occur exactly once with capacity or qualification".to_owned(),
+                    );
+                }
+                mode = Some(match args[index + 1].as_str() {
+                    "capacity" => ClusterBenchmarkMode::Capacity,
+                    "qualification" => ClusterBenchmarkMode::Qualification,
+                    value => return Err(format!("unknown --mode value `{value}`")),
+                });
+                index += 2;
+            }
+            "--scenario" => {
+                if scenario.is_some() || matrix || index + 1 >= args.len() {
+                    return Err(
+                        "exactly one of --scenario <scenario-id> or --matrix is required"
+                            .to_owned(),
+                    );
+                }
+                let value = args[index + 1].clone();
+                if !reference_scenario_matrix()
+                    .iter()
+                    .any(|entry| entry.id == value)
+                {
+                    return Err(format!("unknown scenario `{value}`"));
+                }
+                scenario = Some(value);
+                index += 2;
+            }
+            "--matrix" => {
+                if matrix || scenario.is_some() {
+                    return Err(
+                        "exactly one of --scenario <scenario-id> or --matrix is required"
+                            .to_owned(),
+                    );
+                }
+                matrix = true;
+                index += 1;
+            }
+            value => return Err(format!("unknown benchmark argument `{value}`")),
+        }
+    }
+    let mode = mode.ok_or_else(|| "--mode capacity|qualification is required".to_owned())?;
+    if scenario.is_none() && !matrix {
+        return Err("exactly one of --scenario <scenario-id> or --matrix is required".to_owned());
+    }
+    Ok(ClusterBenchmarkCommand {
+        mode,
+        scenario,
+        matrix,
+    })
+}
 
 /// One fixed D22 scenario before calibration assigns absolute rates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,18 +221,114 @@ pub const fn reference_scenario_matrix() -> [ReferenceScenarioDefinition; 6] {
 /// report, or IO error. Initial-probe failure is `NotReady`; censored knees
 /// remain explicit in the emitted profile.
 pub async fn run_reference() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let environment = detect_reference_environment()?;
+    run_reference_selected(None, true, false).await
+}
+
+/// Run qualification with the parsed public selector.
+///
+/// # Errors
+/// Propagates the non-promotable diagnostic or lifecycle error emitted by the
+/// selected controlled run.
+pub async fn run_qualification(
+    command: ClusterBenchmarkCommand,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    run_reference_selected(command.scenario.as_deref(), command.matrix, false).await
+}
+
+/// Run the bounded absolute-rate capacity characterization.
+///
+/// Capacity reports are diagnostics only. They retain failed stages and never
+/// become a qualification baseline.
+///
+/// # Errors
+/// Propagates the selected cluster lifecycle or report-write error.
+pub async fn run_capacity(
+    command: ClusterBenchmarkCommand,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    run_reference_selected(command.scenario.as_deref(), command.matrix, true).await
+}
+
+/// Execute the selected scenarios for either qualification or capacity mode.
+async fn run_reference_selected(
+    selected_scenario: Option<&str>,
+    matrix: bool,
+    capacity: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let environment = match detect_reference_environment() {
+        Ok(environment) => environment,
+        Err(error) => {
+            let path = report_path(if capacity {
+                "cluster-capacity.json"
+            } else {
+                "cluster-candidate.json"
+            });
+            write_unavailable_capture(&path, &error.to_string())?;
+            return Err(Box::new(error));
+        }
+    };
     let mut reports = Vec::with_capacity(18);
     for definition in reference_scenario_matrix() {
-        let (knee, provenance) = calibrate(definition).await?;
-        for percent in [50_u8, 75, 100] {
-            let rate = knee.saturating_mul(u64::from(percent)).saturating_add(99) / 100;
+        if !matrix && selected_scenario != Some(definition.id) {
+            continue;
+        }
+        let (knee, provenance) = match calibrate(definition).await {
+            Ok(value) => value,
+            Err(error) => {
+                let path = report_path(if capacity {
+                    "cluster-capacity.json"
+                } else {
+                    "cluster-candidate.json"
+                });
+                write_failed_capture(&path, &environment, &error.to_string(), &[FIRST_PROBE_RATE])?;
+                return Err(error);
+            }
+        };
+        let rates = if capacity {
+            wyrd_bench::CANONICAL_CAPACITY_RATES.to_vec()
+        } else {
+            // Qualification replays reviewed absolute rates. The discovered
+            // knee remains diagnostic provenance only.
+            wyrd_bench::DEFAULT_REVIEWED_QUALIFICATION_RATES.to_vec()
+        };
+        for rate in rates {
+            // Percent-of-knee is diagnostic-only and is never persisted in a
+            // v2 report or used for compatibility.
+            let percent = 0;
             let mut trials = Vec::with_capacity(3);
             let mut scenario = None;
             for trial in 1..=3 {
-                let (identity, result) =
-                    run_reference_trial(definition, rate.max(1), percent, trial, knee, provenance)
-                        .await?;
+                let (identity, result) = match run_reference_trial(
+                    definition,
+                    rate.max(1),
+                    percent,
+                    trial,
+                    knee,
+                    provenance,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let path = report_path(if capacity {
+                            "cluster-capacity.json"
+                        } else {
+                            "cluster-candidate.json"
+                        });
+                        write_failed_capture(
+                            &path,
+                            &environment,
+                            &error.to_string(),
+                            &reports
+                                .iter()
+                                .map(|report: &ClusterScenarioReport| {
+                                    report.scenario.offered_requests_per_second
+                                })
+                                .chain(std::iter::once(rate))
+                                .collect::<Vec<_>>(),
+                        )?;
+                        return Err(error);
+                    }
+                };
                 scenario = Some(identity);
                 trials.push(result);
             }
@@ -149,6 +339,7 @@ pub async fn run_reference() -> Result<PathBuf, Box<dyn std::error::Error + Send
                 discovered_knee_provenance: provenance,
                 trials,
                 median,
+                capacity_stages: Vec::new(),
             });
         }
     }
@@ -158,7 +349,11 @@ pub async fn run_reference() -> Result<PathBuf, Box<dyn std::error::Error + Send
         scenarios: reports,
         slos: BifrostSloEnvelope::default(),
     };
-    let path = report_path("cluster-candidate.json");
+    let path = report_path(if capacity {
+        "cluster-capacity.json"
+    } else {
+        "cluster-candidate.json"
+    });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -166,8 +361,168 @@ pub async fn run_reference() -> Result<PathBuf, Box<dyn std::error::Error + Send
         &path,
         format!("{}\n", serde_json::to_string_pretty(&profile)?),
     )?;
-    profile.validate_reference()?;
+    let validation = selected_scenario.map_or_else(
+        || profile.validate_reference(),
+        |scenario_id| profile.validate_selected(scenario_id),
+    );
+    if let Err(error) = validation {
+        write_qualification_diagnostic(&path, &profile, &error)?;
+        if !capacity {
+            return Err(Box::new(error));
+        }
+    }
     Ok(path)
+}
+
+/// Persist a machine-readable non-promotable qualification result beside a capture.
+///
+/// # Errors
+/// Returns an IO or JSON error when the diagnostic cannot be serialized or written.
+fn write_qualification_diagnostic(
+    report_path: &Path,
+    profile: &BifrostReferenceProfile,
+    error: &ClusterBenchmarkError,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let diagnostic_path = report_path.with_extension("qualification.json");
+    std::fs::write(
+        diagnostic_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&qualification_diagnostic(profile, error))?
+        ),
+    )?;
+    Ok(())
+}
+
+/// Persist a v2 non-promotable report when setup or the first probe fails.
+///
+/// Keeping this envelope on disk makes a failed or partial run auditable and
+/// prevents the old behavior of silently dropping the first failed probe.
+///
+/// # Errors
+/// Returns an IO or JSON error when the diagnostic cannot be serialized or
+/// written.
+fn write_failed_capture(
+    report_path: &Path,
+    environment: &BenchmarkEnvironment,
+    error: &str,
+    attempted_rates: &[u64],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let report = serde_json::json!({
+        "schema_version": CLUSTER_REPORT_VERSION,
+        "promotable": false,
+        "status": "not_ready",
+        "error": error,
+        "environment": environment,
+        "attempted_probes": attempted_rates,
+        "stop_reasons": ["failed_first_probe"],
+        "scenarios": [],
+    });
+    std::fs::write(
+        report_path,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    Ok(())
+}
+
+/// Persist a v2 diagnostic when environment discovery itself is unsupported.
+///
+/// # Errors
+/// Returns an IO or JSON error when the diagnostic cannot be written.
+fn write_unavailable_capture(
+    report_path: &Path,
+    error: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let report = serde_json::json!({
+        "schema_version": CLUSTER_REPORT_VERSION,
+        "promotable": false,
+        "status": "unsupported",
+        "error": error,
+        "environment": serde_json::Value::Null,
+        "attempted_probes": [],
+        "stop_reasons": ["unsupported_environment"],
+        "scenarios": [],
+    });
+    std::fs::write(
+        report_path,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    Ok(())
+}
+
+/// Build exact deficient-trial evidence without changing the strict qualification gate.
+#[must_use]
+fn qualification_diagnostic(
+    profile: &BifrostReferenceProfile,
+    error: &ClusterBenchmarkError,
+) -> serde_json::Value {
+    let status = match error {
+        ClusterBenchmarkError::Invalid(_) => "invalid",
+        ClusterBenchmarkError::Unsupported(_) => "unsupported",
+        ClusterBenchmarkError::NotReady(_) => "not_ready",
+        ClusterBenchmarkError::Incompatible(_) => "incompatible",
+    };
+    let deficiencies = profile
+        .scenarios
+        .iter()
+        .flat_map(|report| {
+            report
+                .trials
+                .iter()
+                .filter_map(|trial| trial_deficiency(report, trial))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema_version": "wyrd.bifrost.qualification-diagnostic/v1",
+        "promotable": false,
+        "status": status,
+        "error": error.to_string(),
+        "report_schema_version": profile.schema_version,
+        "git_sha": profile.environment.git_sha,
+        "deficiencies": deficiencies,
+    })
+}
+
+/// Return exact machine-readable evidence when one trial misses its sample floor.
+#[must_use]
+fn trial_deficiency(
+    report: &ClusterScenarioReport,
+    trial: &ClusterBenchmarkTrial,
+) -> Option<serde_json::Value> {
+    let client = &trial.client;
+    let floor = report.scenario.minimum_samples;
+    if client.durable_write.samples >= floor
+        && client.query_time_to_first_frame.samples >= floor
+        && client.total_query.samples >= floor
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "scenario_id": report.scenario.scenario_id,
+        "load_percent": report.scenario.offered_load_percent,
+        "offered_requests_per_second": report.scenario.offered_requests_per_second,
+        "knee_requests_per_second": report.discovered_knee_requests_per_second,
+        "knee_provenance": report.discovered_knee_provenance,
+        "trial": trial.trial,
+        "minimum_samples": floor,
+        "planned_operations": client.planned_operations,
+        "attempted_operations": client.attempted_operations,
+        "accepted_operations": client.accepted_operations,
+        "successful_writes": client.durable_write.samples,
+        "successful_query_ttfb": client.query_time_to_first_frame.samples,
+        "successful_query_total": client.total_query.samples,
+        "retry_operations": client.retry_operations,
+        "backpressure_operations": client.backpressure_operations,
+        "in_flight_cap_exhaustions": client.in_flight_cap_exhaustions,
+        "max_in_flight": client.max_in_flight,
+        "missed_operations": client.missed_operations,
+    }))
 }
 
 /// Discover one scenario knee by doubling from eight requests per second.
@@ -186,6 +541,7 @@ async fn calibrate(
             knee_provenance: KneeProvenance::Discovered,
             warmup: Duration::from_secs(3),
             measured: Duration::from_secs(u64::from(measured_seconds)),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
         })
         .await?;
         let client = &trial.client;
@@ -290,8 +646,9 @@ pub async fn run_reference_trial(
         load_percent: offered_load_percent,
         trial,
         knee_provenance,
-        warmup: Duration::from_secs(5),
+        warmup: Duration::from_secs(10),
         measured: Duration::from_secs(20),
+        max_in_flight: DEFAULT_MAX_IN_FLIGHT,
     })
     .await
 }
@@ -313,6 +670,8 @@ struct ReferenceTrialSpec {
     warmup: Duration,
     /// Measured evidence window.
     measured: Duration,
+    /// Profile-driven concurrent public operation cap.
+    max_in_flight: usize,
 }
 
 /// Execute one fresh-cluster trial with caller-selected calibration/reference windows.
@@ -384,6 +743,7 @@ async fn run_live_trial(
         spec.rate,
         spec.warmup,
         false,
+        spec.max_in_flight,
     )
     .await?;
     flush_tenant_writers(cluster, &tenants).await?;
@@ -409,6 +769,7 @@ async fn run_live_trial(
         spec.rate,
         spec.measured,
         true,
+        spec.max_in_flight,
     )
     .await?;
     flush_tenant_writers(cluster, &tenants).await?;
@@ -440,6 +801,7 @@ async fn run_live_trial(
         measured_seconds: spec.measured.as_secs().try_into()?,
         trials: 3,
         minimum_samples: 200,
+        max_in_flight: spec.max_in_flight,
         seed: 0xB1_F057,
     };
     Ok((
@@ -483,6 +845,8 @@ struct WindowResult {
     backpressure: u64,
     /// Operations skipped after falling behind by more than one interval.
     missed_operations: u64,
+    /// Operations refused solely because the declared cap was exhausted.
+    in_flight_cap_exhaustions: u64,
     /// Fixed flush cadence instants missed by more than one cadence interval.
     missed_flushes: u64,
     /// Measured window denominator for absolute rates.
@@ -493,6 +857,13 @@ impl WindowResult {
     /// Convert the complete measured ledger into report distributions and rates.
     fn metrics(&self) -> ClientTrialMetrics {
         ClientTrialMetrics {
+            planned_operations: self.submitted,
+            attempted_operations: self.submitted.saturating_sub(self.missed_operations),
+            accepted_operations: self.accepted,
+            backpressure_operations: self.backpressure,
+            retry_operations: self.retries,
+            in_flight_cap_exhaustions: self.in_flight_cap_exhaustions,
+            max_in_flight: u64::try_from(DEFAULT_MAX_IN_FLIGHT).unwrap_or(u64::MAX),
             durable_write: distribution(&self.write_us),
             flush_to_visible: distribution(&self.flush_us),
             query_time_to_first_frame: distribution(&self.query_ttfb_us),
@@ -531,6 +902,8 @@ enum OperationResult {
         latency_us: u64,
         /// Durable rows acknowledged by Gate.
         rows: u64,
+        /// Bounded retry attempts retaining the original batch identity.
+        retries: u64,
     },
     /// One successful strict query.
     Query {
@@ -558,13 +931,21 @@ async fn run_window(
     rate: u64,
     duration: Duration,
     measured: bool,
+    max_in_flight: usize,
 ) -> Result<WindowResult, Box<dyn std::error::Error + Send + Sync>> {
     if rate == 0 {
         return Err("open-loop offered rate must be positive".into());
     }
     let start = tokio::time::Instant::now();
     let operations = operation_window(
-        start, tenants, clients, definition, rate, duration, measured,
+        start,
+        tenants,
+        clients,
+        definition,
+        rate,
+        duration,
+        measured,
+        max_in_flight,
     );
     let flushes = flush_window(start, cluster, tenants, clients, duration, measured);
     let (mut result, flush_result) = tokio::try_join!(operations, flushes)?;
@@ -587,6 +968,7 @@ async fn operation_window(
     rate: u64,
     duration: Duration,
     measured: bool,
+    max_in_flight: usize,
 ) -> Result<WindowResult, Box<dyn std::error::Error + Send + Sync>> {
     let interval = Duration::from_secs_f64(1.0 / rate as f64);
     let operation_count = rate.saturating_mul(duration.as_secs());
@@ -603,8 +985,12 @@ async fn operation_window(
         let planned = start + interval.mul_f64(ordinal as f64);
         tokio::time::sleep_until(planned).await;
         result.submitted = result.submitted.saturating_add(1);
-        if tokio::time::Instant::now() > planned + interval || tasks.len() >= MAX_IN_FLIGHT {
+        if tokio::time::Instant::now() > planned + interval {
             result.missed_operations = result.missed_operations.saturating_add(1);
+            continue;
+        }
+        if tasks.len() >= max_in_flight {
+            result.in_flight_cap_exhaustions = result.in_flight_cap_exhaustions.saturating_add(1);
             continue;
         }
         let tenant_index = ordinal as usize % tenants.len();
@@ -641,15 +1027,26 @@ async fn scheduled_write(
         batch_id: deterministic_batch_id(tenant_index, 1_000_000 + ordinal),
         arrow_ipc: payload.into(),
     };
-    match client.writer.send_frame(frame).await {
-        Ok(()) => Ok(OperationResult::Write {
-            tenant: tenant_index,
-            latency_us: elapsed_us(planned),
-            rows: u64::from(ROWS_PER_WRITE),
-        }),
-        Err(error) if is_backpressure(&error.to_string()) => Ok(OperationResult::Backpressure),
-        Err(error) if is_retryable(&error.to_string()) => Ok(OperationResult::Retry),
-        Err(error) => Err(error.into()),
+    let mut retries = 0_u64;
+    loop {
+        match client.writer.send_frame(frame.clone()).await {
+            Ok(()) => {
+                return Ok(OperationResult::Write {
+                    tenant: tenant_index,
+                    latency_us: elapsed_us(planned),
+                    rows: u64::from(ROWS_PER_WRITE),
+                    retries,
+                });
+            }
+            Err(error) if is_backpressure(&error.to_string()) => {
+                return Ok(OperationResult::Backpressure);
+            }
+            Err(error) if is_retryable(&error.to_string()) && retries < 2 => {
+                retries = retries.saturating_add(1);
+            }
+            Err(error) if is_retryable(&error.to_string()) => return Ok(OperationResult::Retry),
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
@@ -765,8 +1162,10 @@ fn apply_operation(result: &mut WindowResult, operation: OperationResult) {
             tenant,
             latency_us,
             rows,
+            retries,
         } => {
             result.accepted = result.accepted.saturating_add(1);
+            result.retries = result.retries.saturating_add(retries);
             result.write_us.push(latency_us);
             result.tenant_write_rows[tenant] =
                 result.tenant_write_rows[tenant].saturating_add(rows);
@@ -818,7 +1217,7 @@ async fn flush_window(
             continue;
         }
         let tenant_index = flush_index as usize % tenants.len();
-        flush_tenant_writers(cluster, tenants).await?;
+        flush_one_tenant(cluster, tenants, tenant_index).await?;
         let request = BifrostQueryRequest {
             sql: format!(
                 "SELECT row_id, wyrd_event_time FROM vala.bifrost.{REFERENCE_TABLE} WHERE row_id BETWEEN {} AND {} ORDER BY row_id LIMIT 64",
@@ -990,6 +1389,30 @@ async fn flush_tenant_writers(
             .flush_bifrost_for_tenant(tenant)
             .await?;
     }
+    Ok(())
+}
+
+/// Flush only the tenant selected for this staggered cadence slot.
+async fn flush_one_tenant(
+    cluster: &WyrdTestCluster,
+    tenants: &[DataTenantId],
+    tenant_index: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let writer_nodes = cluster.ready_ingest_nodes();
+    if writer_nodes.is_empty() {
+        return Err("reference cluster has no tenant writer Server".into());
+    }
+    let tenant = tenants
+        .get(tenant_index)
+        .ok_or("staggered flush selected an unknown tenant")?;
+    let node = writer_nodes
+        .get(tenant_index % writer_nodes.len())
+        .ok_or("reference cluster has no tenant writer Server")?;
+    cluster
+        .server_by_node(*node)
+        .ok_or("reference cluster has no tenant writer Server")?
+        .flush_bifrost_for_tenant(*tenant)
+        .await?;
     Ok(())
 }
 
@@ -1437,9 +1860,12 @@ pub fn detect_reference_environment() -> Result<BenchmarkEnvironment, ClusterBen
         postgres_image: "postgres:16".to_owned(),
         postgres_version: postgres_version()?,
         postgres_config: "wyrd-reference-v1:tmpfs:2cpu:4gib".to_owned(),
-        storage_image: "in-process-memory".to_owned(),
+        storage_image: "local-filesystem".to_owned(),
         storage_version: env!("CARGO_PKG_VERSION").to_owned(),
-        storage_config: "loopback-memory-v1".to_owned(),
+        storage_config: "target/bifrost-benchmarks/storage:dedicated-root".to_owned(),
+        storage_backend_kind: "local-filesystem".to_owned(),
+        storage_root: "target/bifrost-benchmarks/storage".to_owned(),
+        storage_device_class: "local".to_owned(),
         rust_major_minor,
         arrow_version: lock_version(lock, "arrow")?,
         datafusion_version: lock_version(lock, "datafusion")?,
@@ -1456,14 +1882,17 @@ pub fn detect_reference_environment() -> Result<BenchmarkEnvironment, ClusterBen
 
 /// Resolve a default or caller-selected target report path.
 fn report_path(file_name: &str) -> PathBuf {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     std::env::var_os("WYRD_BIFROST_REPORT").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../..")
-                .join("target/bifrost-benchmarks")
-                .join(file_name)
+        || repository.join("target/bifrost-benchmarks").join(file_name),
+        |configured| {
+            let configured = PathBuf::from(configured);
+            if configured.is_absolute() {
+                configured
+            } else {
+                repository.join(configured)
+            }
         },
-        PathBuf::from,
     )
 }
 
@@ -1555,6 +1984,48 @@ fn lock_source_revision(lock: &str, package: &str) -> Result<String, ClusterBenc
 mod tests {
     use super::*;
 
+    /// Proves the public grammar requires one mode and one selector before
+    /// any cluster or database lifecycle starts.
+    #[test]
+    fn public_command_grammar_is_exact() {
+        let command = parse_cluster_benchmark_args([
+            "--mode",
+            "capacity",
+            "--scenario",
+            "balanced-one-pod-eight-tenants",
+        ])
+        .expect("canonical command parses");
+        assert_eq!(command.mode, ClusterBenchmarkMode::Capacity);
+        assert_eq!(
+            command.scenario.as_deref(),
+            Some("balanced-one-pod-eight-tenants")
+        );
+        assert!(parse_cluster_benchmark_args(["--mode", "capacity"]).is_err());
+        assert!(
+            parse_cluster_benchmark_args([
+                "--mode",
+                "capacity",
+                "--matrix",
+                "--scenario",
+                "balanced-one-pod-one-tenant"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cluster_benchmark_args([
+                "--mode",
+                "qualification",
+                "--scenario",
+                "not-a-scenario"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cluster_benchmark_args(["--mode", "qualification", "--matrix", "--unknown"])
+                .is_err()
+        );
+    }
+
     /// Proves the public benchmark owns exactly D22's six scenario identities.
     #[test]
     fn reference_matrix_is_exact() {
@@ -1605,6 +2076,122 @@ mod tests {
         assert!(balanced.windows(10).all(|window| {
             window.iter().any(|write| *write) && window.iter().any(|write| !*write)
         }));
+    }
+
+    /// Proves an unsupported capture preserves exact scheduler and outcome counts.
+    #[test]
+    fn qualification_diagnostic_preserves_deficient_trial_counts() {
+        let report = ClusterScenarioReport {
+            scenario: ClusterBenchmarkScenario {
+                scenario_id: "write-heavy-three-server-three-worker-eight-tenants".to_owned(),
+                workload_version: CLUSTER_WORKLOAD_VERSION.to_owned(),
+                topology: ClusterTopology::ThreeServersThreeForgeWorkers,
+                tenants: 8,
+                traffic: TrafficMix::WriteHeavy,
+                rows_per_batch: 64,
+                query_row_limit: 64,
+                offered_requests_per_second: 32,
+                offered_load_percent: 50,
+                knee_provenance: KneeProvenance::Discovered,
+                warmup_seconds: 5,
+                measured_seconds: 20,
+                trials: 3,
+                minimum_samples: 200,
+                max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+                seed: 0xB1_F057,
+            },
+            discovered_knee_requests_per_second: 64,
+            discovered_knee_provenance: KneeProvenance::Discovered,
+            trials: Vec::new(),
+            median: Default::default(),
+        };
+        let trial = ClusterBenchmarkTrial {
+            trial: 1,
+            client: ClientTrialMetrics {
+                planned_operations: 640,
+                attempted_operations: 640,
+                accepted_operations: 639,
+                backpressure_operations: 1,
+                durable_write: TrialDistribution {
+                    samples: 575,
+                    ..Default::default()
+                },
+                query_time_to_first_frame: TrialDistribution {
+                    samples: 64,
+                    ..Default::default()
+                },
+                total_query: TrialDistribution {
+                    samples: 64,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            production: Default::default(),
+        };
+
+        let diagnostic = trial_deficiency(&report, &trial).expect("trial is deficient");
+        assert_eq!(diagnostic["planned_operations"], 640);
+        assert_eq!(diagnostic["attempted_operations"], 640);
+        assert_eq!(diagnostic["successful_writes"], 575);
+        assert_eq!(diagnostic["successful_query_total"], 64);
+        assert_eq!(diagnostic["backpressure_operations"], 1);
+        assert_eq!(diagnostic["missed_operations"], 0);
+        assert_eq!(diagnostic["knee_requests_per_second"], 64);
+
+        let profile = BifrostReferenceProfile {
+            schema_version: CLUSTER_REPORT_VERSION.to_owned(),
+            environment: BenchmarkEnvironment {
+                architecture: "aarch64".to_owned(),
+                cpu_vendor: "apple".to_owned(),
+                cpu_model: "apple m1".to_owned(),
+                logical_cores: 8,
+                host_memory_bytes: 16 * 1024 * 1024 * 1024,
+                container_cpu_millis: 2_000,
+                container_memory_bytes: 4 * 1024 * 1024 * 1024,
+                postgres_image: "postgres:16".to_owned(),
+                postgres_version: "16".to_owned(),
+                postgres_config: "reference".to_owned(),
+                storage_image: "local-filesystem".to_owned(),
+                storage_version: "0.0.1".to_owned(),
+                storage_config: "loopback-memory-v1".to_owned(),
+                storage_backend_kind: "local-filesystem".to_owned(),
+                storage_root: "target/bifrost-benchmarks/storage".to_owned(),
+                storage_device_class: "local".to_owned(),
+                rust_major_minor: "1.88".to_owned(),
+                arrow_version: "58.4.0".to_owned(),
+                datafusion_version: "53.1.0".to_owned(),
+                iceberg_version: "revision".to_owned(),
+                os: "macos".to_owned(),
+                kernel: "test".to_owned(),
+                git_sha: "candidate".to_owned(),
+                dirty_worktree: false,
+                captured_at: "2026-08-03T00:00:00Z".to_owned(),
+            },
+            scenarios: vec![ClusterScenarioReport {
+                trials: vec![trial],
+                ..report
+            }],
+            slos: BifrostSloEnvelope::default(),
+        };
+        let directory = tempfile::tempdir().expect("temporary diagnostic directory");
+        let report_path = directory.path().join("cluster-candidate.json");
+        write_qualification_diagnostic(
+            &report_path,
+            &profile,
+            &ClusterBenchmarkError::Unsupported("insufficient samples".to_owned()),
+        )
+        .expect("unsupported diagnostic persists");
+        let persisted = std::fs::read_to_string(
+            directory
+                .path()
+                .join("cluster-candidate.qualification.json"),
+        )
+        .expect("persisted diagnostic is readable");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&persisted).expect("persisted diagnostic is JSON");
+        assert_eq!(persisted["promotable"], false);
+        assert_eq!(persisted["status"], "unsupported");
+        assert_eq!(persisted["deficiencies"][0]["successful_query_total"], 64);
     }
 
     /// Proves tenant row identities occupy non-overlapping deterministic ranges.

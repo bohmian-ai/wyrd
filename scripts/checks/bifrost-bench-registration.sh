@@ -13,10 +13,13 @@ require() {
   fi
 }
 
-for lane in reference reference:inner capture compare smoke; do
-  require "[tasks.\"bench:bifrost:cluster:$lane\"]" mise.toml
+for lane in capacity qualify compare components; do
+  require "[tasks.\"bench:bifrost:$lane\"]" mise.toml
 done
 require "--bench bench_bifrost_cluster" mise.toml
+require "--mode capacity" mise.toml
+require "--mode qualification" mise.toml
+require "--matrix" mise.toml
 require "bench_bifrost_cluster" crates/wyrd/wyrd-testing/Cargo.toml
 require "reference_scenario_matrix" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
 require "balanced-one-pod-one-tenant" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
@@ -29,18 +32,12 @@ require "CLUSTER_REPORT_VERSION" crates/shared/wyrd-bench/src/cluster.rs
 require "deny_unknown_fields" crates/shared/wyrd-bench/src/cluster.rs
 require "docker-compose.reference.yml" mise.toml
 
-for diagnostic in \
-  bench_bifrost_scribe \
-  bench_bifrost_forge \
-  bench_bifrost_oracle \
-  bench_bifrost_otlp; do
-  require "$diagnostic" crates/wyrd/wyrd-testing/Cargo.toml
-done
-
-if rg -n -F 'production-readiness' \
-  crates/wyrd/wyrd-testing/src/bifrost/bench_scribe.rs \
-  crates/wyrd/wyrd-testing/src/bifrost/bench_forge.rs >/dev/null; then
-  echo "component diagnostics still claim production-readiness authority" >&2
+if rg -n '^\[tasks\."bench(:workload|:check)?"\]' mise.toml >/dev/null; then
+  echo "legacy headline benchmark commands remain registered" >&2
+  exit 1
+fi
+if rg -n '^\[tasks\."bench:bifrost:(cluster|baseline|preflight|scribe|forge|oracle|otlp)' mise.toml >/dev/null; then
+  echo "legacy Bifrost benchmark aliases remain registered" >&2
   exit 1
 fi
 

@@ -226,6 +226,15 @@ pub struct OracleSlotManager {
     running_limit: usize,
 }
 
+/// Closed reason why bounded local running capacity was not acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalSlotAcquireError {
+    /// The immutable admission deadline elapsed before capacity became available.
+    Deadline,
+    /// Oracle lifecycle cancellation interrupted the bounded wait.
+    Cancelled,
+}
+
 /// Production metric owner for one retained local Oracle.
 ///
 /// The owner keeps the process-local slot and memory accounting needed to
@@ -325,7 +334,7 @@ impl OracleTelemetry {
             )
             .increment(0);
         }
-        for outcome in ["acquired", "rejected"] {
+        for outcome in ["acquired", "deadline", "cancelled"] {
             metrics::counter!(
                 "bifrost_oracle_slot_reservations_total",
                 "role" => "leader",
@@ -754,6 +763,38 @@ impl OracleSlotManager {
         Arc::clone(&self.running)
             .try_acquire_many_owned(demand)
             .map_err(|_| BifrostError::QueryAdmissionRejected)
+    }
+
+    /// Waits for local running units within the caller's admission boundary.
+    ///
+    /// The existing pending semaphore bounds the number of callers that may
+    /// enter this wait. The returned permit is transferred into the admitted
+    /// query guard or dropped before any failed durable admission returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalSlotAcquireError::Deadline`] when the immutable deadline
+    /// elapses and [`LocalSlotAcquireError::Cancelled`] when Oracle lifecycle
+    /// cancellation wins. A closed semaphore is treated as cancellation.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the future drops the semaphore acquisition future without
+    /// consuming capacity.
+    pub(crate) async fn acquire_running(
+        &self,
+        demand: u32,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OwnedSemaphorePermit, LocalSlotAcquireError> {
+        let acquire = Arc::clone(&self.running).acquire_many_owned(demand);
+        tokio::select! {
+            permit = acquire => permit.map_err(|_| LocalSlotAcquireError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(LocalSlotAcquireError::Deadline)
+            }
+            () = cancellation.cancelled() => Err(LocalSlotAcquireError::Cancelled),
+        }
     }
 }
 
@@ -3405,6 +3446,56 @@ mod tests {
         assert_eq!(admission_limits(10, QueryClass::Interactive), (8, 1));
         assert_eq!(admission_limits(10, QueryClass::Analytical), (4, 2));
         assert_eq!(admission_limits(1, QueryClass::Analytical), (2, 2));
+    }
+
+    /// Bounded local admission waits for an executing query instead of rejecting a transient race.
+    #[tokio::test]
+    async fn local_slot_wait_admits_after_capacity_is_released() {
+        let slots = Arc::new(OracleSlotManager::new(2, 1));
+        let held = slots.try_running(1).expect("initial slot is available");
+        let cancellation = CancellationToken::new();
+        let waiting = {
+            let slots = Arc::clone(&slots);
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                slots
+                    .acquire_running(1, Instant::now() + Duration::from_secs(1), &cancellation)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(held);
+        let acquired = waiting
+            .await
+            .expect("local wait task completes")
+            .expect("released capacity is acquired");
+        drop(acquired);
+        assert!(slots.try_running(1).is_ok());
+    }
+
+    /// Deadline and cancellation leave the local semaphore at its configured capacity.
+    #[tokio::test]
+    async fn local_slot_wait_terminates_without_leaking_capacity() {
+        let slots = OracleSlotManager::new(2, 1);
+        let held = slots.try_running(1).expect("initial slot is available");
+        let cancellation = CancellationToken::new();
+        let deadline = slots
+            .acquire_running(1, Instant::now() + Duration::from_millis(1), &cancellation)
+            .await;
+        assert!(matches!(deadline, Err(LocalSlotAcquireError::Deadline)));
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let cancellation_result = slots
+            .acquire_running(1, Instant::now() + Duration::from_secs(1), &cancelled)
+            .await;
+        assert!(matches!(
+            cancellation_result,
+            Err(LocalSlotAcquireError::Cancelled)
+        ));
+        drop(held);
+        assert!(slots.try_running(1).is_ok());
     }
 
     /// Tenant tripwire rejects a foreign row instead of filtering it away.

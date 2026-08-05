@@ -817,7 +817,7 @@ impl OracleAdmission {
         !self.cluster.snapshot().live_oracles().is_empty() && self.slots.running_capacity() > 0
     }
 
-    /// Acquires cluster/class/tenant capacity and the matching local running guard.
+    /// Acquires local running capacity and then matching cluster/class/tenant capacity.
     ///
     /// The calculation uses one immutable membership snapshot. This single-node
     /// task selects the local leader and never downgrades analytical work. The
@@ -829,9 +829,10 @@ impl OracleAdmission {
     /// Returns stable admission rejection for bounded waiter, durable capacity,
     /// local-capacity, or placement failure; SQL failures fail the query closed.
     /// Cancellation before durable acquisition returns without a lease. After
-    /// acquisition, local-slot failure awaits fenced durable release; success
-    /// transfers the lease, renewal task, cancellation token, and local permits to
-    /// the returned guard so no admitted capacity is detached from stream cleanup.
+    /// acquisition, durable rejection drops the already-reserved local permit;
+    /// success transfers the lease, renewal task, cancellation token, and local
+    /// permit to the returned guard so no admitted capacity is detached from stream
+    /// cleanup.
     #[tracing::instrument(
         name = "bifrost.oracle.admission",
         skip_all,
@@ -860,6 +861,33 @@ impl OracleAdmission {
         let (plan, lease_ttl) = self.plan_admission(tenant, query_class, deadline)?;
         let demand = plan.lease.slot_units;
         let local_node = plan.lease.leader_node_id;
+        let _slot_span = tracing::info_span!(
+            "bifrost.oracle.slot_reservation",
+            role = "leader",
+            query_class = query_class_label(query_class),
+            slot_units = demand
+        );
+        let running = match self
+            .slots
+            .acquire_running(demand, plan.deadline, &cancellation)
+            .await
+        {
+            Ok(running) => {
+                OracleTelemetry::record_slot_reservation(query_class, "acquired");
+                running
+            }
+            Err(LocalSlotAcquireError::Deadline) => {
+                OracleTelemetry::record_slot_reservation(query_class, "deadline");
+                OracleTelemetry::record_admission_rejection("cluster", "local_slots", query_class);
+                waiter.finish("cluster", "rejected");
+                return Err(BifrostError::QueryAdmissionRejected);
+            }
+            Err(LocalSlotAcquireError::Cancelled) => {
+                OracleTelemetry::record_slot_reservation(query_class, "cancelled");
+                waiter.finish("cluster", "cancelled");
+                return Err(BifrostError::QueryAdmissionRejected);
+            }
+        };
         let acquired = match self.acquire_plan(&plan).await {
             Ok(acquired) => acquired,
             Err(error) => {
@@ -903,34 +931,6 @@ impl OracleAdmission {
             AdmissionAcquire::Acquired(lease) => {
                 waiter.finish("cluster", "acquired");
                 drop(pending);
-                let _slot_span = tracing::info_span!(
-                    "bifrost.oracle.slot_reservation",
-                    role = "leader",
-                    query_class = query_class_label(query_class),
-                    slot_units = demand
-                );
-                let running = match self.slots.try_running(demand) {
-                    Ok(running) => {
-                        OracleTelemetry::record_slot_reservation(query_class, "acquired");
-                        running
-                    }
-                    Err(error) => {
-                        OracleTelemetry::record_slot_reservation(query_class, "rejected");
-                        OracleTelemetry::record_admission_rejection(
-                            "cluster",
-                            "local_slots",
-                            query_class,
-                        );
-                        let leader = RoleFence {
-                            node_id: local_node,
-                            fencing_token: self.local_role.fencing_token,
-                        };
-                        let _ = self
-                            .release_lease(lease.data_tenant_id, lease.query_id, &leader)
-                            .await;
-                        return Err(error);
-                    }
-                };
                 let slot_telemetry = OracleTelemetry::start_slot_use(query_class, demand);
                 let (renewal_terminal, renewal) =
                     self.start_lease_renewal(&lease, &cancellation, lease_ttl);

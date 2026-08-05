@@ -183,6 +183,15 @@ enum QueryStreamEvent {
     Failed(QueryTerminalErrorCode),
 }
 
+/// Closed proof returned by one explicit durable admission-release attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionReleaseOutcome {
+    /// Durable mutation proved that admission capacity is no longer retained.
+    Released,
+    /// SQL failure or a committed no-op left cleanup owned by guard drop.
+    Incomplete,
+}
+
 /// Waits for the next physical batch while enforcing lease cancellation and deadline.
 ///
 /// Lease cancellation wins over starting another read when already observable.
@@ -349,11 +358,64 @@ fn finish_stream(
     }
 }
 
-/// Releases stream admission exactly once after a terminal frame is selected.
-async fn release_admitted(admitted: &mut Option<AdmittedQueryGuard>) {
-    if let Some(admitted) = admitted.take() {
-        let _ = admitted.release().await;
+/// Releases stream admission exactly once and returns durable completion proof.
+async fn release_admitted(admitted: &mut Option<AdmittedQueryGuard>) -> AdmissionReleaseOutcome {
+    let Some(admitted) = admitted.take() else {
+        tracing::error!("Oracle query stream admission owner was already consumed");
+        return AdmissionReleaseOutcome::Incomplete;
+    };
+    let result = admitted.release().await;
+    match &result {
+        Ok(AdmissionReleaseStatus::Released) => {}
+        Ok(AdmissionReleaseStatus::NotReleased) => {
+            tracing::warn!("Oracle query terminal admission release was incomplete");
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "Oracle query terminal admission release failed");
+        }
     }
+    match result {
+        Ok(AdmissionReleaseStatus::Released) => AdmissionReleaseOutcome::Released,
+        Ok(AdmissionReleaseStatus::NotReleased) | Err(_) => AdmissionReleaseOutcome::Incomplete,
+    }
+}
+
+/// Releases admission, selects the truthful terminal, then finishes telemetry.
+async fn release_and_finish_terminal(
+    admitted: &mut Option<AdmittedQueryGuard>,
+    query_telemetry: &mut QueryTelemetryGuard,
+    gate_lifecycle: Option<&Arc<QueryStreamLifecycle>>,
+    candidate: QueryTerminalFrame,
+    failed_outcome: &'static str,
+    visibility: VisibilityMode,
+    row_count: u64,
+) -> QueryTerminalFrame {
+    let release = release_admitted(admitted).await;
+    let terminal = if release == AdmissionReleaseOutcome::Incomplete
+        && matches!(
+            candidate.outcome,
+            QueryTerminalOutcome::Success | QueryTerminalOutcome::Degraded
+        ) {
+        failed_terminal_for_visibility(
+            QueryTerminalErrorCode::QueryExecutionFailed,
+            row_count,
+            visibility,
+        )
+    } else {
+        candidate
+    };
+    let outcome = if terminal.outcome == QueryTerminalOutcome::Failed {
+        failed_outcome
+    } else {
+        "success"
+    };
+    let status = if terminal.outcome == QueryTerminalOutcome::Degraded {
+        "degraded"
+    } else {
+        "complete"
+    };
+    finish_stream(query_telemetry, gate_lifecycle, outcome, status);
+    terminal
 }
 
 impl OracleQueryStream {
@@ -418,17 +480,7 @@ impl OracleQueryStream {
             let mut row_count = 0_u64;
             query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
             yield Ok(QueryStreamFrame::Schema(schema_frame));
-            macro_rules! finish_failed_stream {
-                ($code:expr) => {{
-                    let outcome = failed_stream_outcome(&stream_telemetry_cancelled);
-                    finish_stream(&mut query_telemetry, gate_lifecycle.as_ref(), outcome, "complete");
-                    let terminal = failed_terminal_for_visibility($code, row_count, visibility);
-                    release_admitted(&mut admitted).await;
-                    yield Ok(QueryStreamFrame::Terminal(terminal));
-                    return;
-                }};
-            }
-            loop {
+            let candidate = loop {
                 let event = if lease_cancellation.is_cancelled() {
                     QueryStreamEvent::Failed(renewal_terminal_code(&renewal_terminal))
                 } else if let Some(value) = next.take() {
@@ -444,37 +496,48 @@ impl OracleQueryStream {
                 match event {
                     QueryStreamEvent::Batch(Some(Ok(batch))) => {
                         query_telemetry.first_batch();
-                        row_count = row_count.saturating_add(batch.num_rows() as u64);
-                        if let Ok(frame) = encode_batch_frame(&batch) {
-                            query_telemetry.record_payload(
-                                batch.num_rows() as u64,
-                                frame.arrow_ipc_batch.len(),
+                        let batch_rows = batch.num_rows() as u64;
+                        row_count = row_count.saturating_add(batch_rows);
+                        let Ok(frame) = encode_batch_frame(&batch) else {
+                            break failed_terminal_for_visibility(
+                                QueryTerminalErrorCode::QueryExecutionFailed,
+                                row_count,
+                                visibility,
                             );
-                            yield Ok(QueryStreamFrame::Batch(frame));
-                        } else {
-                            finish_failed_stream!(QueryTerminalErrorCode::QueryExecutionFailed);
-                        }
+                        };
+                        query_telemetry.record_payload(batch_rows, frame.arrow_ipc_batch.len());
+                        yield Ok(QueryStreamFrame::Batch(frame));
                     }
                     QueryStreamEvent::Batch(Some(Err(error))) => {
                         let code = terminal_error_code(&error);
                         tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                        finish_failed_stream!(code);
+                        break failed_terminal_for_visibility(code, row_count, visibility);
                     }
-                    QueryStreamEvent::Batch(None) => break,
+                    QueryStreamEvent::Batch(None) => break successful_terminal(
+                        visibility,
+                        degraded,
+                        stale_replanned,
+                        row_count,
+                    ),
                     QueryStreamEvent::Failed(code) => {
-                        finish_failed_stream!(code);
+                        break failed_terminal_for_visibility(code, row_count, visibility);
                     }
                 }
-            }
-            let terminal = successful_terminal(visibility, degraded, stale_replanned, row_count);
-            debug_assert!(terminal.validate(visibility).is_ok());
-            finish_stream(
+            };
+            let failed_outcome = if candidate.outcome == QueryTerminalOutcome::Failed {
+                failed_stream_outcome(&stream_telemetry_cancelled)
+            } else {
+                "failed"
+            };
+            let terminal = release_and_finish_terminal(
+                &mut admitted,
                 &mut query_telemetry,
                 gate_lifecycle.as_ref(),
-                "success",
-                if degraded { "degraded" } else { "complete" },
-            );
-            release_admitted(&mut admitted).await;
+                candidate,
+                failed_outcome,
+                visibility,
+                row_count,
+            ).await;
             yield Ok(QueryStreamFrame::Terminal(terminal));
         };
         let stream = Self::assemble(
@@ -598,22 +661,6 @@ mod tests {
         assert_eq!(owner.slots_in_use.load(Ordering::Acquire), 0);
         assert!(owner.release_complete.load(Ordering::Acquire));
         assert!(owner.fence_released.load(Ordering::Acquire));
-    }
-
-    /// Keeps every production terminal path awaited on the admitted owner.
-    #[test]
-    fn production_paths_await_admitted_release() {
-        let source = include_str!("query_stream.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("query stream production section");
-        assert_eq!(
-            source
-                .matches("release_admitted(&mut admitted).await")
-                .count(),
-            4,
-            "every stream terminal path must await admitted.release()"
-        );
     }
 
     /// Cancellation signals a stalled frame source before bounded drain returns.

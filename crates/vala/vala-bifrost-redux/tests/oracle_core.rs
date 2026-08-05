@@ -1498,6 +1498,17 @@ fn renewal_test_config() -> OracleConfig {
     }
 }
 
+/// Returns a cadence that keeps renewal and maintenance outside bounded release tests.
+#[must_use]
+fn terminal_release_test_config() -> OracleConfig {
+    OracleConfig {
+        lease_ttl: Duration::from_secs(300),
+        lease_renew_interval: Duration::from_secs(120),
+        maintenance_interval: Duration::from_secs(120),
+        ..OracleConfig::default()
+    }
+}
+
 /// Reads the sole active admission query identity from an isolated fixture.
 ///
 /// # Panics
@@ -1533,6 +1544,68 @@ async fn active_lease_count(fixture: &OracleFixture) -> i64 {
     .expect("active lease count");
     conn.commit().await.expect("commit lease count");
     count
+}
+
+/// Reads active durable admission accounting grouped by the three scopes.
+///
+/// # Panics
+///
+/// Panics when the fixture owner cannot query admission accounting.
+async fn active_admission_accounting(fixture: &OracleFixture) -> HashMap<String, i64> {
+    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+    sqlx::query_as(
+        "SELECT scope_kind, sum(used_slots)::bigint FROM vala.oracle_admission_accounting \
+         WHERE used_slots > 0 AND (data_tenant_id=$1 OR scope_key='global') GROUP BY scope_kind",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .fetch_all(&owner)
+    .await
+    .expect("active admission accounting")
+    .into_iter()
+    .collect()
+}
+
+/// Asserts the lease and all three accounting scopes are active or clear.
+///
+/// # Panics
+///
+/// Panics when durable admission state differs from `active`.
+async fn assert_admission_state(fixture: &OracleFixture, active: bool) {
+    assert_eq!(active_lease_count(fixture).await, i64::from(active));
+    let accounting = active_admission_accounting(fixture).await;
+    if active {
+        assert_eq!(accounting.get("cluster"), Some(&1));
+        assert_eq!(accounting.get("class"), Some(&1));
+        assert_eq!(accounting.get("tenant"), Some(&1));
+    } else {
+        assert!(
+            accounting.is_empty(),
+            "accounting remained active: {accounting:?}"
+        );
+    }
+}
+
+/// Starts one real admitted stream without consuming its terminal.
+///
+/// # Panics
+///
+/// Panics when the real Oracle rejects stream construction.
+async fn admitted_release_stream(
+    oracle: &Oracle,
+    fixture: &OracleFixture,
+) -> vala_bifrost_redux::oracle::OracleQueryStream {
+    oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect("admitted release stream")
 }
 
 /// Counts durable read decisions for the isolated fixture tenant.
@@ -3302,6 +3375,155 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_lease_sql_failure_terminal(
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
+}
+
+/// A successful terminal proves its admission lease was durably released first.
+#[tokio::test]
+async fn oracle_terminal_success_requires_released_admission() {
+    let fixture = OracleFixture::new("oracle_terminal_release_success").await;
+    fixture.seed_hot_row(1).await;
+    let recorder = wyrd_bench::BenchmarkRecorder::new();
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            terminal_release_test_config(),
+        )
+        .await;
+    let result = terminal(admitted_release_stream(&oracle, &fixture).await).await;
+    assert_eq!(result.outcome, QueryTerminalOutcome::Success);
+    assert!(result.error.is_none());
+    assert_counter(
+        &recorder.snapshot(),
+        "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"success\"}",
+    );
+    assert_admission_state(&fixture, false).await;
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await;
+    assert_admission_state(&fixture, false).await;
+}
+
+/// A fenced release no-op fails the terminal and remains queued through shutdown drain.
+#[tokio::test]
+async fn oracle_terminal_not_released_fails_and_shutdown_drains() {
+    let fixture = OracleFixture::new("oracle_terminal_release_noop").await;
+    fixture.seed_hot_row(1).await;
+    let recorder = wyrd_bench::BenchmarkRecorder::new();
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            terminal_release_test_config(),
+        )
+        .await;
+    let stream = admitted_release_stream(&oracle, &fixture).await;
+    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+    let query_id = sole_lease_id(&fixture).await;
+    let original_fence: i64 = sqlx::query_scalar(
+        "SELECT leader_fencing_token FROM vala.oracle_admission_leases \
+         WHERE data_tenant_id=$1 AND query_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .bind(query_id)
+    .fetch_one(&owner)
+    .await
+    .expect("original leader fence");
+    sqlx::query(
+        "UPDATE vala.oracle_admission_leases SET leader_fencing_token=$3 \
+         WHERE data_tenant_id=$1 AND query_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .bind(query_id)
+    .bind(original_fence + 1)
+    .execute(&owner)
+    .await
+    .expect("mutate leader fence");
+    let result = terminal(stream).await;
+    assert_eq!(result.outcome, QueryTerminalOutcome::Failed);
+    assert_eq!(
+        result.error.expect("release failure terminal").code,
+        QueryTerminalErrorCode::QueryExecutionFailed
+    );
+    assert_counter(
+        &recorder.snapshot(),
+        "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"failed\"}",
+    );
+    assert_admission_state(&fixture, true).await;
+    let mut transaction = owner.begin().await.expect("fence restore transaction");
+    let restored = sqlx::query(
+        "UPDATE vala.oracle_admission_leases SET leader_fencing_token=$3 \
+         WHERE data_tenant_id=$1 AND query_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .bind(query_id)
+    .bind(original_fence)
+    .execute(&mut *transaction)
+    .await
+    .expect("restore leader fence");
+    assert_eq!(restored.rows_affected(), 1);
+    transaction.commit().await.expect("commit fence restore");
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await;
+    assert_admission_state(&fixture, false).await;
+}
+
+/// A release SQL error fails the terminal and queues durable shutdown cleanup.
+#[tokio::test]
+async fn oracle_terminal_release_sql_error_fails_and_shutdown_drains() {
+    let fixture = OracleFixture::new("oracle_terminal_release_sql_error").await;
+    fixture.seed_hot_row(1).await;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            terminal_release_test_config(),
+        )
+        .await;
+    let stream = admitted_release_stream(&oracle, &fixture).await;
+    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION vala.test_oracle_release_failure() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced release failure'; END $$",
+    )
+    .execute(&owner)
+    .await
+    .expect("install release failure function");
+    sqlx::query(
+        "CREATE TRIGGER test_oracle_release_failure BEFORE DELETE ON vala.oracle_admission_leases \
+         FOR EACH ROW EXECUTE FUNCTION vala.test_oracle_release_failure()",
+    )
+    .execute(&owner)
+    .await
+    .expect("install release failure trigger");
+    let result = terminal(stream).await;
+    assert_eq!(result.outcome, QueryTerminalOutcome::Failed);
+    assert_eq!(
+        result.error.expect("release failure terminal").code,
+        QueryTerminalErrorCode::QueryExecutionFailed
+    );
+    assert_admission_state(&fixture, true).await;
+    sqlx::query("DROP TRIGGER test_oracle_release_failure ON vala.oracle_admission_leases")
+        .execute(&owner)
+        .await
+        .expect("remove release failure trigger");
+    sqlx::query("DROP FUNCTION vala.test_oracle_release_failure()")
+        .execute(&owner)
+        .await
+        .expect("remove release failure function");
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await;
+    assert_admission_state(&fixture, false).await;
 }
 
 /// A short test cadence proves renewal and drop-driven durable release.

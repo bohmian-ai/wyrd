@@ -29,12 +29,17 @@ pub struct PgFixture {
     operator_pool: OperatorPool,
     /// Catalog-role DSN used by embedded Iceberg catalog fixtures.
     catalog_dsn: SecretString,
-    /// Migrator-role DSN reserved for schema-level fixture assertions.
-    migrator_dsn: SecretString,
     /// Tenant seeded when this fixture starts.
     data_tenant_id: DataTenantId,
     /// Human-readable slug associated with the seeded tenant.
     tenant_slug: String,
+    /// Shared table-owner pool retained for BYPASSRLS assertion probes.
+    ///
+    /// Callers receive cheap clones and must drop them normally. They must not
+    /// call [`PgPool::close`] because SQLx closes the shared pool across every
+    /// clone. This field precedes `_test_db` so the pool owner drops before the
+    /// ephemeral database is forcibly removed.
+    assertion_pool: PgPool,
     /// Database owner whose drop implementation cleans up the isolated database.
     _test_db: TestDatabase,
 }
@@ -199,7 +204,7 @@ impl PgFixture {
         seed_tenant(&self.operator_pool, data_tenant_id, slug).await
     }
 
-    /// Open a pool connected as the `wyrd_migrator` (table-owner) role.
+    /// Clone the fixture-owned pool connected as the `wyrd_migrator` role.
     ///
     /// Use this pool in test assertions that need to read across all tenants
     /// without RLS. The `wyrd_migrator` role is the table owner and has the
@@ -207,19 +212,17 @@ impl PgFixture {
     /// assertion queries. It is not a PostgreSQL superuser and cannot create
     /// databases.
     ///
-    /// A new pool is created on each call; cache it in a local if you need
-    /// it more than once per test.
+    /// The fixture retains this pool for its full lifetime so repeated probes
+    /// do not create new SQLx pool graphs. Callers must drop returned clones
+    /// normally and never call [`PgPool::close`], which closes the shared pool
+    /// for every clone.
     ///
     /// # Errors
-    /// Returns [`FixtureError`] when the pool cannot connect.
+    /// The result remains fallible for API compatibility. Pool construction
+    /// errors are returned by fixture startup, so this method returns `Ok`
+    /// after a fixture has started successfully.
     pub async fn superuser_pool(&self) -> Result<PgPool, FixtureError> {
-        build_pool(
-            self.migrator_dsn.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)
-        .map_err(FixtureError::Sql)
+        Ok(self.assertion_pool.clone())
     }
 
     /// Start an isolated fixture and seed the requested tenant identity.
@@ -236,6 +239,12 @@ impl PgFixture {
         let resolved = test_db.resolved_dsns()?;
         let catalog_dsn = resolved.catalog_app;
         let migrator_dsn = resolved.migrator;
+        let assertion_pool = build_pool(
+            migrator_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
         seed_tenant(&handles.operator_pool, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
@@ -243,9 +252,9 @@ impl PgFixture {
             wyrd: handles.wyrd,
             vala: handles.vala,
             catalog_dsn,
-            migrator_dsn,
             data_tenant_id,
             tenant_slug,
+            assertion_pool,
             _test_db: test_db,
         })
     }
@@ -560,8 +569,13 @@ mod pg_tests {
         assert_eq!(recovery_authority, (true, true, true, true, true));
         fixture_admin.close().await;
 
+        let migrator_dsn = fixture
+            ._test_db
+            .resolved_dsns()
+            .expect("fixture DSNs resolve")
+            .migrator;
         let postgres_migrator_dsn =
-            database_dsn(&fixture.migrator_dsn, "postgres").expect("migrator DSN rewrites");
+            database_dsn(&migrator_dsn, "postgres").expect("migrator DSN rewrites");
         let migrator = build_pool(
             postgres_migrator_dsn.expose_secret(),
             PoolConfig::migrator_defaults(),
@@ -596,6 +610,75 @@ mod pg_tests {
 
         assert_eq!(fixture.tenant_slug(), "custom-tenant");
         assert_seeded_tenant(&fixture, "custom-tenant").await;
+    }
+
+    /// Repeated table-owner probes reuse one fixture pool without exhausting
+    /// the isolated Postgres server's connection budget.
+    #[tokio::test]
+    async fn assertion_pool_supports_repeated_fixture_probes() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+
+        for expected in 0_i32..32 {
+            let assertion_pool = fixture
+                .superuser_pool()
+                .await
+                .expect("assertion pool clone");
+            let (current_user, bypasses_rls, observed): (String, bool, i32) = sqlx::query_as(
+                "SELECT current_user, rolbypassrls, $1::integer FROM pg_roles WHERE rolname = current_user",
+            )
+            .bind(expected)
+            .fetch_one(&assertion_pool)
+            .await
+            .expect("table-owner assertion probe");
+
+            assert_eq!(current_user, "wyrd_migrator");
+            assert!(bypasses_rls);
+            assert_eq!(observed, expected);
+            drop(assertion_pool);
+        }
+    }
+
+    /// SQLx pool clones share lifecycle state, proving assertion callers must
+    /// drop clones instead of explicitly closing them.
+    #[tokio::test]
+    async fn assertion_pool_clone_close_is_shared() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let first = fixture
+            .superuser_pool()
+            .await
+            .expect("first assertion pool clone");
+        let second = fixture
+            .superuser_pool()
+            .await
+            .expect("second assertion pool clone");
+
+        let (current_user, bypasses_rls): (String, bool) = sqlx::query_as(
+            "SELECT current_user, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+        )
+        .fetch_one(&first)
+        .await
+        .expect("first clone performs table-owner assertion");
+        assert_eq!(current_user, "wyrd_migrator");
+        assert!(bypasses_rls);
+        let observed: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&second)
+            .await
+            .expect("second clone performs assertion");
+        assert_eq!(observed, 1);
+
+        first.close().await;
+        assert!(second.is_closed());
+    }
+
+    /// Oracle journeys retain assertion-pool clones only for their local
+    /// mutation windows and release them without closing the shared pool.
+    #[test]
+    fn oracle_journeys_drop_assertion_pool_clones_without_closing() {
+        let journeys = include_str!("../../../wyrd/wyrd-testing/tests/oracle_edge_journeys.rs");
+
+        assert_eq!(journeys.matches(".superuser_pool()").count(), 4);
+        assert_eq!(journeys.matches("drop(owner);").count(), 2);
+        assert!(!journeys.contains("owner.close().await"));
     }
 
     async fn assert_required_schemas(fixture: &PgFixture) {

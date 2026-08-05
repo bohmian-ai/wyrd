@@ -1,6 +1,7 @@
 //! Read-only parsing and validation of production Forge telemetry windows.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -82,15 +83,26 @@ pub(crate) struct TelemetryLabelValues {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TelemetryBindingId(pub(crate) &'static str);
 
+/// One exact label value selected for a binding destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TelemetrySelectedLabel {
+    /// Exact allowed label key used by the selector.
+    key: &'static str,
+    /// Exact allowed value required for destination aggregation.
+    value: &'static str,
+}
+
 /// Exact production metric binding used by the canonical cluster projection.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TelemetryBinding {
     /// Stable report-local binding identity.
-    id: TelemetryBindingId,
+    pub(crate) id: TelemetryBindingId,
+    /// Exact label pairs selecting the destination's subset of valid series.
+    selected_label_values: &'static [TelemetrySelectedLabel],
     /// Exact normalized production family.
-    family: &'static str,
+    pub(crate) family: &'static str,
     /// Required Prometheus sample kind.
-    kind: BifrostMetricKind,
+    pub(crate) kind: BifrostMetricKind,
     /// Normative family unit.
     unit: TelemetryUnit,
     /// Required window aggregation.
@@ -106,7 +118,11 @@ pub(crate) struct TelemetryBinding {
 /// Closed exact binding ledger shared by qualification and capacity projection.
 const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     TelemetryBinding {
-        id: TelemetryBindingId("gate.requests"),
+        id: TelemetryBindingId("gate.requests.success"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "success",
+        }],
         family: "bifrost_gate_requests_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
@@ -125,8 +141,18 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         ],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("gate.rows"),
-        family: "bifrost_gate_rows_total",
+        id: TelemetryBindingId("gate.requests.query_success"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "operation",
+                value: "query",
+            },
+            TelemetrySelectedLabel {
+                key: "outcome",
+                value: "success",
+            },
+        ],
+        family: "bifrost_gate_requests_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
@@ -144,7 +170,134 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         ],
     },
     TelemetryBinding {
+        id: TelemetryBindingId("gate.requests.rejected"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "rejected",
+        }],
+        family: "bifrost_gate_requests_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["operation", "outcome"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["query", "write"],
+            },
+            TelemetryLabelValues {
+                key: "outcome",
+                values: &["success", "rejected", "failed", "cancelled"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.requests.failed"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "failed",
+        }],
+        family: "bifrost_gate_requests_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["operation", "outcome"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["query", "write"],
+            },
+            TelemetryLabelValues {
+                key: "outcome",
+                values: &["success", "rejected", "failed", "cancelled"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.requests.cancelled"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "cancelled",
+        }],
+        family: "bifrost_gate_requests_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["operation", "outcome"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["query", "write"],
+            },
+            TelemetryLabelValues {
+                key: "outcome",
+                values: &["success", "rejected", "failed", "cancelled"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.requests.write_cancelled"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "operation",
+                value: "write",
+            },
+            TelemetrySelectedLabel {
+                key: "outcome",
+                value: "cancelled",
+            },
+        ],
+        family: "bifrost_gate_requests_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["operation", "outcome"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["query", "write"],
+            },
+            TelemetryLabelValues {
+                key: "outcome",
+                values: &["success", "rejected", "failed", "cancelled"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.bytes"),
+        selected_label_values: &[],
+        family: "bifrost_gate_frame_bytes_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &[],
+        allowed_label_values: &[],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.rows"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "status",
+            value: "accepted",
+        }],
+        family: "bifrost_gate_rows_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["status"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "status",
+            values: &["accepted", "rejected"],
+        }],
+    },
+    TelemetryBinding {
         id: TelemetryBindingId("gate.active"),
+        selected_label_values: &[],
         family: "bifrost_gate_active_streams",
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
@@ -153,11 +306,122 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_keys: &["operation"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "operation",
-            values: &["query", "write"],
+            values: &["query"],
         }],
     },
     TelemetryBinding {
+        id: TelemetryBindingId("cleanup.scribe_ingress"),
+        selected_label_values: &[],
+        family: "bifrost_scribe_ingress_active",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Final,
+        requirement: TelemetryRequirement::Role("scribe"),
+        allowed_label_keys: &[],
+        allowed_label_values: &[],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("cleanup.scribe_lane_active"),
+        selected_label_values: &[],
+        family: "bifrost_scribe_lane_active",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Final,
+        requirement: TelemetryRequirement::Role("scribe"),
+        allowed_label_keys: &["lane"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "lane",
+            values: &["ingress", "persistence", "wal_io"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("cleanup.scribe_lane_queued"),
+        selected_label_values: &[],
+        family: "bifrost_scribe_lane_queued",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Final,
+        requirement: TelemetryRequirement::Role("scribe"),
+        allowed_label_keys: &["lane"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "lane",
+            values: &["ingress", "persistence", "wal_io"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("cleanup.scribe_persistence_queue"),
+        selected_label_values: &[],
+        family: "bifrost_scribe_persistence_queue_depth",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Final,
+        requirement: TelemetryRequirement::Role("scribe"),
+        allowed_label_keys: &[],
+        allowed_label_values: &[],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("cleanup.oracle_in_flight"),
+        selected_label_values: &[],
+        family: "bifrost_oracle_in_flight",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Final,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_keys: &["query_class", "visibility"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "query_class",
+                values: &["interactive", "analytical"],
+            },
+            TelemetryLabelValues {
+                key: "visibility",
+                values: &["published_only", "fused"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("cleanup.oracle_slots"),
+        selected_label_values: &[],
+        family: "bifrost_oracle_slots_in_use",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Final,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_keys: &["query_class", "role"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "query_class",
+                values: &["interactive", "analytical"],
+            },
+            TelemetryLabelValues {
+                key: "role",
+                values: &["leader"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("cleanup.storage_active"),
+        selected_label_values: &[],
+        family: "wyrd_storage_operations_active",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Final,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["backend", "operation"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "backend",
+                values: &["local", "s3", "gcs", "azure"],
+            },
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["get", "put", "list", "delete", "head"],
+            },
+        ],
+    },
+    TelemetryBinding {
         id: TelemetryBindingId("gate.query_streams"),
+        selected_label_values: &[],
         family: "bifrost_gate_query_streams_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
@@ -166,11 +430,63 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_keys: &["outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
-            values: &["success", "failed", "cancelled"],
+            values: &["success", "rejected", "failed", "cancelled"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.query_streams.cancelled"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "cancelled",
+        }],
+        family: "bifrost_gate_query_streams_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["outcome"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "outcome",
+            values: &["success", "rejected", "failed", "cancelled"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.request_duration"),
+        selected_label_values: &[],
+        family: "bifrost_gate_request_duration_seconds",
+        kind: BifrostMetricKind::HistogramBucket,
+        unit: TelemetryUnit::Seconds,
+        aggregation: TelemetryAggregation::P99,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["le", "operation", "outcome"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["query", "write"],
+            },
+            TelemetryLabelValues {
+                key: "outcome",
+                values: &["success", "rejected", "failed", "cancelled"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("gate.query_stream_duration"),
+        selected_label_values: &[],
+        family: "bifrost_gate_query_stream_duration_seconds",
+        kind: BifrostMetricKind::HistogramBucket,
+        unit: TelemetryUnit::Seconds,
+        aggregation: TelemetryAggregation::P99,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["le", "outcome"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "outcome",
+            values: &["success", "rejected", "failed", "cancelled"],
         }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("scribe.rows"),
+        selected_label_values: &[],
         family: "bifrost_scribe_rows_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
@@ -184,6 +500,7 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.backlog_peak"),
+        selected_label_values: &[],
         family: "bifrost_forge_oldest_backlog_seconds",
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Seconds,
@@ -194,16 +511,21 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     },
     TelemetryBinding {
         id: TelemetryBindingId("oracle.slots_final"),
+        selected_label_values: &[],
         family: "bifrost_oracle_slots_total",
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_keys: &["role"],
-        allowed_label_values: &[],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "role",
+            values: &["leader"],
+        }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("scribe.wal_bytes"),
+        selected_label_values: &[],
         family: "bifrost_scribe_wal_append_bytes_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
@@ -214,6 +536,10 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     },
     TelemetryBinding {
         id: TelemetryBindingId("scribe.seal_rows"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "stage",
+            value: "file_list_transaction",
+        }],
         family: "bifrost_scribe_seal_rows_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
@@ -222,11 +548,17 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_keys: &["stage"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "stage",
-            values: &["file_list_transaction"],
+            values: &[
+                "freeze",
+                "parquet_encode",
+                "object_store_put",
+                "file_list_transaction",
+            ],
         }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.publications"),
+        selected_label_values: &[],
         family: "bifrost_forge_complete_gauge_publications_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
@@ -236,7 +568,81 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_values: &[],
     },
     TelemetryBinding {
+        id: TelemetryBindingId("forge.rewrite_input_files"),
+        selected_label_values: &[],
+        family: "bifrost_forge_rewrite_input_files_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("forge"),
+        allowed_label_keys: &["source"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "source",
+            values: &["staging", "iceberg"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("forge.rewrite_input_bytes"),
+        selected_label_values: &[],
+        family: "bifrost_forge_rewrite_input_bytes_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("forge"),
+        allowed_label_keys: &["source"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "source",
+            values: &["staging", "iceberg"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("forge.rewrite_output_files"),
+        selected_label_values: &[],
+        family: "bifrost_forge_rewrite_output_files_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("forge"),
+        allowed_label_keys: &["source"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "source",
+            values: &["staging", "iceberg"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("forge.rewrite_output_bytes"),
+        selected_label_values: &[],
+        family: "bifrost_forge_rewrite_output_bytes_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("forge"),
+        allowed_label_keys: &["source"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "source",
+            values: &["staging", "iceberg"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.source_rows"),
+        selected_label_values: &[],
+        family: "bifrost_oracle_source_rows_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_keys: &["source"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "source",
+            values: &["iceberg", "hot_sealed", "live_tail"],
+        }],
+    },
+    TelemetryBinding {
         id: TelemetryBindingId("oracle.rows"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "success",
+        }],
         family: "bifrost_oracle_stream_rows_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
@@ -245,11 +651,29 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_keys: &["outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
-            values: &["success", "failed", "cancelled"],
+            values: &["success", "failed", "cancelled", "client_drop"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.stream_bytes"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "success",
+        }],
+        family: "bifrost_oracle_stream_bytes_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_keys: &["outcome"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "outcome",
+            values: &["success", "failed", "cancelled", "client_drop"],
         }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("postgres.acquire"),
+        selected_label_values: &[],
         family: "vala_postgres_pool_acquire_seconds",
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
@@ -268,17 +692,70 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         ],
     },
     TelemetryBinding {
+        id: TelemetryBindingId("postgres.transactions"),
+        selected_label_values: &[],
+        family: "vala_postgres_pool_acquire_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["pool"],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "pool",
+            values: &["runtime"],
+        }],
+    },
+    TelemetryBinding {
         id: TelemetryBindingId("storage.duration"),
+        selected_label_values: &[],
         family: "wyrd_storage_operation_duration_seconds",
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
         requirement: TelemetryRequirement::Always,
         allowed_label_keys: &["backend", "le", "operation", "outcome"],
-        allowed_label_values: &[],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "backend",
+                values: &["local", "s3", "gcs", "azure"],
+            },
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["get", "put", "list", "delete", "head"],
+            },
+            TelemetryLabelValues {
+                key: "outcome",
+                values: &["success", "failed", "cancelled"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("storage.bytes"),
+        selected_label_values: &[],
+        family: "wyrd_storage_bytes_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Always,
+        allowed_label_keys: &["backend", "direction", "operation"],
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "backend",
+                values: &["local", "s3", "gcs", "azure"],
+            },
+            TelemetryLabelValues {
+                key: "direction",
+                values: &["read", "write"],
+            },
+            TelemetryLabelValues {
+                key: "operation",
+                values: &["get", "put"],
+            },
+        ],
     },
     TelemetryBinding {
         id: TelemetryBindingId("wal.fsync"),
+        selected_label_values: &[],
         family: "bifrost_scribe_wal_fsync_seconds",
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
@@ -291,6 +768,70 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
 ];
+
+/// Return the one closed canonical cluster binding ledger.
+#[cfg(all(test, feature = "bench"))]
+pub(crate) fn cluster_bindings() -> &'static [TelemetryBinding] {
+    CLUSTER_BINDINGS
+}
+
+/// One typed value produced by evaluating an exact closed binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvaluatedBindingValue {
+    /// Window counter delta.
+    Counter(u64),
+    /// Sampled gauge final and peak values.
+    Gauge {
+        /// Sum of final values across accepted closed label series.
+        final_value: u64,
+        /// Maximum sampled value across accepted closed label series.
+        peak: u64,
+    },
+    /// Checked aggregate histogram p99 in microseconds.
+    DurationP99Micros(u64),
+}
+
+/// Canonical crate-local phase evidence shared by benchmark and journey consumers.
+pub(crate) struct ClusterPhaseTelemetryEvidence {
+    /// Gate rows accepted in the sampled phase.
+    pub(crate) gate_rows: u64,
+    /// Gate frame bytes received in the sampled phase.
+    pub(crate) gate_bytes: u64,
+    /// Aggregate successful Gate request terminals.
+    pub(crate) gate_success: u64,
+    /// Aggregate rejected Gate request terminals.
+    pub(crate) gate_rejected: u64,
+    /// Aggregate failed Gate request terminals.
+    pub(crate) gate_failed: u64,
+    /// Aggregate cancelled Gate request terminals.
+    pub(crate) gate_cancelled: u64,
+    /// Successful query-request terminals selected from exact labels.
+    pub(crate) gate_query_request_success: u64,
+    /// Cancelled write-request terminals selected from exact labels.
+    pub(crate) gate_write_request_cancelled: u64,
+    /// Cancelled returned query-stream terminals.
+    pub(crate) gate_query_stream_cancelled: u64,
+    /// All returned query-stream terminal outcomes.
+    pub(crate) gate_query_stream_terminals: u64,
+    /// Final active Gate query streams.
+    pub(crate) gate_active_streams: u64,
+    /// Scribe rows accepted in the sampled phase.
+    pub(crate) scribe_rows: u64,
+    /// Rows decoded from all Oracle sources.
+    pub(crate) oracle_source_rows: u64,
+    /// Rows returned by successful Oracle streams.
+    pub(crate) oracle_stream_rows: u64,
+    /// Bytes returned by successful Oracle streams.
+    pub(crate) oracle_stream_bytes: u64,
+    /// Forge rewrite input files committed in the phase.
+    pub(crate) forge_input_files: u64,
+    /// Forge rewrite input bytes committed in the phase.
+    pub(crate) forge_input_bytes: u64,
+    /// Forge rewrite output files committed in the phase.
+    pub(crate) forge_output_files: u64,
+    /// Forge rewrite output bytes committed in the phase.
+    pub(crate) forge_output_bytes: u64,
+}
 
 /// One parsed production Prometheus sample.
 #[derive(Debug, Clone, PartialEq)]
@@ -601,9 +1142,13 @@ impl BifrostTelemetryCapture {
         }
         let rendered = self.metrics.render();
         let current_types = rendered_types(&rendered)?;
-        if current_types != checkpoint.types {
+        if checkpoint.types.iter().any(|(family, baseline)| {
+            current_types
+                .get(family)
+                .is_some_and(|current| current != baseline)
+        }) {
             return Err(BifrostTelemetryReportError::Parse {
-                detail: "Prometheus TYPE metadata changed within one window".to_owned(),
+                detail: "Prometheus TYPE metadata conflicted within one window".to_owned(),
             });
         }
         let current = rendered_values(&rendered)?;
@@ -723,13 +1268,7 @@ impl BifrostTelemetryCapture {
         sampler: BifrostTelemetrySampler,
     ) -> Result<BifrostTelemetryDelta, BifrostTelemetryReportError> {
         sampler.stop.cancel();
-        let sampled =
-            sampler
-                .task
-                .await
-                .map_err(|error| BifrostTelemetryReportError::SamplerJoin {
-                    detail: error.to_string(),
-                })??;
+        let sampled = join_sampler(sampler.task).await?;
         let current_types = checkpoint.types.clone();
         let process_start = checkpoint.process.clone();
         let mut delta = self.delta_without_sampler(checkpoint)?;
@@ -754,6 +1293,16 @@ impl BifrostTelemetryCapture {
         )?;
         Ok(delta)
     }
+}
+
+/// Join the single sampler and preserve both task and polling failures.
+async fn join_sampler(
+    task: tokio::task::JoinHandle<Result<SamplerSnapshot, BifrostTelemetryReportError>>,
+) -> Result<SamplerSnapshot, BifrostTelemetryReportError> {
+    task.await
+        .map_err(|error| BifrostTelemetryReportError::SamplerJoin {
+            detail: error.to_string(),
+        })?
 }
 
 /// Read one real process/runtime sample without inventing per-node resources.
@@ -867,65 +1416,129 @@ fn process_window(
 /// Returns [`BifrostTelemetryReportError::InvalidBinding`] for a missing family,
 /// wrong kind or unit convention, unknown label, open categorical value,
 /// non-finite value, or empty required histogram.
+#[cfg(test)]
 pub(crate) fn validate_cluster_bindings(
     delta: &BifrostTelemetryDelta,
 ) -> Result<(), BifrostTelemetryReportError> {
+    evaluate_cluster_bindings(delta).map(|_| ())
+}
+
+/// Evaluate the complete closed ledger into the only typed binding-result map.
+///
+/// # Errors
+/// Returns the exact invalid binding ID for missing or malformed evidence.
+#[cfg(any(test, feature = "bench"))]
+pub(crate) fn evaluate_cluster_bindings(
+    delta: &BifrostTelemetryDelta,
+) -> Result<BTreeMap<&'static str, EvaluatedBindingValue>, BifrostTelemetryReportError> {
+    evaluate_cluster_bindings_required(
+        delta,
+        &CLUSTER_BINDINGS
+            .iter()
+            .map(|binding| binding.id.0)
+            .collect::<BTreeSet<_>>(),
+    )
+}
+
+/// Evaluate the canonical ledger for one closed phase expectation.
+///
+/// Required destinations fail when absent. Other counters project as zero;
+/// inactive gauges and histograms are omitted while any present malformed
+/// evidence and every error-status span still fail closed.
+///
+/// # Errors
+/// Returns the exact invalid binding ID for required or malformed evidence.
+pub(crate) fn evaluate_cluster_phase_bindings(
+    delta: &BifrostTelemetryDelta,
+    required_ids: &[&'static str],
+) -> Result<BTreeMap<&'static str, EvaluatedBindingValue>, BifrostTelemetryReportError> {
+    evaluate_cluster_bindings_required(delta, &required_ids.iter().copied().collect())
+}
+
+/// Evaluate the ledger using one explicit closed set of required destinations.
+fn evaluate_cluster_bindings_required(
+    delta: &BifrostTelemetryDelta,
+    required_ids: &BTreeSet<&'static str>,
+) -> Result<BTreeMap<&'static str, EvaluatedBindingValue>, BifrostTelemetryReportError> {
+    let mut evaluated = BTreeMap::new();
     for binding in CLUSTER_BINDINGS {
+        validate_binding_labels(binding)?;
         let _aggregation = binding.aggregation;
         let _required = match binding.requirement {
             TelemetryRequirement::Always => true,
             TelemetryRequirement::Role(role) => !role.is_empty(),
         };
-        let unit_valid = match binding.unit {
-            TelemetryUnit::Count => {
-                !binding.family.ends_with("_seconds") && !binding.family.ends_with("_bytes_total")
-            }
-            TelemetryUnit::Bytes => binding.family.ends_with("_bytes_total"),
-            TelemetryUnit::Seconds => binding.family.ends_with("_seconds"),
-        };
-        if !unit_valid {
-            return Err(invalid_binding(
-                binding,
-                "family violates its normative unit suffix",
-            ));
-        }
+        validate_binding_unit(binding)?;
         let source = match binding.aggregation {
             TelemetryAggregation::Delta | TelemetryAggregation::P99 => &delta.metrics,
             TelemetryAggregation::Peak => &delta.gauge_maxima,
             TelemetryAggregation::Final => &delta.gauge_final,
         };
-        let samples = source
+        let family_samples = source
             .iter()
-            .filter(|sample| sample.family == binding.family && sample.kind == binding.kind)
+            .filter(|sample| sample.family == binding.family)
+            .collect::<Vec<_>>();
+        if family_samples.iter().any(|sample| {
+            sample.kind != binding.kind
+                && !(binding.kind == BifrostMetricKind::HistogramBucket
+                    && matches!(
+                        sample.kind,
+                        BifrostMetricKind::HistogramCount | BifrostMetricKind::HistogramSum
+                    ))
+        }) {
+            return Err(invalid_binding(
+                binding,
+                "family contains a sample with the wrong kind",
+            ));
+        }
+        let samples = family_samples
+            .iter()
+            .copied()
+            .filter(|sample| sample.kind == binding.kind)
             .collect::<Vec<_>>();
         if samples.is_empty() {
+            if !required_ids.contains(binding.id.0) {
+                if binding.aggregation == TelemetryAggregation::Delta {
+                    evaluated.insert(binding.id.0, EvaluatedBindingValue::Counter(0));
+                }
+                continue;
+            }
             return Err(invalid_binding(
                 binding,
                 "required family and kind are absent",
             ));
         }
-        for sample in samples {
+        for sample in &family_samples {
             if !sample.value.is_finite() {
                 return Err(invalid_binding(binding, "sample value is not finite"));
             }
-            if sample
-                .labels
-                .keys()
-                .any(|key| !binding.allowed_label_keys.contains(&key.as_str()))
-            {
+            let bucket = sample.kind == BifrostMetricKind::HistogramBucket;
+            if sample.labels.keys().any(|key| {
+                !binding
+                    .allowed_label_values
+                    .iter()
+                    .any(|domain| domain.key == key)
+                    && !(bucket && key == "le")
+            }) {
                 return Err(invalid_binding(binding, "sample contains an unknown label"));
             }
-            if binding.kind == BifrostMetricKind::HistogramBucket
-                && !sample.labels.contains_key("le")
-            {
+            if bucket && !sample.labels.contains_key("le") {
                 return Err(invalid_binding(binding, "histogram bucket omits le"));
             }
+            if !bucket && sample.labels.contains_key("le") {
+                return Err(invalid_binding(
+                    binding,
+                    "histogram count or sum contains le",
+                ));
+            }
             for domain in binding.allowed_label_values {
-                if sample
-                    .labels
-                    .get(domain.key)
-                    .is_some_and(|value| !domain.values.contains(&value.as_str()))
-                {
+                let Some(value) = sample.labels.get(domain.key) else {
+                    return Err(invalid_binding(
+                        binding,
+                        &format!("sample omits required label {}", domain.key),
+                    ));
+                };
+                if !domain.values.contains(&value.as_str()) {
                     return Err(invalid_binding(
                         binding,
                         "sample contains an open label value",
@@ -933,6 +1546,71 @@ pub(crate) fn validate_cluster_bindings(
                 }
             }
         }
+        if binding.aggregation == TelemetryAggregation::P99 {
+            let has_count = delta.metrics.iter().any(|sample| {
+                sample.family == binding.family
+                    && sample.kind == BifrostMetricKind::HistogramCount
+                    && sample.value.is_finite()
+                    && sample.value > 0.0
+            });
+            let has_sum = delta.metrics.iter().any(|sample| {
+                sample.family == binding.family
+                    && sample.kind == BifrostMetricKind::HistogramSum
+                    && sample.value.is_finite()
+                    && sample.value >= 0.0
+            });
+            if (!has_count || !has_sum || histogram_quantile(delta, binding.family, 0.99).is_err())
+                && !required_ids.contains(binding.id.0)
+            {
+                continue;
+            }
+            if !has_count || !has_sum || histogram_quantile(delta, binding.family, 0.99).is_err() {
+                return Err(invalid_binding(
+                    binding,
+                    "histogram window is empty, reset, nonmonotonic, or overflow-only",
+                ));
+            }
+        }
+        let selected = samples
+            .into_iter()
+            .filter(|sample| {
+                binding.selected_label_values.iter().all(|selected| {
+                    sample
+                        .labels
+                        .get(selected.key)
+                        .is_some_and(|value| value == selected.value)
+                })
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() && binding.aggregation != TelemetryAggregation::Delta {
+            return Err(invalid_binding(
+                binding,
+                "required destination label series is absent",
+            ));
+        }
+        let value = match binding.aggregation {
+            TelemetryAggregation::Delta => EvaluatedBindingValue::Counter(
+                selected.iter().map(|sample| sample.value).sum::<f64>() as u64,
+            ),
+            TelemetryAggregation::Peak => EvaluatedBindingValue::Gauge {
+                final_value: 0,
+                peak: selected
+                    .iter()
+                    .map(|sample| sample.value)
+                    .fold(0.0, f64::max) as u64,
+            },
+            TelemetryAggregation::Final => EvaluatedBindingValue::Gauge {
+                final_value: selected.iter().map(|sample| sample.value).sum::<f64>() as u64,
+                peak: 0,
+            },
+            TelemetryAggregation::P99 => {
+                EvaluatedBindingValue::DurationP99Micros(seconds_to_micros(
+                    binding.id.0,
+                    histogram_quantile(delta, binding.family, 0.99)?,
+                )?)
+            }
+        };
+        evaluated.insert(binding.id.0, value);
     }
     if delta
         .spans
@@ -944,7 +1622,145 @@ pub(crate) fn validate_cluster_bindings(
             detail: "capture contains an error-status span".to_owned(),
         });
     }
+    Ok(evaluated)
+}
+
+/// Validate one binding's categorical domains and selectors before evaluation.
+///
+/// # Errors
+/// Returns the binding ID when a domain or selector is not closed by the ledger.
+fn validate_binding_labels(
+    binding: &TelemetryBinding,
+) -> Result<(), BifrostTelemetryReportError> {
+    for domain in binding.allowed_label_values {
+        if !binding.allowed_label_keys.contains(&domain.key) || domain.key == "le" {
+            return Err(invalid_binding(
+                binding,
+                "categorical label domain is not allowed",
+            ));
+        }
+    }
+    if binding.allowed_label_keys.iter().any(|key| {
+        *key != "le"
+            && !binding
+                .allowed_label_values
+                .iter()
+                .any(|domain| domain.key == *key)
+    }) {
+        return Err(invalid_binding(
+            binding,
+            "allowed categorical label omits its closed domain",
+        ));
+    }
+    if binding.allowed_label_keys.contains(&"le")
+        != (binding.kind == BifrostMetricKind::HistogramBucket)
+    {
+        return Err(invalid_binding(
+            binding,
+            "only histogram buckets may allow le",
+        ));
+    }
+    for selector in binding.selected_label_values {
+        let Some(domain) = binding
+            .allowed_label_values
+            .iter()
+            .find(|domain| domain.key == selector.key)
+        else {
+            return Err(invalid_binding(
+                binding,
+                "selector key omits its categorical domain",
+            ));
+        };
+        if !domain.values.contains(&selector.value) {
+            return Err(invalid_binding(
+                binding,
+                "selector value is outside its categorical domain",
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Project the exact phase counters retained by journey assertions.
+#[must_use]
+pub(crate) fn project_cluster_phase_evidence(
+    bindings: &BTreeMap<&'static str, EvaluatedBindingValue>,
+) -> ClusterPhaseTelemetryEvidence {
+    let counter = |id: &str| match bindings.get(id) {
+        Some(EvaluatedBindingValue::Counter(value)) => *value,
+        _ => 0,
+    };
+    let gauge_final = |id: &str| match bindings.get(id) {
+        Some(EvaluatedBindingValue::Gauge { final_value, .. }) => *final_value,
+        _ => 0,
+    };
+    ClusterPhaseTelemetryEvidence {
+        gate_rows: counter("gate.rows"),
+        gate_bytes: counter("gate.bytes"),
+        gate_success: counter("gate.requests.success"),
+        gate_rejected: counter("gate.requests.rejected"),
+        gate_failed: counter("gate.requests.failed"),
+        gate_cancelled: counter("gate.requests.cancelled"),
+        gate_query_request_success: counter("gate.requests.query_success"),
+        gate_write_request_cancelled: counter("gate.requests.write_cancelled"),
+        gate_query_stream_cancelled: counter("gate.query_streams.cancelled"),
+        gate_query_stream_terminals: counter("gate.query_streams"),
+        gate_active_streams: gauge_final("gate.active"),
+        scribe_rows: counter("scribe.rows"),
+        oracle_source_rows: counter("oracle.source_rows"),
+        oracle_stream_rows: counter("oracle.rows"),
+        oracle_stream_bytes: counter("oracle.stream_bytes"),
+        forge_input_files: counter("forge.rewrite_input_files"),
+        forge_input_bytes: counter("forge.rewrite_input_bytes"),
+        forge_output_files: counter("forge.rewrite_output_files"),
+        forge_output_bytes: counter("forge.rewrite_output_bytes"),
+    }
+}
+
+/// Execute one workload inside the canonical sampled telemetry window.
+///
+/// # Errors
+/// Returns the workload error, the sampler/capture error, or both contexts when both fail.
+pub(crate) async fn run_sampled_window<T, F, Fut>(
+    capture: &BifrostTelemetryCapture,
+    workload: F,
+) -> Result<(T, BifrostTelemetryDelta), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+{
+    let checkpoint = capture.checkpoint()?;
+    let sampler = capture.begin_gauge_sampling(&checkpoint).await?;
+    let workload_result = workload().await;
+    let telemetry_result = capture.delta_since_with_sampler(checkpoint, sampler).await;
+    match (workload_result, telemetry_result) {
+        (Ok(value), Ok(telemetry)) => Ok((value, telemetry)),
+        (Err(workload), Ok(_)) => Err(workload),
+        (Ok(_), Err(telemetry)) => Err(telemetry.into()),
+        (Err(workload), Err(telemetry)) => Err(format!(
+            "sampled workload failed ({workload}); sampler cleanup also failed ({telemetry})"
+        )
+        .into()),
+    }
+}
+
+/// Validate one binding's normative unit convention.
+fn validate_binding_unit(binding: &TelemetryBinding) -> Result<(), BifrostTelemetryReportError> {
+    let valid = match binding.unit {
+        TelemetryUnit::Count => {
+            !binding.family.ends_with("_seconds") && !binding.family.ends_with("_bytes_total")
+        }
+        TelemetryUnit::Bytes => binding.family.ends_with("_bytes_total"),
+        TelemetryUnit::Seconds => binding.family.ends_with("_seconds"),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_binding(
+            binding,
+            "family violates its normative unit suffix",
+        ))
+    }
 }
 
 /// Construct one stable binding failure without exposing metric values.
@@ -966,6 +1782,9 @@ fn merge_gauge_maxima(
     types: &BTreeMap<String, PrometheusFamilyType>,
 ) -> Result<(), BifrostTelemetryReportError> {
     for (series, value) in rendered {
+        if !supported_series(series, types) {
+            continue;
+        }
         if parse_sample(series, *value, types)?.kind == BifrostMetricKind::Gauge {
             maxima
                 .entry(series.clone())
@@ -1480,16 +2299,38 @@ fn rendered_types(
 /// Return whether one rendered series belongs to a supported canonical kind.
 fn supported_series(series: &str, types: &BTreeMap<String, PrometheusFamilyType>) -> bool {
     let name = series.split_once('{').map_or(series, |(name, _)| name);
-    let normalized = name
-        .strip_suffix("_bucket")
-        .or_else(|| name.strip_suffix("_count"))
-        .or_else(|| name.strip_suffix("_sum"));
-    !matches!(
-        types
-            .get(name)
-            .or_else(|| normalized.and_then(|family| types.get(family))),
-        Some(PrometheusFamilyType::Summary)
-    )
+    match sample_identity(name, types) {
+        Ok(identity) => identity.is_some(),
+        Err(_) => true,
+    }
+}
+
+/// Resolve one rendered name through exact TYPE metadata and histogram bases.
+fn sample_identity(
+    name: &str,
+    types: &BTreeMap<String, PrometheusFamilyType>,
+) -> Result<Option<(String, BifrostMetricKind)>, BifrostTelemetryReportError> {
+    let histogram = [
+        ("_bucket", BifrostMetricKind::HistogramBucket),
+        ("_count", BifrostMetricKind::HistogramCount),
+        ("_sum", BifrostMetricKind::HistogramSum),
+    ]
+    .into_iter()
+    .find_map(|(suffix, kind)| name.strip_suffix(suffix).map(|base| (base, kind)))
+    .filter(|(base, _)| types.get(*base) == Some(&PrometheusFamilyType::Histogram));
+    if let Some((base, kind)) = histogram {
+        if types.contains_key(name) {
+            return Err(BifrostTelemetryReportError::Parse {
+                detail: format!("conflicting exact and histogram TYPE for {name}"),
+            });
+        }
+        return Ok(Some((base.to_owned(), kind)));
+    }
+    Ok(match types.get(name) {
+        Some(PrometheusFamilyType::Counter) => Some((name.to_owned(), BifrostMetricKind::Counter)),
+        Some(PrometheusFamilyType::Gauge) => Some((name.to_owned(), BifrostMetricKind::Gauge)),
+        Some(PrometheusFamilyType::Histogram | PrometheusFamilyType::Summary) | None => None,
+    })
 }
 
 /// Parse one constrained Prometheus series into its family and labels.
@@ -1511,12 +2352,10 @@ fn parse_sample(
         } else {
             (series, None)
         };
-    let histogram_family = name
-        .strip_suffix("_bucket")
-        .or_else(|| name.strip_suffix("_sum"))
-        .or_else(|| name.strip_suffix("_count"))
-        .filter(|family| types.get(*family) == Some(&PrometheusFamilyType::Histogram));
-    let family = histogram_family.unwrap_or(name).to_owned();
+    let (family, kind) =
+        sample_identity(name, types)?.ok_or_else(|| BifrostTelemetryReportError::Parse {
+            detail: format!("missing TYPE for {name}"),
+        })?;
     let mut parsed = BTreeMap::new();
     if let Some(labels) = labels {
         for label in labels.split(',').filter(|label| !label.is_empty()) {
@@ -1540,41 +2379,12 @@ fn parse_sample(
             }
         }
     }
-    let kind = metric_kind(name, &family, types)?;
     Ok(BifrostMetricSample {
         family,
         labels: parsed,
         value,
         kind,
     })
-}
-
-/// Classify a rendered Prometheus series before normalizing histogram suffixes.
-#[must_use]
-fn metric_kind(
-    name: &str,
-    family: &str,
-    types: &BTreeMap<String, PrometheusFamilyType>,
-) -> Result<BifrostMetricKind, BifrostTelemetryReportError> {
-    match types.get(family) {
-        Some(PrometheusFamilyType::Histogram) if name.ends_with("_bucket") => {
-            Ok(BifrostMetricKind::HistogramBucket)
-        }
-        Some(PrometheusFamilyType::Histogram) if name.ends_with("_count") => {
-            Ok(BifrostMetricKind::HistogramCount)
-        }
-        Some(PrometheusFamilyType::Histogram) if name.ends_with("_sum") => {
-            Ok(BifrostMetricKind::HistogramSum)
-        }
-        Some(PrometheusFamilyType::Counter) if name == family => Ok(BifrostMetricKind::Counter),
-        Some(PrometheusFamilyType::Gauge) if name == family => Ok(BifrostMetricKind::Gauge),
-        Some(_) => Err(BifrostTelemetryReportError::Parse {
-            detail: format!("sample kind conflicts with TYPE for {family}"),
-        }),
-        None => Err(BifrostTelemetryReportError::Parse {
-            detail: format!("missing TYPE for {family}"),
-        }),
-    }
 }
 
 /// Rebuild a normalized rendered-series identity from one parsed production sample.
@@ -1693,7 +2503,7 @@ fn histogram_quantile_for_label(
     value: &str,
     quantile: f64,
 ) -> Result<f64, BifrostTelemetryReportError> {
-    let mut buckets = delta
+    let mut series_buckets = delta
         .metrics
         .iter()
         .filter(|sample| {
@@ -1712,7 +2522,18 @@ fn histogram_quantile_for_label(
                 .map(|upper| (upper, sample.value))
         })
         .collect::<Vec<_>>();
-    buckets.sort_by(|left, right| left.0.total_cmp(&right.0));
+    series_buckets.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut buckets: Vec<(f64, f64)> = Vec::new();
+    for (upper, count) in series_buckets {
+        if let Some((_, aggregate)) = buckets
+            .last_mut()
+            .filter(|(existing, _)| existing.total_cmp(&upper).is_eq())
+        {
+            *aggregate += count;
+        } else {
+            buckets.push((upper, count));
+        }
+    }
     let count = delta
         .metrics
         .iter()
@@ -1909,6 +2730,64 @@ mod tests {
         assert_eq!(counter.kind, BifrostMetricKind::Counter);
     }
 
+    /// Histogram suffixes inherit only an explicit base histogram TYPE.
+    #[test]
+    fn parser_normalizes_histogram_type_without_guessing_suffixes() {
+        let base = "bifrost_gate_resolution_seconds";
+        let types = BTreeMap::from([(base.to_owned(), PrometheusFamilyType::Histogram)]);
+        for (suffix, expected) in [
+            ("_bucket{le=\"0.1\"}", BifrostMetricKind::HistogramBucket),
+            ("_count", BifrostMetricKind::HistogramCount),
+            ("_sum", BifrostMetricKind::HistogramSum),
+        ] {
+            let parsed = parse_sample(&format!("{base}{suffix}"), 1.0, &types)
+                .expect("base histogram TYPE classifies rendered suffix");
+            assert_eq!(parsed.family, base);
+            assert_eq!(parsed.kind, expected);
+        }
+
+        let exact = BTreeMap::from([
+            ("jobs_count".to_owned(), PrometheusFamilyType::Counter),
+            ("queue_total".to_owned(), PrometheusFamilyType::Gauge),
+        ]);
+        assert_eq!(
+            parse_sample("jobs_count", 1.0, &exact)
+                .expect("exact count-named counter")
+                .kind,
+            BifrostMetricKind::Counter
+        );
+        assert_eq!(
+            parse_sample("queue_total", 1.0, &exact)
+                .expect("exact total-named gauge")
+                .kind,
+            BifrostMetricKind::Gauge
+        );
+
+        let missing = parse_sample("required_seconds_count", 1.0, &BTreeMap::new())
+            .expect_err("required histogram suffix needs a base TYPE");
+        assert!(
+            missing
+                .to_string()
+                .contains("missing TYPE for required_seconds_count")
+        );
+        assert!(!supported_series(
+            "unrelated_seconds_count",
+            &BTreeMap::new()
+        ));
+
+        let conflicting = BTreeMap::from([
+            (base.to_owned(), PrometheusFamilyType::Histogram),
+            (format!("{base}_count"), PrometheusFamilyType::Counter),
+        ]);
+        let conflict = parse_sample(&format!("{base}_count"), 1.0, &conflicting)
+            .expect_err("exact suffix TYPE conflicts with histogram base");
+        assert!(
+            conflict
+                .to_string()
+                .contains("conflicting exact and histogram TYPE")
+        );
+    }
+
     /// Proves names never override declared Prometheus family types.
     #[test]
     fn parser_uses_type_for_nonstandard_counter_and_gauge_names() {
@@ -1965,6 +2844,59 @@ mod tests {
         });
         let p99 = histogram_quantile(&delta, family, 0.99).unwrap();
         assert_eq!(seconds_to_micros("postgres.acquire", p99).unwrap(), 25_000);
+    }
+
+    /// Proves independent accepted label series aggregate by bucket boundary.
+    #[test]
+    fn histogram_quantile_aggregates_label_series_by_bucket() {
+        let family = "wyrd_storage_operation_duration_seconds";
+        let mut metrics = Vec::new();
+        for (operation, buckets, count) in [
+            (
+                "get",
+                [("0.001", 49.0), ("0.025", 50.0), ("+Inf", 50.0)],
+                50.0,
+            ),
+            (
+                "put",
+                [("0.001", 49.0), ("0.025", 49.0), ("+Inf", 50.0)],
+                50.0,
+            ),
+        ] {
+            for (le, value) in buckets {
+                metrics.push(BifrostMetricSample {
+                    family: family.to_owned(),
+                    labels: BTreeMap::from([
+                        ("operation".to_owned(), operation.to_owned()),
+                        ("le".to_owned(), le.to_owned()),
+                    ]),
+                    value,
+                    kind: BifrostMetricKind::HistogramBucket,
+                });
+            }
+            metrics.push(BifrostMetricSample {
+                family: family.to_owned(),
+                labels: BTreeMap::from([("operation".to_owned(), operation.to_owned())]),
+                value: count,
+                kind: BifrostMetricKind::HistogramCount,
+            });
+        }
+        let delta = BifrostTelemetryDelta {
+            metrics,
+            gauge_maxima: Vec::new(),
+            gauge_final: Vec::new(),
+            spans: Vec::new(),
+            interval_seconds: 1.0,
+            process: test_process_window(),
+        };
+        assert_eq!(
+            seconds_to_micros(
+                "storage.duration",
+                histogram_quantile(&delta, family, 0.99).unwrap()
+            )
+            .unwrap(),
+            25_000
+        );
     }
 
     /// Proves empty, nonmonotonic, reset, and infinity-only windows are rejected.
@@ -2045,6 +2977,12 @@ mod tests {
         let complete = canonical_binding_delta();
         validate_cluster_bindings(&complete).expect("closed binding fixture is complete");
         for binding in CLUSTER_BINDINGS {
+            let first_family_id = CLUSTER_BINDINGS
+                .iter()
+                .find(|candidate| candidate.family == binding.family)
+                .expect("binding family has an owner")
+                .id
+                .0;
             let mut removed = complete.clone();
             removed
                 .metrics
@@ -2058,8 +2996,121 @@ mod tests {
             assert!(matches!(
                 validate_cluster_bindings(&removed),
                 Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. })
+                    if id == first_family_id
+            ));
+        }
+    }
+
+    /// Table-drives kind, unit, label, value, and aggregation failures for every binding.
+    #[test]
+    fn canonical_projection_rejects_each_invalid_binding_dimension() {
+        for binding in CLUSTER_BINDINGS {
+            let first_family_id = CLUSTER_BINDINGS
+                .iter()
+                .find(|candidate| candidate.family == binding.family)
+                .expect("binding family has an owner")
+                .id
+                .0;
+            let assert_id = |result: Result<(), BifrostTelemetryReportError>| {
+                assert!(
+                    matches!(result, Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. }) if id == first_family_id),
+                    "binding {} expected invalid ID {first_family_id}, got {result:?}",
+                    binding.id.0,
+                );
+            };
+
+            let mut wrong_kind = canonical_binding_delta();
+            let sources = [
+                &mut wrong_kind.metrics,
+                &mut wrong_kind.gauge_maxima,
+                &mut wrong_kind.gauge_final,
+            ];
+            let sample = sources.into_iter().find_map(|source| {
+                source
+                    .iter_mut()
+                    .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
+            });
+            sample.expect("binding fixture has expected sample").kind =
+                if binding.kind == BifrostMetricKind::Gauge {
+                    BifrostMetricKind::Counter
+                } else {
+                    BifrostMetricKind::Gauge
+                };
+            assert_id(validate_cluster_bindings(&wrong_kind));
+
+            let mut unknown_key = canonical_binding_delta();
+            [
+                &mut unknown_key.metrics,
+                &mut unknown_key.gauge_maxima,
+                &mut unknown_key.gauge_final,
+            ]
+            .into_iter()
+            .find_map(|source| {
+                source
+                    .iter_mut()
+                    .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
+            })
+            .expect("binding fixture has expected sample")
+            .labels
+            .insert("tenant".to_owned(), "forbidden".to_owned());
+            assert_id(validate_cluster_bindings(&unknown_key));
+
+            let mut nonfinite = canonical_binding_delta();
+            [
+                &mut nonfinite.metrics,
+                &mut nonfinite.gauge_maxima,
+                &mut nonfinite.gauge_final,
+            ]
+            .into_iter()
+            .find_map(|source| {
+                source
+                    .iter_mut()
+                    .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
+            })
+            .expect("binding fixture has expected sample")
+            .value = f64::NAN;
+            assert_id(validate_cluster_bindings(&nonfinite));
+
+            let mut wrong_aggregation = canonical_binding_delta();
+            let source = match binding.aggregation {
+                TelemetryAggregation::Delta | TelemetryAggregation::P99 => {
+                    &mut wrong_aggregation.metrics
+                }
+                TelemetryAggregation::Peak => &mut wrong_aggregation.gauge_maxima,
+                TelemetryAggregation::Final => &mut wrong_aggregation.gauge_final,
+            };
+            source.retain(|sample| sample.family != binding.family);
+            assert_id(validate_cluster_bindings(&wrong_aggregation));
+
+            let mut wrong_unit = *binding;
+            wrong_unit.unit = match binding.unit {
+                TelemetryUnit::Count => TelemetryUnit::Seconds,
+                TelemetryUnit::Bytes | TelemetryUnit::Seconds => TelemetryUnit::Count,
+            };
+            assert!(matches!(
+                validate_binding_unit(&wrong_unit),
+                Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. })
                     if id == binding.id.0
             ));
+
+            if let Some(domain) = binding.allowed_label_values.first() {
+                let mut wrong_value = canonical_binding_delta();
+                [
+                    &mut wrong_value.metrics,
+                    &mut wrong_value.gauge_maxima,
+                    &mut wrong_value.gauge_final,
+                ]
+                .into_iter()
+                .find_map(|source| {
+                    source.iter_mut().find(|sample| {
+                        sample.family == binding.family && sample.kind == binding.kind
+                    })
+                })
+                .expect("binding fixture has expected sample")
+                .labels
+                .insert(domain.key.to_owned(), "forbidden".to_owned());
+                assert_id(validate_cluster_bindings(&wrong_value));
+            }
         }
     }
 
@@ -2106,7 +3157,749 @@ mod tests {
             .expect("bounded sampler reports clean cancellation");
     }
 
-    /// Build one complete exact binding fixture from the closed compile-time ledger.
+    /// Proves sampler task panic and polling failures remain distinct typed errors.
+    #[tokio::test]
+    async fn sampler_join_propagates_panic_and_polling_failure() {
+        let panic: tokio::task::JoinHandle<Result<SamplerSnapshot, BifrostTelemetryReportError>> =
+            tokio::spawn(async move { panic!("injected sampler panic") });
+        assert!(matches!(
+            join_sampler(panic).await,
+            Err(BifrostTelemetryReportError::SamplerJoin { .. })
+        ));
+
+        let polling = tokio::spawn(async move {
+            Err(BifrostTelemetryReportError::Parse {
+                detail: "injected malformed scrape".to_owned(),
+            })
+        });
+        assert!(matches!(
+            join_sampler(polling).await,
+            Err(BifrostTelemetryReportError::Parse { .. })
+        ));
+    }
+
+    /// Independent accepted-T16 emitter contract used to audit one binding.
+    struct EmitterContractFixture {
+        /// Stable binding identity expected to consume the emitter.
+        id: &'static str,
+        /// Exact destination selectors independently derived from report semantics.
+        selectors: &'static [(&'static str, &'static str)],
+        /// Exact family emitted by production source.
+        family: &'static str,
+        /// Prometheus kind declared by the emitter.
+        kind: BifrostMetricKind,
+        /// Exact emitted label keys.
+        keys: &'static [&'static str],
+        /// Closed categorical domains declared by production code.
+        domains: &'static [(&'static str, &'static [&'static str])],
+        /// Normative emitted unit.
+        unit: TelemetryUnit,
+        /// Destination aggregation required by the report.
+        aggregation: TelemetryAggregation,
+        /// Workload role that owns the emitter.
+        requirement: TelemetryRequirement,
+        /// Exact report destination fed by this binding.
+        destination: &'static str,
+    }
+
+    /// Enumerate accepted-T16 emitter contracts without reading the binding ledger.
+    fn emitter_contracts() -> Vec<EmitterContractFixture> {
+        use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
+        use TelemetryAggregation::{Delta, Final, P99, Peak};
+        use TelemetryRequirement::{Always, Role};
+        use TelemetryUnit::{Bytes, Count, Seconds};
+        vec![
+            EmitterContractFixture {
+                id: "gate.requests.success",
+                selectors: &[("outcome", "success")],
+                family: "bifrost_gate_requests_total",
+                kind: Counter,
+                keys: &["operation", "outcome"],
+                domains: &[
+                    ("operation", &["query", "write"]),
+                    ("outcome", &["success", "rejected", "failed", "cancelled"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "pillars.gate_accepted",
+            },
+            EmitterContractFixture {
+                id: "gate.requests.query_success",
+                selectors: &[("operation", "query"), ("outcome", "success")],
+                family: "bifrost_gate_requests_total",
+                kind: Counter,
+                keys: &["operation", "outcome"],
+                domains: &[
+                    ("operation", &["query", "write"]),
+                    ("outcome", &["success", "rejected", "failed", "cancelled"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "reconciliation.successful_queries",
+            },
+            EmitterContractFixture {
+                id: "gate.requests.rejected",
+                selectors: &[("outcome", "rejected")],
+                family: "bifrost_gate_requests_total",
+                kind: Counter,
+                keys: &["operation", "outcome"],
+                domains: &[
+                    ("operation", &["query", "write"]),
+                    ("outcome", &["success", "rejected", "failed", "cancelled"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "phase.gate_rejected",
+            },
+            EmitterContractFixture {
+                id: "gate.requests.failed",
+                selectors: &[("outcome", "failed")],
+                family: "bifrost_gate_requests_total",
+                kind: Counter,
+                keys: &["operation", "outcome"],
+                domains: &[
+                    ("operation", &["query", "write"]),
+                    ("outcome", &["success", "rejected", "failed", "cancelled"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "phase.gate_failed",
+            },
+            EmitterContractFixture {
+                id: "gate.requests.cancelled",
+                selectors: &[("outcome", "cancelled")],
+                family: "bifrost_gate_requests_total",
+                kind: Counter,
+                keys: &["operation", "outcome"],
+                domains: &[
+                    ("operation", &["query", "write"]),
+                    ("outcome", &["success", "rejected", "failed", "cancelled"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "phase.gate_cancelled",
+            },
+            EmitterContractFixture {
+                id: "gate.requests.write_cancelled",
+                selectors: &[("operation", "write"), ("outcome", "cancelled")],
+                family: "bifrost_gate_requests_total",
+                kind: Counter,
+                keys: &["operation", "outcome"],
+                domains: &[
+                    ("operation", &["query", "write"]),
+                    ("outcome", &["success", "rejected", "failed", "cancelled"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "phase.gate_write_request_cancelled",
+            },
+            EmitterContractFixture {
+                id: "gate.bytes",
+                selectors: &[],
+                family: "bifrost_gate_frame_bytes_total",
+                kind: Counter,
+                keys: &[],
+                domains: &[],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "phase.gate_bytes",
+            },
+            EmitterContractFixture {
+                id: "gate.rows",
+                selectors: &[("status", "accepted")],
+                family: "bifrost_gate_rows_total",
+                kind: Counter,
+                keys: &["status"],
+                domains: &[("status", &["accepted", "rejected"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "reconciliation.gate_rows(status=accepted)",
+            },
+            EmitterContractFixture {
+                id: "gate.active",
+                selectors: &[],
+                family: "bifrost_gate_active_streams",
+                kind: Gauge,
+                keys: &["operation"],
+                domains: &[("operation", &["query"])],
+                unit: Count,
+                aggregation: Final,
+                requirement: Always,
+                destination: "cleanup.gate_active",
+            },
+            EmitterContractFixture {
+                id: "cleanup.scribe_ingress",
+                selectors: &[],
+                family: "bifrost_scribe_ingress_active",
+                kind: Gauge,
+                keys: &[],
+                domains: &[],
+                unit: Count,
+                aggregation: Final,
+                requirement: Role("scribe"),
+                destination: "cleanup.scribe_ingress",
+            },
+            EmitterContractFixture {
+                id: "cleanup.scribe_lane_active",
+                selectors: &[],
+                family: "bifrost_scribe_lane_active",
+                kind: Gauge,
+                keys: &["lane"],
+                domains: &[("lane", &["ingress", "persistence", "wal_io"])],
+                unit: Count,
+                aggregation: Final,
+                requirement: Role("scribe"),
+                destination: "cleanup.scribe_lane_active",
+            },
+            EmitterContractFixture {
+                id: "cleanup.scribe_lane_queued",
+                selectors: &[],
+                family: "bifrost_scribe_lane_queued",
+                kind: Gauge,
+                keys: &["lane"],
+                domains: &[("lane", &["ingress", "persistence", "wal_io"])],
+                unit: Count,
+                aggregation: Final,
+                requirement: Role("scribe"),
+                destination: "cleanup.scribe_lane_queued",
+            },
+            EmitterContractFixture {
+                id: "cleanup.scribe_persistence_queue",
+                selectors: &[],
+                family: "bifrost_scribe_persistence_queue_depth",
+                kind: Gauge,
+                keys: &[],
+                domains: &[],
+                unit: Count,
+                aggregation: Final,
+                requirement: Role("scribe"),
+                destination: "cleanup.scribe_persistence_queue",
+            },
+            EmitterContractFixture {
+                id: "cleanup.oracle_in_flight",
+                selectors: &[],
+                family: "bifrost_oracle_in_flight",
+                kind: Gauge,
+                keys: &["query_class", "visibility"],
+                domains: &[
+                    ("query_class", &["interactive", "analytical"]),
+                    ("visibility", &["published_only", "fused"]),
+                ],
+                unit: Count,
+                aggregation: Final,
+                requirement: Role("oracle"),
+                destination: "cleanup.oracle_in_flight",
+            },
+            EmitterContractFixture {
+                id: "cleanup.oracle_slots",
+                selectors: &[],
+                family: "bifrost_oracle_slots_in_use",
+                kind: Gauge,
+                keys: &["query_class", "role"],
+                domains: &[
+                    ("query_class", &["interactive", "analytical"]),
+                    ("role", &["leader"]),
+                ],
+                unit: Count,
+                aggregation: Final,
+                requirement: Role("oracle"),
+                destination: "cleanup.oracle_slots",
+            },
+            EmitterContractFixture {
+                id: "cleanup.storage_active",
+                selectors: &[],
+                family: "wyrd_storage_operations_active",
+                kind: Gauge,
+                keys: &["backend", "operation"],
+                domains: &[
+                    ("backend", &["local", "s3", "gcs", "azure"]),
+                    ("operation", &["get", "put", "list", "delete", "head"]),
+                ],
+                unit: Count,
+                aggregation: Final,
+                requirement: Always,
+                destination: "cleanup.storage_active",
+            },
+            EmitterContractFixture {
+                id: "gate.query_streams",
+                selectors: &[],
+                family: "bifrost_gate_query_streams_total",
+                kind: Counter,
+                keys: &["outcome"],
+                domains: &[("outcome", &["success", "rejected", "failed", "cancelled"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "binding validation",
+            },
+            EmitterContractFixture {
+                id: "gate.query_streams.cancelled",
+                selectors: &[("outcome", "cancelled")],
+                family: "bifrost_gate_query_streams_total",
+                kind: Counter,
+                keys: &["outcome"],
+                domains: &[("outcome", &["success", "rejected", "failed", "cancelled"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "phase.gate_query_stream_cancelled",
+            },
+            EmitterContractFixture {
+                id: "gate.request_duration",
+                selectors: &[],
+                family: "bifrost_gate_request_duration_seconds",
+                kind: HistogramBucket,
+                keys: &["le", "operation", "outcome"],
+                domains: &[
+                    ("operation", &["query", "write"]),
+                    ("outcome", &["success", "rejected", "failed", "cancelled"]),
+                ],
+                unit: Seconds,
+                aggregation: P99,
+                requirement: Always,
+                destination: "binding validation",
+            },
+            EmitterContractFixture {
+                id: "gate.query_stream_duration",
+                selectors: &[],
+                family: "bifrost_gate_query_stream_duration_seconds",
+                kind: HistogramBucket,
+                keys: &["le", "outcome"],
+                domains: &[("outcome", &["success", "rejected", "failed", "cancelled"])],
+                unit: Seconds,
+                aggregation: P99,
+                requirement: Always,
+                destination: "binding validation",
+            },
+            EmitterContractFixture {
+                id: "scribe.rows",
+                selectors: &[],
+                family: "bifrost_scribe_rows_total",
+                kind: Counter,
+                keys: &["status"],
+                domains: &[("status", &["accepted"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("scribe"),
+                destination: "reconciliation.scribe_rows",
+            },
+            EmitterContractFixture {
+                id: "forge.backlog_peak",
+                selectors: &[],
+                family: "bifrost_forge_oldest_backlog_seconds",
+                kind: Gauge,
+                keys: &[],
+                domains: &[],
+                unit: Seconds,
+                aggregation: Peak,
+                requirement: Role("forge"),
+                destination: "binding validation",
+            },
+            EmitterContractFixture {
+                id: "oracle.slots_final",
+                selectors: &[],
+                family: "bifrost_oracle_slots_total",
+                kind: Gauge,
+                keys: &["role"],
+                domains: &[("role", &["leader"])],
+                unit: Count,
+                aggregation: Final,
+                requirement: Role("oracle"),
+                destination: "binding validation",
+            },
+            EmitterContractFixture {
+                id: "scribe.wal_bytes",
+                selectors: &[],
+                family: "bifrost_scribe_wal_append_bytes_total",
+                kind: Counter,
+                keys: &[],
+                domains: &[],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Role("scribe"),
+                destination: "pillars.scribe_wal_bytes",
+            },
+            EmitterContractFixture {
+                id: "scribe.seal_rows",
+                selectors: &[("stage", "file_list_transaction")],
+                family: "bifrost_scribe_seal_rows_total",
+                kind: Counter,
+                keys: &["stage"],
+                domains: &[(
+                    "stage",
+                    &[
+                        "freeze",
+                        "parquet_encode",
+                        "object_store_put",
+                        "file_list_transaction",
+                    ],
+                )],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("scribe"),
+                destination: "reconciliation.sealed_rows(stage=file_list_transaction)",
+            },
+            EmitterContractFixture {
+                id: "forge.publications",
+                selectors: &[],
+                family: "bifrost_forge_complete_gauge_publications_total",
+                kind: Counter,
+                keys: &[],
+                domains: &[],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("forge"),
+                destination: "pillars.forge_publications",
+            },
+            EmitterContractFixture {
+                id: "forge.rewrite_input_files",
+                selectors: &[],
+                family: "bifrost_forge_rewrite_input_files_total",
+                kind: Counter,
+                keys: &["source"],
+                domains: &[("source", &["staging", "iceberg"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("forge"),
+                destination: "phase.forge_input_files",
+            },
+            EmitterContractFixture {
+                id: "forge.rewrite_input_bytes",
+                selectors: &[],
+                family: "bifrost_forge_rewrite_input_bytes_total",
+                kind: Counter,
+                keys: &["source"],
+                domains: &[("source", &["staging", "iceberg"])],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Role("forge"),
+                destination: "phase.forge_input_bytes",
+            },
+            EmitterContractFixture {
+                id: "forge.rewrite_output_files",
+                selectors: &[],
+                family: "bifrost_forge_rewrite_output_files_total",
+                kind: Counter,
+                keys: &["source"],
+                domains: &[("source", &["staging", "iceberg"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("forge"),
+                destination: "phase.forge_output_files",
+            },
+            EmitterContractFixture {
+                id: "forge.rewrite_output_bytes",
+                selectors: &[],
+                family: "bifrost_forge_rewrite_output_bytes_total",
+                kind: Counter,
+                keys: &["source"],
+                domains: &[("source", &["staging", "iceberg"])],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Role("forge"),
+                destination: "phase.forge_output_bytes",
+            },
+            EmitterContractFixture {
+                id: "oracle.source_rows",
+                selectors: &[],
+                family: "bifrost_oracle_source_rows_total",
+                kind: Counter,
+                keys: &["source"],
+                domains: &[("source", &["iceberg", "hot_sealed", "live_tail"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "phase.oracle_source_rows",
+            },
+            EmitterContractFixture {
+                id: "oracle.rows",
+                selectors: &[("outcome", "success")],
+                family: "bifrost_oracle_stream_rows_total",
+                kind: Counter,
+                keys: &["outcome"],
+                domains: &[(
+                    "outcome",
+                    &["success", "failed", "cancelled", "client_drop"],
+                )],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_decoded_rows/reconciliation.oracle_rows(outcome=success)",
+            },
+            EmitterContractFixture {
+                id: "oracle.stream_bytes",
+                selectors: &[("outcome", "success")],
+                family: "bifrost_oracle_stream_bytes_total",
+                kind: Counter,
+                keys: &["outcome"],
+                domains: &[(
+                    "outcome",
+                    &["success", "failed", "cancelled", "client_drop"],
+                )],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "phase.oracle_stream_bytes",
+            },
+            EmitterContractFixture {
+                id: "postgres.acquire",
+                selectors: &[],
+                family: "vala_postgres_pool_acquire_seconds",
+                kind: HistogramBucket,
+                keys: &["le", "outcome", "pool"],
+                domains: &[
+                    ("outcome", &["success", "failed", "cancelled"]),
+                    ("pool", &["runtime"]),
+                ],
+                unit: Seconds,
+                aggregation: P99,
+                requirement: Always,
+                destination: "dependencies.postgres_pool_wait_us",
+            },
+            EmitterContractFixture {
+                id: "postgres.transactions",
+                selectors: &[],
+                family: "vala_postgres_pool_acquire_total",
+                kind: Counter,
+                keys: &["pool"],
+                domains: &[("pool", &["runtime"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "dependencies.postgres_transactions",
+            },
+            EmitterContractFixture {
+                id: "storage.duration",
+                selectors: &[],
+                family: "wyrd_storage_operation_duration_seconds",
+                kind: HistogramBucket,
+                keys: &["backend", "le", "operation", "outcome"],
+                domains: &[
+                    ("backend", &["local", "s3", "gcs", "azure"]),
+                    ("operation", &["get", "put", "list", "delete", "head"]),
+                    ("outcome", &["success", "failed", "cancelled"]),
+                ],
+                unit: Seconds,
+                aggregation: P99,
+                requirement: Always,
+                destination: "dependencies.storage_p99_us",
+            },
+            EmitterContractFixture {
+                id: "storage.bytes",
+                selectors: &[],
+                family: "wyrd_storage_bytes_total",
+                kind: Counter,
+                keys: &["backend", "direction", "operation"],
+                domains: &[
+                    ("backend", &["local", "s3", "gcs", "azure"]),
+                    ("direction", &["read", "write"]),
+                    ("operation", &["get", "put"]),
+                ],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Always,
+                destination: "dependencies.storage_bytes",
+            },
+            EmitterContractFixture {
+                id: "wal.fsync",
+                selectors: &[],
+                family: "bifrost_scribe_wal_fsync_seconds",
+                kind: HistogramBucket,
+                keys: &["le", "outcome"],
+                domains: &[("outcome", &["success", "failed", "cancelled"])],
+                unit: Seconds,
+                aggregation: P99,
+                requirement: Role("scribe"),
+                destination: "dependencies.wal_fsync_p99_us",
+            },
+        ]
+    }
+
+    /// Prove every binding exactly matches an independently enumerated emitter contract.
+    #[test]
+    fn bindings_match_accepted_t16_emitter_contracts() {
+        let contracts = emitter_contracts();
+        assert_eq!(contracts.len(), CLUSTER_BINDINGS.len());
+        for contract in contracts {
+            assert!(!contract.destination.is_empty());
+            let binding = CLUSTER_BINDINGS
+                .iter()
+                .find(|binding| binding.id.0 == contract.id)
+                .expect("emitter contract has one binding");
+            assert_eq!(
+                (binding.family, binding.kind),
+                (contract.family, contract.kind)
+            );
+            assert_eq!(binding.allowed_label_keys, contract.keys);
+            assert_eq!(
+                (binding.unit, binding.aggregation, binding.requirement),
+                (contract.unit, contract.aggregation, contract.requirement)
+            );
+            let actual = binding
+                .allowed_label_values
+                .iter()
+                .map(|domain| (domain.key, domain.values))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, contract.domains);
+            let selectors = binding
+                .selected_label_values
+                .iter()
+                .map(|selected| (selected.key, selected.value))
+                .collect::<Vec<_>>();
+            assert_eq!(selectors, contract.selectors);
+            assert!(selectors_match_allowed_domains(binding));
+        }
+    }
+
+    /// Return whether every selector pair belongs to its allowed emitter domain.
+    fn selectors_match_allowed_domains(binding: &TelemetryBinding) -> bool {
+        binding.selected_label_values.iter().all(|selected| {
+            binding
+                .allowed_label_values
+                .iter()
+                .any(|domain| domain.key == selected.key && domain.values.contains(&selected.value))
+        })
+    }
+
+    /// Prove selector filtering distinguishes accepted operations from query successes.
+    #[test]
+    fn gate_request_destinations_use_distinct_declarative_selectors() {
+        let mut delta = canonical_binding_delta();
+        delta
+            .metrics
+            .retain(|sample| sample.family != "bifrost_gate_requests_total");
+        for (operation, outcome) in [
+            ("write", "success"),
+            ("write", "cancelled"),
+            ("query", "success"),
+            ("query", "rejected"),
+            ("query", "failed"),
+            ("query", "cancelled"),
+        ] {
+            delta.metrics.push(BifrostMetricSample {
+                family: "bifrost_gate_requests_total".to_owned(),
+                labels: BTreeMap::from([
+                    ("operation".to_owned(), operation.to_owned()),
+                    ("outcome".to_owned(), outcome.to_owned()),
+                ]),
+                value: 1.0,
+                kind: BifrostMetricKind::Counter,
+            });
+        }
+        let evaluated = evaluate_cluster_bindings(&delta).expect("valid Gate domains evaluate");
+        assert_eq!(
+            evaluated.get("gate.requests.success"),
+            Some(&EvaluatedBindingValue::Counter(2))
+        );
+        assert_eq!(
+            evaluated.get("gate.requests.query_success"),
+            Some(&EvaluatedBindingValue::Counter(1))
+        );
+
+        let mut missing_query_success = delta.clone();
+        missing_query_success.metrics.retain(|sample| {
+            sample.family != "bifrost_gate_requests_total"
+                || sample.labels.get("operation").map(String::as_str) != Some("query")
+                || sample.labels.get("outcome").map(String::as_str) != Some("success")
+        });
+        assert_eq!(
+            evaluate_cluster_bindings(&missing_query_success)
+                .expect("an unobserved closed counter destination is exact zero")
+                .get("gate.requests.query_success"),
+            Some(&EvaluatedBindingValue::Counter(0))
+        );
+
+        delta.metrics.push(BifrostMetricSample {
+            family: "bifrost_gate_requests_total".to_owned(),
+            labels: BTreeMap::from([
+                ("operation".to_owned(), "write".to_owned()),
+                ("outcome".to_owned(), "rejected".to_owned()),
+                ("unexpected".to_owned(), "value".to_owned()),
+            ]),
+            value: 1.0,
+            kind: BifrostMetricKind::Counter,
+        });
+        assert!(matches!(
+            evaluate_cluster_bindings(&delta),
+            Err(BifrostTelemetryReportError::InvalidBinding { id, .. })
+                if id == "gate.requests.success"
+        ));
+
+        let mut inconsistent = *CLUSTER_BINDINGS
+            .iter()
+            .find(|binding| binding.id.0 == "gate.requests.query_success")
+            .expect("query-success binding exists");
+        inconsistent.selected_label_values = &[TelemetrySelectedLabel {
+            key: "outcome",
+            value: "unknown",
+        }];
+        assert!(!selectors_match_allowed_domains(&inconsistent));
+    }
+
+    /// Prove rejected Gate rows never inflate the accepted-row destination.
+    #[test]
+    fn gate_rows_projection_selects_only_accepted_status() {
+        let mut delta = canonical_binding_delta();
+        delta.metrics.push(BifrostMetricSample {
+            family: "bifrost_gate_rows_total".to_owned(),
+            labels: BTreeMap::from([("status".to_owned(), "rejected".to_owned())]),
+            value: 99.0,
+            kind: BifrostMetricKind::Counter,
+        });
+        assert_eq!(
+            evaluate_cluster_bindings(&delta)
+                .expect("emitter-aligned fixture evaluates")
+                .get("gate.rows"),
+            Some(&EvaluatedBindingValue::Counter(1))
+        );
+    }
+
+    /// Proves every matrix phase field is read from its exact evaluated binding.
+    #[test]
+    fn canonical_phase_projection_retains_exact_matrix_destinations() {
+        let delta = canonical_binding_delta();
+        let bindings = evaluate_cluster_bindings(&delta).expect("complete bindings evaluate");
+        let phase = project_cluster_phase_evidence(&bindings);
+        assert_eq!(phase.gate_rows, 1);
+        assert_eq!(phase.gate_bytes, 1);
+        assert_eq!(phase.gate_query_request_success, 1);
+        assert_eq!(phase.gate_write_request_cancelled, 1);
+        assert_eq!(phase.gate_query_stream_cancelled, 1);
+        assert_eq!(phase.gate_query_stream_terminals, 2);
+        assert_eq!(phase.gate_active_streams, 1);
+        assert_eq!(phase.scribe_rows, 1);
+        assert_eq!(phase.oracle_source_rows, 1);
+        assert_eq!(phase.oracle_stream_rows, 1);
+        assert_eq!(phase.oracle_stream_bytes, 1);
+        assert_eq!(phase.forge_input_files, 1);
+        assert_eq!(phase.forge_input_bytes, 1);
+        assert_eq!(phase.forge_output_files, 1);
+        assert_eq!(phase.forge_output_bytes, 1);
+    }
+
+    /// Proves a newly exposed phase destination cannot disappear silently.
+    #[test]
+    fn canonical_phase_projection_rejects_missing_oracle_stream_bytes() {
+        let mut delta = canonical_binding_delta();
+        delta
+            .metrics
+            .retain(|sample| sample.family != "bifrost_oracle_stream_bytes_total");
+        assert!(matches!(
+            evaluate_cluster_bindings(&delta),
+            Err(BifrostTelemetryReportError::InvalidBinding { id, .. })
+                if id == "oracle.stream_bytes"
+        ));
+    }
+
+    /// Build one complete exact binding fixture from independent emitter contracts.
     fn canonical_binding_delta() -> BifrostTelemetryDelta {
         let mut delta = BifrostTelemetryDelta {
             metrics: Vec::new(),
@@ -2116,27 +3909,58 @@ mod tests {
             interval_seconds: 1.0,
             process: test_process_window(),
         };
-        for binding in CLUSTER_BINDINGS {
-            let mut labels = binding
-                .allowed_label_values
+        for contract in emitter_contracts() {
+            let binding = CLUSTER_BINDINGS
                 .iter()
-                .map(|domain| (domain.key.to_owned(), domain.values[0].to_owned()))
+                .find(|binding| binding.id.0 == contract.id)
+                .expect("contract has binding");
+            let mut labels = contract
+                .domains
+                .iter()
+                .map(|(key, values)| ((*key).to_owned(), values[0].to_owned()))
                 .collect::<BTreeMap<_, _>>();
-            if binding.kind == BifrostMetricKind::HistogramBucket {
-                labels.insert("le".to_owned(), "+Inf".to_owned());
+            for (key, value) in contract.selectors {
+                labels.insert((*key).to_owned(), (*value).to_owned());
             }
-            if binding.family == "bifrost_oracle_slots_total" {
-                labels.insert("role".to_owned(), "leader".to_owned());
-            }
-            let sample = BifrostMetricSample {
+            let mut sample = BifrostMetricSample {
                 family: binding.family.to_owned(),
-                labels,
+                labels: labels.clone(),
                 value: 1.0,
                 kind: binding.kind,
             };
             match binding.aggregation {
-                TelemetryAggregation::Delta | TelemetryAggregation::P99 => {
+                TelemetryAggregation::Delta => {
+                    if !delta.metrics.iter().any(|existing| {
+                        existing.family == sample.family
+                            && existing.kind == sample.kind
+                            && existing.labels == sample.labels
+                    }) {
+                        delta.metrics.push(sample);
+                    }
+                }
+                TelemetryAggregation::P99 => {
+                    sample.labels.insert("le".to_owned(), "0.001".to_owned());
                     delta.metrics.push(sample);
+                    let mut infinity = labels.clone();
+                    infinity.insert("le".to_owned(), "+Inf".to_owned());
+                    delta.metrics.push(BifrostMetricSample {
+                        family: binding.family.to_owned(),
+                        labels: infinity,
+                        value: 1.0,
+                        kind: BifrostMetricKind::HistogramBucket,
+                    });
+                    delta.metrics.push(BifrostMetricSample {
+                        family: binding.family.to_owned(),
+                        labels: labels.clone(),
+                        value: 1.0,
+                        kind: BifrostMetricKind::HistogramCount,
+                    });
+                    delta.metrics.push(BifrostMetricSample {
+                        family: binding.family.to_owned(),
+                        labels,
+                        value: 0.001,
+                        kind: BifrostMetricKind::HistogramSum,
+                    });
                 }
                 TelemetryAggregation::Peak => delta.gauge_maxima.push(sample),
                 TelemetryAggregation::Final => delta.gauge_final.push(sample),

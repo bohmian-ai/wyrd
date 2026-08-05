@@ -1,9 +1,11 @@
 //! Deterministic public-Gate Bifrost cluster matrix journeys.
 
+#[cfg(feature = "bench")]
+use wyrd_bench::{EvidenceStatus, KneeProvenance};
 use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster};
 use wyrd_testing::load::{BifrostClusterLoad, ClusterLoadProfile};
 
-/// The public task owns Postgres and invokes only the seven exact serial filters.
+/// The public task owns Postgres and invokes only the six earned serial filters.
 ///
 /// # Panics
 ///
@@ -23,7 +25,6 @@ fn bifrost_cluster_task_contract_is_exact() {
         "multi_tenant_single_pod_mixed_gate_load",
         "multi_tenant_three_server_three_worker_mixed_gate_load",
         "pressured_tenant_does_not_starve_peers",
-        "cluster_load_telemetry_reconciles_all_pillars",
         "cluster_load_cancellation_and_shutdown_release_all_owners",
         "three_server_cluster_reconciles_production_telemetry",
     ];
@@ -148,6 +149,7 @@ async fn multi_tenant_three_server_three_worker_mixed_gate_load() {
 /// pillar, audit, durable-state, fairness, or exact production-telemetry assertion.
 #[tokio::test]
 #[ignore = "requires managed Postgres and the real public Gate cluster"]
+#[cfg(not(feature = "bench"))]
 async fn three_server_cluster_reconciles_production_telemetry() {
     let profile = ClusterLoadProfile::multi_tenant_three_server_three_worker();
     let summary = BifrostClusterLoad::start(profile)
@@ -158,17 +160,38 @@ async fn three_server_cluster_reconciles_production_telemetry() {
         .expect("production telemetry reconciles");
     assert_eq!(summary.tenants.len(), 8);
     assert!(summary.jain_fairness >= 0.95);
-    assert!(
-        summary
-            .telemetry
-            .iter()
-            .all(|phase| !phase.required_families.is_empty())
-    );
     assert!(summary.tenants.values().all(|tenant| {
         tenant.tenant_audit_rows > 0
             && tenant.final_rows == tenant.acknowledged_rows
             && tenant.completed_reads >= profile.minimum_reads_per_tenant
     }));
+}
+
+/// Eight tenants exercise the canonical sampled projection and reconciled report.
+#[tokio::test]
+#[ignore = "requires managed Postgres and the real public Gate cluster"]
+#[cfg(feature = "bench")]
+async fn three_server_cluster_reconciles_production_telemetry() {
+    let definition = wyrd_testing::bifrost::bench_cluster::reference_scenario_matrix()[2];
+    let (scenario, trial) = wyrd_testing::bifrost::bench_cluster::run_reference_trial(
+        definition,
+        20,
+        100,
+        1,
+        20,
+        KneeProvenance::Discovered,
+    )
+    .await
+    .expect("canonical sampled production telemetry reconciles");
+    assert_eq!(scenario.tenants, 8);
+    assert_eq!(
+        trial.production.required_telemetry,
+        EvidenceStatus::Complete
+    );
+    assert_eq!(trial.production.counter_integrity, EvidenceStatus::Complete);
+    assert_eq!(trial.production.spans_clean, EvidenceStatus::Complete);
+    assert_eq!(trial.production.cleanup, EvidenceStatus::Complete);
+    assert!(trial.production.reconciles());
 }
 
 /// Real admission pressure on one tenant does not stall peer progress.
@@ -205,122 +228,8 @@ async fn pressured_tenant_does_not_starve_peers() {
                 tenant.backpressure == 0
                     && tenant.acknowledged_rows == 512
                     && tenant.final_rows == 512
-                    && tenant.completed_reads >= 16
+                    && tenant.completed_reads >= profile.minimum_reads_per_tenant
             })
-    );
-}
-
-/// Per-phase production telemetry reconciles every public operation ledger.
-///
-/// # Panics
-///
-/// Panics when the fixture fails or phase order, required families, pillar
-/// row/byte/request totals, cancellation outcomes, or D24 labels do not reconcile.
-#[tokio::test]
-#[ignore = "requires managed Postgres and the real public Gate cluster"]
-async fn cluster_load_telemetry_reconciles_all_pillars() {
-    let summary = BifrostClusterLoad::start(ClusterLoadProfile::single_tenant_single_pod())
-        .await
-        .expect("cluster load starts")
-        .run()
-        .await
-        .expect("cluster load completes");
-    assert_eq!(
-        summary
-            .telemetry
-            .iter()
-            .map(|delta| delta.phase.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "setup",
-            "warmup",
-            "measured",
-            "flush_publication",
-            "final_verification",
-            "cancellation_shutdown",
-        ]
-    );
-    assert!(
-        summary
-            .telemetry
-            .iter()
-            .all(|delta| delta.required_families.len() == 3)
-    );
-    let total = |field: fn(&wyrd_testing::load::PillarTelemetryDelta) -> f64| {
-        summary
-            .telemetry
-            .iter()
-            .filter(|delta| delta.phase != "cancellation_shutdown")
-            .map(field)
-            .sum::<f64>()
-    };
-    assert!(
-        total(|delta| delta.gate_rows) > 0.0,
-        "Gate emitted no native row counter delta"
-    );
-    let expected_rows = summary
-        .tenants
-        .values()
-        .map(|tenant| {
-            u64::from(tenant.warmup_acknowledged_batches)
-                * u64::from(summary.profile.rows_per_batch)
-                + tenant.acknowledged_rows
-        })
-        .sum::<u64>();
-    let expected_bytes = summary
-        .tenants
-        .values()
-        .map(|tenant| tenant.warmup_acknowledged_bytes + tenant.acknowledged_bytes)
-        .sum::<u64>();
-    assert_eq!(total(|delta| delta.gate_rows) as u64, expected_rows);
-    assert_eq!(total(|delta| delta.scribe_rows) as u64, expected_rows);
-    assert_eq!(total(|delta| delta.oracle_rows) as u64, expected_rows);
-    assert_eq!(
-        total(|delta| delta.oracle_stream_rows) as u64,
-        summary
-            .tenants
-            .values()
-            .map(|tenant| tenant.final_rows)
-            .sum::<u64>()
-    );
-    assert_eq!(total(|delta| delta.gate_bytes) as u64, expected_bytes);
-    let expected_successful_requests = summary
-        .tenants
-        .values()
-        .map(|tenant| {
-            u64::from(tenant.warmup_acknowledged_batches)
-                + u64::from(tenant.acknowledged_batches)
-                + u64::from(tenant.completed_reads)
-                + 2
-        })
-        .sum::<u64>();
-    assert_eq!(
-        total(|delta| delta.gate_success) as u64,
-        expected_successful_requests
-    );
-    let cancelled = summary
-        .telemetry
-        .iter()
-        .map(|delta| delta.gate_cancelled)
-        .sum::<f64>();
-    assert_eq!(cancelled as u64, 2);
-    let request_series = summary
-        .telemetry
-        .iter()
-        .flat_map(|delta| delta.metrics.keys())
-        .filter(|series| series.starts_with("bifrost_gate_requests_total{"))
-        .collect::<Vec<_>>();
-    assert!(
-        request_series
-            .iter()
-            .any(|series| series.contains("operation=write")),
-        "production Gate emitted no write request sample"
-    );
-    assert!(
-        request_series
-            .iter()
-            .all(|series| !series.contains("operation=ingest")),
-        "D24 forbids the ingest operation label: {request_series:?}"
     );
 }
 

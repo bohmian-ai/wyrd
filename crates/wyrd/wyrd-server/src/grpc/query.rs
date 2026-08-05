@@ -17,7 +17,7 @@ use crate::components::auth::Caller;
 pub(crate) type QueryGrpcStream =
     Pin<Box<dyn Stream<Item = Result<proto::QueryStreamFrame, Status>> + Send + 'static>>;
 
-/// Owns one Oracle stream and drains it asynchronously when gRPC drops early.
+/// Owns one Oracle stream through terminal completion or synchronous transport drop.
 struct QueryGrpcStreamOwner {
     /// Oracle stream whose admission and renewal guards must be cancelled.
     query: Option<vala_bifrost_redux::oracle::OracleQueryStream>,
@@ -46,17 +46,6 @@ impl Stream for QueryGrpcStreamOwner {
             )),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
-    }
-}
-
-impl Drop for QueryGrpcStreamOwner {
-    fn drop(&mut self) {
-        let Some(query) = self.query.take() else {
-            return;
-        };
-        tokio::spawn(async move {
-            query.cancel().await;
-        });
     }
 }
 
@@ -177,6 +166,7 @@ mod tests {
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use vala_bifrost_redux::oracle::OracleQueryStream;
+    use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
         QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame, QuerySource,
         QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
@@ -356,48 +346,63 @@ mod tests {
         }
     }
 
-    /// Proves dropping a gRPC stream releases the retained Oracle frame owner.
-    #[tokio::test]
-    async fn grpc_query_stream_drop_propagates_cancellation() {
-        /// Sends the owner-release signal only when the synthetic source drops.
-        struct ReleaseSignal {
-            /// One-shot completion observed by the test after source drop.
-            sender: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Proves dropping a gRPC stream synchronously destroys its Oracle frame owner.
+    #[test]
+    fn grpc_query_stream_drop_releases_owner_without_runtime() {
+        /// Pending synthetic source whose destruction exposes inline owner release.
+        struct DropObservedStream {
+            /// Shared observation set only by this source's destructor.
+            dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         }
 
-        impl Drop for ReleaseSignal {
-            /// Completes the bounded test assertion at source-owner drop.
+        impl futures_util::Stream for DropObservedStream {
+            type Item = Result<QueryStreamFrame, BifrostError>;
+
+            /// Remains pending so only transport destruction can release the owner.
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for DropObservedStream {
+            /// Records synchronous destruction of the retained Oracle source.
             fn drop(&mut self) {
-                if let Some(sender) = self.sender.take() {
-                    let _ = sender.send(());
-                }
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
         }
 
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let source_cancellation = cancellation.clone();
-        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
-        let frames = async_stream::stream! {
-            let _release = ReleaseSignal {
-                sender: Some(release_sender),
-            };
-            yield Ok(schema_frame());
-            source_cancellation.cancelled().await;
-        };
-        let mut stream = query_stream_response(OracleQueryStream::test_new(
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = query_stream_response(OracleQueryStream::test_new(
             "abcd".to_owned(),
-            Box::pin(frames),
-            cancellation.clone(),
+            Box::pin(DropObservedStream {
+                dropped: std::sync::Arc::clone(&dropped),
+            }),
+            cancellation,
         ))
         .into_inner();
-        let _first = stream.next().await.expect("schema frame");
         drop(stream);
-        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation.cancelled())
-            .await
-            .expect("gRPC drop signals Oracle cancellation");
-        tokio::time::timeout(std::time::Duration::from_secs(1), release_receiver)
-            .await
-            .expect("synthetic source observes cancellation and releases owner")
-            .expect("source release signal remains connected");
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// Prevents reintroducing asynchronous work into the gRPC stream destructor.
+    #[test]
+    fn grpc_query_stream_owner_has_no_detached_drop() {
+        let source = include_str!("query.rs");
+        let owner = source
+            .split("struct QueryGrpcStreamOwner")
+            .nth(1)
+            .expect("gRPC query stream owner exists");
+        let owner = owner
+            .split("pub struct BifrostQueryGrpc")
+            .next()
+            .expect("gRPC query owner section ends before service");
+
+        assert!(!owner.contains("impl Drop for QueryGrpcStreamOwner"));
+        assert!(!owner.contains("tokio::spawn"));
     }
 }

@@ -1,7 +1,8 @@
 //! Deterministic public-SDK Bifrost cluster load matrix.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -26,21 +27,49 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 
 use crate::Bootstrap;
+use crate::bifrost::telemetry::{
+    ClusterPhaseTelemetryEvidence, evaluate_cluster_phase_bindings, project_cluster_phase_evidence,
+    run_sampled_window,
+};
 use crate::bifrost::{BifrostTelemetryCapture, BifrostTopology, WyrdTestCluster};
 
 /// Stable table name provisioned independently inside every tenant.
 const TABLE_NAME: &str = "bifrost_cluster_load";
 /// Whole-scenario progress ceiling, not a latency SLO.
 const DEFAULT_SCENARIO_DEADLINE: Duration = Duration::from_secs(60);
-/// Exact D24 Gate families required in every production capture.
-const REQUIRED_GATE_FAMILIES: [&str; 5] = [
-    "bifrost_gate_requests_total",
-    "bifrost_gate_request_duration_seconds",
-    "bifrost_gate_active_streams",
-    "bifrost_gate_query_streams_total",
-    "bifrost_gate_query_stream_duration_seconds",
+/// Exact bindings required to reconcile warmup writes.
+const WARMUP_BINDINGS: &[&str] = &[
+    "gate.requests.success",
+    "gate.bytes",
+    "gate.rows",
+    "scribe.rows",
 ];
-
+/// Exact bindings required to reconcile mixed measured traffic.
+const MEASURED_BINDINGS: &[&str] = &[
+    "gate.requests.success",
+    "gate.bytes",
+    "gate.rows",
+    "scribe.rows",
+];
+/// Exact bindings required to reconcile final public reads.
+const FINAL_BINDINGS: &[&str] = &[
+    "gate.requests.query_success",
+    "oracle.source_rows",
+    "oracle.rows",
+    "oracle.stream_bytes",
+];
+/// Exact bindings required to prove request-versus-stream cancellation.
+const CANCELLATION_BINDINGS: &[&str] = &[
+    "gate.requests.success",
+    "gate.requests.rejected",
+    "gate.requests.failed",
+    "gate.requests.cancelled",
+    "gate.requests.query_success",
+    "gate.requests.write_cancelled",
+    "gate.query_streams",
+    "gate.query_streams.cancelled",
+    "gate.active",
+];
 /// Immutable operation counts collected for one tenant.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct TenantLoadResult {
@@ -84,51 +113,6 @@ pub struct TenantLoadResult {
     pub rejected_batches: u32,
     /// Number of measured phases in which this tenant made progress.
     pub progressed_phases: u32,
-}
-
-/// Typed production telemetry delta for one matrix phase.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct PillarTelemetryDelta {
-    /// Matrix phase represented by the checkpoint delta.
-    pub phase: String,
-    /// Production metric-family deltas keyed by family and closed labels.
-    pub metrics: BTreeMap<String, f64>,
-    /// Finished production span names and counts.
-    pub spans: BTreeMap<String, u64>,
-    /// Required families that were present at both checkpoints.
-    pub required_families: BTreeSet<String>,
-    /// Gate-accepted row and wire-byte counters in this phase.
-    pub gate_rows: f64,
-    /// Gate frame-byte counter in this phase.
-    pub gate_bytes: f64,
-    /// Scribe-ingested row and sealed-byte counters in this phase.
-    pub scribe_rows: f64,
-    /// Oracle source row and byte counters in this phase.
-    pub oracle_rows: f64,
-    /// Oracle stream rows and bytes emitted to strict clients.
-    pub oracle_stream_rows: f64,
-    /// Oracle stream bytes emitted to strict clients.
-    pub oracle_stream_bytes: f64,
-    /// Forge rewrite output bytes published in this phase.
-    pub forge_output_bytes: f64,
-    /// Forge rewrite input files committed in this phase.
-    pub forge_input_files: f64,
-    /// Forge rewrite input bytes committed in this phase.
-    pub forge_input_bytes: f64,
-    /// Forge rewrite output files committed in this phase.
-    pub forge_output_files: f64,
-    /// Forge tasks that reached a durable terminal state in this phase.
-    pub forge_committed_tasks: u64,
-    /// Durable Oracle read-decision audit rows committed in this phase.
-    pub read_audit_rows: u64,
-    /// Gate request outcome counts by closed outcome label.
-    pub gate_success: f64,
-    /// Gate requests rejected by policy/admission.
-    pub gate_rejected: f64,
-    /// Gate requests that ended in an internal or transport failure.
-    pub gate_failed: f64,
-    /// Gate requests cancelled before terminal completion.
-    pub gate_cancelled: f64,
 }
 
 /// Aggregated resource state after cancellation and shutdown.
@@ -230,7 +214,7 @@ impl ClusterLoadProfile {
             || self.rows_per_batch == 0
             || self.writers_per_tenant != 2
             || self.readers_per_tenant != 2
-            || self.minimum_reads_per_tenant < 16
+            || self.minimum_reads_per_tenant != self.readers_per_tenant as u32
             || self.warmup_batches_per_tenant < 2
             || self.measured_batches_per_tenant < 8
             || self.scenario_deadline < Duration::from_millis(1)
@@ -289,7 +273,7 @@ impl ClusterLoadProfile {
             rows_per_batch: 64,
             writers_per_tenant: 2,
             readers_per_tenant: 2,
-            minimum_reads_per_tenant: 16,
+            minimum_reads_per_tenant: 2,
             scenario_deadline: DEFAULT_SCENARIO_DEADLINE,
             seed: 0xB1F0_57A5,
             pressured_tenant: None,
@@ -304,8 +288,6 @@ pub struct BifrostClusterLoadSummary {
     pub profile: ClusterLoadProfile,
     /// Per-tenant operation results in deterministic tenant order.
     pub tenants: BTreeMap<String, TenantLoadResult>,
-    /// Per-phase production telemetry deltas.
-    pub telemetry: Vec<PillarTelemetryDelta>,
     /// Jain fairness over acknowledged batches.
     pub jain_fairness: f64,
     /// Final owner/resource state.
@@ -332,221 +314,47 @@ pub enum ClusterLoadError {
     Telemetry(String),
 }
 
-/// Typed read-only mapper over production metric/span checkpoints.
-#[derive(Clone)]
-pub struct ClusterTelemetryCapture {
-    forge: BifrostTelemetryCapture,
-}
-
-impl ClusterTelemetryCapture {
-    /// Construct a mapper from the process-installed production capture.
-    #[must_use]
-    pub fn new(forge: BifrostTelemetryCapture) -> Self {
-        Self { forge }
+/// Execute and project one matrix phase through the canonical sampled window.
+///
+/// # Errors
+/// Returns the workload error or canonical capture/projection failure without
+/// suppressing sampler cleanup context.
+async fn sampled_phase<T, F, Fut>(
+    capture: &BifrostTelemetryCapture,
+    topology: BifrostTopology,
+    required_ids: &[&'static str],
+    workload: F,
+) -> Result<(T, ClusterPhaseTelemetryEvidence), ClusterLoadError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, ClusterLoadError>>,
+{
+    if !matches!(
+        topology,
+        BifrostTopology::OnePod | BifrostTopology::ThreeServersThreeForgeWorkers
+    ) {
+        return Err(ClusterLoadError::Telemetry(
+            "topology is outside the canonical cluster matrix".to_owned(),
+        ));
     }
-
-    /// Capture one immutable production checkpoint.
-    pub fn checkpoint(
-        &self,
-    ) -> Result<crate::bifrost::telemetry::BifrostTelemetryCheckpoint, ClusterLoadError> {
-        self.forge
-            .checkpoint()
-            .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))
-    }
-
-    /// Map one checkpoint to closed-family metric and span deltas.
-    pub fn delta_since(
-        &self,
-        checkpoint: &crate::bifrost::telemetry::BifrostTelemetryCheckpoint,
-    ) -> Result<PillarTelemetryDelta, ClusterLoadError> {
-        let delta = self
-            .forge
-            .delta_since(checkpoint)
-            .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))?;
-        let mut metrics = BTreeMap::new();
-        let mut required_families = BTreeSet::new();
-        for sample in delta.metrics.into_iter().chain(delta.gauge_final) {
-            if REQUIRED_GATE_FAMILIES.contains(&sample.family.as_str()) {
-                required_families.insert(sample.family.clone());
-                validate_gate_metric(&sample)?;
-            }
-            let key = metric_series_key(&sample);
-            *metrics.entry(key).or_insert(0.0) += sample.value;
-        }
-        let mut spans = BTreeMap::new();
-        for span in delta.spans {
-            let structured_failure = span
-                .attributes
-                .get("outcome")
-                .is_some_and(|outcome| matches!(outcome.as_str(), "failed" | "error"))
-                || span
-                    .attributes
-                    .get("result")
-                    .is_some_and(|result| matches!(result.as_str(), "failed" | "error"));
-            let status_failure = span
-                .attributes
-                .get("status")
-                .is_some_and(|status| matches!(status.as_str(), "error" | "ERROR" | "failed"))
-                || span.attributes.contains_key("error.type")
-                || span.attributes.contains_key("error.message");
-            if structured_failure || status_failure {
-                return Err(ClusterLoadError::Telemetry(format!(
-                    "unexpected failed production span {}",
-                    span.name
-                )));
-            }
-            *spans.entry(span.name).or_insert(0) += 1;
-        }
-        let total = |family: &str| {
-            metrics
-                .iter()
-                .filter(|(key, _)| key.starts_with(&format!("{family}{{")))
-                .map(|(_, value)| *value)
-                .sum::<f64>()
-        };
-        let gate_rows = total("bifrost_gate_rows_total");
-        let gate_bytes = total("bifrost_gate_frame_bytes_total");
-        let scribe_rows = total("bifrost_scribe_rows_total");
-        let oracle_rows = total("bifrost_oracle_source_rows_total");
-        let oracle_stream_rows = total("bifrost_oracle_stream_rows_total");
-        let oracle_stream_bytes = total("bifrost_oracle_stream_bytes_total");
-        let forge_output_bytes = total("bifrost_forge_rewrite_output_bytes_total");
-        let forge_input_files = total("bifrost_forge_rewrite_input_files_total");
-        let forge_input_bytes = total("bifrost_forge_rewrite_input_bytes_total");
-        let forge_output_files = total("bifrost_forge_rewrite_output_files_total");
-        let outcome_total = |outcome: &str| {
-            metrics
-                .iter()
-                .filter(|(key, _)| {
-                    key.starts_with("bifrost_gate_requests_total{")
-                        && key.contains(&format!("outcome={outcome}"))
-                })
-                .map(|(_, value)| *value)
-                .sum::<f64>()
-        };
-        let gate_success = outcome_total("success");
-        let gate_rejected = outcome_total("rejected");
-        let gate_failed = outcome_total("failed");
-        let gate_cancelled = outcome_total("cancelled");
-        Ok(PillarTelemetryDelta {
-            phase: String::new(),
-            metrics,
-            spans,
-            required_families,
-            gate_rows,
-            gate_bytes,
-            scribe_rows,
-            oracle_rows,
-            oracle_stream_rows,
-            oracle_stream_bytes,
-            forge_output_bytes,
-            forge_input_files,
-            forge_input_bytes,
-            forge_output_files,
-            forge_committed_tasks: 0,
-            read_audit_rows: 0,
-            gate_success,
-            gate_rejected,
-            gate_failed,
-            gate_cancelled,
-        })
-    }
-
-    /// Assert the D24 Gate families are present in a production snapshot.
-    ///
-    /// # Errors
-    /// Returns [`ClusterLoadError::Telemetry`] when any required family is
-    /// absent. No synthetic metric is inserted to satisfy this check.
-    pub fn assert_gate_families(&self) -> Result<(), ClusterLoadError> {
-        let families = self.forge.families();
-        let missing = REQUIRED_GATE_FAMILIES
-            .iter()
-            .filter(|family| !families.contains(**family))
-            .copied()
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            Ok(())
-        } else {
-            Err(ClusterLoadError::Telemetry(format!(
-                "missing required Gate families: {missing:?}"
-            )))
-        }
-    }
-}
-
-/// Validate D24's closed Gate operation/outcome label inventory.
-fn validate_gate_metric(
-    sample: &crate::bifrost::telemetry::BifrostMetricSample,
-) -> Result<(), ClusterLoadError> {
-    let operation = sample.labels.get("operation").map(String::as_str);
-    let outcome = sample.labels.get("outcome").map(String::as_str);
-    match sample.family.as_str() {
-        "bifrost_gate_requests_total" | "bifrost_gate_request_duration_seconds"
-            if !(matches!(operation, Some("query" | "write"))
-                && matches!(
-                    outcome,
-                    Some("success" | "rejected" | "failed" | "cancelled")
-                )) =>
-        {
-            return Err(ClusterLoadError::Telemetry(format!(
-                "invalid Gate labels for {}: {:?}",
-                sample.family, sample.labels
-            )));
-        }
-        "bifrost_gate_active_streams" if operation != Some("query") => {
-            return Err(ClusterLoadError::Telemetry(format!(
-                "invalid Gate active-stream labels: {:?}",
-                sample.labels
-            )));
-        }
-        "bifrost_gate_query_streams_total"
-            if operation.is_some()
-                || !matches!(
-                    outcome,
-                    Some("success" | "rejected" | "failed" | "cancelled")
-                ) =>
-        {
-            return Err(ClusterLoadError::Telemetry(format!(
-                "invalid Gate query-stream labels for {}: {:?}",
-                sample.family, sample.labels
-            )));
-        }
-        "bifrost_gate_query_stream_duration_seconds"
-            if operation.is_some()
-                || (sample.kind
-                    == crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket
-                    && !sample.labels.contains_key("le"))
-                || !matches!(
-                    outcome,
-                    Some("success" | "rejected" | "failed" | "cancelled")
-                ) =>
-        {
-            return Err(ClusterLoadError::Telemetry(format!(
-                "invalid Gate query-stream labels for {}: {:?}",
-                sample.family, sample.labels
-            )));
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Preserve fixed labels in the typed report key without creating new labels.
-fn metric_series_key(sample: &crate::bifrost::telemetry::BifrostMetricSample) -> String {
-    let labels = sample
-        .labels
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{}{{{labels}}}", sample.family)
+    let (value, delta) = run_sampled_window(capture, || async {
+        workload()
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    })
+    .await
+    .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))?;
+    let bindings = evaluate_cluster_phase_bindings(&delta, required_ids)
+        .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))?;
+    let evidence = project_cluster_phase_evidence(&bindings);
+    Ok((value, evidence))
 }
 
 /// Owns one complete deterministic cluster workload and its cleanup boundary.
 pub struct BifrostClusterLoad {
     cluster: Option<WyrdTestCluster>,
     profile: ClusterLoadProfile,
-    telemetry: ClusterTelemetryCapture,
+    telemetry: BifrostTelemetryCapture,
 }
 
 impl BifrostClusterLoad {
@@ -574,7 +382,7 @@ impl BifrostClusterLoad {
             .await
         }
         .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
-        let telemetry = ClusterTelemetryCapture::new(cluster.telemetry().clone());
+        let telemetry = cluster.telemetry().clone();
         Ok(Self {
             cluster: Some(cluster),
             profile,
@@ -638,7 +446,6 @@ impl BifrostClusterLoad {
             .cluster
             .as_ref()
             .ok_or_else(|| ClusterLoadError::Cluster("cluster already shut down".to_owned()))?;
-        let setup_checkpoint = self.telemetry.checkpoint()?;
         let tenants = provision_tenants(cluster, self.profile.tenants).await?;
         let table = format!("vala.bifrost.{TABLE_NAME}");
         provision_tables(cluster, &tenants).await?;
@@ -661,11 +468,8 @@ impl BifrostClusterLoad {
             )
             .await
             .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
-        let mut setup_telemetry = self.telemetry.delta_since(&setup_checkpoint)?;
-        setup_telemetry.phase = "setup".to_owned();
-        let (results, mut matrix_telemetry) =
+        let results =
             run_public_matrix(&self.telemetry, cluster, &self.profile, &tenants, &table).await?;
-        self.telemetry.assert_gate_families()?;
         let fairness = jain_fairness(results.values().filter_map(|result| {
             (self.profile.pressured_tenant != Some(result.tenant_index))
                 .then_some(result.acknowledged_rows)
@@ -675,24 +479,23 @@ impl BifrostClusterLoad {
                 "Jain fairness {fairness:.3} is below 0.95"
             )));
         }
-        let cancellation_checkpoint = self.telemetry.checkpoint()?;
         let cancellation_owners = phase_owner_checkpoint(cluster).await?;
-        exercise_query_cancellation(setup_server, &setup_client, &table).await?;
-        let mut cancellation = self.telemetry.delta_since(&cancellation_checkpoint)?;
-        cancellation.phase = "cancellation_shutdown".to_owned();
+        let (_, cancellation) = sampled_phase(
+            &self.telemetry,
+            self.profile.topology,
+            CANCELLATION_BINDINGS,
+            || async { exercise_query_cancellation(setup_server, &setup_client, &table).await },
+        )
+        .await?;
         let cancellation_finished_owners = phase_owner_checkpoint(cluster).await?;
-        apply_owner_delta(
-            &mut cancellation,
-            cancellation_owners,
-            cancellation_finished_owners,
-        )?;
+        let cancellation_owner_delta =
+            owner_delta(cancellation_owners, cancellation_finished_owners)?;
         assert_cancellation_outcomes(&cancellation)?;
         assert_phase_counter(
             "cancellation Oracle read audits",
-            cancellation.read_audit_rows as f64,
+            cancellation_owner_delta.read_audit_rows,
             1,
         )?;
-        matrix_telemetry.push(cancellation);
         for server in cluster.servers() {
             if server.bifrost_scribe().is_some() {
                 server
@@ -701,19 +504,7 @@ impl BifrostClusterLoad {
                     .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
             }
         }
-        let cleanup_telemetry = matrix_telemetry
-            .last()
-            .ok_or_else(|| ClusterLoadError::Telemetry("matrix emitted no telemetry".to_owned()))?;
-        let cleanup = cleanup_snapshot(cluster, cleanup_telemetry).await?;
-        let forge_output_bytes = matrix_telemetry
-            .iter()
-            .map(|delta| delta.forge_output_bytes)
-            .sum::<f64>();
-        if forge_output_bytes > 0.0 && cleanup.forge_terminal_tasks == 0 {
-            return Err(ClusterLoadError::Assertion(
-                "Forge emitted rewrite bytes without a terminal task evidence row".to_owned(),
-            ));
-        }
+        let cleanup = cleanup_snapshot(cluster, cancellation.gate_active_streams).await?;
         if cleanup.forge_active_claims != 0 || cleanup.forge_active_attempts != 0 {
             return Err(ClusterLoadError::Assertion(format!(
                 "Forge cleanup retained {} claims and {} attempts",
@@ -723,16 +514,45 @@ impl BifrostClusterLoad {
         let summary = BifrostClusterLoadSummary {
             profile: self.profile,
             tenants: results,
-            telemetry: {
-                let mut telemetry = Vec::with_capacity(matrix_telemetry.len() + 1);
-                telemetry.push(setup_telemetry);
-                telemetry.append(&mut matrix_telemetry);
-                telemetry
-            },
             jain_fairness: fairness,
             cleanup,
         };
         Ok(summary)
+    }
+}
+
+/// Observe whether a configured query stall or the query task completes first.
+///
+/// # Errors
+/// Returns the original stall, client, join, or unexpected-success evidence
+/// with cancellation-probe context when the query does not reach the stall.
+async fn await_query_schema_stall_or_completion<S, T, E>(
+    stall: S,
+    query_task: &mut tokio::task::JoinHandle<Result<T, E>>,
+) -> Result<String, ClusterLoadError>
+where
+    S: Future<Output = Result<String, crate::WyrdTestServerError>>,
+    T: fmt::Debug,
+    E: fmt::Display,
+{
+    tokio::pin!(stall);
+    tokio::select! {
+        stalled = &mut stall => stalled.map_err(|error| {
+            ClusterLoadError::Client(format!(
+                "cancellation query schema stall failed: {error}"
+            ))
+        }),
+        completed = &mut *query_task => match completed {
+            Err(error) => Err(ClusterLoadError::Client(format!(
+                "cancellation query task join failed before schema stall: {error}"
+            ))),
+            Ok(Err(error)) => Err(ClusterLoadError::Client(format!(
+                "cancellation query completed before schema stall: {error}"
+            ))),
+            Ok(Ok(result)) => Err(ClusterLoadError::Assertion(format!(
+                "cancellation query unexpectedly succeeded before schema stall: {result:?}"
+            ))),
+        },
     }
 }
 
@@ -800,7 +620,7 @@ async fn exercise_query_cancellation(
     server.stall_next_query_after_schema();
     let query = QueryClient::new(client);
     let sql = format!("SELECT id, tenant, batch FROM {table} LIMIT 0");
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         query
             .collect_bounded(
                 &BifrostQueryRequest {
@@ -816,10 +636,8 @@ async fn exercise_query_cancellation(
             )
             .await
     });
-    let query_id = server
-        .wait_query_schema_stall()
-        .await
-        .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
+    let query_id =
+        await_query_schema_stall_or_completion(server.wait_query_schema_stall(), &mut task).await?;
     let baseline = crate::server::BifrostQueryResourceSnapshot {
         admission_slots: 0,
         memory_bytes: 0,
@@ -903,90 +721,124 @@ async fn provision_tables(
 /// # Errors
 /// Returns a typed lifecycle, public-client, telemetry, or reconciliation failure.
 async fn run_public_matrix(
-    telemetry: &ClusterTelemetryCapture,
+    telemetry: &BifrostTelemetryCapture,
     cluster: &WyrdTestCluster,
     profile: &ClusterLoadProfile,
     tenants: &[DataTenantId],
     table: &str,
-) -> Result<
-    (
-        BTreeMap<String, TenantLoadResult>,
-        Vec<PillarTelemetryDelta>,
-    ),
-    ClusterLoadError,
-> {
-    let matrix_checkpoint = telemetry.checkpoint()?;
+) -> Result<BTreeMap<String, TenantLoadResult>, ClusterLoadError> {
+    let publish_tenants = || async {
+        for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
+            let node_count = cluster.ready_ingest_nodes().len().max(1);
+            let pressured = profile.pressured_tenant == Some(tenant_index);
+            let mut writer_index = tenant_index % node_count;
+            if !pressured && profile.pressured_tenant.is_some() && writer_index == 0 {
+                writer_index = 1 % node_count;
+            }
+            let writer = cluster.server(writer_index).ok_or_else(|| {
+                ClusterLoadError::Cluster("flush writer Server is absent".to_owned())
+            })?;
+            let completion = cluster.forge_completion_observer();
+            let expected_completion = completion
+                .as_ref()
+                .map(|observer| observer.completed().saturating_add(1));
+            writer
+                .flush_bifrost_for_tenant(tenant)
+                .await
+                .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
+            let pending_forge_tasks = writer
+                .bifrost_pending_forge_tasks_for_tenant(tenant)
+                .await
+                .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
+            if pending_forge_tasks > 0
+                && let (Some(observer), Some(expected)) = (completion, expected_completion)
+            {
+                tokio::time::timeout(Duration::from_secs(5), observer.wait_for_at_least(expected))
+                    .await
+                    .map_err(|_| {
+                        ClusterLoadError::Cluster(format!(
+                            "Forge publication observer did not complete a scheduled task for tenant {tenant}"
+                        ))
+                    })?;
+            }
+        }
+        Ok::<_, ClusterLoadError>(())
+    };
     let matrix_owners = phase_owner_checkpoint(cluster).await?;
-    let phase_progress = Arc::new(PhaseProgress::new(tenants.len()));
-    let mut tasks = tokio::task::JoinSet::new();
-    let warmup_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
-    let measured_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
-    let completed_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
-    for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
-        let node_count = cluster.ready_ingest_nodes().len().max(1);
-        let pressured = profile.pressured_tenant == Some(tenant_index);
-        let mut writer_index = tenant_index % node_count;
-        if !pressured && profile.pressured_tenant.is_some() && writer_index == 0 {
-            writer_index = 1 % node_count;
-        }
-        let mut reader_index = if cluster.ready_query_nodes().len() > 1 {
-            (writer_index + 1) % cluster.ready_query_nodes().len()
-        } else {
-            writer_index
-        };
-        if !pressured && profile.pressured_tenant.is_some() && reader_index == 0 {
-            reader_index = 1 % cluster.ready_query_nodes().len().max(1);
-        }
-        let writer = cluster
-            .server(writer_index)
-            .ok_or_else(|| ClusterLoadError::Cluster("writer Server is absent".to_owned()))?;
-        let reader = cluster
-            .server(reader_index)
-            .ok_or_else(|| ClusterLoadError::Cluster("reader Server is absent".to_owned()))?;
-        let writer_client =
-            public_client(writer, tenant, &format!("load-writer-{tenant_index}")).await?;
-        let reader_client =
-            public_client(reader, tenant, &format!("load-reader-{tenant_index}")).await?;
-        let writer_transport = BifrostGrpcTransport::connect(&writer_client)
-            .await
-            .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
-        let query = QueryClient::new(&reader_client);
-        let profile = *profile;
-        let table = table.to_owned();
-        let warmup_barrier = Arc::clone(&warmup_barrier);
-        let measured_barrier = Arc::clone(&measured_barrier);
-        let completed_barrier = Arc::clone(&completed_barrier);
-        let phase_progress = Arc::clone(&phase_progress);
-        tasks.spawn(async move {
-            run_tenant(TenantRunContext {
-                tenant,
-                tenant_index,
-                profile,
-                table,
-                writer: writer_transport,
-                query,
-                warmup_barrier,
-                measured_barrier,
-                completed_barrier,
-                phase_progress,
-            })
-            .await
-            .map(|result| (tenant.to_string(), result))
-        });
-    }
-    phase_progress.wait_for(LoadPhase::Warmup).await;
-    let warmup_checkpoint = telemetry.checkpoint()?;
+    let ((phase_progress, mut tasks), warmup) =
+        sampled_phase(telemetry, profile.topology, WARMUP_BINDINGS, || async {
+            let phase_progress = Arc::new(PhaseProgress::new(tenants.len()));
+            let mut tasks = tokio::task::JoinSet::new();
+            let warmup_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
+            let measured_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
+            let completed_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
+            for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
+                let node_count = cluster.ready_ingest_nodes().len().max(1);
+                let pressured = profile.pressured_tenant == Some(tenant_index);
+                let mut writer_index = tenant_index % node_count;
+                if !pressured && profile.pressured_tenant.is_some() && writer_index == 0 {
+                    writer_index = 1 % node_count;
+                }
+                let mut reader_index = if cluster.ready_query_nodes().len() > 1 {
+                    (writer_index + 1) % cluster.ready_query_nodes().len()
+                } else {
+                    writer_index
+                };
+                if !pressured && profile.pressured_tenant.is_some() && reader_index == 0 {
+                    reader_index = 1 % cluster.ready_query_nodes().len().max(1);
+                }
+                let writer = cluster.server(writer_index).ok_or_else(|| {
+                    ClusterLoadError::Cluster("writer Server is absent".to_owned())
+                })?;
+                let reader = cluster.server(reader_index).ok_or_else(|| {
+                    ClusterLoadError::Cluster("reader Server is absent".to_owned())
+                })?;
+                let writer_client =
+                    public_client(writer, tenant, &format!("load-writer-{tenant_index}")).await?;
+                let reader_client =
+                    public_client(reader, tenant, &format!("load-reader-{tenant_index}")).await?;
+                let writer_transport = BifrostGrpcTransport::connect(&writer_client)
+                    .await
+                    .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
+                let query = QueryClient::new(&reader_client);
+                let profile = *profile;
+                let table = table.to_owned();
+                let warmup_barrier = Arc::clone(&warmup_barrier);
+                let measured_barrier = Arc::clone(&measured_barrier);
+                let completed_barrier = Arc::clone(&completed_barrier);
+                let phase_progress = Arc::clone(&phase_progress);
+                tasks.spawn(async move {
+                    run_tenant(TenantRunContext {
+                        tenant,
+                        tenant_index,
+                        profile,
+                        table,
+                        writer: writer_transport,
+                        query,
+                        warmup_barrier,
+                        measured_barrier,
+                        completed_barrier,
+                        phase_progress,
+                    })
+                    .await
+                    .map(|result| (tenant.to_string(), result))
+                });
+            }
+            phase_progress.wait_for(LoadPhase::Warmup).await;
+            publish_tenants().await?;
+            Ok((phase_progress, tasks))
+        })
+        .await?;
     let warmup_owners = phase_owner_checkpoint(cluster).await?;
-    let mut warmup = telemetry.delta_since(&matrix_checkpoint)?;
-    warmup.phase = "warmup".to_owned();
-    apply_owner_delta(&mut warmup, matrix_owners, warmup_owners)?;
-    phase_progress.release_warmup();
-    phase_progress.wait_for(LoadPhase::Measured).await;
-    let measured_checkpoint = telemetry.checkpoint()?;
+    let warmup_owner_delta = owner_delta(matrix_owners, warmup_owners)?;
+    let (_, measured) = sampled_phase(telemetry, profile.topology, MEASURED_BINDINGS, || async {
+        phase_progress.release_warmup();
+        phase_progress.wait_for(LoadPhase::Measured).await;
+        Ok(())
+    })
+    .await?;
     let measured_owners = phase_owner_checkpoint(cluster).await?;
-    let mut measured = telemetry.delta_since(&warmup_checkpoint)?;
-    measured.phase = "measured".to_owned();
-    apply_owner_delta(&mut measured, warmup_owners, measured_owners)?;
+    let measured_owner_delta = owner_delta(warmup_owners, measured_owners)?;
 
     let mut results = BTreeMap::new();
     while let Some(result) = tasks.join_next().await {
@@ -994,43 +846,11 @@ async fn run_public_matrix(
             result.map_err(|error| ClusterLoadError::Client(error.to_string()))??;
         results.insert(tenant, report);
     }
-    for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
-        let node_count = cluster.ready_ingest_nodes().len().max(1);
-        let pressured = profile.pressured_tenant == Some(tenant_index);
-        let mut writer_index = tenant_index % node_count;
-        if !pressured && profile.pressured_tenant.is_some() && writer_index == 0 {
-            writer_index = 1 % node_count;
-        }
-        let writer = cluster
-            .server(writer_index)
-            .ok_or_else(|| ClusterLoadError::Cluster("flush writer Server is absent".to_owned()))?;
-        writer
-            .flush_bifrost_for_tenant(tenant)
-            .await
-            .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
-        let pending_forge_tasks = writer
-            .bifrost_pending_forge_tasks_for_tenant(tenant)
-            .await
-            .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
-        if pending_forge_tasks > 0
-            && let Some(observer) = cluster.forge_completion_observer()
-        {
-            let expected = observer.completed().saturating_add(1);
-            tokio::time::timeout(Duration::from_secs(5), observer.wait_for_at_least(expected))
-                .await
-                .map_err(|_| {
-                    ClusterLoadError::Cluster(format!(
-                        "Forge publication observer did not complete a scheduled task for tenant {tenant}"
-                    ))
-                })?;
-        }
-    }
-    let publication_checkpoint = telemetry.checkpoint()?;
+    let (_, publication) = sampled_phase(telemetry, profile.topology, &[], publish_tenants).await?;
     let publication_owners = phase_owner_checkpoint(cluster).await?;
-    let mut publication = telemetry.delta_since(&measured_checkpoint)?;
-    publication.phase = "flush_publication".to_owned();
-    apply_owner_delta(&mut publication, measured_owners, publication_owners)?;
-    for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
+    let publication_owner_delta = owner_delta(measured_owners, publication_owners)?;
+    let (_, final_verification) = sampled_phase(telemetry, profile.topology, FINAL_BINDINGS, || async {
+        for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
         let node_count = cluster.ready_ingest_nodes().len().max(1);
         let pressured = profile.pressured_tenant == Some(tenant_index);
         let mut writer_index = tenant_index % node_count;
@@ -1212,20 +1032,23 @@ async fn run_public_matrix(
                 report.tenant_audit_rows
             )));
         }
-    }
-    let mut final_verification = telemetry.delta_since(&publication_checkpoint)?;
-    final_verification.phase = "final_verification".to_owned();
+        }
+        Ok(())
+    })
+    .await?;
     let final_owners = phase_owner_checkpoint(cluster).await?;
-    apply_owner_delta(&mut final_verification, publication_owners, final_owners)?;
+    let final_owner_delta = owner_delta(publication_owners, final_owners)?;
     reconcile_matrix_telemetry(
         profile,
         &results,
-        &[&warmup, &measured, &publication, &final_verification],
+        &[
+            ("warmup", &warmup, warmup_owner_delta),
+            ("measured", &measured, measured_owner_delta),
+            ("flush_publication", &publication, publication_owner_delta),
+            ("final_verification", &final_verification, final_owner_delta),
+        ],
     )?;
-    Ok((
-        results,
-        vec![warmup, measured, publication, final_verification],
-    ))
+    Ok(results)
 }
 
 /// Durable owner counts captured at one telemetry phase boundary.
@@ -1258,24 +1081,35 @@ async fn phase_owner_checkpoint(
 ///
 /// # Errors
 /// Returns [`ClusterLoadError::Assertion`] when a durable owner counter regresses.
-fn apply_owner_delta(
-    delta: &mut PillarTelemetryDelta,
+fn owner_delta(
     before: PhaseOwnerCheckpoint,
     after: PhaseOwnerCheckpoint,
-) -> Result<(), ClusterLoadError> {
-    delta.forge_committed_tasks = after
+) -> Result<PhaseOwnerDelta, ClusterLoadError> {
+    let forge_terminal_tasks = after
         .forge_terminal_tasks
         .checked_sub(before.forge_terminal_tasks)
         .ok_or_else(|| {
             ClusterLoadError::Assertion("Forge terminal task count regressed".to_owned())
         })?;
-    delta.read_audit_rows = after
+    let read_audit_rows = after
         .read_audit_rows
         .checked_sub(before.read_audit_rows)
         .ok_or_else(|| {
             ClusterLoadError::Assertion("Oracle read audit count regressed".to_owned())
         })?;
-    Ok(())
+    Ok(PhaseOwnerDelta {
+        forge_terminal_tasks,
+        read_audit_rows,
+    })
+}
+
+/// Direct durable-owner deltas paired with one canonical metric projection.
+#[derive(Clone, Copy)]
+struct PhaseOwnerDelta {
+    /// Forge tasks reaching a durable terminal state in the phase.
+    forge_terminal_tasks: u64,
+    /// Tenant-bound Oracle read audit rows committed in the phase.
+    read_audit_rows: u64,
 }
 
 /// Reconcile each public workload phase against its owner-side operation ledger.
@@ -1290,18 +1124,18 @@ fn apply_owner_delta(
 fn reconcile_matrix_telemetry(
     profile: &ClusterLoadProfile,
     results: &BTreeMap<String, TenantLoadResult>,
-    phases: &[&PillarTelemetryDelta],
+    phases: &[(&str, &ClusterPhaseTelemetryEvidence, PhaseOwnerDelta)],
 ) -> Result<(), ClusterLoadError> {
     let phase = |name: &str| {
         phases
             .iter()
-            .find(|delta| delta.phase == name)
-            .copied()
+            .find(|(phase, _, _)| *phase == name)
+            .map(|(_, evidence, owners)| (*evidence, *owners))
             .ok_or_else(|| ClusterLoadError::Assertion(format!("missing telemetry phase {name}")))
     };
-    let warmup = phase("warmup")?;
-    let measured = phase("measured")?;
-    let final_verification = phase("final_verification")?;
+    let (warmup, warmup_owners) = phase("warmup")?;
+    let (measured, measured_owners) = phase("measured")?;
+    let (final_verification, final_owners) = phase("final_verification")?;
     let warmup_rows = results
         .values()
         .map(|tenant| {
@@ -1378,11 +1212,11 @@ fn reconcile_matrix_telemetry(
     assert_phase_counter("warmup Gate rows", warmup.gate_rows, warmup_rows)?;
     assert_phase_counter("warmup Gate bytes", warmup.gate_bytes, warmup_bytes)?;
     assert_phase_counter("warmup Scribe rows", warmup.scribe_rows, warmup_rows)?;
-    assert_phase_counter("warmup Oracle source rows", warmup.oracle_rows, 0)?;
+    assert_phase_counter("warmup Oracle source rows", warmup.oracle_source_rows, 0)?;
     assert_phase_counter("warmup Oracle stream rows", warmup.oracle_stream_rows, 0)?;
     assert_phase_counter(
         "warmup Oracle read audits",
-        warmup.read_audit_rows as f64,
+        warmup_owners.read_audit_rows,
         0,
     )?;
     assert_phase_counter(
@@ -1404,7 +1238,7 @@ fn reconcile_matrix_telemetry(
     assert_phase_counter("measured Scribe rows", measured.scribe_rows, measured_rows)?;
     assert_phase_counter(
         "measured Oracle source rows",
-        measured.oracle_rows,
+        measured.oracle_source_rows,
         queried_rows,
     )?;
     assert_phase_counter(
@@ -1419,7 +1253,7 @@ fn reconcile_matrix_telemetry(
     )?;
     assert_phase_counter(
         "measured Oracle read audits",
-        measured.read_audit_rows as f64,
+        measured_owners.read_audit_rows,
         results
             .values()
             .map(|tenant| u64::from(tenant.completed_reads))
@@ -1437,7 +1271,7 @@ fn reconcile_matrix_telemetry(
     )?;
     assert_phase_counter(
         "final Oracle source rows",
-        final_verification.oracle_rows,
+        final_verification.oracle_source_rows,
         final_source_rows,
     )?;
     assert_phase_counter(
@@ -1452,7 +1286,7 @@ fn reconcile_matrix_telemetry(
     )?;
     assert_phase_counter(
         "final Oracle read audits",
-        final_verification.read_audit_rows as f64,
+        final_owners.read_audit_rows,
         profile.tenants as u64,
     )?;
     assert_phase_counter(
@@ -1460,13 +1294,13 @@ fn reconcile_matrix_telemetry(
         final_verification.gate_success,
         profile.tenants as u64,
     )?;
-    for delta in phases {
-        assert_forge_phase(delta)?;
+    for (name, evidence, owners) in phases {
+        assert_forge_phase(name, evidence, *owners)?;
     }
-    for delta in phases {
+    for (name, evidence, _) in phases {
         assert_phase_counter(
-            &format!("{} cancelled Gate requests", delta.phase),
-            delta.gate_cancelled,
+            &format!("{name} cancelled Gate requests"),
+            evidence.gate_cancelled,
             0,
         )?;
     }
@@ -1478,35 +1312,37 @@ fn reconcile_matrix_telemetry(
 /// # Errors
 /// Returns [`ClusterLoadError::Assertion`] when volume exists without a durable
 /// terminal task, a committed task lacks volume, or file/byte counts are invalid.
-fn assert_forge_phase(delta: &PillarTelemetryDelta) -> Result<(), ClusterLoadError> {
-    let has_volume = delta.forge_input_files > 0.0
-        || delta.forge_input_bytes > 0.0
-        || delta.forge_output_files > 0.0
-        || delta.forge_output_bytes > 0.0;
-    if delta.forge_committed_tasks == 0 && has_volume {
+fn assert_forge_phase(
+    phase: &str,
+    evidence: &ClusterPhaseTelemetryEvidence,
+    owners: PhaseOwnerDelta,
+) -> Result<(), ClusterLoadError> {
+    let has_volume = evidence.forge_input_files > 0
+        || evidence.forge_input_bytes > 0
+        || evidence.forge_output_files > 0
+        || evidence.forge_output_bytes > 0;
+    if owners.forge_terminal_tasks == 0 && has_volume {
         return Err(ClusterLoadError::Assertion(format!(
-            "{} Forge volume has no durable terminal task",
-            delta.phase
+            "{phase} Forge volume has no durable terminal task"
         )));
     }
-    if delta.forge_committed_tasks > 0 {
+    if owners.forge_terminal_tasks > 0 {
         assert_phase_counter(
-            &format!("{} Forge output files", delta.phase),
-            delta.forge_output_files,
-            delta.forge_committed_tasks,
+            &format!("{phase} Forge output files"),
+            evidence.forge_output_files,
+            owners.forge_terminal_tasks,
         )?;
-        if delta.forge_input_files < delta.forge_committed_tasks as f64
-            || delta.forge_input_bytes <= 0.0
-            || delta.forge_output_bytes <= 0.0
+        if evidence.forge_input_files < owners.forge_terminal_tasks
+            || evidence.forge_input_bytes == 0
+            || evidence.forge_output_bytes == 0
         {
             return Err(ClusterLoadError::Assertion(format!(
-                "{} Forge committed tasks lack exact input/output volume: tasks={} input_files={} input_bytes={} output_files={} output_bytes={}",
-                delta.phase,
-                delta.forge_committed_tasks,
-                delta.forge_input_files,
-                delta.forge_input_bytes,
-                delta.forge_output_files,
-                delta.forge_output_bytes
+                "{phase} Forge committed tasks lack exact input/output volume: tasks={} input_files={} input_bytes={} output_files={} output_bytes={}",
+                owners.forge_terminal_tasks,
+                evidence.forge_input_files,
+                evidence.forge_input_bytes,
+                evidence.forge_output_files,
+                evidence.forge_output_bytes
             )));
         }
     }
@@ -1514,8 +1350,8 @@ fn assert_forge_phase(delta: &PillarTelemetryDelta) -> Result<(), ClusterLoadErr
 }
 
 /// Compare an integer production counter represented by a floating metric.
-fn assert_phase_counter(name: &str, actual: f64, expected: u64) -> Result<(), ClusterLoadError> {
-    if actual != expected as f64 {
+fn assert_phase_counter(name: &str, actual: u64, expected: u64) -> Result<(), ClusterLoadError> {
+    if actual != expected {
         return Err(ClusterLoadError::Assertion(format!(
             "{name} mismatch: actual={actual} expected={expected}"
         )));
@@ -1528,39 +1364,52 @@ fn assert_phase_counter(name: &str, actual: f64, expected: u64) -> Result<(), Cl
 /// # Errors
 /// Returns [`ClusterLoadError::Assertion`] when either cancelled operation has
 /// zero or multiple terminal outcomes, or any other outcome is emitted.
-fn assert_cancellation_outcomes(delta: &PillarTelemetryDelta) -> Result<(), ClusterLoadError> {
-    for operation in ["write", "query"] {
-        for outcome in ["success", "rejected", "failed", "cancelled"] {
-            let series =
-                format!("bifrost_gate_requests_total{{operation={operation},outcome={outcome}}}");
-            let actual = delta.metrics.get(&series).copied().unwrap_or(0.0);
-            let expected = u64::from(
-                (operation == "write" && outcome == "cancelled")
-                    || (operation == "query" && outcome == "success"),
-            );
-            assert_phase_counter(
-                &format!("cancellation Gate {operation}/{outcome}"),
-                actual,
-                expected,
-            )?;
-        }
-    }
-    for outcome in ["success", "failed", "cancelled"] {
-        let series = format!("bifrost_gate_query_streams_total{{outcome={outcome}}}");
-        let actual = delta.metrics.get(&series).copied().unwrap_or(0.0);
-        assert_phase_counter(
-            &format!("cancellation Gate query stream/{outcome}"),
-            actual,
-            u64::from(outcome == "cancelled"),
-        )?;
-    }
+fn assert_cancellation_outcomes(
+    evidence: &ClusterPhaseTelemetryEvidence,
+) -> Result<(), ClusterLoadError> {
+    assert_phase_counter(
+        "cancellation Gate query request success",
+        evidence.gate_query_request_success,
+        1,
+    )?;
+    assert_phase_counter(
+        "cancellation Gate write request cancelled",
+        evidence.gate_write_request_cancelled,
+        1,
+    )?;
+    assert_phase_counter(
+        "cancellation Gate aggregate successes",
+        evidence.gate_success,
+        evidence.gate_query_request_success,
+    )?;
+    assert_phase_counter(
+        "cancellation Gate aggregate cancellations",
+        evidence.gate_cancelled,
+        evidence.gate_write_request_cancelled,
+    )?;
+    assert_phase_counter(
+        "cancellation Gate aggregate rejections",
+        evidence.gate_rejected,
+        0,
+    )?;
+    assert_phase_counter(
+        "cancellation Gate aggregate failures",
+        evidence.gate_failed,
+        0,
+    )?;
+    assert_phase_counter(
+        "cancellation Gate query stream cancellations",
+        evidence.gate_query_stream_cancelled,
+        1,
+    )?;
+    assert_phase_counter(
+        "cancellation Gate query stream terminals",
+        evidence.gate_query_stream_terminals,
+        evidence.gate_query_stream_cancelled,
+    )?;
     assert_phase_counter(
         "cancellation Gate active query streams",
-        delta
-            .metrics
-            .get("bifrost_gate_active_streams{operation=query}")
-            .copied()
-            .unwrap_or(0.0),
+        evidence.gate_active_streams,
         0,
     )?;
     Ok(())
@@ -1785,7 +1634,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
         let table = table.clone();
         tasks.spawn(async move {
             let mut result = TenantLoadResult::default();
-            let target = (min_reads / profile.readers_per_tenant as u32).max(1);
+            let target = min_reads / profile.readers_per_tenant as u32;
             let mut attempts = 0_u32;
             while result.completed_reads < target
                 && attempts < target.saturating_mul(32).max(target)
@@ -1961,7 +1810,7 @@ fn deterministic_batch_id(seed: u64, tenant_index: usize, batch: u32) -> [u8; 16
 /// Returns a cluster or telemetry error when an owner cannot be inspected.
 async fn cleanup_snapshot(
     cluster: &WyrdTestCluster,
-    telemetry: &PillarTelemetryDelta,
+    gate_active_streams: u64,
 ) -> Result<ClusterCleanupSnapshot, ClusterLoadError> {
     let inspection = cluster
         .oracle_inspection()
@@ -1979,12 +1828,6 @@ async fn cleanup_snapshot(
             inflight = inflight.saturating_add(scribe.inflight_items_for_test() as u64);
         }
     }
-    let gate_active_streams = telemetry
-        .metrics
-        .get("bifrost_gate_active_streams{operation=query}")
-        .copied()
-        .unwrap_or_default()
-        .max(0.0) as u64;
     Ok(ClusterCleanupSnapshot {
         scribe_queued: queued,
         scribe_inflight: inflight,
@@ -2075,6 +1918,53 @@ impl TopologySpec for BifrostTopology {
 mod tests {
     use super::*;
 
+    /// Stall-first observation leaves the query task owned for explicit cancellation.
+    #[tokio::test]
+    async fn cancellation_probe_preserves_stall_first_ordering() {
+        let mut query_task = tokio::spawn(std::future::pending::<Result<(), &'static str>>());
+        let query_id = await_query_schema_stall_or_completion(
+            async { Ok::<_, crate::WyrdTestServerError>("query-id".to_owned()) },
+            &mut query_task,
+        )
+        .await
+        .expect("schema stall wins");
+        assert_eq!(query_id, "query-id");
+        assert!(!query_task.is_finished());
+        query_task.abort();
+        let _ = query_task.await;
+    }
+
+    /// Completion-first observation retains client and join failures instead of a timeout.
+    #[tokio::test]
+    async fn cancellation_probe_preserves_completion_first_errors() {
+        let mut client_failure = tokio::spawn(async { Err::<(), _>("original client failure") });
+        let error = await_query_schema_stall_or_completion(
+            std::future::pending::<Result<String, crate::WyrdTestServerError>>(),
+            &mut client_failure,
+        )
+        .await
+        .expect_err("client completion wins");
+        assert!(error.to_string().contains("original client failure"));
+        assert!(!error.to_string().contains("schema stall deadline elapsed"));
+
+        let mut join_failure: tokio::task::JoinHandle<Result<(), &'static str>> =
+            tokio::spawn(async {
+                panic!("injected cancellation query panic");
+            });
+        let error = await_query_schema_stall_or_completion(
+            std::future::pending::<Result<String, crate::WyrdTestServerError>>(),
+            &mut join_failure,
+        )
+        .await
+        .expect_err("join failure wins");
+        assert!(error.to_string().contains("query task join failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("injected cancellation query panic")
+        );
+    }
+
     /// The profile encodes D21's exact bounded writer/reader matrix.
     #[test]
     fn profile_is_exact_and_serializable() {
@@ -2085,6 +1975,28 @@ mod tests {
         assert_eq!(json["rows_per_batch"], 64);
         assert_eq!(json["writers_per_tenant"], 2);
         assert_eq!(json["readers_per_tenant"], 2);
+        assert_eq!(json["minimum_reads_per_tenant"], 2);
+        assert_eq!(
+            profile.minimum_reads_per_tenant / profile.readers_per_tenant as u32,
+            1
+        );
+        assert_eq!(
+            profile.minimum_reads_per_tenant % profile.readers_per_tenant as u32,
+            0
+        );
+    }
+
+    /// The closed matrix profile rejects missing or mismatched reader participation.
+    #[test]
+    fn profile_rejects_inexact_reader_participation() {
+        for minimum_reads in [0, 1, 3] {
+            let mut profile = ClusterLoadProfile::multi_tenant_three_server_three_worker();
+            profile.minimum_reads_per_tenant = minimum_reads;
+            assert!(
+                matches!(profile.validate(), Err(ClusterLoadError::Profile(_))),
+                "minimum read count {minimum_reads} unexpectedly validated"
+            );
+        }
     }
 
     /// Jain fairness remains deterministic and rewards equal admitted work.

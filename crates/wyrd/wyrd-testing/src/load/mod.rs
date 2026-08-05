@@ -15,7 +15,7 @@ pub use harness::{
 };
 pub use matrix::{
     BifrostClusterLoad, BifrostClusterLoadSummary, ClusterCleanupSnapshot, ClusterLoadError,
-    ClusterLoadProfile, ClusterTelemetryCapture, PillarTelemetryDelta, TenantLoadResult,
+    ClusterLoadProfile, TenantLoadResult,
 };
 pub use workload::{
     ExpectedRowShape, QueryGenerator, QueryRequest, TenantIdentity, TenantWorkload,

@@ -13,7 +13,7 @@ use arrow::record_batch::RecordBatch;
 use hdrhistogram::Histogram;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sdk::{BifrostFrame, BifrostGrpcTransport, QueryClient, QueryResultStream};
+use vala_sdk::{BifrostFrame, BifrostGrpcTransport, QueryClient, ValaSdkError};
 use wyrd_bench::{
     AttemptedProbe, BenchmarkEnvironment, BenchmarkOperation, BifrostDiagnosticReport,
     BifrostReferenceProfile, BifrostRuntimeRole, BifrostSloEnvelope, CALIBRATION_RATE_CAP,
@@ -36,6 +36,7 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::Bootstrap;
+use crate::bifrost::telemetry::run_sampled_window;
 use crate::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 /// Stable logical table used by the controlled workload.
@@ -46,6 +47,8 @@ pub const CAPACITY_WARMUP_TABLE: &str = "cluster_capacity_warmup";
 pub const CAPACITY_STAGE_TABLE_COUNT: usize = 13;
 /// Rows preloaded through Gate for every tenant before measured traffic.
 const PRELOAD_ROWS: u64 = 8_192;
+/// Maximum acknowledged identities assigned to one public reconciliation query.
+const IDENTITY_RECONCILIATION_ROWS_PER_QUERY: usize = 1_024;
 /// Rows in one public durable write request.
 const ROWS_PER_WRITE: u32 = 64;
 /// Default profile-driven concurrent public-operation cap.
@@ -54,6 +57,23 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 4_096;
 const MINIMUM_OPEN_FILE_LIMIT: u64 = 8_192;
 /// Disjoint logical row-id space reserved for each authenticated tenant.
 const TENANT_ROW_STRIDE: u64 = 1_000_000_000_000;
+
+/// Typed first-attempt failure for an ancillary correctness query.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "ancillary {phase} query failed for tenant index {tenant_index} and table {table}: {source}"
+)]
+struct AncillaryQueryError {
+    /// Closed correctness phase issuing the query.
+    phase: &'static str,
+    /// Numeric benchmark tenant ordinal without tenant identity material.
+    tenant_index: usize,
+    /// Repository-owned table name queried by the phase.
+    table: String,
+    /// Original typed SDK failure from the single public-client attempt.
+    #[source]
+    source: ValaSdkError,
+}
 
 /// Public benchmark execution mode selected by the canonical command grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,7 +319,9 @@ async fn run_qualification_selected(
                     });
                     let projected = ClusterTelemetryProjection::from_delta(
                         &telemetry,
-                        ClusterTelemetryExpectation { definition },
+                        ClusterTelemetryExpectation {
+                            topology: definition.topology,
+                        },
                     )?;
                     let evidence = ClusterTrialReport {
                         offered_requests_per_second: rate,
@@ -568,7 +590,9 @@ fn capacity_stage_report(
 ) -> CapacityStage {
     let projected = ClusterTelemetryProjection::from_delta(
         &result.telemetry,
-        ClusterTelemetryExpectation { definition },
+        ClusterTelemetryExpectation {
+            topology: definition.topology,
+        },
     )
     .expect("invariant: a completed capture stage has a positive finite interval");
     let mut stop_reasons = Vec::new();
@@ -661,94 +685,65 @@ fn stage_row_identity(tenant: usize, ordinals: &BTreeSet<u64>) -> TenantStageRow
 /// Project bounded production counters into capacity pillar evidence.
 #[must_use]
 fn project_pillars(
-    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
+    bindings: &BTreeMap<&'static str, crate::bifrost::telemetry::EvaluatedBindingValue>,
 ) -> PillarTelemetryDelta {
-    let total = |family: &str| {
-        telemetry
-            .metrics
-            .iter()
-            .filter(|sample| sample.family == family)
-            .map(|sample| sample.value.max(0.0))
-            .sum::<f64>() as u64
+    let counter = |id: &str| match bindings.get(id) {
+        Some(crate::bifrost::telemetry::EvaluatedBindingValue::Counter(value)) => *value,
+        _ => 0,
     };
-    let required = [
-        "bifrost_gate_requests_total",
-        "bifrost_scribe_rows_total",
-        "bifrost_oracle_stream_rows_total",
-    ];
     PillarTelemetryDelta {
-        gate_accepted: total("bifrost_gate_requests_total"),
-        scribe_wal_bytes: total("bifrost_scribe_wal_append_bytes_total"),
-        forge_publications: total("bifrost_forge_complete_gauge_publications_total"),
-        oracle_decoded_rows: total("bifrost_oracle_stream_rows_total"),
-        status: if required.iter().all(|family| {
-            telemetry
-                .metrics
-                .iter()
-                .any(|sample| sample.family == *family)
-        }) {
-            EvidenceStatus::Complete
-        } else {
-            EvidenceStatus::Failed
-        },
-        missing_required: required
-            .iter()
-            .filter(|family| {
-                !telemetry
-                    .metrics
-                    .iter()
-                    .any(|sample| sample.family == **family)
-            })
-            .map(|family| (*family).to_owned())
-            .collect(),
+        gate_accepted: counter("gate.requests.success"),
+        scribe_wal_bytes: counter("scribe.wal_bytes"),
+        forge_publications: counter("forge.publications"),
+        oracle_decoded_rows: counter("oracle.rows"),
+        status: EvidenceStatus::Complete,
+        missing_required: Vec::new(),
         invalid: Vec::new(),
     }
 }
 
 /// Closed expectation used by the canonical cluster telemetry projection.
 #[derive(Debug, Clone, Copy)]
-struct ClusterTelemetryExpectation {
+pub(crate) struct ClusterTelemetryExpectation {
     /// Scenario topology whose logical roles are hosted by the capture process.
-    definition: ReferenceScenarioDefinition,
+    topology: ClusterTopology,
 }
 
 /// Canonical typed evidence projected once for every benchmark consumer.
-struct ClusterTelemetryEvidence {
+pub(crate) struct ClusterTelemetryEvidence {
     /// Exact pillar counter evidence.
-    telemetry: PillarTelemetryDelta,
+    pub(crate) telemetry: PillarTelemetryDelta,
     /// Exact dependency histogram and counter evidence.
-    dependencies: DependencyTelemetryEvidence,
+    pub(crate) dependencies: DependencyTelemetryEvidence,
     /// Exact-name trace evidence with error spans excluded from clean evidence.
-    traces: Vec<TraceManifest>,
+    pub(crate) traces: Vec<TraceManifest>,
     /// Honest process-scoped resource evidence.
-    resources: Vec<ProcessResourceEvidence>,
+    pub(crate) resources: Vec<ProcessResourceEvidence>,
     /// Exact counters consumed by client/audit/durable reconciliation.
     reconciliation: ReconciliationCounters,
+    /// Exact final-gauge drain status for scenario-owned resources.
+    pub(crate) cleanup: EvidenceStatus,
+    /// Exact evaluated-binding phase counters shared with the public matrix journey.
+    phase: crate::bifrost::telemetry::ClusterPhaseTelemetryEvidence,
 }
 
 /// Closed typed counter projection used by the only reconciliation path.
 struct ReconciliationCounters {
-    /// Rows accepted by Gate.
-    gate_rows: u64,
-    /// Rows accepted by Scribe.
-    scribe_rows: u64,
     /// Rows sealed durably by Scribe.
     sealed_rows: u64,
-    /// Rows returned by Oracle streams.
-    oracle_rows: u64,
     /// Successful query request terminals.
     successful_queries: u64,
 }
 
 /// Concrete owner of the closed Bifrost telemetry binding projection.
-struct ClusterTelemetryProjection;
+pub(crate) struct ClusterTelemetryProjection;
 
 impl ClusterTelemetryProjection {
     /// Project one capture delta through the closed production binding definitions.
     ///
     /// # Errors
     /// Returns [`BifrostTelemetryReportError`] when the capture interval is invalid.
-    fn from_delta(
+    pub(crate) fn from_delta(
         delta: &crate::bifrost::telemetry::BifrostTelemetryDelta,
         expectation: ClusterTelemetryExpectation,
     ) -> Result<ClusterTelemetryEvidence, crate::bifrost::telemetry::BifrostTelemetryReportError>
@@ -756,115 +751,91 @@ impl ClusterTelemetryProjection {
         if !delta.interval_seconds.is_finite() || delta.interval_seconds <= 0.0 {
             return Err(crate::bifrost::telemetry::BifrostTelemetryReportError::InvalidInterval);
         }
-        crate::bifrost::telemetry::validate_cluster_bindings(delta)?;
-        let exact_total = |family: &str, labels: &[(&str, &str)]| {
-            delta
-                .metrics
-                .iter()
-                .filter(|sample| {
-                    sample.family == family
-                        && labels.iter().all(|(key, value)| {
-                            sample
-                                .labels
-                                .get(*key)
-                                .is_some_and(|actual| actual == value)
-                        })
-                })
-                .map(|sample| sample.value)
-                .sum::<f64>() as u64
+        if delta.spans.iter().any(|span| {
+            exact_span_operation(&span.name).is_some()
+                && matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_))
+        }) {
+            return Err(
+                crate::bifrost::telemetry::BifrostTelemetryReportError::InvalidBinding {
+                    id: "traces.status".to_owned(),
+                    detail: "a required production span finished with error status".to_owned(),
+                },
+            );
+        }
+        let bindings = crate::bifrost::telemetry::evaluate_cluster_bindings(delta)?;
+        let counter = |id: &str| match bindings.get(id) {
+            Some(crate::bifrost::telemetry::EvaluatedBindingValue::Counter(value)) => *value,
+            _ => 0,
         };
         Ok(ClusterTelemetryEvidence {
-            telemetry: project_pillars(delta),
-            dependencies: project_dependencies(delta)?,
+            telemetry: project_pillars(&bindings),
+            dependencies: project_dependencies(&bindings),
             traces: project_traces(delta),
-            resources: project_process_resources(expectation.definition, delta),
+            resources: project_process_resources(expectation.topology, delta),
             reconciliation: ReconciliationCounters {
-                gate_rows: exact_total("bifrost_gate_rows_total", &[]),
-                scribe_rows: exact_total("bifrost_scribe_rows_total", &[]),
-                sealed_rows: exact_total(
-                    "bifrost_scribe_seal_rows_total",
-                    &[("stage", "file_list_transaction")],
-                ),
-                oracle_rows: exact_total("bifrost_oracle_stream_rows_total", &[]),
-                successful_queries: exact_total(
-                    "bifrost_gate_requests_total",
-                    &[("operation", "query"), ("outcome", "success")],
-                ),
+                sealed_rows: counter("scribe.seal_rows"),
+                successful_queries: counter("gate.requests.query_success"),
             },
+            cleanup: cleanup_status(&bindings),
+            phase: crate::bifrost::telemetry::project_cluster_phase_evidence(&bindings),
         })
     }
 }
 
+/// Derive cleanup only from final values of closed cleanup bindings.
+fn cleanup_status(
+    bindings: &BTreeMap<&'static str, crate::bifrost::telemetry::EvaluatedBindingValue>,
+) -> EvidenceStatus {
+    let clean = bindings
+        .iter()
+        .filter(|(id, _)| **id == "gate.active" || id.starts_with("cleanup."))
+        .all(|(_, value)| {
+            matches!(
+                value,
+                crate::bifrost::telemetry::EvaluatedBindingValue::Gauge { final_value: 0, .. }
+            )
+        });
+    if clean {
+        EvidenceStatus::Complete
+    } else {
+        EvidenceStatus::Failed
+    }
+}
+
 /// Project dependency families without inventing missing observations.
-#[must_use]
 fn project_dependencies(
-    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
-) -> Result<DependencyTelemetryEvidence, crate::bifrost::telemetry::BifrostTelemetryReportError> {
-    let total = |family: &str| {
-        telemetry
-            .metrics
-            .iter()
-            .filter(|sample| sample.family == family)
-            .map(|sample| sample.value.max(0.0))
-            .sum::<f64>() as u64
+    bindings: &BTreeMap<&'static str, crate::bifrost::telemetry::EvaluatedBindingValue>,
+) -> DependencyTelemetryEvidence {
+    let counter = |id: &str| match bindings.get(id) {
+        Some(crate::bifrost::telemetry::EvaluatedBindingValue::Counter(value)) => *value,
+        _ => 0,
     };
-    let p99_us = |id: &str, family: &str| {
-        crate::bifrost::telemetry::histogram_quantile(telemetry, family, 0.99)
-            .and_then(|seconds| crate::bifrost::telemetry::seconds_to_micros(id, seconds))
+    let p99 = |id: &str| match bindings.get(id) {
+        Some(crate::bifrost::telemetry::EvaluatedBindingValue::DurationP99Micros(value)) => *value,
+        _ => 0,
     };
-    Ok(DependencyTelemetryEvidence {
-        postgres_pool_wait_us: p99_us("postgres.acquire", "vala_postgres_pool_acquire_seconds")?,
-        postgres_transactions: total("vala_postgres_pool_acquire_total"),
-        storage_bytes: total("wyrd_storage_bytes_total"),
-        storage_p99_us: p99_us(
-            "storage.duration",
-            "wyrd_storage_operation_duration_seconds",
-        )?,
-        wal_fsync_p99_us: p99_us("wal.fsync", "bifrost_scribe_wal_fsync_seconds")?,
-        status: if [
-            "vala_postgres_pool_acquire_seconds",
-            "wyrd_storage_operation_duration_seconds",
-            "bifrost_scribe_wal_fsync_seconds",
-        ]
-        .iter()
-        .all(|family| {
-            telemetry
-                .metrics
-                .iter()
-                .any(|sample| sample.family == *family)
-        }) {
-            EvidenceStatus::Complete
-        } else {
-            EvidenceStatus::Failed
-        },
-        missing_required: [
-            "vala_postgres_pool_acquire_seconds",
-            "wyrd_storage_operation_duration_seconds",
-            "bifrost_scribe_wal_fsync_seconds",
-        ]
-        .iter()
-        .filter(|family| {
-            !telemetry
-                .metrics
-                .iter()
-                .any(|sample| sample.family == **family)
-        })
-        .map(|family| (*family).to_owned())
-        .collect(),
+    DependencyTelemetryEvidence {
+        postgres_pool_wait_us: p99("postgres.acquire"),
+        postgres_transactions: counter("postgres.transactions"),
+        storage_bytes: counter("storage.bytes"),
+        storage_p99_us: p99("storage.duration"),
+        wal_fsync_p99_us: p99("wal.fsync"),
+        status: EvidenceStatus::Complete,
+        missing_required: Vec::new(),
         invalid: Vec::new(),
-    })
+    }
 }
 
 /// Capture bounded process resource evidence for the active role topology.
 #[must_use]
 fn project_process_resources(
-    definition: ReferenceScenarioDefinition,
+    topology: ClusterTopology,
     telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
 ) -> Vec<ProcessResourceEvidence> {
     vec![ProcessResourceEvidence {
         process_id: ProcessId(telemetry.process.identity.clone()),
         epoch: telemetry.process.epoch,
-        hosted_logical_nodes: match definition.topology {
+        hosted_logical_nodes: match topology {
             ClusterTopology::OnePod => vec!["server-0".to_owned()],
             ClusterTopology::ThreeServersThreeForgeWorkers => vec![
                 "server-0".to_owned(),
@@ -1498,6 +1469,14 @@ struct ReferenceTrialSpec {
     max_in_flight: usize,
 }
 
+/// One completed capacity table and its exact acknowledged identities.
+struct CompletedTableLedger {
+    /// Boot-provisioned table queried during cumulative reconciliation.
+    table: String,
+    /// Exact acknowledged identities for each tenant in roster order.
+    expected_rows_by_tenant: Vec<BTreeSet<u64>>,
+}
+
 /// One live, benchmark-only capacity scenario lifecycle.
 ///
 /// The session owns the T15 cluster, tenant-bound public clients, exact
@@ -1518,8 +1497,8 @@ pub struct CapacityScenarioSession {
     tables: Vec<String>,
     /// Cumulative expected row identities by tenant.
     expected_rows: Vec<BTreeSet<u64>>,
-    /// Measurement tables completed and eligible for final cumulative union.
-    completed_tables: Vec<String>,
+    /// Completed measurement tables and their exact per-tenant ledgers.
+    completed_tables: Vec<CompletedTableLedger>,
 }
 
 impl CapacityScenarioSession {
@@ -1702,27 +1681,32 @@ impl CapacityScenarioSession {
         await_forge_convergence(cluster, &self.tenants).await?;
         let telemetry = cluster.telemetry().delta_since(&checkpoint)?;
         let audit_after = audit_rows(cluster, &self.tenants).await?;
+        let expected_rows_by_tenant = result
+            .tenant_write_ordinals
+            .iter()
+            .enumerate()
+            .map(|(tenant, ordinals)| {
+                stage_row_identity(tenant, ordinals)
+                    .row_ids
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>();
         let published = final_published_identities(
             cluster,
             &self.tenants,
             &self.clients,
             self.stage_table(plan)?,
+            &expected_rows_by_tenant,
         )
         .await?;
-        for (tenant, ordinals) in result.tenant_write_ordinals.iter().enumerate() {
-            let expected = stage_row_identity(tenant, ordinals)
-                .row_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            if published[tenant] != expected {
-                return Err(
-                    "stage public Oracle identities differ from acknowledged writes".into(),
-                );
-            }
+        for (tenant, expected) in expected_rows_by_tenant.iter().enumerate() {
             self.expected_rows[tenant].extend(expected);
         }
-        self.completed_tables
-            .push(self.stage_table(plan)?.to_owned());
+        self.completed_tables.push(CompletedTableLedger {
+            table: self.stage_table(plan)?.to_owned(),
+            expected_rows_by_tenant,
+        });
         Ok(CapacityStageRun {
             client: result,
             telemetry,
@@ -1742,9 +1726,15 @@ impl CapacityScenarioSession {
             .as_ref()
             .ok_or("capacity session is shut down")?;
         let mut observed = vec![BTreeSet::new(); self.tenants.len()];
-        for table in &self.completed_tables {
-            let identities =
-                final_published_identities(cluster, &self.tenants, &self.clients, table).await?;
+        for completed in &self.completed_tables {
+            let identities = final_published_identities(
+                cluster,
+                &self.tenants,
+                &self.clients,
+                &completed.table,
+                &completed.expected_rows_by_tenant,
+            )
+            .await?;
             for (tenant, rows) in identities.into_iter().enumerate() {
                 observed[tenant].extend(rows);
             }
@@ -1805,32 +1795,55 @@ impl CapacityScenarioSession {
             .run()
             .await?;
         }
-        let checkpoint = cluster.telemetry().checkpoint()?;
-        let audit_before = audit_rows(cluster, &self.tenants).await?;
-        let result = WindowRun {
+        let ((result, audit_before, audit_after), telemetry) =
+            run_sampled_window(cluster.telemetry(), || async {
+                let audit_before = audit_rows(cluster, &self.tenants).await?;
+                let result = WindowRun {
+                    cluster,
+                    tenants: &self.tenants,
+                    clients: &self.clients,
+                    definition: self.definition,
+                    rate,
+                    duration: measured,
+                    measured: true,
+                    max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+                    table: measurement_table,
+                    phase_ordinal_base: 20_000_000 + pair as u64 * 100_000,
+                }
+                .run()
+                .await?;
+                flush_tenant_writers(cluster, &self.tenants).await?;
+                await_forge_convergence(cluster, &self.tenants).await?;
+                let audit_after = audit_rows(cluster, &self.tenants).await?;
+                Ok((result, audit_before, audit_after))
+            })
+            .await?;
+        let expected_rows_by_tenant = result
+            .tenant_write_ordinals
+            .iter()
+            .enumerate()
+            .map(|(tenant, ordinals)| {
+                stage_row_identity(tenant, ordinals)
+                    .row_ids
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>();
+        let published = final_published_identities(
             cluster,
-            tenants: &self.tenants,
-            clients: &self.clients,
-            definition: self.definition,
-            rate,
-            duration: measured,
-            measured: true,
-            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            table: measurement_table,
-            phase_ordinal_base: 20_000_000 + pair as u64 * 100_000,
-        }
-        .run()
-        .await?;
-        flush_tenant_writers(cluster, &self.tenants).await?;
-        await_forge_convergence(cluster, &self.tenants).await?;
-        let telemetry = cluster.telemetry().delta_since(&checkpoint)?;
-        let audit_after = audit_rows(cluster, &self.tenants).await?;
-        let published =
-            final_published_rows(cluster, &self.tenants, &self.clients, measurement_table).await?;
+            &self.tenants,
+            &self.clients,
+            measurement_table,
+            &expected_rows_by_tenant,
+        )
+        .await?
+        .iter()
+        .map(|identities| identities.len() as u64)
+        .sum();
         let projected = ClusterTelemetryProjection::from_delta(
             &telemetry,
             ClusterTelemetryExpectation {
-                definition: self.definition,
+                topology: self.definition.topology,
             },
         )?;
         let production = reconcile_production(
@@ -1977,11 +1990,24 @@ async fn run_live_trial(
     .await?;
     flush_tenant_writers(cluster, &tenants).await?;
     await_forge_convergence(cluster, &tenants).await?;
-    let published_before =
-        final_published_rows(cluster, &tenants, &clients, REFERENCE_TABLE).await?;
-    let expected_before = PRELOAD_ROWS
-        .saturating_mul(tenants.len() as u64)
-        .saturating_add(warmup.tenant_write_rows.iter().sum::<u64>());
+    let mut expected_rows_by_tenant = preload_identity_ledger(tenants.len());
+    extend_identity_ledger(&mut expected_rows_by_tenant, &warmup.tenant_write_ordinals);
+    let published_before_identities = final_published_identities(
+        cluster,
+        &tenants,
+        &clients,
+        REFERENCE_TABLE,
+        &expected_rows_by_tenant,
+    )
+    .await?;
+    let published_before = published_before_identities
+        .iter()
+        .map(|identities| identities.len() as u64)
+        .sum::<u64>();
+    let expected_before = expected_rows_by_tenant
+        .iter()
+        .map(|identities| identities.len() as u64)
+        .sum::<u64>();
     if published_before != expected_before {
         return Err(format!(
             "post-warmup published rows {published_before} do not equal preload plus acknowledged warmup rows {expected_before}"
@@ -1989,33 +2015,53 @@ async fn run_live_trial(
         .into());
     }
     prove_wrong_tenant_query(cluster, &tenants, &clients).await?;
-    let checkpoint = cluster.telemetry().checkpoint()?;
-    let audit_before = audit_rows(cluster, &tenants).await?;
-    let measured = WindowRun {
+    let ((measured, audit_before, audit_after), telemetry) =
+        run_sampled_window(cluster.telemetry(), || async {
+            let audit_before = audit_rows(cluster, &tenants).await?;
+            let measured = WindowRun {
+                cluster,
+                tenants: &tenants,
+                clients: &clients,
+                definition,
+                rate: spec.rate,
+                duration: spec.measured,
+                measured: true,
+                max_in_flight: spec.max_in_flight,
+                table: REFERENCE_TABLE,
+                phase_ordinal_base: 2_000_000,
+            }
+            .run()
+            .await?;
+            flush_tenant_writers(cluster, &tenants).await?;
+            await_forge_convergence(cluster, &tenants).await?;
+            let audit_after = audit_rows(cluster, &tenants).await?;
+            Ok((measured, audit_before, audit_after))
+        })
+        .await?;
+    extend_identity_ledger(
+        &mut expected_rows_by_tenant,
+        &measured.tenant_write_ordinals,
+    );
+    let published_after_identities = final_published_identities(
         cluster,
-        tenants: &tenants,
-        clients: &clients,
-        definition,
-        rate: spec.rate,
-        duration: spec.measured,
-        measured: true,
-        max_in_flight: spec.max_in_flight,
-        table: REFERENCE_TABLE,
-        phase_ordinal_base: 2_000_000,
-    }
-    .run()
+        &tenants,
+        &clients,
+        REFERENCE_TABLE,
+        &expected_rows_by_tenant,
+    )
     .await?;
-    flush_tenant_writers(cluster, &tenants).await?;
-    await_forge_convergence(cluster, &tenants).await?;
-    let audit_after = audit_rows(cluster, &tenants).await?;
-    let telemetry = cluster.telemetry().delta_since(&checkpoint)?;
-    let published_rows = final_published_rows(cluster, &tenants, &clients, REFERENCE_TABLE).await?;
+    let published_rows = published_after_identities
+        .iter()
+        .map(|identities| identities.len() as u64)
+        .sum::<u64>();
     let measured_published_rows = published_rows
         .checked_sub(published_before)
         .ok_or("final publication cardinality regressed below the post-warmup baseline")?;
     let projected = ClusterTelemetryProjection::from_delta(
         &telemetry,
-        ClusterTelemetryExpectation { definition },
+        ClusterTelemetryExpectation {
+            topology: definition.topology,
+        },
     )?;
     let production = reconcile_production(
         &projected,
@@ -2049,6 +2095,24 @@ async fn run_live_trial(
             production,
         },
     ))
+}
+
+/// Build the exact deterministic preload ledger for every tenant.
+#[must_use]
+fn preload_identity_ledger(tenant_count: usize) -> Vec<BTreeSet<u64>> {
+    (0..tenant_count)
+        .map(|tenant| {
+            let start = tenant_row_base(tenant);
+            (start..start + PRELOAD_ROWS).collect()
+        })
+        .collect()
+}
+
+/// Extend a per-tenant identity ledger from acknowledged write ordinals.
+fn extend_identity_ledger(ledger: &mut [BTreeSet<u64>], acknowledged_ordinals: &[BTreeSet<u64>]) {
+    for (tenant, ordinals) in acknowledged_ordinals.iter().enumerate() {
+        ledger[tenant].extend(stage_row_identity(tenant, ordinals).row_ids);
+    }
 }
 
 /// Client-side ledger accumulated by one open-loop window.
@@ -2412,31 +2476,6 @@ async fn scheduled_query(
     })
 }
 
-/// Start an ancillary strict query across bounded production admission races.
-///
-/// Measured workload queries account a transient response directly; setup,
-/// isolation, flush, and final-correctness queries instead need one completed
-/// observation and retry at most 32 immediate admission handoffs.
-///
-/// # Errors
-/// Returns the first non-retryable public-client error or an error after 32
-/// retryable responses.
-async fn ancillary_query(
-    client: &QueryClient,
-    request: &BifrostQueryRequest,
-) -> Result<QueryResultStream, Box<dyn std::error::Error + Send + Sync>> {
-    for _ in 0..32 {
-        match client.query(request).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) if is_retryable(&error.to_string()) => {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err("ancillary strict query exhausted 32 bounded admission retries".into())
-}
-
 /// Collect caller-visible row identities and reject schema, range, or duplicate drift.
 ///
 /// # Errors
@@ -2795,7 +2834,17 @@ async fn prove_wrong_tenant_query(
         freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(5_000),
     };
-    let mut stream = ancillary_query(&clients[0].query, &request).await?;
+    let mut stream =
+        clients[0]
+            .query
+            .query(&request)
+            .await
+            .map_err(|source| AncillaryQueryError {
+                phase: "wrong-tenant isolation",
+                tenant_index: 0,
+                table: REFERENCE_TABLE.to_owned(),
+                source,
+            })?;
     if stream.next_batch().await?.is_some()
         || stream
             .terminal()
@@ -2870,18 +2919,113 @@ async fn await_forge_convergence(
     }
 }
 
-/// Query every tenant after convergence and prove exact published unique rows.
-async fn final_published_rows(
-    cluster: &WyrdTestCluster,
-    tenants: &[DataTenantId],
-    clients: &[ReferenceClient],
-    table: &str,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(final_published_identities(cluster, tenants, clients, table)
-        .await?
+/// One disjoint public-query range spanning part of the signed row-id domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdentityReconciliationRange {
+    /// Exclusive lower endpoint, absent for the signed-domain prefix.
+    lower_exclusive: Option<u64>,
+    /// Inclusive upper endpoint, absent for the signed-domain suffix.
+    upper_inclusive: Option<u64>,
+    /// Number of acknowledged identities assigned to this query.
+    expected_rows: usize,
+}
+
+impl IdentityReconciliationRange {
+    /// Return whether one observed identity satisfies this range predicate.
+    #[must_use]
+    fn contains(self, identity: u64) -> bool {
+        self.lower_exclusive.is_none_or(|lower| identity > lower)
+            && self.upper_inclusive.is_none_or(|upper| identity <= upper)
+    }
+
+    /// Append the exact disjoint predicate used by the public SQL query.
+    #[must_use]
+    fn sql(self, table: &str) -> String {
+        let projection = format!("SELECT row_id, wyrd_event_time FROM vala.bifrost.{table}");
+        match (self.lower_exclusive, self.upper_inclusive) {
+            (None, None) => projection,
+            (None, Some(upper)) => format!("{projection} WHERE row_id <= {upper}"),
+            (Some(lower), Some(upper)) => {
+                format!("{projection} WHERE row_id > {lower} AND row_id <= {upper}")
+            }
+            (Some(lower), None) => format!("{projection} WHERE row_id > {lower}"),
+        }
+    }
+}
+
+/// Partition the complete signed row-id domain around bounded expected chunks.
+#[must_use]
+fn identity_reconciliation_ranges(expected: &BTreeSet<u64>) -> Vec<IdentityReconciliationRange> {
+    if expected.is_empty() {
+        return vec![IdentityReconciliationRange {
+            lower_exclusive: None,
+            upper_inclusive: None,
+            expected_rows: 0,
+        }];
+    }
+    let chunks = expected
         .iter()
-        .map(|identities| identities.len() as u64)
-        .sum())
+        .copied()
+        .collect::<Vec<_>>()
+        .chunks(IDENTITY_RECONCILIATION_ROWS_PER_QUERY)
+        .map(|chunk| {
+            (
+                chunk.len(),
+                *chunk.last().expect("invariant: expected chunk is nonempty"),
+            )
+        })
+        .collect::<Vec<_>>();
+    if chunks.len() == 1 {
+        return vec![IdentityReconciliationRange {
+            lower_exclusive: None,
+            upper_inclusive: None,
+            expected_rows: chunks[0].0,
+        }];
+    }
+    let mut ranges = Vec::with_capacity(chunks.len());
+    let mut previous_endpoint = None;
+    for (index, (expected_rows, endpoint)) in chunks.iter().copied().enumerate() {
+        let final_range = index + 1 == chunks.len();
+        ranges.push(IdentityReconciliationRange {
+            lower_exclusive: previous_endpoint,
+            upper_inclusive: (!final_range).then_some(endpoint),
+            expected_rows,
+        });
+        previous_endpoint = Some(endpoint);
+    }
+    ranges
+}
+
+/// Merge one range only after its public query reports a successful terminal.
+///
+/// # Errors
+/// Returns an error for a missing/non-success terminal, a predicate violation,
+/// or a duplicate already observed by another disjoint range.
+fn merge_completed_identity_range(
+    range: IdentityReconciliationRange,
+    terminal: Option<QueryTerminalOutcome>,
+    range_identities: BTreeSet<u64>,
+    published: &mut BTreeSet<u64>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if terminal != Some(QueryTerminalOutcome::Success) {
+        return Err("final reference range query omitted a successful terminal".into());
+    }
+    if range_identities
+        .iter()
+        .any(|identity| !range.contains(*identity))
+    {
+        return Err(
+            "final reference range query returned an identity outside its predicate".into(),
+        );
+    }
+    for identity in range_identities {
+        if !published.insert(identity) {
+            return Err(
+                "final reference queries returned a duplicate identity across ranges".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Query every tenant through the public Oracle and retain its exact row identities.
@@ -2894,29 +3038,51 @@ async fn final_published_identities(
     tenants: &[DataTenantId],
     clients: &[ReferenceClient],
     table: &str,
+    expected_rows_by_tenant: &[BTreeSet<u64>],
 ) -> Result<Vec<BTreeSet<u64>>, Box<dyn std::error::Error + Send + Sync>> {
+    if tenants.len() != clients.len() || tenants.len() != expected_rows_by_tenant.len() {
+        return Err(
+            "final identity reconciliation tenant/client/ledger cardinality differs".into(),
+        );
+    }
     let mut published = Vec::with_capacity(tenants.len());
     for (tenant_index, client) in clients.iter().enumerate().take(tenants.len()) {
-        let request = BifrostQueryRequest {
-            sql: format!(
-                "SELECT row_id, wyrd_event_time FROM vala.bifrost.{table} ORDER BY row_id"
-            ),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(5_000),
-        };
-        let mut stream = ancillary_query(&client.query, &request).await?;
         let mut identities = BTreeSet::new();
         let lower = tenant_row_base(tenant_index);
         let upper = lower + TENANT_ROW_STRIDE - 1;
-        while let Some(batch) = stream.next_batch().await? {
-            collect_query_identities(&batch, lower, upper, &mut identities)?;
+        for range in identity_reconciliation_ranges(&expected_rows_by_tenant[tenant_index]) {
+            let request = BifrostQueryRequest {
+                sql: range.sql(table),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            };
+            let mut stream =
+                client
+                    .query
+                    .query(&request)
+                    .await
+                    .map_err(|source| AncillaryQueryError {
+                        phase: "final published identity",
+                        tenant_index,
+                        table: table.to_owned(),
+                        source,
+                    })?;
+            let mut range_identities = BTreeSet::new();
+            while let Some(batch) = stream.next_batch().await? {
+                collect_query_identities(&batch, lower, upper, &mut range_identities)?;
+            }
+            merge_completed_identity_range(
+                range,
+                stream.terminal().map(|terminal| terminal.outcome),
+                range_identities,
+                &mut identities,
+            )?;
         }
-        if stream
-            .terminal()
-            .is_none_or(|terminal| terminal.outcome != QueryTerminalOutcome::Success)
-        {
-            return Err("final reference query omitted a successful terminal".into());
+        if identities != expected_rows_by_tenant[tenant_index] {
+            return Err(
+                "final public Oracle identities differ from the acknowledged ledger".into(),
+            );
         }
         published.push(identities);
     }
@@ -2939,12 +3105,12 @@ fn reconcile_production(
         .into());
     }
     let evidence = ProductionTelemetryEvidence {
-        gate_accepted_rows: evidence.reconciliation.gate_rows,
-        scribe_accepted_rows: evidence.reconciliation.scribe_rows,
+        gate_accepted_rows: evidence.phase.gate_rows,
+        scribe_accepted_rows: evidence.phase.scribe_rows,
         client_acknowledged_rows: rows,
         scribe_persisted_rows: evidence.reconciliation.sealed_rows,
         forge_published_rows: published_rows,
-        oracle_stream_rows: evidence.reconciliation.oracle_rows,
+        oracle_stream_rows: evidence.phase.oracle_stream_rows,
         client_decoded_rows: client.telemetry_decoded_rows,
         oracle_terminal_outcomes: evidence.reconciliation.successful_queries,
         client_completed_queries: completed_queries,
@@ -2953,7 +3119,7 @@ fn reconcile_production(
         required_telemetry: EvidenceStatus::Complete,
         counter_integrity: EvidenceStatus::Complete,
         spans_clean: EvidenceStatus::Complete,
-        cleanup: EvidenceStatus::Failed,
+        cleanup: evidence.cleanup,
         correctness: EvidenceStatus::Complete,
     };
     Ok(evidence)
@@ -3514,6 +3680,40 @@ mod tests {
         assert!(!exact_identity_ledger_matches(&expected, &corrupted));
     }
 
+    /// Proves per-table capacity ledgers catch corruption that a cumulative
+    /// union alone would conceal.
+    #[test]
+    fn completed_table_ledgers_prevent_cross_table_substitution() {
+        let first = CompletedTableLedger {
+            table: "first".to_owned(),
+            expected_rows_by_tenant: vec![BTreeSet::from([10, 11])],
+        };
+        let second = CompletedTableLedger {
+            table: "second".to_owned(),
+            expected_rows_by_tenant: vec![BTreeSet::from([20, 21])],
+        };
+        let corrupted_first = vec![BTreeSet::from([10, 20])];
+        let corrupted_second = vec![BTreeSet::from([11, 21])];
+        let expected_union = first.expected_rows_by_tenant[0]
+            .union(&second.expected_rows_by_tenant[0])
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let corrupted_union = corrupted_first[0]
+            .union(&corrupted_second[0])
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(expected_union, corrupted_union);
+        assert!(!exact_identity_ledger_matches(
+            &first.expected_rows_by_tenant,
+            &corrupted_first
+        ));
+        assert!(!exact_identity_ledger_matches(
+            &second.expected_rows_by_tenant,
+            &corrupted_second
+        ));
+    }
+
     /// Proves trace manifests cannot reuse one span across multiple operations.
     #[test]
     fn benchmark_span_classification_is_operation_specific() {
@@ -3684,10 +3884,9 @@ mod tests {
                     ("operation".to_owned(), "write".to_owned()),
                     ("outcome".to_owned(), "success".to_owned()),
                 ]),
-                "bifrost_gate_rows_total" => BTreeMap::from([
-                    ("operation".to_owned(), "write".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
+                "bifrost_gate_rows_total" => {
+                    BTreeMap::from([("status".to_owned(), "accepted".to_owned())])
+                }
                 "bifrost_gate_query_streams_total" => {
                     BTreeMap::from([("outcome".to_owned(), "success".to_owned())])
                 }
@@ -3715,6 +3914,23 @@ mod tests {
                     ("le".to_owned(), "0.001".to_owned()),
                     ("outcome".to_owned(), "success".to_owned()),
                 ]),
+                "bifrost_gate_request_duration_seconds" => BTreeMap::from([
+                    ("le".to_owned(), "0.001".to_owned()),
+                    ("operation".to_owned(), "write".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+                "bifrost_gate_query_stream_duration_seconds" => BTreeMap::from([
+                    ("le".to_owned(), "0.001".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+                "vala_postgres_pool_acquire_total" => {
+                    BTreeMap::from([("pool".to_owned(), "runtime".to_owned())])
+                }
+                "wyrd_storage_bytes_total" => BTreeMap::from([
+                    ("backend".to_owned(), "local".to_owned()),
+                    ("direction".to_owned(), "read".to_owned()),
+                    ("operation".to_owned(), "get".to_owned()),
+                ]),
                 _ => BTreeMap::new(),
             };
             crate::bifrost::telemetry::BifrostMetricSample {
@@ -3732,19 +3948,88 @@ mod tests {
             "bifrost_gate_requests_total",
             "bifrost_gate_rows_total",
             "bifrost_gate_query_streams_total",
+            "bifrost_gate_request_duration_seconds",
+            "bifrost_gate_query_stream_duration_seconds",
             "bifrost_scribe_rows_total",
             "bifrost_scribe_seal_rows_total",
             "bifrost_scribe_wal_append_bytes_total",
             "bifrost_forge_complete_gauge_publications_total",
             "bifrost_oracle_stream_rows_total",
             "vala_postgres_pool_acquire_seconds",
+            "vala_postgres_pool_acquire_total",
             "wyrd_storage_operation_duration_seconds",
+            "wyrd_storage_bytes_total",
             "bifrost_scribe_wal_fsync_seconds",
         ]
         .into_iter()
         .map(metric)
         .collect::<Vec<_>>();
         let mut metrics = metrics;
+        metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+            family: "bifrost_gate_requests_total".to_owned(),
+            labels: BTreeMap::from([
+                ("operation".to_owned(), "query".to_owned()),
+                ("outcome".to_owned(), "success".to_owned()),
+            ]),
+            value: 1.0,
+            kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
+        });
+        for (operation, outcome) in [
+            ("query", "rejected"),
+            ("query", "failed"),
+            ("query", "cancelled"),
+            ("write", "cancelled"),
+        ] {
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: "bifrost_gate_requests_total".to_owned(),
+                labels: BTreeMap::from([
+                    ("operation".to_owned(), operation.to_owned()),
+                    ("outcome".to_owned(), outcome.to_owned()),
+                ]),
+                value: 0.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
+            });
+        }
+        metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+            family: "bifrost_gate_query_streams_total".to_owned(),
+            labels: BTreeMap::from([("outcome".to_owned(), "cancelled".to_owned())]),
+            value: 0.0,
+            kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
+        });
+        for (family, labels) in [
+            ("bifrost_gate_frame_bytes_total", BTreeMap::new()),
+            (
+                "bifrost_forge_rewrite_input_files_total",
+                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
+            ),
+            (
+                "bifrost_forge_rewrite_input_bytes_total",
+                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
+            ),
+            (
+                "bifrost_forge_rewrite_output_files_total",
+                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
+            ),
+            (
+                "bifrost_forge_rewrite_output_bytes_total",
+                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
+            ),
+            (
+                "bifrost_oracle_source_rows_total",
+                BTreeMap::from([("source".to_owned(), "iceberg".to_owned())]),
+            ),
+            (
+                "bifrost_oracle_stream_bytes_total",
+                BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
+            ),
+        ] {
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: family.to_owned(),
+                labels,
+                value: 1.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
+            });
+        }
         for (family, labels) in [
             (
                 "vala_postgres_pool_acquire_seconds",
@@ -3763,6 +4048,17 @@ mod tests {
             ),
             (
                 "bifrost_scribe_wal_fsync_seconds",
+                BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
+            ),
+            (
+                "bifrost_gate_request_duration_seconds",
+                BTreeMap::from([
+                    ("operation".to_owned(), "write".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+            ),
+            (
+                "bifrost_gate_query_stream_duration_seconds",
                 BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
             ),
         ] {
@@ -3793,10 +4089,10 @@ mod tests {
             value: 0.0,
             kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
         }];
-        let gauge_final = vec![
+        let mut gauge_final = vec![
             crate::bifrost::telemetry::BifrostMetricSample {
                 family: "bifrost_oracle_slots_total".to_owned(),
-                labels: BTreeMap::from([("role".to_owned(), "server".to_owned())]),
+                labels: BTreeMap::from([("role".to_owned(), "leader".to_owned())]),
                 value: 8.0,
                 kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
             },
@@ -3807,6 +4103,50 @@ mod tests {
                 kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
             },
         ];
+        gauge_final.extend(
+            [
+                ("bifrost_scribe_ingress_active", BTreeMap::new()),
+                (
+                    "bifrost_scribe_lane_active",
+                    BTreeMap::from([("lane".to_owned(), "ingress".to_owned())]),
+                ),
+                (
+                    "bifrost_scribe_lane_queued",
+                    BTreeMap::from([("lane".to_owned(), "ingress".to_owned())]),
+                ),
+                ("bifrost_scribe_persistence_queue_depth", BTreeMap::new()),
+                (
+                    "bifrost_oracle_in_flight",
+                    BTreeMap::from([
+                        ("query_class".to_owned(), "analytical".to_owned()),
+                        ("visibility".to_owned(), "published_only".to_owned()),
+                    ]),
+                ),
+                (
+                    "bifrost_oracle_slots_in_use",
+                    BTreeMap::from([
+                        ("query_class".to_owned(), "analytical".to_owned()),
+                        ("role".to_owned(), "leader".to_owned()),
+                    ]),
+                ),
+                (
+                    "wyrd_storage_operations_active",
+                    BTreeMap::from([
+                        ("backend".to_owned(), "local".to_owned()),
+                        ("operation".to_owned(), "get".to_owned()),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .map(
+                |(family, labels)| crate::bifrost::telemetry::BifrostMetricSample {
+                    family: family.to_owned(),
+                    labels,
+                    value: 0.0,
+                    kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
+                },
+            ),
+        );
         let spans = if complete_evidence {
             [
                 "bifrost.scribe.wal.append",
@@ -3937,7 +4277,7 @@ mod tests {
             reference_scenario_matrix()[0],
             reference_scenario_matrix()[2],
         ] {
-            let resources = project_process_resources(definition, &telemetry);
+            let resources = project_process_resources(definition.topology, &telemetry);
             assert_eq!(resources.len(), 1);
             assert_eq!(
                 resources[0].roles,
@@ -3962,6 +4302,45 @@ mod tests {
             replacement.epoch += 1;
             assert_eq!(replacement.process_id, resources[0].process_id);
             assert_ne!(replacement.epoch, resources[0].epoch);
+        }
+    }
+
+    /// Proves cleanup completes only when every closed final resource gauge drains.
+    #[test]
+    fn cleanup_status_requires_full_drain() {
+        let cleanup_bindings = crate::bifrost::telemetry::cluster_bindings()
+            .iter()
+            .filter(|binding| binding.id.0 == "gate.active" || binding.id.0.starts_with("cleanup."))
+            .collect::<Vec<_>>();
+        let mut values = cleanup_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.id.0,
+                    crate::bifrost::telemetry::EvaluatedBindingValue::Gauge {
+                        final_value: 0,
+                        peak: 0,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(cleanup_status(&values), EvidenceStatus::Complete);
+        for binding in cleanup_bindings {
+            values.insert(
+                binding.id.0,
+                crate::bifrost::telemetry::EvaluatedBindingValue::Gauge {
+                    final_value: 1,
+                    peak: 1,
+                },
+            );
+            assert_eq!(cleanup_status(&values), EvidenceStatus::Failed);
+            values.insert(
+                binding.id.0,
+                crate::bifrost::telemetry::EvaluatedBindingValue::Gauge {
+                    final_value: 0,
+                    peak: 0,
+                },
+            );
         }
     }
 
@@ -4265,6 +4644,260 @@ mod tests {
         let error = "query admission rejected";
         assert!(is_backpressure(error));
         assert!(is_retryable(error));
+    }
+
+    /// Proves ancillary correctness failures preserve their first typed SDK source.
+    #[test]
+    fn ancillary_query_is_single_attempt_with_typed_context() {
+        let mut attempts = 0_usize;
+        let result: Result<(), ValaSdkError> = {
+            attempts += 1;
+            Err(ValaSdkError::Transport(
+                wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected.into(),
+            ))
+        };
+        let error = result
+            .map_err(|source| AncillaryQueryError {
+                phase: "final published identity",
+                tenant_index: 2,
+                table: REFERENCE_TABLE.to_owned(),
+                source,
+            })
+            .expect_err("injected admission rejection fails immediately");
+        assert_eq!(attempts, 1);
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ValaSdkError>())
+            .expect("context retains the typed SDK source");
+        assert_eq!(source.code(), "WYRD_VALA_429_QUERY_ADMISSION_REJECTED");
+        assert_eq!(source.detail(), "query admission rejected");
+        assert_eq!(source.status(), 429);
+        let display = error.to_string();
+        assert!(display.contains("final published identity"));
+        assert!(display.contains("tenant index 2"));
+        assert!(display.contains(REFERENCE_TABLE));
+
+        let source_text = include_str!("bench_cluster.rs");
+        assert!(!source_text.contains(&["async fn ancillary", "_query"].concat()));
+        assert!(!source_text.contains(&["ancillary strict query", " exhausted"].concat()));
+    }
+
+    /// Proves bounded ranges partition the full domain with one unbounded tail.
+    #[test]
+    fn identity_ranges_are_disjoint_complete_and_bounded() {
+        let expected = (0_u64..2_049).map(|value| value * 2 + 10).collect();
+        let ranges = identity_reconciliation_ranges(&expected);
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].lower_exclusive, None);
+        assert!(ranges[0].upper_inclusive.is_some());
+        assert_eq!(ranges[1].lower_exclusive, ranges[0].upper_inclusive);
+        assert!(ranges[1].upper_inclusive > ranges[0].upper_inclusive);
+        assert_eq!(ranges[2].lower_exclusive, ranges[1].upper_inclusive);
+        assert_eq!(ranges[2].upper_inclusive, None);
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|range| range.upper_inclusive.is_none())
+                .count(),
+            1
+        );
+        assert!(
+            ranges
+                .iter()
+                .all(|range| { range.expected_rows <= IDENTITY_RECONCILIATION_ROWS_PER_QUERY })
+        );
+        for identity in [0, 9, 10, 2_057, 4_107, u64::MAX] {
+            assert_eq!(
+                ranges
+                    .iter()
+                    .filter(|range| range.contains(identity))
+                    .count(),
+                1,
+                "identity {identity} belongs to exactly one range"
+            );
+        }
+    }
+
+    /// Proves empty and single-chunk ledgers each retain one full-domain query.
+    #[test]
+    fn identity_ranges_cover_empty_and_single_chunk_ledgers() {
+        for expected in [BTreeSet::new(), BTreeSet::from([10, 20, 30])] {
+            let ranges = identity_reconciliation_ranges(&expected);
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(ranges[0].lower_exclusive, None);
+            assert_eq!(ranges[0].upper_inclusive, None);
+            assert_eq!(ranges[0].expected_rows, expected.len());
+            assert!(ranges[0].contains(0));
+            assert!(ranges[0].contains(u64::MAX));
+        }
+    }
+
+    /// Proves completed ranges reject predicate drift, cross-range duplicates,
+    /// and incomplete terminals without merging partial observations.
+    #[test]
+    fn completed_identity_range_merge_is_fail_closed() {
+        let prefix = IdentityReconciliationRange {
+            lower_exclusive: None,
+            upper_inclusive: Some(20),
+            expected_rows: 2,
+        };
+        let suffix = IdentityReconciliationRange {
+            lower_exclusive: Some(20),
+            upper_inclusive: None,
+            expected_rows: 1,
+        };
+        let mut published = BTreeSet::new();
+        merge_completed_identity_range(
+            prefix,
+            Some(QueryTerminalOutcome::Success),
+            BTreeSet::from([10, 20]),
+            &mut published,
+        )
+        .expect("valid prefix merges");
+        assert!(
+            merge_completed_identity_range(
+                suffix,
+                Some(QueryTerminalOutcome::Success),
+                BTreeSet::from([20]),
+                &mut published,
+            )
+            .is_err()
+        );
+        assert!(
+            merge_completed_identity_range(
+                prefix,
+                Some(QueryTerminalOutcome::Success),
+                BTreeSet::from([21]),
+                &mut published,
+            )
+            .is_err()
+        );
+        for terminal in [None, Some(QueryTerminalOutcome::Failed)] {
+            let mut partial = BTreeSet::new();
+            assert!(
+                merge_completed_identity_range(
+                    prefix,
+                    terminal,
+                    BTreeSet::from([10]),
+                    &mut partial,
+                )
+                .is_err()
+            );
+            assert!(partial.is_empty(), "partial failed range is discarded");
+        }
+    }
+
+    /// Proves exact comparison rejects missing rows and unexpected identities
+    /// in the prefix, acknowledged gaps, and suffix.
+    #[test]
+    fn exact_range_reconciliation_rejects_missing_and_all_extra_regions() {
+        let expected = vec![BTreeSet::from([10, 20, 30])];
+        assert!(exact_identity_ledger_matches(&expected, &expected));
+        for observed in [
+            BTreeSet::from([10, 20]),
+            BTreeSet::from([9, 10, 20, 30]),
+            BTreeSet::from([10, 15, 20, 30]),
+            BTreeSet::from([10, 20, 30, 31]),
+        ] {
+            assert!(!exact_identity_ledger_matches(&expected, &[observed]));
+        }
+    }
+
+    /// Proves row collection rejects foreign tenant identities and duplicates.
+    #[test]
+    fn range_row_collection_rejects_foreign_and_duplicate_identities() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::Int64, false),
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let timestamps = arrow::array::TimestampMicrosecondArray::from(vec![1, 2]);
+        for row_ids in [vec![10_i64, 10], vec![10_i64, 1_001]] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(row_ids)),
+                    Arc::new(timestamps.clone()),
+                ],
+            )
+            .expect("fixture batch");
+            let mut identities = BTreeSet::new();
+            assert!(collect_query_identities(&batch, 0, 1_000, &mut identities).is_err());
+        }
+    }
+
+    /// Proves final identity reads retain their projection and one attempt per range.
+    #[test]
+    fn final_identity_query_is_one_unsorted_attempt_per_range() {
+        let source = include_str!("bench_cluster.rs");
+        let start = source
+            .find("struct IdentityReconciliationRange")
+            .expect("identity range owner exists");
+        let end = source[start..]
+            .find("fn reconcile_production(")
+            .map(|offset| start + offset)
+            .expect("reconciliation follows final identity collection");
+        let function = &source[start..end];
+        let projection = [
+            "SELECT row_id, wyrd_event_time FROM vala.bifrost.",
+            "{table}",
+        ]
+        .concat();
+        assert!(function.contains(&projection));
+        assert!(!function.contains(&["ORDER", " BY"].concat()));
+        assert!(!function.contains(&["LIM", "IT"].concat()));
+        assert_eq!(function.matches(".query(&request)").count(), 1);
+        assert!(function.contains("for (tenant_index, client)"));
+        assert!(function.contains("while let Some(batch)"));
+        assert!(function.contains("collect_query_identities"));
+        assert!(function.contains("QueryTerminalOutcome::Success"));
+        assert!(function.contains("identity_reconciliation_ranges"));
+        assert!(function.contains("deadline_ms: Some(5_000)"));
+        assert!(!function.contains("sleep"));
+        assert!(!function.contains("retry"));
+    }
+
+    /// Proves live and qualification correctness reads occur only after their
+    /// sampled telemetry and audit checkpoints have completed.
+    #[test]
+    fn correctness_reads_follow_sampled_windows_and_audit_checkpoints() {
+        let source = include_str!("bench_cluster.rs");
+        let live_start = source.find("async fn run_live_trial(").expect("live trial");
+        let live_end = source[live_start..]
+            .find("fn preload_identity_ledger(")
+            .map(|offset| live_start + offset)
+            .expect("live trial end");
+        let live = &source[live_start..live_end];
+        assert!(
+            live.find("let audit_after = audit_rows").unwrap()
+                < live.find(".await?;\n    extend_identity_ledger").unwrap()
+        );
+        assert!(
+            live.find(".await?;\n    extend_identity_ledger").unwrap()
+                < live.find("let published_after_identities").unwrap()
+        );
+
+        let qualification_start = source
+            .find("async fn run_qualification_pair(")
+            .expect("qualification pair");
+        let qualification_end = source[qualification_start..]
+            .find("pub async fn shutdown")
+            .map(|offset| qualification_start + offset)
+            .expect("qualification end");
+        let qualification = &source[qualification_start..qualification_end];
+        assert!(
+            qualification.find("let audit_after = audit_rows").unwrap()
+                < qualification.find("let expected_rows_by_tenant").unwrap()
+        );
+        assert!(
+            qualification.find("let expected_rows_by_tenant").unwrap()
+                < qualification
+                    .find("let published = final_published_identities")
+                    .unwrap()
+        );
     }
 
     /// Stable WAL capacity stops calibration while unrelated server errors stay fatal.

@@ -377,13 +377,13 @@ pub struct ClusterShutdownInspection {
     pub scribe_inflight: u64,
     /// Persistent WAL streams remaining after server shutdown.
     pub scribe_wal_streams: u64,
-    /// Durable Oracle leases remaining at the final pre-stop drain checkpoint.
+    /// Durable Oracle leases remaining after every server shutdown completes.
     pub oracle_leases: u64,
-    /// Durable Oracle admission slots remaining at the final pre-stop drain checkpoint.
+    /// Durable Oracle admission slots remaining after every server shutdown completes.
     pub oracle_slots: u64,
-    /// Forge claims remaining at the final pre-stop drain checkpoint.
+    /// Forge claims remaining after every server shutdown completes.
     pub forge_active_claims: u64,
-    /// Forge attempts remaining at the final pre-stop drain checkpoint.
+    /// Forge attempts remaining after every server shutdown completes.
     pub forge_active_attempts: u64,
     /// Supervised server tasks retained after every server owner is dropped.
     pub supervised_tasks: u64,
@@ -1867,7 +1867,6 @@ impl WyrdTestCluster {
                 }
             }
         }
-        let inspection = self.oracle_inspection().await?;
         let node_ids = self.servers.keys().copied().collect::<Vec<_>>();
         let expected_servers = node_ids.len();
         let mut stopped_servers = 0_usize;
@@ -1894,10 +1893,14 @@ impl WyrdTestCluster {
                 }
             }
         }
-        if let Some(error) = first_error {
-            Err(ClusterError::Shutdown(error))
-        } else {
-            Ok(ClusterShutdownInspection {
+        let inspection = self.oracle_inspection().await;
+        match (first_error, inspection) {
+            (Some(shutdown), Err(inspection)) => Err(ClusterError::Shutdown(format!(
+                "{shutdown}; post-shutdown durable inspection failed: {inspection}"
+            ))),
+            (Some(shutdown), Ok(_)) => Err(ClusterError::Shutdown(shutdown)),
+            (None, Err(error)) => Err(error),
+            (None, Ok(inspection)) => Ok(ClusterShutdownInspection {
                 servers_stopped: stopped_servers == expected_servers,
                 listeners_stopped,
                 scribe_queued,
@@ -1908,7 +1911,7 @@ impl WyrdTestCluster {
                 forge_active_claims: inspection.forge_active_claims,
                 forge_active_attempts: inspection.forge_active_attempts,
                 supervised_tasks,
-            })
+            }),
         }
     }
 }
@@ -2047,6 +2050,74 @@ fn parse_metric_sample(series: &str, value: f64) -> Result<OracleMetricSample, C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Durable cleanup inspection remains ordered after every server shutdown
+    /// attempt and preserves shutdown-error precedence.
+    #[test]
+    fn shutdown_durable_inspection_is_post_server_loop() {
+        let source = include_str!("cluster.rs");
+        let start = source
+            .find("pub async fn shutdown_and_inspect(mut self)")
+            .expect("cluster shutdown owner exists");
+        let end = source[start..]
+            .find("fn has_full_server_roles")
+            .map(|offset| start + offset)
+            .expect("shutdown owner ends before topology helper");
+        let function = &source[start..end];
+        let server_shutdown = function
+            .find("server.shutdown_and_inspect().await")
+            .expect("server shutdown is awaited");
+        let durable_inspection = function
+            .rfind("self.oracle_inspection().await")
+            .expect("durable state is inspected once");
+
+        assert!(server_shutdown < durable_inspection);
+        assert_eq!(
+            function.matches("self.oracle_inspection().await").count(),
+            1
+        );
+        assert!(function.contains("match (first_error, inspection)"));
+        assert!(function.contains("(Some(shutdown), Err(inspection))"));
+    }
+
+    /// A durable lease not owned by a running Oracle remains visible after
+    /// shutdown instead of being replaced with synthetic zero evidence.
+    #[tokio::test]
+    #[ignore = "requires managed Postgres for durable shutdown inspection"]
+    async fn shutdown_inspection_preserves_unreleasable_durable_lease() {
+        let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+            .await
+            .expect("cluster starts");
+        let owner = cluster
+            .fixture
+            .superuser_pool()
+            .await
+            .expect("assertion pool");
+        sqlx::query(
+            "INSERT INTO vala.oracle_admission_leases \
+             (data_tenant_id, query_id, query_class, slot_units, leader_node_id, \
+              leader_fencing_token, acquired_at, expires_at) \
+             VALUES ($1, $2, 'analytical', 2, $3, 999999, now(), now() + interval '1 hour')",
+        )
+        .bind(cluster.data_tenant_id().as_uuid())
+        .bind(uuid::Uuid::now_v7())
+        .bind(uuid::Uuid::now_v7())
+        .execute(&owner)
+        .await
+        .expect("unowned durable lease inserts");
+        drop(owner);
+        let before = cluster
+            .oracle_inspection()
+            .await
+            .expect("pre-shutdown inspection");
+        assert_eq!(before.active_leases, 1);
+
+        let after = cluster
+            .shutdown_and_inspect()
+            .await
+            .expect("shutdown inspection succeeds");
+        assert_eq!(after.oracle_leases, 1);
+    }
 
     /// The six-process matrix contains exactly three complete Servers and
     /// three Forge-only workers, with no mixed or partial role descriptors.

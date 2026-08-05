@@ -21,7 +21,9 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBindi
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
-use vala_sdk::{BifrostGrpcTransport, IngestTransport, QueryClient, ValaSdkError};
+use vala_sdk::{
+    BifrostGrpcTransport, CollectedQueryLimits, IngestTransport, QueryClient, ValaSdkError,
+};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -512,7 +514,7 @@ async fn public_grpc_without_oracle_is_unavailable() {
     assert!(WyrdTestCluster::start_spec(spec).await.is_err());
 }
 
-/// Proves dropping a public gRPC stream releases Oracle admission resources.
+/// Proves production shutdown drains a dropped stream's queued durable release.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn public_grpc_drop_releases_query_resources() {
@@ -535,19 +537,34 @@ async fn public_grpc_drop_releases_query_resources() {
         freshness: FreshnessPolicy::Strict,
         deadline_ms: None,
     };
-    let mut stream = grpc_query_stream(&client, &request)
+    server.stall_next_query_after_schema();
+    let query = QueryClient::new(&client);
+    let query_task = tokio::spawn(async move {
+        query
+            .collect_bounded(
+                &request,
+                CollectedQueryLimits {
+                    max_rows: 16,
+                    max_encoded_bytes: 1024 * 1024,
+                },
+            )
+            .await
+    });
+    let _query_id = server
+        .wait_query_schema_stall()
         .await
-        .expect("drop stream");
-    assert!(stream.message().await.expect("schema result").is_some());
-    assert!(stream.message().await.expect("batch result").is_some());
-    drop(stream);
-    wait_for_oracle_cleanup(&cluster)
+        .expect("query reaches schema stall");
+    let before = cluster
+        .oracle_inspection()
         .await
-        .expect("drop cleanup");
-    let inspection = cluster.oracle_inspection().await.expect("drop inspection");
-    assert_eq!(inspection.active_leases, 0);
-    assert_eq!(inspection.slots_in_use, 0);
-    cluster.shutdown().await.expect("drop shutdown");
+        .expect("pre-shutdown drop inspection");
+    assert!(before.active_leases > 0);
+    assert!(before.slots_in_use > 0);
+    query_task.abort();
+    let _ = query_task.await;
+    let after = cluster.shutdown_and_inspect().await.expect("drop shutdown");
+    assert_eq!(after.oracle_leases, 0);
+    assert_eq!(after.oracle_slots, 0);
 }
 
 /// J5 proves tenant tripwire, durable audit, admission cleanup, and audit refusal.
@@ -658,7 +675,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey() {
     assert_eq!(inspection.active_leases, 0);
     assert_eq!(inspection.slots_in_use, 0);
     assert!(inspection.audit_rows >= 4);
-    owner.close().await;
+    drop(owner);
     cluster.shutdown().await.expect("J5 shutdown");
 }
 
@@ -771,7 +788,7 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
     wait_for_oracle_cleanup(&cluster)
         .await
         .expect("J7 admission cleanup");
-    owner.close().await;
+    drop(owner);
     cluster.shutdown().await.expect("J7 shutdown");
 }
 

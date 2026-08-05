@@ -15,16 +15,16 @@ use thiserror::Error;
 pub const CLUSTER_REPORT_VERSION: &str = "wyrd.bifrost.cluster-report/v2";
 /// Stable workload identifier shared by captures and comparisons.
 pub const CLUSTER_WORKLOAD_VERSION: &str = "wyrd.bifrost.cluster-workload/v2";
+/// Closed schema identifier for reviewed qualification-rate profiles.
+pub const QUALIFICATION_PROFILE_VERSION: &str = "wyrd.bifrost.qualification-profile/v2";
 /// Canonical bounded capacity stages. Qualification replays reviewed values
 /// from this sequence as absolute rates, never as a percentage of a knee.
-pub const CANONICAL_CAPACITY_RATES: [u64; 8] = [100, 200, 300, 500, 750, 1_000, 1_500, 2_000];
+pub const CANONICAL_CAPACITY_RATES: [u64; 11] =
+    [25, 50, 75, 100, 200, 300, 500, 750, 1_000, 1_500, 2_000];
 /// Optional continuation rates used only when every canonical stage is healthy.
 pub const OPTIONAL_CAPACITY_RATES: [u64; 3] = [2_500, 3_000, 4_000];
 /// Shortened smoke sequence; it makes no SLO or capacity claim.
 pub const SMOKE_CAPACITY_RATES: [u64; 4] = [100, 300, 500, 1_000];
-/// Qualification profile defaults used until a human-reviewed profile selects
-/// a compatible subset from a passing capacity report.
-pub const DEFAULT_REVIEWED_QUALIFICATION_RATES: [u64; 3] = [100, 1_000, 2_000];
 /// Maximum wall-clock duration for a six-scenario matrix, including lifecycle.
 pub const MATRIX_DURATION_CAP: Duration = Duration::from_mins(40);
 /// Production authentication-cache TTL compared by every v2 report.
@@ -41,7 +41,7 @@ pub const BATCHING_POLICY: &str = "arrow-64-rows-max-64-kib-v1";
 pub const ALLOCATION_POLICY: &str = "per-phase-preprovisioned-v1";
 /// Exact capacity allocation including warmup, base, optional, confirmation,
 /// and recovery slots.
-pub const CAPACITY_TABLES_PER_TENANT: u32 = 14;
+pub const CAPACITY_TABLES_PER_TENANT: u32 = 17;
 /// Exact capacity conditioning duration before each measured stage.
 pub const CAPACITY_CONDITIONING_SECONDS: u32 = 3;
 /// Exact capacity initial warmup duration.
@@ -100,6 +100,17 @@ pub enum CapacityStageKind {
     Recovery,
 }
 
+/// Evidence-aware result consumed by the capacity transition owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityStageOutcome {
+    /// Every qualification gate passed with zero backpressure.
+    Passing,
+    /// The only failing condition was exact controlled service backpressure.
+    ControlledBackpressure,
+    /// Correctness, evidence, latency, fairness, resource, audit, or cleanup failed.
+    Invalid,
+}
+
 /// Next stage selected by the capacity state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityStagePlan {
@@ -115,13 +126,21 @@ pub struct CapacityStagePlan {
 /// confirmation, and recovery transition without provisioning decisions.
 #[derive(Debug)]
 pub struct CapacityStateMachine {
+    /// Ordered absolute discovery rates; confirmation and recovery reuse entries.
     rates: Vec<u64>,
+    /// Index of the next undispatched discovery rate.
     next_rate: usize,
+    /// Monotonic measured-stage slot used for deterministic table allocation.
     slot: u16,
+    /// First failed discovery rate awaiting or consumed by confirmation.
     first_failed_rate: Option<u64>,
+    /// Greatest passing discovery rate eligible for the terminal recovery replay.
     highest_healthy_rate: Option<u64>,
+    /// Single-use confirmation transition state for the first controlled boundary.
     confirmation: ConfirmationState,
+    /// Whether the next plan must replay the highest healthy discovery rate.
     recovery_pending: bool,
+    /// Whether the bounded curve has emitted its final permitted stage.
     finished: bool,
 }
 
@@ -163,7 +182,7 @@ impl CapacityStateMachine {
     /// Return the next deterministic stage plan, if the curve is complete.
     #[must_use]
     pub fn next_plan(&mut self) -> Option<CapacityStagePlan> {
-        if self.finished || self.slot >= 13 {
+        if self.finished || usize::from(self.slot) >= self.rates.len().saturating_add(2) {
             return None;
         }
         let (rate, kind) = if self.confirmation == ConfirmationState::Pending {
@@ -195,13 +214,19 @@ impl CapacityStateMachine {
     pub fn record(
         &mut self,
         plan: CapacityStagePlan,
-        passed: bool,
+        outcome: CapacityStageOutcome,
     ) -> Result<(), ClusterBenchmarkError> {
         if self.finished && plan.kind != CapacityStageKind::Recovery {
             return Err(ClusterBenchmarkError::Invalid(
                 "capacity result arrived after terminal recovery".to_owned(),
             ));
         }
+        if outcome == CapacityStageOutcome::Invalid {
+            return Err(ClusterBenchmarkError::NotReady(
+                "capacity stage failed a non-saturation qualification gate".to_owned(),
+            ));
+        }
+        let passed = outcome == CapacityStageOutcome::Passing;
         match plan.kind {
             CapacityStageKind::Discovery if passed => {
                 self.highest_healthy_rate = Some(plan.offered_requests_per_second);
@@ -239,10 +264,6 @@ impl CapacityStateMachine {
         Ok(())
     }
 }
-/// First open-loop calibration probe in public operations per second.
-pub const FIRST_PROBE_RATE: u64 = 8;
-/// Maximum calibration probe in public operations per second.
-pub const CALIBRATION_RATE_CAP: u64 = 4_096;
 /// Planned measured flush cadence in seconds.
 pub const FLUSH_CADENCE_SECONDS: u64 = 2;
 /// Number of planned flushes in one 20-second measured trial.
@@ -476,6 +497,8 @@ pub struct CapacityStageIdentity {
 pub struct CapacityStage {
     /// Stage identity and deterministic row ledger.
     pub identity: CapacityStageIdentity,
+    /// Discovery, confirmation, or recovery role of this retained stage.
+    pub kind: CapacityStageKind,
     /// Absolute offered rate.
     pub offered_requests_per_second: u64,
     /// Completed public operations per second.
@@ -498,6 +521,303 @@ pub struct CapacityStage {
     pub dependencies: DependencyTelemetryEvidence,
     /// Representative traces.
     pub traces: Vec<TraceManifest>,
+}
+
+/// Closed semantic role assigned to one reviewed absolute qualification rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationRateRole {
+    /// Lowest passing canonical rate in the source curve.
+    Healthy,
+    /// Highest passing canonical rate below the required headroom ceiling.
+    TargetOperating,
+    /// Highest passing canonical rate with a passing recovery replay.
+    NearSaturation,
+}
+
+/// One absolute rate selected deterministically from a passing capacity curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedQualificationRate {
+    /// Absolute public requests offered per second.
+    pub requests_per_second: u64,
+    /// Qualification role derived from the source curve.
+    pub role: QualificationRateRole,
+}
+
+/// Passing source-stage identity retained for review and replay validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedPassingStage {
+    /// Exact capacity stage identity from the canonical report.
+    pub identity: CapacityStageIdentity,
+    /// Absolute passing rate represented by the stage.
+    pub requests_per_second: u64,
+    /// Explicit source status; reviewed stages must always remain passing.
+    pub passed: bool,
+}
+
+/// Digest-bound provenance for one generated qualification profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedCapacitySource {
+    /// Exact schema of the source capacity report.
+    pub report_schema_version: String,
+    /// Lowercase SHA-256 of the complete source artifact bytes.
+    pub artifact_sha256: String,
+    /// Exact environment copied from the source report.
+    pub environment: BenchmarkEnvironment,
+    /// Exact scenario workload copied from the source report.
+    pub workload: ClusterWorkloadIdentity,
+    /// Complete passing source identity for every selected role.
+    pub selected_stages: Vec<ReviewedPassingStage>,
+}
+
+/// Human-reviewable absolute-rate profile generated from canonical capacity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationProfileV2 {
+    /// Closed qualification-profile schema identifier.
+    pub schema_version: String,
+    /// Exact compatible environment identity.
+    pub environment: BenchmarkEnvironment,
+    /// Exact compatible workload identity with the three selected rates.
+    pub workload: ClusterWorkloadIdentity,
+    /// Digest-bound source capacity evidence.
+    pub source_capacity: ReviewedCapacitySource,
+    /// Exactly one absolute rate per qualification role.
+    pub rates: Vec<ReviewedQualificationRate>,
+}
+
+impl QualificationProfileV2 {
+    /// Generate the deterministic three-role candidate from one capacity scenario.
+    ///
+    /// # Errors
+    /// Returns [`ClusterBenchmarkError::Unsupported`] when fewer than three
+    /// distinct canonical discovery rates pass, recovery is absent or failed,
+    /// or no passing target rate satisfies the seventy-percent headroom rule.
+    pub fn from_capacity(
+        environment: &BenchmarkEnvironment,
+        workload: &ClusterWorkloadIdentity,
+        stages: &[CapacityStage],
+        artifact_sha256: String,
+    ) -> Result<Self, ClusterBenchmarkError> {
+        let recovery_rate = stages
+            .iter()
+            .rev()
+            .find(|stage| stage.kind == CapacityStageKind::Recovery && stage.passed)
+            .map(|stage| stage.offered_requests_per_second)
+            .ok_or_else(|| {
+                ClusterBenchmarkError::Unsupported(
+                    "capacity source lacks a passing recovery replay".to_owned(),
+                )
+            })?;
+        let passing = CANONICAL_CAPACITY_RATES
+            .iter()
+            .filter_map(|rate| {
+                stages.iter().find(|stage| {
+                    stage.offered_requests_per_second == *rate
+                        && stage.passed
+                        && stage.kind == CapacityStageKind::Discovery
+                })
+            })
+            .collect::<Vec<_>>();
+        if passing.len() < 3
+            || passing
+                .last()
+                .map(|stage| stage.offered_requests_per_second)
+                != Some(recovery_rate)
+        {
+            return Err(ClusterBenchmarkError::Unsupported(
+                "capacity source has fewer than three qualifying rates or recovery does not replay the highest passing rate".to_owned(),
+            ));
+        }
+        let Some(&healthy) = passing.first() else {
+            return Err(ClusterBenchmarkError::Unsupported(
+                "capacity source has no passing healthy rate".to_owned(),
+            ));
+        };
+        let Some(&near) = passing.last() else {
+            return Err(ClusterBenchmarkError::Unsupported(
+                "capacity source has no passing near-saturation rate".to_owned(),
+            ));
+        };
+        let target_ceiling = near.offered_requests_per_second.saturating_mul(70) / 100;
+        let target = passing
+            .iter()
+            .rev()
+            .find(|stage| {
+                stage.offered_requests_per_second > healthy.offered_requests_per_second
+                    && stage.offered_requests_per_second < near.offered_requests_per_second
+                    && stage.offered_requests_per_second <= target_ceiling
+            })
+            .copied()
+            .ok_or_else(|| {
+                ClusterBenchmarkError::Unsupported(
+                    "capacity source has no passing target rate within required headroom"
+                        .to_owned(),
+                )
+            })?;
+        let selected = [healthy, target, near];
+        for stage in selected {
+            stage.validate_evidence()?;
+        }
+        let rates = [
+            QualificationRateRole::Healthy,
+            QualificationRateRole::TargetOperating,
+            QualificationRateRole::NearSaturation,
+        ]
+        .into_iter()
+        .zip(selected)
+        .map(|(role, stage)| ReviewedQualificationRate {
+            requests_per_second: stage.offered_requests_per_second,
+            role,
+        })
+        .collect::<Vec<_>>();
+        let mut qualification_workload = workload.clone();
+        qualification_workload.ordered_rates =
+            rates.iter().map(|rate| rate.requests_per_second).collect();
+        qualification_workload.trial_count = 3;
+        qualification_workload.tables_per_tenant = 18;
+        let source_capacity = ReviewedCapacitySource {
+            report_schema_version: CLUSTER_REPORT_VERSION.to_owned(),
+            artifact_sha256,
+            environment: environment.clone(),
+            workload: workload.clone(),
+            selected_stages: selected
+                .into_iter()
+                .map(|stage| ReviewedPassingStage {
+                    identity: stage.identity.clone(),
+                    requests_per_second: stage.offered_requests_per_second,
+                    passed: stage.passed,
+                })
+                .collect(),
+        };
+        let candidate = Self {
+            schema_version: QUALIFICATION_PROFILE_VERSION.to_owned(),
+            environment: environment.clone(),
+            workload: qualification_workload,
+            source_capacity,
+            rates,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    /// Validate identities, digest shape, roles, ordering, and source binding.
+    ///
+    /// # Errors
+    /// Returns [`ClusterBenchmarkError::Incompatible`] for any malformed,
+    /// duplicated, reordered, non-passing, or identity-incompatible profile.
+    pub fn validate(&self) -> Result<(), ClusterBenchmarkError> {
+        let expected_roles = [
+            QualificationRateRole::Healthy,
+            QualificationRateRole::TargetOperating,
+            QualificationRateRole::NearSaturation,
+        ];
+        let rate_values = self
+            .rates
+            .iter()
+            .map(|rate| rate.requests_per_second)
+            .collect::<Vec<_>>();
+        let mut expected_workload = self.source_capacity.workload.clone();
+        expected_workload.ordered_rates.clone_from(&rate_values);
+        expected_workload.trial_count = 3;
+        expected_workload.tables_per_tenant = 18;
+        if self.schema_version != QUALIFICATION_PROFILE_VERSION
+            || self.source_capacity.report_schema_version != CLUSTER_REPORT_VERSION
+            || self.environment != self.source_capacity.environment
+            || self.source_capacity.artifact_sha256.len() != 64
+            || !self
+                .source_capacity
+                .artifact_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.rates.len() != 3
+            || self.source_capacity.selected_stages.len() != 3
+            || self.rates.iter().map(|rate| rate.role).ne(expected_roles)
+            || rate_values.windows(2).any(|window| window[0] >= window[1])
+            || self.workload.ordered_rates != rate_values
+            || self.workload != expected_workload
+        {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "qualification profile roles, rates, digest, or identities are invalid".to_owned(),
+            ));
+        }
+        self.workload.validate()?;
+        for (rate, stage) in self.rates.iter().zip(&self.source_capacity.selected_stages) {
+            if rate.requests_per_second != stage.requests_per_second || !stage.passed {
+                return Err(ClusterBenchmarkError::Incompatible(
+                    "qualification rate is not bound to its selected passing stage".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate selected rates against the exact retained capacity report.
+    ///
+    /// The operation binds every self-declared selected stage to one and only
+    /// one evidence-complete passing discovery stage in the digest-verified
+    /// source report. Confirmation and recovery stages cannot substitute for
+    /// discovery evidence even when their rate and identity are otherwise
+    /// consistent.
+    ///
+    /// # Errors
+    /// Returns [`ClusterBenchmarkError::Incompatible`] when report schema,
+    /// environment, workload, scenario cardinality, stage identity, rate,
+    /// kind, passing status, or reviewed-rate pairing differs. Propagates the
+    /// stricter existing evidence error when a matched stage is incomplete.
+    pub fn validate_capacity_source(
+        &self,
+        report: &BifrostReferenceProfile,
+    ) -> Result<(), ClusterBenchmarkError> {
+        self.validate()?;
+        if report.schema_version != self.source_capacity.report_schema_version
+            || report.schema_version != CLUSTER_REPORT_VERSION
+            || report.environment != self.source_capacity.environment
+        {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "capacity source schema or environment differs from the reviewed profile"
+                    .to_owned(),
+            ));
+        }
+        let matching_scenarios = report
+            .scenarios
+            .iter()
+            .filter(|scenario| scenario.workload == self.source_capacity.workload)
+            .collect::<Vec<_>>();
+        let [scenario] = matching_scenarios.as_slice() else {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "capacity source must contain exactly one matching workload scenario".to_owned(),
+            ));
+        };
+        for (rate, selected) in self.rates.iter().zip(&self.source_capacity.selected_stages) {
+            let matching_stages = scenario
+                .reports
+                .iter()
+                .flat_map(|report| report.capacity_stages.iter())
+                .filter(|stage| stage.identity == selected.identity)
+                .collect::<Vec<_>>();
+            let [stage] = matching_stages.as_slice() else {
+                return Err(ClusterBenchmarkError::Incompatible(
+                    "reviewed stage identity is absent or duplicated in capacity source".to_owned(),
+                ));
+            };
+            if rate.requests_per_second != selected.requests_per_second
+                || stage.offered_requests_per_second != selected.requests_per_second
+                || stage.kind != CapacityStageKind::Discovery
+                || !stage.passed
+            {
+                return Err(ClusterBenchmarkError::Incompatible(
+                    "reviewed rate is not an exact passing discovery stage in capacity source"
+                        .to_owned(),
+                ));
+            }
+            stage.validate_evidence()?;
+        }
+        Ok(())
+    }
 }
 
 impl CapacityStage {
@@ -760,16 +1080,6 @@ impl ClusterTrialReport {
     }
 }
 
-/// Provenance for a calibrated saturation knee.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KneeProvenance {
-    /// The first failing probe bounded the last passing absolute rate.
-    Discovered,
-    /// The 4,096 request/second cap passed, so the knee is a lower bound.
-    CensoredAtCap,
-}
-
 /// Exact workload identity required for compatible comparison.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -790,11 +1100,6 @@ pub struct ClusterBenchmarkScenario {
     pub query_row_limit: u32,
     /// Absolute public operations offered each second.
     pub offered_requests_per_second: u64,
-    /// Percent of the reference knee represented by the absolute rate.
-    #[serde(skip)]
-    pub offered_load_percent: u8,
-    /// Reference calibration provenance.
-    pub knee_provenance: KneeProvenance,
     /// Warmup duration in seconds.
     pub warmup_seconds: u32,
     /// Measured duration in seconds.
@@ -821,7 +1126,6 @@ impl ClusterBenchmarkScenario {
             || self.rows_per_batch != 64
             || self.query_row_limit != 64
             || self.offered_requests_per_second == 0
-            || !matches!(self.offered_load_percent, 0 | 50 | 75 | 100)
             || self.warmup_seconds != 10
             || self.measured_seconds != 20
             || self.trials != 3
@@ -1165,10 +1469,6 @@ pub struct MedianMetrics {
 pub struct ClusterScenarioReport {
     /// Exact scenario and rate identity.
     pub scenario: ClusterBenchmarkScenario,
-    /// Independently discovered candidate/reference knee.
-    pub discovered_knee_requests_per_second: u64,
-    /// Provenance of the independently discovered knee.
-    pub discovered_knee_provenance: KneeProvenance,
     /// Three independent trials.
     pub trials: Vec<ClusterBenchmarkTrial>,
     /// Complete bounded evidence corresponding one-for-one with `trials`.
@@ -1223,12 +1523,9 @@ impl ClusterScenarioReport {
                         || trial.client.total_query.samples < self.scenario.minimum_samples))
             {
                 return Err(ClusterBenchmarkError::Unsupported(format!(
-                    "scenario={} load_percent={} offered_rps={} knee_rps={} knee_provenance={:?} trial={} has insufficient samples: required={}, planned={}, attempted={}, accepted={}, writes={}, query_ttfb={}, query_total={}, retries={}, backpressure={}, missed={}",
+                    "scenario={} offered_rps={} trial={} has insufficient samples: required={}, planned={}, attempted={}, accepted={}, writes={}, query_ttfb={}, query_total={}, retries={}, backpressure={}, missed={}",
                     self.scenario.scenario_id,
-                    self.scenario.offered_load_percent,
                     self.scenario.offered_requests_per_second,
-                    self.discovered_knee_requests_per_second,
-                    self.discovered_knee_provenance,
                     trial.trial,
                     self.scenario.minimum_samples,
                     trial.client.planned_operations,
@@ -1579,24 +1876,6 @@ fn validate_report_matrix(profile: &BifrostReferenceProfile) -> Result<(), Clust
                 "reference matrix is missing exact scenario `{id}`"
             )));
         }
-        let knee = reports[0].discovered_knee_requests_per_second;
-        let provenance = reports[0].discovered_knee_provenance;
-        if knee < FIRST_PROBE_RATE
-            || (provenance == KneeProvenance::CensoredAtCap && knee != CALIBRATION_RATE_CAP)
-        {
-            return Err(ClusterBenchmarkError::Invalid(format!(
-                "scenario `{id}` has an invalid calibrated knee"
-            )));
-        }
-        if reports.iter().any(|report| {
-            report.discovered_knee_requests_per_second != knee
-                || report.discovered_knee_provenance != provenance
-                || report.scenario.knee_provenance != provenance
-        }) {
-            return Err(ClusterBenchmarkError::Invalid(format!(
-                "scenario `{id}` has inconsistent knee or provenance"
-            )));
-        }
         let mut rates = reports
             .iter()
             .map(|report| report.scenario.offered_requests_per_second)
@@ -1836,19 +2115,6 @@ pub fn median_three_f64(values: &[f64]) -> Result<f64, ClusterBenchmarkError> {
     Ok(values[1])
 }
 
-/// Return the fixed probe duration needed to reach thirty attempted samples.
-///
-/// The result grows from five seconds in five-second increments and never
-/// exceeds forty-five seconds.
-#[must_use]
-pub fn calibration_probe_seconds(rate: u64, operations_per_request: u64) -> Option<u32> {
-    (5..=45).step_by(5).find(|seconds| {
-        rate.saturating_mul(u64::from(*seconds))
-            .saturating_mul(operations_per_request)
-            >= 30
-    })
-}
-
 /// Return the ten immutable flush offsets in a measured 20-second trial.
 #[must_use]
 pub fn measured_flush_offsets_seconds() -> [u64; 10] {
@@ -2052,7 +2318,7 @@ fn scenario_map(profile: &BifrostReferenceProfile) -> BTreeMap<String, &ClusterS
             let scenario = &report.scenario;
             (
                 format!(
-                    "{}:{}:{:?}:{}:{:?}:{}:{}:{}:{:?}:{}:{}:{}:{}:{}:{}",
+                    "{}:{}:{:?}:{}:{:?}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                     scenario.scenario_id,
                     scenario.workload_version,
                     scenario.topology,
@@ -2061,7 +2327,6 @@ fn scenario_map(profile: &BifrostReferenceProfile) -> BTreeMap<String, &ClusterS
                     scenario.rows_per_batch,
                     scenario.query_row_limit,
                     scenario.offered_requests_per_second,
-                    scenario.knee_provenance,
                     scenario.warmup_seconds,
                     scenario.measured_seconds,
                     scenario.trials,
@@ -2154,16 +2419,11 @@ fn evaluate_scaling(
     let mut one = None;
     let mut three = None;
     for report in balanced {
-        if report.discovered_knee_provenance == KneeProvenance::CensoredAtCap {
-            comparison
-                .failures
-                .push("censored knee cannot claim scaling qualification".to_owned());
-            return;
-        }
+        let highest_rate = report.scenario.offered_requests_per_second;
         match report.scenario.topology {
-            ClusterTopology::OnePod => one = Some(report.discovered_knee_requests_per_second),
+            ClusterTopology::OnePod => one = Some(one.unwrap_or(0).max(highest_rate)),
             ClusterTopology::ThreeServersThreeForgeWorkers => {
-                three = Some(report.discovered_knee_requests_per_second);
+                three = Some(three.unwrap_or(0).max(highest_rate));
             }
         }
     }
@@ -2182,18 +2442,79 @@ fn evaluate_scaling(
 mod tests {
     use super::*;
 
+    /// Build one evidence-complete retained stage for qualification selection tests.
+    fn qualification_stage(rate: u64, kind: CapacityStageKind, passed: bool) -> CapacityStage {
+        let operations = [
+            BenchmarkOperation::DurableWrite,
+            BenchmarkOperation::FlushToVisible,
+            BenchmarkOperation::QueryTimeToFirstFrame,
+            BenchmarkOperation::QueryTotal,
+        ];
+        CapacityStage {
+            identity: CapacityStageIdentity {
+                stage_id: format!("stage-{kind:?}-{rate}"),
+                ordinal: u16::try_from(rate).unwrap_or(u16::MAX),
+                tenant_rows: Vec::new(),
+            },
+            kind,
+            offered_requests_per_second: rate,
+            completed_requests_per_second: rate.to_f64().unwrap_or(f64::INFINITY),
+            duration: Duration::from_secs(20),
+            passed,
+            in_flight_cap_exhaustions: 0,
+            stop_reasons: if passed {
+                Vec::new()
+            } else {
+                vec![CapacityLimit::Backpressure]
+            },
+            metrics: fixture_client(),
+            telemetry: PillarTelemetryDelta {
+                status: EvidenceStatus::Complete,
+                ..Default::default()
+            },
+            resources: vec![ProcessResourceEvidence {
+                process_id: ProcessId("pid-test".to_owned()),
+                epoch: 0,
+                hosted_logical_nodes: vec!["server-0".to_owned()],
+                roles: vec![BifrostRuntimeRole::Oracle],
+                cpu_seconds: 1.0,
+                peak_rss_bytes: 1,
+                current_rss_bytes: 1,
+                runtime_busy_seconds: 1.0,
+                runtime_queue_peak: 1,
+            }],
+            dependencies: DependencyTelemetryEvidence {
+                status: EvidenceStatus::Complete,
+                ..Default::default()
+            },
+            traces: operations
+                .into_iter()
+                .map(|operation| TraceManifest {
+                    operation,
+                    representative_trace_ids: vec![format!("trace-{operation:?}")],
+                    critical_path_spans: vec![SpanDistribution {
+                        operation,
+                        samples: 1,
+                        p95_us: 1,
+                        p99_us: 1,
+                    }],
+                })
+                .collect(),
+        }
+    }
+
     /// Proves capacity stages use the exact absolute-rate sequence and one
     /// confirmation after the first failed stage.
     #[test]
     fn capacity_sequence_is_absolute_and_bounded() {
         assert_eq!(
             capacity_rate_sequence(false),
-            vec![100, 200, 300, 500, 750, 1_000, 1_500, 2_000]
+            vec![25, 50, 75, 100, 200, 300, 500, 750, 1_000, 1_500, 2_000]
         );
         assert_eq!(
             capacity_rate_sequence(true),
             vec![
-                100, 200, 300, 500, 750, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000
+                25, 50, 75, 100, 200, 300, 500, 750, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000
             ]
         );
         assert!(requires_failure_confirmation(1));
@@ -2209,10 +2530,149 @@ mod tests {
                 }
             )
         );
+        assert_eq!(capacity_stage_rates(&[true, false]), vec![25, 50, 50, 25]);
+    }
+
+    /// Proves profile roles are selected only from passing discovery stages
+    /// and the near-saturation rate is bound to a passing recovery replay.
+    #[test]
+    fn qualification_profile_selection_is_digest_bound_and_deterministic() {
+        let source = profile();
+        let workload = source.scenarios[0].workload.clone();
+        let mut stages = [25, 50, 75, 100, 200]
+            .into_iter()
+            .map(|rate| qualification_stage(rate, CapacityStageKind::Discovery, true))
+            .collect::<Vec<_>>();
+        stages.push(qualification_stage(
+            300,
+            CapacityStageKind::Discovery,
+            false,
+        ));
+        stages.push(qualification_stage(
+            300,
+            CapacityStageKind::Confirmation,
+            false,
+        ));
+        stages.push(qualification_stage(200, CapacityStageKind::Recovery, true));
+        let candidate = QualificationProfileV2::from_capacity(
+            &source.environment,
+            &workload,
+            &stages,
+            "a".repeat(64),
+        )
+        .expect("passing curve generates a candidate");
         assert_eq!(
-            capacity_stage_rates(&[true, false]),
-            vec![100, 200, 200, 100]
+            candidate
+                .rates
+                .iter()
+                .map(|rate| (rate.role, rate.requests_per_second))
+                .collect::<Vec<_>>(),
+            vec![
+                (QualificationRateRole::Healthy, 25),
+                (QualificationRateRole::TargetOperating, 100),
+                (QualificationRateRole::NearSaturation, 200),
+            ]
         );
+        candidate.validate().expect("candidate remains valid");
+        let mut capacity_report = source.clone();
+        capacity_report.scenarios[0].reports[0].capacity_stages = stages;
+        candidate
+            .validate_capacity_source(&capacity_report)
+            .expect("candidate binds to exact retained source stages");
+    }
+
+    /// Proves insufficient passing rates and malformed role/source bindings
+    /// remain unsupported or incompatible rather than acquiring fallback rates.
+    #[test]
+    fn qualification_profile_refuses_insufficient_or_reordered_sources() {
+        let source = profile();
+        let workload = source.scenarios[0].workload.clone();
+        let stages = vec![
+            qualification_stage(25, CapacityStageKind::Discovery, true),
+            qualification_stage(50, CapacityStageKind::Discovery, true),
+            qualification_stage(75, CapacityStageKind::Discovery, false),
+            qualification_stage(50, CapacityStageKind::Recovery, true),
+        ];
+        assert!(matches!(
+            QualificationProfileV2::from_capacity(
+                &source.environment,
+                &workload,
+                &stages,
+                "b".repeat(64),
+            ),
+            Err(ClusterBenchmarkError::Unsupported(_))
+        ));
+
+        let mut passing = [25, 50, 75, 100, 200]
+            .into_iter()
+            .map(|rate| qualification_stage(rate, CapacityStageKind::Discovery, true))
+            .collect::<Vec<_>>();
+        passing.push(qualification_stage(200, CapacityStageKind::Recovery, true));
+        let mut candidate = QualificationProfileV2::from_capacity(
+            &source.environment,
+            &workload,
+            &passing,
+            "c".repeat(64),
+        )
+        .expect("valid source");
+        candidate.rates.swap(0, 1);
+        assert!(matches!(
+            candidate.validate(),
+            Err(ClusterBenchmarkError::Incompatible(_))
+        ));
+        candidate.rates.swap(0, 1);
+        candidate.source_capacity.selected_stages[0].passed = false;
+        assert!(matches!(
+            candidate.validate(),
+            Err(ClusterBenchmarkError::Incompatible(_))
+        ));
+
+        let mut source_stages = passing;
+        let mut failed_source = qualification_stage(100, CapacityStageKind::Discovery, false);
+        failed_source.identity.stage_id.push_str("-failed");
+        source_stages.push(failed_source);
+        let mut capacity_report = source.clone();
+        capacity_report.scenarios[0].reports[0].capacity_stages = source_stages.clone();
+        let valid = QualificationProfileV2::from_capacity(
+            &source.environment,
+            &workload,
+            &source_stages,
+            "d".repeat(64),
+        )
+        .expect("valid source selects passing discovery identities");
+
+        let mut absent = valid.clone();
+        absent.source_capacity.selected_stages[0].identity.stage_id = "invented-stage".to_owned();
+        assert!(matches!(
+            absent.validate_capacity_source(&capacity_report),
+            Err(ClusterBenchmarkError::Incompatible(_))
+        ));
+
+        let failed = source_stages
+            .iter()
+            .find(|stage| {
+                stage.offered_requests_per_second == 100
+                    && stage.kind == CapacityStageKind::Discovery
+                    && !stage.passed
+            })
+            .expect("failed source fixture");
+        let mut non_passing = valid.clone();
+        non_passing.source_capacity.selected_stages[1].identity = failed.identity.clone();
+        assert!(matches!(
+            non_passing.validate_capacity_source(&capacity_report),
+            Err(ClusterBenchmarkError::Incompatible(_))
+        ));
+
+        let recovery = source_stages
+            .iter()
+            .find(|stage| stage.kind == CapacityStageKind::Recovery)
+            .expect("recovery source fixture");
+        let mut substituted = valid;
+        substituted.source_capacity.selected_stages[2].identity = recovery.identity.clone();
+        assert!(matches!(
+            substituted.validate_capacity_source(&capacity_report),
+            Err(ClusterBenchmarkError::Incompatible(_))
+        ));
     }
 
     /// Proves the concrete state machine confirms the first failure and then
@@ -2221,22 +2681,28 @@ mod tests {
     fn capacity_state_machine_confirms_and_recovers() {
         let mut machine = CapacityStateMachine::canonical();
         let first = machine.next_plan().expect("first discovery exists");
-        assert_eq!(first.offered_requests_per_second, 100);
-        machine.record(first, true).expect("healthy stage records");
+        assert_eq!(first.offered_requests_per_second, 25);
+        machine
+            .record(first, CapacityStageOutcome::Passing)
+            .expect("healthy stage records");
         let second = machine.next_plan().expect("second discovery exists");
-        assert_eq!(second.offered_requests_per_second, 200);
-        machine.record(second, false).expect("failure records");
+        assert_eq!(second.offered_requests_per_second, 50);
+        machine
+            .record(second, CapacityStageOutcome::ControlledBackpressure)
+            .expect("failure records");
         let confirmation = machine.next_plan().expect("confirmation exists");
         assert_eq!(confirmation.kind, CapacityStageKind::Confirmation);
-        assert_eq!(confirmation.offered_requests_per_second, 200);
+        assert_eq!(confirmation.offered_requests_per_second, 50);
         machine
-            .record(confirmation, false)
+            .record(confirmation, CapacityStageOutcome::ControlledBackpressure)
             .expect("confirmation records");
         let recovery = machine.next_plan().expect("recovery exists");
         assert_eq!(recovery.kind, CapacityStageKind::Recovery);
-        assert_eq!(recovery.offered_requests_per_second, 100);
+        assert_eq!(recovery.offered_requests_per_second, 25);
         assert_ne!(recovery.slot, first.slot);
-        machine.record(recovery, true).expect("recovery records");
+        machine
+            .record(recovery, CapacityStageOutcome::Passing)
+            .expect("recovery records");
         assert!(machine.next_plan().is_none());
     }
 
@@ -2245,14 +2711,20 @@ mod tests {
     fn capacity_passing_confirmation_resumes_discovery() {
         let mut machine = CapacityStateMachine::canonical();
         let first = machine.next_plan().unwrap();
-        machine.record(first, true).unwrap();
+        machine
+            .record(first, CapacityStageOutcome::Passing)
+            .unwrap();
         let failed = machine.next_plan().unwrap();
-        machine.record(failed, false).unwrap();
+        machine
+            .record(failed, CapacityStageOutcome::ControlledBackpressure)
+            .unwrap();
         let confirmation = machine.next_plan().unwrap();
-        machine.record(confirmation, true).unwrap();
+        machine
+            .record(confirmation, CapacityStageOutcome::Passing)
+            .unwrap();
         let resumed = machine.next_plan().unwrap();
         assert_eq!(resumed.kind, CapacityStageKind::Discovery);
-        assert_eq!(resumed.offered_requests_per_second, 300);
+        assert_eq!(resumed.offered_requests_per_second, 75);
     }
 
     /// Proves an all-passing curve still ends with a fresh recovery identity.
@@ -2264,14 +2736,14 @@ mod tests {
             let plan = machine.next_plan().unwrap();
             if plan.kind == CapacityStageKind::Recovery {
                 assert_eq!(plan.offered_requests_per_second, 4_000);
-                assert_eq!(plan.slot, 11);
-                machine.record(plan, true).unwrap();
+                assert_eq!(plan.slot, 14);
+                machine.record(plan, CapacityStageOutcome::Passing).unwrap();
                 break;
             }
             discoveries.push(plan.offered_requests_per_second);
-            machine.record(plan, true).unwrap();
+            machine.record(plan, CapacityStageOutcome::Passing).unwrap();
         }
-        assert_eq!(discoveries.len(), 11);
+        assert_eq!(discoveries.len(), 14);
         assert!(machine.next_plan().is_none());
     }
 
@@ -2286,7 +2758,16 @@ mod tests {
                 CapacityStageKind::Confirmation | CapacityStageKind::Recovery => true,
             };
             plans.push(plan);
-            machine.record(plan, passed).unwrap();
+            machine
+                .record(
+                    plan,
+                    if passed {
+                        CapacityStageOutcome::Passing
+                    } else {
+                        CapacityStageOutcome::ControlledBackpressure
+                    },
+                )
+                .unwrap();
         }
         assert_eq!(
             plans
@@ -2356,14 +2837,6 @@ mod tests {
         assert_eq!(median_three_u64(&[9, 1, 5]).unwrap(), 5);
         assert!((median_three_f64(&[9.0, 1.0, 5.0]).unwrap() - 5.0).abs() < f64::EPSILON);
         assert!(median_three_u64(&[1, 2]).is_err());
-    }
-
-    /// Proves calibration extends only as far as required and caps at 45s.
-    #[test]
-    fn calibration_sample_extension_is_bounded() {
-        assert_eq!(calibration_probe_seconds(8, 1), Some(5));
-        assert_eq!(calibration_probe_seconds(1, 1), Some(30));
-        assert_eq!(calibration_probe_seconds(0, 1), None);
     }
 
     /// Proves measured flush cadence is fixed and never shifted.
@@ -2505,8 +2978,6 @@ mod tests {
                 rows_per_batch: 64,
                 query_row_limit: 64,
                 offered_requests_per_second: knee * u64::from(percent) / 100,
-                offered_load_percent: percent,
-                knee_provenance: KneeProvenance::Discovered,
                 warmup_seconds: 10,
                 measured_seconds: 20,
                 trials: 3,
@@ -2514,8 +2985,6 @@ mod tests {
                 max_in_flight: 4096,
                 seed: 0xB1_F057,
             },
-            discovered_knee_requests_per_second: knee,
-            discovered_knee_provenance: KneeProvenance::Discovered,
             trials: (1..=3)
                 .map(|trial| ClusterBenchmarkTrial {
                     trial,
@@ -2674,6 +3143,9 @@ mod tests {
             attempted_operations: 400,
             accepted_operations: 400,
             backpressure_operations: 0,
+            write_backpressure_operations: 0,
+            query_backpressure_operations: 0,
+            backpressure_by_code: BTreeMap::new(),
             retry_operations: 0,
             in_flight_cap_exhaustions: 0,
             max_in_flight: 256,
@@ -2697,24 +3169,6 @@ mod tests {
             read_fairness: 1.0,
             missed_operations: 0,
             missed_flushes: 0,
-        }
-    }
-
-    /// Replace one fixed scenario's knee and derived absolute loads consistently.
-    fn set_knee(
-        profile: &mut BifrostReferenceProfile,
-        scenario_id: &str,
-        knee: u64,
-        provenance: KneeProvenance,
-    ) {
-        for reviewed in &mut profile.scenarios {
-            for report in &mut reviewed.reports {
-                if report.scenario.scenario_id == scenario_id {
-                    report.discovered_knee_requests_per_second = knee;
-                    report.discovered_knee_provenance = provenance;
-                    report.scenario.knee_provenance = provenance;
-                }
-            }
         }
     }
 
@@ -2807,7 +3261,6 @@ mod tests {
             report.validate_reference(),
             Err(ClusterBenchmarkError::NotReady(_))
         ));
-        assert_eq!(FIRST_PROBE_RATE, 8);
     }
 
     /// Proves exact-rate identity mismatches refuse comparison.
@@ -2861,33 +3314,6 @@ mod tests {
         assert!(!comparison.ready);
     }
 
-    /// Proves a censored knee cannot claim scaling qualification.
-    #[test]
-    fn censored_knee_is_unsupported_for_scaling() {
-        let mut before = profile();
-        let mut after = profile();
-        set_knee(
-            &mut before,
-            "balanced-one-pod-eight-tenants",
-            CALIBRATION_RATE_CAP,
-            KneeProvenance::CensoredAtCap,
-        );
-        set_knee(
-            &mut after,
-            "balanced-one-pod-eight-tenants",
-            CALIBRATION_RATE_CAP,
-            KneeProvenance::CensoredAtCap,
-        );
-        let comparison = compare_cluster_profiles(&before, &after);
-        assert!(!comparison.ready);
-        assert!(
-            comparison
-                .failures
-                .iter()
-                .any(|failure| failure.contains("censored"))
-        );
-    }
-
     /// Proves all exact relative thresholds pass at the boundary and fail beyond it.
     #[test]
     fn regression_threshold_boundaries_are_inclusive() {
@@ -2916,26 +3342,5 @@ mod tests {
             .durable_rows_per_second = 899.9;
         synchronize_fixture_trials(&mut boundary.scenarios[0].reports[0]);
         assert!(!compare_cluster_profiles(&before, &boundary).ready);
-    }
-
-    /// Proves three-pod scaling must reach at least 75 percent efficiency.
-    #[test]
-    fn scaling_efficiency_boundary_is_enforced() {
-        let before = profile();
-        let mut after = profile();
-        set_knee(
-            &mut after,
-            "balanced-three-server-three-worker-eight-tenants",
-            225,
-            KneeProvenance::Discovered,
-        );
-        assert!(compare_cluster_profiles(&before, &after).ready);
-        set_knee(
-            &mut after,
-            "balanced-three-server-three-worker-eight-tenants",
-            224,
-            KneeProvenance::Discovered,
-        );
-        assert!(!compare_cluster_profiles(&before, &after).ready);
     }
 }

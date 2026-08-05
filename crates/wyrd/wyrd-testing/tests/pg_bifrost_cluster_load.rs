@@ -1,7 +1,7 @@
 //! Deterministic public-Gate Bifrost cluster matrix journeys.
 
 #[cfg(feature = "bench")]
-use wyrd_bench::{EvidenceStatus, KneeProvenance};
+use wyrd_bench::EvidenceStatus;
 use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster};
 use wyrd_testing::load::{BifrostClusterLoad, ClusterLoadProfile};
 
@@ -173,16 +173,10 @@ async fn three_server_cluster_reconciles_production_telemetry() {
 #[cfg(feature = "bench")]
 async fn three_server_cluster_reconciles_production_telemetry() {
     let definition = wyrd_testing::bifrost::bench_cluster::reference_scenario_matrix()[2];
-    let (scenario, trial) = wyrd_testing::bifrost::bench_cluster::run_reference_trial(
-        definition,
-        20,
-        100,
-        1,
-        20,
-        KneeProvenance::Discovered,
-    )
-    .await
-    .expect("canonical sampled production telemetry reconciles");
+    let (scenario, trial) =
+        wyrd_testing::bifrost::bench_cluster::run_reference_trial(definition, 20, 1)
+            .await
+            .expect("canonical sampled production telemetry reconciles");
     assert_eq!(scenario.tenants, 8);
     assert_eq!(
         trial.production.required_telemetry,

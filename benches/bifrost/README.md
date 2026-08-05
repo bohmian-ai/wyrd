@@ -10,7 +10,7 @@ bench:bifrost:components
 ```
 
 Capacity is a bounded diagnostic sweep. It runs the absolute offered-rate
-sequence `100,200,300,500,750,1000,1500,2000` and may continue at
+sequence `25,50,75,100,200,300,500,750,1000,1500,2000` and may continue at
 `2500,3000,4000` while every stage remains healthy. A failed stage is retained,
 the next stage confirms the stop predicate, and the highest healthy rate is
 replayed for recovery. The four-rate shortened smoke (`100,300,500,1000`) is

@@ -439,9 +439,9 @@ async fn run_capacity_selected(
                 .await
                 .map_err(|_| "capacity stage exceeded its 30-second bound")??;
                 let stage = assemble_capacity_stage(definition, plan, result, 20);
-                session.record_stage(plan, capacity_stage_outcome(&stage))?;
-                complete_current_probe(&mut attempted_probes, &stage.stop_reasons);
-                stages.push(stage);
+                let outcome =
+                    retain_completed_capacity_stage(&mut stages, &mut attempted_probes, stage);
+                session.record_stage(plan, outcome)?;
             }
             session.reconcile_cumulative().await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -686,6 +686,22 @@ fn capacity_stage_outcome(stage: &CapacityStage) -> CapacityStageOutcome {
     } else {
         CapacityStageOutcome::Invalid
     }
+}
+
+/// Retain one fully assembled stage and its exact probe reasons before transition.
+///
+/// This ordering ensures a state-machine refusal cannot discard completed
+/// diagnostic evidence from the partial capacity artifact.
+#[must_use]
+fn retain_completed_capacity_stage(
+    stages: &mut Vec<CapacityStage>,
+    attempted_probes: &mut [AttemptedProbe],
+    stage: CapacityStage,
+) -> CapacityStageOutcome {
+    let outcome = capacity_stage_outcome(&stage);
+    complete_current_probe(attempted_probes, &stage.stop_reasons);
+    stages.push(stage);
+    outcome
 }
 
 /// Derive the report identity from the same ordinal used to write public frames.
@@ -3828,6 +3844,53 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    /// Proves a completed invalid stage reaches the partial artifact before
+    /// the state machine returns its non-saturation `NotReady` error.
+    #[test]
+    fn invalid_completed_stage_is_retained_before_transition_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial-invalid-stage.json");
+        let environment = diagnostic_environment_fixture();
+        let definition = reference_scenario_matrix()[0];
+        let plan = CapacityStagePlan {
+            slot: 2,
+            offered_requests_per_second: 75,
+            kind: wyrd_bench::CapacityStageKind::Discovery,
+        };
+        let invalid =
+            assemble_capacity_stage(definition, plan, completed_stage_fixture(0, false), 20);
+        assert_eq!(invalid.stop_reasons, vec![CapacityLimit::InvalidEvidence]);
+        let mut probes = Vec::new();
+        begin_probe(&mut probes, definition.id.to_owned(), 75);
+        let mut stages = Vec::new();
+        let outcome = retain_completed_capacity_stage(&mut stages, &mut probes, invalid);
+        let mut machine = CapacityStateMachine::for_rates(vec![75]);
+        let transition = machine.record(plan, outcome);
+        assert!(matches!(
+            &transition,
+            Err(ClusterBenchmarkError::NotReady(_))
+        ));
+        write_partial_capture(
+            &path,
+            &environment,
+            &transition.expect_err("invalid transition").to_string(),
+            probes,
+            vec![capacity_scenario_report(definition, stages)],
+        )
+        .unwrap();
+        let report: BifrostDiagnosticReport =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(report.attempted_probes[0].completed);
+        assert_eq!(
+            report.attempted_probes[0].stop_reasons,
+            vec![CapacityLimit::InvalidEvidence]
+        );
+        assert_eq!(
+            report.scenarios[0].reports[0].capacity_stages[0].stop_reasons,
+            vec![CapacityLimit::InvalidEvidence]
         );
     }
 

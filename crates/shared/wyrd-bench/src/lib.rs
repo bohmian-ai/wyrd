@@ -22,12 +22,13 @@ pub use cluster::{
     PLANNED_FLUSHES_PER_TRIAL, PillarTelemetryDelta, ProcessId, ProcessResourceEvidence,
     ProductionTelemetryEvidence, ProfileCompatibility, QUALIFICATION_PROFILE_VERSION,
     QualificationProfileV2, QualificationRateRole, ROUTING_POLICY, ReviewedCapacitySource,
-    ReviewedPassingStage, ReviewedQualificationRate, ReviewedScenarioProfile, SMOKE_CAPACITY_RATES,
-    SpanDistribution, TenantStageRows, TraceManifest, TrafficMix, TrialDistribution,
-    capacity_rate_sequence, capacity_stage_rates, classify_cpu_vendor, compare_cluster_profiles,
-    derive_trial_median, extract_linux_cpu_identity, extract_macos_cpu_identity, jain_fairness,
-    measured_flush_offsets_seconds, median_three_f64, median_three_u64, normalize_cpu_model,
-    qualification_preflight_seconds, requires_failure_confirmation,
+    ReviewedQualificationRate, ReviewedScenarioProfile, ReviewedScenarioQualification,
+    ReviewedStageRef, SMOKE_CAPACITY_RATES, SpanDistribution, TenantStageRows, TraceManifest,
+    TrafficMix, TrialDistribution, capacity_rate_sequence, capacity_stage_rates,
+    classify_cpu_vendor, compare_cluster_profiles, derive_trial_median, extract_linux_cpu_identity,
+    extract_macos_cpu_identity, jain_fairness, measured_flush_offsets_seconds, median_three_f64,
+    median_three_u64, normalize_cpu_model, qualification_preflight_seconds,
+    requires_failure_confirmation,
 };
 
 pub use lane::{

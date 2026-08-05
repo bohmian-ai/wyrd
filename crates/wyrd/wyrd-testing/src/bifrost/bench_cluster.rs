@@ -251,6 +251,70 @@ pub const fn reference_scenario_matrix() -> [ReferenceScenarioDefinition; 6] {
     ]
 }
 
+/// One fully validated scenario-local qualification route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QualificationScenarioPlan {
+    /// Canonical scenario definition in repository execution order.
+    definition: ReferenceScenarioDefinition,
+    /// Exact reviewed rates owned by this scenario.
+    rates: Vec<u64>,
+}
+
+/// Resolve and validate the complete qualification selection before any IO.
+///
+/// # Errors
+/// Returns [`ClusterBenchmarkError::Incompatible`] when command authority is
+/// ambiguous or any selected entry differs from its exact canonical workload.
+fn qualification_execution_plan(
+    profile: &QualificationProfileV2,
+    selected_scenario: Option<&str>,
+    matrix: bool,
+) -> Result<Vec<QualificationScenarioPlan>, ClusterBenchmarkError> {
+    profile.validate()?;
+    if matrix {
+        if selected_scenario.is_some() {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "qualification selection cannot combine matrix and scenario authority".to_owned(),
+            ));
+        }
+        profile.validate_matrix()?;
+    } else if selected_scenario.is_none() {
+        return Err(ClusterBenchmarkError::Incompatible(
+            "qualification selection requires one scenario or matrix authority".to_owned(),
+        ));
+    }
+    reference_scenario_matrix()
+        .into_iter()
+        .filter(|definition| matrix || selected_scenario == Some(definition.id))
+        .map(|definition| {
+            let reviewed = profile.scenario(definition.id)?;
+            let workload = &reviewed.qualification_workload;
+            if workload.scenario_id != definition.id
+                || workload.topology != definition.topology
+                || workload.tenants != definition.tenants
+                || workload.traffic != definition.traffic
+                || workload.rows_per_batch != 64
+                || workload.query_row_limit != 64
+                || workload.tables_per_tenant != 18
+                || workload.trial_count != 3
+            {
+                return Err(ClusterBenchmarkError::Incompatible(format!(
+                    "reviewed workload does not exactly match scenario {}",
+                    definition.id
+                )));
+            }
+            Ok(QualificationScenarioPlan {
+                definition,
+                rates: reviewed
+                    .rates
+                    .iter()
+                    .map(|rate| rate.requests_per_second)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 /// Run qualification with the parsed public selector.
 ///
 /// # Errors
@@ -269,15 +333,15 @@ async fn run_qualification_selected(
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let path = report_path("cluster-candidate.json");
     let environment = detect_reference_environment_or_write(&path)?;
-    let rates = load_reviewed_qualification_rates(&environment)?;
-    wyrd_bench::qualification_preflight_seconds(rates.len(), 20, 180, 1_200)?;
+    let qualification = load_reviewed_qualification_profile(&environment)?;
+    let execution_plan = qualification_execution_plan(&qualification, selected_scenario, matrix)?;
     let mut reports = Vec::new();
     let mut attempted_probes = Vec::new();
     let mut current_partial = None;
-    for definition in reference_scenario_matrix() {
-        if !matrix && selected_scenario != Some(definition.id) {
-            continue;
-        }
+    for item in execution_plan {
+        let definition = item.definition;
+        let rates = item.rates;
+        wyrd_bench::qualification_preflight_seconds(rates.len(), 20, 180, 1_200)?;
         let session = CapacityScenarioSession::start_with_tables(
             definition,
             qualification_table_names(rates.len()),
@@ -3207,24 +3271,24 @@ fn repository_root() -> PathBuf {
 /// Returns `Unsupported` when the checked-in profile is absent, malformed,
 /// incompatible with the live environment, or no longer matches the retained
 /// canonical capacity artifact.
-fn load_reviewed_qualification_rates(
+fn load_reviewed_qualification_profile(
     environment: &BenchmarkEnvironment,
-) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<QualificationProfileV2, Box<dyn std::error::Error + Send + Sync>> {
     let profile_path = repository_root().join("benches/bifrost/qualification-profile-v2.json");
     let capacity_path = repository_root().join("target/bifrost-benchmarks/cluster-capacity.json");
-    load_reviewed_qualification_rates_from_paths(environment, &profile_path, &capacity_path)
+    load_reviewed_qualification_profile_from_paths(environment, &profile_path, &capacity_path)
 }
 
 /// Load reviewed rates from explicit paths for deterministic source-binding tests.
 ///
 /// # Errors
 /// Returns the same profile, environment, digest, report, and membership
-/// failures as [`load_reviewed_qualification_rates`].
-fn load_reviewed_qualification_rates_from_paths(
+/// failures as [`load_reviewed_qualification_profile`].
+fn load_reviewed_qualification_profile_from_paths(
     environment: &BenchmarkEnvironment,
     profile_path: &Path,
     capacity_path: &Path,
-) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<QualificationProfileV2, Box<dyn std::error::Error + Send + Sync>> {
     let bytes = std::fs::read(profile_path).map_err(|error| {
         ClusterBenchmarkError::Unsupported(format!(
             "reviewed qualification profile {} is unavailable: {error}",
@@ -3250,11 +3314,7 @@ fn load_reviewed_qualification_rates_from_paths(
         let capacity_report: BifrostReferenceProfile = serde_json::from_slice(&capacity_bytes)?;
         profile.validate_capacity_source(&capacity_report)?;
     }
-    Ok(profile
-        .rates
-        .iter()
-        .map(|rate| rate.requests_per_second)
-        .collect())
+    Ok(profile)
 }
 
 /// Generate a non-authoritative candidate beside benchmark captures.
@@ -3265,31 +3325,8 @@ fn write_qualification_profile_candidate(
     capacity_path: &Path,
     report: &BifrostReferenceProfile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let source = report
-        .scenarios
-        .iter()
-        .find(|scenario| scenario.scenario_id == "balanced-three-server-three-worker-eight-tenants")
-        .or_else(|| report.scenarios.first())
-        .ok_or_else(|| {
-            ClusterBenchmarkError::Unsupported(
-                "capacity report contains no scenario eligible for profile generation".to_owned(),
-            )
-        })?;
-    let stages = source
-        .reports
-        .first()
-        .map(|scenario| scenario.capacity_stages.as_slice())
-        .ok_or_else(|| {
-            ClusterBenchmarkError::Unsupported(
-                "capacity report contains no retained stage curve".to_owned(),
-            )
-        })?;
-    let candidate = QualificationProfileV2::from_capacity(
-        &report.environment,
-        &source.workload,
-        stages,
-        sha256_file(capacity_path)?,
-    )?;
+    let candidate =
+        QualificationProfileV2::from_capacity_report(report, sha256_file(capacity_path)?)?;
     let candidate_path =
         repository_root().join("target/bifrost-benchmarks/qualification-profile-v2.candidate.json");
     if let Some(parent) = candidate_path.parent() {
@@ -3577,6 +3614,98 @@ mod tests {
         assert_eq!(tables.iter().collect::<BTreeSet<_>>().len(), tables.len());
     }
 
+    /// Build six independently qualified scenario entries for routing tests.
+    fn qualification_profile_fixture() -> QualificationProfileV2 {
+        let environment = diagnostic_environment_fixture();
+        let reports = reference_scenario_matrix()
+            .into_iter()
+            .enumerate()
+            .map(|(index, definition)| {
+                let discovery = if index == 1 {
+                    vec![25, 50, 75]
+                } else {
+                    vec![25, 50, 75, 100, 200]
+                };
+                let recovery = *discovery.last().expect("fixture has discovery rates");
+                let mut stages = discovery
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, rate)| {
+                        assemble_capacity_stage(
+                            definition,
+                            CapacityStagePlan {
+                                slot: u16::try_from(slot).expect("bounded fixture slot"),
+                                offered_requests_per_second: rate,
+                                kind: wyrd_bench::CapacityStageKind::Discovery,
+                            },
+                            completed_stage_fixture(0, true),
+                            20,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                stages.push(assemble_capacity_stage(
+                    definition,
+                    CapacityStagePlan {
+                        slot: u16::try_from(stages.len()).expect("bounded fixture slot"),
+                        offered_requests_per_second: recovery,
+                        kind: wyrd_bench::CapacityStageKind::Recovery,
+                    },
+                    completed_stage_fixture(0, true),
+                    20,
+                ));
+                capacity_scenario_report(definition, stages)
+            })
+            .collect();
+        let report = BifrostReferenceProfile {
+            schema_version: CLUSTER_REPORT_VERSION.to_owned(),
+            environment: environment.clone(),
+            scenarios: reviewed_scenario_profiles(
+                reports,
+                &environment_storage_identity(&environment),
+            ),
+            slos: BifrostSloEnvelope::default(),
+        };
+        QualificationProfileV2::from_capacity_report(&report, "a".repeat(64))
+            .expect("six-scenario fixture qualifies")
+    }
+
+    /// Proves all matrix routes validate before a startup loop can begin.
+    #[test]
+    fn qualification_preflight_rejects_final_workload_before_any_start() {
+        let mut profile = qualification_profile_fixture();
+        profile
+            .scenarios
+            .last_mut()
+            .expect("sixth scenario exists")
+            .qualification_workload
+            .query_row_limit = 65;
+        let mut starts = 0_u8;
+        match qualification_execution_plan(&profile, None, true) {
+            Ok(plan) => {
+                for _ in plan {
+                    starts = starts.saturating_add(1);
+                }
+                panic!("malformed final workload must fail preflight");
+            }
+            Err(ClusterBenchmarkError::Incompatible(_)) => {}
+            Err(error) => panic!("unexpected preflight error: {error}"),
+        }
+        assert_eq!(starts, 0);
+    }
+
+    /// Proves production preflight preserves distinct scenario-owned rates.
+    #[test]
+    fn qualification_preflight_routes_distinct_local_rates() {
+        let profile = qualification_profile_fixture();
+        let plan =
+            qualification_execution_plan(&profile, None, true).expect("complete matrix preflights");
+        assert_eq!(plan.len(), 6);
+        assert_eq!(plan[0].rates, vec![25, 100, 200]);
+        assert_eq!(plan[1].rates, vec![25, 50, 75]);
+        assert_eq!(plan[0].definition.id, "balanced-one-pod-one-tenant");
+        assert_eq!(plan[1].definition.id, "balanced-one-pod-eight-tenants");
+    }
+
     /// Proves an existing digest-matched source is deserialized and every
     /// reviewed rate is checked against retained stage membership.
     #[test]
@@ -3619,11 +3748,8 @@ mod tests {
             slos: BifrostSloEnvelope::default(),
         };
         let capacity_bytes = serde_json::to_vec(&capacity_report).expect("capacity fixture JSON");
-        let source = &capacity_report.scenarios[0];
-        let profile = QualificationProfileV2::from_capacity(
-            &environment,
-            &source.workload,
-            &stages,
+        let profile = QualificationProfileV2::from_capacity_report(
+            &capacity_report,
             sha256_bytes(&capacity_bytes).expect("fixture digest"),
         )
         .expect("valid qualification fixture");
@@ -3637,26 +3763,29 @@ mod tests {
         )
         .expect("write profile fixture");
         assert_eq!(
-            load_reviewed_qualification_rates_from_paths(
+            load_reviewed_qualification_profile_from_paths(
                 &environment,
                 &profile_path,
                 &capacity_path,
             )
-            .expect("exact source membership loads"),
-            vec![25, 100, 200]
+            .expect("exact source membership loads")
+            .scenarios[0]
+                .rates
+                .iter()
+                .map(|rate| rate.requests_per_second)
+                .collect::<Vec<_>>(),
+            vec![25, 100, 200],
         );
 
         let mut invented = profile;
-        invented.source_capacity.selected_stages[0]
-            .identity
-            .stage_id = "invented-stage".to_owned();
+        invented.scenarios[0].selected_stages[0].stage_id = "invented-stage".to_owned();
         std::fs::write(
             &profile_path,
             serde_json::to_vec(&invented).expect("tampered profile JSON"),
         )
         .expect("write tampered profile fixture");
         assert!(
-            load_reviewed_qualification_rates_from_paths(
+            load_reviewed_qualification_profile_from_paths(
                 &environment,
                 &profile_path,
                 &capacity_path,

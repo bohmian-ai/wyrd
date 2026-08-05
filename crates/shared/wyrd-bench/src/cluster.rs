@@ -545,35 +545,51 @@ pub struct ReviewedQualificationRate {
     pub role: QualificationRateRole,
 }
 
-/// Passing source-stage identity retained for review and replay validation.
+/// Compact identity for one reviewed passing discovery stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReviewedPassingStage {
-    /// Exact capacity stage identity from the canonical report.
-    pub identity: CapacityStageIdentity,
-    /// Absolute passing rate represented by the stage.
+pub struct ReviewedStageRef {
+    /// Scenario that owns the stage.
+    pub scenario_id: String,
+    /// Stable scenario-local stage identifier.
+    pub stage_id: String,
+    /// Strictly increasing scenario-local ordinal.
+    pub ordinal: u16,
+    /// Absolute offered request rate.
     pub requests_per_second: u64,
-    /// Explicit source status; reviewed stages must always remain passing.
+    /// Capacity-stage role.
+    pub kind: CapacityStageKind,
+    /// Explicit reviewed passing status.
     pub passed: bool,
 }
 
-/// Digest-bound provenance for one generated qualification profile.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Digest-bound provenance shared by every scenario entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewedCapacitySource {
     /// Exact schema of the source capacity report.
     pub report_schema_version: String,
     /// Lowercase SHA-256 of the complete source artifact bytes.
     pub artifact_sha256: String,
-    /// Exact environment copied from the source report.
-    pub environment: BenchmarkEnvironment,
-    /// Exact scenario workload copied from the source report.
-    pub workload: ClusterWorkloadIdentity,
-    /// Complete passing source identity for every selected role.
-    pub selected_stages: Vec<ReviewedPassingStage>,
 }
 
-/// Human-reviewable absolute-rate profile generated from canonical capacity.
+/// One independently derived qualification curve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedScenarioQualification {
+    /// Stable scenario identity used for exact routing.
+    pub scenario_id: String,
+    /// Exact capacity workload from which this entry was derived.
+    pub source_workload: ClusterWorkloadIdentity,
+    /// Exact three-rate workload permitted for qualification.
+    pub qualification_workload: ClusterWorkloadIdentity,
+    /// One absolute rate for each closed qualification role.
+    pub rates: Vec<ReviewedQualificationRate>,
+    /// Compact reviewed identities for the selected discovery stages.
+    pub selected_stages: Vec<ReviewedStageRef>,
+}
+
+/// Human-reviewable per-scenario profile generated from canonical capacity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationProfileV2 {
@@ -581,81 +597,242 @@ pub struct QualificationProfileV2 {
     pub schema_version: String,
     /// Exact compatible environment identity.
     pub environment: BenchmarkEnvironment,
-    /// Exact compatible workload identity with the three selected rates.
-    pub workload: ClusterWorkloadIdentity,
     /// Digest-bound source capacity evidence.
     pub source_capacity: ReviewedCapacitySource,
-    /// Exactly one absolute rate per qualification role.
-    pub rates: Vec<ReviewedQualificationRate>,
+    /// Independently derived scenario qualification entries.
+    pub scenarios: Vec<ReviewedScenarioQualification>,
 }
 
 impl QualificationProfileV2 {
-    /// Generate the deterministic three-role candidate from one capacity scenario.
+    /// Generate independent qualification entries for every capacity scenario.
     ///
     /// # Errors
-    /// Returns [`ClusterBenchmarkError::Unsupported`] when fewer than three
-    /// distinct canonical discovery rates pass, recovery is absent or failed,
-    /// or no passing target rate satisfies the seventy-percent headroom rule.
-    pub fn from_capacity(
-        environment: &BenchmarkEnvironment,
-        workload: &ClusterWorkloadIdentity,
-        stages: &[CapacityStage],
+    /// Returns an error when any scenario lacks a qualifying curve.
+    pub fn from_capacity_report(
+        report: &BifrostReferenceProfile,
         artifact_sha256: String,
     ) -> Result<Self, ClusterBenchmarkError> {
-        let recovery_rate = stages
+        let scenarios = report
+            .scenarios
+            .iter()
+            .map(Self::scenario_from_capacity)
+            .collect::<Result<Vec<_>, _>>()?;
+        let candidate = Self {
+            schema_version: QUALIFICATION_PROFILE_VERSION.to_owned(),
+            environment: report.environment.clone(),
+            source_capacity: ReviewedCapacitySource {
+                report_schema_version: report.schema_version.clone(),
+                artifact_sha256,
+            },
+            scenarios,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    /// Validate all per-scenario identities, curves, roles, and digest shape.
+    ///
+    /// # Errors
+    /// Returns an error for malformed or cross-scenario data.
+    pub fn validate(&self) -> Result<(), ClusterBenchmarkError> {
+        if self.schema_version != QUALIFICATION_PROFILE_VERSION
+            || self.source_capacity.report_schema_version != CLUSTER_REPORT_VERSION
+            || self.source_capacity.artifact_sha256.len() != 64
+            || !self
+                .source_capacity
+                .artifact_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.scenarios.is_empty()
+        {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "qualification profile schema, digest, or scenario set is invalid".to_owned(),
+            ));
+        }
+        let mut ids = HashSet::new();
+        for scenario in &self.scenarios {
+            if !ids.insert(scenario.scenario_id.as_str()) {
+                return Err(ClusterBenchmarkError::Incompatible(
+                    "qualification profile contains duplicate scenarios".to_owned(),
+                ));
+            }
+            scenario.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Require exact coverage of the six canonical matrix scenarios.
+    ///
+    /// # Errors
+    /// Returns an error unless exactly the canonical six are present.
+    pub fn validate_matrix(&self) -> Result<(), ClusterBenchmarkError> {
+        self.validate()?;
+        let expected = fixed_scenarios()
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect::<HashSet<_>>();
+        let actual = self
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.scenario_id.as_str())
+            .collect::<HashSet<_>>();
+        if actual != expected || self.scenarios.len() != expected.len() {
+            return Err(ClusterBenchmarkError::Unsupported(
+                "qualification matrix requires exactly the six canonical scenarios".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve one reviewed scenario entry.
+    ///
+    /// # Errors
+    /// Returns an error when the scenario is missing or duplicated.
+    pub fn scenario(
+        &self,
+        scenario_id: &str,
+    ) -> Result<&ReviewedScenarioQualification, ClusterBenchmarkError> {
+        let matches = self
+            .scenarios
+            .iter()
+            .filter(|scenario| scenario.scenario_id == scenario_id)
+            .collect::<Vec<_>>();
+        let [scenario] = matches.as_slice() else {
+            return Err(ClusterBenchmarkError::Incompatible(format!(
+                "qualification profile does not contain exactly one entry for {scenario_id}"
+            )));
+        };
+        Ok(scenario)
+    }
+
+    /// Resolve T19's distributed target-operating rate.
+    ///
+    /// # Errors
+    /// Returns an error when the distributed scenario or role is unavailable.
+    pub fn distributed_target_operating_rate(&self) -> Result<u64, ClusterBenchmarkError> {
+        self.scenario("balanced-three-server-three-worker-eight-tenants")?
+            .rate(QualificationRateRole::TargetOperating)
+    }
+
+    /// Validate compact stage references against the digest-verified report.
+    ///
+    /// # Errors
+    /// Returns an error for any source or selected-stage mismatch.
+    pub fn validate_capacity_source(
+        &self,
+        report: &BifrostReferenceProfile,
+    ) -> Result<(), ClusterBenchmarkError> {
+        self.validate()?;
+        if report.schema_version != self.source_capacity.report_schema_version
+            || report.environment != self.environment
+            || report.scenarios.len() != self.scenarios.len()
+        {
+            return Err(ClusterBenchmarkError::Incompatible(
+                "capacity source schema, environment, or scenarios differ".to_owned(),
+            ));
+        }
+        for reviewed in &self.scenarios {
+            let matches = report
+                .scenarios
+                .iter()
+                .filter(|scenario| scenario.workload == reviewed.source_workload)
+                .collect::<Vec<_>>();
+            let [source] = matches.as_slice() else {
+                return Err(ClusterBenchmarkError::Incompatible(
+                    "capacity source must contain exactly one matching workload".to_owned(),
+                ));
+            };
+            for selected in &reviewed.selected_stages {
+                let stages = source
+                    .reports
+                    .iter()
+                    .flat_map(|report| &report.capacity_stages)
+                    .filter(|stage| {
+                        stage.identity.stage_id == selected.stage_id
+                            && stage.identity.ordinal == selected.ordinal
+                    })
+                    .collect::<Vec<_>>();
+                let [stage] = stages.as_slice() else {
+                    return Err(ClusterBenchmarkError::Incompatible(
+                        "reviewed stage is absent or duplicated".to_owned(),
+                    ));
+                };
+                if selected.scenario_id != reviewed.scenario_id
+                    || selected.requests_per_second != stage.offered_requests_per_second
+                    || selected.kind != stage.kind
+                    || selected.passed != stage.passed
+                    || stage.kind != CapacityStageKind::Discovery
+                    || !stage.passed
+                {
+                    return Err(ClusterBenchmarkError::Incompatible(
+                        "reviewed stage is not an exact passing discovery stage".to_owned(),
+                    ));
+                }
+                stage.validate_evidence()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Derive one scenario-local three-role entry.
+    ///
+    /// # Errors
+    /// Returns an error when capacity evidence cannot supply the three roles.
+    fn scenario_from_capacity(
+        scenario: &ReviewedScenarioProfile,
+    ) -> Result<ReviewedScenarioQualification, ClusterBenchmarkError> {
+        let stages = scenario
+            .reports
+            .iter()
+            .flat_map(|report| &report.capacity_stages)
+            .collect::<Vec<_>>();
+        let recovery = stages
             .iter()
             .rev()
             .find(|stage| stage.kind == CapacityStageKind::Recovery && stage.passed)
             .map(|stage| stage.offered_requests_per_second)
             .ok_or_else(|| {
                 ClusterBenchmarkError::Unsupported(
-                    "capacity source lacks a passing recovery replay".to_owned(),
+                    "capacity source lacks passing recovery".to_owned(),
                 )
             })?;
         let passing = CANONICAL_CAPACITY_RATES
             .iter()
             .filter_map(|rate| {
-                stages.iter().find(|stage| {
-                    stage.offered_requests_per_second == *rate
-                        && stage.passed
-                        && stage.kind == CapacityStageKind::Discovery
-                })
+                stages
+                    .iter()
+                    .find(|stage| {
+                        stage.kind == CapacityStageKind::Discovery
+                            && stage.passed
+                            && stage.offered_requests_per_second == *rate
+                    })
+                    .copied()
             })
             .collect::<Vec<_>>();
-        if passing.len() < 3
-            || passing
-                .last()
-                .map(|stage| stage.offered_requests_per_second)
-                != Some(recovery_rate)
-        {
+        let healthy = passing.first().copied().ok_or_else(|| {
+            ClusterBenchmarkError::Unsupported("capacity source lacks passing discovery".to_owned())
+        })?;
+        let near = passing.last().copied().ok_or_else(|| {
+            ClusterBenchmarkError::Unsupported("capacity source lacks passing discovery".to_owned())
+        })?;
+        if passing.len() < 3 || near.offered_requests_per_second != recovery {
             return Err(ClusterBenchmarkError::Unsupported(
-                "capacity source has fewer than three qualifying rates or recovery does not replay the highest passing rate".to_owned(),
+                "capacity curve or recovery is insufficient".to_owned(),
             ));
         }
-        let Some(&healthy) = passing.first() else {
-            return Err(ClusterBenchmarkError::Unsupported(
-                "capacity source has no passing healthy rate".to_owned(),
-            ));
-        };
-        let Some(&near) = passing.last() else {
-            return Err(ClusterBenchmarkError::Unsupported(
-                "capacity source has no passing near-saturation rate".to_owned(),
-            ));
-        };
-        let target_ceiling = near.offered_requests_per_second.saturating_mul(70) / 100;
+        let ceiling = near.offered_requests_per_second.saturating_mul(70) / 100;
         let target = passing
             .iter()
             .rev()
             .find(|stage| {
                 stage.offered_requests_per_second > healthy.offered_requests_per_second
                     && stage.offered_requests_per_second < near.offered_requests_per_second
-                    && stage.offered_requests_per_second <= target_ceiling
+                    && stage.offered_requests_per_second <= ceiling
             })
             .copied()
             .ok_or_else(|| {
                 ClusterBenchmarkError::Unsupported(
-                    "capacity source has no passing target rate within required headroom"
-                        .to_owned(),
+                    "capacity source lacks target headroom".to_owned(),
                 )
             })?;
         let selected = [healthy, target, near];
@@ -674,149 +851,94 @@ impl QualificationProfileV2 {
             role,
         })
         .collect::<Vec<_>>();
-        let mut qualification_workload = workload.clone();
+        let mut qualification_workload = scenario.workload.clone();
         qualification_workload.ordered_rates =
             rates.iter().map(|rate| rate.requests_per_second).collect();
         qualification_workload.trial_count = 3;
         qualification_workload.tables_per_tenant = 18;
-        let source_capacity = ReviewedCapacitySource {
-            report_schema_version: CLUSTER_REPORT_VERSION.to_owned(),
-            artifact_sha256,
-            environment: environment.clone(),
-            workload: workload.clone(),
+        Ok(ReviewedScenarioQualification {
+            scenario_id: scenario.workload.scenario_id.clone(),
+            source_workload: scenario.workload.clone(),
+            qualification_workload,
+            rates,
             selected_stages: selected
                 .into_iter()
-                .map(|stage| ReviewedPassingStage {
-                    identity: stage.identity.clone(),
+                .map(|stage| ReviewedStageRef {
+                    scenario_id: scenario.workload.scenario_id.clone(),
+                    stage_id: stage.identity.stage_id.clone(),
+                    ordinal: stage.identity.ordinal,
                     requests_per_second: stage.offered_requests_per_second,
+                    kind: stage.kind,
                     passed: stage.passed,
                 })
                 .collect(),
-        };
-        let candidate = Self {
-            schema_version: QUALIFICATION_PROFILE_VERSION.to_owned(),
-            environment: environment.clone(),
-            workload: qualification_workload,
-            source_capacity,
-            rates,
-        };
-        candidate.validate()?;
-        Ok(candidate)
+        })
     }
+}
 
-    /// Validate identities, digest shape, roles, ordering, and source binding.
+impl ReviewedScenarioQualification {
+    /// Validate this scenario-local curve and workload relationship.
     ///
     /// # Errors
-    /// Returns [`ClusterBenchmarkError::Incompatible`] for any malformed,
-    /// duplicated, reordered, non-passing, or identity-incompatible profile.
+    /// Returns an error for malformed roles, workloads, or stage references.
     pub fn validate(&self) -> Result<(), ClusterBenchmarkError> {
-        let expected_roles = [
+        let roles = [
             QualificationRateRole::Healthy,
             QualificationRateRole::TargetOperating,
             QualificationRateRole::NearSaturation,
         ];
-        let rate_values = self
+        let values = self
             .rates
             .iter()
             .map(|rate| rate.requests_per_second)
             .collect::<Vec<_>>();
-        let mut expected_workload = self.source_capacity.workload.clone();
-        expected_workload.ordered_rates.clone_from(&rate_values);
-        expected_workload.trial_count = 3;
-        expected_workload.tables_per_tenant = 18;
-        if self.schema_version != QUALIFICATION_PROFILE_VERSION
-            || self.source_capacity.report_schema_version != CLUSTER_REPORT_VERSION
-            || self.environment != self.source_capacity.environment
-            || self.source_capacity.artifact_sha256.len() != 64
-            || !self
-                .source_capacity
-                .artifact_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        let mut expected = self.source_workload.clone();
+        expected.ordered_rates.clone_from(&values);
+        expected.trial_count = 3;
+        expected.tables_per_tenant = 18;
+        if self.scenario_id != self.source_workload.scenario_id
+            || self.scenario_id != self.qualification_workload.scenario_id
             || self.rates.len() != 3
-            || self.source_capacity.selected_stages.len() != 3
-            || self.rates.iter().map(|rate| rate.role).ne(expected_roles)
-            || rate_values.windows(2).any(|window| window[0] >= window[1])
-            || self.workload.ordered_rates != rate_values
-            || self.workload != expected_workload
+            || self.selected_stages.len() != 3
+            || self.rates.iter().map(|rate| rate.role).ne(roles)
+            || values.windows(2).any(|window| window[0] >= window[1])
+            || self.qualification_workload != expected
         {
             return Err(ClusterBenchmarkError::Incompatible(
-                "qualification profile roles, rates, digest, or identities are invalid".to_owned(),
+                "scenario qualification is invalid".to_owned(),
             ));
         }
-        self.workload.validate()?;
-        for (rate, stage) in self.rates.iter().zip(&self.source_capacity.selected_stages) {
-            if rate.requests_per_second != stage.requests_per_second || !stage.passed {
+        self.qualification_workload.validate()?;
+        for (rate, stage) in self.rates.iter().zip(&self.selected_stages) {
+            if stage.scenario_id != self.scenario_id
+                || stage.kind != CapacityStageKind::Discovery
+                || !stage.passed
+                || stage.requests_per_second != rate.requests_per_second
+            {
                 return Err(ClusterBenchmarkError::Incompatible(
-                    "qualification rate is not bound to its selected passing stage".to_owned(),
+                    "qualification rate has a cross-scenario or invalid stage".to_owned(),
                 ));
             }
         }
         Ok(())
     }
 
-    /// Validate selected rates against the exact retained capacity report.
-    ///
-    /// The operation binds every self-declared selected stage to one and only
-    /// one evidence-complete passing discovery stage in the digest-verified
-    /// source report. Confirmation and recovery stages cannot substitute for
-    /// discovery evidence even when their rate and identity are otherwise
-    /// consistent.
+    /// Resolve one scenario-local role.
     ///
     /// # Errors
-    /// Returns [`ClusterBenchmarkError::Incompatible`] when report schema,
-    /// environment, workload, scenario cardinality, stage identity, rate,
-    /// kind, passing status, or reviewed-rate pairing differs. Propagates the
-    /// stricter existing evidence error when a matched stage is incomplete.
-    pub fn validate_capacity_source(
-        &self,
-        report: &BifrostReferenceProfile,
-    ) -> Result<(), ClusterBenchmarkError> {
-        self.validate()?;
-        if report.schema_version != self.source_capacity.report_schema_version
-            || report.schema_version != CLUSTER_REPORT_VERSION
-            || report.environment != self.source_capacity.environment
-        {
-            return Err(ClusterBenchmarkError::Incompatible(
-                "capacity source schema or environment differs from the reviewed profile"
-                    .to_owned(),
-            ));
-        }
-        let matching_scenarios = report
-            .scenarios
+    /// Returns an error when the role is missing or duplicated.
+    pub fn rate(&self, role: QualificationRateRole) -> Result<u64, ClusterBenchmarkError> {
+        let matches = self
+            .rates
             .iter()
-            .filter(|scenario| scenario.workload == self.source_capacity.workload)
+            .filter(|rate| rate.role == role)
             .collect::<Vec<_>>();
-        let [scenario] = matching_scenarios.as_slice() else {
+        let [rate] = matches.as_slice() else {
             return Err(ClusterBenchmarkError::Incompatible(
-                "capacity source must contain exactly one matching workload scenario".to_owned(),
+                "qualification role is absent or duplicated".to_owned(),
             ));
         };
-        for (rate, selected) in self.rates.iter().zip(&self.source_capacity.selected_stages) {
-            let matching_stages = scenario
-                .reports
-                .iter()
-                .flat_map(|report| report.capacity_stages.iter())
-                .filter(|stage| stage.identity == selected.identity)
-                .collect::<Vec<_>>();
-            let [stage] = matching_stages.as_slice() else {
-                return Err(ClusterBenchmarkError::Incompatible(
-                    "reviewed stage identity is absent or duplicated in capacity source".to_owned(),
-                ));
-            };
-            if rate.requests_per_second != selected.requests_per_second
-                || stage.offered_requests_per_second != selected.requests_per_second
-                || stage.kind != CapacityStageKind::Discovery
-                || !stage.passed
-            {
-                return Err(ClusterBenchmarkError::Incompatible(
-                    "reviewed rate is not an exact passing discovery stage in capacity source"
-                        .to_owned(),
-                ));
-            }
-            stage.validate_evidence()?;
-        }
-        Ok(())
+        Ok(rate.requests_per_second)
     }
 }
 
@@ -2533,145 +2655,119 @@ mod tests {
         assert_eq!(capacity_stage_rates(&[true, false]), vec![25, 50, 50, 25]);
     }
 
-    /// Proves profile roles are selected only from passing discovery stages
-    /// and the near-saturation rate is bound to a passing recovery replay.
+    /// Proves every scenario derives and retains its own reviewed rate curve.
     #[test]
-    fn qualification_profile_selection_is_digest_bound_and_deterministic() {
-        let source = profile();
-        let workload = source.scenarios[0].workload.clone();
-        let mut stages = [25, 50, 75, 100, 200]
-            .into_iter()
-            .map(|rate| qualification_stage(rate, CapacityStageKind::Discovery, true))
-            .collect::<Vec<_>>();
-        stages.push(qualification_stage(
-            300,
-            CapacityStageKind::Discovery,
-            false,
-        ));
-        stages.push(qualification_stage(
-            300,
-            CapacityStageKind::Confirmation,
-            false,
-        ));
-        stages.push(qualification_stage(200, CapacityStageKind::Recovery, true));
-        let candidate = QualificationProfileV2::from_capacity(
-            &source.environment,
-            &workload,
-            &stages,
-            "a".repeat(64),
-        )
-        .expect("passing curve generates a candidate");
-        assert_eq!(
-            candidate
-                .rates
-                .iter()
-                .map(|rate| (rate.role, rate.requests_per_second))
-                .collect::<Vec<_>>(),
-            vec![
-                (QualificationRateRole::Healthy, 25),
-                (QualificationRateRole::TargetOperating, 100),
-                (QualificationRateRole::NearSaturation, 200),
-            ]
-        );
-        candidate.validate().expect("candidate remains valid");
-        let mut capacity_report = source.clone();
-        capacity_report.scenarios[0].reports[0].capacity_stages = stages;
+    fn qualification_profile_is_per_scenario_and_compact() {
+        let mut source = profile();
+        for (index, scenario) in source.scenarios.iter_mut().enumerate() {
+            let rates = if index == 1 {
+                vec![25, 50, 75]
+            } else {
+                vec![25, 50, 75, 100, 200]
+            };
+            let mut stages = rates
+                .into_iter()
+                .map(|rate| qualification_stage(rate, CapacityStageKind::Discovery, true))
+                .collect::<Vec<_>>();
+            let recovery = stages
+                .last()
+                .expect("passing fixture has a stage")
+                .offered_requests_per_second;
+            stages.push(qualification_stage(
+                recovery,
+                CapacityStageKind::Recovery,
+                true,
+            ));
+            scenario.reports[0].capacity_stages = stages;
+        }
+        let candidate = QualificationProfileV2::from_capacity_report(&source, "a".repeat(64))
+            .expect("all scenarios qualify");
         candidate
-            .validate_capacity_source(&capacity_report)
-            .expect("candidate binds to exact retained source stages");
-    }
-
-    /// Proves insufficient passing rates and malformed role/source bindings
-    /// remain unsupported or incompatible rather than acquiring fallback rates.
-    #[test]
-    fn qualification_profile_refuses_insufficient_or_reordered_sources() {
-        let source = profile();
-        let workload = source.scenarios[0].workload.clone();
-        let stages = vec![
-            qualification_stage(25, CapacityStageKind::Discovery, true),
-            qualification_stage(50, CapacityStageKind::Discovery, true),
-            qualification_stage(75, CapacityStageKind::Discovery, false),
-            qualification_stage(50, CapacityStageKind::Recovery, true),
-        ];
+            .validate_matrix()
+            .expect("canonical six are covered");
+        let mut duplicate = candidate.clone();
+        duplicate.scenarios[5] = duplicate.scenarios[0].clone();
         assert!(matches!(
-            QualificationProfileV2::from_capacity(
-                &source.environment,
-                &workload,
-                &stages,
-                "b".repeat(64),
-            ),
+            duplicate.validate(),
+            Err(ClusterBenchmarkError::Incompatible(_))
+        ));
+        let mut missing = candidate.clone();
+        missing.scenarios.pop();
+        assert!(matches!(
+            missing.validate_matrix(),
             Err(ClusterBenchmarkError::Unsupported(_))
         ));
-
-        let mut passing = [25, 50, 75, 100, 200]
-            .into_iter()
-            .map(|rate| qualification_stage(rate, CapacityStageKind::Discovery, true))
-            .collect::<Vec<_>>();
-        passing.push(qualification_stage(200, CapacityStageKind::Recovery, true));
-        let mut candidate = QualificationProfileV2::from_capacity(
-            &source.environment,
-            &workload,
-            &passing,
-            "c".repeat(64),
-        )
-        .expect("valid source");
-        candidate.rates.swap(0, 1);
+        let mut seventh = candidate.clone();
+        let mut unexpected = seventh.scenarios[0].clone();
+        unexpected.scenario_id = "unexpected-seventh".to_owned();
+        unexpected.source_workload.scenario_id = unexpected.scenario_id.clone();
+        unexpected.qualification_workload.scenario_id = unexpected.scenario_id.clone();
+        for stage in &mut unexpected.selected_stages {
+            stage.scenario_id = unexpected.scenario_id.clone();
+        }
+        seventh.scenarios.push(unexpected);
         assert!(matches!(
-            candidate.validate(),
-            Err(ClusterBenchmarkError::Incompatible(_))
+            seventh.validate_matrix(),
+            Err(ClusterBenchmarkError::Unsupported(_))
         ));
-        candidate.rates.swap(0, 1);
-        candidate.source_capacity.selected_stages[0].passed = false;
-        assert!(matches!(
-            candidate.validate(),
-            Err(ClusterBenchmarkError::Incompatible(_))
-        ));
+        assert_eq!(
+            candidate.scenarios[0]
+                .rate(QualificationRateRole::TargetOperating)
+                .expect("target"),
+            100
+        );
+        assert_eq!(
+            candidate.scenarios[1]
+                .rate(QualificationRateRole::TargetOperating)
+                .expect("target"),
+            50
+        );
+        assert_eq!(
+            candidate
+                .distributed_target_operating_rate()
+                .expect("distributed target"),
+            100
+        );
+        candidate
+            .validate_capacity_source(&source)
+            .expect("digest-bound entries match source");
+        let json = serde_json::to_string(&candidate).expect("profile serializes");
+        assert!(!json.contains("tenant_rows"));
+        assert!(!json.contains("row_ids"));
 
-        let mut source_stages = passing;
-        let mut failed_source = qualification_stage(100, CapacityStageKind::Discovery, false);
-        failed_source.identity.stage_id.push_str("-failed");
-        source_stages.push(failed_source);
-        let mut capacity_report = source.clone();
-        capacity_report.scenarios[0].reports[0].capacity_stages = source_stages.clone();
-        let valid = QualificationProfileV2::from_capacity(
-            &source.environment,
-            &workload,
-            &source_stages,
-            "d".repeat(64),
-        )
-        .expect("valid source selects passing discovery identities");
-
-        let mut absent = valid.clone();
-        absent.source_capacity.selected_stages[0].identity.stage_id = "invented-stage".to_owned();
+        let mut crossed = candidate.clone();
+        crossed.scenarios[0].selected_stages[0].scenario_id =
+            crossed.scenarios[1].scenario_id.clone();
         assert!(matches!(
-            absent.validate_capacity_source(&capacity_report),
-            Err(ClusterBenchmarkError::Incompatible(_))
-        ));
-
-        let failed = source_stages
-            .iter()
-            .find(|stage| {
-                stage.offered_requests_per_second == 100
-                    && stage.kind == CapacityStageKind::Discovery
-                    && !stage.passed
-            })
-            .expect("failed source fixture");
-        let mut non_passing = valid.clone();
-        non_passing.source_capacity.selected_stages[1].identity = failed.identity.clone();
-        assert!(matches!(
-            non_passing.validate_capacity_source(&capacity_report),
+            crossed.validate(),
             Err(ClusterBenchmarkError::Incompatible(_))
         ));
 
-        let recovery = source_stages
-            .iter()
-            .find(|stage| stage.kind == CapacityStageKind::Recovery)
-            .expect("recovery source fixture");
-        let mut substituted = valid;
-        substituted.source_capacity.selected_stages[2].identity = recovery.identity.clone();
+        let mut selected_only = candidate;
+        selected_only.scenarios.truncate(1);
+        selected_only
+            .validate()
+            .expect("one selected scenario is valid");
         assert!(matches!(
-            substituted.validate_capacity_source(&capacity_report),
-            Err(ClusterBenchmarkError::Incompatible(_))
+            selected_only.validate_matrix(),
+            Err(ClusterBenchmarkError::Unsupported(_))
+        ));
+    }
+
+    /// Proves insufficient capacity never receives fallback qualification rates.
+    #[test]
+    fn qualification_profile_refuses_insufficient_sources() {
+        let mut source = profile();
+        for scenario in &mut source.scenarios {
+            scenario.reports[0].capacity_stages = vec![
+                qualification_stage(25, CapacityStageKind::Discovery, true),
+                qualification_stage(50, CapacityStageKind::Discovery, true),
+                qualification_stage(50, CapacityStageKind::Recovery, true),
+            ];
+        }
+        assert!(matches!(
+            QualificationProfileV2::from_capacity_report(&source, "b".repeat(64)),
+            Err(ClusterBenchmarkError::Unsupported(_))
         ));
     }
 

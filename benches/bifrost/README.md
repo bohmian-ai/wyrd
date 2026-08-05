@@ -16,8 +16,15 @@ the next stage confirms the stop predicate, and the highest healthy rate is
 replayed for recovery. The four-rate shortened smoke (`100,300,500,1000`) is
 non-promotable and makes no wall-clock or SLO claim.
 
-Qualification is separately invoked and replays reviewed absolute rates for
-three trials. It enforces durable-write p99 ≤100 ms, flush-to-strict-visibility
+Qualification is separately invoked and replays each scenario's own reviewed
+healthy, target-operating, and near-saturation rates for three trials. The
+compact `qualification-profile-v2` binds every scenario entry to its exact
+source and qualification workload plus selected stage IDs and the SHA-256 of
+the complete capacity artifact; it does not duplicate tenant row ledgers.
+Matrix qualification requires exactly the six canonical entries, while a
+selected run resolves only its exact scenario before cluster startup. Candidate
+profiles remain non-authoritative under `target/bifrost-benchmarks` until human
+review. Qualification enforces durable-write p99 ≤100 ms, flush-to-strict-visibility
 p99 ≤5 s, bounded-query time-to-first-frame p99 ≤500 ms, and at least 200
 samples per required operation. A report is versioned as
 `wyrd.bifrost.cluster-report/v2`; failed, partial, unsupported, dirty, or

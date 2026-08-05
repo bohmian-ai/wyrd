@@ -512,9 +512,11 @@ Consequences, stated so they stop drifting:
   and different cards — before it flushes, so one sealed batch (one
   `wyrd_batch_id`) freely mixes them. The producer is keyed by **table only**; it
   never splits a batch by card or run. The server therefore authorizes `card_ref`
-  **per row** (every distinct card in the batch must be in the principal's scope)
-  and stamps the per-request columns (`tenant_id`, `wyrd_request_id`, timestamps,
-  `wyrd_batch_id`) across the whole batch.
+  **per row** (every distinct card in the batch must be in the principal's scope),
+  validates the client-generated UUIDv7 `wyrd_batch_id`, stamps
+  request-scoped `data_tenant_id`, `wyrd_request_id`, and
+  `wyrd_ingested_at`, validates or normalizes `wyrd_event_time`, and assigns
+  one `wyrd_row_ordinal` per row across the complete logical batch.
 
 - **`card_ref` is authorized, not trusted.** The server checks the asserted
   `card_ref` against the principal's **card scope**. For Service and Agent
@@ -1103,14 +1105,54 @@ internal surfaces — it would collide with the external `sql_warehouse` Source
 semantics.
 
 **Everything is a Bifrost table.** One table shape underlies every internal
-analytical table, with five reserved system columns: `wyrd_event_time`,
-`wyrd_ingested_at`, `wyrd_batch_id`, `wyrd_row_ordinal`, and
-`data_tenant_id`. `wyrd_row_ordinal` is the required non-null Iceberg `int` /
-Arrow `Int32` zero-based position within one immutable `wyrd_batch_id`. Scribe
-stamps it before WAL append, rejects batches at or above `i32::MAX` rows, and
-WAL, memory, Parquet, `vala.file_list`, Forge, and Iceberg preserve it without
-reassignment. The physical identity
-is always the authenticated organization plus the logical table:
+analytical table. Every physical schema has a server-owned managed envelope
+with these required non-null columns:
+
+- `wyrd_event_time`: the validated or server-derived event timestamp;
+- `wyrd_ingested_at`: the server-stamped ingestion timestamp;
+- `wyrd_batch_id`: the immutable 16-byte identity of one accepted logical
+  batch;
+- `wyrd_row_ordinal`: the zero-based position of a row in that complete
+  logical batch, stored as an Iceberg `int` / Arrow `Int32`;
+- `wyrd_request_id`: the server-minted or validated request-correlation ID;
+- `data_tenant_id`: the authenticated tenant-isolation key.
+
+Physical schemas also reserve nullable `run_id`, `card_uid`, and
+`principal_id` correlation columns. Their values may be absent according to
+the table's correlation policy and do not participate in physical row
+identity.
+
+Within one organization-qualified physical table, the immutable row identity
+is:
+
+```text
+(wyrd_batch_id, wyrd_row_ordinal)
+```
+
+The globally qualified row identity is:
+
+```text
+(organization_id, logical_table, wyrd_batch_id, wyrd_row_ordinal)
+```
+
+`wyrd_row_ordinal` is contiguous across the logical request order and never
+resets at an Arrow `RecordBatch`, WAL segment, Parquet file, or Forge rewrite
+boundary. The accepted batch-row limit is below `i32::MAX`; negative or
+non-contiguous ordinals are invalid. The client SDK generates one UUIDv7 batch
+identity and preserves it unchanged across retries. Gate validates that
+envelope value and assigns ordinals before Scribe admission; payload columns
+cannot supply or override either identity field or other server-owned request,
+ingestion, or tenant columns. Scribe, WAL, Parquet, Iceberg, and Forge preserve
+the pair unchanged. Within the configured Scribe idempotency-retention window,
+a replay may reuse an accepted batch identity only when schema fingerprint,
+row count, row order, and payload digest match; otherwise it fails with the
+stable Bifrost batch-identity conflict. Outside that window, callers must never
+reuse a batch ID for a different logical batch. Oracle uses the pair to
+reconcile live and sealed sources, with the fixed Iceberg snapshot winning when
+both sources contain the same identity.
+
+The physical table identity is always the authenticated organization plus the
+logical table:
 
 ```text
 (organization_id, logical_table) → one physical Iceberg table

@@ -28,7 +28,7 @@ Before editing:
 1. Read the active task, referenced approved-plan context, and applicable
    `AGENTS.md` files completely.
 2. For a standardized Wyrd task, read
-   `.codex/skills/wyrd-plan/references/task-packet-format.md` and validate its
+   `.agents/skills/wyrd-plan/references/task-packet-format.md` and validate its
    parent plan directory. The task must be `Ready`.
 3. Read `architecture/agent-rules.md` and `architecture/wyrd-design.md`. Read
    `architecture/wyrd-doctrine.mdx` before changing Wyrd contracts, APIs,
@@ -68,7 +68,7 @@ guessing at the fix.
 | `architecture/references/languages/implementation-execution.md` | Every task: authority boundaries, verification recovery, test integrity, diff audit, and completion evidence |
 | `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, or removed concepts |
 | `architecture/references/doctrine/architecture-constraints.md` | Tier boundaries, deployment, or observation identity |
-| `architecture/references/architecture/patterns.md` | Crate placement and server/client/storage/provider/audit patterns |
+| `architecture/references/architecture/patterns.md` | Ownership boundaries, contract placement, and server/client/storage/provider/audit patterns |
 | `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, and idioms |
 | `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, and registration |
 | `architecture/references/languages/errors.md` | Stable errors and boundary mappings |
@@ -76,7 +76,15 @@ guessing at the fix.
 | `architecture/references/languages/testing-workflows.md` | Test tiers, verification levels, and boundary checks |
 | `architecture/references/languages/agent-harness.md` | MCP and other agent-facing contracts |
 | `architecture/references/languages/typescript-guide.md` | `@wyrd/sdk` and napi conventions |
-| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, and object storage |
+| `architecture/references/domain/vala-architecture.md` | Vala ownership, Bifrost boundaries, observations, and analytical placement |
+| `architecture/references/domain/telemetry-observations.md` | OpenTelemetry, observation identity, correlation, or payload sensitivity |
+| `architecture/references/domain/evaluation.md` | Eval Cards, scenarios, judges, scoring, or evidence |
+| `architecture/references/domain/drift-monitoring.md` | Drift signals, baselines, thresholds, or alert behavior |
+| `architecture/references/domain/olap-serving.md` | Bifrost ingest/query serving, admission, or tenant-safe analytical APIs |
+| `architecture/references/domain/iceberg.md` | Iceberg snapshots, catalog, partitioning, schema evolution, or compaction |
+| `architecture/references/domain/datafusion.md` | DataFusion planning, provider pushdown, pruning, memory, or spills |
+| `architecture/references/domain/arrow-analytical-interop.md` | Arrow, Parquet, RecordBatch, PyArrow, or analytical Python boundaries |
+| `architecture/references/domain/analytical-operations-reliability.md` | Backpressure, durability, leases, repair, retention, or recovery |
 
 When an approved task explicitly supersedes a Wyrd design decision, update the
 named design authority with the implementation and update doctrine when the

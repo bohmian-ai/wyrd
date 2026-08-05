@@ -33,6 +33,16 @@ Next artifact: <none, existing task path, revised plan/task, or missing authorit
 
 - <local mechanic or bounded correction, repository evidence, and disposition>
 
+## Adversarial Analysis
+
+| Counter-hypothesis | Source evidence | Disposition |
+|---|---|---|
+| <wrong owner, duplicate path, unnecessary complexity, failed negative path, weak assertion, or missed consumer> | <authority and source> | Disproved / Finding <ID> |
+
+Record only meaningful probes for the changed surface. When material new
+structure was introduced, include the smallest repository-native alternative
+and why the implementation earns its additional cost or link the finding.
+
 ## Findings
 
 ### WRD-001: <plain-English issue>
@@ -65,7 +75,7 @@ For REVIEW_BLOCKED: missing authority or mandatory proof.>
 Use `Not applicable: <one-sentence reason>` instead of an empty section.
 Consolidate symptoms sharing one root cause. A clean review still includes the
 complete conformance matrix, verification state, adaptations, and inspected
-surfaces.
+surfaces, plus the meaningful adversarial probes supporting approval.
 
 Do not turn the review into a replacement task packet. The applicable
 implementation skill receives the existing task for bounded work; `$wyrd-plan`

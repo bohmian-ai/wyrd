@@ -15,107 +15,26 @@ Wyrd is agent-first and headless: MCP, CLI, HTTP, generated schemas,
 stable errors, and machine-readable docs are primary surfaces. The
 developer UI is supported, but not the source of truth.
 
-## Crate Ownership (Actual Inventory)
+## Ownership boundaries
 
-### `crates/wyrd-spec`
+Keep ownership at the narrowest Wyrd layer that has the behavior and its
+dependency cost. `wyrd-spec` owns pure wire contracts and validation;
+`wyrd-server` owns serving, tenancy, policy, audit, and durable orchestration;
+Vala owns observations, evaluation, drift, and analytical engines; Skald owns
+provider, prompt, tool, agent, and workflow primitives. `python/py-wyrd` and
+the TypeScript surface project approved owner-crate behavior and do not create
+parallel durable state.
 
-Pure contracts, IDs, cards/specs, schema generation, request/response
-shapes, validation, stable error catalog. PyO3-free, IO-free, async-free.
+Vala and Bifrost crates are engines/data-plane libraries, never network
+servers. The server remains the only listener. Client-tier crates stay free of
+analytical dependencies such as SQL, cloud SDKs, DataFusion, Iceberg, and
+object-store engines. When a behavior crosses a boundary, put the shared
+contract in `wyrd-spec`, durable behavior in its owner, and expose it through
+typed HTTP/MCP/SDK projections.
 
-### `crates/wyrd/*` — control plane
-
-- `wyrd` — public umbrella / sanctioned re-exports.
-- `wyrd-auth` — server-tier auth domain logic.
-- `wyrd-cards` — Card storage + Card type definitions (Python owner).
-- `wyrd-cli` — human-facing CLI.
-- `wyrd-config` — configuration management (Python owner).
-- `wyrd-interfaces` — serialization, compression, Card IO (Python owner).
-- `wyrd-mcp` — agent-facing MCP tool surface.
-- `wyrd-server` — HTTP server and application state; **the only serving
-  surface**.
-- `wyrd-sql` — durable Postgres schema, migrations, query compilation for
-  Wyrd artifacts. No `axum`/`hyper`/`tower` (enforced).
-- `wyrd-storage` — server-tier storage handles, cloud backend signers
-  (S3/GCS/Azure), OpenDAL operator.
-- `wyrd-testing` — `WyrdTestServer` fixtures + HTTP testing utilities
-  (Python owner, dev-only wheel).
-- `wyrd-tonic` — gRPC server/client bindings (single owner of tonic-family
-  deps; enforced by `check:no-tonic-outside-wyrd-tonic`).
-
-### `crates/shared/*` — cross-cutting foundation
-
-- Auth: `wyrd-auth-check`, `wyrd-auth-issue`, `wyrd-auth-oidc`,
-  `wyrd-auth-verify`.
-- Runtime: `wyrd-runtime` (async runtime + PyO3 sync/async bridge),
-  `wyrd-queue` (bounded producer + BatchSink seam).
-- Domain primitives: `wyrd-semver`, `wyrd-version`.
-- Observability: `wyrd-telemetry`.
-- Transport / client: `wyrd-client`.
-- Security / crypto: `wyrd-crypt`.
-- Test infra: `wyrd-dev-fixtures`, `wyrd-test-contract-macros`.
-- Utilities: `wyrd-utils` (Python owner), `wyrd-error-derive`.
-
-Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
-`deltalake` (enforced by `check:client-tier`).
-
-### `crates/skald/*` — LLM runtime plane
-
-- `skald-spec` — Skald contracts (no PyO3, no server deps).
-- `skald-observer` — Observer trait + implementations for agent/workflow
-  events (Python owner).
-- `skald-providers` — provider registry + driver interface.
-- `skald-runtime` — native provider runtime dispatch + mock provider seam
-  (Python owner).
-- `skald-cache` — agent result caching.
-- `skald-prompt` — prompt generation + templating (Python owner).
-- `skald-tool` — tool definition + execution (Python owner).
-- `skald-agent` — live agent: identity, provider, tools, tool loop
-  (Python owner).
-- `skald-workflow` — DAG scheduler, tasks, cross-provider handoff (Python
-  owner).
-
-Skald does not depend on Vala.
-
-### `crates/vala/*` — observability + analytical plane
-
-- `vala-core` — server-internal analytical + alert-routing core.
-- `vala-sdk` — client SDK: Bifrost ingest sink, pooled producers, observe
-  surface (Python owner).
-- `vala-sql` — Vala Postgres schema and migrations (`vala.file_list`,
-  `vala.cluster_nodes`, `vala.audit_outbox`, `vala.maintenance_leases`,
-  etc.). Outlives individual Bifrost engine implementations.
-- `vala-ingest` — data ingestion pipeline.
-- `vala-bifrost` — OLAP write/read engine on Apache Iceberg + DataFusion.
-- `vala-drift` — in-memory PSI/SPC/Custom drift baseline fit + scoring.
-- `vala-eval` — DAG-stage execution, operators, scoring, aggregation,
-  comparison.
-
-Vala may depend on Skald for reusable agent evaluation. `vala-*` crates
-are engines/libraries — they do **not** own HTTP/gRPC serving.
-
-### `python/py-wyrd` — Python extension aggregator
-
-Thin PyO3 module root. Registers approved owner-crate submodules; does
-not duplicate validation, lifecycle, registry, storage, or runtime logic.
-
-### Planned But Not Yet Present
-
-- **`wyrd-sdk`** — approved Python owner per `AGENTS.md` §2; not yet in
-  tree.
-- **`crates/bindings/*`** — TypeScript/napi and future native SDK
-  bindings; not yet in tree. TypeScript SDK today talks to `wyrd-server`
-  over HTTP + gRPC.
-
-Do not assume these paths exist when writing code today.
-
-## Approved Python Owner Crates
-
-Twelve crates enable a `python` feature (enforced by
-`check:pyo3-scope`):
-
-`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `wyrd-observe`,
-`wyrd-testing` (dev-only), `wyrd-utils`, `skald-agent`, `skald-prompt`,
-`skald-runtime`, `skald-tool`, `skald-workflow`, `vala-sdk`.
+For current owner paths and approved Python features, consult `AGENTS.md` and
+the focused language references; this file documents structural patterns, not
+a frozen package inventory.
 
 ## Contract Placement
 

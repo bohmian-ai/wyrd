@@ -20,8 +20,8 @@ Before planning:
 1. Read `AGENTS.md`, `architecture/agent-rules.md`,
    `architecture/wyrd-design.md`, and `architecture/wyrd-doctrine.mdx`.
 2. Read the applicable repo-local execution skills:
-   `.codex/skills/wyrd-implement/SKILL.md` and, for UI scope,
-   `.codex/skills/wyrd-ui/SKILL.md`.
+   `.agents/skills/wyrd-implement/SKILL.md` and, for UI scope,
+   `.agents/skills/wyrd-ui/SKILL.md`.
 3. Read `architecture/references/README.md`, then only the references relevant
    to the affected surfaces.
 4. Inspect `mise.toml`, affected manifests, `pyproject.toml`, and lockfiles
@@ -44,6 +44,13 @@ Read each selected reference completely when its stage begins:
 | `references/task-decomposition.md` | Creating tasks and running implementation rehearsal |
 | `references/plan-format.md` | Drafting, auditing, presenting, or saving the plan |
 | `references/task-packet-format.md` | Drafting or updating task packets |
+
+For Wyrd domain knowledge, route through `architecture/references/README.md`
+and load only the needed Vala slice: `domain/vala-architecture.md`,
+`domain/telemetry-observations.md`, `domain/evaluation.md`,
+`domain/drift-monitoring.md`, `domain/olap-serving.md`, `domain/iceberg.md`,
+`domain/datafusion.md`, `domain/arrow-analytical-interop.md`, or
+`domain/analytical-operations-reliability.md`.
 
 Examples establish density and structure, not repository facts.
 
@@ -186,7 +193,7 @@ Load both format references and confirm:
 Run the structural validator for materialized plans:
 
 ```bash
-python .codex/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
+python .agents/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
   .dev/plan/<slug>
 ```
 

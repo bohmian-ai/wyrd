@@ -132,7 +132,7 @@ classification, the durable artifact, and canonical planning.
    claimed. Read them completely and run:
 
    ```bash
-   python .codex/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
+   python .agents/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
      .dev/plan/<slug>
    ```
 
@@ -183,7 +183,7 @@ by the affected surface:
 |---|---|
 | `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, or removed concepts |
 | `architecture/references/doctrine/architecture-constraints.md` | Tier boundaries, deployment, or observation identity |
-| `architecture/references/architecture/patterns.md` | Crate placement and server/client/storage/provider/audit ownership |
+| `architecture/references/architecture/patterns.md` | Ownership boundaries, contract placement, and server/client/storage/provider/audit ownership |
 | `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, or API shape |
 | `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, or registration |
 | `architecture/references/languages/errors.md` | Stable errors and boundary mappings |
@@ -191,7 +191,15 @@ by the affected surface:
 | `architecture/references/languages/testing-workflows.md` | Test tiers, journey coverage, verification levels, or boundary gates |
 | `architecture/references/languages/agent-harness.md` | MCP and other agent-facing contracts |
 | `architecture/references/languages/typescript-guide.md` | `@wyrd/sdk` and napi conventions |
-| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, or object storage |
+| `architecture/references/domain/vala-architecture.md` | Vala ownership, Bifrost boundaries, observations, or analytical placement |
+| `architecture/references/domain/telemetry-observations.md` | OpenTelemetry, observation identity, correlation, or payload sensitivity |
+| `architecture/references/domain/evaluation.md` | Eval Cards, scenarios, judges, scoring, or evidence |
+| `architecture/references/domain/drift-monitoring.md` | Drift signals, baselines, thresholds, or alert behavior |
+| `architecture/references/domain/olap-serving.md` | Bifrost ingest/query serving, admission, or tenant-safe analytical APIs |
+| `architecture/references/domain/iceberg.md` | Iceberg snapshots, catalog, partitioning, schema evolution, or compaction |
+| `architecture/references/domain/datafusion.md` | DataFusion planning, provider pushdown, pruning, memory, or spills |
+| `architecture/references/domain/arrow-analytical-interop.md` | Arrow, Parquet, RecordBatch, PyArrow, or analytical Python boundaries |
+| `architecture/references/domain/analytical-operations-reliability.md` | Backpressure, durability, leases, repair, retention, or recovery |
 
 State which conditional references were loaded and the decision each governs.
 Do not duplicate their repository rules in this skill.

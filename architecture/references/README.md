@@ -1,41 +1,77 @@
 # Wyrd Doctrine Reference Library
 
-Shared reference library consumed by `wyrd-implement` (Claude + Codex
-skills). Skills own *process*; this library owns *knowledge*. Skills load
-only the slices they need.
+`architecture/references/` is the sole reusable Wyrd knowledge library.
+Skills own conversational or execution process; this library owns concise,
+durable product and implementation knowledge. Start here and load only the
+slices required by the question or change.
 
 ## Layout
 
 ```text
 references/
-  doctrine/     product framing + canonical boundary facts
-  architecture/ implementation patterns ("build it this way")
-  languages/    per-language implementation doctrine (Rust, PyO3, Python, TypeScript)
-  domain/       specialized surfaces (OLAP / Iceberg / Bifrost)
+  doctrine/     product framing and canonical boundary facts
+  architecture/ implementation ownership and structural patterns
+  languages/    Rust, PyO3, Python, TypeScript, testing, and agent surfaces
+  domain/       Vala, telemetry, evaluation, drift, and analytical systems
 ```
 
-## Files
+## Canonical routes
 
-| File | Purpose |
+| Reference | Load when the question or change touches |
 |---|---|
-| `doctrine/positioning-and-vocabulary.md` | Doctrine vocabulary, Card envelope, `CardRef` shape, v1 Card kinds, deleted concepts |
-| `doctrine/architecture-constraints.md` | Terse boundary checklist (wyrd/vala/skald, `wyrd-spec` free-of list, deployment topologies, observation identity) |
-| `architecture/patterns.md` | Implementation doctrine: full crate inventory, contract placement, server/client/storage/provider/observability/audit patterns |
-| `languages/rust-core.md` | Rust ownership, traits, async, allocation, API shape, concrete idiomatic examples |
-| `languages/pyo3-boundaries.md` | PyO3 classes, `fn __new__` rule, GIL, lifetimes, boundary conversion, module registration |
-| `languages/errors.md` | Wyrd error codes, `WyrdError` derive, boundary conversion, Rust/Python/TS/HTTP/CLI mapping |
-| `languages/python-api-and-stubs.md` | Python exports, generated stubs, package layout, test conventions |
-| `languages/testing-workflows.md` | Three-tier test taxonomy, targeted `mise` tasks, boundary checks, aggregate CI gate |
-| `languages/agent-harness.md` | Agent-facing contracts, MCP, structured validation, audit foundation |
-| `languages/typescript-guide.md` | `@wyrd/sdk` conventions, high-performance TS patterns, declaration file do's/don'ts, napi bridge parity |
-| `domain/iceberg-bifrost.md` | OLAP / Iceberg / Bifrost implementation doctrine + rebuild source-of-truth pointers |
+| `doctrine/positioning-and-vocabulary.md` | Card vocabulary, envelope, `CardRef`, v1 kinds, or removed concepts |
+| `doctrine/architecture-constraints.md` | Wyrd/Vala/Skald boundaries, deployment, tenant isolation, or observation identity |
+| `architecture/patterns.md` | Ownership, contract placement, server/client/storage/provider/audit structure |
+| `languages/implementation-execution.md` | Execution authority, adaptation, verification recovery, or completion evidence |
+| `languages/rust-core.md` | Rust ownership, async, traits, allocation, or API shape |
+| `languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversion, or module registration |
+| `languages/python-api-and-stubs.md` | Python exports, stubs, package layout, or typing |
+| `languages/typescript-guide.md` | TypeScript SDK, declaration files, or napi boundaries |
+| `languages/testing-workflows.md` | Journey, integration, unit, or repository verification gates |
+| `languages/agent-harness.md` | MCP, agent-facing contracts, structured validation, or audit |
+| `languages/errors.md` | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
+| `domain/vala-architecture.md` | Broad Vala architecture, ownership, Bifrost orientation, or cross-domain advice |
+| `domain/telemetry-observations.md` | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
+| `domain/evaluation.md` | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| `domain/drift-monitoring.md` | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
+| `domain/olap-serving.md` | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
+| `domain/iceberg.md` | Iceberg snapshots, catalogs, schemas, partitions, object storage, or compaction |
+| `domain/datafusion.md` | Logical/physical plans, provider pushdown, pruning, stats, memory, or spills |
+| `domain/arrow-analytical-interop.md` | Arrow, RecordBatch, Parquet, PyArrow, FFI, or Python analytical boundaries |
+| `domain/analytical-operations-reliability.md` | Backpressure, durability, leases, repair, retention, SLOs, or failure recovery |
+
+## Compound routing examples
+
+Use the smallest complete set; compound concerns should load each named slice:
+
+| Request shape | Route |
+|---|---|
+| “Should Wyrd own this analytical behavior or expose it through a client?” | `doctrine/architecture-constraints.md` + `domain/vala-architecture.md` + `architecture/patterns.md` |
+| “How should we evaluate an agent and turn failures into a safe release signal?” | `domain/evaluation.md` + `domain/telemetry-observations.md` + `domain/drift-monitoring.md` + `doctrine/positioning-and-vocabulary.md` |
+| “Why did latency drift page after a trace pipeline change?” | `domain/telemetry-observations.md` + `domain/drift-monitoring.md` + `domain/analytical-operations-reliability.md` |
+| “Which query shape will prune files and stay tenant-safe?” | `domain/olap-serving.md` + `domain/datafusion.md` + `domain/iceberg.md` |
+| “When should compaction refresh the catalog, and what can fail?” | `domain/iceberg.md` + `domain/analytical-operations-reliability.md` + `domain/olap-serving.md` |
+| “How do Python callers receive analytical data without copies or hidden IO?” | `domain/arrow-analytical-interop.md` + `languages/pyo3-boundaries.md` + `languages/python-api-and-stubs.md` |
+| “How should an MCP or HTTP surface expose this capability?” | `languages/agent-harness.md` + `doctrine/positioning-and-vocabulary.md` + `domain/vala-architecture.md` |
+| “This is a non-Vala Card, SDK, Rust, or server question.” | Start with the matching `doctrine/`, `architecture/`, or `languages/` slice; do not load domain references unless the evidence crosses into Vala. |
+
+## Reading rules
+
+- Read a selected file completely, then use its stable Wyrd anchors to inspect
+  current code only when the question depends on implementation reality.
+- Treat `architecture/wyrd-design.md` as the protocol authority and
+  `architecture/wyrd-doctrine.mdx` as the public rationale when references and
+  code disagree.
+- Treat upstream links in each reference's `Primary grounding` section as
+  live technical sources. Browse them when API behavior, standards, or research
+  may have changed; prefer primary sources over summaries.
+- Keep this library concise and nonredundant. Add or extend a reference only
+  when a durable knowledge gap is demonstrated.
 
 ## Consumers
 
+- `.agents/skills/wyrd-advise/SKILL.md`
+- `.agents/skills/wyrd-implement/SKILL.md`
+- `.agents/skills/wyrd-plan/SKILL.md`
+- `.agents/skills/wyrd-review/SKILL.md`
 - `.claude/skills/wyrd-implement/SKILL.md`
-- `.codex/skills/wyrd-implement/SKILL.md`
-- Global Claude and Codex `wyrd-plan-reviewer` skills
-
-New skills that need shared doctrine route here instead of carrying their
-own copy. Add new files only when a doctrine gap forces it — extend an
-existing file first.

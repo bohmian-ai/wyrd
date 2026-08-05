@@ -13,6 +13,27 @@ For every in-scope requirement and acceptance criterion, identify:
 Use `PASS`, `FAIL`, or `UNVERIFIED`. A changed file without a requirement,
 acceptance criterion, or necessary verification role is scope drift.
 
+## Adversarial structural analysis
+
+Conformance is necessary but insufficient. After reconstructing approved
+behavior, try to disprove that the implementation is repository-native and as
+simple as the task permits:
+
+- identify the nearest existing owner and pattern;
+- test whether an existing capability already satisfies the requirement;
+- search for parallel paths, duplicate state, duplicate contracts, and second
+  sources of truth;
+- compare the implementation with the smallest repository-native shape that
+  preserves all approved behavior and non-goals;
+- challenge every new abstraction or dependency with its present concrete
+  need and material consequence;
+- trace relevant failure, cleanup, recovery, concurrency, cancellation,
+  tenancy, audit, projection, and consumer paths.
+
+An alternative is actionable only when it exposes a repository-rule violation
+or material complexity, correctness, reliability, performance, ownership, or
+maintenance consequence. A merely preferred refactor is not a finding.
+
 Check:
 
 - observable behavior and non-goals;

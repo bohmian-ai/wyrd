@@ -467,22 +467,25 @@ A change is not done until:
 Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo. Additional/older planning files live in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo.
 Code in this repo lands one session at a time, via dialogue-locked decisions.
 
-### Codex agent skill bindings
+### Agent skill bindings
+
+Skills are referenced by name; each harness resolves a named skill from its
+own skill directory. Do not hard-code harness-specific skill paths in plans,
+task packets, or documentation.
 
 - The plan orchestrator reads this file, `architecture/wyrd-design.md`,
   `architecture/wyrd-doctrine.mdx`, and the applicable repo-local skill before
   decomposing work.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
-  implementors must receive `.codex/skills/wyrd-implement/SKILL.md` in their
-  task packet.
-- Wyrd UI implementors additionally receive
-  `.codex/skills/wyrd-ui/SKILL.md` when their write set enters the UI tree.
+  implementors must receive the `wyrd-implement` skill in their task packet.
+- Wyrd UI implementors additionally receive the `wyrd-ui` skill when their
+  write set enters the UI tree.
 - Complete-plan execution uses the global `wyrd-implement-plan` controller in
   a dedicated clean worktree. It dispatches one serial task at a time through
-  the surface-appropriate implementation skill and repo-local
-  `.codex/skills/wyrd-review/SKILL.md`, then owns integrated verification.
+  the surface-appropriate implementation skill and the repo-local
+  `wyrd-review` skill, then owns integrated verification.
 - The complete integration review runs the global `review-and-plan` skill; its
-  repo-specific review binding is `.codex/skills/wyrd-review/SKILL.md`.
+  repo-specific review binding is the `wyrd-review` skill.
 
 ## 15. Implementation Rules
 

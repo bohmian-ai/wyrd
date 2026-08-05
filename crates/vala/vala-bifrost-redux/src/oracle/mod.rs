@@ -244,6 +244,7 @@ impl OracleTelemetry {
     #[must_use]
     fn new(slots: Arc<OracleSlotManager>) -> Self {
         for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
+            Self::register_sparse_series(query_class);
             for visibility in [VisibilityMode::PublishedOnly, VisibilityMode::Fused] {
                 metrics::gauge!(
                     "bifrost_oracle_in_flight",
@@ -258,6 +259,14 @@ impl OracleTelemetry {
                 "query_class" => query_class_label(query_class)
             )
             .set(0.0);
+            for reason in ["estimated_scan", "predicted_scan", "global_operator"] {
+                metrics::counter!(
+                    "bifrost_oracle_classification_total",
+                    "query_class" => query_class_label(query_class),
+                    "reason" => reason
+                )
+                .increment(0);
+            }
         }
         Self {
             slots,
@@ -272,7 +281,6 @@ impl OracleTelemetry {
         visibility: VisibilityMode,
         query_class: QueryClass,
     ) -> QueryTelemetryGuard {
-        Self::register_sparse_series(query_class);
         metrics::gauge!("bifrost_oracle_slots_total", "role" => "leader")
             .set(self.slots.running_capacity().to_f64().unwrap_or(f64::MAX));
         metrics::gauge!(
@@ -303,6 +311,7 @@ impl OracleTelemetry {
     fn register_sparse_series(query_class: QueryClass) {
         for (scope, reason) in [
             ("cluster", "pending_limit"),
+            ("cluster", "lease_timeout"),
             ("cluster", "lease_capacity"),
             ("class", "lease_capacity"),
             ("tenant", "lease_capacity"),
@@ -3011,13 +3020,17 @@ fn optimized_plan_is_complex(plan: &datafusion::logical_expr::LogicalPlan) -> bo
         plan,
         LogicalPlan::Window(_)
             | LogicalPlan::Aggregate(_)
-            | LogicalPlan::Sort(_)
             | LogicalPlan::Join(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Union(_)
             | LogicalPlan::Distinct(_)
             | LogicalPlan::RecursiveQuery(_)
     ) {
+        return true;
+    }
+    if let LogicalPlan::Sort(sort) = plan
+        && sort.fetch.is_none()
+    {
         return true;
     }
     plan.inputs().into_iter().any(optimized_plan_is_complex)
@@ -3332,6 +3345,58 @@ mod tests {
             OraclePlanner::classify(1, 8.0, true),
             QueryClass::Analytical
         );
+    }
+
+    /// Bounded Top-K sorting defers to scan cost while unbounded or nested-heavy work stays analytical.
+    #[tokio::test]
+    async fn bounded_top_k_uses_scan_cost_without_downgrading_heavy_plans() {
+        let session = SessionContext::new();
+        let provider = MemTable::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "row_id",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Vec::new()],
+        )
+        .expect("schema-only provider");
+        session
+            .register_table("events", Arc::new(provider))
+            .expect("register bounded-sort table");
+
+        let bounded = session
+            .sql("SELECT row_id FROM events ORDER BY row_id LIMIT 64")
+            .await
+            .expect("bounded Top-K query plans")
+            .into_optimized_plan()
+            .expect("bounded Top-K query optimizes");
+        assert!(!optimized_plan_is_complex(&bounded));
+        let small = OraclePlanner::classification(1, 8.0, optimized_plan_is_complex(&bounded));
+        assert_eq!(small.query_class, QueryClass::Interactive);
+        assert_eq!(small.reason, "estimated_scan");
+        let large = OraclePlanner::classification(
+            11 * 1_073_741_824,
+            1.0,
+            optimized_plan_is_complex(&bounded),
+        );
+        assert_eq!(large.query_class, QueryClass::Analytical);
+        assert_eq!(large.reason, "predicted_scan");
+
+        let unbounded = session
+            .sql("SELECT row_id FROM events ORDER BY row_id")
+            .await
+            .expect("unbounded sort query plans")
+            .into_optimized_plan()
+            .expect("unbounded sort query optimizes");
+        assert!(optimized_plan_is_complex(&unbounded));
+
+        let nested_heavy = session
+            .sql("SELECT count(*) AS total FROM events ORDER BY total LIMIT 64")
+            .await
+            .expect("bounded sort over aggregate plans")
+            .into_optimized_plan()
+            .expect("bounded sort over aggregate optimizes");
+        assert!(optimized_plan_is_complex(&nested_heavy));
     }
 
     /// Class ceilings remain independent and analytical work is never downgraded.

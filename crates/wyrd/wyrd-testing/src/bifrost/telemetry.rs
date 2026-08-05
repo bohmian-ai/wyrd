@@ -123,11 +123,28 @@ const ORACLE_ADMISSION_REJECTION_LABELS: &[TelemetryLabelValues] = &[
     },
     TelemetryLabelValues {
         key: "reason",
-        values: &["pending_limit", "lease_capacity", "local_slots"],
+        values: &[
+            "pending_limit",
+            "lease_timeout",
+            "lease_capacity",
+            "local_slots",
+        ],
     },
     TelemetryLabelValues {
         key: "query_class",
         values: &["interactive", "analytical"],
+    },
+];
+
+/// Closed production labels carried by Oracle classification decisions.
+const ORACLE_CLASSIFICATION_LABELS: &[TelemetryLabelValues] = &[
+    TelemetryLabelValues {
+        key: "query_class",
+        values: &["interactive", "analytical"],
+    },
+    TelemetryLabelValues {
+        key: "reason",
+        values: &["estimated_scan", "predicted_scan", "global_operator"],
     },
 ];
 
@@ -539,6 +556,63 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         ],
     },
     TelemetryBinding {
+        id: TelemetryBindingId("oracle.classification.interactive_scan"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "interactive",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "estimated_scan",
+            },
+        ],
+        family: "bifrost_oracle_classification_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_CLASSIFICATION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.classification.predicted_scan"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "analytical",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "predicted_scan",
+            },
+        ],
+        family: "bifrost_oracle_classification_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_CLASSIFICATION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.classification.global_operator"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "analytical",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "global_operator",
+            },
+        ],
+        family: "bifrost_oracle_classification_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_CLASSIFICATION_LABELS,
+    },
+    TelemetryBinding {
         id: TelemetryBindingId("oracle.admission.pending_limit"),
         selected_label_values: &[
             TelemetrySelectedLabel {
@@ -551,7 +625,30 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
             },
             TelemetrySelectedLabel {
                 key: "query_class",
-                value: "analytical",
+                value: "interactive",
+            },
+        ],
+        family: "bifrost_oracle_admission_rejections_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.admission.lease_timeout"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "scope",
+                value: "cluster",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "lease_timeout",
+            },
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "interactive",
             },
         ],
         family: "bifrost_oracle_admission_rejections_total",
@@ -574,7 +671,7 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
             },
             TelemetrySelectedLabel {
                 key: "query_class",
-                value: "analytical",
+                value: "interactive",
             },
         ],
         family: "bifrost_oracle_admission_rejections_total",
@@ -597,7 +694,7 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
             },
             TelemetrySelectedLabel {
                 key: "query_class",
-                value: "analytical",
+                value: "interactive",
             },
         ],
         family: "bifrost_oracle_admission_rejections_total",
@@ -620,7 +717,7 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
             },
             TelemetrySelectedLabel {
                 key: "query_class",
-                value: "analytical",
+                value: "interactive",
             },
         ],
         family: "bifrost_oracle_admission_rejections_total",
@@ -643,7 +740,7 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
             },
             TelemetrySelectedLabel {
                 key: "query_class",
-                value: "analytical",
+                value: "interactive",
             },
         ],
         family: "bifrost_oracle_admission_rejections_total",
@@ -911,7 +1008,11 @@ const COMPLETE_BINDING_IDS: &[&str] = &[
     "forge.backlog_peak",
     "oracle.slots_final",
     "oracle.slots_peak.analytical",
+    "oracle.classification.interactive_scan",
+    "oracle.classification.predicted_scan",
+    "oracle.classification.global_operator",
     "oracle.admission.pending_limit",
+    "oracle.admission.lease_timeout",
     "oracle.admission.lease_cluster",
     "oracle.admission.lease_class",
     "oracle.admission.lease_tenant",
@@ -1075,8 +1176,18 @@ pub(crate) struct ClusterPillarTelemetryEvidence {
     pub(crate) oracle_decoded_rows: u64,
     /// Peak analytical slot units retained concurrently by local Oracle leaders.
     pub(crate) oracle_analytical_slots_peak: u64,
+    /// Final configured local Oracle slot capacity exposed by the process.
+    pub(crate) oracle_slots_total: u64,
+    /// Queries classified interactive by the estimated-scan rule.
+    pub(crate) oracle_interactive_scan_classifications: u64,
+    /// Queries classified analytical by the predicted-scan rule.
+    pub(crate) oracle_predicted_scan_classifications: u64,
+    /// Queries classified analytical because an unbounded global operator remains.
+    pub(crate) oracle_global_operator_classifications: u64,
     /// Analytical requests rejected because the local pending waiter bound was full.
     pub(crate) oracle_pending_limit_rejections: u64,
+    /// Admission attempts that exhausted the bounded durable lease-acquisition window.
+    pub(crate) oracle_lease_timeout_rejections: u64,
     /// Analytical requests rejected by the durable cluster slot ceiling.
     pub(crate) oracle_cluster_lease_rejections: u64,
     /// Analytical requests rejected by the durable class slot ceiling.
@@ -2139,9 +2250,31 @@ impl ClusterTelemetryProjection {
                     "oracle.slots_peak.analytical",
                 )
                 .unwrap_or(0),
+                oracle_slots_total: binding_gauge_final(&bindings, "oracle.slots_final")
+                    .unwrap_or(0),
+                oracle_interactive_scan_classifications: binding_counter(
+                    &bindings,
+                    "oracle.classification.interactive_scan",
+                )
+                .unwrap_or(0),
+                oracle_predicted_scan_classifications: binding_counter(
+                    &bindings,
+                    "oracle.classification.predicted_scan",
+                )
+                .unwrap_or(0),
+                oracle_global_operator_classifications: binding_counter(
+                    &bindings,
+                    "oracle.classification.global_operator",
+                )
+                .unwrap_or(0),
                 oracle_pending_limit_rejections: binding_counter(
                     &bindings,
                     "oracle.admission.pending_limit",
+                )
+                .unwrap_or(0),
+                oracle_lease_timeout_rejections: binding_counter(
+                    &bindings,
+                    "oracle.admission.lease_timeout",
                 )
                 .unwrap_or(0),
                 oracle_cluster_lease_rejections: binding_counter(
@@ -4445,11 +4578,65 @@ mod tests {
                 destination: "pillars.oracle_analytical_slots_peak",
             },
             EmitterContractFixture {
+                id: "oracle.classification.interactive_scan",
+                selectors: &[("query_class", "interactive"), ("reason", "estimated_scan")],
+                family: "bifrost_oracle_classification_total",
+                kind: Counter,
+                keys: &["query_class", "reason"],
+                domains: &[
+                    ("query_class", &["interactive", "analytical"]),
+                    (
+                        "reason",
+                        &["estimated_scan", "predicted_scan", "global_operator"],
+                    ),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_interactive_scan_classifications",
+            },
+            EmitterContractFixture {
+                id: "oracle.classification.predicted_scan",
+                selectors: &[("query_class", "analytical"), ("reason", "predicted_scan")],
+                family: "bifrost_oracle_classification_total",
+                kind: Counter,
+                keys: &["query_class", "reason"],
+                domains: &[
+                    ("query_class", &["interactive", "analytical"]),
+                    (
+                        "reason",
+                        &["estimated_scan", "predicted_scan", "global_operator"],
+                    ),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_predicted_scan_classifications",
+            },
+            EmitterContractFixture {
+                id: "oracle.classification.global_operator",
+                selectors: &[("query_class", "analytical"), ("reason", "global_operator")],
+                family: "bifrost_oracle_classification_total",
+                kind: Counter,
+                keys: &["query_class", "reason"],
+                domains: &[
+                    ("query_class", &["interactive", "analytical"]),
+                    (
+                        "reason",
+                        &["estimated_scan", "predicted_scan", "global_operator"],
+                    ),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_global_operator_classifications",
+            },
+            EmitterContractFixture {
                 id: "oracle.admission.pending_limit",
                 selectors: &[
                     ("scope", "cluster"),
                     ("reason", "pending_limit"),
-                    ("query_class", "analytical"),
+                    ("query_class", "interactive"),
                 ],
                 family: "bifrost_oracle_admission_rejections_total",
                 kind: Counter,
@@ -4458,7 +4645,12 @@ mod tests {
                     ("scope", &["cluster", "class", "tenant"]),
                     (
                         "reason",
-                        &["pending_limit", "lease_capacity", "local_slots"],
+                        &[
+                            "pending_limit",
+                            "lease_timeout",
+                            "lease_capacity",
+                            "local_slots",
+                        ],
                     ),
                     ("query_class", &["interactive", "analytical"]),
                 ],
@@ -4468,11 +4660,11 @@ mod tests {
                 destination: "pillars.oracle_pending_limit_rejections",
             },
             EmitterContractFixture {
-                id: "oracle.admission.lease_cluster",
+                id: "oracle.admission.lease_timeout",
                 selectors: &[
                     ("scope", "cluster"),
-                    ("reason", "lease_capacity"),
-                    ("query_class", "analytical"),
+                    ("reason", "lease_timeout"),
+                    ("query_class", "interactive"),
                 ],
                 family: "bifrost_oracle_admission_rejections_total",
                 kind: Counter,
@@ -4481,7 +4673,40 @@ mod tests {
                     ("scope", &["cluster", "class", "tenant"]),
                     (
                         "reason",
-                        &["pending_limit", "lease_capacity", "local_slots"],
+                        &[
+                            "pending_limit",
+                            "lease_timeout",
+                            "lease_capacity",
+                            "local_slots",
+                        ],
+                    ),
+                    ("query_class", &["interactive", "analytical"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_lease_timeout_rejections",
+            },
+            EmitterContractFixture {
+                id: "oracle.admission.lease_cluster",
+                selectors: &[
+                    ("scope", "cluster"),
+                    ("reason", "lease_capacity"),
+                    ("query_class", "interactive"),
+                ],
+                family: "bifrost_oracle_admission_rejections_total",
+                kind: Counter,
+                keys: &["scope", "reason", "query_class"],
+                domains: &[
+                    ("scope", &["cluster", "class", "tenant"]),
+                    (
+                        "reason",
+                        &[
+                            "pending_limit",
+                            "lease_timeout",
+                            "lease_capacity",
+                            "local_slots",
+                        ],
                     ),
                     ("query_class", &["interactive", "analytical"]),
                 ],
@@ -4495,7 +4720,7 @@ mod tests {
                 selectors: &[
                     ("scope", "class"),
                     ("reason", "lease_capacity"),
-                    ("query_class", "analytical"),
+                    ("query_class", "interactive"),
                 ],
                 family: "bifrost_oracle_admission_rejections_total",
                 kind: Counter,
@@ -4504,7 +4729,12 @@ mod tests {
                     ("scope", &["cluster", "class", "tenant"]),
                     (
                         "reason",
-                        &["pending_limit", "lease_capacity", "local_slots"],
+                        &[
+                            "pending_limit",
+                            "lease_timeout",
+                            "lease_capacity",
+                            "local_slots",
+                        ],
                     ),
                     ("query_class", &["interactive", "analytical"]),
                 ],
@@ -4518,7 +4748,7 @@ mod tests {
                 selectors: &[
                     ("scope", "tenant"),
                     ("reason", "lease_capacity"),
-                    ("query_class", "analytical"),
+                    ("query_class", "interactive"),
                 ],
                 family: "bifrost_oracle_admission_rejections_total",
                 kind: Counter,
@@ -4527,7 +4757,12 @@ mod tests {
                     ("scope", &["cluster", "class", "tenant"]),
                     (
                         "reason",
-                        &["pending_limit", "lease_capacity", "local_slots"],
+                        &[
+                            "pending_limit",
+                            "lease_timeout",
+                            "lease_capacity",
+                            "local_slots",
+                        ],
                     ),
                     ("query_class", &["interactive", "analytical"]),
                 ],
@@ -4541,7 +4776,7 @@ mod tests {
                 selectors: &[
                     ("scope", "cluster"),
                     ("reason", "local_slots"),
-                    ("query_class", "analytical"),
+                    ("query_class", "interactive"),
                 ],
                 family: "bifrost_oracle_admission_rejections_total",
                 kind: Counter,
@@ -4550,7 +4785,12 @@ mod tests {
                     ("scope", &["cluster", "class", "tenant"]),
                     (
                         "reason",
-                        &["pending_limit", "lease_capacity", "local_slots"],
+                        &[
+                            "pending_limit",
+                            "lease_timeout",
+                            "lease_capacity",
+                            "local_slots",
+                        ],
                     ),
                     ("query_class", &["interactive", "analytical"]),
                 ],

@@ -92,7 +92,7 @@ impl OraclePlanner {
 
     /// Produces the class, closed reason, and predicted duration from one cut.
     #[must_use]
-    fn classification(
+    pub(super) fn classification(
         estimated_bytes: u64,
         live_oracle_cpu: f64,
         complex: bool,

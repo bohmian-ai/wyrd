@@ -185,6 +185,7 @@ fn bifrost_error_from_code(
                 .unwrap_or(message)
                 .to_owned(),
         },
+        "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
         _ => return None,
     };
     Some(WyrdError::Vala { error })
@@ -254,6 +255,14 @@ mod tests {
         }));
         assert_eq!(invalid_sql.status(), 400);
         assert_eq!(invalid_sql.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
+
+        let admission = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+            "detail": "query admission rejected",
+            "details": {},
+        }));
+        assert_eq!(admission.status(), 429);
+        assert_eq!(admission.code(), "WYRD_VALA_429_QUERY_ADMISSION_REJECTED");
     }
 
     #[test]

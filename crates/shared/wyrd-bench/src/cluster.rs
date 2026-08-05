@@ -366,15 +366,25 @@ pub struct PillarTelemetryDelta {
     pub oracle_decoded_rows: u64,
     /// Peak analytical slot units held concurrently by Oracle leaders.
     pub oracle_analytical_slots_peak: u64,
-    /// Analytical admission rejections from the local pending waiter bound.
+    /// Final configured local Oracle slot capacity exposed by the process.
+    pub oracle_slots_total: u64,
+    /// Queries classified interactive by the estimated-scan rule.
+    pub oracle_interactive_scan_classifications: u64,
+    /// Queries classified analytical by the predicted-scan rule.
+    pub oracle_predicted_scan_classifications: u64,
+    /// Queries classified analytical because an unbounded global operator remains.
+    pub oracle_global_operator_classifications: u64,
+    /// Interactive admission rejections from the local pending waiter bound.
     pub oracle_pending_limit_rejections: u64,
-    /// Analytical admission rejections from the durable cluster ceiling.
+    /// Admission attempts that exhausted the bounded durable lease-acquisition window.
+    pub oracle_lease_timeout_rejections: u64,
+    /// Interactive admission rejections from the durable cluster ceiling.
     pub oracle_cluster_lease_rejections: u64,
-    /// Analytical admission rejections from the durable class ceiling.
+    /// Interactive admission rejections from the durable class ceiling.
     pub oracle_class_lease_rejections: u64,
-    /// Analytical admission rejections from the durable tenant ceiling.
+    /// Interactive admission rejections from the durable tenant ceiling.
     pub oracle_tenant_lease_rejections: u64,
-    /// Analytical admission rejections from the selected leader's local slots.
+    /// Interactive admission rejections from the selected leader's local slots.
     pub oracle_local_slot_rejections: u64,
     /// Validation status across the exact closed pillar bindings.
     pub status: EvidenceStatus,
@@ -993,6 +1003,12 @@ pub struct ClientTrialMetrics {
     pub accepted_operations: u64,
     /// Stable public admission or capacity rejections.
     pub backpressure_operations: u64,
+    /// Stable durable-write admission or capacity rejections.
+    pub write_backpressure_operations: u64,
+    /// Stable query and strict-visibility admission or capacity rejections.
+    pub query_backpressure_operations: u64,
+    /// Stable public error-code counts for all rejected operations.
+    pub backpressure_by_code: BTreeMap<String, u64>,
     /// Transient public failures eligible for bounded retry.
     pub retry_operations: u64,
     /// Public operations rejected because the profile-driven in-flight cap was exhausted.

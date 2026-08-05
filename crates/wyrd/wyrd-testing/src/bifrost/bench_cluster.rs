@@ -621,7 +621,12 @@ fn capacity_stage_report(
                     forge_publications: 0,
                     oracle_decoded_rows: 0,
                     oracle_analytical_slots_peak: 0,
+                    oracle_slots_total: 0,
+                    oracle_interactive_scan_classifications: 0,
+                    oracle_predicted_scan_classifications: 0,
+                    oracle_global_operator_classifications: 0,
                     oracle_pending_limit_rejections: 0,
+                    oracle_lease_timeout_rejections: 0,
                     oracle_cluster_lease_rejections: 0,
                     oracle_class_lease_rejections: 0,
                     oracle_tenant_lease_rejections: 0,
@@ -730,7 +735,18 @@ fn adapt_pillars(evidence: &ClusterTelemetryEvidence) -> PillarTelemetryDelta {
         forge_publications: evidence.pillars.forge_publications,
         oracle_decoded_rows: evidence.pillars.oracle_decoded_rows,
         oracle_analytical_slots_peak: evidence.pillars.oracle_analytical_slots_peak,
+        oracle_slots_total: evidence.pillars.oracle_slots_total,
+        oracle_interactive_scan_classifications: evidence
+            .pillars
+            .oracle_interactive_scan_classifications,
+        oracle_predicted_scan_classifications: evidence
+            .pillars
+            .oracle_predicted_scan_classifications,
+        oracle_global_operator_classifications: evidence
+            .pillars
+            .oracle_global_operator_classifications,
         oracle_pending_limit_rejections: evidence.pillars.oracle_pending_limit_rejections,
+        oracle_lease_timeout_rejections: evidence.pillars.oracle_lease_timeout_rejections,
         oracle_cluster_lease_rejections: evidence.pillars.oracle_cluster_lease_rejections,
         oracle_class_lease_rejections: evidence.pillars.oracle_class_lease_rejections,
         oracle_tenant_lease_rejections: evidence.pillars.oracle_tenant_lease_rejections,
@@ -2057,6 +2073,12 @@ pub struct WindowResult {
     retries: u64,
     /// Stable admission/backpressure rejections observed by the client.
     backpressure: u64,
+    /// Stable admission/backpressure rejections from durable writes.
+    write_backpressure: u64,
+    /// Stable admission/backpressure rejections from queries and visibility probes.
+    query_backpressure: u64,
+    /// Stable public error-code counts for rejected operations.
+    backpressure_by_code: BTreeMap<String, u64>,
     /// Operations skipped after falling behind by more than one interval.
     missed_operations: u64,
     /// Operations refused solely because the declared cap was exhausted.
@@ -2086,6 +2108,7 @@ impl WindowResult {
         self.missed_flushes = flush_result.1;
         self.telemetry_decoded_rows = self.telemetry_decoded_rows.saturating_add(flush_result.2);
         self.backpressure = self.backpressure.saturating_add(flush_result.3);
+        self.query_backpressure = self.query_backpressure.saturating_add(flush_result.3);
     }
 
     /// Convert the complete measured ledger into report distributions and rates.
@@ -2095,6 +2118,9 @@ impl WindowResult {
             attempted_operations: self.submitted.saturating_sub(self.missed_operations),
             accepted_operations: self.accepted,
             backpressure_operations: self.backpressure,
+            write_backpressure_operations: self.write_backpressure,
+            query_backpressure_operations: self.query_backpressure,
+            backpressure_by_code: self.backpressure_by_code.clone(),
             retry_operations: self.retries,
             in_flight_cap_exhaustions: self.in_flight_cap_exhaustions,
             max_in_flight: u64::try_from(self.max_in_flight).unwrap_or(u64::MAX),
@@ -2153,7 +2179,15 @@ enum OperationResult {
         rows: u64,
     },
     /// Stable public admission/backpressure rejection.
-    Backpressure,
+    WriteBackpressure {
+        /// Stable public error code returned by Gate.
+        code: &'static str,
+    },
+    /// Stable public query or visibility admission/backpressure rejection.
+    QueryBackpressure {
+        /// Stable public error code returned by Gate or Oracle.
+        code: &'static str,
+    },
     /// Bounded transient public response eligible for retry accounting.
     Retry,
 }
@@ -2326,7 +2360,7 @@ async fn scheduled_write(
                 });
             }
             Err(error) if is_backpressure(&error.to_string()) => {
-                return Ok(OperationResult::Backpressure);
+                return Ok(OperationResult::WriteBackpressure { code: error.code() });
             }
             Err(error) if is_retryable(&error.to_string()) && retries < 2 => {
                 retries = retries.saturating_add(1);
@@ -2358,7 +2392,7 @@ async fn scheduled_query(
     let mut stream = match client.query.query(&request).await {
         Ok(stream) => stream,
         Err(error) if is_backpressure(&error.to_string()) => {
-            return Ok(OperationResult::Backpressure);
+            return Ok(OperationResult::QueryBackpressure { code: error.code() });
         }
         Err(error) if is_retryable(&error.to_string()) => return Ok(OperationResult::Retry),
         Err(error) => return Err(error.into()),
@@ -2449,8 +2483,21 @@ fn apply_operation(result: &mut WindowResult, operation: OperationResult) {
             result.telemetry_completed_queries =
                 result.telemetry_completed_queries.saturating_add(1);
         }
-        OperationResult::Backpressure => {
+        OperationResult::WriteBackpressure { code } => {
             result.backpressure = result.backpressure.saturating_add(1);
+            result.write_backpressure = result.write_backpressure.saturating_add(1);
+            *result
+                .backpressure_by_code
+                .entry(code.to_owned())
+                .or_default() += 1;
+        }
+        OperationResult::QueryBackpressure { code } => {
+            result.backpressure = result.backpressure.saturating_add(1);
+            result.query_backpressure = result.query_backpressure.saturating_add(1);
+            *result
+                .backpressure_by_code
+                .entry(code.to_owned())
+                .or_default() += 1;
         }
         OperationResult::Retry => {
             result.retries = result.retries.saturating_add(1);
@@ -3670,7 +3717,12 @@ mod tests {
             tenant_write_ordinals: vec![BTreeSet::new()],
             ..Default::default()
         };
-        apply_operation(&mut result, OperationResult::Backpressure);
+        apply_operation(
+            &mut result,
+            OperationResult::WriteBackpressure {
+                code: "WYRD_VALA_507_WAL_DISK_FULL",
+            },
+        );
         apply_operation(
             &mut result,
             OperationResult::Write {
@@ -3915,6 +3967,21 @@ mod tests {
                     ("query_class".to_owned(), "analytical".to_owned()),
                 ]),
                 value: 0.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
+            });
+        }
+        for (query_class, reason, value) in [
+            ("interactive", "estimated_scan", 1.0),
+            ("analytical", "predicted_scan", 0.0),
+            ("analytical", "global_operator", 0.0),
+        ] {
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: "bifrost_oracle_classification_total".to_owned(),
+                labels: BTreeMap::from([
+                    ("query_class".to_owned(), query_class.to_owned()),
+                    ("reason".to_owned(), reason.to_owned()),
+                ]),
+                value,
                 kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
             });
         }
@@ -4253,7 +4320,12 @@ mod tests {
                 forge_publications: 13,
                 oracle_decoded_rows: 14,
                 oracle_analytical_slots_peak: 4,
+                oracle_slots_total: 8,
+                oracle_interactive_scan_classifications: 11,
+                oracle_predicted_scan_classifications: 0,
+                oracle_global_operator_classifications: 0,
                 oracle_pending_limit_rejections: 0,
+                oracle_lease_timeout_rejections: 0,
                 oracle_cluster_lease_rejections: 0,
                 oracle_class_lease_rejections: 0,
                 oracle_tenant_lease_rejections: 0,

@@ -860,7 +860,20 @@ impl OracleAdmission {
         let (plan, lease_ttl) = self.plan_admission(tenant, query_class, deadline)?;
         let demand = plan.lease.slot_units;
         let local_node = plan.lease.leader_node_id;
-        let acquired = self.acquire_plan(&plan).await?;
+        let acquired = match self.acquire_plan(&plan).await {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                if matches!(error, BifrostError::QueryAdmissionRejected) {
+                    OracleTelemetry::record_admission_rejection(
+                        "cluster",
+                        "lease_timeout",
+                        query_class,
+                    );
+                    waiter.finish("cluster", "rejected");
+                }
+                return Err(error);
+            }
+        };
         match acquired {
             AdmissionAcquire::Rejected {
                 scope,

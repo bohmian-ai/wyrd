@@ -22,7 +22,7 @@ use wyrd_bench::{
     ClientTrialMetrics, ClusterBenchmarkError, ClusterBenchmarkScenario, ClusterBenchmarkTrial,
     ClusterScenarioReport, ClusterTopology, ClusterTrialReport, ClusterWorkloadIdentity,
     DependencyTelemetryEvidence, DiagnosticStatus, EvidenceStatus, FIRST_PROBE_RATE,
-    KneeProvenance, NodeId, NodeResourceEvidence, PillarTelemetryDelta,
+    KneeProvenance, PillarTelemetryDelta, ProcessId, ProcessResourceEvidence,
     ProductionTelemetryEvidence, ReviewedScenarioProfile, SpanDistribution, TenantStageRows,
     TraceManifest, TrafficMix, TrialDistribution, derive_trial_median, extract_linux_cpu_identity,
     extract_macos_cpu_identity, jain_fairness,
@@ -297,14 +297,18 @@ async fn run_qualification_selected(
                         client: metrics.clone(),
                         production,
                     });
+                    let projected = ClusterTelemetryProjection::from_delta(
+                        &telemetry,
+                        ClusterTelemetryExpectation { definition },
+                    )?;
                     let evidence = ClusterTrialReport {
                         offered_requests_per_second: rate,
                         trial_index: trial,
                         metrics,
-                        telemetry: capacity_pillar_evidence(&telemetry),
-                        resources: capacity_resource_evidence(definition, &telemetry),
-                        dependencies: capacity_dependency_evidence(&telemetry),
-                        traces: capacity_trace_evidence(&telemetry),
+                        telemetry: projected.telemetry,
+                        resources: projected.resources,
+                        dependencies: projected.dependencies,
+                        traces: projected.traces,
                     };
                     evidence.validate_evidence()?;
                     trial_evidence.push(evidence);
@@ -562,6 +566,11 @@ fn capacity_stage_report(
     passed: bool,
     measured_seconds: u64,
 ) -> CapacityStage {
+    let projected = ClusterTelemetryProjection::from_delta(
+        &result.telemetry,
+        ClusterTelemetryExpectation { definition },
+    )
+    .expect("invariant: a completed capture stage has a positive finite interval");
     let mut stop_reasons = Vec::new();
     if result.client.backpressure > 0 {
         stop_reasons.push(CapacityLimit::Backpressure);
@@ -592,10 +601,10 @@ fn capacity_stage_report(
         in_flight_cap_exhaustions: result.client.in_flight_cap_exhaustions,
         stop_reasons,
         metrics: result.client.metrics(),
-        telemetry: capacity_pillar_evidence(&result.telemetry),
-        resources: capacity_resource_evidence(definition, &result.telemetry),
-        dependencies: capacity_dependency_evidence(&result.telemetry),
-        traces: capacity_trace_evidence(&result.telemetry),
+        telemetry: projected.telemetry,
+        resources: projected.resources,
+        dependencies: projected.dependencies,
+        traces: projected.traces,
     }
 }
 
@@ -619,7 +628,7 @@ fn assemble_capacity_stage(
     let mut stage = capacity_stage_report(definition, plan, result, passed, measured_seconds);
     if stage.validate_evidence().is_err() {
         stage.passed = false;
-        stage.stop_reasons.push(CapacityLimit::DependencySlo);
+        stage.stop_reasons.push(CapacityLimit::InvalidEvidence);
     }
     stage
 }
@@ -651,8 +660,8 @@ fn stage_row_identity(tenant: usize, ordinals: &BTreeSet<u64>) -> TenantStageRow
 
 /// Project bounded production counters into capacity pillar evidence.
 #[must_use]
-fn capacity_pillar_evidence(
-    telemetry: &crate::bifrost::telemetry::ForgeTelemetryDelta,
+fn project_pillars(
+    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
 ) -> PillarTelemetryDelta {
     let total = |family: &str| {
         telemetry
@@ -669,121 +678,235 @@ fn capacity_pillar_evidence(
     ];
     PillarTelemetryDelta {
         gate_accepted: total("bifrost_gate_requests_total"),
-        scribe_wal_bytes: total("bifrost_scribe_wal_bytes_total"),
-        forge_materialized_rows: total("bifrost_forge_materialized_rows_total"),
+        scribe_wal_bytes: total("bifrost_scribe_wal_append_bytes_total"),
+        forge_publications: total("bifrost_forge_complete_gauge_publications_total"),
         oracle_decoded_rows: total("bifrost_oracle_stream_rows_total"),
-        complete: required.iter().all(|family| {
+        status: if required.iter().all(|family| {
             telemetry
                 .metrics
                 .iter()
                 .any(|sample| sample.family == *family)
-        }),
+        }) {
+            EvidenceStatus::Complete
+        } else {
+            EvidenceStatus::Failed
+        },
+        missing_required: required
+            .iter()
+            .filter(|family| {
+                !telemetry
+                    .metrics
+                    .iter()
+                    .any(|sample| sample.family == **family)
+            })
+            .map(|family| (*family).to_owned())
+            .collect(),
+        invalid: Vec::new(),
+    }
+}
+
+/// Closed expectation used by the canonical cluster telemetry projection.
+#[derive(Debug, Clone, Copy)]
+struct ClusterTelemetryExpectation {
+    /// Scenario topology whose logical roles are hosted by the capture process.
+    definition: ReferenceScenarioDefinition,
+}
+
+/// Canonical typed evidence projected once for every benchmark consumer.
+struct ClusterTelemetryEvidence {
+    /// Exact pillar counter evidence.
+    telemetry: PillarTelemetryDelta,
+    /// Exact dependency histogram and counter evidence.
+    dependencies: DependencyTelemetryEvidence,
+    /// Exact-name trace evidence with error spans excluded from clean evidence.
+    traces: Vec<TraceManifest>,
+    /// Honest process-scoped resource evidence.
+    resources: Vec<ProcessResourceEvidence>,
+    /// Exact counters consumed by client/audit/durable reconciliation.
+    reconciliation: ReconciliationCounters,
+}
+
+/// Closed typed counter projection used by the only reconciliation path.
+struct ReconciliationCounters {
+    /// Rows accepted by Gate.
+    gate_rows: u64,
+    /// Rows accepted by Scribe.
+    scribe_rows: u64,
+    /// Rows sealed durably by Scribe.
+    sealed_rows: u64,
+    /// Rows returned by Oracle streams.
+    oracle_rows: u64,
+    /// Successful query request terminals.
+    successful_queries: u64,
+}
+
+/// Concrete owner of the closed Bifrost telemetry binding projection.
+struct ClusterTelemetryProjection;
+
+impl ClusterTelemetryProjection {
+    /// Project one capture delta through the closed production binding definitions.
+    ///
+    /// # Errors
+    /// Returns [`BifrostTelemetryReportError`] when the capture interval is invalid.
+    fn from_delta(
+        delta: &crate::bifrost::telemetry::BifrostTelemetryDelta,
+        expectation: ClusterTelemetryExpectation,
+    ) -> Result<ClusterTelemetryEvidence, crate::bifrost::telemetry::BifrostTelemetryReportError>
+    {
+        if !delta.interval_seconds.is_finite() || delta.interval_seconds <= 0.0 {
+            return Err(crate::bifrost::telemetry::BifrostTelemetryReportError::InvalidInterval);
+        }
+        crate::bifrost::telemetry::validate_cluster_bindings(delta)?;
+        let exact_total = |family: &str, labels: &[(&str, &str)]| {
+            delta
+                .metrics
+                .iter()
+                .filter(|sample| {
+                    sample.family == family
+                        && labels.iter().all(|(key, value)| {
+                            sample
+                                .labels
+                                .get(*key)
+                                .is_some_and(|actual| actual == value)
+                        })
+                })
+                .map(|sample| sample.value)
+                .sum::<f64>() as u64
+        };
+        Ok(ClusterTelemetryEvidence {
+            telemetry: project_pillars(delta),
+            dependencies: project_dependencies(delta)?,
+            traces: project_traces(delta),
+            resources: project_process_resources(expectation.definition, delta),
+            reconciliation: ReconciliationCounters {
+                gate_rows: exact_total("bifrost_gate_rows_total", &[]),
+                scribe_rows: exact_total("bifrost_scribe_rows_total", &[]),
+                sealed_rows: exact_total(
+                    "bifrost_scribe_seal_rows_total",
+                    &[("stage", "file_list_transaction")],
+                ),
+                oracle_rows: exact_total("bifrost_oracle_stream_rows_total", &[]),
+                successful_queries: exact_total(
+                    "bifrost_gate_requests_total",
+                    &[("operation", "query"), ("outcome", "success")],
+                ),
+            },
+        })
     }
 }
 
 /// Project dependency families without inventing missing observations.
 #[must_use]
-fn capacity_dependency_evidence(
-    telemetry: &crate::bifrost::telemetry::ForgeTelemetryDelta,
-) -> DependencyTelemetryEvidence {
-    let total = |needle: &str| {
+fn project_dependencies(
+    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
+) -> Result<DependencyTelemetryEvidence, crate::bifrost::telemetry::BifrostTelemetryReportError> {
+    let total = |family: &str| {
         telemetry
             .metrics
             .iter()
-            .filter(|sample| sample.family.contains(needle))
+            .filter(|sample| sample.family == family)
             .map(|sample| sample.value.max(0.0))
             .sum::<f64>() as u64
     };
-    DependencyTelemetryEvidence {
-        postgres_pool_wait_us: total("pool_wait"),
-        postgres_transactions: total("transaction"),
-        storage_bytes: total("storage_bytes"),
-        storage_p99_us: total("storage_duration"),
-        wal_fsync_p99_us: total("fsync"),
-        complete: ["pool", "storage", "fsync"].iter().all(|needle| {
+    let p99_us = |id: &str, family: &str| {
+        crate::bifrost::telemetry::histogram_quantile(telemetry, family, 0.99)
+            .and_then(|seconds| crate::bifrost::telemetry::seconds_to_micros(id, seconds))
+    };
+    Ok(DependencyTelemetryEvidence {
+        postgres_pool_wait_us: p99_us("postgres.acquire", "vala_postgres_pool_acquire_seconds")?,
+        postgres_transactions: total("vala_postgres_pool_acquire_total"),
+        storage_bytes: total("wyrd_storage_bytes_total"),
+        storage_p99_us: p99_us(
+            "storage.duration",
+            "wyrd_storage_operation_duration_seconds",
+        )?,
+        wal_fsync_p99_us: p99_us("wal.fsync", "bifrost_scribe_wal_fsync_seconds")?,
+        status: if [
+            "vala_postgres_pool_acquire_seconds",
+            "wyrd_storage_operation_duration_seconds",
+            "bifrost_scribe_wal_fsync_seconds",
+        ]
+        .iter()
+        .all(|family| {
             telemetry
                 .metrics
                 .iter()
-                .any(|sample| sample.family.contains(needle))
-        }),
-    }
+                .any(|sample| sample.family == *family)
+        }) {
+            EvidenceStatus::Complete
+        } else {
+            EvidenceStatus::Failed
+        },
+        missing_required: [
+            "vala_postgres_pool_acquire_seconds",
+            "wyrd_storage_operation_duration_seconds",
+            "bifrost_scribe_wal_fsync_seconds",
+        ]
+        .iter()
+        .filter(|family| {
+            !telemetry
+                .metrics
+                .iter()
+                .any(|sample| sample.family == **family)
+        })
+        .map(|family| (*family).to_owned())
+        .collect(),
+        invalid: Vec::new(),
+    })
 }
 
 /// Capture bounded process resource evidence for the active role topology.
 #[must_use]
-fn capacity_resource_evidence(
-    _definition: ReferenceScenarioDefinition,
-    telemetry: &crate::bifrost::telemetry::ForgeTelemetryDelta,
-) -> Vec<NodeResourceEvidence> {
-    let pid = std::process::id().to_string();
-    let rss = command_output("ps", &["-o", "rss=", "-p", &pid])
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let cpu = command_output("ps", &["-o", "time=", "-p", &pid])
-        .ok()
-        .and_then(|value| parse_process_cpu_seconds(value.trim()));
-    match (cpu, rss) {
-        (Some(cpu_seconds), Some(rss_kib)) => vec![NodeResourceEvidence {
-            node_id: NodeId(format!("in-process-cluster-{pid}")),
-            roles: vec![
-                BifrostRuntimeRole::Gate,
-                BifrostRuntimeRole::Scribe,
-                BifrostRuntimeRole::Forge,
-                BifrostRuntimeRole::Oracle,
+fn project_process_resources(
+    definition: ReferenceScenarioDefinition,
+    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
+) -> Vec<ProcessResourceEvidence> {
+    vec![ProcessResourceEvidence {
+        process_id: ProcessId(telemetry.process.identity.clone()),
+        epoch: telemetry.process.epoch,
+        hosted_logical_nodes: match definition.topology {
+            ClusterTopology::OnePod => vec!["server-0".to_owned()],
+            ClusterTopology::ThreeServersThreeForgeWorkers => vec![
+                "server-0".to_owned(),
+                "server-1".to_owned(),
+                "server-2".to_owned(),
+                "forge-worker-0".to_owned(),
+                "forge-worker-1".to_owned(),
+                "forge-worker-2".to_owned(),
             ],
-            cpu_seconds,
-            peak_rss_bytes: rss_kib.saturating_mul(1024),
-            runtime_busy_seconds: telemetry
-                .spans
-                .iter()
-                .map(|span| span.duration_nanos as f64 / 1_000_000_000.0)
-                .sum(),
-            runtime_queue_peak: tokio::runtime::Handle::current()
-                .metrics()
-                .global_queue_depth() as u64,
-        }],
-        _ => Vec::new(),
-    }
-}
-
-/// Parse the host `ps` CPU-time representation without substituting wall time.
-#[must_use]
-fn parse_process_cpu_seconds(rendered: &str) -> Option<f64> {
-    let fields = rendered.split(':').collect::<Vec<_>>();
-    match fields.as_slice() {
-        [minutes, seconds] => {
-            Some(minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?)
-        }
-        [hours, minutes, seconds] => Some(
-            hours.parse::<f64>().ok()? * 3_600.0
-                + minutes.parse::<f64>().ok()? * 60.0
-                + seconds.parse::<f64>().ok()?,
-        ),
-        _ => None,
-    }
+        },
+        roles: vec![
+            BifrostRuntimeRole::Gate,
+            BifrostRuntimeRole::Scribe,
+            BifrostRuntimeRole::Forge,
+            BifrostRuntimeRole::Oracle,
+        ],
+        cpu_seconds: telemetry.process.cpu_seconds,
+        peak_rss_bytes: telemetry.process.peak_rss_bytes,
+        current_rss_bytes: telemetry.process.current_rss_bytes,
+        runtime_busy_seconds: telemetry.process.tokio_busy_seconds,
+        runtime_queue_peak: telemetry.process.queue_peak,
+    }]
 }
 
 /// Classify a production span only when its name proves one benchmark operation.
 #[must_use]
-fn benchmark_span_operation(name: &str) -> Option<BenchmarkOperation> {
-    let name = name.to_ascii_lowercase();
-    if name.contains("first_frame") || name.contains("time_to_first") {
-        Some(BenchmarkOperation::QueryTimeToFirstFrame)
-    } else if name.contains("oracle") || name.contains("query") {
-        Some(BenchmarkOperation::QueryTotal)
-    } else if name.contains("forge") || name.contains("flush") || name.contains("publish") {
-        Some(BenchmarkOperation::FlushToVisible)
-    } else if name.contains("scribe") || name.contains("ingest") || name.contains("durable_write") {
-        Some(BenchmarkOperation::DurableWrite)
-    } else {
-        None
+fn exact_span_operation(name: &str) -> Option<BenchmarkOperation> {
+    match name {
+        "bifrost.gate.write" | "bifrost.scribe.wal.append" => {
+            Some(BenchmarkOperation::DurableWrite)
+        }
+        "bifrost.forge.catalog.commit" => Some(BenchmarkOperation::FlushToVisible),
+        "bifrost.oracle.source" => Some(BenchmarkOperation::QueryTimeToFirstFrame),
+        "bifrost.oracle.query" => Some(BenchmarkOperation::QueryTotal),
+        _ => None,
     }
 }
 
 /// Build four bounded trace manifests from the production capture window.
 #[must_use]
-fn capacity_trace_evidence(
-    telemetry: &crate::bifrost::telemetry::ForgeTelemetryDelta,
+fn project_traces(
+    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
 ) -> Vec<TraceManifest> {
     [
         BenchmarkOperation::DurableWrite,
@@ -796,7 +919,8 @@ fn capacity_trace_evidence(
         let mut durations = telemetry
             .spans
             .iter()
-            .filter(|span| benchmark_span_operation(&span.name) == Some(operation))
+            .filter(|span| exact_span_operation(&span.name) == Some(operation))
+            .filter(|span| !matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_)))
             .map(|span| span.duration_nanos / 1_000)
             .collect::<Vec<_>>();
         durations.sort_unstable();
@@ -806,7 +930,8 @@ fn capacity_trace_evidence(
             representative_trace_ids: telemetry
                 .spans
                 .iter()
-                .filter(|span| benchmark_span_operation(&span.name) == Some(operation))
+                .filter(|span| exact_span_operation(&span.name) == Some(operation))
+                .filter(|span| !matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_)))
                 .rev()
                 .take(3)
                 .map(|span| span.trace_id.clone())
@@ -1648,7 +1773,7 @@ impl CapacityScenarioSession {
         (
             WindowResult,
             ProductionTelemetryEvidence,
-            crate::bifrost::telemetry::ForgeTelemetryDelta,
+            crate::bifrost::telemetry::BifrostTelemetryDelta,
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
@@ -1702,8 +1827,14 @@ impl CapacityScenarioSession {
         let audit_after = audit_rows(cluster, &self.tenants).await?;
         let published =
             final_published_rows(cluster, &self.tenants, &self.clients, measurement_table).await?;
-        let production = reconcile_production(
+        let projected = ClusterTelemetryProjection::from_delta(
             &telemetry,
+            ClusterTelemetryExpectation {
+                definition: self.definition,
+            },
+        )?;
+        let production = reconcile_production(
+            &projected,
             &result,
             audit_after.saturating_sub(audit_before),
             published,
@@ -1882,8 +2013,12 @@ async fn run_live_trial(
     let measured_published_rows = published_rows
         .checked_sub(published_before)
         .ok_or("final publication cardinality regressed below the post-warmup baseline")?;
-    let production = reconcile_production(
+    let projected = ClusterTelemetryProjection::from_delta(
         &telemetry,
+        ClusterTelemetryExpectation { definition },
+    )?;
+    let production = reconcile_production(
+        &projected,
         &measured,
         audit_after.saturating_sub(audit_before),
         measured_published_rows,
@@ -1964,7 +2099,7 @@ struct CapacityStageRun {
     /// Complete client scheduler ledger.
     client: WindowResult,
     /// Production telemetry delta for only this stage.
-    telemetry: crate::bifrost::telemetry::ForgeTelemetryDelta,
+    telemetry: crate::bifrost::telemetry::BifrostTelemetryDelta,
     /// Exact rows visible through public Oracle for this stage table.
     published_rows: u64,
     /// Durable audit rows committed during this stage.
@@ -2790,39 +2925,11 @@ async fn final_published_identities(
 
 /// Reconcile measured client ledgers with production metric and audit evidence.
 fn reconcile_production(
-    telemetry: &crate::bifrost::telemetry::ForgeTelemetryDelta,
+    evidence: &ClusterTelemetryEvidence,
     client: &WindowResult,
     observed_audit_rows: u64,
     published_rows: u64,
 ) -> Result<ProductionTelemetryEvidence, Box<dyn std::error::Error + Send + Sync>> {
-    let total = |family: &str| {
-        telemetry
-            .metrics
-            .iter()
-            .filter(|sample| sample.family == family)
-            .map(|sample| sample.value.max(0.0))
-            .sum::<f64>() as u64
-    };
-    let labeled_total = |family: &str, labels: &[(&str, &str)]| {
-        telemetry
-            .metrics
-            .iter()
-            .filter(|sample| {
-                sample.family == family
-                    && labels.iter().all(|(key, value)| {
-                        sample.labels.get(*key).is_some_and(|label| label == value)
-                    })
-            })
-            .map(|sample| sample.value.max(0.0))
-            .sum::<f64>() as u64
-    };
-    let spans_error = telemetry.spans.iter().any(|span| {
-        span.attributes
-            .get("outcome")
-            .is_some_and(|value| matches!(value.as_str(), "failed" | "error"))
-            || span.attributes.contains_key("error.type")
-            || span.attributes.contains_key("error.message")
-    });
     let rows = client.tenant_write_rows.iter().sum::<u64>();
     let completed_queries = client.telemetry_completed_queries;
     if published_rows != rows {
@@ -2832,49 +2939,20 @@ fn reconcile_production(
         .into());
     }
     let evidence = ProductionTelemetryEvidence {
-        gate_accepted_rows: total("bifrost_gate_rows_total"),
-        scribe_accepted_rows: total("bifrost_scribe_rows_total"),
+        gate_accepted_rows: evidence.reconciliation.gate_rows,
+        scribe_accepted_rows: evidence.reconciliation.scribe_rows,
         client_acknowledged_rows: rows,
-        scribe_persisted_rows: labeled_total(
-            "bifrost_scribe_seal_rows_total",
-            &[("stage", "file_list_transaction")],
-        ),
+        scribe_persisted_rows: evidence.reconciliation.sealed_rows,
         forge_published_rows: published_rows,
-        oracle_stream_rows: total("bifrost_oracle_stream_rows_total"),
+        oracle_stream_rows: evidence.reconciliation.oracle_rows,
         client_decoded_rows: client.telemetry_decoded_rows,
-        oracle_terminal_outcomes: labeled_total(
-            "bifrost_gate_requests_total",
-            &[("operation", "query"), ("outcome", "success")],
-        ),
+        oracle_terminal_outcomes: evidence.reconciliation.successful_queries,
         client_completed_queries: completed_queries,
         expected_audit_rows: completed_queries,
         observed_audit_rows,
-        required_telemetry: if [
-            "bifrost_gate_requests_total",
-            "bifrost_gate_request_duration_seconds",
-            "bifrost_gate_active_streams",
-            "bifrost_scribe_rows_total",
-            "bifrost_scribe_seal_rows_total",
-            "bifrost_oracle_stream_rows_total",
-        ]
-        .iter()
-        .all(|family| {
-            telemetry
-                .metrics
-                .iter()
-                .chain(telemetry.gauge_final.iter())
-                .any(|sample| sample.family == *family)
-        }) {
-            EvidenceStatus::Complete
-        } else {
-            EvidenceStatus::Failed
-        },
+        required_telemetry: EvidenceStatus::Complete,
         counter_integrity: EvidenceStatus::Complete,
-        spans_clean: if spans_error {
-            EvidenceStatus::Failed
-        } else {
-            EvidenceStatus::Complete
-        },
+        spans_clean: EvidenceStatus::Complete,
         cleanup: EvidenceStatus::Failed,
         correctness: EvidenceStatus::Complete,
     };
@@ -3440,22 +3518,22 @@ mod tests {
     #[test]
     fn benchmark_span_classification_is_operation_specific() {
         assert_eq!(
-            benchmark_span_operation("scribe_durable_write"),
+            exact_span_operation("bifrost.scribe.wal.append"),
             Some(BenchmarkOperation::DurableWrite)
         );
         assert_eq!(
-            benchmark_span_operation("forge_publish"),
+            exact_span_operation("bifrost.forge.catalog.commit"),
             Some(BenchmarkOperation::FlushToVisible)
         );
         assert_eq!(
-            benchmark_span_operation("oracle_first_frame"),
+            exact_span_operation("bifrost.oracle.source"),
             Some(BenchmarkOperation::QueryTimeToFirstFrame)
         );
         assert_eq!(
-            benchmark_span_operation("oracle_query_total"),
+            exact_span_operation("bifrost.oracle.query"),
             Some(BenchmarkOperation::QueryTotal)
         );
-        assert_eq!(benchmark_span_operation("unrelated"), None);
+        assert_eq!(exact_span_operation("unrelated"), None);
     }
 
     /// Proves serialized row and batch seeds describe the actual first frame.
@@ -3599,40 +3677,155 @@ mod tests {
 
     /// Build one completed production-shaped stage input for classification tests.
     fn completed_stage_fixture(backpressure: u64, complete_evidence: bool) -> CapacityStageRun {
-        let metric = |family: &str| crate::bifrost::telemetry::ForgeMetricSample {
-            family: family.to_owned(),
-            labels: BTreeMap::new(),
-            value: 1.0,
+        let metric = |family: &str| {
+            let histogram = family.ends_with("_seconds");
+            let labels = match family {
+                "bifrost_gate_requests_total" => BTreeMap::from([
+                    ("operation".to_owned(), "write".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+                "bifrost_gate_rows_total" => BTreeMap::from([
+                    ("operation".to_owned(), "write".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+                "bifrost_gate_query_streams_total" => {
+                    BTreeMap::from([("outcome".to_owned(), "success".to_owned())])
+                }
+                "bifrost_scribe_seal_rows_total" => {
+                    BTreeMap::from([("stage".to_owned(), "file_list_transaction".to_owned())])
+                }
+                "bifrost_scribe_rows_total" => {
+                    BTreeMap::from([("status".to_owned(), "accepted".to_owned())])
+                }
+                "bifrost_oracle_stream_rows_total" => {
+                    BTreeMap::from([("outcome".to_owned(), "success".to_owned())])
+                }
+                "vala_postgres_pool_acquire_seconds" => BTreeMap::from([
+                    ("le".to_owned(), "0.001".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                    ("pool".to_owned(), "runtime".to_owned()),
+                ]),
+                "wyrd_storage_operation_duration_seconds" => BTreeMap::from([
+                    ("backend".to_owned(), "local".to_owned()),
+                    ("le".to_owned(), "0.001".to_owned()),
+                    ("operation".to_owned(), "get".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+                "bifrost_scribe_wal_fsync_seconds" => BTreeMap::from([
+                    ("le".to_owned(), "0.001".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+                _ => BTreeMap::new(),
+            };
+            crate::bifrost::telemetry::BifrostMetricSample {
+                family: family.to_owned(),
+                labels,
+                value: 1.0,
+                kind: if histogram {
+                    crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket
+                } else {
+                    crate::bifrost::telemetry::BifrostMetricKind::Counter
+                },
+            }
         };
         let metrics = [
             "bifrost_gate_requests_total",
+            "bifrost_gate_rows_total",
+            "bifrost_gate_query_streams_total",
             "bifrost_scribe_rows_total",
+            "bifrost_scribe_seal_rows_total",
+            "bifrost_scribe_wal_append_bytes_total",
+            "bifrost_forge_complete_gauge_publications_total",
             "bifrost_oracle_stream_rows_total",
-            "postgres_pool_wait_total",
-            "storage_bytes_total",
-            "wal_fsync_total",
+            "vala_postgres_pool_acquire_seconds",
+            "wyrd_storage_operation_duration_seconds",
+            "bifrost_scribe_wal_fsync_seconds",
         ]
         .into_iter()
         .map(metric)
-        .collect();
-        let spans = complete_evidence
-            .then(|| {
-                [
-                    "scribe_durable_write",
-                    "forge_publish",
-                    "oracle_first_frame",
-                    "oracle_query_total",
-                ]
-                .into_iter()
-                .map(|name| wyrd_telemetry::CapturedSpan {
-                    trace_id: format!("trace-{name}"),
-                    name: name.to_owned(),
-                    attributes: BTreeMap::new(),
-                    duration_nanos: 1_000,
-                })
-                .collect()
+        .collect::<Vec<_>>();
+        let mut metrics = metrics;
+        for (family, labels) in [
+            (
+                "vala_postgres_pool_acquire_seconds",
+                BTreeMap::from([
+                    ("outcome".to_owned(), "success".to_owned()),
+                    ("pool".to_owned(), "runtime".to_owned()),
+                ]),
+            ),
+            (
+                "wyrd_storage_operation_duration_seconds",
+                BTreeMap::from([
+                    ("backend".to_owned(), "local".to_owned()),
+                    ("operation".to_owned(), "get".to_owned()),
+                    ("outcome".to_owned(), "success".to_owned()),
+                ]),
+            ),
+            (
+                "bifrost_scribe_wal_fsync_seconds",
+                BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
+            ),
+        ] {
+            let mut infinity = labels.clone();
+            infinity.insert("le".to_owned(), "+Inf".to_owned());
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: family.to_owned(),
+                labels: infinity,
+                value: 1.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket,
+            });
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: family.to_owned(),
+                labels: labels.clone(),
+                value: 1.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramCount,
+            });
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: family.to_owned(),
+                labels,
+                value: 0.001,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramSum,
+            });
+        }
+        let gauge_maxima = vec![crate::bifrost::telemetry::BifrostMetricSample {
+            family: "bifrost_forge_oldest_backlog_seconds".to_owned(),
+            labels: BTreeMap::new(),
+            value: 0.0,
+            kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
+        }];
+        let gauge_final = vec![
+            crate::bifrost::telemetry::BifrostMetricSample {
+                family: "bifrost_oracle_slots_total".to_owned(),
+                labels: BTreeMap::from([("role".to_owned(), "server".to_owned())]),
+                value: 8.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
+            },
+            crate::bifrost::telemetry::BifrostMetricSample {
+                family: "bifrost_gate_active_streams".to_owned(),
+                labels: BTreeMap::from([("operation".to_owned(), "query".to_owned())]),
+                value: 0.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
+            },
+        ];
+        let spans = if complete_evidence {
+            [
+                "bifrost.scribe.wal.append",
+                "bifrost.forge.catalog.commit",
+                "bifrost.oracle.source",
+                "bifrost.oracle.query",
+            ]
+            .into_iter()
+            .map(|name| wyrd_telemetry::CapturedSpan {
+                trace_id: format!("trace-{name}"),
+                name: name.to_owned(),
+                attributes: BTreeMap::new(),
+                duration_nanos: 1_000,
+                status: wyrd_telemetry::CapturedSpanStatus::Unset,
             })
-            .unwrap_or_default();
+            .collect()
+        } else {
+            Vec::new()
+        };
         CapacityStageRun {
             client: WindowResult {
                 max_in_flight: DEFAULT_MAX_IN_FLIGHT,
@@ -3652,12 +3845,13 @@ mod tests {
                 measured_seconds: 10,
                 ..WindowResult::default()
             },
-            telemetry: crate::bifrost::telemetry::ForgeTelemetryDelta {
+            telemetry: crate::bifrost::telemetry::BifrostTelemetryDelta {
                 metrics,
-                gauge_maxima: Vec::new(),
-                gauge_final: Vec::new(),
+                gauge_maxima,
+                gauge_final,
                 spans,
                 interval_seconds: 10.0,
+                process: test_process_window(),
             },
             published_rows: 64,
             audit_rows: 1,
@@ -3703,7 +3897,7 @@ mod tests {
         assert!(
             incomplete_evidence
                 .stop_reasons
-                .contains(&CapacityLimit::DependencySlo)
+                .contains(&CapacityLimit::InvalidEvidence)
         );
         machine
             .record(confirmation, incomplete_evidence.passed)
@@ -3731,18 +3925,19 @@ mod tests {
     /// Proves both logical topologies are truthfully attributed to the single harness process.
     #[tokio::test]
     async fn in_process_resource_topologies_have_exact_roles() {
-        let telemetry = crate::bifrost::telemetry::ForgeTelemetryDelta {
+        let telemetry = crate::bifrost::telemetry::BifrostTelemetryDelta {
             metrics: Vec::new(),
             gauge_maxima: Vec::new(),
             gauge_final: Vec::new(),
             spans: Vec::new(),
             interval_seconds: 1.0,
+            process: test_process_window(),
         };
         for definition in [
             reference_scenario_matrix()[0],
             reference_scenario_matrix()[2],
         ] {
-            let resources = capacity_resource_evidence(definition, &telemetry);
+            let resources = project_process_resources(definition, &telemetry);
             assert_eq!(resources.len(), 1);
             assert_eq!(
                 resources[0].roles,
@@ -3754,6 +3949,32 @@ mod tests {
                 ]
             );
             assert!(resources[0].peak_rss_bytes > 0);
+            assert_eq!(resources[0].epoch, 0);
+            assert!(!resources[0].process_id.0.is_empty());
+            assert_eq!(
+                resources[0].hosted_logical_nodes.len(),
+                match definition.topology {
+                    ClusterTopology::OnePod => 1,
+                    ClusterTopology::ThreeServersThreeForgeWorkers => 6,
+                }
+            );
+            let mut replacement = resources[0].clone();
+            replacement.epoch += 1;
+            assert_eq!(replacement.process_id, resources[0].process_id);
+            assert_ne!(replacement.epoch, resources[0].epoch);
+        }
+    }
+
+    /// Build deterministic checked process evidence for projection-only tests.
+    fn test_process_window() -> crate::bifrost::telemetry::ProcessWindow {
+        crate::bifrost::telemetry::ProcessWindow {
+            identity: "pid-test".to_owned(),
+            epoch: 0,
+            cpu_seconds: 1.0,
+            current_rss_bytes: 1,
+            peak_rss_bytes: 2,
+            tokio_busy_seconds: 1.0,
+            queue_peak: 2,
         }
     }
 

@@ -34,6 +34,6 @@ pub use forge_harness::{
 pub use harness::{BifrostHarness, HarnessError};
 pub use query_fixture::{SeededBifrostQuery, seed_query_fixture};
 pub use telemetry::{
-    BifrostQueryTelemetryReport, ForgeMaintenanceTelemetryReport, ForgeTelemetryCapture,
-    ForgeTelemetryReportError,
+    BifrostQueryTelemetryReport, BifrostTelemetryCapture, BifrostTelemetryReportError,
+    ForgeMaintenanceTelemetryReport,
 };

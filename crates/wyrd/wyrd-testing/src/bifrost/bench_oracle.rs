@@ -745,7 +745,7 @@ async fn measured_query(
     client: &WyrdClient,
     request: &BifrostQueryRequest,
     expected_rows: u64,
-    telemetry: &super::telemetry::ForgeTelemetryCapture,
+    telemetry: &super::telemetry::BifrostTelemetryCapture,
 ) -> Result<QueryMeasurement, BenchError> {
     let started = Instant::now();
     let mut stream = QueryClient::new(client).query(request).await?;
@@ -806,7 +806,7 @@ fn percentile_us(samples: &[u64], percentile: usize) -> f64 {
 }
 
 /// Sum all changed production series belonging to one normalized family.
-fn metric_sum(samples: &[super::telemetry::ForgeMetricSample], family: &str) -> f64 {
+fn metric_sum(samples: &[super::telemetry::BifrostMetricSample], family: &str) -> f64 {
     samples
         .iter()
         .filter(|sample| sample.family == family)
@@ -816,7 +816,7 @@ fn metric_sum(samples: &[super::telemetry::ForgeMetricSample], family: &str) -> 
 
 /// Sum changed production series with one exact closed label value.
 fn metric_sum_matching(
-    samples: &[super::telemetry::ForgeMetricSample],
+    samples: &[super::telemetry::BifrostMetricSample],
     family: &str,
     label: &str,
     value: &str,

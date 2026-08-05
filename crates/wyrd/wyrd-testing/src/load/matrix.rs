@@ -26,17 +26,19 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 
 use crate::Bootstrap;
-use crate::bifrost::{BifrostTopology, ForgeTelemetryCapture, WyrdTestCluster};
+use crate::bifrost::{BifrostTelemetryCapture, BifrostTopology, WyrdTestCluster};
 
 /// Stable table name provisioned independently inside every tenant.
 const TABLE_NAME: &str = "bifrost_cluster_load";
 /// Whole-scenario progress ceiling, not a latency SLO.
 const DEFAULT_SCENARIO_DEADLINE: Duration = Duration::from_secs(60);
 /// Exact D24 Gate families required in every production capture.
-const REQUIRED_GATE_FAMILIES: [&str; 3] = [
+const REQUIRED_GATE_FAMILIES: [&str; 5] = [
     "bifrost_gate_requests_total",
     "bifrost_gate_request_duration_seconds",
     "bifrost_gate_active_streams",
+    "bifrost_gate_query_streams_total",
+    "bifrost_gate_query_stream_duration_seconds",
 ];
 
 /// Immutable operation counts collected for one tenant.
@@ -333,20 +335,20 @@ pub enum ClusterLoadError {
 /// Typed read-only mapper over production metric/span checkpoints.
 #[derive(Clone)]
 pub struct ClusterTelemetryCapture {
-    forge: ForgeTelemetryCapture,
+    forge: BifrostTelemetryCapture,
 }
 
 impl ClusterTelemetryCapture {
     /// Construct a mapper from the process-installed production capture.
     #[must_use]
-    pub fn new(forge: ForgeTelemetryCapture) -> Self {
+    pub fn new(forge: BifrostTelemetryCapture) -> Self {
         Self { forge }
     }
 
     /// Capture one immutable production checkpoint.
     pub fn checkpoint(
         &self,
-    ) -> Result<crate::bifrost::telemetry::ForgeTelemetryCheckpoint, ClusterLoadError> {
+    ) -> Result<crate::bifrost::telemetry::BifrostTelemetryCheckpoint, ClusterLoadError> {
         self.forge
             .checkpoint()
             .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))
@@ -355,7 +357,7 @@ impl ClusterTelemetryCapture {
     /// Map one checkpoint to closed-family metric and span deltas.
     pub fn delta_since(
         &self,
-        checkpoint: &crate::bifrost::telemetry::ForgeTelemetryCheckpoint,
+        checkpoint: &crate::bifrost::telemetry::BifrostTelemetryCheckpoint,
     ) -> Result<PillarTelemetryDelta, ClusterLoadError> {
         let delta = self
             .forge
@@ -474,7 +476,7 @@ impl ClusterTelemetryCapture {
 
 /// Validate D24's closed Gate operation/outcome label inventory.
 fn validate_gate_metric(
-    sample: &crate::bifrost::telemetry::ForgeMetricSample,
+    sample: &crate::bifrost::telemetry::BifrostMetricSample,
 ) -> Result<(), ClusterLoadError> {
     let operation = sample.labels.get("operation").map(String::as_str);
     let outcome = sample.labels.get("outcome").map(String::as_str);
@@ -497,13 +499,40 @@ fn validate_gate_metric(
                 sample.labels
             )));
         }
+        "bifrost_gate_query_streams_total"
+            if operation.is_some()
+                || !matches!(
+                    outcome,
+                    Some("success" | "rejected" | "failed" | "cancelled")
+                ) =>
+        {
+            return Err(ClusterLoadError::Telemetry(format!(
+                "invalid Gate query-stream labels for {}: {:?}",
+                sample.family, sample.labels
+            )));
+        }
+        "bifrost_gate_query_stream_duration_seconds"
+            if operation.is_some()
+                || (sample.kind
+                    == crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket
+                    && !sample.labels.contains_key("le"))
+                || !matches!(
+                    outcome,
+                    Some("success" | "rejected" | "failed" | "cancelled")
+                ) =>
+        {
+            return Err(ClusterLoadError::Telemetry(format!(
+                "invalid Gate query-stream labels for {}: {:?}",
+                sample.family, sample.labels
+            )));
+        }
         _ => {}
     }
     Ok(())
 }
 
 /// Preserve fixed labels in the typed report key without creating new labels.
-fn metric_series_key(sample: &crate::bifrost::telemetry::ForgeMetricSample) -> String {
+fn metric_series_key(sample: &crate::bifrost::telemetry::BifrostMetricSample) -> String {
     let labels = sample
         .labels
         .iter()
@@ -1502,17 +1531,13 @@ fn assert_phase_counter(name: &str, actual: f64, expected: u64) -> Result<(), Cl
 fn assert_cancellation_outcomes(delta: &PillarTelemetryDelta) -> Result<(), ClusterLoadError> {
     for operation in ["write", "query"] {
         for outcome in ["success", "rejected", "failed", "cancelled"] {
-            let actual = delta
-                .metrics
-                .iter()
-                .filter(|(series, _)| {
-                    series.starts_with("bifrost_gate_requests_total{")
-                        && series.contains(&format!("operation={operation}"))
-                        && series.contains(&format!("outcome={outcome}"))
-                })
-                .map(|(_, value)| *value)
-                .sum::<f64>();
-            let expected = u64::from(outcome == "cancelled");
+            let series =
+                format!("bifrost_gate_requests_total{{operation={operation},outcome={outcome}}}");
+            let actual = delta.metrics.get(&series).copied().unwrap_or(0.0);
+            let expected = u64::from(
+                (operation == "write" && outcome == "cancelled")
+                    || (operation == "query" && outcome == "success"),
+            );
             assert_phase_counter(
                 &format!("cancellation Gate {operation}/{outcome}"),
                 actual,
@@ -1520,6 +1545,24 @@ fn assert_cancellation_outcomes(delta: &PillarTelemetryDelta) -> Result<(), Clus
             )?;
         }
     }
+    for outcome in ["success", "failed", "cancelled"] {
+        let series = format!("bifrost_gate_query_streams_total{{outcome={outcome}}}");
+        let actual = delta.metrics.get(&series).copied().unwrap_or(0.0);
+        assert_phase_counter(
+            &format!("cancellation Gate query stream/{outcome}"),
+            actual,
+            u64::from(outcome == "cancelled"),
+        )?;
+    }
+    assert_phase_counter(
+        "cancellation Gate active query streams",
+        delta
+            .metrics
+            .get("bifrost_gate_active_streams{operation=query}")
+            .copied()
+            .unwrap_or(0.0),
+        0,
+    )?;
     Ok(())
 }
 

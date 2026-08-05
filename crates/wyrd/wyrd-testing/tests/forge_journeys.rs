@@ -330,8 +330,10 @@ async fn start_maintenance_journey_server() -> WyrdTestServer {
 /// # Panics
 ///
 /// Panics when the process-global recorder or isolated server cannot start.
-async fn start_telemetry_maintenance_server()
--> (WyrdTestServer, wyrd_testing::bifrost::ForgeTelemetryCapture) {
+async fn start_telemetry_maintenance_server() -> (
+    WyrdTestServer,
+    wyrd_testing::bifrost::BifrostTelemetryCapture,
+) {
     let (telemetry_guard, telemetry) =
         shared_process_telemetry_for_test().expect("shared production telemetry runtime");
     let server = WyrdTestServer::builder()

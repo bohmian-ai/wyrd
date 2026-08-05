@@ -3,7 +3,7 @@
 use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster};
 use wyrd_testing::load::{BifrostClusterLoad, ClusterLoadProfile};
 
-/// The public task owns Postgres and invokes only the six exact serial filters.
+/// The public task owns Postgres and invokes only the seven exact serial filters.
 ///
 /// # Panics
 ///
@@ -25,6 +25,7 @@ fn bifrost_cluster_task_contract_is_exact() {
         "pressured_tenant_does_not_starve_peers",
         "cluster_load_telemetry_reconciles_all_pillars",
         "cluster_load_cancellation_and_shutdown_release_all_owners",
+        "three_server_cluster_reconciles_production_telemetry",
     ];
     let commands = inner.split(" && ").collect::<Vec<_>>();
     assert_eq!(commands.len(), expected.len());
@@ -137,6 +138,37 @@ async fn multi_tenant_single_pod_mixed_gate_load() {
 #[ignore = "requires managed Postgres and the real public Gate cluster"]
 async fn multi_tenant_three_server_three_worker_mixed_gate_load() {
     run_profile(ClusterLoadProfile::multi_tenant_three_server_three_worker()).await;
+}
+
+/// Eight tenants reconcile public traffic, durable rows, audit, and production telemetry.
+///
+/// # Panics
+///
+/// Panics when the real three-server/three-worker lifecycle fails any public-client,
+/// pillar, audit, durable-state, fairness, or exact production-telemetry assertion.
+#[tokio::test]
+#[ignore = "requires managed Postgres and the real public Gate cluster"]
+async fn three_server_cluster_reconciles_production_telemetry() {
+    let profile = ClusterLoadProfile::multi_tenant_three_server_three_worker();
+    let summary = BifrostClusterLoad::start(profile)
+        .await
+        .expect("telemetry cluster starts")
+        .run()
+        .await
+        .expect("production telemetry reconciles");
+    assert_eq!(summary.tenants.len(), 8);
+    assert!(summary.jain_fairness >= 0.95);
+    assert!(
+        summary
+            .telemetry
+            .iter()
+            .all(|phase| !phase.required_families.is_empty())
+    );
+    assert!(summary.tenants.values().all(|tenant| {
+        tenant.tenant_audit_rows > 0
+            && tenant.final_rows == tenant.acknowledged_rows
+            && tenant.completed_reads >= profile.minimum_reads_per_tenant
+    }));
 }
 
 /// Real admission pressure on one tenant does not stall peer progress.

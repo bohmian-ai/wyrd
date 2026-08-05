@@ -16,7 +16,7 @@ use wyrd_server::{ForgeProcessRole, install_capture_runtime, start_capture_forge
 use wyrd_telemetry::TelemetryConfig;
 
 use crate::bifrost::{
-    ForgeMaintenanceTelemetryReport, ForgeTelemetryCapture, StandaloneForgeFixture,
+    BifrostTelemetryCapture, ForgeMaintenanceTelemetryReport, StandaloneForgeFixture,
 };
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
@@ -123,44 +123,6 @@ impl ForgeTopologyIdentities {
     #[must_use]
     fn replacement(&self, index: usize) -> Option<uuid::Uuid> {
         self.workers.get(index).copied()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::*;
-
-    /// Pins embedded colocation, dedicated uniqueness, stability, and replacement reuse.
-    #[test]
-    fn topology_identities_match_configured_role_owners() {
-        let node = |value| uuid::Uuid::from_u128(value);
-        let embedded = ForgeTopologyIdentities::plan(1).expect("embedded topology identities");
-        assert_eq!(embedded.coordinator, node(1));
-        assert_eq!(embedded.workers, vec![node(1)]);
-        assert_eq!(embedded.replacement(0), Some(node(1)));
-
-        let dedicated = ForgeTopologyIdentities::plan(3).expect("dedicated topology identities");
-        assert_eq!(dedicated.coordinator, node(1));
-        assert_eq!(dedicated.workers, vec![node(2), node(3), node(4)]);
-        assert_eq!(dedicated.replacement(1), Some(node(3)));
-        assert_eq!(dedicated.replacement(3), None);
-        assert_eq!(
-            dedicated
-                .workers
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .len(),
-            dedicated.workers.len()
-        );
-        assert!(!dedicated.workers.contains(&dedicated.coordinator));
-        assert_eq!(
-            ForgeTopologyIdentities::plan(3).expect("stable topology identities"),
-            dedicated
-        );
-        assert!(ForgeTopologyIdentities::plan(0).is_err());
     }
 }
 
@@ -405,7 +367,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         service_name: Some("wyrd-forge-benchmark".to_owned()),
         ..TelemetryConfig::default()
     })?;
-    let capture = ForgeTelemetryCapture::new(runtime.prometheus(), traces);
+    let capture = BifrostTelemetryCapture::new(runtime.prometheus(), traces);
     let fixture =
         StandaloneForgeFixture::start_topology("bifrost_bench_forge", scenario.tenants).await?;
     let forge_fixture = fixture.fixture();
@@ -476,4 +438,42 @@ fn report_path() -> std::path::PathBuf {
     std::env::var_os("WYRD_BIFROST_REPORT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("target/bifrost-benchmarks/forge.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// Pins embedded colocation, dedicated uniqueness, stability, and replacement reuse.
+    #[test]
+    fn topology_identities_match_configured_role_owners() {
+        let node = |value| uuid::Uuid::from_u128(value);
+        let embedded = ForgeTopologyIdentities::plan(1).expect("embedded topology identities");
+        assert_eq!(embedded.coordinator, node(1));
+        assert_eq!(embedded.workers, vec![node(1)]);
+        assert_eq!(embedded.replacement(0), Some(node(1)));
+
+        let dedicated = ForgeTopologyIdentities::plan(3).expect("dedicated topology identities");
+        assert_eq!(dedicated.coordinator, node(1));
+        assert_eq!(dedicated.workers, vec![node(2), node(3), node(4)]);
+        assert_eq!(dedicated.replacement(1), Some(node(3)));
+        assert_eq!(dedicated.replacement(3), None);
+        assert_eq!(
+            dedicated
+                .workers
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            dedicated.workers.len()
+        );
+        assert!(!dedicated.workers.contains(&dedicated.coordinator));
+        assert_eq!(
+            ForgeTopologyIdentities::plan(3).expect("stable topology identities"),
+            dedicated
+        );
+        assert!(ForgeTopologyIdentities::plan(0).is_err());
+    }
 }

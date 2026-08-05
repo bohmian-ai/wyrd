@@ -29,7 +29,7 @@ use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 use wyrd_telemetry::{CapturedSpan, TelemetryConfig, TelemetryGuard, TestTraceCapture};
 
 use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
-use crate::bifrost::telemetry::ForgeTelemetryCapture;
+use crate::bifrost::telemetry::BifrostTelemetryCapture;
 use crate::server::{
     TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
     provision_oracle_peer_credentials, test_catalog, test_redux_catalog,
@@ -487,7 +487,7 @@ struct ProcessTelemetry {
     /// Guard retaining the one SDK tracer provider.
     guard: Arc<TelemetryGuard>,
     /// Forge report capture backed by the same process recorder and provider.
-    forge_capture: ForgeTelemetryCapture,
+    forge_capture: BifrostTelemetryCapture,
 }
 
 /// One telemetry installation per test process.
@@ -517,7 +517,7 @@ fn process_telemetry() -> Result<&'static ProcessTelemetry, ClusterError> {
     })
     .map_err(|error| ClusterError::Telemetry(error.to_string()))?;
     let metrics = install_recorder().map_err(|error| ClusterError::Telemetry(error.to_string()))?;
-    let forge_capture = ForgeTelemetryCapture::new(metrics.clone(), traces.clone());
+    let forge_capture = BifrostTelemetryCapture::new(metrics.clone(), traces.clone());
     let _ = PROCESS_TELEMETRY.set(ProcessTelemetry {
         guard: Arc::new(guard),
         forge_capture,
@@ -533,7 +533,7 @@ fn process_telemetry() -> Result<&'static ProcessTelemetry, ClusterError> {
 /// Returns a telemetry error when process installation fails or another global
 /// recorder/subscriber already owns the process.
 pub fn shared_process_telemetry_for_test()
--> Result<(Arc<TelemetryGuard>, ForgeTelemetryCapture), ClusterError> {
+-> Result<(Arc<TelemetryGuard>, BifrostTelemetryCapture), ClusterError> {
     let process = process_telemetry()?;
     Ok((Arc::clone(&process.guard), process.forge_capture.clone()))
 }
@@ -661,7 +661,7 @@ pub struct WyrdTestCluster {
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
-    telemetry: ForgeTelemetryCapture,
+    telemetry: BifrostTelemetryCapture,
     /// Valid SYSTEM_OWNER Service credential retained across node restarts.
     oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional retained TLS fixture directory and paths for real peer transport.
@@ -1483,7 +1483,7 @@ impl WyrdTestCluster {
 
     /// Return the process production telemetry capture handle.
     #[must_use]
-    pub const fn telemetry(&self) -> &ForgeTelemetryCapture {
+    pub const fn telemetry(&self) -> &BifrostTelemetryCapture {
         &self.telemetry
     }
 

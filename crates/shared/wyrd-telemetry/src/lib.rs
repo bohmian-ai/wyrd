@@ -75,6 +75,20 @@ pub struct CapturedSpan {
     pub attributes: BTreeMap<String, String>,
     /// Measured wall-clock duration from the production span timestamps.
     pub duration_nanos: u64,
+    /// Terminal OpenTelemetry status retained without collapsing unset and success.
+    pub status: CapturedSpanStatus,
+}
+
+/// Closed terminal status of one captured OpenTelemetry span.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapturedSpanStatus {
+    /// The owner did not assign a terminal status.
+    Unset,
+    /// The owner explicitly marked the operation successful.
+    Ok,
+    /// The owner marked the operation failed, retaining its scrubbed description.
+    Error(String),
 }
 
 /// Handle for inspecting spans exported by the production-shaped test pipeline.
@@ -124,6 +138,13 @@ impl TestTraceCapture {
                             .map_or(0, |duration| {
                                 u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
                             }),
+                        status: match &span.status {
+                            opentelemetry::trace::Status::Unset => CapturedSpanStatus::Unset,
+                            opentelemetry::trace::Status::Ok => CapturedSpanStatus::Ok,
+                            opentelemetry::trace::Status::Error { description } => {
+                                CapturedSpanStatus::Error(description.to_string())
+                            }
+                        },
                     })
                     .collect()
             },
@@ -401,6 +422,7 @@ mod tests {
         let spans = capture.finished_since(checkpoint);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "telemetry.compatibility");
+        assert_eq!(spans[0].status, super::CapturedSpanStatus::Unset);
         assert_eq!(
             spans[0].attributes.get("component"),
             Some(&"wyrd".to_owned())

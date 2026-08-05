@@ -310,6 +310,8 @@ pub enum CapacityLimit {
     MissedDeadline,
     /// A production dependency exceeded its declared SLO.
     DependencySlo,
+    /// Required production evidence was absent, malformed, or internally inconsistent.
+    InvalidEvidence,
     /// Exact data, tenant, or audit reconciliation failed.
     Correctness,
     /// The stage cleanup or resource lifecycle did not converge.
@@ -319,7 +321,7 @@ pub enum CapacityLimit {
 /// Stable node identity retained for per-node evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeId(
+pub struct ProcessId(
     /// Stable process/node value from the benchmark topology.
     pub String,
 );
@@ -359,11 +361,15 @@ pub struct PillarTelemetryDelta {
     /// Scribe WAL append and fsync bytes.
     pub scribe_wal_bytes: u64,
     /// Forge materialized rows.
-    pub forge_materialized_rows: u64,
+    pub forge_publications: u64,
     /// Oracle decoded rows.
     pub oracle_decoded_rows: u64,
-    /// Whether every required production family was observed.
-    pub complete: bool,
+    /// Validation status across the exact closed pillar bindings.
+    pub status: EvidenceStatus,
+    /// Bounded identifiers for required bindings that were absent.
+    pub missing_required: Vec<String>,
+    /// Bounded identifiers for bindings with invalid kind, labels, unit, or value.
+    pub invalid: Vec<String>,
 }
 
 /// Dependency evidence used to explain a limiting stage.
@@ -380,22 +386,32 @@ pub struct DependencyTelemetryEvidence {
     pub storage_p99_us: u64,
     /// WAL fsync latency p99 in microseconds.
     pub wal_fsync_p99_us: u64,
-    /// Whether all dependency families were observed.
-    pub complete: bool,
+    /// Validation status across the exact closed dependency bindings.
+    pub status: EvidenceStatus,
+    /// Bounded identifiers for required bindings that were absent.
+    pub missing_required: Vec<String>,
+    /// Bounded identifiers for malformed dependency bindings.
+    pub invalid: Vec<String>,
 }
 
 /// Workload resource evidence attributed to one node and its roles.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeResourceEvidence {
-    /// Stable node/process identity.
-    pub node_id: NodeId,
+pub struct ProcessResourceEvidence {
+    /// Stable OS process identity.
+    pub process_id: ProcessId,
+    /// Explicit process epoch; replacement begins a new epoch instead of a counter reset.
+    pub epoch: u64,
+    /// Logical node identities hosted in this process.
+    pub hosted_logical_nodes: Vec<String>,
     /// Roles hosted by this node.
     pub roles: Vec<BifrostRuntimeRole>,
     /// CPU seconds consumed by the process.
     pub cpu_seconds: f64,
     /// Peak resident set size in bytes.
     pub peak_rss_bytes: u64,
+    /// Resident set size at the end of the capture window.
+    pub current_rss_bytes: u64,
     /// Runtime busy seconds.
     pub runtime_busy_seconds: f64,
     /// Peak runtime queue depth.
@@ -455,7 +471,7 @@ pub struct CapacityStage {
     /// Pillar telemetry delta.
     pub telemetry: PillarTelemetryDelta,
     /// Per-node resource evidence.
-    pub resources: Vec<NodeResourceEvidence>,
+    pub resources: Vec<ProcessResourceEvidence>,
     /// Dependency evidence.
     pub dependencies: DependencyTelemetryEvidence,
     /// Representative traces.
@@ -474,8 +490,12 @@ impl CapacityStage {
             .iter()
             .map(|trace| trace.operation)
             .collect::<HashSet<_>>();
-        if !self.telemetry.complete
-            || !self.dependencies.complete
+        if self.telemetry.status != EvidenceStatus::Complete
+            || self.dependencies.status != EvidenceStatus::Complete
+            || !self.telemetry.missing_required.is_empty()
+            || !self.telemetry.invalid.is_empty()
+            || !self.dependencies.missing_required.is_empty()
+            || !self.dependencies.invalid.is_empty()
             || self.resources.is_empty()
             || self
                 .resources
@@ -668,7 +688,7 @@ pub struct ClusterTrialReport {
     /// Pillar telemetry delta.
     pub telemetry: PillarTelemetryDelta,
     /// Per-node resource evidence.
-    pub resources: Vec<NodeResourceEvidence>,
+    pub resources: Vec<ProcessResourceEvidence>,
     /// Dependency evidence.
     pub dependencies: DependencyTelemetryEvidence,
     /// Trace manifest.
@@ -688,8 +708,12 @@ impl ClusterTrialReport {
             .iter()
             .map(|trace| trace.operation)
             .collect::<HashSet<_>>();
-        if !self.telemetry.complete
-            || !self.dependencies.complete
+        if self.telemetry.status != EvidenceStatus::Complete
+            || self.dependencies.status != EvidenceStatus::Complete
+            || !self.telemetry.missing_required.is_empty()
+            || !self.telemetry.invalid.is_empty()
+            || !self.dependencies.missing_required.is_empty()
+            || !self.dependencies.invalid.is_empty()
             || self.resources.is_empty()
             || self
                 .resources
@@ -2506,19 +2530,22 @@ mod tests {
             trial_index,
             metrics: ClientTrialMetrics::default(),
             telemetry: PillarTelemetryDelta {
-                complete: true,
+                status: EvidenceStatus::Complete,
                 ..Default::default()
             },
-            resources: vec![NodeResourceEvidence {
-                node_id: NodeId("fixture".to_owned()),
+            resources: vec![ProcessResourceEvidence {
+                process_id: ProcessId("fixture".to_owned()),
+                epoch: 0,
+                hosted_logical_nodes: vec!["server-0".to_owned()],
                 roles: vec![BifrostRuntimeRole::Gate],
                 cpu_seconds: 1.0,
                 peak_rss_bytes: 1,
+                current_rss_bytes: 1,
                 runtime_busy_seconds: 1.0,
                 runtime_queue_peak: 1,
             }],
             dependencies: DependencyTelemetryEvidence {
-                complete: true,
+                status: EvidenceStatus::Complete,
                 ..Default::default()
             },
             traces: operations
@@ -2551,7 +2578,7 @@ mod tests {
             )
         };
         let mut report = fixture();
-        report.trial_evidence[0].telemetry.complete = false;
+        report.trial_evidence[0].telemetry.status = EvidenceStatus::Failed;
         assert!(matches!(
             report.validate(),
             Err(ClusterBenchmarkError::NotReady(_))
@@ -2563,7 +2590,7 @@ mod tests {
             Err(ClusterBenchmarkError::NotReady(_))
         ));
         let mut report = fixture();
-        report.trial_evidence[0].dependencies.complete = false;
+        report.trial_evidence[0].dependencies.status = EvidenceStatus::Failed;
         assert!(matches!(
             report.validate(),
             Err(ClusterBenchmarkError::NotReady(_))

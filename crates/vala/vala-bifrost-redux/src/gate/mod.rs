@@ -192,6 +192,15 @@ fn initialize_gate_metrics() {
         metrics::Unit::Seconds,
         "Bifrost Gate request duration by operation and terminal outcome."
     );
+    metrics::describe_counter!(
+        "bifrost_gate_query_streams_total",
+        "Total Bifrost Gate query streams by terminal outcome."
+    );
+    metrics::describe_histogram!(
+        "bifrost_gate_query_stream_duration_seconds",
+        metrics::Unit::Seconds,
+        "Bifrost Gate query-stream duration by terminal outcome."
+    );
     metrics::describe_gauge!(
         "bifrost_gate_active_streams",
         "Current authorized and admitted Bifrost Gate query streams."
@@ -214,6 +223,9 @@ fn initialize_gate_metrics() {
             )
             .increment(0);
         }
+    }
+    for outcome in ["success", "rejected", "failed", "cancelled"] {
+        metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome).increment(0);
     }
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
 }
@@ -1115,6 +1127,18 @@ mod tests {
                     "Bifrost Gate request duration by operation and terminal outcome.".to_owned(),
                 ),
                 (
+                    "counter".to_owned(),
+                    "bifrost_gate_query_streams_total".to_owned(),
+                    None,
+                    "Total Bifrost Gate query streams by terminal outcome.".to_owned(),
+                ),
+                (
+                    "histogram".to_owned(),
+                    "bifrost_gate_query_stream_duration_seconds".to_owned(),
+                    Some(metrics::Unit::Seconds),
+                    "Bifrost Gate query-stream duration by terminal outcome.".to_owned(),
+                ),
+                (
                     "gauge".to_owned(),
                     "bifrost_gate_active_streams".to_owned(),
                     None,
@@ -1153,6 +1177,14 @@ mod tests {
                     Some(&0)
                 );
             }
+        }
+        for outcome in ["success", "rejected", "failed", "cancelled"] {
+            assert_eq!(
+                snapshot.counters.get(&format!(
+                    "bifrost_gate_query_streams_total{{outcome=\"{outcome}\"}}"
+                )),
+                Some(&0)
+            );
         }
     }
 

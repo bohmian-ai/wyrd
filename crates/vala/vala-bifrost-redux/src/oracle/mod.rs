@@ -301,12 +301,27 @@ impl OracleTelemetry {
     /// entry keeps the production scrape contract discoverable without
     /// fabricating an event or changing subsequent counter values.
     fn register_sparse_series(query_class: QueryClass) {
-        for reason in ["pending_limit", "lease_capacity", "local_slots"] {
+        for (scope, reason) in [
+            ("cluster", "pending_limit"),
+            ("cluster", "lease_capacity"),
+            ("class", "lease_capacity"),
+            ("tenant", "lease_capacity"),
+            ("cluster", "local_slots"),
+        ] {
             metrics::counter!(
                 "bifrost_oracle_admission_rejections_total",
-                "scope" => "cluster",
+                "scope" => scope,
                 "reason" => reason,
                 "query_class" => query_class_label(query_class)
+            )
+            .increment(0);
+        }
+        for outcome in ["acquired", "rejected"] {
+            metrics::counter!(
+                "bifrost_oracle_slot_reservations_total",
+                "role" => "leader",
+                "query_class" => query_class_label(query_class),
+                "outcome" => outcome
             )
             .increment(0);
         }

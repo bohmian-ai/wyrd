@@ -620,6 +620,12 @@ fn capacity_stage_report(
                     scribe_wal_bytes: 0,
                     forge_publications: 0,
                     oracle_decoded_rows: 0,
+                    oracle_analytical_slots_peak: 0,
+                    oracle_pending_limit_rejections: 0,
+                    oracle_cluster_lease_rejections: 0,
+                    oracle_class_lease_rejections: 0,
+                    oracle_tenant_lease_rejections: 0,
+                    oracle_local_slot_rejections: 0,
                     status: EvidenceStatus::Failed,
                     missing_required: Vec::new(),
                     invalid: invalid.clone(),
@@ -723,6 +729,12 @@ fn adapt_pillars(evidence: &ClusterTelemetryEvidence) -> PillarTelemetryDelta {
         scribe_wal_bytes: evidence.pillars.scribe_wal_bytes,
         forge_publications: evidence.pillars.forge_publications,
         oracle_decoded_rows: evidence.pillars.oracle_decoded_rows,
+        oracle_analytical_slots_peak: evidence.pillars.oracle_analytical_slots_peak,
+        oracle_pending_limit_rejections: evidence.pillars.oracle_pending_limit_rejections,
+        oracle_cluster_lease_rejections: evidence.pillars.oracle_cluster_lease_rejections,
+        oracle_class_lease_rejections: evidence.pillars.oracle_class_lease_rejections,
+        oracle_tenant_lease_rejections: evidence.pillars.oracle_tenant_lease_rejections,
+        oracle_local_slot_rejections: evidence.pillars.oracle_local_slot_rejections,
         status: EvidenceStatus::Complete,
         missing_required: Vec::new(),
         invalid: Vec::new(),
@@ -3888,6 +3900,24 @@ mod tests {
             value: 0.0,
             kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
         });
+        for (scope, reason) in [
+            ("cluster", "pending_limit"),
+            ("cluster", "lease_capacity"),
+            ("class", "lease_capacity"),
+            ("tenant", "lease_capacity"),
+            ("cluster", "local_slots"),
+        ] {
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: "bifrost_oracle_admission_rejections_total".to_owned(),
+                labels: BTreeMap::from([
+                    ("scope".to_owned(), scope.to_owned()),
+                    ("reason".to_owned(), reason.to_owned()),
+                    ("query_class".to_owned(), "analytical".to_owned()),
+                ]),
+                value: 0.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
+            });
+        }
         for (family, labels) in [
             ("bifrost_gate_frame_bytes_total", BTreeMap::new()),
             (
@@ -3975,12 +4005,23 @@ mod tests {
                 kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramSum,
             });
         }
-        let gauge_maxima = vec![crate::bifrost::telemetry::BifrostMetricSample {
-            family: "bifrost_forge_oldest_backlog_seconds".to_owned(),
-            labels: BTreeMap::new(),
-            value: 0.0,
-            kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
-        }];
+        let gauge_maxima = vec![
+            crate::bifrost::telemetry::BifrostMetricSample {
+                family: "bifrost_forge_oldest_backlog_seconds".to_owned(),
+                labels: BTreeMap::new(),
+                value: 0.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
+            },
+            crate::bifrost::telemetry::BifrostMetricSample {
+                family: "bifrost_oracle_slots_in_use".to_owned(),
+                labels: BTreeMap::from([
+                    ("query_class".to_owned(), "analytical".to_owned()),
+                    ("role".to_owned(), "leader".to_owned()),
+                ]),
+                value: 4.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
+            },
+        ];
         let mut gauge_final = vec![
             crate::bifrost::telemetry::BifrostMetricSample {
                 family: "bifrost_oracle_slots_total".to_owned(),
@@ -4044,7 +4085,7 @@ mod tests {
                 "bifrost.scribe.wal.append",
                 "bifrost.forge.catalog.commit",
                 "bifrost.oracle.source",
-                "bifrost.oracle.query",
+                "bifrost.gate.query.stream",
             ]
             .into_iter()
             .map(|name| wyrd_telemetry::CapturedSpan {
@@ -4098,7 +4139,11 @@ mod tests {
         let healthy = machine.next_plan().unwrap();
         let healthy_stage =
             assemble_capacity_stage(definition, healthy, completed_stage_fixture(0, true), 10);
-        assert!(healthy_stage.passed);
+        assert!(
+            healthy_stage.passed,
+            "healthy fixture failed: {:?} {:?}",
+            healthy_stage.stop_reasons, healthy_stage.telemetry.invalid
+        );
         machine.record(healthy, healthy_stage.passed).unwrap();
 
         let failed = machine.next_plan().unwrap();
@@ -4207,6 +4252,12 @@ mod tests {
                 scribe_wal_bytes: 12,
                 forge_publications: 13,
                 oracle_decoded_rows: 14,
+                oracle_analytical_slots_peak: 4,
+                oracle_pending_limit_rejections: 0,
+                oracle_cluster_lease_rejections: 0,
+                oracle_class_lease_rejections: 0,
+                oracle_tenant_lease_rejections: 0,
+                oracle_local_slot_rejections: 0,
             },
             dependencies: crate::bifrost::telemetry::ClusterDependencyTelemetryEvidence {
                 postgres_pool_wait_us: Some(21),

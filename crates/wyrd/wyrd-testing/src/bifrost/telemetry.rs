@@ -115,6 +115,22 @@ pub(crate) struct TelemetryBinding {
     allowed_label_values: &'static [TelemetryLabelValues],
 }
 
+/// Closed production labels carried by every Oracle admission rejection.
+const ORACLE_ADMISSION_REJECTION_LABELS: &[TelemetryLabelValues] = &[
+    TelemetryLabelValues {
+        key: "scope",
+        values: &["cluster", "class", "tenant"],
+    },
+    TelemetryLabelValues {
+        key: "reason",
+        values: &["pending_limit", "lease_capacity", "local_slots"],
+    },
+    TelemetryLabelValues {
+        key: "query_class",
+        values: &["interactive", "analytical"],
+    },
+];
+
 /// Closed exact binding ledger shared by qualification and capacity projection.
 const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     TelemetryBinding {
@@ -501,6 +517,143 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
     TelemetryBinding {
+        id: TelemetryBindingId("oracle.slots_peak.analytical"),
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "query_class",
+            value: "analytical",
+        }],
+        family: "bifrost_oracle_slots_in_use",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Peak,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "query_class",
+                values: &["interactive", "analytical"],
+            },
+            TelemetryLabelValues {
+                key: "role",
+                values: &["leader"],
+            },
+        ],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.admission.pending_limit"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "scope",
+                value: "cluster",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "pending_limit",
+            },
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "analytical",
+            },
+        ],
+        family: "bifrost_oracle_admission_rejections_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.admission.lease_cluster"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "scope",
+                value: "cluster",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "lease_capacity",
+            },
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "analytical",
+            },
+        ],
+        family: "bifrost_oracle_admission_rejections_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.admission.lease_class"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "scope",
+                value: "class",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "lease_capacity",
+            },
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "analytical",
+            },
+        ],
+        family: "bifrost_oracle_admission_rejections_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.admission.lease_tenant"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "scope",
+                value: "tenant",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "lease_capacity",
+            },
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "analytical",
+            },
+        ],
+        family: "bifrost_oracle_admission_rejections_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.admission.local_slots"),
+        selected_label_values: &[
+            TelemetrySelectedLabel {
+                key: "scope",
+                value: "cluster",
+            },
+            TelemetrySelectedLabel {
+                key: "reason",
+                value: "local_slots",
+            },
+            TelemetrySelectedLabel {
+                key: "query_class",
+                value: "analytical",
+            },
+        ],
+        family: "bifrost_oracle_admission_rejections_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
+    },
+    TelemetryBinding {
         id: TelemetryBindingId("scribe.wal_bytes"),
         selected_label_values: &[],
         family: "bifrost_scribe_wal_append_bytes_total",
@@ -757,6 +910,12 @@ const COMPLETE_BINDING_IDS: &[&str] = &[
     "scribe.rows",
     "forge.backlog_peak",
     "oracle.slots_final",
+    "oracle.slots_peak.analytical",
+    "oracle.admission.pending_limit",
+    "oracle.admission.lease_cluster",
+    "oracle.admission.lease_class",
+    "oracle.admission.lease_tenant",
+    "oracle.admission.local_slots",
     "scribe.wal_bytes",
     "scribe.seal_rows",
     "forge.publications",
@@ -914,6 +1073,18 @@ pub(crate) struct ClusterPillarTelemetryEvidence {
     pub(crate) forge_publications: u64,
     /// Rows decoded by successful Oracle streams.
     pub(crate) oracle_decoded_rows: u64,
+    /// Peak analytical slot units retained concurrently by local Oracle leaders.
+    pub(crate) oracle_analytical_slots_peak: u64,
+    /// Analytical requests rejected because the local pending waiter bound was full.
+    pub(crate) oracle_pending_limit_rejections: u64,
+    /// Analytical requests rejected by the durable cluster slot ceiling.
+    pub(crate) oracle_cluster_lease_rejections: u64,
+    /// Analytical requests rejected by the durable class slot ceiling.
+    pub(crate) oracle_class_lease_rejections: u64,
+    /// Analytical requests rejected by the durable per-tenant slot ceiling.
+    pub(crate) oracle_tenant_lease_rejections: u64,
+    /// Analytical requests rejected by the selected leader's local slot guard.
+    pub(crate) oracle_local_slot_rejections: u64,
 }
 
 /// Canonical dependency observations without a dependency on benchmark reports.
@@ -1963,6 +2134,36 @@ impl ClusterTelemetryProjection {
                 scribe_wal_bytes: binding_counter(&bindings, "scribe.wal_bytes").unwrap_or(0),
                 forge_publications: binding_counter(&bindings, "forge.publications").unwrap_or(0),
                 oracle_decoded_rows: binding_counter(&bindings, "oracle.rows").unwrap_or(0),
+                oracle_analytical_slots_peak: binding_gauge_peak(
+                    &bindings,
+                    "oracle.slots_peak.analytical",
+                )
+                .unwrap_or(0),
+                oracle_pending_limit_rejections: binding_counter(
+                    &bindings,
+                    "oracle.admission.pending_limit",
+                )
+                .unwrap_or(0),
+                oracle_cluster_lease_rejections: binding_counter(
+                    &bindings,
+                    "oracle.admission.lease_cluster",
+                )
+                .unwrap_or(0),
+                oracle_class_lease_rejections: binding_counter(
+                    &bindings,
+                    "oracle.admission.lease_class",
+                )
+                .unwrap_or(0),
+                oracle_tenant_lease_rejections: binding_counter(
+                    &bindings,
+                    "oracle.admission.lease_tenant",
+                )
+                .unwrap_or(0),
+                oracle_local_slot_rejections: binding_counter(
+                    &bindings,
+                    "oracle.admission.local_slots",
+                )
+                .unwrap_or(0),
             },
             dependencies: ClusterDependencyTelemetryEvidence {
                 postgres_pool_wait_us: binding_p99(&bindings, "postgres.acquire"),
@@ -2058,6 +2259,17 @@ fn binding_gauge_final(
 ) -> Option<u64> {
     match bindings.get(id) {
         Some(EvaluatedBindingValue::Gauge { final_value, .. }) => Some(*final_value),
+        _ => None,
+    }
+}
+
+/// Return one exact peak gauge destination without synthesizing absence.
+fn binding_gauge_peak(
+    bindings: &BTreeMap<&'static str, EvaluatedBindingValue>,
+    id: &str,
+) -> Option<u64> {
+    match bindings.get(id) {
+        Some(EvaluatedBindingValue::Gauge { peak, .. }) => Some(*peak),
         _ => None,
     }
 }
@@ -3227,6 +3439,18 @@ mod tests {
         }
     }
 
+    /// Return the sampled window owned by one binding aggregation in test fixtures.
+    fn binding_samples_mut<'a>(
+        delta: &'a mut BifrostTelemetryDelta,
+        binding: &TelemetryBinding,
+    ) -> &'a mut Vec<BifrostMetricSample> {
+        match binding.aggregation {
+            TelemetryAggregation::Delta | TelemetryAggregation::P99 => &mut delta.metrics,
+            TelemetryAggregation::Peak => &mut delta.gauge_maxima,
+            TelemetryAggregation::Final => &mut delta.gauge_final,
+        }
+    }
+
     /// Slot capacity is an up/down gauge even though its legacy family ends in `_total`.
     #[test]
     fn oracle_slot_capacity_is_not_monotonic() {
@@ -3555,7 +3779,10 @@ mod tests {
         for binding in CLUSTER_BINDINGS {
             let first_family_id = CLUSTER_BINDINGS
                 .iter()
-                .find(|candidate| candidate.family == binding.family)
+                .find(|candidate| {
+                    candidate.family == binding.family
+                        && candidate.aggregation == binding.aggregation
+                })
                 .expect("binding family has an owner")
                 .id
                 .0;
@@ -3568,16 +3795,14 @@ mod tests {
             };
 
             let mut wrong_kind = canonical_binding_delta();
-            let sources = [
-                &mut wrong_kind.metrics,
-                &mut wrong_kind.gauge_maxima,
-                &mut wrong_kind.gauge_final,
-            ];
-            let sample = sources.into_iter().find_map(|source| {
-                source
-                    .iter_mut()
-                    .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
-            });
+            let source = match binding.aggregation {
+                TelemetryAggregation::Delta | TelemetryAggregation::P99 => &mut wrong_kind.metrics,
+                TelemetryAggregation::Peak => &mut wrong_kind.gauge_maxima,
+                TelemetryAggregation::Final => &mut wrong_kind.gauge_final,
+            };
+            let sample = source
+                .iter_mut()
+                .find(|sample| sample.family == binding.family && sample.kind == binding.kind);
             sample.expect("binding fixture has expected sample").kind =
                 if binding.kind == BifrostMetricKind::Gauge {
                     BifrostMetricKind::Counter
@@ -3587,36 +3812,20 @@ mod tests {
             assert_id(validate_cluster_bindings(&wrong_kind));
 
             let mut unknown_key = canonical_binding_delta();
-            [
-                &mut unknown_key.metrics,
-                &mut unknown_key.gauge_maxima,
-                &mut unknown_key.gauge_final,
-            ]
-            .into_iter()
-            .find_map(|source| {
-                source
-                    .iter_mut()
-                    .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
-            })
-            .expect("binding fixture has expected sample")
-            .labels
-            .insert("tenant".to_owned(), "forbidden".to_owned());
+            binding_samples_mut(&mut unknown_key, binding)
+                .iter_mut()
+                .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
+                .expect("binding fixture has expected sample")
+                .labels
+                .insert("tenant".to_owned(), "forbidden".to_owned());
             assert_id(validate_cluster_bindings(&unknown_key));
 
             let mut nonfinite = canonical_binding_delta();
-            [
-                &mut nonfinite.metrics,
-                &mut nonfinite.gauge_maxima,
-                &mut nonfinite.gauge_final,
-            ]
-            .into_iter()
-            .find_map(|source| {
-                source
-                    .iter_mut()
-                    .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
-            })
-            .expect("binding fixture has expected sample")
-            .value = f64::NAN;
+            binding_samples_mut(&mut nonfinite, binding)
+                .iter_mut()
+                .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
+                .expect("binding fixture has expected sample")
+                .value = f64::NAN;
             assert_id(validate_cluster_bindings(&nonfinite));
 
             let mut wrong_aggregation = canonical_binding_delta();
@@ -3643,30 +3852,19 @@ mod tests {
 
             if let Some(domain) = binding.allowed_label_values.first() {
                 let mut wrong_value = canonical_binding_delta();
-                [
-                    &mut wrong_value.metrics,
-                    &mut wrong_value.gauge_maxima,
-                    &mut wrong_value.gauge_final,
-                ]
-                .into_iter()
-                .find_map(|source| {
-                    source.iter_mut().find(|sample| {
-                        sample.family == binding.family && sample.kind == binding.kind
-                    })
-                })
-                .expect("binding fixture has expected sample")
-                .labels
-                .insert(domain.key.to_owned(), "forbidden".to_owned());
+                binding_samples_mut(&mut wrong_value, binding)
+                    .iter_mut()
+                    .find(|sample| sample.family == binding.family && sample.kind == binding.kind)
+                    .expect("binding fixture has expected sample")
+                    .labels
+                    .insert(domain.key.to_owned(), "forbidden".to_owned());
                 assert_id(validate_cluster_bindings(&wrong_value));
             }
 
             for domain in binding.allowed_label_values {
                 let mut missing_key = canonical_binding_delta();
-                for sample in missing_key
-                    .metrics
+                for sample in binding_samples_mut(&mut missing_key, binding)
                     .iter_mut()
-                    .chain(&mut missing_key.gauge_maxima)
-                    .chain(&mut missing_key.gauge_final)
                     .filter(|sample| sample.family == binding.family)
                 {
                     sample.labels.remove(domain.key);
@@ -4230,6 +4428,136 @@ mod tests {
                 aggregation: Final,
                 requirement: Role("oracle"),
                 destination: "binding validation",
+            },
+            EmitterContractFixture {
+                id: "oracle.slots_peak.analytical",
+                selectors: &[("query_class", "analytical")],
+                family: "bifrost_oracle_slots_in_use",
+                kind: Gauge,
+                keys: &["query_class", "role"],
+                domains: &[
+                    ("query_class", &["interactive", "analytical"]),
+                    ("role", &["leader"]),
+                ],
+                unit: Count,
+                aggregation: Peak,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_analytical_slots_peak",
+            },
+            EmitterContractFixture {
+                id: "oracle.admission.pending_limit",
+                selectors: &[
+                    ("scope", "cluster"),
+                    ("reason", "pending_limit"),
+                    ("query_class", "analytical"),
+                ],
+                family: "bifrost_oracle_admission_rejections_total",
+                kind: Counter,
+                keys: &["scope", "reason", "query_class"],
+                domains: &[
+                    ("scope", &["cluster", "class", "tenant"]),
+                    (
+                        "reason",
+                        &["pending_limit", "lease_capacity", "local_slots"],
+                    ),
+                    ("query_class", &["interactive", "analytical"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_pending_limit_rejections",
+            },
+            EmitterContractFixture {
+                id: "oracle.admission.lease_cluster",
+                selectors: &[
+                    ("scope", "cluster"),
+                    ("reason", "lease_capacity"),
+                    ("query_class", "analytical"),
+                ],
+                family: "bifrost_oracle_admission_rejections_total",
+                kind: Counter,
+                keys: &["scope", "reason", "query_class"],
+                domains: &[
+                    ("scope", &["cluster", "class", "tenant"]),
+                    (
+                        "reason",
+                        &["pending_limit", "lease_capacity", "local_slots"],
+                    ),
+                    ("query_class", &["interactive", "analytical"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_cluster_lease_rejections",
+            },
+            EmitterContractFixture {
+                id: "oracle.admission.lease_class",
+                selectors: &[
+                    ("scope", "class"),
+                    ("reason", "lease_capacity"),
+                    ("query_class", "analytical"),
+                ],
+                family: "bifrost_oracle_admission_rejections_total",
+                kind: Counter,
+                keys: &["scope", "reason", "query_class"],
+                domains: &[
+                    ("scope", &["cluster", "class", "tenant"]),
+                    (
+                        "reason",
+                        &["pending_limit", "lease_capacity", "local_slots"],
+                    ),
+                    ("query_class", &["interactive", "analytical"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_class_lease_rejections",
+            },
+            EmitterContractFixture {
+                id: "oracle.admission.lease_tenant",
+                selectors: &[
+                    ("scope", "tenant"),
+                    ("reason", "lease_capacity"),
+                    ("query_class", "analytical"),
+                ],
+                family: "bifrost_oracle_admission_rejections_total",
+                kind: Counter,
+                keys: &["scope", "reason", "query_class"],
+                domains: &[
+                    ("scope", &["cluster", "class", "tenant"]),
+                    (
+                        "reason",
+                        &["pending_limit", "lease_capacity", "local_slots"],
+                    ),
+                    ("query_class", &["interactive", "analytical"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_tenant_lease_rejections",
+            },
+            EmitterContractFixture {
+                id: "oracle.admission.local_slots",
+                selectors: &[
+                    ("scope", "cluster"),
+                    ("reason", "local_slots"),
+                    ("query_class", "analytical"),
+                ],
+                family: "bifrost_oracle_admission_rejections_total",
+                kind: Counter,
+                keys: &["scope", "reason", "query_class"],
+                domains: &[
+                    ("scope", &["cluster", "class", "tenant"]),
+                    (
+                        "reason",
+                        &["pending_limit", "lease_capacity", "local_slots"],
+                    ),
+                    ("query_class", &["interactive", "analytical"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "pillars.oracle_local_slot_rejections",
             },
             EmitterContractFixture {
                 id: "scribe.wal_bytes",

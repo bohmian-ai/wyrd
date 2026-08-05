@@ -136,6 +136,22 @@ pub(super) struct PendingLeaseRelease {
     pub(super) resource_probe: Option<Arc<QueryResourceProbe>>,
 }
 
+impl Clone for PendingLeaseRelease {
+    /// Clones the small fenced identity and shared test probe for an in-flight release.
+    fn clone(&self) -> Self {
+        Self {
+            data_tenant_id: self.data_tenant_id,
+            query_id: self.query_id,
+            leader: RoleFence {
+                node_id: self.leader.node_id,
+                fencing_token: self.leader.fencing_token,
+            },
+            #[cfg(feature = "test-support")]
+            resource_probe: self.resource_probe.clone(),
+        }
+    }
+}
+
 /// FIFO for lease releases initiated from synchronous `Drop` paths.
 ///
 /// The map is naturally bounded by admitted guards: each active query identity
@@ -163,30 +179,33 @@ impl LeaseReleaseQueue {
         true
     }
 
-    /// Takes at most `limit` requests for one maintenance tick.
-    fn take(&mut self, limit: usize) -> Vec<PendingLeaseRelease> {
-        let mut releases = Vec::with_capacity(self.order.len().min(limit));
-        while releases.len() < limit {
-            let Some(query_id) = self.order.pop_front() else {
-                break;
-            };
-            if let Some(release) = self.pending.remove(&query_id) {
-                releases.push(release);
-            }
-        }
-        releases
+    /// Clones the oldest release while retaining authoritative queue ownership.
+    fn front_cloned(&self) -> Option<PendingLeaseRelease> {
+        self.order
+            .front()
+            .and_then(|query_id| self.pending.get(query_id))
+            .cloned()
     }
 
-    /// Restores failed requests at the FIFO head in their original order.
-    fn requeue(&mut self, releases: impl IntoIterator<Item = PendingLeaseRelease>) {
-        let releases = releases.into_iter().collect::<Vec<_>>();
-        for release in releases.into_iter().rev() {
-            let query_id = release.query_id;
-            if self.pending.insert(query_id, release).is_none() {
-                self.order.push_front(query_id);
-            }
+    /// Removes the exact oldest release after durable SQL proves completion.
+    fn complete(&mut self, query_id: QueryId) -> bool {
+        if self.order.front().copied() != Some(query_id) {
+            return false;
         }
+        self.order.pop_front();
+        self.pending.remove(&query_id).is_some()
     }
+}
+
+/// Result of one cancellation-safe queued lease-release operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedLeaseReleaseOutcome {
+    /// No queued lease remains.
+    Empty,
+    /// The exact FIFO front was durably released and removed.
+    Released,
+    /// SQL, a committed no-op, or a queue invariant blocked this pass.
+    Blocked,
 }
 
 /// Bounded deduplicated tenant scopes repaired by admission maintenance.
@@ -618,6 +637,57 @@ impl OracleAdmission {
         }
     }
 
+    /// Releases the retained FIFO front and removes only that completed identity.
+    ///
+    /// The queue keeps its authoritative entry across the SQL await. Cancellation
+    /// therefore leaves the entry available for shutdown, while cancellation after
+    /// commit is replay-safe because the durable mutation reports already released.
+    async fn release_next_queued(&self) -> QueuedLeaseReleaseOutcome {
+        let release = if let Ok(queue) = self.lease_release_queue.lock() {
+            match queue.front_cloned() {
+                Some(release) => release,
+                None => return QueuedLeaseReleaseOutcome::Empty,
+            }
+        } else {
+            tracing::error!("Oracle queued lease cleanup queue lock was poisoned");
+            return QueuedLeaseReleaseOutcome::Blocked;
+        };
+        let mutation = match self
+            .release_lease(release.data_tenant_id, release.query_id, &release.leader)
+            .await
+        {
+            Ok(mutation) if release_mutation_completed(&mutation) => mutation,
+            Ok(_) => {
+                tracing::warn!(query_id = ?release.query_id, "Oracle queued lease cleanup made no durable release");
+                return QueuedLeaseReleaseOutcome::Blocked;
+            }
+            Err(error) => {
+                tracing::error!(error = %error, query_id = ?release.query_id, "Oracle queued lease cleanup failed");
+                return QueuedLeaseReleaseOutcome::Blocked;
+            }
+        };
+        #[cfg(not(feature = "test-support"))]
+        let _ = &mutation;
+        let completed = self
+            .lease_release_queue
+            .lock()
+            .is_ok_and(|mut queue| queue.complete(release.query_id));
+        if !completed {
+            tracing::error!(query_id = ?release.query_id, "Oracle queued lease cleanup completion did not match the FIFO front");
+            return QueuedLeaseReleaseOutcome::Blocked;
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &release.resource_probe {
+            probe.observe_release_mutation(&mutation);
+        }
+        metrics::counter!(
+            "bifrost_oracle_lease_release_queue_total",
+            "outcome" => "released"
+        )
+        .increment(1);
+        QueuedLeaseReleaseOutcome::Released
+    }
+
     /// Drains queued dropped-stream leases before Oracle shutdown completes.
     ///
     /// The deadline prevents shutdown from hanging on a degraded database. A
@@ -628,71 +698,16 @@ impl OracleAdmission {
     /// release; the uncommitted transaction rolls back and durable expiry remains
     /// authoritative. Releases committed before cancellation remain complete.
     pub(super) async fn drain_lease_releases(&self, deadline: Instant) {
-        loop {
-            let releases = self
-                .lease_release_queue
-                .lock()
-                .map(|mut queue| queue.take(64))
-                .unwrap_or_default();
-            if releases.is_empty() {
+        for _ in 0..64 {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return;
-            }
-            let mut pending = VecDeque::from(releases);
-            while let Some(release) = pending.pop_front() {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    pending.push_front(release);
-                    if let Ok(mut queue) = self.lease_release_queue.lock() {
-                        queue.requeue(pending);
-                    }
+            };
+            match tokio::time::timeout(remaining, self.release_next_queued()).await {
+                Ok(QueuedLeaseReleaseOutcome::Released) => {}
+                Ok(QueuedLeaseReleaseOutcome::Empty | QueuedLeaseReleaseOutcome::Blocked) => return,
+                Err(_) => {
+                    tracing::error!("Oracle shutdown queued lease cleanup timed out");
                     return;
-                };
-                match tokio::time::timeout(
-                    remaining,
-                    self.release_lease(release.data_tenant_id, release.query_id, &release.leader),
-                )
-                .await
-                {
-                    Ok(Ok(mutation)) if release_mutation_completed(&mutation) => {
-                        #[cfg(feature = "test-support")]
-                        {
-                            if let Some(probe) = &release.resource_probe {
-                                probe.observe_release_mutation(&mutation);
-                            }
-                        }
-                        metrics::counter!(
-                            "bifrost_oracle_lease_release_queue_total",
-                            "outcome" => "released"
-                        )
-                        .increment(1);
-                    }
-                    Ok(Ok(_mutation)) => {
-                        pending.push_front(release);
-                        if let Ok(mut queue) = self.lease_release_queue.lock() {
-                            queue.requeue(pending);
-                        }
-                        tracing::warn!(
-                            "Oracle shutdown lease cleanup made no durable release; requests requeued"
-                        );
-                        return;
-                    }
-                    Ok(Err(error)) => {
-                        pending.push_front(release);
-                        if let Ok(mut queue) = self.lease_release_queue.lock() {
-                            queue.requeue(pending);
-                        }
-                        tracing::error!(error = %error, "Oracle shutdown lease cleanup failed; requests requeued");
-                        return;
-                    }
-                    Err(_) => {
-                        pending.push_front(release);
-                        if let Ok(mut queue) = self.lease_release_queue.lock() {
-                            queue.requeue(pending);
-                        }
-                        tracing::error!(
-                            "Oracle shutdown lease cleanup timed out; requests requeued"
-                        );
-                        return;
-                    }
                 }
             }
         }
@@ -719,7 +734,6 @@ impl OracleAdmission {
             })?;
         let admission = Arc::clone(self);
         let queue = Arc::clone(&self.tenant_reconcile_queue);
-        let lease_release_queue = Arc::clone(&self.lease_release_queue);
         let maintenance_interval = self.config.maintenance_interval;
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
         let task = runtime.spawn(async move {
@@ -739,44 +753,11 @@ impl OracleAdmission {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        let releases = lease_release_queue
-                            .lock()
-                            .map(|mut queue| queue.take(64))
-                            .unwrap_or_default();
-                        for release in releases {
-                            match admission
-                                .release_lease(
-                                    release.data_tenant_id,
-                                    release.query_id,
-                                    &release.leader,
-                                )
-                                .await
+                        for _ in 0..64 {
+                            if admission.release_next_queued().await
+                                != QueuedLeaseReleaseOutcome::Released
                             {
-                                Ok(mutation) if release_mutation_completed(&mutation) => {
-                                    #[cfg(feature = "test-support")]
-                                    {
-                                        if let Some(probe) = &release.resource_probe {
-                                            probe.observe_release_mutation(&mutation);
-                                        }
-                                    }
-                                    metrics::counter!(
-                                        "bifrost_oracle_lease_release_queue_total",
-                                        "outcome" => "released"
-                                    )
-                                    .increment(1);
-                                }
-                                Ok(_mutation) => {
-                                    if let Ok(mut queue) = lease_release_queue.lock() {
-                                        queue.requeue(std::iter::once(release));
-                                    }
-                                    tracing::warn!("Oracle dropped-lease cleanup made no durable release; request requeued");
-                                }
-                                Err(error) => {
-                                    if let Ok(mut queue) = lease_release_queue.lock() {
-                                        queue.requeue(std::iter::once(release));
-                                    }
-                                    tracing::error!(error = %error, "Oracle dropped-lease cleanup failed; request requeued");
-                                }
+                                break;
                             }
                         }
                         let scopes = queue
@@ -1217,7 +1198,7 @@ mod tests {
         );
     }
 
-    /// Pending lease cleanup has no arbitrary cap and deduplicates one query identity.
+    /// Pending lease cleanup retains FIFO ownership until exact completion.
     #[test]
     fn oracle_lease_release_queue_retains_distinct_entries() {
         let mut queue = LeaseReleaseQueue::default();
@@ -1250,8 +1231,46 @@ mod tests {
             #[cfg(feature = "test-support")]
             resource_probe: None,
         }));
-        assert_eq!(queue.take(usize::MAX).len(), 300);
+        for query_id in query_ids {
+            assert_eq!(
+                queue.front_cloned().map(|release| release.query_id),
+                Some(query_id)
+            );
+            assert!(!queue.complete(QueryId::new(uuid::Uuid::now_v7())));
+            assert_eq!(queue.order.front().copied(), Some(query_id));
+            assert!(queue.complete(query_id));
+        }
         assert!(queue.order.is_empty());
         assert!(queue.pending.is_empty());
+    }
+
+    /// Cancelling work after a non-destructive peek leaves the FIFO front queued.
+    #[tokio::test]
+    async fn oracle_lease_release_queue_retains_front_across_cancellation() {
+        let mut queue = LeaseReleaseQueue::default();
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        assert!(queue.enqueue(PendingLeaseRelease {
+            data_tenant_id: DataTenantId::new_v7(),
+            query_id,
+            leader: RoleFence {
+                node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
+                fencing_token: 1,
+            },
+            #[cfg(feature = "test-support")]
+            resource_probe: None,
+        }));
+        let release = queue
+            .front_cloned()
+            .expect("queued release remains visible");
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        tokio::select! {
+            biased;
+            () = cancelled.cancelled() => {}
+            () = std::future::pending() => unreachable!("pending release cannot win"),
+        }
+        assert_eq!(release.query_id, query_id);
+        assert_eq!(queue.order.front().copied(), Some(query_id));
+        assert!(queue.pending.contains_key(&query_id));
     }
 }

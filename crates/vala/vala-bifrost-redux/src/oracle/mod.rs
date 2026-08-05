@@ -88,8 +88,8 @@ pub use exec::{ReconcileExec, TenantTripwireExec};
 use planner::OracleClassification;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
-use query_stream::QueryStreamInput;
 pub(crate) use query_stream::QueryStreamLifecycle;
+use query_stream::{QueryStreamInput, encode_schema_frame};
 pub use tail_fence::{DiscoveredTailRoute, TailStreamDiscovery};
 use tail_fence::{DrainedTails, TailFenceDrainer, TailFenceDrainerConfig};
 
@@ -1834,14 +1834,10 @@ impl Oracle {
             .await
         {
             Ok(drained) => drained,
-            Err(error) => {
-                release_admission_after_error(admitted, "audit rejection").await;
-                return Err(error);
-            }
+            Err(error) => return release_error(deadline, admitted, error, "audit rejection").await,
         };
-        let degraded = drained.degraded;
         admitted.live_reservations = drained.reservations;
-        let execution = self
+        let (schema, mut batches) = match self
             .execute_sql_cut(SqlCutInput {
                 context,
                 sql: &request.sql,
@@ -1851,8 +1847,8 @@ impl Oracle {
                 admitted: &admitted,
                 deadline,
             })
-            .await;
-        let (schema, mut batches) = match execution {
+            .await
+        {
             Ok(execution) => execution,
             Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
                 await_stale_release(deadline, admitted.release()).await?;
@@ -1860,20 +1856,23 @@ impl Oracle {
                 return Ok(None);
             }
             Err(OracleExecutionError::StaleObject) => {
-                release_admission_after_error(admitted, "final stale attempt").await;
-                return Err(BifrostError::QueryExecutionFailed);
+                let error = BifrostError::QueryExecutionFailed;
+                return release_error(deadline, admitted, error, "final stale attempt").await;
             }
             Err(OracleExecutionError::Public(error)) => {
-                release_admission_after_error(admitted, "execution rejection").await;
-                return Err(error);
+                return release_error(deadline, admitted, error, "execution rejection").await;
             }
         };
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BifrostError::QueryTimeout)?;
-        let first = tokio::time::timeout(remaining, batches.next())
-            .await
-            .map_err(|_| BifrostError::QueryTimeout)?;
+        let (first, admitted) =
+            await_first_batch_or_release(deadline, batches.next(), admitted, |admitted| {
+                release_error(
+                    deadline,
+                    admitted,
+                    BifrostError::QueryTimeout,
+                    "first-batch timeout",
+                )
+            })
+            .await?;
         if first.as_ref().is_some_and(|result| {
             retry_ordinal == 0 && result.as_ref().is_err_and(is_stale_file_error)
         }) {
@@ -1883,22 +1882,28 @@ impl Oracle {
             record_stale_replan();
             return Ok(None);
         }
-        let query_telemetry = query_telemetry
-            .take()
-            .ok_or(BifrostError::QueryExecutionFailed)?;
-        OracleQueryStream::new(QueryStreamInput {
-            schema,
+        let Some(query_telemetry) = query_telemetry.take() else {
+            let error = BifrostError::QueryExecutionFailed;
+            return release_error(deadline, admitted, error, "missing telemetry").await;
+        };
+        let schema_frame = match encode_schema_frame(&schema) {
+            Ok(schema_frame) => schema_frame,
+            Err(error) => {
+                return release_error(deadline, admitted, error, "schema preparation").await;
+            }
+        };
+        Ok(Some(OracleQueryStream::new(QueryStreamInput {
+            schema_frame,
             batches,
             first,
             admitted,
             deadline,
             visibility: request.visibility,
-            degraded,
+            degraded: drained.degraded,
             stale_replanned: retry_ordinal == 1,
             query_telemetry,
             gate_lifecycle,
-        })
-        .map(Some)
+        })))
     }
 
     /// Acquire the local and durable admission owner for one SQL attempt.
@@ -2173,8 +2178,9 @@ impl Oracle {
         let first = tokio::time::timeout(remaining, batches.next())
             .await
             .map_err(|_| BifrostError::QueryTimeout)?;
-        OracleQueryStream::new(QueryStreamInput {
-            schema,
+        let schema_frame = encode_schema_frame(&schema)?;
+        Ok(OracleQueryStream::new(QueryStreamInput {
+            schema_frame,
             batches,
             first,
             admitted,
@@ -2184,7 +2190,7 @@ impl Oracle {
             stale_replanned: false,
             query_telemetry,
             gate_lifecycle: None,
-        })
+        }))
     }
 
     /// Builds and durably appends one typed-plan success decision within its deadline.
@@ -3190,10 +3196,66 @@ fn record_stale_replan() {
 /// Release an admitted query after an attempt-local terminal error.
 ///
 /// Cleanup failure is logged without replacing the stable public error that
-/// caused the attempt to terminate.
-async fn release_admission_after_error(admitted: AdmittedQueryGuard, phase: &'static str) {
-    if let Err(error) = admitted.release().await {
-        tracing::error!(error = %error, phase, "Oracle admission cleanup failed");
+/// caused the attempt to terminate. The original absolute query deadline bounds
+/// the single release poll; cancellation drops the still-pending guard so its
+/// ordinary queue fallback retains durable cleanup ownership exactly once.
+///
+/// # Errors
+///
+/// Always returns the caller-supplied original error after the cleanup attempt.
+async fn release_error<T>(
+    deadline: Instant,
+    admitted: AdmittedQueryGuard,
+    original: BifrostError,
+    phase: &'static str,
+) -> Result<T, BifrostError> {
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), admitted.release())
+        .await
+    {
+        Ok(Ok(AdmissionReleaseStatus::Released)) => {}
+        Ok(Ok(AdmissionReleaseStatus::NotReleased)) => {
+            tracing::warn!(
+                phase,
+                "Oracle admission cleanup made no durable release while preserving the original query error"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, phase, "Oracle admission cleanup failed while preserving the original query error");
+        }
+        Err(_) => {
+            tracing::warn!(
+                phase,
+                "Oracle admission cleanup reached the query deadline while preserving the original query error"
+            );
+        }
+    }
+    Err(original)
+}
+
+/// Awaits the actual first physical batch while retaining admission ownership.
+///
+/// A ready batch returns with the unchanged owner for stream transfer. If the
+/// absolute query deadline wins, the one-shot cleanup consumes the owner.
+/// Production delegates that cleanup to [`release_error`] so it remains bounded
+/// by the same absolute deadline and preserves the query-timeout error.
+///
+/// # Errors
+///
+/// Returns the cleanup operation's preserved error after the deadline wins.
+async fn await_first_batch_or_release<F, T, O, C, R>(
+    deadline: Instant,
+    first_batch: F,
+    owner: O,
+    cleanup: C,
+) -> Result<(T, O), BifrostError>
+where
+    F: std::future::Future<Output = T>,
+    C: FnOnce(O) -> R,
+    R: std::future::Future<Output = Result<(T, O), BifrostError>>,
+{
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), first_batch).await {
+        Ok(first) => Ok((first, owner)),
+        Err(_) => cleanup(owner).await,
     }
 }
 
@@ -3233,6 +3295,87 @@ mod tests {
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::atomic::AtomicUsize;
+
+    /// Synthetic first-batch owner exposing cleanup and final-drop observations.
+    struct FirstBatchOwner {
+        /// Stable identity proving the ready path returns the same owner.
+        id: usize,
+        /// Number of one-shot cleanup operations that consumed this owner.
+        cleanups: Arc<AtomicUsize>,
+        /// Number of owners whose final destructor ran.
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for FirstBatchOwner {
+        /// Records final owner destruction after cleanup or caller release.
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Consumes a synthetic owner and returns the preserved timeout error.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`BifrostError::QueryTimeout`] after consuming the owner.
+    async fn release_first_batch_owner(
+        owner: FirstBatchOwner,
+    ) -> Result<(u8, FirstBatchOwner), BifrostError> {
+        owner.cleanups.fetch_add(1, Ordering::SeqCst);
+        drop(owner);
+        Err(BifrostError::QueryTimeout)
+    }
+
+    /// A pending first batch consumes its owner through cleanup and preserves timeout.
+    #[tokio::test]
+    async fn first_batch_timeout_releases_owner_and_preserves_query_timeout() {
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = FirstBatchOwner {
+            id: 7,
+            cleanups: Arc::clone(&cleanups),
+            drops: Arc::clone(&drops),
+        };
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("test deadline remains representable");
+        let result = await_first_batch_or_release(
+            deadline,
+            std::future::pending::<u8>(),
+            owner,
+            release_first_batch_owner,
+        )
+        .await;
+        assert!(matches!(result, Err(BifrostError::QueryTimeout)));
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// A ready first batch transfers the same owner without invoking cleanup.
+    #[tokio::test]
+    async fn first_batch_ready_transfers_owner_without_cleanup() {
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = FirstBatchOwner {
+            id: 11,
+            cleanups: Arc::clone(&cleanups),
+            drops: Arc::clone(&drops),
+        };
+        let (value, owner) = await_first_batch_or_release(
+            Instant::now() + Duration::from_secs(1),
+            std::future::ready(23_u8),
+            owner,
+            release_first_batch_owner,
+        )
+        .await
+        .expect("ready batch preserves ownership");
+        assert_eq!(value, 23);
+        assert_eq!(owner.id, 11);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 
     /// A stalled explicit release times out without authorizing another admission.
     #[tokio::test]

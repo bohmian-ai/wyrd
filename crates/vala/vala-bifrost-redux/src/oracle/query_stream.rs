@@ -153,8 +153,8 @@ impl std::fmt::Debug for OracleQueryStream {
 
 /// Complete owned inputs for one terminal-aware query stream.
 pub(super) struct QueryStreamInput {
-    /// Public output schema.
-    pub(super) schema: SchemaRef,
+    /// Public output schema encoded before admission ownership transfers.
+    pub(super) schema_frame: QuerySchemaFrame,
     /// Lazy physical batch stream.
     pub(super) batches: SendableRecordBatchStream,
     /// Pre-byte lookahead result.
@@ -291,7 +291,7 @@ fn successful_terminal(
 /// # Errors
 ///
 /// Returns query execution failure when Arrow IPC rejects the schema.
-fn encode_schema_frame(schema: &SchemaRef) -> Result<QuerySchemaFrame, BifrostError> {
+pub(super) fn encode_schema_frame(schema: &SchemaRef) -> Result<QuerySchemaFrame, BifrostError> {
     let mut bytes = Vec::new();
     let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema)
         .map_err(|_| BifrostError::QueryExecutionFailed)?;
@@ -444,13 +444,11 @@ impl OracleQueryStream {
     ///
     /// The returned future retains all cleanup state until the terminal frame
     /// is emitted or the stream is dropped, so cancellation cannot detach a
-    /// lease, permit, or renewal task from its query owner.
-    ///
-    /// # Errors
-    /// Returns query execution failure when the output schema cannot be encoded.
-    pub(super) fn new(input: QueryStreamInput) -> Result<Self, super::BifrostError> {
+    /// lease, permit, or renewal task from its query owner. The caller supplies
+    /// the encoded schema, leaving no fallible work after guard transfer.
+    pub(super) fn new(input: QueryStreamInput) -> Self {
         let QueryStreamInput {
-            schema,
+            schema_frame,
             batches,
             first,
             admitted,
@@ -463,7 +461,6 @@ impl OracleQueryStream {
         } = input;
         #[cfg(feature = "test-support")]
         let mut admitted = admitted;
-        let schema_frame = encode_schema_frame(&schema)?;
         #[cfg(feature = "test-support")]
         let resource_probe = Some(admitted.attach_resource_probe());
         let schema_fingerprint = schema_frame.schema_fingerprint.clone();
@@ -548,7 +545,7 @@ impl OracleQueryStream {
         );
         #[cfg(feature = "test-support")]
         let stream = stream.with_resource_probe(resource_probe);
-        Ok(stream)
+        stream
     }
 
     /// Assemble the stream owner from its schema, frame source, and cancellation edge.

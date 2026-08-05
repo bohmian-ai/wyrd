@@ -1585,6 +1585,30 @@ async fn assert_admission_state(fixture: &OracleFixture, active: bool) {
     }
 }
 
+/// Waits until one Oracle cleanup statement is blocked on a PostgreSQL row lock.
+///
+/// # Panics
+///
+/// Panics when PostgreSQL does not observe the blocked release within the
+/// existing fixture-operation bound or lock inspection fails.
+async fn wait_for_blocked_admission_release(owner: &sqlx::PgPool) {
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let blocked: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted)")
+                    .fetch_one(owner)
+                    .await
+                    .expect("inspect blocked admission release");
+            if blocked {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    result.expect("maintenance release reaches the row lock");
+}
+
 /// Starts one real admitted stream without consuming its terminal.
 ///
 /// # Panics
@@ -2792,6 +2816,7 @@ async fn fused_audit_failure_releases_every_fence_before_return() {
         .expect_err("audit refusal fails the query");
     assert_eq!(error, BifrostError::QueryAuditUnavailable);
     assert_eq!(releases.load(Ordering::SeqCst), 2);
+    assert_admission_state(&fixture, false).await;
     tokio::task::yield_now().await;
     assert_eq!(releases.load(Ordering::SeqCst), 2);
     oracle
@@ -2829,7 +2854,7 @@ async fn fused_post_acquisition_timeout_releases_before_return() {
                     entered: Arc::clone(&entered),
                 }),
                 tails,
-                OracleConfig::default(),
+                terminal_release_test_config(),
             )
             .await,
     );
@@ -2860,9 +2885,11 @@ async fn fused_post_acquisition_timeout_releases_before_return() {
     tokio::task::yield_now().await;
     assert_eq!(release_polls.load(Ordering::SeqCst), 2);
     assert_eq!(release_completions.load(Ordering::SeqCst), 1);
+    assert_admission_state(&fixture, true).await;
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
+    assert_admission_state(&fixture, false).await;
 }
 
 /// Typed Fused acquisition failure records no success decision or provider read.
@@ -3520,6 +3547,51 @@ async fn oracle_terminal_release_sql_error_fails_and_shutdown_drains() {
         .execute(&owner)
         .await
         .expect("remove release failure function");
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await;
+    assert_admission_state(&fixture, false).await;
+}
+
+/// Aborted maintenance retains its in-flight FIFO release for shutdown replay.
+#[tokio::test]
+async fn oracle_maintenance_cancellation_retains_release_for_shutdown() {
+    let fixture = OracleFixture::new("oracle_maintenance_release_cancel").await;
+    fixture.seed_hot_row(1).await;
+    let mut config = terminal_release_test_config();
+    config.maintenance_interval = renewal_test_config().lease_renew_interval;
+    let maintenance_interval = config.maintenance_interval;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            config,
+        )
+        .await;
+    let mut stream = admitted_release_stream(&oracle, &fixture).await;
+    assert!(matches!(
+        stream.frames.next().await,
+        Some(Ok(QueryStreamFrame::Schema(_)))
+    ));
+    let query_id = sole_lease_id(&fixture).await;
+    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+    let mut lock = owner.begin().await.expect("lease lock transaction");
+    sqlx::query(
+        "SELECT query_id FROM vala.oracle_admission_leases \
+         WHERE data_tenant_id=$1 AND query_id=$2 FOR UPDATE",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .bind(query_id)
+    .fetch_one(&mut *lock)
+    .await
+    .expect("lock queued lease identity");
+    drop(stream);
+    wait_for_blocked_admission_release(&owner).await;
+    oracle.shutdown(Instant::now() + maintenance_interval).await;
+    assert_admission_state(&fixture, true).await;
+    lock.rollback().await.expect("unblock queued release");
     oracle
         .shutdown(Instant::now() + Duration::from_secs(2))
         .await;

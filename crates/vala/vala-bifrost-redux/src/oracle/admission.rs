@@ -24,6 +24,8 @@ pub struct OracleAdmission {
     pub(super) tenant_reconcile_queue: Arc<Mutex<TenantReconcileQueue>>,
     /// Bounded durable leases queued when a public query stream is dropped.
     pub(super) lease_release_queue: Arc<Mutex<LeaseReleaseQueue>>,
+    /// Coalesced wake signal for newly queued dropped-query lease cleanup.
+    release_notify: tokio::sync::Notify,
 }
 
 /// Exact resources retained by one query identity for test-tier lifecycle proof.
@@ -206,6 +208,63 @@ enum QueuedLeaseReleaseOutcome {
     Released,
     /// SQL, a committed no-op, or a queue invariant blocked this pass.
     Blocked,
+}
+
+/// Result of one bounded activation of queued lease cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseReleaseBatchOutcome {
+    /// No queued release existed when the activation began.
+    Empty,
+    /// SQL or queue state retained the authoritative FIFO front for periodic retry.
+    Blocked,
+    /// The activation released all work observed before reaching its bound.
+    Drained,
+    /// Sixty-four releases completed and another FIFO front remains.
+    LimitReachedWithPending,
+}
+
+/// Authoritative FIFO state inspected only after a full release batch.
+enum LeaseReleasePendingCheck {
+    /// Another release remains at the FIFO front.
+    Pending,
+    /// The full batch exhausted the queue exactly at its bound.
+    Empty,
+    /// Queue state could not be inspected safely.
+    Blocked,
+}
+
+/// Drives the exact bounded queued-release decision for one activation.
+///
+/// The driver polls at most 64 release operations. It inspects pending state
+/// only after all 64 complete, preserving a blocked front without retrying it.
+async fn release_queued_batch_with<N, F, P>(
+    mut release_next: N,
+    has_pending: P,
+) -> LeaseReleaseBatchOutcome
+where
+    N: FnMut() -> F,
+    F: std::future::Future<Output = QueuedLeaseReleaseOutcome>,
+    P: FnOnce() -> LeaseReleasePendingCheck,
+{
+    let mut released = 0_usize;
+    while released < 64 {
+        match release_next().await {
+            QueuedLeaseReleaseOutcome::Released => released += 1,
+            QueuedLeaseReleaseOutcome::Empty => {
+                return if released == 0 {
+                    LeaseReleaseBatchOutcome::Empty
+                } else {
+                    LeaseReleaseBatchOutcome::Drained
+                };
+            }
+            QueuedLeaseReleaseOutcome::Blocked => return LeaseReleaseBatchOutcome::Blocked,
+        }
+    }
+    match has_pending() {
+        LeaseReleasePendingCheck::Pending => LeaseReleaseBatchOutcome::LimitReachedWithPending,
+        LeaseReleasePendingCheck::Empty => LeaseReleaseBatchOutcome::Drained,
+        LeaseReleasePendingCheck::Blocked => LeaseReleaseBatchOutcome::Blocked,
+    }
 }
 
 /// Bounded deduplicated tenant scopes repaired by admission maintenance.
@@ -616,15 +675,23 @@ impl OracleAdmission {
             config,
             tenant_reconcile_queue: Arc::new(Mutex::new(TenantReconcileQueue::default())),
             lease_release_queue: Arc::new(Mutex::new(LeaseReleaseQueue::default())),
+            release_notify: tokio::sync::Notify::new(),
         }
     }
 
     /// Queues one dropped stream's durable lease for lifecycle-owned cleanup.
     fn enqueue_lease_release(&self, release: PendingLeaseRelease) {
-        if let Ok(mut queue) = self.lease_release_queue.lock() {
-            if !queue.enqueue(release) {
-                tracing::debug!("Oracle dropped-lease cleanup request was already pending");
-            }
+        Self::enqueue_lease_release_parts(&self.lease_release_queue, &self.release_notify, release);
+    }
+
+    /// Inserts one release and wakes maintenance only after relinquishing the queue lock.
+    fn enqueue_lease_release_parts(
+        queue: &Mutex<LeaseReleaseQueue>,
+        notify: &tokio::sync::Notify,
+        release: PendingLeaseRelease,
+    ) {
+        let inserted = if let Ok(mut queue) = queue.lock() {
+            queue.enqueue(release)
         } else {
             tracing::error!(
                 "Oracle dropped-lease cleanup queue lock poisoned; lease expiry remains authoritative"
@@ -634,6 +701,12 @@ impl OracleAdmission {
                 "outcome" => "queue_poisoned"
             )
             .increment(1);
+            return;
+        };
+        if inserted {
+            notify.notify_one();
+        } else {
+            tracing::debug!("Oracle dropped-lease cleanup request was already pending");
         }
     }
 
@@ -686,6 +759,32 @@ impl OracleAdmission {
         )
         .increment(1);
         QueuedLeaseReleaseOutcome::Released
+    }
+
+    /// Releases at most 64 FIFO entries during one maintenance activation.
+    ///
+    /// The authoritative queue remains intact when SQL or queue state blocks its
+    /// front. Reaching the bound inspects only whether another front remains.
+    async fn release_queued_batch(&self) -> LeaseReleaseBatchOutcome {
+        release_queued_batch_with(
+            || self.release_next_queued(),
+            || match self.lease_release_queue.lock() {
+                Ok(queue) if queue.front_cloned().is_some() => LeaseReleasePendingCheck::Pending,
+                Ok(_) => LeaseReleasePendingCheck::Empty,
+                Err(_) => {
+                    tracing::error!("Oracle queued lease cleanup queue lock was poisoned");
+                    LeaseReleasePendingCheck::Blocked
+                }
+            },
+        )
+        .await
+    }
+
+    /// Re-arms one later maintenance turn only for a successful full batch.
+    fn rearm_release_batch(notify: &tokio::sync::Notify, outcome: LeaseReleaseBatchOutcome) {
+        if matches!(outcome, LeaseReleaseBatchOutcome::LimitReachedWithPending) {
+            notify.notify_one();
+        }
     }
 
     /// Drains queued dropped-stream leases before Oracle shutdown completes.
@@ -750,38 +849,35 @@ impl OracleAdmission {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
             loop {
-                tokio::select! {
+                let reconcile_tenants = tokio::select! {
                     () = shutdown.cancelled() => break,
-                    _ = interval.tick() => {
-                        for _ in 0..64 {
-                            if admission.release_next_queued().await
-                                != QueuedLeaseReleaseOutcome::Released
-                            {
-                                break;
+                    _ = interval.tick() => true,
+                    () = admission.release_notify.notified() => false,
+                };
+                let release_outcome = admission.release_queued_batch().await;
+                Self::rearm_release_batch(&admission.release_notify, release_outcome);
+                if reconcile_tenants {
+                    let scopes = queue
+                        .lock()
+                        .map(|mut queue| queue.take(64))
+                        .unwrap_or_default();
+                    for scope in scopes {
+                        match admission.maintain_scope(&scope, chrono::Utc::now()).await {
+                            Ok(()) => {
+                                if let Ok(mut queue) = queue.lock() {
+                                    queue.complete(std::slice::from_ref(&scope));
+                                }
                             }
-                        }
-                        let scopes = queue
-                            .lock()
-                            .map(|mut queue| queue.take(64))
-                            .unwrap_or_default();
-                        for scope in scopes {
-                            match admission.maintain_scope(&scope, chrono::Utc::now()).await {
-                                Ok(()) => {
-                                    if let Ok(mut queue) = queue.lock() {
-                                        queue.complete(std::slice::from_ref(&scope));
-                                    }
+                            Err(error) => {
+                                if let Ok(mut queue) = queue.lock() {
+                                    queue.requeue(std::slice::from_ref(&scope));
                                 }
-                                Err(error) => {
-                                    if let Ok(mut queue) = queue.lock() {
-                                        queue.requeue(std::slice::from_ref(&scope));
-                                    }
-                                    metrics::counter!(
-                                        "bifrost_oracle_admission_reconcile_total",
-                                        "outcome" => "requeued"
-                                    )
-                                    .increment(1);
-                                    tracing::error!(error = %error, "Oracle tenant admission reconciliation failed; scopes requeued");
-                                }
+                                metrics::counter!(
+                                    "bifrost_oracle_admission_reconcile_total",
+                                    "outcome" => "requeued"
+                                )
+                                .increment(1);
+                                tracing::error!(error = %error, "Oracle tenant admission reconciliation failed; scopes requeued");
                             }
                         }
                     }
@@ -1098,6 +1194,68 @@ impl AdmittedQueryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+
+    /// Creates one synthetic queued-release identity without durable IO.
+    fn pending_release(query_id: QueryId) -> PendingLeaseRelease {
+        PendingLeaseRelease {
+            data_tenant_id: DataTenantId::new_v7(),
+            query_id,
+            leader: RoleFence {
+                node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
+                fencing_token: 1,
+            },
+            #[cfg(feature = "test-support")]
+            resource_probe: None,
+        }
+    }
+
+    /// A distinct queued identity wakes maintenance after releasing the queue lock.
+    #[test]
+    fn oracle_lease_release_enqueue_notifies_after_unlock() {
+        let queue = Mutex::new(LeaseReleaseQueue::default());
+        let notify = tokio::sync::Notify::new();
+        OracleAdmission::enqueue_lease_release_parts(
+            &queue,
+            &notify,
+            pending_release(QueryId::new(uuid::Uuid::now_v7())),
+        );
+
+        assert!(
+            queue.try_lock().is_ok(),
+            "enqueue must relinquish the queue lock"
+        );
+        assert!(notify.notified().now_or_never().is_some());
+    }
+
+    /// A duplicate identity does not create another cleanup activation permit.
+    #[test]
+    fn oracle_lease_release_duplicate_does_not_renotify() {
+        let queue = Mutex::new(LeaseReleaseQueue::default());
+        let notify = tokio::sync::Notify::new();
+        let release = pending_release(QueryId::new(uuid::Uuid::now_v7()));
+        OracleAdmission::enqueue_lease_release_parts(&queue, &notify, release.clone());
+        assert!(notify.notified().now_or_never().is_some());
+
+        OracleAdmission::enqueue_lease_release_parts(&queue, &notify, release);
+
+        assert!(notify.notified().now_or_never().is_none());
+    }
+
+    /// A full successful batch re-arms once while blocked work never self-retries.
+    #[test]
+    fn oracle_lease_release_batch_rearms_only_with_pending_work() {
+        let notify = tokio::sync::Notify::new();
+        OracleAdmission::rearm_release_batch(
+            &notify,
+            LeaseReleaseBatchOutcome::LimitReachedWithPending,
+        );
+        assert!(notify.notified().now_or_never().is_some());
+        assert!(notify.notified().now_or_never().is_none());
+
+        OracleAdmission::rearm_release_batch(&notify, LeaseReleaseBatchOutcome::Blocked);
+        assert!(notify.notified().now_or_never().is_none());
+    }
 
     /// Query-keyed lifecycle observations ignore unrelated concurrent work.
     #[cfg(feature = "test-support")]

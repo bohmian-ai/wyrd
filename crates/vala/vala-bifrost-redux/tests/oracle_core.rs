@@ -39,8 +39,8 @@ use vala_bifrost_redux::oracle::peer::{
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, Oracle,
     OracleAudit, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-    OracleStaleReleaseProbe, QueryOptions, TailTransportDirectory, TestPostgresOracleAudit,
-    VerifiedSecurityContext,
+    OracleStaleReleaseProbe, QueryOptions, QueryResourceSnapshot, TailTransportDirectory,
+    TestPostgresOracleAudit, VerifiedSecurityContext,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -1585,6 +1585,23 @@ async fn assert_admission_state(fixture: &OracleFixture, active: bool) {
     }
 }
 
+/// Waits for notification-driven cleanup to remove the fixture's sole lease.
+///
+/// # Panics
+///
+/// Panics when durable lease inspection fails or cleanup exceeds the bounded
+/// fixture-operation deadline.
+async fn wait_for_admission_clear(fixture: &OracleFixture) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while active_lease_count(fixture).await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("notification-driven admission cleanup completes");
+    assert_admission_state(fixture, false).await;
+}
+
 /// Waits until one Oracle cleanup statement is blocked on a PostgreSQL row lock.
 ///
 /// # Panics
@@ -2885,7 +2902,7 @@ async fn fused_post_acquisition_timeout_releases_before_return() {
     tokio::task::yield_now().await;
     assert_eq!(release_polls.load(Ordering::SeqCst), 2);
     assert_eq!(release_completions.load(Ordering::SeqCst), 1);
-    assert_admission_state(&fixture, true).await;
+    wait_for_admission_clear(&fixture).await;
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
@@ -3551,6 +3568,62 @@ async fn oracle_terminal_release_sql_error_fails_and_shutdown_drains() {
         .shutdown(Instant::now() + Duration::from_secs(2))
         .await;
     assert_admission_state(&fixture, false).await;
+}
+
+/// A dropped stream wakes real SQL cleanup before the long maintenance interval.
+#[tokio::test]
+async fn oracle_queued_release_notification_precedes_periodic_maintenance() {
+    let fixture = OracleFixture::new("oracle_release_notify").await;
+    fixture.seed_hot_row(1).await;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            terminal_release_test_config(),
+        )
+        .await;
+    let mut stream = admitted_release_stream(&oracle, &fixture).await;
+    assert!(matches!(
+        stream.frames.next().await,
+        Some(Ok(QueryStreamFrame::Schema(_)))
+    ));
+    let probe = stream.resource_probe_for_test();
+    let mut resources = probe.subscribe();
+    let query_id = sole_lease_id(&fixture).await;
+    assert_eq!(uuid::Uuid::from(probe.query_id()), query_id);
+    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+    let mut lock = owner.begin().await.expect("lease lock transaction");
+    sqlx::query(
+        "SELECT query_id FROM vala.oracle_admission_leases \
+         WHERE data_tenant_id=$1 AND query_id=$2 FOR UPDATE",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .bind(query_id)
+    .fetch_one(&mut *lock)
+    .await
+    .expect("lock queued lease identity");
+
+    drop(stream);
+    wait_for_blocked_admission_release(&owner).await;
+    assert_admission_state(&fixture, true).await;
+    lock.rollback().await.expect("unblock notified release");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while *resources.borrow_and_update() != QueryResourceSnapshot::default() {
+            resources
+                .changed()
+                .await
+                .expect("resource owner remains observable");
+        }
+    })
+    .await
+    .expect("notified release clears exact query resources");
+    assert_admission_state(&fixture, false).await;
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await;
 }
 
 /// Aborted maintenance retains its in-flight FIFO release for shutdown replay.

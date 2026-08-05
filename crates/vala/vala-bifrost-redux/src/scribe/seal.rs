@@ -22,7 +22,7 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::WalLsn;
 
 /// Capability returned by `pre_commit` and consumed after the SQL transaction commits.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PostCommitToken {
     /// Local immutable generation identity.
     pub seal_id: u64,
@@ -40,6 +40,72 @@ pub struct PostCommitToken {
     pub wal_lsn_max: WalLsn,
     /// Arrow bytes transferred from the writable to immutable tier.
     pub memtable_bytes: usize,
+    /// Move-owned production visibility trace terminalized with this capability.
+    pub(super) visibility: VisibilityPublishGuard,
+}
+
+/// Move-owned terminal guard for one durable Scribe visibility publication.
+#[derive(Debug)]
+pub(super) struct VisibilityPublishGuard {
+    /// Production span retained until the durable lifecycle reaches one terminal.
+    span: tracing::Span,
+    /// Fallback terminal recorded when the owner is dropped before explicit completion.
+    drop_outcome: &'static str,
+    /// Whether an explicit terminal has already been recorded.
+    terminal: bool,
+}
+
+impl VisibilityPublishGuard {
+    /// Starts one production visibility publication with failure as the pre-commit fallback.
+    #[must_use]
+    pub(super) fn new() -> Self {
+        Self {
+            span: tracing::info_span!(
+                "bifrost.scribe.visibility.publish",
+                outcome = tracing::field::Empty
+            ),
+            drop_outcome: "failed",
+            terminal: false,
+        }
+    }
+
+    /// Changes abandonment after successful pre-commit into cancellation.
+    pub(super) fn arm_cancellation(&mut self) {
+        self.drop_outcome = "cancelled";
+    }
+
+    /// Records the exact successful lifecycle terminal once.
+    pub(super) fn succeed(&mut self) {
+        self.finish("success");
+    }
+
+    /// Records the exact failed lifecycle terminal once.
+    pub(super) fn fail(&mut self) {
+        self.finish("failed");
+    }
+
+    /// Records the exact cancelled lifecycle terminal once.
+    pub(super) fn cancel(&mut self) {
+        self.finish("cancelled");
+    }
+
+    /// Records one terminal outcome while preventing double terminalization.
+    fn finish(&mut self, outcome: &'static str) {
+        if !self.terminal {
+            self.span.record("outcome", outcome);
+            self.terminal = true;
+        }
+    }
+}
+
+impl Drop for VisibilityPublishGuard {
+    /// Records abandonment or task cancellation before closing the production span.
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.span.record("outcome", self.drop_outcome);
+            self.terminal = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -80,16 +146,18 @@ mod tests {
             wal_lsn_min: WalLsn::new(11),
             wal_lsn_max: WalLsn::new(11),
             memtable_bytes: 0,
+            visibility: super::VisibilityPublishGuard::new(),
         };
-        let batch: PostCommitBatch = token.clone().into();
+        let seal_id = token.seal_id;
+        let batch: PostCommitBatch = token.into();
         assert_eq!(batch.0.len(), 1);
-        assert_eq!(batch.0[0].seal_id, token.seal_id);
+        assert_eq!(batch.0[0].seal_id, seal_id);
         assert_eq!(batch.0[0].wal_lsn_max, WalLsn::new(11));
     }
 }
 
 /// A set of post-commit capabilities produced by one force-seal call.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PostCommitBatch(pub Vec<PostCommitToken>);
 
 impl From<PostCommitToken> for PostCommitBatch {
@@ -99,7 +167,7 @@ impl From<PostCommitToken> for PostCommitBatch {
 }
 
 /// Handle returned by `pre_commit` to be completed after the caller commits.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SealCommit {
     /// Post-commit lifecycle capability.
     pub token: PostCommitToken,
@@ -178,6 +246,7 @@ impl SealDriver {
         node_id: &str,
         writer_epoch: i64,
     ) -> Result<SealCommit, ScribeError> {
+        let mut visibility = VisibilityPublishGuard::new();
         binding
             .validate_authenticated_tenant(conn.data_tenant_id())
             .map_err(|error| ScribeError::Internal {
@@ -253,6 +322,7 @@ impl SealDriver {
             .max()
             .unwrap_or_else(|| WalLsn::new(0));
 
+        visibility.arm_cancellation();
         Ok(SealCommit {
             token: PostCommitToken {
                 seal_id: frozen.seal_id,
@@ -267,6 +337,7 @@ impl SealDriver {
                 wal_lsn_min,
                 wal_lsn_max,
                 memtable_bytes: frozen.arrow_bytes,
+                visibility,
             },
             binding: binding.clone(),
             parquet_path,

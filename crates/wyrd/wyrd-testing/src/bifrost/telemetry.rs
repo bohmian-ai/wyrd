@@ -9,6 +9,8 @@ use std::time::Instant;
 use metrics_exporter_prometheus::PrometheusHandle;
 use wyrd_telemetry::{CapturedSpan, TestTraceCapture};
 
+use crate::bifrost::BifrostTopology;
+
 /// Exact Prometheus sample kind retained across family normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BifrostMetricKind {
@@ -109,8 +111,6 @@ pub(crate) struct TelemetryBinding {
     aggregation: TelemetryAggregation,
     /// Closed workload requirement.
     requirement: TelemetryRequirement,
-    /// Exact allowed label keys.
-    allowed_label_keys: &'static [&'static str],
     /// Closed categorical label domains.
     allowed_label_values: &'static [TelemetryLabelValues],
 }
@@ -128,7 +128,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -157,7 +156,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -180,7 +178,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -203,7 +200,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -226,7 +222,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -255,7 +250,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -275,7 +269,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &[],
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -289,7 +282,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["status"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "status",
             values: &["accepted", "rejected"],
@@ -303,7 +295,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["operation"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "operation",
             values: &["query"],
@@ -317,7 +308,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &[],
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -328,7 +318,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &["lane"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "lane",
             values: &["ingress", "persistence", "wal_io"],
@@ -342,7 +331,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &["lane"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "lane",
             values: &["ingress", "persistence", "wal_io"],
@@ -356,7 +344,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &[],
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -367,7 +354,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_keys: &["query_class", "visibility"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "query_class",
@@ -387,7 +373,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_keys: &["query_class", "role"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "query_class",
@@ -407,7 +392,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["backend", "operation"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "backend",
@@ -427,7 +411,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "rejected", "failed", "cancelled"],
@@ -444,7 +427,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "rejected", "failed", "cancelled"],
@@ -458,7 +440,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["le", "operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -478,7 +459,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["le", "outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "rejected", "failed", "cancelled"],
@@ -492,7 +472,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &["status"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "status",
             values: &["accepted"],
@@ -506,7 +485,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::Peak,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_keys: &[],
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -517,7 +495,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_keys: &["role"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "role",
             values: &["leader"],
@@ -531,7 +508,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &[],
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -545,7 +521,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &["stage"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "stage",
             values: &[
@@ -564,7 +539,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_keys: &[],
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -575,7 +549,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_keys: &["source"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "source",
             values: &["staging", "iceberg"],
@@ -589,7 +562,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_keys: &["source"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "source",
             values: &["staging", "iceberg"],
@@ -603,7 +575,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_keys: &["source"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "source",
             values: &["staging", "iceberg"],
@@ -617,7 +588,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_keys: &["source"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "source",
             values: &["staging", "iceberg"],
@@ -631,7 +601,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_keys: &["source"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "source",
             values: &["iceberg", "hot_sealed", "live_tail"],
@@ -648,7 +617,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_keys: &["outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "failed", "cancelled", "client_drop"],
@@ -665,7 +633,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_keys: &["outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "failed", "cancelled", "client_drop"],
@@ -679,7 +646,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["le", "outcome", "pool"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "outcome",
@@ -699,7 +665,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["pool"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "pool",
             values: &["runtime"],
@@ -713,7 +678,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["backend", "le", "operation", "outcome"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "backend",
@@ -737,7 +701,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Always,
-        allowed_label_keys: &["backend", "direction", "operation"],
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "backend",
@@ -761,7 +724,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_keys: &["le", "outcome"],
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "failed", "cancelled"],
@@ -769,15 +731,81 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     },
 ];
 
-/// Return the one closed canonical cluster binding ledger.
-#[cfg(all(test, feature = "bench"))]
-pub(crate) fn cluster_bindings() -> &'static [TelemetryBinding] {
-    CLUSTER_BINDINGS
-}
+/// Every destination required by a complete benchmark evidence window.
+#[cfg(feature = "bench")]
+const COMPLETE_BINDING_IDS: &[&str] = &[
+    "gate.requests.success",
+    "gate.requests.query_success",
+    "gate.requests.rejected",
+    "gate.requests.failed",
+    "gate.requests.cancelled",
+    "gate.requests.write_cancelled",
+    "gate.bytes",
+    "gate.rows",
+    "gate.active",
+    "cleanup.scribe_ingress",
+    "cleanup.scribe_lane_active",
+    "cleanup.scribe_lane_queued",
+    "cleanup.scribe_persistence_queue",
+    "cleanup.oracle_in_flight",
+    "cleanup.oracle_slots",
+    "cleanup.storage_active",
+    "gate.query_streams",
+    "gate.query_streams.cancelled",
+    "gate.request_duration",
+    "gate.query_stream_duration",
+    "scribe.rows",
+    "forge.backlog_peak",
+    "oracle.slots_final",
+    "scribe.wal_bytes",
+    "scribe.seal_rows",
+    "forge.publications",
+    "forge.rewrite_input_files",
+    "forge.rewrite_input_bytes",
+    "forge.rewrite_output_files",
+    "forge.rewrite_output_bytes",
+    "oracle.source_rows",
+    "oracle.rows",
+    "oracle.stream_bytes",
+    "postgres.acquire",
+    "postgres.transactions",
+    "storage.duration",
+    "storage.bytes",
+    "wal.fsync",
+];
+
+/// Closed dependency destinations carried by canonical evidence.
+const DEPENDENCY_BINDING_IDS: &[&str] = &[
+    "postgres.acquire",
+    "postgres.transactions",
+    "storage.duration",
+    "storage.bytes",
+    "wal.fsync",
+];
+
+/// Closed final-gauge destinations carried by cleanup evidence.
+const CLEANUP_BINDING_IDS: &[&str] = &[
+    "gate.active",
+    "cleanup.scribe_ingress",
+    "cleanup.scribe_lane_active",
+    "cleanup.scribe_lane_queued",
+    "cleanup.scribe_persistence_queue",
+    "cleanup.oracle_in_flight",
+    "cleanup.oracle_slots",
+    "cleanup.storage_active",
+];
+
+/// Closed trace operations carried by canonical evidence.
+const COMPLETE_TRACE_OPERATIONS: &[ClusterTraceOperation] = &[
+    ClusterTraceOperation::DurableWrite,
+    ClusterTraceOperation::FlushToVisible,
+    ClusterTraceOperation::QueryTimeToFirstFrame,
+    ClusterTraceOperation::QueryTotal,
+];
 
 /// One typed value produced by evaluating an exact closed binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EvaluatedBindingValue {
+enum EvaluatedBindingValue {
     /// Window counter delta.
     Counter(u64),
     /// Sampled gauge final and peak values.
@@ -792,6 +820,7 @@ pub(crate) enum EvaluatedBindingValue {
 }
 
 /// Canonical crate-local phase evidence shared by benchmark and journey consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClusterPhaseTelemetryEvidence {
     /// Gate rows accepted in the sampled phase.
     pub(crate) gate_rows: u64,
@@ -831,6 +860,214 @@ pub(crate) struct ClusterPhaseTelemetryEvidence {
     pub(crate) forge_output_files: u64,
     /// Forge rewrite output bytes committed in the phase.
     pub(crate) forge_output_bytes: u64,
+}
+
+/// Dependency-neutral operation identity for exact production trace evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ClusterTraceOperation {
+    /// Gate/Scribe work that durably acknowledges a write.
+    DurableWrite,
+    /// Forge catalog publication that makes acknowledged rows visible.
+    FlushToVisible,
+    /// Oracle source work up to the first returned frame.
+    QueryTimeToFirstFrame,
+    /// Complete Oracle query lifetime.
+    QueryTotal,
+}
+
+impl ClusterTraceOperation {
+    /// Return the stable private evidence identifier for this operation.
+    #[must_use]
+    const fn id(self) -> &'static str {
+        match self {
+            Self::DurableWrite => "trace.durable_write",
+            Self::FlushToVisible => "trace.flush_to_visible",
+            Self::QueryTimeToFirstFrame => "trace.query_time_to_first_frame",
+            Self::QueryTotal => "trace.query_total",
+        }
+    }
+}
+
+/// Closed topology, metric, dependency, trace, and cleanup policy for one window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClusterTelemetryExpectation {
+    /// Process topology whose logical nodes share the sampled runtime.
+    pub(crate) topology: BifrostTopology,
+    /// Exact metric destinations that must exist in this phase.
+    pub(crate) required_binding_ids: &'static [&'static str],
+    /// Exact dependency destinations that must exist in this phase.
+    pub(crate) required_dependency_ids: &'static [&'static str],
+    /// Exact trace operations that must occur in this phase.
+    pub(crate) required_trace_operations: &'static [ClusterTraceOperation],
+    /// Exact final-gauge destinations that must equal zero in this phase.
+    pub(crate) required_clean_binding_ids: &'static [&'static str],
+}
+
+/// Canonical pillar counters retained independently from report-layer types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClusterPillarTelemetryEvidence {
+    /// Successful Gate request terminals.
+    pub(crate) gate_accepted: u64,
+    /// Bytes appended through Scribe WAL ownership.
+    pub(crate) scribe_wal_bytes: u64,
+    /// Successful Forge publications.
+    pub(crate) forge_publications: u64,
+    /// Rows decoded by successful Oracle streams.
+    pub(crate) oracle_decoded_rows: u64,
+}
+
+/// Canonical dependency observations without a dependency on benchmark reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClusterDependencyTelemetryEvidence {
+    /// PostgreSQL pool-acquire p99 in microseconds when observed.
+    pub(crate) postgres_pool_wait_us: Option<u64>,
+    /// PostgreSQL transaction attempts when observed.
+    pub(crate) postgres_transactions: Option<u64>,
+    /// Storage bytes transferred when observed.
+    pub(crate) storage_bytes: Option<u64>,
+    /// Storage operation p99 in microseconds when observed.
+    pub(crate) storage_p99_us: Option<u64>,
+    /// Scribe WAL fsync p99 in microseconds when observed.
+    pub(crate) wal_fsync_p99_us: Option<u64>,
+}
+
+/// Closed dependency-neutral runtime role retained by process evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClusterRuntimeRole {
+    /// Public request admission and routing.
+    Gate,
+    /// Durable WAL append and acknowledgement.
+    Scribe,
+    /// Publication and compaction work.
+    Forge,
+    /// Query planning, admission, and streaming.
+    Oracle,
+}
+
+/// Honest process-scoped resource evidence for one sampled cluster window.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClusterProcessTelemetryEvidence {
+    /// Stable sampled operating-system process identity.
+    pub(crate) identity: String,
+    /// Explicit counter epoch after any process replacement.
+    pub(crate) epoch: u64,
+    /// Logical nodes hosted by this one process.
+    pub(crate) hosted_logical_nodes: Vec<String>,
+    /// Bifrost roles hosted by this process.
+    pub(crate) roles: Vec<ClusterRuntimeRole>,
+    /// CPU seconds consumed in the final stable epoch.
+    pub(crate) cpu_seconds: f64,
+    /// Maximum sampled resident bytes.
+    pub(crate) peak_rss_bytes: u64,
+    /// Final sampled resident bytes.
+    pub(crate) current_rss_bytes: u64,
+    /// Tokio busy seconds consumed in the final stable epoch.
+    pub(crate) runtime_busy_seconds: f64,
+    /// Maximum sampled Tokio global queue depth.
+    pub(crate) runtime_queue_peak: u64,
+}
+
+/// Exact trace distribution for one dependency-neutral operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterTraceTelemetryEvidence {
+    /// Closed operation proved by exact span names.
+    pub(crate) operation: ClusterTraceOperation,
+    /// Bounded representative trace identifiers.
+    pub(crate) representative_trace_ids: Vec<String>,
+    /// Number of exact production spans in the window.
+    pub(crate) samples: u64,
+    /// Nearest-rank p95 duration in microseconds.
+    pub(crate) p95_us: u64,
+    /// Nearest-rank p99 duration in microseconds.
+    pub(crate) p99_us: u64,
+}
+
+/// Exact counters consumed by client, audit, and durable-state reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClusterReconciliationTelemetryEvidence {
+    /// Rows sealed durably by Scribe.
+    pub(crate) sealed_rows: u64,
+    /// Successful query request terminals.
+    pub(crate) successful_queries: u64,
+}
+
+/// Exact final values for every cleanup binding in the canonical ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClusterCleanupTelemetryEvidence {
+    /// Final active Gate query streams.
+    pub(crate) gate_active: Option<u64>,
+    /// Final active Scribe ingress operations.
+    pub(crate) scribe_ingress: Option<u64>,
+    /// Final active Scribe lane operations.
+    pub(crate) scribe_lane_active: Option<u64>,
+    /// Final queued Scribe lane operations.
+    pub(crate) scribe_lane_queued: Option<u64>,
+    /// Final Scribe persistence queue depth.
+    pub(crate) scribe_persistence_queue: Option<u64>,
+    /// Final in-flight Oracle queries.
+    pub(crate) oracle_in_flight: Option<u64>,
+    /// Final Oracle admission slots in use.
+    pub(crate) oracle_slots: Option<u64>,
+    /// Final active storage operations.
+    pub(crate) storage_active: Option<u64>,
+}
+
+impl ClusterCleanupTelemetryEvidence {
+    /// Return whether every retained cleanup value is zero.
+    #[must_use]
+    #[cfg(feature = "bench")]
+    pub(crate) fn is_clean(&self) -> bool {
+        [
+            self.gate_active,
+            self.scribe_ingress,
+            self.scribe_lane_active,
+            self.scribe_lane_queued,
+            self.scribe_persistence_queue,
+            self.oracle_in_flight,
+            self.oracle_slots,
+            self.storage_active,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|value| value == 0)
+    }
+}
+
+/// One complete canonical cluster projection shared by matrix and bench consumers.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClusterTelemetryEvidence {
+    /// Exact counters required by phase-level journey reconciliation.
+    pub(crate) phase: ClusterPhaseTelemetryEvidence,
+    /// Exact canonical pillar counters.
+    pub(crate) pillars: ClusterPillarTelemetryEvidence,
+    /// Exact dependency observations.
+    pub(crate) dependencies: ClusterDependencyTelemetryEvidence,
+    /// Honest process-scoped resource evidence.
+    pub(crate) process: ClusterProcessTelemetryEvidence,
+    /// Exact-name trace operation distributions.
+    pub(crate) traces: Vec<ClusterTraceTelemetryEvidence>,
+    /// Exact owner counters used by reconciliation.
+    pub(crate) reconciliation: ClusterReconciliationTelemetryEvidence,
+    /// Exact final cleanup values.
+    pub(crate) cleanup: ClusterCleanupTelemetryEvidence,
+}
+
+/// Sole owner of canonical binding evaluation and complete evidence construction.
+pub(crate) struct ClusterTelemetryProjection;
+
+#[cfg(feature = "bench")]
+impl ClusterTelemetryExpectation {
+    /// Build the complete policy used by benchmark report assembly.
+    #[must_use]
+    pub(crate) const fn complete(topology: BifrostTopology) -> Self {
+        Self {
+            topology,
+            required_binding_ids: COMPLETE_BINDING_IDS,
+            required_dependency_ids: DEPENDENCY_BINDING_IDS,
+            required_trace_operations: COMPLETE_TRACE_OPERATIONS,
+            required_clean_binding_ids: CLEANUP_BINDING_IDS,
+        }
+    }
 }
 
 /// One parsed production Prometheus sample.
@@ -1417,6 +1654,7 @@ fn process_window(
 /// wrong kind or unit convention, unknown label, open categorical value,
 /// non-finite value, or empty required histogram.
 #[cfg(test)]
+#[cfg(test)]
 pub(crate) fn validate_cluster_bindings(
     delta: &BifrostTelemetryDelta,
 ) -> Result<(), BifrostTelemetryReportError> {
@@ -1427,8 +1665,8 @@ pub(crate) fn validate_cluster_bindings(
 ///
 /// # Errors
 /// Returns the exact invalid binding ID for missing or malformed evidence.
-#[cfg(any(test, feature = "bench"))]
-pub(crate) fn evaluate_cluster_bindings(
+#[cfg(test)]
+fn evaluate_cluster_bindings(
     delta: &BifrostTelemetryDelta,
 ) -> Result<BTreeMap<&'static str, EvaluatedBindingValue>, BifrostTelemetryReportError> {
     evaluate_cluster_bindings_required(
@@ -1438,21 +1676,6 @@ pub(crate) fn evaluate_cluster_bindings(
             .map(|binding| binding.id.0)
             .collect::<BTreeSet<_>>(),
     )
-}
-
-/// Evaluate the canonical ledger for one closed phase expectation.
-///
-/// Required destinations fail when absent. Other counters project as zero;
-/// inactive gauges and histograms are omitted while any present malformed
-/// evidence and every error-status span still fail closed.
-///
-/// # Errors
-/// Returns the exact invalid binding ID for required or malformed evidence.
-pub(crate) fn evaluate_cluster_phase_bindings(
-    delta: &BifrostTelemetryDelta,
-    required_ids: &[&'static str],
-) -> Result<BTreeMap<&'static str, EvaluatedBindingValue>, BifrostTelemetryReportError> {
-    evaluate_cluster_bindings_required(delta, &required_ids.iter().copied().collect())
 }
 
 /// Evaluate the ledger using one explicit closed set of required destinations.
@@ -1498,9 +1721,6 @@ fn evaluate_cluster_bindings_required(
             .collect::<Vec<_>>();
         if samples.is_empty() {
             if !required_ids.contains(binding.id.0) {
-                if binding.aggregation == TelemetryAggregation::Delta {
-                    evaluated.insert(binding.id.0, EvaluatedBindingValue::Counter(0));
-                }
                 continue;
             }
             return Err(invalid_binding(
@@ -1514,11 +1734,11 @@ fn evaluate_cluster_bindings_required(
             }
             let bucket = sample.kind == BifrostMetricKind::HistogramBucket;
             if sample.labels.keys().any(|key| {
-                !binding
+                !(binding
                     .allowed_label_values
                     .iter()
                     .any(|domain| domain.key == key)
-                    && !(bucket && key == "le")
+                    || bucket && key == "le")
             }) {
                 return Err(invalid_binding(binding, "sample contains an unknown label"));
             }
@@ -1546,31 +1766,26 @@ fn evaluate_cluster_bindings_required(
                 }
             }
         }
-        if binding.aggregation == TelemetryAggregation::P99 {
-            let has_count = delta.metrics.iter().any(|sample| {
-                sample.family == binding.family
-                    && sample.kind == BifrostMetricKind::HistogramCount
-                    && sample.value.is_finite()
-                    && sample.value > 0.0
-            });
-            let has_sum = delta.metrics.iter().any(|sample| {
-                sample.family == binding.family
-                    && sample.kind == BifrostMetricKind::HistogramSum
-                    && sample.value.is_finite()
-                    && sample.value >= 0.0
-            });
-            if (!has_count || !has_sum || histogram_quantile(delta, binding.family, 0.99).is_err())
-                && !required_ids.contains(binding.id.0)
-            {
-                continue;
+        let p99 = if binding.aggregation == TelemetryAggregation::P99 {
+            match histogram_quantile_state_for_label(delta, binding.family, "", "", 0.99) {
+                Ok(Some(value)) => Some(value),
+                Ok(None) if !required_ids.contains(binding.id.0) => continue,
+                Ok(None) => {
+                    return Err(invalid_binding(
+                        binding,
+                        "required histogram has no observations",
+                    ));
+                }
+                Err(_) => {
+                    return Err(invalid_binding(
+                        binding,
+                        "histogram window is malformed, reset, nonmonotonic, or overflow-only",
+                    ));
+                }
             }
-            if !has_count || !has_sum || histogram_quantile(delta, binding.family, 0.99).is_err() {
-                return Err(invalid_binding(
-                    binding,
-                    "histogram window is empty, reset, nonmonotonic, or overflow-only",
-                ));
-            }
-        }
+        } else {
+            None
+        };
         let selected = samples
             .into_iter()
             .filter(|sample| {
@@ -1582,11 +1797,14 @@ fn evaluate_cluster_bindings_required(
                 })
             })
             .collect::<Vec<_>>();
-        if selected.is_empty() && binding.aggregation != TelemetryAggregation::Delta {
-            return Err(invalid_binding(
-                binding,
-                "required destination label series is absent",
-            ));
+        if selected.is_empty() {
+            if required_ids.contains(binding.id.0) {
+                return Err(invalid_binding(
+                    binding,
+                    "required destination label series is absent",
+                ));
+            }
+            continue;
         }
         let value = match binding.aggregation {
             TelemetryAggregation::Delta => EvaluatedBindingValue::Counter(
@@ -1606,21 +1824,11 @@ fn evaluate_cluster_bindings_required(
             TelemetryAggregation::P99 => {
                 EvaluatedBindingValue::DurationP99Micros(seconds_to_micros(
                     binding.id.0,
-                    histogram_quantile(delta, binding.family, 0.99)?,
+                    p99.expect("invariant: validated p99 binding retains its quantile"),
                 )?)
             }
         };
         evaluated.insert(binding.id.0, value);
-    }
-    if delta
-        .spans
-        .iter()
-        .any(|span| matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_)))
-    {
-        return Err(BifrostTelemetryReportError::InvalidBinding {
-            id: "trace.status".to_owned(),
-            detail: "capture contains an error-status span".to_owned(),
-        });
     }
     Ok(evaluated)
 }
@@ -1629,36 +1837,23 @@ fn evaluate_cluster_bindings_required(
 ///
 /// # Errors
 /// Returns the binding ID when a domain or selector is not closed by the ledger.
-fn validate_binding_labels(
-    binding: &TelemetryBinding,
-) -> Result<(), BifrostTelemetryReportError> {
-    for domain in binding.allowed_label_values {
-        if !binding.allowed_label_keys.contains(&domain.key) || domain.key == "le" {
+fn validate_binding_labels(binding: &TelemetryBinding) -> Result<(), BifrostTelemetryReportError> {
+    for (index, domain) in binding.allowed_label_values.iter().enumerate() {
+        if domain.key == "le" {
             return Err(invalid_binding(
                 binding,
-                "categorical label domain is not allowed",
+                "exporter-owned le cannot be a categorical domain",
             ));
         }
-    }
-    if binding.allowed_label_keys.iter().any(|key| {
-        *key != "le"
-            && !binding
-                .allowed_label_values
-                .iter()
-                .any(|domain| domain.key == *key)
-    }) {
-        return Err(invalid_binding(
-            binding,
-            "allowed categorical label omits its closed domain",
-        ));
-    }
-    if binding.allowed_label_keys.contains(&"le")
-        != (binding.kind == BifrostMetricKind::HistogramBucket)
-    {
-        return Err(invalid_binding(
-            binding,
-            "only histogram buckets may allow le",
-        ));
+        if binding.allowed_label_values[..index]
+            .iter()
+            .any(|prior| prior.key == domain.key)
+        {
+            return Err(invalid_binding(
+                binding,
+                "categorical label domain is declared more than once",
+            ));
+        }
     }
     for selector in binding.selected_label_values {
         let Some(domain) = binding
@@ -1683,7 +1878,7 @@ fn validate_binding_labels(
 
 /// Project the exact phase counters retained by journey assertions.
 #[must_use]
-pub(crate) fn project_cluster_phase_evidence(
+fn project_cluster_phase_evidence(
     bindings: &BTreeMap<&'static str, EvaluatedBindingValue>,
 ) -> ClusterPhaseTelemetryEvidence {
     let counter = |id: &str| match bindings.get(id) {
@@ -1715,6 +1910,271 @@ pub(crate) fn project_cluster_phase_evidence(
         forge_output_files: counter("forge.rewrite_output_files"),
         forge_output_bytes: counter("forge.rewrite_output_bytes"),
     }
+}
+
+impl ClusterTelemetryProjection {
+    /// Evaluate one sampled delta once and construct the complete canonical evidence.
+    ///
+    /// Optional inactive families remain absent in typed dependency and cleanup
+    /// evidence. Any present malformed family, relevant error span, invalid
+    /// process sample, missing required destination, or nonzero required cleanup
+    /// final fails before evidence leaves telemetry ownership.
+    ///
+    /// # Errors
+    /// Returns [`BifrostTelemetryReportError::InvalidInterval`],
+    /// [`BifrostTelemetryReportError::TopologyMismatch`], or an exact
+    /// [`BifrostTelemetryReportError::InvalidBinding`] for invalid evidence.
+    pub(crate) fn from_delta(
+        delta: &BifrostTelemetryDelta,
+        expectation: ClusterTelemetryExpectation,
+    ) -> Result<ClusterTelemetryEvidence, BifrostTelemetryReportError> {
+        if !delta.interval_seconds.is_finite() || delta.interval_seconds <= 0.0 {
+            return Err(BifrostTelemetryReportError::InvalidInterval);
+        }
+        validate_expectation(&expectation)?;
+        let mut required_ids = expectation
+            .required_binding_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        required_ids.extend(expectation.required_dependency_ids.iter().copied());
+        required_ids.extend(expectation.required_clean_binding_ids.iter().copied());
+        let bindings = evaluate_cluster_bindings_required(delta, &required_ids)?;
+        let traces = project_cluster_traces(delta, expectation.required_trace_operations)?;
+        let process = project_cluster_process(delta, expectation.topology)?;
+        for id in expectation.required_clean_binding_ids {
+            let value = binding_gauge_final(&bindings, id).ok_or_else(|| {
+                BifrostTelemetryReportError::InvalidBinding {
+                    id: (*id).to_owned(),
+                    detail: "required cleanup final is absent".to_owned(),
+                }
+            })?;
+            if value != 0 {
+                return Err(BifrostTelemetryReportError::InvalidBinding {
+                    id: (*id).to_owned(),
+                    detail: format!("required cleanup final is {value}, expected zero"),
+                });
+            }
+        }
+        Ok(ClusterTelemetryEvidence {
+            phase: project_cluster_phase_evidence(&bindings),
+            pillars: ClusterPillarTelemetryEvidence {
+                gate_accepted: binding_counter(&bindings, "gate.requests.success").unwrap_or(0),
+                scribe_wal_bytes: binding_counter(&bindings, "scribe.wal_bytes").unwrap_or(0),
+                forge_publications: binding_counter(&bindings, "forge.publications").unwrap_or(0),
+                oracle_decoded_rows: binding_counter(&bindings, "oracle.rows").unwrap_or(0),
+            },
+            dependencies: ClusterDependencyTelemetryEvidence {
+                postgres_pool_wait_us: binding_p99(&bindings, "postgres.acquire"),
+                postgres_transactions: binding_counter(&bindings, "postgres.transactions"),
+                storage_bytes: binding_counter(&bindings, "storage.bytes"),
+                storage_p99_us: binding_p99(&bindings, "storage.duration"),
+                wal_fsync_p99_us: binding_p99(&bindings, "wal.fsync"),
+            },
+            process,
+            traces,
+            reconciliation: ClusterReconciliationTelemetryEvidence {
+                sealed_rows: binding_counter(&bindings, "scribe.seal_rows").unwrap_or(0),
+                successful_queries: binding_counter(&bindings, "gate.requests.query_success")
+                    .unwrap_or(0),
+            },
+            cleanup: ClusterCleanupTelemetryEvidence {
+                gate_active: binding_gauge_final(&bindings, "gate.active"),
+                scribe_ingress: binding_gauge_final(&bindings, "cleanup.scribe_ingress"),
+                scribe_lane_active: binding_gauge_final(&bindings, "cleanup.scribe_lane_active"),
+                scribe_lane_queued: binding_gauge_final(&bindings, "cleanup.scribe_lane_queued"),
+                scribe_persistence_queue: binding_gauge_final(
+                    &bindings,
+                    "cleanup.scribe_persistence_queue",
+                ),
+                oracle_in_flight: binding_gauge_final(&bindings, "cleanup.oracle_in_flight"),
+                oracle_slots: binding_gauge_final(&bindings, "cleanup.oracle_slots"),
+                storage_active: binding_gauge_final(&bindings, "cleanup.storage_active"),
+            },
+        })
+    }
+}
+
+/// Validate that an expectation references only the closed canonical ledger.
+fn validate_expectation(
+    expectation: &ClusterTelemetryExpectation,
+) -> Result<(), BifrostTelemetryReportError> {
+    for id in expectation
+        .required_binding_ids
+        .iter()
+        .chain(expectation.required_dependency_ids)
+        .chain(expectation.required_clean_binding_ids)
+    {
+        if !CLUSTER_BINDINGS.iter().any(|binding| binding.id.0 == *id) {
+            return Err(BifrostTelemetryReportError::InvalidBinding {
+                id: (*id).to_owned(),
+                detail: "expectation references an unknown binding".to_owned(),
+            });
+        }
+    }
+    for id in expectation.required_dependency_ids {
+        if !DEPENDENCY_BINDING_IDS.contains(id) {
+            return Err(BifrostTelemetryReportError::InvalidBinding {
+                id: (*id).to_owned(),
+                detail: "expectation classifies a non-dependency binding as a dependency"
+                    .to_owned(),
+            });
+        }
+    }
+    for id in expectation.required_clean_binding_ids {
+        if !CLEANUP_BINDING_IDS.contains(id) {
+            return Err(BifrostTelemetryReportError::InvalidBinding {
+                id: (*id).to_owned(),
+                detail: "expectation classifies a non-final binding as cleanup".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Return one exact counter destination without synthesizing absence.
+fn binding_counter(
+    bindings: &BTreeMap<&'static str, EvaluatedBindingValue>,
+    id: &str,
+) -> Option<u64> {
+    match bindings.get(id) {
+        Some(EvaluatedBindingValue::Counter(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Return one exact histogram destination without synthesizing absence.
+fn binding_p99(bindings: &BTreeMap<&'static str, EvaluatedBindingValue>, id: &str) -> Option<u64> {
+    match bindings.get(id) {
+        Some(EvaluatedBindingValue::DurationP99Micros(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Return one exact final gauge destination without synthesizing absence.
+fn binding_gauge_final(
+    bindings: &BTreeMap<&'static str, EvaluatedBindingValue>,
+    id: &str,
+) -> Option<u64> {
+    match bindings.get(id) {
+        Some(EvaluatedBindingValue::Gauge { final_value, .. }) => Some(*final_value),
+        _ => None,
+    }
+}
+
+/// Map one exact production span name to its canonical operation.
+fn cluster_trace_operation(name: &str) -> Option<ClusterTraceOperation> {
+    match name {
+        "bifrost.gate.write" | "bifrost.scribe.wal.append" => {
+            Some(ClusterTraceOperation::DurableWrite)
+        }
+        "bifrost.scribe.visibility.publish" | "bifrost.forge.catalog.commit" => {
+            Some(ClusterTraceOperation::FlushToVisible)
+        }
+        "bifrost.oracle.source" => Some(ClusterTraceOperation::QueryTimeToFirstFrame),
+        "bifrost.gate.query.stream" => Some(ClusterTraceOperation::QueryTotal),
+        _ => None,
+    }
+}
+
+/// Build exact trace distributions and reject required absence or error status.
+fn project_cluster_traces(
+    delta: &BifrostTelemetryDelta,
+    required: &[ClusterTraceOperation],
+) -> Result<Vec<ClusterTraceTelemetryEvidence>, BifrostTelemetryReportError> {
+    if let Some((operation, _)) = delta.spans.iter().find_map(|span| {
+        cluster_trace_operation(&span.name)
+            .filter(|_| matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_)))
+            .map(|operation| (operation, span))
+    }) {
+        return Err(BifrostTelemetryReportError::InvalidBinding {
+            id: operation.id().to_owned(),
+            detail: "required production operation contains an error-status span".to_owned(),
+        });
+    }
+    let mut traces = Vec::new();
+    for operation in COMPLETE_TRACE_OPERATIONS {
+        let matching = delta
+            .spans
+            .iter()
+            .filter(|span| cluster_trace_operation(&span.name) == Some(*operation))
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            if required.contains(operation) {
+                return Err(BifrostTelemetryReportError::InvalidBinding {
+                    id: operation.id().to_owned(),
+                    detail: "required trace operation is absent".to_owned(),
+                });
+            }
+            continue;
+        }
+        let mut durations = matching
+            .iter()
+            .map(|span| span.duration_nanos / 1_000)
+            .collect::<Vec<_>>();
+        durations.sort_unstable();
+        let index = durations.len().saturating_sub(1);
+        traces.push(ClusterTraceTelemetryEvidence {
+            operation: *operation,
+            representative_trace_ids: matching
+                .iter()
+                .rev()
+                .take(3)
+                .map(|span| span.trace_id.clone())
+                .collect(),
+            samples: durations.len() as u64,
+            p95_us: durations.get(index * 95 / 100).copied().unwrap_or(0),
+            p99_us: durations.get(index * 99 / 100).copied().unwrap_or(0),
+        });
+    }
+    Ok(traces)
+}
+
+/// Validate and project honest process evidence for the closed matrix topologies.
+fn project_cluster_process(
+    delta: &BifrostTelemetryDelta,
+    topology: BifrostTopology,
+) -> Result<ClusterProcessTelemetryEvidence, BifrostTelemetryReportError> {
+    if delta.process.identity.is_empty()
+        || !delta.process.cpu_seconds.is_finite()
+        || delta.process.cpu_seconds < 0.0
+        || !delta.process.tokio_busy_seconds.is_finite()
+        || delta.process.tokio_busy_seconds < 0.0
+        || delta.process.peak_rss_bytes < delta.process.current_rss_bytes
+    {
+        return Err(BifrostTelemetryReportError::InvalidBinding {
+            id: "process.resources".to_owned(),
+            detail: "process identity, counters, or sampled peaks are invalid".to_owned(),
+        });
+    }
+    let hosted_logical_nodes = match topology {
+        BifrostTopology::OnePod => vec!["server-0".to_owned()],
+        BifrostTopology::ThreeServersThreeForgeWorkers => vec![
+            "server-0".to_owned(),
+            "server-1".to_owned(),
+            "server-2".to_owned(),
+            "forge-worker-0".to_owned(),
+            "forge-worker-1".to_owned(),
+            "forge-worker-2".to_owned(),
+        ],
+        _ => return Err(BifrostTelemetryReportError::TopologyMismatch),
+    };
+    Ok(ClusterProcessTelemetryEvidence {
+        identity: delta.process.identity.clone(),
+        epoch: delta.process.epoch,
+        hosted_logical_nodes,
+        roles: vec![
+            ClusterRuntimeRole::Gate,
+            ClusterRuntimeRole::Scribe,
+            ClusterRuntimeRole::Forge,
+            ClusterRuntimeRole::Oracle,
+        ],
+        cpu_seconds: delta.process.cpu_seconds,
+        peak_rss_bytes: delta.process.peak_rss_bytes,
+        current_rss_bytes: delta.process.current_rss_bytes,
+        runtime_busy_seconds: delta.process.tokio_busy_seconds,
+        runtime_queue_peak: delta.process.queue_peak,
+    })
 }
 
 /// Execute one workload inside the canonical sampled telemetry window.
@@ -2503,86 +2963,161 @@ fn histogram_quantile_for_label(
     value: &str,
     quantile: f64,
 ) -> Result<f64, BifrostTelemetryReportError> {
-    let mut series_buckets = delta
-        .metrics
-        .iter()
-        .filter(|sample| {
-            sample.family == family
-                && sample.kind == BifrostMetricKind::HistogramBucket
-                && (key.is_empty() || sample.labels.get(key).map(String::as_str) == Some(value))
-        })
-        .filter_map(|sample| {
-            sample
-                .labels
-                .get("le")
-                .and_then(|upper| match upper.as_str() {
-                    "+Inf" | "Inf" => Some(f64::INFINITY),
-                    _ => upper.parse::<f64>().ok(),
-                })
-                .map(|upper| (upper, sample.value))
-        })
-        .collect::<Vec<_>>();
-    series_buckets.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let mut buckets: Vec<(f64, f64)> = Vec::new();
-    for (upper, count) in series_buckets {
-        if let Some((_, aggregate)) = buckets
-            .last_mut()
-            .filter(|(existing, _)| existing.total_cmp(&upper).is_eq())
-        {
-            *aggregate += count;
-        } else {
-            buckets.push((upper, count));
-        }
-    }
-    let count = delta
-        .metrics
-        .iter()
-        .filter(|sample| {
-            sample.family == family
-                && sample.kind == BifrostMetricKind::HistogramCount
-                && (key.is_empty() || sample.labels.get(key).map(String::as_str) == Some(value))
-        })
-        .map(|sample| sample.value)
-        .sum::<f64>();
-    if !count.is_finite() || count <= 0.0 {
-        return Err(BifrostTelemetryReportError::EmptyHistogram {
-            family: family.to_owned(),
-        });
-    }
-    let mut previous = 0.0;
-    for (_, cumulative) in &buckets {
-        if !cumulative.is_finite() || *cumulative < previous || *cumulative < 0.0 {
-            return Err(BifrostTelemetryReportError::InvalidBinding {
-                id: family.to_owned(),
-                detail: "histogram buckets are nonmonotonic".to_owned(),
-            });
-        }
-        previous = *cumulative;
-    }
-    let infinity_count = buckets.last().map(|(_, count)| *count).ok_or_else(|| {
+    histogram_quantile_state_for_label(delta, family, key, value, quantile)?.ok_or_else(|| {
         BifrostTelemetryReportError::EmptyHistogram {
             family: family.to_owned(),
         }
-    })?;
-    if infinity_count != count {
-        return Err(BifrostTelemetryReportError::EmptyHistogram {
+    })
+}
+
+/// Validate every categorical histogram tuple before deriving one family quantile.
+///
+/// A structurally complete all-zero family has no observations and returns
+/// `None`. Complete idle tuples may coexist with active tuples and contribute
+/// zero to the aggregate distribution.
+///
+/// # Errors
+/// Returns a typed histogram error for missing or duplicate components,
+/// mismatched bucket boundaries, invalid values, nonmonotonic buckets,
+/// count mismatches, or an overflow-only positive distribution.
+fn histogram_quantile_state_for_label(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+    key: &str,
+    value: &str,
+    quantile: f64,
+) -> Result<Option<f64>, BifrostTelemetryReportError> {
+    type TupleKey = Vec<(String, String)>;
+    type TupleParts = (Vec<f64>, Vec<f64>, BTreeMap<String, Vec<f64>>);
+
+    let invalid = |detail: &str| BifrostTelemetryReportError::InvalidBinding {
+        id: family.to_owned(),
+        detail: detail.to_owned(),
+    };
+    let mut tuples = BTreeMap::<TupleKey, TupleParts>::new();
+    for sample in delta.metrics.iter().filter(|sample| {
+        sample.family == family
+            && (key.is_empty() || sample.labels.get(key).map(String::as_str) == Some(value))
+    }) {
+        let tuple = sample
+            .labels
+            .iter()
+            .filter(|(label, _)| label.as_str() != "le")
+            .map(|(label, value)| (label.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let parts = tuples.entry(tuple).or_default();
+        match sample.kind {
+            BifrostMetricKind::HistogramBucket => {
+                let upper = sample
+                    .labels
+                    .get("le")
+                    .ok_or_else(|| invalid("histogram bucket omits le"))?;
+                parts.2.entry(upper.clone()).or_default().push(sample.value);
+            }
+            BifrostMetricKind::HistogramCount => parts.0.push(sample.value),
+            BifrostMetricKind::HistogramSum => parts.1.push(sample.value),
+            _ => return Err(invalid("histogram family contains a non-histogram sample")),
+        }
+    }
+    if tuples.is_empty() {
+        return Err(BifrostTelemetryReportError::MissingSeries {
             family: family.to_owned(),
         });
     }
-    let target = (count * quantile).ceil();
-    for (upper, count) in buckets {
-        if count >= target {
-            if !upper.is_finite() {
-                return Err(BifrostTelemetryReportError::EmptyHistogram {
-                    family: family.to_owned(),
-                });
-            }
-            return Ok(upper);
+
+    let mut expected_boundaries: Option<Vec<String>> = None;
+    let mut aggregate = BTreeMap::<String, f64>::new();
+    let mut aggregate_count = 0.0;
+    let mut any_active = false;
+    for (counts, sums, buckets) in tuples.values() {
+        if counts.len() != 1 || sums.len() != 1 || buckets.is_empty() {
+            return Err(invalid(
+                "each histogram tuple requires exactly one count, one sum, and buckets",
+            ));
         }
+        if buckets.values().any(|values| values.len() != 1) {
+            return Err(invalid(
+                "histogram tuple contains a duplicate bucket boundary",
+            ));
+        }
+        let boundaries = buckets.keys().cloned().collect::<Vec<_>>();
+        if expected_boundaries
+            .as_ref()
+            .is_some_and(|expected| expected != &boundaries)
+        {
+            return Err(invalid(
+                "histogram tuples have mismatched bucket boundaries",
+            ));
+        }
+        expected_boundaries.get_or_insert(boundaries);
+        let count = counts[0];
+        let sum = sums[0];
+        if !count.is_finite() || !sum.is_finite() || count < 0.0 || sum < 0.0 {
+            return Err(invalid("histogram count or sum is invalid"));
+        }
+        let idle = count == 0.0 && sum == 0.0 && buckets.values().all(|values| values[0] == 0.0);
+        if idle {
+            continue;
+        }
+        any_active = true;
+        if count <= 0.0 {
+            return Err(invalid("active histogram tuple has no positive count"));
+        }
+        let mut ordered = buckets
+            .iter()
+            .map(|(upper, values)| {
+                let parsed = match upper.as_str() {
+                    "+Inf" | "Inf" => Ok(f64::INFINITY),
+                    _ => upper
+                        .parse::<f64>()
+                        .map_err(|_| invalid("histogram bucket boundary is invalid")),
+                }?;
+                Ok((parsed, upper, values[0]))
+            })
+            .collect::<Result<Vec<_>, BifrostTelemetryReportError>>()?;
+        ordered.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let mut previous = 0.0;
+        for (_, upper, cumulative) in &ordered {
+            if !cumulative.is_finite() || *cumulative < previous || *cumulative < 0.0 {
+                return Err(invalid("histogram buckets are nonmonotonic"));
+            }
+            previous = *cumulative;
+            *aggregate.entry((*upper).clone()).or_default() += *cumulative;
+        }
+        if ordered.last().map(|(_, _, value)| *value) != Some(count) {
+            return Err(invalid("histogram +Inf bucket does not equal count"));
+        }
+        let target = (count * quantile).ceil();
+        if !ordered
+            .iter()
+            .any(|(upper, _, cumulative)| upper.is_finite() && *cumulative >= target)
+        {
+            return Err(invalid("histogram positive observations are overflow-only"));
+        }
+        aggregate_count += count;
     }
-    Err(BifrostTelemetryReportError::EmptyHistogram {
-        family: family.to_owned(),
-    })
+    if !any_active {
+        return Ok(None);
+    }
+    let target = (aggregate_count * quantile).ceil();
+    let mut ordered = aggregate
+        .into_iter()
+        .map(|(upper, cumulative)| {
+            let parsed = match upper.as_str() {
+                "+Inf" | "Inf" => Ok(f64::INFINITY),
+                _ => upper
+                    .parse::<f64>()
+                    .map_err(|_| invalid("histogram bucket boundary is invalid")),
+            }?;
+            Ok((parsed, cumulative))
+        })
+        .collect::<Result<Vec<_>, BifrostTelemetryReportError>>()?;
+    ordered.sort_by(|left, right| left.0.total_cmp(&right.0));
+    ordered
+        .into_iter()
+        .find(|(upper, cumulative)| upper.is_finite() && *cumulative >= target)
+        .map(|(upper, _)| Some(upper))
+        .ok_or_else(|| invalid("histogram aggregate is overflow-only"))
 }
 
 /// Validate active-role gauges and restart activity against launched topology.
@@ -2668,6 +3203,13 @@ mod tests {
     fn histogram_count(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
         let mut sample = sample(family, labels, value);
         sample.kind = BifrostMetricKind::HistogramCount;
+        sample
+    }
+
+    /// Construct one normalized histogram sum sample for mapper tests.
+    fn histogram_sum(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
+        let mut sample = sample(family, labels, value);
+        sample.kind = BifrostMetricKind::HistogramSum;
         sample
     }
 
@@ -2859,7 +3401,7 @@ mod tests {
             ),
             (
                 "put",
-                [("0.001", 49.0), ("0.025", 49.0), ("+Inf", 50.0)],
+                [("0.001", 49.0), ("0.025", 50.0), ("+Inf", 50.0)],
                 50.0,
             ),
         ] {
@@ -2879,6 +3421,12 @@ mod tests {
                 labels: BTreeMap::from([("operation".to_owned(), operation.to_owned())]),
                 value: count,
                 kind: BifrostMetricKind::HistogramCount,
+            });
+            metrics.push(BifrostMetricSample {
+                family: family.to_owned(),
+                labels: BTreeMap::from([("operation".to_owned(), operation.to_owned())]),
+                value: 0.5,
+                kind: BifrostMetricKind::HistogramSum,
             });
         }
         let delta = BifrostTelemetryDelta {
@@ -3111,7 +3659,74 @@ mod tests {
                 .insert(domain.key.to_owned(), "forbidden".to_owned());
                 assert_id(validate_cluster_bindings(&wrong_value));
             }
+
+            for domain in binding.allowed_label_values {
+                let mut missing_key = canonical_binding_delta();
+                for sample in missing_key
+                    .metrics
+                    .iter_mut()
+                    .chain(&mut missing_key.gauge_maxima)
+                    .chain(&mut missing_key.gauge_final)
+                    .filter(|sample| sample.family == binding.family)
+                {
+                    sample.labels.remove(domain.key);
+                }
+                assert_id(validate_cluster_bindings(&missing_key));
+            }
+
+            if binding.kind == BifrostMetricKind::HistogramBucket {
+                let mut missing_le = canonical_binding_delta();
+                missing_le
+                    .metrics
+                    .iter_mut()
+                    .filter(|sample| {
+                        sample.family == binding.family
+                            && sample.kind == BifrostMetricKind::HistogramBucket
+                    })
+                    .for_each(|sample| {
+                        sample.labels.remove("le");
+                    });
+                assert_id(validate_cluster_bindings(&missing_le));
+
+                for kind in [
+                    BifrostMetricKind::HistogramCount,
+                    BifrostMetricKind::HistogramSum,
+                ] {
+                    let mut illegal_le = canonical_binding_delta();
+                    illegal_le
+                        .metrics
+                        .iter_mut()
+                        .filter(|sample| sample.family == binding.family && sample.kind == kind)
+                        .for_each(|sample| {
+                            sample.labels.insert("le".to_owned(), "1".to_owned());
+                        });
+                    assert_id(validate_cluster_bindings(&illegal_le));
+                }
+            }
         }
+    }
+
+    /// Proves a rejected Gate sample cannot omit its operation identity.
+    #[test]
+    fn gate_rejected_sample_without_operation_fails_closed() {
+        let mut delta = canonical_binding_delta();
+        let rejected = delta
+            .metrics
+            .iter_mut()
+            .find(|sample| {
+                sample.family == "bifrost_gate_requests_total"
+                    && sample
+                        .labels
+                        .get("outcome")
+                        .is_some_and(|value| value == "rejected")
+            })
+            .expect("fixture contains one rejected Gate request");
+        rejected.labels.remove("operation");
+        assert!(matches!(
+            validate_cluster_bindings(&delta),
+            Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. })
+                if id == "gate.requests.success"
+        ));
     }
 
     /// Proves wrong kinds, open labels, and error spans invalidate clean evidence.
@@ -3131,7 +3746,108 @@ mod tests {
         let mut span = captured_span("bifrost.oracle.query", &[]);
         span.status = wyrd_telemetry::CapturedSpanStatus::Error("failed".to_owned());
         error_span.spans.push(span);
-        assert!(validate_cluster_bindings(&error_span).is_err());
+        assert!(
+            ClusterTelemetryProjection::from_delta(
+                &error_span,
+                ClusterTelemetryExpectation {
+                    topology: BifrostTopology::OnePod,
+                    required_binding_ids: &[],
+                    required_dependency_ids: &[],
+                    required_trace_operations: &[ClusterTraceOperation::QueryTotal],
+                    required_clean_binding_ids: &[],
+                },
+            )
+            .is_err()
+        );
+    }
+
+    /// Query-total evidence recognizes only the terminal public stream owner.
+    #[test]
+    fn query_total_trace_uses_stream_lifecycle_not_oracle_setup() {
+        assert_eq!(
+            cluster_trace_operation("bifrost.gate.query.stream"),
+            Some(ClusterTraceOperation::QueryTotal)
+        );
+        assert_eq!(cluster_trace_operation("bifrost.oracle.query"), None);
+        assert_eq!(cluster_trace_operation("bifrost.gate.query"), None);
+    }
+
+    /// Optional dependency absence stays absent while present malformed evidence fails closed.
+    #[test]
+    fn canonical_projection_distinguishes_absent_idle_and_malformed_storage_latency() {
+        let family = "wyrd_storage_operation_duration_seconds";
+        let mut absent = canonical_binding_delta();
+        absent.metrics.retain(|sample| sample.family != family);
+        let expectation = ClusterTelemetryExpectation {
+            topology: BifrostTopology::OnePod,
+            required_binding_ids: &[],
+            required_dependency_ids: &[],
+            required_trace_operations: &[],
+            required_clean_binding_ids: &[],
+        };
+        let evidence = ClusterTelemetryProjection::from_delta(&absent, expectation)
+            .expect("optional storage latency may be wholly absent");
+        assert_eq!(evidence.dependencies.storage_p99_us, None);
+
+        let mut idle = canonical_binding_delta();
+        idle.metrics
+            .iter_mut()
+            .filter(|sample| sample.family == family)
+            .for_each(|sample| sample.value = 0.0);
+        let idle_evidence = ClusterTelemetryProjection::from_delta(&idle, expectation)
+            .expect("structurally complete idle storage latency is optional");
+        assert_eq!(idle_evidence.dependencies.storage_p99_us, None);
+
+        let mut malformed = idle;
+        malformed
+            .metrics
+            .iter_mut()
+            .find(|sample| {
+                sample.family == family && sample.kind == BifrostMetricKind::HistogramCount
+            })
+            .expect("fixture contains storage histogram count")
+            .value = 1.0;
+        let malformed_error = ClusterTelemetryProjection::from_delta(&malformed, expectation)
+            .expect_err("positive count with zero buckets must fail closed");
+        assert!(
+            matches!(
+                malformed_error,
+                BifrostTelemetryReportError::InvalidBinding { ref id, .. }
+                    if id == "storage.duration"
+            ),
+            "unexpected malformed storage error: {malformed_error:?}"
+        );
+    }
+
+    /// Complete benchmark evidence cannot omit storage latency or synthesize a p99.
+    #[cfg(feature = "bench")]
+    #[test]
+    fn complete_projection_requires_storage_latency() {
+        let family = "wyrd_storage_operation_duration_seconds";
+        let mut absent = canonical_binding_delta();
+        absent.metrics.retain(|sample| sample.family != family);
+        assert!(matches!(
+            ClusterTelemetryProjection::from_delta(
+                &absent,
+                ClusterTelemetryExpectation::complete(BifrostTopology::OnePod),
+            ),
+            Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. })
+                if id == "storage.duration"
+        ));
+
+        let mut idle = canonical_binding_delta();
+        idle.metrics
+            .iter_mut()
+            .filter(|sample| sample.family == family)
+            .for_each(|sample| sample.value = 0.0);
+        assert!(matches!(
+            ClusterTelemetryProjection::from_delta(
+                &idle,
+                ClusterTelemetryExpectation::complete(BifrostTopology::OnePod),
+            ),
+            Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. })
+                if id == "storage.duration"
+        ));
     }
 
     /// Proves the bounded sampler cancellation signal terminates and joins its owner task.
@@ -3738,7 +4454,18 @@ mod tests {
                 (binding.family, binding.kind),
                 (contract.family, contract.kind)
             );
-            assert_eq!(binding.allowed_label_keys, contract.keys);
+            let mut keys = binding
+                .allowed_label_values
+                .iter()
+                .map(|domain| domain.key)
+                .collect::<Vec<_>>();
+            if binding.kind == BifrostMetricKind::HistogramBucket {
+                keys.push("le");
+            }
+            keys.sort_unstable();
+            let mut expected_keys = contract.keys.to_vec();
+            expected_keys.sort_unstable();
+            assert_eq!(keys, expected_keys);
             assert_eq!(
                 (binding.unit, binding.aggregation, binding.requirement),
                 (contract.unit, contract.aggregation, contract.requirement)
@@ -3810,12 +4537,11 @@ mod tests {
                 || sample.labels.get("operation").map(String::as_str) != Some("query")
                 || sample.labels.get("outcome").map(String::as_str) != Some("success")
         });
-        assert_eq!(
-            evaluate_cluster_bindings(&missing_query_success)
-                .expect("an unobserved closed counter destination is exact zero")
-                .get("gate.requests.query_success"),
-            Some(&EvaluatedBindingValue::Counter(0))
-        );
+        assert!(matches!(
+            evaluate_cluster_bindings(&missing_query_success),
+            Err(BifrostTelemetryReportError::InvalidBinding { id, .. })
+                if id == "gate.requests.query_success"
+        ));
 
         delta.metrics.push(BifrostMetricSample {
             family: "bifrost_gate_requests_total".to_owned(),
@@ -4061,6 +4787,21 @@ mod tests {
                     "bifrost_forge_role_process_started_total",
                     &[("role", "forge_worker")],
                     4.0,
+                ),
+                histogram_sum(
+                    "bifrost_forge_task_duration_seconds",
+                    &[("strategy", "staging_fold"), ("result", "succeeded")],
+                    0.1,
+                ),
+                histogram_sum(
+                    "bifrost_forge_task_spill_bytes",
+                    &[("strategy", "staging_fold")],
+                    65_536.0,
+                ),
+                histogram_sum(
+                    "bifrost_forge_cleanup_duration_seconds",
+                    &[("kind", "expired")],
+                    0.025,
                 ),
             ],
             gauge_maxima: vec![

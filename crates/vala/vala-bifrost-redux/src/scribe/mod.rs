@@ -1557,33 +1557,46 @@ impl ScribeImpl {
     where
         T: Into<seal::PostCommitBatch>,
     {
-        for token in post_commit.into().0 {
-            let binding =
-                TenantTableBinding::resolve((token.seal_key.tenant, token.seal_key.table.clone()))
-                    .map_err(|error| ScribeError::Internal {
-                        detail: error.to_string(),
-                    })?;
-            self.shards
-                .complete_post_commit(
-                    token.seal_id,
-                    &token.seal_key,
-                    token.memtable_bytes,
-                    token.file_list_key,
-                )
-                .await?;
-            #[cfg(feature = "test-support")]
-            self.publication_observer
-                .record(ScribePublicationEvent::Published {
-                    seal_id: token.seal_id,
-                    file_list_row_id: token.file_list_row_id,
-                    batch_ids: token.batch_ids.clone(),
-                    table: token.seal_key.table.fqn(),
-                });
-            if let Some(publisher) = &self.staging_file_publisher {
-                let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
-                    binding,
-                    token.seal_key.day.as_naive_date(),
-                ));
+        for mut token in post_commit.into().0 {
+            let result = async {
+                let binding = TenantTableBinding::resolve((
+                    token.seal_key.tenant,
+                    token.seal_key.table.clone(),
+                ))
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+                self.shards
+                    .complete_post_commit(
+                        token.seal_id,
+                        &token.seal_key,
+                        token.memtable_bytes,
+                        token.file_list_key.clone(),
+                    )
+                    .await?;
+                #[cfg(feature = "test-support")]
+                self.publication_observer
+                    .record(ScribePublicationEvent::Published {
+                        seal_id: token.seal_id,
+                        file_list_row_id: token.file_list_row_id,
+                        batch_ids: token.batch_ids.clone(),
+                        table: token.seal_key.table.fqn(),
+                    });
+                if let Some(publisher) = &self.staging_file_publisher {
+                    let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
+                        binding,
+                        token.seal_key.day.as_naive_date(),
+                    ));
+                }
+                Ok::<(), ScribeError>(())
+            }
+            .await;
+            match result {
+                Ok(()) => token.visibility.succeed(),
+                Err(error) => {
+                    token.visibility.fail();
+                    return Err(error);
+                }
             }
         }
         Ok(())
@@ -1594,17 +1607,28 @@ impl ScribeImpl {
     where
         T: Into<seal::PostCommitBatch>,
     {
-        for token in post_commit.into().0 {
-            self.shards
-                .abort_post_commit(token.seal_id, &token.seal_key)
-                .await?;
-            self.admission
-                .transfer_immutable_to_active(token.memtable_bytes);
-            self.memory_ledger
-                .move_immutable_to_active(token.memtable_bytes)
-                .map_err(|error| ScribeError::Internal {
-                    detail: error.to_string(),
-                })?;
+        for mut token in post_commit.into().0 {
+            let result = async {
+                self.shards
+                    .abort_post_commit(token.seal_id, &token.seal_key)
+                    .await?;
+                self.admission
+                    .transfer_immutable_to_active(token.memtable_bytes);
+                self.memory_ledger
+                    .move_immutable_to_active(token.memtable_bytes)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: error.to_string(),
+                    })?;
+                Ok::<(), ScribeError>(())
+            }
+            .await;
+            match result {
+                Ok(()) => token.visibility.cancel(),
+                Err(error) => {
+                    token.visibility.fail();
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
@@ -1616,21 +1640,22 @@ impl ScribeImpl {
     /// pending so WAL replay can retry the seal.
     pub async fn reconcile_post_commit(
         &self,
-        token: &seal::PostCommitToken,
+        mut token: seal::PostCommitToken,
         conn: &mut TenantConn<'_>,
     ) -> Result<bool, ScribeError> {
-        let key = &token.file_list_key;
-        if conn.data_tenant_id() != key.data_tenant_id {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "post-commit reconciliation tenant mismatch: key={} connection={}",
-                    key.data_tenant_id,
-                    conn.data_tenant_id()
-                ),
-            });
-        }
-        let row: Option<uuid::Uuid> = sqlx::query_scalar(
-            "SELECT id
+        let result = async {
+            let key = &token.file_list_key;
+            if conn.data_tenant_id() != key.data_tenant_id {
+                return Err(ScribeError::Internal {
+                    detail: format!(
+                        "post-commit reconciliation tenant mismatch: key={} connection={}",
+                        key.data_tenant_id,
+                        conn.data_tenant_id()
+                    ),
+                });
+            }
+            let row: Option<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT id
                FROM vala.file_list
               WHERE data_tenant_id = $1
                 AND namespace = $2
@@ -1639,46 +1664,64 @@ impl ScribeImpl {
                 AND writer_epoch = $5
                 AND wal_lsn_min = $6
                 AND wal_lsn_max = $7",
-        )
-        .bind(key.data_tenant_id.as_uuid())
-        .bind(&key.namespace)
-        .bind(&key.table_name)
-        .bind(key.node_id)
-        .bind(key.writer_epoch)
-        .bind(key.wal_lsn_min)
-        .bind(key.wal_lsn_max)
-        .fetch_optional(&mut **conn.transaction())
-        .await
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("file-list post-commit reconciliation failed: {error}"),
-        })?;
+            )
+            .bind(key.data_tenant_id.as_uuid())
+            .bind(&key.namespace)
+            .bind(&key.table_name)
+            .bind(key.node_id)
+            .bind(key.writer_epoch)
+            .bind(key.wal_lsn_min)
+            .bind(key.wal_lsn_max)
+            .fetch_optional(&mut **conn.transaction())
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("file-list post-commit reconciliation failed: {error}"),
+            })?;
 
-        if row.is_some() {
-            let binding =
-                TenantTableBinding::resolve((token.seal_key.tenant, token.seal_key.table.clone()))
-                    .map_err(|error| ScribeError::Internal {
-                        detail: error.to_string(),
-                    })?;
-            self.shards
-                .complete_post_commit(
-                    token.seal_id,
-                    &token.seal_key,
-                    token.memtable_bytes,
-                    key.clone(),
-                )
-                .await?;
-            if let Some(publisher) = &self.staging_file_publisher {
-                let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
-                    binding,
-                    token.seal_key.day.as_naive_date(),
-                ));
+            if row.is_some() {
+                let binding = TenantTableBinding::resolve((
+                    token.seal_key.tenant,
+                    token.seal_key.table.clone(),
+                ))
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+                self.shards
+                    .complete_post_commit(
+                        token.seal_id,
+                        &token.seal_key,
+                        token.memtable_bytes,
+                        key.clone(),
+                    )
+                    .await?;
+                if let Some(publisher) = &self.staging_file_publisher {
+                    let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
+                        binding,
+                        token.seal_key.day.as_naive_date(),
+                    ));
+                }
+                Ok(true)
+            } else {
+                self.shards
+                    .abort_post_commit(token.seal_id, &token.seal_key)
+                    .await?;
+                Ok(false)
             }
-            Ok(true)
-        } else {
-            self.shards
-                .abort_post_commit(token.seal_id, &token.seal_key)
-                .await?;
-            Ok(false)
+        }
+        .await;
+        match result {
+            Ok(true) => {
+                token.visibility.succeed();
+                Ok(true)
+            }
+            Ok(false) => {
+                token.visibility.cancel();
+                Ok(false)
+            }
+            Err(error) => {
+                token.visibility.fail();
+                Err(error)
+            }
         }
     }
 

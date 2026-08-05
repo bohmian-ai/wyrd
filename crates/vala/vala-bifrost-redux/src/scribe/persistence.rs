@@ -670,6 +670,8 @@ impl PersistenceWorker {
     /// Cancellation can occur after object or SQL side effects. The shard keeps
     /// the generation pending and WAL replay reconciles any partial progress.
     async fn process_job(&self, job: PersistenceJob) {
+        let mut visibility = super::seal::VisibilityPublishGuard::new();
+        visibility.arm_cancellation();
         let generation = Arc::clone(&job.generation);
         tracing::debug!(
             generation_id = generation.generation_id.0,
@@ -723,6 +725,7 @@ impl PersistenceWorker {
                 .duration_since(generation.closed_at)
                 .as_secs_f64(),
         );
+        let publication_succeeded = result.is_ok();
         let completion = match result {
             Ok(file_list_key) => PersistenceCompletion {
                 generation_id: generation.generation_id,
@@ -741,16 +744,21 @@ impl PersistenceWorker {
                 error: Some(error.to_string()),
             },
         };
-        if job
+        let completion_delivered = job
             .completion_tx
             .send(crate::scribe::shards::ShardCommand::PersistenceComplete {
                 completion: Box::new(completion),
                 waiter: job.completion_waiter,
             })
             .await
-            .is_err()
-        {
+            .is_ok();
+        if !completion_delivered {
             metrics::counter!("bifrost_scribe_persistence_completion_dropped_total").increment(1);
+        }
+        if publication_succeeded && completion_delivered {
+            visibility.succeed();
+        } else {
+            visibility.fail();
         }
     }
 

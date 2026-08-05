@@ -28,8 +28,8 @@ use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode}
 
 use crate::Bootstrap;
 use crate::bifrost::telemetry::{
-    ClusterPhaseTelemetryEvidence, evaluate_cluster_phase_bindings, project_cluster_phase_evidence,
-    run_sampled_window,
+    ClusterPhaseTelemetryEvidence, ClusterTelemetryEvidence, ClusterTelemetryExpectation,
+    ClusterTelemetryProjection, ClusterTraceOperation, run_sampled_window,
 };
 use crate::bifrost::{BifrostTelemetryCapture, BifrostTopology, WyrdTestCluster};
 
@@ -70,6 +70,55 @@ const CANCELLATION_BINDINGS: &[&str] = &[
     "gate.query_streams.cancelled",
     "gate.active",
 ];
+/// Exact dependencies guaranteed by warmup writes and publication.
+const WARMUP_DEPENDENCIES: &[&str] = &[
+    "postgres.acquire",
+    "postgres.transactions",
+    "storage.bytes",
+    "wal.fsync",
+];
+/// Exact dependencies guaranteed by measured mixed traffic.
+const MEASURED_DEPENDENCIES: &[&str] = &["postgres.acquire", "postgres.transactions", "wal.fsync"];
+/// Exact dependencies guaranteed by publication reconciliation.
+const PUBLICATION_DEPENDENCIES: &[&str] =
+    &["postgres.acquire", "postgres.transactions", "storage.bytes"];
+/// Exact dependencies guaranteed by public reads and cancellation.
+const QUERY_DEPENDENCIES: &[&str] = &["postgres.acquire", "postgres.transactions"];
+/// Exact cleanup finals required after publication drains.
+const PUBLICATION_CLEANUP: &[&str] = &[
+    "cleanup.scribe_ingress",
+    "cleanup.scribe_lane_active",
+    "cleanup.scribe_lane_queued",
+    "cleanup.scribe_persistence_queue",
+    "cleanup.storage_active",
+];
+/// Exact cleanup finals required after query and cancellation phases.
+const QUERY_CLEANUP: &[&str] = &[
+    "gate.active",
+    "cleanup.oracle_in_flight",
+    "cleanup.oracle_slots",
+    "cleanup.storage_active",
+];
+/// Trace operations required while acknowledging warmup writes and publishing them.
+const WARMUP_TRACES: &[ClusterTraceOperation] = &[
+    ClusterTraceOperation::DurableWrite,
+    ClusterTraceOperation::FlushToVisible,
+];
+/// Trace operations required by the mixed measured phase.
+const MEASURED_TRACES: &[ClusterTraceOperation] = &[
+    ClusterTraceOperation::DurableWrite,
+    ClusterTraceOperation::QueryTimeToFirstFrame,
+    ClusterTraceOperation::QueryTotal,
+];
+/// Trace operation required by a publication-only phase.
+const PUBLICATION_TRACES: &[ClusterTraceOperation] = &[ClusterTraceOperation::FlushToVisible];
+/// Trace operations required by a strict public read phase.
+const QUERY_TRACES: &[ClusterTraceOperation] = &[
+    ClusterTraceOperation::QueryTimeToFirstFrame,
+    ClusterTraceOperation::QueryTotal,
+];
+/// Trace operation required by the cancellation phase.
+const CANCELLATION_TRACES: &[ClusterTraceOperation] = &[ClusterTraceOperation::QueryTotal];
 /// Immutable operation counts collected for one tenant.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct TenantLoadResult {
@@ -321,16 +370,15 @@ pub enum ClusterLoadError {
 /// suppressing sampler cleanup context.
 async fn sampled_phase<T, F, Fut>(
     capture: &BifrostTelemetryCapture,
-    topology: BifrostTopology,
-    required_ids: &[&'static str],
+    expectation: ClusterTelemetryExpectation,
     workload: F,
-) -> Result<(T, ClusterPhaseTelemetryEvidence), ClusterLoadError>
+) -> Result<(T, ClusterTelemetryEvidence), ClusterLoadError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, ClusterLoadError>>,
 {
     if !matches!(
-        topology,
+        expectation.topology,
         BifrostTopology::OnePod | BifrostTopology::ThreeServersThreeForgeWorkers
     ) {
         return Err(ClusterLoadError::Telemetry(
@@ -344,9 +392,8 @@ where
     })
     .await
     .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))?;
-    let bindings = evaluate_cluster_phase_bindings(&delta, required_ids)
+    let evidence = ClusterTelemetryProjection::from_delta(&delta, expectation)
         .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))?;
-    let evidence = project_cluster_phase_evidence(&bindings);
     Ok((value, evidence))
 }
 
@@ -482,15 +529,20 @@ impl BifrostClusterLoad {
         let cancellation_owners = phase_owner_checkpoint(cluster).await?;
         let (_, cancellation) = sampled_phase(
             &self.telemetry,
-            self.profile.topology,
-            CANCELLATION_BINDINGS,
+            ClusterTelemetryExpectation {
+                topology: self.profile.topology,
+                required_binding_ids: CANCELLATION_BINDINGS,
+                required_dependency_ids: QUERY_DEPENDENCIES,
+                required_trace_operations: CANCELLATION_TRACES,
+                required_clean_binding_ids: QUERY_CLEANUP,
+            },
             || async { exercise_query_cancellation(setup_server, &setup_client, &table).await },
         )
         .await?;
         let cancellation_finished_owners = phase_owner_checkpoint(cluster).await?;
         let cancellation_owner_delta =
             owner_delta(cancellation_owners, cancellation_finished_owners)?;
-        assert_cancellation_outcomes(&cancellation)?;
+        assert_cancellation_outcomes(&cancellation.phase)?;
         assert_phase_counter(
             "cancellation Oracle read audits",
             cancellation_owner_delta.read_audit_rows,
@@ -504,7 +556,7 @@ impl BifrostClusterLoad {
                     .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
             }
         }
-        let cleanup = cleanup_snapshot(cluster, cancellation.gate_active_streams).await?;
+        let cleanup = cleanup_snapshot(cluster, cancellation.phase.gate_active_streams).await?;
         if cleanup.forge_active_claims != 0 || cleanup.forge_active_attempts != 0 {
             return Err(ClusterLoadError::Assertion(format!(
                 "Forge cleanup retained {} claims and {} attempts",
@@ -765,8 +817,16 @@ async fn run_public_matrix(
         Ok::<_, ClusterLoadError>(())
     };
     let matrix_owners = phase_owner_checkpoint(cluster).await?;
-    let ((phase_progress, mut tasks), warmup) =
-        sampled_phase(telemetry, profile.topology, WARMUP_BINDINGS, || async {
+    let ((phase_progress, mut tasks), warmup) = sampled_phase(
+        telemetry,
+        ClusterTelemetryExpectation {
+            topology: profile.topology,
+            required_binding_ids: WARMUP_BINDINGS,
+            required_dependency_ids: WARMUP_DEPENDENCIES,
+            required_trace_operations: WARMUP_TRACES,
+            required_clean_binding_ids: &[],
+        },
+        || async {
             let phase_progress = Arc::new(PhaseProgress::new(tenants.len()));
             let mut tasks = tokio::task::JoinSet::new();
             let warmup_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
@@ -827,15 +887,26 @@ async fn run_public_matrix(
             phase_progress.wait_for(LoadPhase::Warmup).await;
             publish_tenants().await?;
             Ok((phase_progress, tasks))
-        })
-        .await?;
+        },
+    )
+    .await?;
     let warmup_owners = phase_owner_checkpoint(cluster).await?;
     let warmup_owner_delta = owner_delta(matrix_owners, warmup_owners)?;
-    let (_, measured) = sampled_phase(telemetry, profile.topology, MEASURED_BINDINGS, || async {
-        phase_progress.release_warmup();
-        phase_progress.wait_for(LoadPhase::Measured).await;
-        Ok(())
-    })
+    let (_, measured) = sampled_phase(
+        telemetry,
+        ClusterTelemetryExpectation {
+            topology: profile.topology,
+            required_binding_ids: MEASURED_BINDINGS,
+            required_dependency_ids: MEASURED_DEPENDENCIES,
+            required_trace_operations: MEASURED_TRACES,
+            required_clean_binding_ids: &[],
+        },
+        || async {
+            phase_progress.release_warmup();
+            phase_progress.wait_for(LoadPhase::Measured).await;
+            Ok(())
+        },
+    )
     .await?;
     let measured_owners = phase_owner_checkpoint(cluster).await?;
     let measured_owner_delta = owner_delta(warmup_owners, measured_owners)?;
@@ -846,10 +917,27 @@ async fn run_public_matrix(
             result.map_err(|error| ClusterLoadError::Client(error.to_string()))??;
         results.insert(tenant, report);
     }
-    let (_, publication) = sampled_phase(telemetry, profile.topology, &[], publish_tenants).await?;
+    let (_, publication) = sampled_phase(
+        telemetry,
+        ClusterTelemetryExpectation {
+            topology: profile.topology,
+            required_binding_ids: &[],
+            required_dependency_ids: PUBLICATION_DEPENDENCIES,
+            required_trace_operations: PUBLICATION_TRACES,
+            required_clean_binding_ids: PUBLICATION_CLEANUP,
+        },
+        publish_tenants,
+    )
+    .await?;
     let publication_owners = phase_owner_checkpoint(cluster).await?;
     let publication_owner_delta = owner_delta(measured_owners, publication_owners)?;
-    let (_, final_verification) = sampled_phase(telemetry, profile.topology, FINAL_BINDINGS, || async {
+    let (_, final_verification) = sampled_phase(telemetry, ClusterTelemetryExpectation {
+        topology: profile.topology,
+        required_binding_ids: FINAL_BINDINGS,
+        required_dependency_ids: QUERY_DEPENDENCIES,
+        required_trace_operations: QUERY_TRACES,
+        required_clean_binding_ids: QUERY_CLEANUP,
+    }, || async {
         for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
         let node_count = cluster.ready_ingest_nodes().len().max(1);
         let pressured = profile.pressured_tenant == Some(tenant_index);
@@ -1124,13 +1212,13 @@ struct PhaseOwnerDelta {
 fn reconcile_matrix_telemetry(
     profile: &ClusterLoadProfile,
     results: &BTreeMap<String, TenantLoadResult>,
-    phases: &[(&str, &ClusterPhaseTelemetryEvidence, PhaseOwnerDelta)],
+    phases: &[(&str, &ClusterTelemetryEvidence, PhaseOwnerDelta)],
 ) -> Result<(), ClusterLoadError> {
     let phase = |name: &str| {
         phases
             .iter()
             .find(|(phase, _, _)| *phase == name)
-            .map(|(_, evidence, owners)| (*evidence, *owners))
+            .map(|(_, evidence, owners)| (&evidence.phase, *owners))
             .ok_or_else(|| ClusterLoadError::Assertion(format!("missing telemetry phase {name}")))
     };
     let (warmup, warmup_owners) = phase("warmup")?;
@@ -1295,12 +1383,12 @@ fn reconcile_matrix_telemetry(
         profile.tenants as u64,
     )?;
     for (name, evidence, owners) in phases {
-        assert_forge_phase(name, evidence, *owners)?;
+        assert_forge_phase(name, &evidence.phase, *owners)?;
     }
     for (name, evidence, _) in phases {
         assert_phase_counter(
             &format!("{name} cancelled Gate requests"),
-            evidence.gate_cancelled,
+            evidence.phase.gate_cancelled,
             0,
         )?;
     }
@@ -2013,5 +2101,31 @@ mod tests {
         let uuid = uuid::Uuid::from_bytes(first);
         assert_eq!(uuid.get_version_num(), 7);
         assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    /// Matrix phases require only dependency evidence guaranteed by their operations.
+    #[test]
+    fn phase_dependency_expectations_are_exact() {
+        assert_eq!(
+            WARMUP_DEPENDENCIES,
+            &[
+                "postgres.acquire",
+                "postgres.transactions",
+                "storage.bytes",
+                "wal.fsync",
+            ]
+        );
+        assert_eq!(
+            MEASURED_DEPENDENCIES,
+            &["postgres.acquire", "postgres.transactions", "wal.fsync"]
+        );
+        assert_eq!(
+            PUBLICATION_DEPENDENCIES,
+            &["postgres.acquire", "postgres.transactions", "storage.bytes"]
+        );
+        assert_eq!(
+            QUERY_DEPENDENCIES,
+            &["postgres.acquire", "postgres.transactions"]
+        );
     }
 }

@@ -37,6 +37,8 @@ pub struct QueryStreamLifecycle {
     started_at: Instant,
     finished: AtomicBool,
     finish_callback: Arc<dyn Fn(&'static str, Duration) + Send + Sync>,
+    /// Production span retained for the complete public stream lifetime.
+    span: tracing::Span,
     #[cfg(feature = "test-support")]
     observer: Arc<QueryLifecycleObserver>,
 }
@@ -109,6 +111,7 @@ impl QueryStreamLifecycle {
             started_at: Instant::now(),
             finished: AtomicBool::new(false),
             finish_callback: Arc::new(finish_callback),
+            span: tracing::info_span!("bifrost.gate.query.stream", outcome = tracing::field::Empty),
             #[cfg(feature = "test-support")]
             observer: query_lifecycle_observer_for_test(),
         }
@@ -117,6 +120,7 @@ impl QueryStreamLifecycle {
     /// Record one terminal outcome; repeated calls are ignored.
     pub fn finish(&self, outcome: &'static str) {
         if !self.finished.swap(true, Ordering::AcqRel) {
+            self.span.record("outcome", outcome);
             (self.finish_callback)(outcome, self.started_at.elapsed());
             #[cfg(feature = "test-support")]
             self.observer.record(outcome);
@@ -128,6 +132,7 @@ impl Drop for QueryStreamLifecycle {
     /// Records cancellation when the client drops before a terminal frame.
     fn drop(&mut self) {
         if !self.finished.swap(true, Ordering::AcqRel) {
+            self.span.record("outcome", "cancelled");
             (self.finish_callback)("cancelled", self.started_at.elapsed());
             #[cfg(feature = "test-support")]
             self.observer.record("cancelled");

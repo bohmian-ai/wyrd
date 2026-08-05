@@ -36,8 +36,11 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::Bootstrap;
-use crate::bifrost::telemetry::run_sampled_window;
-use crate::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use crate::bifrost::telemetry::{
+    ClusterRuntimeRole, ClusterTelemetryEvidence, ClusterTelemetryExpectation,
+    ClusterTelemetryProjection, ClusterTraceOperation, run_sampled_window,
+};
+use crate::bifrost::{BifrostClusterSpec, BifrostTopology, WyrdTestCluster};
 
 /// Stable logical table used by the controlled workload.
 const REFERENCE_TABLE: &str = "cluster_reference_events";
@@ -319,18 +322,18 @@ async fn run_qualification_selected(
                     });
                     let projected = ClusterTelemetryProjection::from_delta(
                         &telemetry,
-                        ClusterTelemetryExpectation {
-                            topology: definition.topology,
-                        },
+                        ClusterTelemetryExpectation::complete(canonical_topology(
+                            definition.topology,
+                        )),
                     )?;
                     let evidence = ClusterTrialReport {
                         offered_requests_per_second: rate,
                         trial_index: trial,
                         metrics,
-                        telemetry: projected.telemetry,
-                        resources: projected.resources,
-                        dependencies: projected.dependencies,
-                        traces: projected.traces,
+                        telemetry: adapt_pillars(&projected),
+                        resources: adapt_process(&projected),
+                        dependencies: adapt_dependencies(&projected),
+                        traces: adapt_traces(&projected),
                     };
                     evidence.validate_evidence()?;
                     trial_evidence.push(evidence);
@@ -588,13 +591,10 @@ fn capacity_stage_report(
     passed: bool,
     measured_seconds: u64,
 ) -> CapacityStage {
-    let projected = ClusterTelemetryProjection::from_delta(
+    let projection = ClusterTelemetryProjection::from_delta(
         &result.telemetry,
-        ClusterTelemetryExpectation {
-            topology: definition.topology,
-        },
-    )
-    .expect("invariant: a completed capture stage has a positive finite interval");
+        ClusterTelemetryExpectation::complete(canonical_topology(definition.topology)),
+    );
     let mut stop_reasons = Vec::new();
     if result.client.backpressure > 0 {
         stop_reasons.push(CapacityLimit::Backpressure);
@@ -605,6 +605,40 @@ fn capacity_stage_report(
     if result.client.missed_operations > 0 {
         stop_reasons.push(CapacityLimit::MissedDeadline);
     }
+    let (telemetry, resources, dependencies, traces) = match projection {
+        Ok(projected) => (
+            adapt_pillars(&projected),
+            adapt_process(&projected),
+            adapt_dependencies(&projected),
+            adapt_traces(&projected),
+        ),
+        Err(error) => {
+            let invalid = vec![error.to_string()];
+            (
+                PillarTelemetryDelta {
+                    gate_accepted: 0,
+                    scribe_wal_bytes: 0,
+                    forge_publications: 0,
+                    oracle_decoded_rows: 0,
+                    status: EvidenceStatus::Failed,
+                    missing_required: Vec::new(),
+                    invalid: invalid.clone(),
+                },
+                Vec::new(),
+                DependencyTelemetryEvidence {
+                    postgres_pool_wait_us: 0,
+                    postgres_transactions: 0,
+                    storage_bytes: 0,
+                    storage_p99_us: 0,
+                    wal_fsync_p99_us: 0,
+                    status: EvidenceStatus::Failed,
+                    missing_required: Vec::new(),
+                    invalid,
+                },
+                Vec::new(),
+            )
+        }
+    };
     CapacityStage {
         identity: CapacityStageIdentity {
             stage_id: format!("{}-{:02}", definition.id, plan.slot),
@@ -625,10 +659,10 @@ fn capacity_stage_report(
         in_flight_cap_exhaustions: result.client.in_flight_cap_exhaustions,
         stop_reasons,
         metrics: result.client.metrics(),
-        telemetry: projected.telemetry,
-        resources: projected.resources,
-        dependencies: projected.dependencies,
-        traces: projected.traces,
+        telemetry,
+        resources,
+        dependencies,
+        traces,
     }
 }
 
@@ -682,240 +716,107 @@ fn stage_row_identity(tenant: usize, ordinals: &BTreeSet<u64>) -> TenantStageRow
     }
 }
 
-/// Project bounded production counters into capacity pillar evidence.
-#[must_use]
-fn project_pillars(
-    bindings: &BTreeMap<&'static str, crate::bifrost::telemetry::EvaluatedBindingValue>,
-) -> PillarTelemetryDelta {
-    let counter = |id: &str| match bindings.get(id) {
-        Some(crate::bifrost::telemetry::EvaluatedBindingValue::Counter(value)) => *value,
-        _ => 0,
-    };
+/// Copy canonical pillar evidence into the stable benchmark report shape.
+fn adapt_pillars(evidence: &ClusterTelemetryEvidence) -> PillarTelemetryDelta {
     PillarTelemetryDelta {
-        gate_accepted: counter("gate.requests.success"),
-        scribe_wal_bytes: counter("scribe.wal_bytes"),
-        forge_publications: counter("forge.publications"),
-        oracle_decoded_rows: counter("oracle.rows"),
+        gate_accepted: evidence.pillars.gate_accepted,
+        scribe_wal_bytes: evidence.pillars.scribe_wal_bytes,
+        forge_publications: evidence.pillars.forge_publications,
+        oracle_decoded_rows: evidence.pillars.oracle_decoded_rows,
         status: EvidenceStatus::Complete,
         missing_required: Vec::new(),
         invalid: Vec::new(),
     }
 }
 
-/// Closed expectation used by the canonical cluster telemetry projection.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ClusterTelemetryExpectation {
-    /// Scenario topology whose logical roles are hosted by the capture process.
-    topology: ClusterTopology,
-}
-
-/// Canonical typed evidence projected once for every benchmark consumer.
-pub(crate) struct ClusterTelemetryEvidence {
-    /// Exact pillar counter evidence.
-    pub(crate) telemetry: PillarTelemetryDelta,
-    /// Exact dependency histogram and counter evidence.
-    pub(crate) dependencies: DependencyTelemetryEvidence,
-    /// Exact-name trace evidence with error spans excluded from clean evidence.
-    pub(crate) traces: Vec<TraceManifest>,
-    /// Honest process-scoped resource evidence.
-    pub(crate) resources: Vec<ProcessResourceEvidence>,
-    /// Exact counters consumed by client/audit/durable reconciliation.
-    reconciliation: ReconciliationCounters,
-    /// Exact final-gauge drain status for scenario-owned resources.
-    pub(crate) cleanup: EvidenceStatus,
-    /// Exact evaluated-binding phase counters shared with the public matrix journey.
-    phase: crate::bifrost::telemetry::ClusterPhaseTelemetryEvidence,
-}
-
-/// Closed typed counter projection used by the only reconciliation path.
-struct ReconciliationCounters {
-    /// Rows sealed durably by Scribe.
-    sealed_rows: u64,
-    /// Successful query request terminals.
-    successful_queries: u64,
-}
-
-/// Concrete owner of the closed Bifrost telemetry binding projection.
-pub(crate) struct ClusterTelemetryProjection;
-
-impl ClusterTelemetryProjection {
-    /// Project one capture delta through the closed production binding definitions.
-    ///
-    /// # Errors
-    /// Returns [`BifrostTelemetryReportError`] when the capture interval is invalid.
-    pub(crate) fn from_delta(
-        delta: &crate::bifrost::telemetry::BifrostTelemetryDelta,
-        expectation: ClusterTelemetryExpectation,
-    ) -> Result<ClusterTelemetryEvidence, crate::bifrost::telemetry::BifrostTelemetryReportError>
-    {
-        if !delta.interval_seconds.is_finite() || delta.interval_seconds <= 0.0 {
-            return Err(crate::bifrost::telemetry::BifrostTelemetryReportError::InvalidInterval);
-        }
-        if delta.spans.iter().any(|span| {
-            exact_span_operation(&span.name).is_some()
-                && matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_))
-        }) {
-            return Err(
-                crate::bifrost::telemetry::BifrostTelemetryReportError::InvalidBinding {
-                    id: "traces.status".to_owned(),
-                    detail: "a required production span finished with error status".to_owned(),
-                },
-            );
-        }
-        let bindings = crate::bifrost::telemetry::evaluate_cluster_bindings(delta)?;
-        let counter = |id: &str| match bindings.get(id) {
-            Some(crate::bifrost::telemetry::EvaluatedBindingValue::Counter(value)) => *value,
-            _ => 0,
-        };
-        Ok(ClusterTelemetryEvidence {
-            telemetry: project_pillars(&bindings),
-            dependencies: project_dependencies(&bindings),
-            traces: project_traces(delta),
-            resources: project_process_resources(expectation.topology, delta),
-            reconciliation: ReconciliationCounters {
-                sealed_rows: counter("scribe.seal_rows"),
-                successful_queries: counter("gate.requests.query_success"),
-            },
-            cleanup: cleanup_status(&bindings),
-            phase: crate::bifrost::telemetry::project_cluster_phase_evidence(&bindings),
-        })
-    }
-}
-
-/// Derive cleanup only from final values of closed cleanup bindings.
-fn cleanup_status(
-    bindings: &BTreeMap<&'static str, crate::bifrost::telemetry::EvaluatedBindingValue>,
-) -> EvidenceStatus {
-    let clean = bindings
-        .iter()
-        .filter(|(id, _)| **id == "gate.active" || id.starts_with("cleanup."))
-        .all(|(_, value)| {
-            matches!(
-                value,
-                crate::bifrost::telemetry::EvaluatedBindingValue::Gauge { final_value: 0, .. }
-            )
-        });
-    if clean {
-        EvidenceStatus::Complete
-    } else {
-        EvidenceStatus::Failed
-    }
-}
-
-/// Project dependency families without inventing missing observations.
-fn project_dependencies(
-    bindings: &BTreeMap<&'static str, crate::bifrost::telemetry::EvaluatedBindingValue>,
-) -> DependencyTelemetryEvidence {
-    let counter = |id: &str| match bindings.get(id) {
-        Some(crate::bifrost::telemetry::EvaluatedBindingValue::Counter(value)) => *value,
-        _ => 0,
-    };
-    let p99 = |id: &str| match bindings.get(id) {
-        Some(crate::bifrost::telemetry::EvaluatedBindingValue::DurationP99Micros(value)) => *value,
-        _ => 0,
-    };
+/// Copy required canonical dependencies into the stable benchmark report shape.
+fn adapt_dependencies(evidence: &ClusterTelemetryEvidence) -> DependencyTelemetryEvidence {
     DependencyTelemetryEvidence {
-        postgres_pool_wait_us: p99("postgres.acquire"),
-        postgres_transactions: counter("postgres.transactions"),
-        storage_bytes: counter("storage.bytes"),
-        storage_p99_us: p99("storage.duration"),
-        wal_fsync_p99_us: p99("wal.fsync"),
+        postgres_pool_wait_us: evidence.dependencies.postgres_pool_wait_us.expect(
+            "invariant: complete benchmark projection requires PostgreSQL acquire evidence",
+        ),
+        postgres_transactions: evidence.dependencies.postgres_transactions.expect(
+            "invariant: complete benchmark projection requires PostgreSQL transaction evidence",
+        ),
+        storage_bytes: evidence
+            .dependencies
+            .storage_bytes
+            .expect("invariant: complete benchmark projection requires storage byte evidence"),
+        storage_p99_us: evidence
+            .dependencies
+            .storage_p99_us
+            .expect("invariant: complete benchmark projection requires storage duration evidence"),
+        wal_fsync_p99_us: evidence
+            .dependencies
+            .wal_fsync_p99_us
+            .expect("invariant: complete benchmark projection requires WAL fsync evidence"),
         status: EvidenceStatus::Complete,
         missing_required: Vec::new(),
         invalid: Vec::new(),
     }
 }
 
-/// Capture bounded process resource evidence for the active role topology.
-#[must_use]
-fn project_process_resources(
-    topology: ClusterTopology,
-    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
-) -> Vec<ProcessResourceEvidence> {
+/// Copy canonical process evidence into the stable benchmark report shape.
+fn adapt_process(evidence: &ClusterTelemetryEvidence) -> Vec<ProcessResourceEvidence> {
+    let process = &evidence.process;
     vec![ProcessResourceEvidence {
-        process_id: ProcessId(telemetry.process.identity.clone()),
-        epoch: telemetry.process.epoch,
-        hosted_logical_nodes: match topology {
-            ClusterTopology::OnePod => vec!["server-0".to_owned()],
-            ClusterTopology::ThreeServersThreeForgeWorkers => vec![
-                "server-0".to_owned(),
-                "server-1".to_owned(),
-                "server-2".to_owned(),
-                "forge-worker-0".to_owned(),
-                "forge-worker-1".to_owned(),
-                "forge-worker-2".to_owned(),
-            ],
-        },
-        roles: vec![
-            BifrostRuntimeRole::Gate,
-            BifrostRuntimeRole::Scribe,
-            BifrostRuntimeRole::Forge,
-            BifrostRuntimeRole::Oracle,
-        ],
-        cpu_seconds: telemetry.process.cpu_seconds,
-        peak_rss_bytes: telemetry.process.peak_rss_bytes,
-        current_rss_bytes: telemetry.process.current_rss_bytes,
-        runtime_busy_seconds: telemetry.process.tokio_busy_seconds,
-        runtime_queue_peak: telemetry.process.queue_peak,
+        process_id: ProcessId(process.identity.clone()),
+        epoch: process.epoch,
+        hosted_logical_nodes: process.hosted_logical_nodes.clone(),
+        roles: process
+            .roles
+            .iter()
+            .map(|role| match role {
+                ClusterRuntimeRole::Gate => BifrostRuntimeRole::Gate,
+                ClusterRuntimeRole::Scribe => BifrostRuntimeRole::Scribe,
+                ClusterRuntimeRole::Forge => BifrostRuntimeRole::Forge,
+                ClusterRuntimeRole::Oracle => BifrostRuntimeRole::Oracle,
+            })
+            .collect(),
+        cpu_seconds: process.cpu_seconds,
+        peak_rss_bytes: process.peak_rss_bytes,
+        current_rss_bytes: process.current_rss_bytes,
+        runtime_busy_seconds: process.runtime_busy_seconds,
+        runtime_queue_peak: process.runtime_queue_peak,
     }]
 }
 
-/// Classify a production span only when its name proves one benchmark operation.
-#[must_use]
-fn exact_span_operation(name: &str) -> Option<BenchmarkOperation> {
-    match name {
-        "bifrost.gate.write" | "bifrost.scribe.wal.append" => {
-            Some(BenchmarkOperation::DurableWrite)
-        }
-        "bifrost.forge.catalog.commit" => Some(BenchmarkOperation::FlushToVisible),
-        "bifrost.oracle.source" => Some(BenchmarkOperation::QueryTimeToFirstFrame),
-        "bifrost.oracle.query" => Some(BenchmarkOperation::QueryTotal),
-        _ => None,
-    }
+/// Copy canonical trace evidence into the stable benchmark report shape.
+fn adapt_traces(evidence: &ClusterTelemetryEvidence) -> Vec<TraceManifest> {
+    evidence
+        .traces
+        .iter()
+        .map(|trace| {
+            let operation = match trace.operation {
+                ClusterTraceOperation::DurableWrite => BenchmarkOperation::DurableWrite,
+                ClusterTraceOperation::FlushToVisible => BenchmarkOperation::FlushToVisible,
+                ClusterTraceOperation::QueryTimeToFirstFrame => {
+                    BenchmarkOperation::QueryTimeToFirstFrame
+                }
+                ClusterTraceOperation::QueryTotal => BenchmarkOperation::QueryTotal,
+            };
+            TraceManifest {
+                operation,
+                representative_trace_ids: trace.representative_trace_ids.clone(),
+                critical_path_spans: vec![SpanDistribution {
+                    operation,
+                    samples: trace.samples,
+                    p95_us: trace.p95_us,
+                    p99_us: trace.p99_us,
+                }],
+            }
+        })
+        .collect()
 }
 
-/// Build four bounded trace manifests from the production capture window.
-#[must_use]
-fn project_traces(
-    telemetry: &crate::bifrost::telemetry::BifrostTelemetryDelta,
-) -> Vec<TraceManifest> {
-    [
-        BenchmarkOperation::DurableWrite,
-        BenchmarkOperation::FlushToVisible,
-        BenchmarkOperation::QueryTimeToFirstFrame,
-        BenchmarkOperation::QueryTotal,
-    ]
-    .into_iter()
-    .map(|operation| {
-        let mut durations = telemetry
-            .spans
-            .iter()
-            .filter(|span| exact_span_operation(&span.name) == Some(operation))
-            .filter(|span| !matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_)))
-            .map(|span| span.duration_nanos / 1_000)
-            .collect::<Vec<_>>();
-        durations.sort_unstable();
-        let index = durations.len().saturating_sub(1);
-        TraceManifest {
-            operation,
-            representative_trace_ids: telemetry
-                .spans
-                .iter()
-                .filter(|span| exact_span_operation(&span.name) == Some(operation))
-                .filter(|span| !matches!(span.status, wyrd_telemetry::CapturedSpanStatus::Error(_)))
-                .rev()
-                .take(3)
-                .map(|span| span.trace_id.clone())
-                .collect(),
-            critical_path_spans: vec![SpanDistribution {
-                operation,
-                samples: durations.len() as u64,
-                p95_us: durations.get(index * 95 / 100).copied().unwrap_or(0),
-                p99_us: durations.get(index * 99 / 100).copied().unwrap_or(0),
-            }],
+/// Convert report topology into the dependency-neutral test-cluster topology.
+const fn canonical_topology(topology: ClusterTopology) -> BifrostTopology {
+    match topology {
+        ClusterTopology::OnePod => BifrostTopology::OnePod,
+        ClusterTopology::ThreeServersThreeForgeWorkers => {
+            BifrostTopology::ThreeServersThreeForgeWorkers
         }
-    })
-    .collect()
+    }
 }
 
 /// Execute the selected scenarios for either qualification or capacity mode.
@@ -1842,9 +1743,7 @@ impl CapacityScenarioSession {
         .sum();
         let projected = ClusterTelemetryProjection::from_delta(
             &telemetry,
-            ClusterTelemetryExpectation {
-                topology: self.definition.topology,
-            },
+            ClusterTelemetryExpectation::complete(canonical_topology(self.definition.topology)),
         )?;
         let production = reconcile_production(
             &projected,
@@ -2059,9 +1958,7 @@ async fn run_live_trial(
         .ok_or("final publication cardinality regressed below the post-warmup baseline")?;
     let projected = ClusterTelemetryProjection::from_delta(
         &telemetry,
-        ClusterTelemetryExpectation {
-            topology: definition.topology,
-        },
+        ClusterTelemetryExpectation::complete(canonical_topology(definition.topology)),
     )?;
     let production = reconcile_production(
         &projected,
@@ -3119,7 +3016,11 @@ fn reconcile_production(
         required_telemetry: EvidenceStatus::Complete,
         counter_integrity: EvidenceStatus::Complete,
         spans_clean: EvidenceStatus::Complete,
-        cleanup: evidence.cleanup,
+        cleanup: if evidence.cleanup.is_clean() {
+            EvidenceStatus::Complete
+        } else {
+            EvidenceStatus::Failed
+        },
         correctness: EvidenceStatus::Complete,
     };
     Ok(evidence)
@@ -3714,26 +3615,17 @@ mod tests {
         ));
     }
 
-    /// Proves trace manifests cannot reuse one span across multiple operations.
+    /// Proves trace report adapters copy the canonical operation and distribution.
     #[test]
-    fn benchmark_span_classification_is_operation_specific() {
-        assert_eq!(
-            exact_span_operation("bifrost.scribe.wal.append"),
-            Some(BenchmarkOperation::DurableWrite)
-        );
-        assert_eq!(
-            exact_span_operation("bifrost.forge.catalog.commit"),
-            Some(BenchmarkOperation::FlushToVisible)
-        );
-        assert_eq!(
-            exact_span_operation("bifrost.oracle.source"),
-            Some(BenchmarkOperation::QueryTimeToFirstFrame)
-        );
-        assert_eq!(
-            exact_span_operation("bifrost.oracle.query"),
-            Some(BenchmarkOperation::QueryTotal)
-        );
-        assert_eq!(exact_span_operation("unrelated"), None);
+    fn benchmark_trace_adapter_copies_canonical_evidence() {
+        let evidence = canonical_adapter_evidence();
+        let traces = adapt_traces(&evidence);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].operation, BenchmarkOperation::QueryTotal);
+        assert_eq!(traces[0].representative_trace_ids, vec!["trace-1"]);
+        assert_eq!(traces[0].critical_path_spans[0].samples, 7);
+        assert_eq!(traces[0].critical_path_spans[0].p95_us, 95);
+        assert_eq!(traces[0].critical_path_spans[0].p99_us, 99);
     }
 
     /// Proves serialized row and batch seeds describe the actual first frame.
@@ -4262,85 +4154,104 @@ mod tests {
         assert!(!missed_flush_stage.passed);
     }
 
-    /// Proves both logical topologies are truthfully attributed to the single harness process.
-    #[tokio::test]
-    async fn in_process_resource_topologies_have_exact_roles() {
-        let telemetry = crate::bifrost::telemetry::BifrostTelemetryDelta {
-            metrics: Vec::new(),
-            gauge_maxima: Vec::new(),
-            gauge_final: Vec::new(),
-            spans: Vec::new(),
-            interval_seconds: 1.0,
-            process: test_process_window(),
-        };
-        for definition in [
-            reference_scenario_matrix()[0],
-            reference_scenario_matrix()[2],
-        ] {
-            let resources = project_process_resources(definition.topology, &telemetry);
-            assert_eq!(resources.len(), 1);
-            assert_eq!(
-                resources[0].roles,
-                vec![
-                    BifrostRuntimeRole::Gate,
-                    BifrostRuntimeRole::Scribe,
-                    BifrostRuntimeRole::Forge,
-                    BifrostRuntimeRole::Oracle
-                ]
-            );
-            assert!(resources[0].peak_rss_bytes > 0);
-            assert_eq!(resources[0].epoch, 0);
-            assert!(!resources[0].process_id.0.is_empty());
-            assert_eq!(
-                resources[0].hosted_logical_nodes.len(),
-                match definition.topology {
-                    ClusterTopology::OnePod => 1,
-                    ClusterTopology::ThreeServersThreeForgeWorkers => 6,
-                }
-            );
-            let mut replacement = resources[0].clone();
-            replacement.epoch += 1;
-            assert_eq!(replacement.process_id, resources[0].process_id);
-            assert_ne!(replacement.epoch, resources[0].epoch);
-        }
+    /// Proves all benchmark report adapters are pure copies of canonical evidence.
+    #[test]
+    fn benchmark_adapters_copy_canonical_fields() {
+        let evidence = canonical_adapter_evidence();
+        let pillars = adapt_pillars(&evidence);
+        let dependencies = adapt_dependencies(&evidence);
+        let resources = adapt_process(&evidence);
+        assert_eq!(pillars.gate_accepted, 11);
+        assert_eq!(pillars.scribe_wal_bytes, 12);
+        assert_eq!(pillars.forge_publications, 13);
+        assert_eq!(pillars.oracle_decoded_rows, 14);
+        assert_eq!(dependencies.postgres_pool_wait_us, 21);
+        assert_eq!(dependencies.postgres_transactions, 22);
+        assert_eq!(dependencies.storage_bytes, 23);
+        assert_eq!(dependencies.storage_p99_us, 24);
+        assert_eq!(dependencies.wal_fsync_p99_us, 25);
+        assert_eq!(resources[0].process_id.0, "pid-test");
+        assert_eq!(resources[0].epoch, 3);
+        assert_eq!(resources[0].hosted_logical_nodes, vec!["server-0"]);
+        assert_eq!(resources[0].roles.len(), 4);
+        assert_eq!(resources[0].runtime_queue_peak, 31);
+        assert!(evidence.cleanup.is_clean());
     }
 
-    /// Proves cleanup completes only when every closed final resource gauge drains.
-    #[test]
-    fn cleanup_status_requires_full_drain() {
-        let cleanup_bindings = crate::bifrost::telemetry::cluster_bindings()
-            .iter()
-            .filter(|binding| binding.id.0 == "gate.active" || binding.id.0.starts_with("cleanup."))
-            .collect::<Vec<_>>();
-        let mut values = cleanup_bindings
-            .iter()
-            .map(|binding| {
-                (
-                    binding.id.0,
-                    crate::bifrost::telemetry::EvaluatedBindingValue::Gauge {
-                        final_value: 0,
-                        peak: 0,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(cleanup_status(&values), EvidenceStatus::Complete);
-        for binding in cleanup_bindings {
-            values.insert(
-                binding.id.0,
-                crate::bifrost::telemetry::EvaluatedBindingValue::Gauge {
-                    final_value: 1,
-                    peak: 1,
-                },
-            );
-            assert_eq!(cleanup_status(&values), EvidenceStatus::Failed);
-            values.insert(
-                binding.id.0,
-                crate::bifrost::telemetry::EvaluatedBindingValue::Gauge {
-                    final_value: 0,
-                    peak: 0,
-                },
-            );
+    /// Build complete dependency-neutral evidence for pure adapter tests.
+    fn canonical_adapter_evidence() -> ClusterTelemetryEvidence {
+        ClusterTelemetryEvidence {
+            phase: crate::bifrost::telemetry::ClusterPhaseTelemetryEvidence {
+                gate_rows: 0,
+                gate_bytes: 0,
+                gate_success: 0,
+                gate_rejected: 0,
+                gate_failed: 0,
+                gate_cancelled: 0,
+                gate_query_request_success: 0,
+                gate_write_request_cancelled: 0,
+                gate_query_stream_cancelled: 0,
+                gate_query_stream_terminals: 0,
+                gate_active_streams: 0,
+                scribe_rows: 0,
+                oracle_source_rows: 0,
+                oracle_stream_rows: 0,
+                oracle_stream_bytes: 0,
+                forge_input_files: 0,
+                forge_input_bytes: 0,
+                forge_output_files: 0,
+                forge_output_bytes: 0,
+            },
+            pillars: crate::bifrost::telemetry::ClusterPillarTelemetryEvidence {
+                gate_accepted: 11,
+                scribe_wal_bytes: 12,
+                forge_publications: 13,
+                oracle_decoded_rows: 14,
+            },
+            dependencies: crate::bifrost::telemetry::ClusterDependencyTelemetryEvidence {
+                postgres_pool_wait_us: Some(21),
+                postgres_transactions: Some(22),
+                storage_bytes: Some(23),
+                storage_p99_us: Some(24),
+                wal_fsync_p99_us: Some(25),
+            },
+            process: crate::bifrost::telemetry::ClusterProcessTelemetryEvidence {
+                identity: "pid-test".to_owned(),
+                epoch: 3,
+                hosted_logical_nodes: vec!["server-0".to_owned()],
+                roles: vec![
+                    ClusterRuntimeRole::Gate,
+                    ClusterRuntimeRole::Scribe,
+                    ClusterRuntimeRole::Forge,
+                    ClusterRuntimeRole::Oracle,
+                ],
+                cpu_seconds: 1.0,
+                peak_rss_bytes: 2,
+                current_rss_bytes: 1,
+                runtime_busy_seconds: 1.0,
+                runtime_queue_peak: 31,
+            },
+            traces: vec![crate::bifrost::telemetry::ClusterTraceTelemetryEvidence {
+                operation: ClusterTraceOperation::QueryTotal,
+                representative_trace_ids: vec!["trace-1".to_owned()],
+                samples: 7,
+                p95_us: 95,
+                p99_us: 99,
+            }],
+            reconciliation: crate::bifrost::telemetry::ClusterReconciliationTelemetryEvidence {
+                sealed_rows: 0,
+                successful_queries: 0,
+            },
+            cleanup: crate::bifrost::telemetry::ClusterCleanupTelemetryEvidence {
+                gate_active: Some(0),
+                scribe_ingress: Some(0),
+                scribe_lane_active: Some(0),
+                scribe_lane_queued: Some(0),
+                scribe_persistence_queue: Some(0),
+                oracle_in_flight: Some(0),
+                oracle_slots: Some(0),
+                storage_active: Some(0),
+            },
         }
     }
 

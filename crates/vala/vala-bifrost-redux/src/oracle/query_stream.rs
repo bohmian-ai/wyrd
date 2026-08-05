@@ -554,6 +554,7 @@ mod tests {
 
     use super::{OracleQueryStream, QueryStreamLifecycle};
     use crate::oracle::{BifrostError, QuerySchemaFrame, QueryStreamFrame};
+    use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
     /// Synthetic owner state mirroring admission's local-slot, durable-release,
     /// and fenced-tail completion invariants.
@@ -717,6 +718,50 @@ mod tests {
         assert_eq!(
             *outcomes.lock().expect("lifecycle outcomes lock"),
             vec!["cancelled"]
+        );
+    }
+
+    /// The production query span remains open until explicit success terminalization.
+    #[test]
+    fn gate_lifecycle_closes_exact_production_span_on_success() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        let closed = Arc::clone(&subscriber.closed);
+        tracing::subscriber::with_default(subscriber, || {
+            let lifecycle = QueryStreamLifecycle::new(|_, _| {});
+            assert!(closed.lock().expect("closed spans").is_empty());
+            lifecycle.finish("success");
+            assert!(closed.lock().expect("closed spans").is_empty());
+            drop(lifecycle);
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.gate.query.stream",
+            "success"
+        ));
+        assert_eq!(
+            *closed.lock().expect("closed spans"),
+            vec!["bifrost.gate.query.stream"]
+        );
+    }
+
+    /// Dropping the lifecycle closes the exact production query span as cancelled.
+    #[test]
+    fn gate_lifecycle_closes_exact_production_span_on_drop() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        let closed = Arc::clone(&subscriber.closed);
+        tracing::subscriber::with_default(subscriber, || {
+            drop(QueryStreamLifecycle::new(|_, _| {}));
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.gate.query.stream",
+            "cancelled"
+        ));
+        assert_eq!(
+            *closed.lock().expect("closed spans"),
+            vec!["bifrost.gate.query.stream"]
         );
     }
 }

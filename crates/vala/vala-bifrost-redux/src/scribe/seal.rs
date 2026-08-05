@@ -110,6 +110,8 @@ impl Drop for VisibilityPublishGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::file_list_writer::FileListCommitKey;
@@ -118,6 +120,8 @@ mod tests {
     use crate::scribe::wal::WalLsn;
     use chrono::NaiveDate;
     use wyrd_spec::DataTenantId;
+
+    use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
     /// Force-seal conversion exposes only the post-commit capability batch.
     #[test]
@@ -153,6 +157,63 @@ mod tests {
         assert_eq!(batch.0.len(), 1);
         assert_eq!(batch.0[0].seal_id, seal_id);
         assert_eq!(batch.0[0].wal_lsn_max, WalLsn::new(11));
+    }
+
+    /// Explicit success closes the exact production visibility span once.
+    #[test]
+    fn visibility_guard_closes_production_span_on_success() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        let closed = Arc::clone(&subscriber.closed);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut guard = super::VisibilityPublishGuard::new();
+            guard.succeed();
+            assert!(closed.lock().expect("closed spans").is_empty());
+            drop(guard);
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "success"
+        ));
+        assert_eq!(
+            *closed.lock().expect("closed spans"),
+            vec!["bifrost.scribe.visibility.publish"]
+        );
+    }
+
+    /// Armed abandonment closes the exact production visibility span as cancelled.
+    #[test]
+    fn visibility_guard_closes_production_span_on_cancellation() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut guard = super::VisibilityPublishGuard::new();
+            guard.arm_cancellation();
+            drop(guard);
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "cancelled"
+        ));
+    }
+
+    /// Explicit failure closes the exact production visibility span as failed.
+    #[test]
+    fn visibility_guard_closes_production_span_on_failure() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut guard = super::VisibilityPublishGuard::new();
+            guard.fail();
+            drop(guard);
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "failed"
+        ));
     }
 }
 

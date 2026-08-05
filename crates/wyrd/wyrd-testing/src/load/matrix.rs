@@ -964,10 +964,10 @@ async fn run_public_matrix(
             .await
             .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
         let final_sql = if profile.pressured_tenant == Some(tenant_index) {
-            format!("SELECT id, tenant, batch FROM {table} ORDER BY id")
+            format!("SELECT id, tenant, batch FROM {table}")
         } else {
             format!(
-                "SELECT id, tenant, batch FROM {table} WHERE CAST(batch AS BIGINT) >= 2 ORDER BY id"
+                "SELECT id, tenant, batch FROM {table} WHERE CAST(batch AS BIGINT) >= 2"
             )
         };
         let final_result = query

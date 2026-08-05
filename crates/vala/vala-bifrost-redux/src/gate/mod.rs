@@ -206,6 +206,14 @@ fn initialize_gate_metrics() {
     );
     for operation in ["write", "query"] {
         metrics::gauge!("bifrost_gate_active_requests", "operation" => operation).set(0.0);
+        for outcome in ["success", "rejected", "failed", "cancelled"] {
+            metrics::counter!(
+                "bifrost_gate_requests_total",
+                "operation" => operation,
+                "outcome" => outcome
+            )
+            .increment(0);
+        }
     }
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
 }
@@ -1135,6 +1143,17 @@ mod tests {
                 .get("bifrost_gate_active_streams{operation=\"query\"}"),
             Some(&0.0)
         );
+        let snapshot = recorder.metrics.snapshot();
+        for operation in ["write", "query"] {
+            for outcome in ["success", "rejected", "failed", "cancelled"] {
+                assert_eq!(
+                    snapshot.counters.get(&format!(
+                        "bifrost_gate_requests_total{{operation=\"{operation}\",outcome=\"{outcome}\"}}"
+                    )),
+                    Some(&0)
+                );
+            }
+        }
     }
 
     /// Admission pressure is counted once as a rejected write request.

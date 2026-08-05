@@ -264,8 +264,12 @@ pub(crate) enum ShardCommand {
         response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
     },
     PersistenceComplete {
+        /// Durable persistence result awaiting shard-owned visibility publication.
         completion: Box<PersistenceCompletion>,
+        /// Existing caller completion channel preserved independently of telemetry.
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+        /// Private result returned after the shard completes its visibility transition.
+        visibility_result: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Replay {
         state: Box<crate::scribe::replay::ReplayedSealKey>,
@@ -992,8 +996,13 @@ impl ShardOwner {
             ShardCommand::FlushAll { response } => {
                 let _ = response.send(self.flush_all());
             }
-            ShardCommand::PersistenceComplete { completion, waiter } => {
-                self.handle_persistence_completion(*completion, waiter);
+            ShardCommand::PersistenceComplete {
+                completion,
+                waiter,
+                visibility_result,
+            } => {
+                let result = self.handle_persistence_completion(*completion, waiter);
+                let _ = visibility_result.send(result);
             }
             ShardCommand::Replay { state, response } => {
                 let _ = response.send(self.replay_state(*state).await);
@@ -1379,11 +1388,16 @@ impl ShardOwner {
     /// Successful publication moves the generation to retained state and
     /// submits the next generation for the same key. Failures mark only the
     /// front generation retryable and deliver the error to its waiter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same publication failure delivered to the caller waiter, or
+    /// an invariant error when the owning FIFO cannot advance exactly once.
     fn handle_persistence_completion(
         &mut self,
         completion: PersistenceCompletion,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
-    ) {
+    ) -> Result<(), String> {
         let generation_id = completion.generation_id.0;
         let seal_key = self.pending_generations.iter().find_map(|(key, queue)| {
             queue
@@ -1392,41 +1406,40 @@ impl ShardOwner {
                 .map(|_| key.clone())
         });
         let Some(seal_key) = seal_key else {
-            self.handle_unowned_completion(completion, waiter);
-            return;
+            return self.handle_unowned_completion(completion, waiter);
         };
         if let Some(error) = completion.error.as_ref() {
+            let detail = error.clone();
             self.mark_front_retryable(&seal_key);
             tracing::warn!(error = %error, generation_id, "shard persistence failed; retaining immutable generation");
-            Self::send_waiter_error(waiter, error.clone());
-            return;
+            Self::send_waiter_error(waiter, detail.clone());
+            return Err(detail);
         }
         let Some(file_list_key) = completion.file_list_key.clone() else {
+            let detail = "persistence completion omitted its file-list key".to_owned();
             self.mark_front_retryable(&seal_key);
-            Self::send_waiter_error(
-                waiter,
-                "persistence completion omitted its file-list key".to_owned(),
-            );
-            return;
+            Self::send_waiter_error(waiter, detail.clone());
+            return Err(detail);
         };
         if let Err(error) = self
             .memtable
             .complete_post_commit(generation_id, file_list_key)
         {
+            let detail = error.to_string();
             self.mark_front_retryable(&seal_key);
             tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
-            Self::send_waiter_error(waiter, error.to_string());
-            return;
+            Self::send_waiter_error(waiter, detail.clone());
+            return Err(detail);
         }
         let Some(queue) = self.pending_generations.get_mut(&seal_key) else {
-            return;
+            return Err("persistence completion queue disappeared".to_owned());
         };
         let Some(front) = queue.pop_front() else {
-            return;
+            return Err("persistence completion queue is empty".to_owned());
         };
         if front.generation.generation_id.0 != generation_id {
             queue.push_front(front);
-            return;
+            return Err("persistence completion generation is not queue front".to_owned());
         }
         self.retained_generations.insert(
             generation_id,
@@ -1445,6 +1458,7 @@ impl ShardOwner {
         if self.persistence.is_some() {
             self.submit_front(&seal_key);
         }
+        Ok(())
     }
 
     /// Marks a key's front generation for a later persistence retry.
@@ -1468,29 +1482,34 @@ impl ShardOwner {
         }
     }
 
+    /// Reconciles a replayed or otherwise unqueued completion with the memtable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same persistence or publication failure delivered to the
+    /// caller waiter.
     fn handle_unowned_completion(
         &mut self,
         completion: PersistenceCompletion,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
-    ) {
+    ) -> Result<(), String> {
         let generation_id = completion.generation_id.0;
         if let Some(error) = completion.error {
-            Self::send_waiter_error(waiter, error);
-            return;
+            Self::send_waiter_error(waiter, error.clone());
+            return Err(error);
         }
         let Some(file_list_key) = completion.file_list_key else {
-            Self::send_waiter_error(
-                waiter,
-                "persistence completion omitted its file-list key".to_owned(),
-            );
-            return;
+            let detail = "persistence completion omitted its file-list key".to_owned();
+            Self::send_waiter_error(waiter, detail.clone());
+            return Err(detail);
         };
         if let Err(error) = self
             .memtable
             .complete_post_commit(generation_id, file_list_key)
         {
-            Self::send_waiter_error(waiter, error.to_string());
-            return;
+            let detail = error.to_string();
+            Self::send_waiter_error(waiter, detail.clone());
+            return Err(detail);
         }
         self.retained_generations.insert(
             generation_id,
@@ -1503,6 +1522,7 @@ impl ShardOwner {
         if let Some(waiter) = waiter {
             let _ = waiter.send(Ok(()));
         }
+        Ok(())
     }
 }
 
@@ -2155,6 +2175,185 @@ mod tests {
             wal_lsn_min: 1,
             wal_lsn_max: 1,
         }
+    }
+
+    /// Builds one isolated owner whose mailbox handler can be exercised directly.
+    fn owner_for_completion_test(
+        memtable: Memtable,
+        wal: &Arc<WalWriter>,
+        wal_handle: WalHandle,
+        stream: StreamIdentity,
+    ) -> ShardOwner {
+        let (_command_tx, receiver) = mpsc::channel(1);
+        let (_pressure_tx, pressure_receiver) = watch::channel(None);
+        let (completion_tx, _completion_rx) = mpsc::channel(1);
+        let budget = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
+            .expect("memory governor")
+            .scribe_budget();
+        let _ = wal;
+        ShardOwner {
+            id: 0,
+            receiver,
+            pressure_receiver,
+            scheduler: TenantRoundRobin::default(),
+            shutting_down: false,
+            wal_segments: WalSegmentsByKey::new(),
+            synced_not_inserted: HashMap::new(),
+            pending_generations: PendingGenerationsByKey::new(),
+            retained_generations: HashMap::new(),
+            admission: AdmissionController::new(),
+            memtable,
+            persistence_cpu: ScribePersistenceCpuPool::new(1),
+            wal_io: ScribeWalIoPool::new(1),
+            persistence: None,
+            completion_tx,
+            stream,
+            wal_handle,
+            memory_ledger: MemoryLedger::new(&budget).expect("memory ledger"),
+            snapshot: Arc::new(Mutex::new(ShardMemtableSnapshot::default())),
+            pending: Arc::new(AtomicUsize::new(0)),
+            drained: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Builds the immutable generation paired with one frozen owner bucket.
+    fn owner_generation(
+        key: &SealKey,
+        frozen: &crate::scribe::memtable::FrozenMemtable,
+        stream: StreamIdentity,
+        wal: WalHandle,
+    ) -> Arc<ImmutableGeneration> {
+        Arc::new(ImmutableGeneration {
+            table_key: (key.tenant, key.table.clone()),
+            seal_key: key.clone(),
+            generation_id: crate::scribe::persistence::GenerationId(frozen.seal_id),
+            stream,
+            wal_lsn_min: WalLsn::new(1),
+            wal_lsn_max: WalLsn::new(1),
+            wal_segments: Vec::new(),
+            wal,
+            rows: frozen.batches.clone(),
+            schema: Arc::clone(&frozen.schema),
+            audit_events: frozen.events.clone(),
+            append_metas: frozen.metas.clone(),
+            row_count: frozen.row_count(),
+            arrow_bytes: frozen.arrow_bytes,
+            opened_at: frozen.opened_at,
+            closed_at: frozen.closed_at,
+        })
+    }
+
+    /// The real shard command returns visibility success only after publishing and advancing FIFO ownership.
+    #[tokio::test]
+    async fn persistence_command_acknowledges_only_completed_visibility_transition() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let generation = owner_generation(&key, &frozen, stream, wal_handle.clone());
+        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle.clone(), stream);
+        owner.pending_generations.insert(
+            key.clone(),
+            VecDeque::from([PendingGeneration {
+                generation: Arc::clone(&generation),
+                binding: crate::catalog::TenantTableBinding::resolve((
+                    key.tenant,
+                    key.table.clone(),
+                ))
+                .expect("binding"),
+                submitted: true,
+            }]),
+        );
+        let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
+        let (visibility_tx, visibility_rx) = tokio::sync::oneshot::channel();
+        owner
+            .handle_command(ShardCommand::PersistenceComplete {
+                completion: Box::new(PersistenceCompletion {
+                    generation_id: generation.generation_id,
+                    file_list_key: Some(owner_file_list_key(&key)),
+                    wal_segments: Vec::new(),
+                    wal: wal_handle,
+                    arrow_bytes: generation.arrow_bytes,
+                    error: None,
+                }),
+                waiter: Some(waiter_tx),
+                visibility_result: visibility_tx,
+            })
+            .await;
+        assert_eq!(visibility_rx.await.expect("visibility ack"), Ok(()));
+        assert_eq!(waiter_rx.await.expect("caller ack"), Ok(()));
+        assert!(!owner.pending_generations.contains_key(&key));
+        assert!(owner.retained_generations.contains_key(&frozen.seal_id));
+        assert_eq!(
+            owner
+                .memtable
+                .stats()
+                .expect("memtable stats")
+                .pending_generations,
+            0
+        );
+    }
+
+    /// A shard publication failure returns the identical error to visibility and caller acknowledgments.
+    #[tokio::test]
+    async fn persistence_command_preserves_publication_failure_for_both_waiters() {
+        let key = owner_key();
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let mut owner =
+            owner_for_completion_test(Memtable::new(), &wal, wal_handle.clone(), stream);
+        let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
+        let (visibility_tx, visibility_rx) = tokio::sync::oneshot::channel();
+        owner
+            .handle_command(ShardCommand::PersistenceComplete {
+                completion: Box::new(PersistenceCompletion {
+                    generation_id: crate::scribe::persistence::GenerationId(999),
+                    file_list_key: Some(owner_file_list_key(&key)),
+                    wal_segments: Vec::new(),
+                    wal: wal_handle,
+                    arrow_bytes: 1,
+                    error: None,
+                }),
+                waiter: Some(waiter_tx),
+                visibility_result: visibility_tx,
+            })
+            .await;
+        let visibility_error = visibility_rx
+            .await
+            .expect("visibility ack")
+            .expect_err("publication must fail");
+        let waiter_error = waiter_rx
+            .await
+            .expect("caller ack")
+            .expect_err("caller must fail");
+        assert_eq!(visibility_error, waiter_error);
+        assert!(visibility_error.contains("generation"));
     }
 
     #[test]

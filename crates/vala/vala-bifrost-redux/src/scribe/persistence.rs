@@ -744,21 +744,27 @@ impl PersistenceWorker {
                 error: Some(error.to_string()),
             },
         };
+        let (visibility_result_tx, visibility_result_rx) = oneshot::channel();
         let completion_delivered = job
             .completion_tx
             .send(crate::scribe::shards::ShardCommand::PersistenceComplete {
                 completion: Box::new(completion),
                 waiter: job.completion_waiter,
+                visibility_result: visibility_result_tx,
             })
             .await
             .is_ok();
         if !completion_delivered {
             metrics::counter!("bifrost_scribe_persistence_completion_dropped_total").increment(1);
         }
-        if publication_succeeded && completion_delivered {
-            visibility.succeed();
-        } else {
+        if !publication_succeeded || !completion_delivered {
             visibility.fail();
+            return;
+        }
+        match visibility_result_rx.await {
+            Ok(Ok(())) => visibility.succeed(),
+            Ok(Err(_)) => visibility.fail(),
+            Err(_) => visibility.cancel(),
         }
     }
 
@@ -1141,7 +1147,16 @@ mod tests {
                     completion_waiter: None,
                 })
                 .expect("bounded persistence submission");
-            completion_rx.recv().await.expect("persistence completion");
+            let completion = completion_rx.recv().await.expect("persistence completion");
+            let crate::scribe::shards::ShardCommand::PersistenceComplete {
+                visibility_result, ..
+            } = completion
+            else {
+                panic!("worker must return one persistence completion");
+            };
+            visibility_result
+                .send(Ok(()))
+                .expect("visibility acknowledgment");
             self.runtime.close();
             self.runtime.drain().await;
             self.runtime.abort_retained();

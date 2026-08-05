@@ -1823,7 +1823,7 @@ pub struct WindowResult {
     query_backpressure: u64,
     /// Stable public error-code counts for rejected operations.
     backpressure_by_code: BTreeMap<String, u64>,
-    /// Operations skipped after falling behind by more than one interval.
+    /// Planned operations not spawned because the in-flight cap was exhausted.
     missed_operations: u64,
     /// Operations refused solely because the declared cap was exhausted.
     in_flight_cap_exhaustions: u64,
@@ -2009,17 +2009,11 @@ impl WindowRun<'_> {
                 apply_operation(&mut result, operation);
             }
             let planned = start + interval.mul_f64(ordinal as f64);
-            tokio::time::sleep_until(planned).await;
-            result.submitted = result.submitted.saturating_add(1);
-            if tokio::time::Instant::now() > planned + interval {
-                result.missed_operations = result.missed_operations.saturating_add(1);
+            let Some(offered_planned) =
+                await_scheduled_offer(&mut result, planned, tasks.len(), self.max_in_flight).await
+            else {
                 continue;
-            }
-            if tasks.len() >= self.max_in_flight {
-                result.in_flight_cap_exhaustions =
-                    result.in_flight_cap_exhaustions.saturating_add(1);
-                continue;
-            }
+            };
             let tenant_index = ordinal as usize % self.tenants.len();
             let client = self.clients[tenant_index].clone();
             let write = ordinal == 0 || is_write_operation(ordinal, self.definition.write_percent);
@@ -2033,9 +2027,10 @@ impl WindowRun<'_> {
             }
             tasks.spawn(async move {
                 if write {
-                    scheduled_write(client, &table, tenant_index, phase_ordinal, planned).await
+                    scheduled_write(client, &table, tenant_index, phase_ordinal, offered_planned)
+                        .await
                 } else {
-                    scheduled_query(client, &table, tenant_index, ordinal, planned).await
+                    scheduled_query(client, &table, tenant_index, ordinal, offered_planned).await
                 }
             });
         }
@@ -2046,6 +2041,40 @@ impl WindowRun<'_> {
         }
         Ok(result)
     }
+}
+
+/// Await one immutable instant and hand it unchanged to the spawn boundary.
+///
+/// A late wakeup remains an offer. `None` means only that the declared
+/// in-flight cap refused the operation after its planned instant arrived.
+async fn await_scheduled_offer(
+    result: &mut WindowResult,
+    planned: tokio::time::Instant,
+    in_flight: usize,
+    max_in_flight: usize,
+) -> Option<tokio::time::Instant> {
+    tokio::time::sleep_until(planned).await;
+    record_scheduled_offer(result, in_flight, max_in_flight).then_some(planned)
+}
+
+/// Record one immutable planned offer and decide whether it can be spawned.
+///
+/// Scheduler lateness is deliberately absent from this decision: a late wakeup
+/// still spawns against its original planned instant so end-to-end latency
+/// retains the delay. Only the declared in-flight cap can refuse the offer.
+#[must_use]
+fn record_scheduled_offer(
+    result: &mut WindowResult,
+    in_flight: usize,
+    max_in_flight: usize,
+) -> bool {
+    result.submitted = result.submitted.saturating_add(1);
+    if in_flight < max_in_flight {
+        return true;
+    }
+    result.in_flight_cap_exhaustions = result.in_flight_cap_exhaustions.saturating_add(1);
+    result.missed_operations = result.missed_operations.saturating_add(1);
+    false
 }
 
 /// Publish the latest accepted write ordinal for concurrent visibility probes.
@@ -3644,6 +3673,45 @@ mod tests {
             ..WindowResult::default()
         };
         assert_eq!(result.metrics().max_in_flight, 17);
+    }
+
+    /// Proves an ordinary late scheduler wakeup still offers the operation and
+    /// retains the original planned instant in observed latency.
+    #[tokio::test(start_paused = true)]
+    async fn late_wakeup_still_offers_from_original_planned_instant() {
+        let start = tokio::time::Instant::now();
+        let planned = start + Duration::from_millis(10);
+        tokio::time::advance(Duration::from_millis(30)).await;
+        let mut result = WindowResult::default();
+        let offered = await_scheduled_offer(&mut result, planned, 0, 1)
+            .await
+            .expect("late wakeup still offers");
+        let metrics = result.metrics();
+        assert_eq!(offered, planned);
+        assert_eq!(metrics.planned_operations, 1);
+        assert_eq!(metrics.attempted_operations, 1);
+        assert_eq!(metrics.missed_operations, 0);
+        assert!(elapsed_us(offered) >= 20_000);
+    }
+
+    /// Proves cap refusal is planned but unattempted and preserves the exact
+    /// `planned == attempted + missed` accounting identity.
+    #[test]
+    fn in_flight_refusal_is_cap_exhaustion_and_missed() {
+        let mut result = WindowResult {
+            max_in_flight: 1,
+            ..WindowResult::default()
+        };
+        assert!(!record_scheduled_offer(&mut result, 1, 1));
+        let metrics = result.metrics();
+        assert_eq!(metrics.planned_operations, 1);
+        assert_eq!(metrics.attempted_operations, 0);
+        assert_eq!(metrics.missed_operations, 1);
+        assert_eq!(metrics.in_flight_cap_exhaustions, 1);
+        assert_eq!(
+            metrics.planned_operations,
+            metrics.attempted_operations + metrics.missed_operations
+        );
     }
 
     /// Proves final reconciliation rejects corruption in an earlier completed stage.

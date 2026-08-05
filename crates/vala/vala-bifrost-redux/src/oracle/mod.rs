@@ -243,6 +243,22 @@ impl OracleTelemetry {
     /// Creates telemetry around the same slot owner used by admission.
     #[must_use]
     fn new(slots: Arc<OracleSlotManager>) -> Self {
+        for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
+            for visibility in [VisibilityMode::PublishedOnly, VisibilityMode::Fused] {
+                metrics::gauge!(
+                    "bifrost_oracle_in_flight",
+                    "visibility" => visibility_label(visibility),
+                    "query_class" => query_class_label(query_class)
+                )
+                .set(0.0);
+            }
+            metrics::gauge!(
+                "bifrost_oracle_slots_in_use",
+                "role" => "leader",
+                "query_class" => query_class_label(query_class)
+            )
+            .set(0.0);
+        }
         Self {
             slots,
             memory_bytes: AtomicU64::new(0),
@@ -3371,6 +3387,54 @@ mod tests {
             observed,
             "canonical stream metric was not recorded: {snapshot:?}"
         );
+    }
+
+    /// Oracle construction publishes every closed idle query and slot gauge series.
+    #[test]
+    fn oracle_telemetry_registers_closed_idle_gauges() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+        let expected = [
+            "bifrost_oracle_in_flight{query_class=\"interactive\",visibility=\"published_only\"}",
+            "bifrost_oracle_in_flight{query_class=\"interactive\",visibility=\"fused\"}",
+            "bifrost_oracle_in_flight{query_class=\"analytical\",visibility=\"published_only\"}",
+            "bifrost_oracle_in_flight{query_class=\"analytical\",visibility=\"fused\"}",
+            "bifrost_oracle_slots_in_use{query_class=\"interactive\",role=\"leader\"}",
+            "bifrost_oracle_slots_in_use{query_class=\"analytical\",role=\"leader\"}",
+        ];
+        let initial = recorder.snapshot();
+        assert_eq!(initial.gauges.len(), expected.len());
+        for series in expected {
+            assert_eq!(initial.gauges.get(series), Some(&0.0), "{series}");
+        }
+
+        {
+            for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
+                for visibility in [VisibilityMode::PublishedOnly, VisibilityMode::Fused] {
+                    let query = telemetry.start_query(visibility, query_class);
+                    drop(query);
+                }
+                let slot = OracleTelemetry::start_slot_use(query_class, 1);
+                drop(slot);
+            }
+        }
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .gauges
+                .keys()
+                .filter(|series| {
+                    series.starts_with("bifrost_oracle_in_flight{")
+                        || series.starts_with("bifrost_oracle_slots_in_use{")
+                })
+                .count(),
+            expected.len()
+        );
+        for series in expected {
+            assert_eq!(snapshot.gauges.get(series), Some(&0.0), "{series}");
+        }
     }
 
     /// Stream payload counters retain exact rows and Arrow IPC bytes for every

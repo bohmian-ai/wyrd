@@ -30,6 +30,12 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 
+/// Publishes the unlabeled persistence queue gauges before workers accept jobs.
+fn register_idle_persistence_queue() {
+    metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(0.0);
+    metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(0.0);
+}
+
 /// Test-tier one-shot failures for the concrete persistence seams.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Default)]
@@ -385,6 +391,7 @@ impl PersistenceRuntime {
         runtime: &Handle,
     ) -> Arc<Self> {
         let (sender, receiver) = mpsc::channel::<Box<PersistenceJob>>(config.queue_items);
+        register_idle_persistence_queue();
         let runtime_state = Arc::new(Self {
             sender: Arc::new(Mutex::new(Some(sender))),
             queued: Arc::new(AtomicUsize::new(0)),
@@ -1016,6 +1023,164 @@ mod tests {
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Real minimal persistence owner and dependencies retained for one queue transition.
+    struct IdlePersistenceFixture {
+        /// Runtime under causal telemetry test.
+        runtime: Arc<PersistenceRuntime>,
+        /// WAL handle used by the representative generation.
+        wal: Arc<WalWriter>,
+        /// Stream identity shared by runtime and generation.
+        stream: StreamIdentity,
+        /// Tenant that owns the representative generation.
+        tenant: wyrd_spec::DataTenantId,
+        /// Database retained until worker shutdown completes.
+        _database: wyrd_dev_fixtures::pg::PgFixture,
+        /// WAL directory retained until worker shutdown completes.
+        _wal_root: tempfile::TempDir,
+    }
+
+    impl IdlePersistenceFixture {
+        /// Starts one real persistence runtime before it accepts work.
+        async fn start() -> Self {
+            let database = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("Postgres fixture");
+            let tenant = database.data_tenant_id();
+            let wal_root = tempfile::tempdir().expect("WAL directory");
+            let node_id = crate::scribe::stream_identity::NodeId::generate();
+            let stream =
+                StreamIdentity::new(node_id, crate::scribe::stream_identity::WriterEpoch::new(1));
+            let wal = Arc::new(
+                WalWriter::new(
+                    wal_root.path(),
+                    *node_id.as_bytes(),
+                    1,
+                    crate::scribe::wal::WalConfig::default(),
+                )
+                .expect("WAL writer"),
+            );
+            let memory = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
+                .expect("memory governor")
+                .scribe_budget();
+            let runtime = PersistenceRuntime::start(
+                ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 1, 1),
+                PersistenceRuntimeContext {
+                    operator: Arc::new(
+                        opendal::Operator::new(opendal::services::Memory::default())
+                            .expect("memory operator")
+                            .finish(),
+                    ),
+                    wal: Arc::clone(&wal),
+                    persistence_cpu: ScribePersistenceCpuPool::new(1),
+                    wal_io: ScribeWalIoPool::new(1),
+                    actor_stream: stream,
+                    memory,
+                    staging_file_publisher: None,
+                    faults: PersistenceFaults::default(),
+                },
+                &Handle::current(),
+            );
+            Self {
+                runtime,
+                wal,
+                stream,
+                tenant,
+                _database: database,
+                _wal_root: wal_root,
+            }
+        }
+
+        /// Submits one bounded generation and waits for its real worker completion.
+        async fn submit_and_drain(&self) {
+            let table = crate::catalog::TableRef::new(
+                crate::namespaces::BifrostNamespace::Bifrost,
+                "idle_queue",
+            );
+            let seal_key = SealKey::new(
+                self.tenant,
+                table.clone(),
+                crate::scribe::seal_key::EventDay::new(
+                    chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid test day"),
+                ),
+            );
+            let binding =
+                TenantTableBinding::resolve((self.tenant, table.clone())).expect("binding");
+            let (completion_tx, mut completion_rx) = mpsc::channel(1);
+            self.runtime
+                .try_submit(PersistenceJob {
+                    generation: Arc::new(ImmutableGeneration {
+                        table_key: (self.tenant, table),
+                        seal_key,
+                        generation_id: GenerationId(1),
+                        stream: self.stream,
+                        wal_lsn_min: WalLsn::ZERO,
+                        wal_lsn_max: WalLsn::ZERO,
+                        wal_segments: Vec::new(),
+                        wal: self.wal.handle_for_shard(0).expect("WAL handle"),
+                        rows: Vec::new(),
+                        schema: Arc::new(arrow::datatypes::Schema::empty()),
+                        audit_events: Vec::new(),
+                        append_metas: Vec::new(),
+                        row_count: 0,
+                        arrow_bytes: 1,
+                        opened_at: std::time::Instant::now(),
+                        closed_at: std::time::Instant::now(),
+                    }),
+                    binding,
+                    completion_tx,
+                    completion_waiter: None,
+                })
+                .expect("bounded persistence submission");
+            completion_rx.recv().await.expect("persistence completion");
+            self.runtime.close();
+            self.runtime.drain().await;
+            self.runtime.abort_retained();
+            self.runtime.clear_retained_join_handles();
+        }
+    }
+
+    /// Persistence queue state is observable as zero before the runtime accepts work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn persistence_runtime_registers_idle_queue_gauges() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let fixture = IdlePersistenceFixture::start().await;
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .gauges
+                .keys()
+                .filter(|series| series.starts_with("bifrost_scribe_persistence_queue_"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_scribe_persistence_queue_depth"),
+            Some(&0.0)
+        );
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_scribe_persistence_queue_bytes"),
+            Some(&0.0)
+        );
+
+        fixture.submit_and_drain().await;
+
+        let drained = recorder.snapshot();
+        assert_eq!(
+            drained.gauges.get("bifrost_scribe_persistence_queue_depth"),
+            Some(&0.0)
+        );
+        assert_eq!(
+            drained.gauges.get("bifrost_scribe_persistence_queue_bytes"),
+            Some(&0.0)
+        );
     }
 
     /// Poisons a registry to prove shutdown recovers its retained state.

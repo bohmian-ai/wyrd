@@ -105,6 +105,7 @@ impl ScribeIngressCpuPool {
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-ingress-cpu-{index}"))
             .build()?;
+        record_lane_state("ingress", 0, 0);
         Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
@@ -702,6 +703,7 @@ impl ScribePersistenceCpuPool {
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-persistence-cpu-{index}"))
             .build()?;
+        record_lane_state("persistence", 0, 0);
         Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
@@ -940,6 +942,7 @@ impl ScribeWalIoPool {
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-wal-io-{index}"))
             .build()?;
+        record_lane_state("wal_io", 0, 0);
         Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
@@ -1188,11 +1191,14 @@ mod tests {
     };
 
     use super::{
-        ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool, decode,
-        source_schema_fingerprint, stamp_correlation_columns,
+        ScribeIngressCpuPool, ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribeWalIoPool,
+        decode, source_schema_fingerprint, stamp_correlation_columns,
     };
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::schema::SchemaFingerprint;
+    use crate::scribe::replay::ReplayedSealKey;
+    use crate::scribe::seal_key::SealKey;
+    use crate::scribe::stream_identity::StreamIdentity;
 
     fn principal() -> Principal {
         Principal::new(
@@ -1325,6 +1331,118 @@ mod tests {
                 .worker_name()
                 .starts_with("wyrd-scribe-wal-io-")
         );
+    }
+
+    /// Every concrete execution lane publishes its closed idle gauge series at construction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scribe_execution_lanes_register_closed_idle_gauges() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let ingress = ScribeIngressCpuPool::new(1);
+        let persistence = ScribePersistenceCpuPool::new(1);
+        let wal_io = ScribeWalIoPool::new(1);
+
+        let snapshot = recorder.snapshot();
+        let expected = [
+            "bifrost_scribe_lane_queued{lane=\"ingress\"}",
+            "bifrost_scribe_lane_active{lane=\"ingress\"}",
+            "bifrost_scribe_lane_queued{lane=\"persistence\"}",
+            "bifrost_scribe_lane_active{lane=\"persistence\"}",
+            "bifrost_scribe_lane_queued{lane=\"wal_io\"}",
+            "bifrost_scribe_lane_active{lane=\"wal_io\"}",
+        ];
+        assert_eq!(snapshot.gauges.len(), expected.len());
+        for series in expected {
+            assert_eq!(snapshot.gauges.get(series), Some(&0.0), "{series}");
+        }
+
+        let worker_ingress = ingress.clone();
+        let worker_persistence = persistence.clone();
+        let worker_wal_io = wal_io.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("lane test runtime")
+                .block_on(exercise_lane_owners(
+                    &worker_ingress,
+                    &worker_persistence,
+                    &worker_wal_io,
+                ));
+        })
+        .join()
+        .expect("lane operation thread");
+
+        for owner in [
+            ingress.snapshot(),
+            persistence.snapshot(),
+            wal_io.snapshot(),
+        ] {
+            assert_eq!(owner.depth, 0);
+            assert_eq!(owner.completed + owner.failed, 1);
+        }
+
+        let drained = recorder.snapshot();
+        for series in expected {
+            assert_eq!(drained.gauges.get(series), Some(&0.0), "{series}");
+        }
+    }
+
+    /// Executes and drains one bounded operation through every concrete lane owner.
+    async fn exercise_lane_owners(
+        ingress: &ScribeIngressCpuPool,
+        persistence: &ScribePersistenceCpuPool,
+        wal_io: &ScribeWalIoPool,
+    ) {
+        ingress
+            .run(|| Ok::<_, ScribeError>(()))
+            .await
+            .expect("ingress job");
+        let replayed = ReplayedSealKey {
+            stream: StreamIdentity::new(
+                crate::scribe::stream_identity::NodeId::generate(),
+                crate::scribe::stream_identity::WriterEpoch::new(1),
+            ),
+            seal_key: idle_seal_key(),
+            audit_events: Vec::new(),
+            data_records: Vec::new(),
+            append_metas: Vec::new(),
+            wal_segments: Vec::new(),
+        };
+        let _ = persistence
+            .submit(ScribePersistenceCpuOp::RestoreReplay {
+                replayed: Box::new(replayed),
+            })
+            .await;
+        let manifest = tempfile::tempdir().expect("manifest directory");
+        wal_io
+            .submit(
+                crate::scribe::execution_lanes::ScribeWalIoOp::AdvanceManifest {
+                    path: manifest.path().join("manifest"),
+                    stream: StreamIdentity::new(
+                        crate::scribe::stream_identity::NodeId::generate(),
+                        crate::scribe::stream_identity::WriterEpoch::new(1),
+                    ),
+                    seal_key: idle_seal_key(),
+                    sealed_lsn: crate::scribe::wal::WalLsn::ZERO,
+                },
+            )
+            .await
+            .expect("WAL manifest replacement");
+        ingress.drain().await;
+        persistence.drain().await;
+        wal_io.drain().await;
+    }
+
+    /// Builds the stable owner-local seal key used by lane transition proof.
+    fn idle_seal_key() -> SealKey {
+        SealKey::new(
+            crate::test_support::tenant(),
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "idle"),
+            crate::scribe::seal_key::EventDay::new(
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid test day"),
+            ),
+        )
     }
 
     /// Projected payloads retain their caller-provided run identifier as the

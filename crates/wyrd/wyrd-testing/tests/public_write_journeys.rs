@@ -138,10 +138,62 @@ async fn production_recorder_exposes_bifrost_owner_families() {
         prometheus_family_sum(&rendered, "wyrd_storage_bytes_total") > 0.0,
         "storage telemetry must report actual completed bytes"
     );
+    for (family, labels) in [
+        ("bifrost_scribe_lane_queued", &["lane=\"ingress\""][..]),
+        ("bifrost_scribe_lane_active", &["lane=\"ingress\""][..]),
+        ("bifrost_scribe_lane_queued", &["lane=\"persistence\""][..]),
+        ("bifrost_scribe_lane_active", &["lane=\"persistence\""][..]),
+        ("bifrost_scribe_lane_queued", &["lane=\"wal_io\""][..]),
+        ("bifrost_scribe_lane_active", &["lane=\"wal_io\""][..]),
+        ("bifrost_scribe_persistence_queue_depth", &[][..]),
+        ("bifrost_scribe_persistence_queue_bytes", &[][..]),
+        (
+            "bifrost_oracle_in_flight",
+            &[
+                "query_class=\"interactive\"",
+                "visibility=\"published_only\"",
+            ][..],
+        ),
+        (
+            "bifrost_oracle_in_flight",
+            &["query_class=\"interactive\"", "visibility=\"fused\""][..],
+        ),
+        (
+            "bifrost_oracle_in_flight",
+            &[
+                "query_class=\"analytical\"",
+                "visibility=\"published_only\"",
+            ][..],
+        ),
+        (
+            "bifrost_oracle_in_flight",
+            &["query_class=\"analytical\"", "visibility=\"fused\""][..],
+        ),
+        (
+            "bifrost_oracle_slots_in_use",
+            &["query_class=\"interactive\"", "role=\"leader\""][..],
+        ),
+        (
+            "bifrost_oracle_slots_in_use",
+            &["query_class=\"analytical\"", "role=\"leader\""][..],
+        ),
+    ] {
+        assert_eq!(
+            prometheus_sample(&rendered, family, labels),
+            Some(0.0),
+            "idle production series must be present and zero: {family} with {labels:?}"
+        );
+    }
     for family in [
         "bifrost_gate_active_requests",
         "bifrost_gate_active_streams",
         "bifrost_scribe_ingress_active",
+        "bifrost_scribe_lane_queued",
+        "bifrost_scribe_lane_active",
+        "bifrost_scribe_persistence_queue_depth",
+        "bifrost_scribe_persistence_queue_bytes",
+        "bifrost_oracle_in_flight",
+        "bifrost_oracle_slots_in_use",
         "wyrd_storage_operations_active",
     ] {
         assert_eq!(

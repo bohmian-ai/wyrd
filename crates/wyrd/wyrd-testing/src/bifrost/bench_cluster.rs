@@ -17,16 +17,16 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport, QueryClient, ValaSdkError};
 use wyrd_bench::{
     AttemptedProbe, BenchmarkEnvironment, BenchmarkOperation, BifrostDiagnosticReport,
-    BifrostReferenceProfile, BifrostRuntimeRole, BifrostSloEnvelope, CAPACITY_TABLES_PER_TENANT,
-    CLUSTER_REPORT_VERSION, CLUSTER_WORKLOAD_VERSION, CapacityLimit, CapacityStage,
-    CapacityStageIdentity, CapacityStageOutcome, CapacityStagePlan, CapacityStateMachine,
-    ClientTrialMetrics, ClusterBenchmarkError, ClusterBenchmarkScenario, ClusterBenchmarkTrial,
-    ClusterScenarioReport, ClusterTopology, ClusterTrialReport, ClusterWorkloadIdentity,
-    DependencyTelemetryEvidence, DiagnosticStatus, EvidenceStatus, PillarTelemetryDelta, ProcessId,
-    ProcessResourceEvidence, ProductionTelemetryEvidence, QualificationProfileV2,
-    ReviewedScenarioProfile, SpanDistribution, TenantStageRows, TraceManifest, TrafficMix,
-    TrialDistribution, derive_trial_median, extract_linux_cpu_identity, extract_macos_cpu_identity,
-    jain_fairness,
+    BifrostReferenceProfile, BifrostRuntimeRole, BifrostSloEnvelope, CAPACITY_CONDITIONING_SECONDS,
+    CAPACITY_MEASURED_SECONDS, CAPACITY_TABLES_PER_TENANT, CLUSTER_REPORT_VERSION,
+    CLUSTER_WORKLOAD_VERSION, CapacityLimit, CapacityStage, CapacityStageIdentity,
+    CapacityStageOutcome, CapacityStagePlan, CapacityStateMachine, ClientTrialMetrics,
+    ClusterBenchmarkError, ClusterBenchmarkScenario, ClusterBenchmarkTrial, ClusterScenarioReport,
+    ClusterTopology, ClusterTrialReport, ClusterWorkloadIdentity, DependencyTelemetryEvidence,
+    DiagnosticStatus, EvidenceStatus, PillarTelemetryDelta, ProcessId, ProcessResourceEvidence,
+    ProductionTelemetryEvidence, QualificationProfileV2, ReviewedScenarioProfile, SpanDistribution,
+    TenantStageRows, TraceManifest, TrafficMix, TrialDistribution, derive_trial_median,
+    extract_linux_cpu_identity, extract_macos_cpu_identity, jain_fairness,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -496,13 +496,18 @@ async fn run_capacity_selected(
                     definition.id.to_owned(),
                     plan.offered_requests_per_second,
                 );
-                let result = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    session.run_stage(plan, Duration::from_secs(20)),
-                )
-                .await
-                .map_err(|_| "capacity stage exceeded its 30-second bound")??;
-                let stage = assemble_capacity_stage(definition, plan, result, 20);
+                let result = session
+                    .run_stage(
+                        plan,
+                        Duration::from_secs(u64::from(CAPACITY_MEASURED_SECONDS)),
+                    )
+                    .await?;
+                let stage = assemble_capacity_stage(
+                    definition,
+                    plan,
+                    result,
+                    u64::from(CAPACITY_MEASURED_SECONDS),
+                );
                 let outcome =
                     retain_completed_capacity_stage(&mut stages, &mut attempted_probes, stage);
                 session.record_stage(plan, outcome)?;
@@ -1392,7 +1397,7 @@ impl CapacityScenarioSession {
             clients: &self.clients,
             definition: self.definition,
             rate: plan.offered_requests_per_second,
-            duration: Duration::from_secs(3),
+            duration: Duration::from_secs(u64::from(CAPACITY_CONDITIONING_SECONDS)),
             measured: false,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             table: CAPACITY_WARMUP_TABLE,
@@ -5118,6 +5123,33 @@ mod tests {
         assert!(function.contains("deadline_ms: Some(5_000)"));
         assert!(!function.contains("sleep"));
         assert!(!function.contains("retry"));
+    }
+
+    /// Proves capacity stages rely on their owned lifecycle bounds.
+    #[test]
+    fn capacity_stage_lifecycle_has_no_outer_cancellation() {
+        let source = include_str!("bench_cluster.rs");
+        let capacity_start = source
+            .find("async fn run_capacity_selected(")
+            .expect("capacity runner exists");
+        let capacity_end = source[capacity_start..]
+            .find("fn capacity_scenario_report(")
+            .map(|offset| capacity_start + offset)
+            .expect("capacity runner has a stable end");
+        let capacity = &source[capacity_start..capacity_end];
+        let result_start = capacity
+            .find("let result = session")
+            .expect("capacity stage result begins");
+        let result_end = capacity[result_start..]
+            .find("let outcome =")
+            .map(|offset| result_start + offset)
+            .expect("capacity stage assembly ends");
+        let stage_result = &capacity[result_start..result_end];
+        assert_eq!(stage_result.matches(".run_stage(").count(), 1);
+        assert!(stage_result.contains(".await?"));
+        assert!(!stage_result.contains("timeout"));
+        // The sole runner timeout remains the separately owned initial warmup bound.
+        assert_eq!(capacity.matches("tokio::time::timeout").count(), 1);
     }
 
     /// Proves live and qualification correctness reads occur only after their

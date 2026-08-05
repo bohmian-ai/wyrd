@@ -757,15 +757,13 @@ impl PersistenceWorker {
         if !completion_delivered {
             metrics::counter!("bifrost_scribe_persistence_completion_dropped_total").increment(1);
         }
-        if !publication_succeeded || !completion_delivered {
-            visibility.fail();
-            return;
-        }
-        match visibility_result_rx.await {
-            Ok(Ok(())) => visibility.succeed(),
-            Ok(Err(_)) => visibility.fail(),
-            Err(_) => visibility.cancel(),
-        }
+        finish_visibility_publication(
+            visibility,
+            publication_succeeded,
+            completion_delivered,
+            visibility_result_rx,
+        )
+        .await;
     }
 
     /// Persists one generation through encode, object store, SQL, and manifest stages.
@@ -939,6 +937,30 @@ impl PersistenceWorker {
     }
 }
 
+/// Terminalizes one automatic visibility span from persistence and shard outcomes.
+///
+/// This narrow deterministic join keeps the production worker's outcome mapping
+/// directly testable without reproducing persistence or shard state machines.
+/// Success requires both durable persistence, mailbox delivery, and a successful
+/// shard acknowledgment. A dropped acknowledgment is cancellation because the
+/// shard outcome is unknown.
+async fn finish_visibility_publication(
+    mut visibility: super::seal::VisibilityPublishGuard,
+    publication_succeeded: bool,
+    completion_delivered: bool,
+    visibility_result: oneshot::Receiver<Result<(), String>>,
+) {
+    if !publication_succeeded || !completion_delivered {
+        visibility.fail();
+        return;
+    }
+    match visibility_result.await {
+        Ok(Ok(())) => visibility.succeed(),
+        Ok(Err(_)) => visibility.fail(),
+        Err(_) => visibility.cancel(),
+    }
+}
+
 /// Builds the deterministic staged object path for one generation.
 ///
 /// This helper remains free because it only validates and formats its inputs;
@@ -1023,7 +1045,11 @@ impl PersistenceWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::panic::AssertUnwindSafe;
+    use std::task::{Context, Poll};
+
+    use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
     /// Builds a persistence owner with empty queues for finalizer-only tests.
     fn test_runtime() -> PersistenceRuntime {
@@ -1037,6 +1063,131 @@ mod tests {
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Polls one visibility join without timing or runtime scheduling.
+    fn poll_visibility(future: std::pin::Pin<&mut impl Future<Output = ()>>) -> Poll<()> {
+        let waker = futures_util::task::noop_waker();
+        future.poll(&mut Context::from_waker(&waker))
+    }
+
+    /// Automatic visibility remains open until the shard acknowledgment succeeds.
+    #[test]
+    fn automatic_visibility_waits_for_successful_shard_acknowledgment() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        let closed = Arc::clone(&subscriber.closed);
+        tracing::subscriber::with_default(subscriber, || {
+            let (sender, receiver) = oneshot::channel();
+            let mut future = Box::pin(finish_visibility_publication(
+                super::super::seal::VisibilityPublishGuard::new(),
+                true,
+                true,
+                receiver,
+            ));
+            assert!(poll_visibility(future.as_mut()).is_pending());
+            assert!(closed.lock().expect("closed spans").is_empty());
+            sender.send(Ok(())).expect("shard success");
+            assert!(poll_visibility(future.as_mut()).is_ready());
+            drop(future);
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "success"
+        ));
+    }
+
+    /// Shard failure closes automatic visibility as failed.
+    #[test]
+    fn automatic_visibility_maps_shard_failure_to_failed() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        tracing::subscriber::with_default(subscriber, || {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Err("publication failed".to_owned()))
+                .expect("shard failure");
+            let mut future = Box::pin(finish_visibility_publication(
+                super::super::seal::VisibilityPublishGuard::new(),
+                true,
+                true,
+                receiver,
+            ));
+            assert!(poll_visibility(future.as_mut()).is_ready());
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "failed"
+        ));
+    }
+
+    /// Mailbox delivery failure closes automatic visibility as failed.
+    #[test]
+    fn automatic_visibility_maps_mailbox_failure_to_failed() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        tracing::subscriber::with_default(subscriber, || {
+            let (_sender, receiver) = oneshot::channel();
+            let mut future = Box::pin(finish_visibility_publication(
+                super::super::seal::VisibilityPublishGuard::new(),
+                true,
+                false,
+                receiver,
+            ));
+            assert!(poll_visibility(future.as_mut()).is_ready());
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "failed"
+        ));
+    }
+
+    /// A dropped shard acknowledgment closes automatic visibility as cancelled.
+    #[test]
+    fn automatic_visibility_maps_dropped_acknowledgment_to_cancelled() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        tracing::subscriber::with_default(subscriber, || {
+            let (sender, receiver) = oneshot::channel::<Result<(), String>>();
+            drop(sender);
+            let mut future = Box::pin(finish_visibility_publication(
+                super::super::seal::VisibilityPublishGuard::new(),
+                true,
+                true,
+                receiver,
+            ));
+            assert!(poll_visibility(future.as_mut()).is_ready());
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "cancelled"
+        ));
+    }
+
+    /// Cancelling the pending join drops its armed guard as cancelled.
+    #[test]
+    fn automatic_visibility_maps_task_cancellation_to_cancelled() {
+        let subscriber = SpanCaptureSubscriber::default();
+        let records = Arc::clone(&subscriber.records);
+        tracing::subscriber::with_default(subscriber, || {
+            let (_sender, receiver) = oneshot::channel::<Result<(), String>>();
+            let mut visibility = super::super::seal::VisibilityPublishGuard::new();
+            visibility.arm_cancellation();
+            let mut future = Box::pin(finish_visibility_publication(
+                visibility, true, true, receiver,
+            ));
+            assert!(poll_visibility(future.as_mut()).is_pending());
+            drop(future);
+        });
+        assert!(has_span_outcome(
+            &records,
+            "bifrost.scribe.visibility.publish",
+            "cancelled"
+        ));
     }
 
     /// Real minimal persistence owner and dependencies retained for one queue transition.

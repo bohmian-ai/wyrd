@@ -1601,7 +1601,7 @@ impl CapacityScenarioSession {
     ///
     /// # Errors
     /// Returns a lifecycle error for repeated shutdown or retained listeners,
-    /// queues, leases, slots, claims, attempts, or supervised tasks.
+    /// queues, claims, attempts, or supervised tasks.
     pub async fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cluster = self
             .cluster
@@ -1613,8 +1613,6 @@ impl CapacityScenarioSession {
             || cleanup.scribe_queued != 0
             || cleanup.scribe_inflight != 0
             || cleanup.scribe_wal_streams != 0
-            || cleanup.oracle_leases != 0
-            || cleanup.oracle_slots != 0
             || cleanup.forge_active_claims != 0
             || cleanup.forge_active_attempts != 0
             || cleanup.supervised_tasks != 0
@@ -1678,8 +1676,6 @@ async fn run_trial_with_windows(
                 && cleanup.scribe_queued == 0
                 && cleanup.scribe_inflight == 0
                 && cleanup.scribe_wal_streams == 0
-                && cleanup.oracle_leases == 0
-                && cleanup.oracle_slots == 0
                 && cleanup.forge_active_claims == 0
                 && cleanup.forge_active_attempts == 0
                 && cleanup.supervised_tasks == 0

@@ -173,10 +173,6 @@ pub struct ClusterCleanupSnapshot {
     pub scribe_inflight: u64,
     /// Persistent Scribe WAL streams retained by the server runtime.
     pub scribe_wal_streams: u64,
-    /// Oracle leases retained in Postgres.
-    pub oracle_leases: u64,
-    /// Oracle admission slots retained in Postgres.
-    pub oracle_slots: u64,
     /// Exact Oracle tail fences observed after the cancellation owner released.
     pub oracle_tail_fences: u64,
     /// Forge claims/attempts still active at the cleanup checkpoint.
@@ -469,8 +465,6 @@ impl BifrostClusterLoad {
                 summary.cleanup.scribe_queued = shutdown_inspection.scribe_queued;
                 summary.cleanup.scribe_inflight = shutdown_inspection.scribe_inflight;
                 summary.cleanup.scribe_wal_streams = shutdown_inspection.scribe_wal_streams;
-                summary.cleanup.oracle_leases = shutdown_inspection.oracle_leases;
-                summary.cleanup.oracle_slots = shutdown_inspection.oracle_slots;
                 summary.cleanup.forge_active_claims = shutdown_inspection.forge_active_claims;
                 summary.cleanup.forge_active_attempts = shutdown_inspection.forge_active_attempts;
                 summary.cleanup.supervised_tasks = shutdown_inspection.supervised_tasks;
@@ -1920,8 +1914,6 @@ async fn cleanup_snapshot(
         scribe_queued: queued,
         scribe_inflight: inflight,
         scribe_wal_streams: wal_streams,
-        oracle_leases: inspection.active_leases,
-        oracle_slots: inspection.slots_in_use,
         oracle_tail_fences: inspection.active_tail_fences,
         forge_active_claims: inspection.forge_active_claims,
         forge_active_attempts: inspection.forge_active_attempts,

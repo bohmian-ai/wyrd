@@ -19,7 +19,5 @@ pub mod forge_tasks;
 pub mod maintenance_leases;
 pub mod monitor;
 pub mod olap_catalog;
-pub mod oracle_admission;
-mod oracle_admission_operator;
 pub mod profiles;
 pub mod queues;

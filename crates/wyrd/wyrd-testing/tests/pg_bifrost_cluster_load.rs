@@ -244,8 +244,6 @@ async fn cluster_load_cancellation_and_shutdown_release_all_owners() {
         .expect("cluster load completes");
     assert_eq!(summary.cleanup.scribe_queued, 0);
     assert_eq!(summary.cleanup.scribe_inflight, 0);
-    assert_eq!(summary.cleanup.oracle_leases, 0);
-    assert_eq!(summary.cleanup.oracle_slots, 0);
     assert_eq!(summary.cleanup.oracle_tail_fences, 0);
     assert_eq!(summary.cleanup.forge_active_claims, 0);
     assert_eq!(summary.cleanup.forge_active_attempts, 0);

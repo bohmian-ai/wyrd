@@ -340,10 +340,6 @@ pub struct OracleMembershipInspection {
 pub struct OracleInspection {
     /// Durable Scribe and Oracle membership rows.
     pub memberships: Vec<OracleMembershipInspection>,
-    /// Active durable Oracle admission leases.
-    pub active_leases: u64,
-    /// Sum of durable admission accounting slots.
-    pub slots_in_use: u64,
     /// Live-tail fences retained across every Scribe process.
     pub active_tail_fences: u64,
     /// Number of durable audit rows observed across tenants.
@@ -377,10 +373,6 @@ pub struct ClusterShutdownInspection {
     pub scribe_inflight: u64,
     /// Persistent WAL streams remaining after server shutdown.
     pub scribe_wal_streams: u64,
-    /// Durable Oracle leases remaining after every server shutdown completes.
-    pub oracle_leases: u64,
-    /// Durable Oracle admission slots remaining after every server shutdown completes.
-    pub oracle_slots: u64,
     /// Forge claims remaining after every server shutdown completes.
     pub forge_active_claims: u64,
     /// Forge attempts remaining after every server shutdown completes.
@@ -1487,7 +1479,7 @@ impl WyrdTestCluster {
         &self.telemetry
     }
 
-    /// Inspect durable membership, admission, audit, and production telemetry.
+    /// Inspect durable membership, audit, and production telemetry.
     ///
     /// # Errors
     ///
@@ -1531,18 +1523,6 @@ impl WyrdTestCluster {
                 })
             })
             .collect::<Result<Vec<_>, ClusterError>>()?;
-        let active_leases: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM vala.oracle_admission_leases")
-                .fetch_one(pool)
-                .await
-                .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let slots_in_use: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(used_slots), 0)::bigint \
-             FROM vala.oracle_admission_accounting",
-        )
-        .fetch_one(pool)
-        .await
-        .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM vala.audit_outbox")
             .fetch_one(pool)
             .await
@@ -1583,10 +1563,6 @@ impl WyrdTestCluster {
             })?;
         Ok(OracleInspection {
             memberships,
-            active_leases: u64::try_from(active_leases)
-                .map_err(|error| ClusterError::Resource(error.to_string()))?,
-            slots_in_use: u64::try_from(slots_in_use)
-                .map_err(|error| ClusterError::Resource(error.to_string()))?,
             active_tail_fences,
             audit_rows: u64::try_from(audit_rows)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
@@ -1896,7 +1872,7 @@ impl WyrdTestCluster {
         let inspection = self.oracle_inspection().await;
         match (first_error, inspection) {
             (Some(shutdown), Err(inspection)) => Err(ClusterError::Shutdown(format!(
-                "{shutdown}; post-shutdown durable inspection failed: {inspection}"
+                "{shutdown}; post-shutdown inspection failed: {inspection}"
             ))),
             (Some(shutdown), Ok(_)) => Err(ClusterError::Shutdown(shutdown)),
             (None, Err(error)) => Err(error),
@@ -1906,8 +1882,6 @@ impl WyrdTestCluster {
                 scribe_queued,
                 scribe_inflight,
                 scribe_wal_streams,
-                oracle_leases: inspection.active_leases,
-                oracle_slots: inspection.slots_in_use,
                 forge_active_claims: inspection.forge_active_claims,
                 forge_active_attempts: inspection.forge_active_attempts,
                 supervised_tasks,
@@ -2078,45 +2052,6 @@ mod tests {
         );
         assert!(function.contains("match (first_error, inspection)"));
         assert!(function.contains("(Some(shutdown), Err(inspection))"));
-    }
-
-    /// A durable lease not owned by a running Oracle remains visible after
-    /// shutdown instead of being replaced with synthetic zero evidence.
-    #[tokio::test]
-    #[ignore = "requires managed Postgres for durable shutdown inspection"]
-    async fn shutdown_inspection_preserves_unreleasable_durable_lease() {
-        let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
-            .await
-            .expect("cluster starts");
-        let owner = cluster
-            .fixture
-            .superuser_pool()
-            .await
-            .expect("assertion pool");
-        sqlx::query(
-            "INSERT INTO vala.oracle_admission_leases \
-             (data_tenant_id, query_id, query_class, slot_units, leader_node_id, \
-              leader_fencing_token, acquired_at, expires_at) \
-             VALUES ($1, $2, 'analytical', 2, $3, 999999, now(), now() + interval '1 hour')",
-        )
-        .bind(cluster.data_tenant_id().as_uuid())
-        .bind(uuid::Uuid::now_v7())
-        .bind(uuid::Uuid::now_v7())
-        .execute(&owner)
-        .await
-        .expect("unowned durable lease inserts");
-        drop(owner);
-        let before = cluster
-            .oracle_inspection()
-            .await
-            .expect("pre-shutdown inspection");
-        assert_eq!(before.active_leases, 1);
-
-        let after = cluster
-            .shutdown_and_inspect()
-            .await
-            .expect("shutdown inspection succeeds");
-        assert_eq!(after.oracle_leases, 1);
     }
 
     /// The six-process matrix contains exactly three complete Servers and

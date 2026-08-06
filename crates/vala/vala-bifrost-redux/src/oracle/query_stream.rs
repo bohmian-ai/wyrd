@@ -1,6 +1,6 @@
 //! Terminal-aware query stream owner.
 //!
-//! The stream retains admission, renewal, cancellation, telemetry, and lazy
+//! The stream retains local admission, cancellation, telemetry, and lazy
 //! physical batches until exactly one terminal outcome releases owned resources.
 
 use std::sync::Arc;
@@ -183,53 +183,39 @@ enum QueryStreamEvent {
     Failed(QueryTerminalErrorCode),
 }
 
-/// Closed proof returned by one explicit durable admission-release attempt.
+/// Closed proof returned by one explicit local admission-release attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionReleaseOutcome {
-    /// Durable mutation proved that admission capacity is no longer retained.
+    /// Local permits and reservations were released before terminal emission.
     Released,
-    /// SQL failure or a committed no-op left cleanup owned by guard drop.
-    Incomplete,
 }
 
-/// Waits for the next physical batch while enforcing lease cancellation and deadline.
+/// Waits for the next physical batch while enforcing cancellation and deadline.
 ///
-/// Lease cancellation wins over starting another read when already observable.
+/// Query cancellation wins over starting another read when already observable.
 /// While waiting, cancellation and the absolute deadline race the physical stream;
 /// any earlier batches remain accounted by the owner, but no additional batch is
 /// exposed after a cancellation or timeout event is selected.
 async fn next_query_stream_event(
     batches: &mut SendableRecordBatchStream,
     cancellation: &CancellationToken,
-    renewal_terminal: &Mutex<Option<QueryTerminalErrorCode>>,
     deadline: Instant,
 ) -> QueryStreamEvent {
     if cancellation.is_cancelled() {
-        return QueryStreamEvent::Failed(renewal_terminal_code(renewal_terminal));
+        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed);
     }
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
         return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout);
     };
     tokio::select! {
         () = cancellation.cancelled() => {
-            QueryStreamEvent::Failed(renewal_terminal_code(renewal_terminal))
+            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
         }
         () = tokio::time::sleep(remaining) => {
             QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout)
         }
         value = batches.next() => QueryStreamEvent::Batch(value),
     }
-}
-
-/// Reads the renewal-selected terminal code without exposing lock poisoning.
-fn renewal_terminal_code(
-    renewal_terminal: &Mutex<Option<QueryTerminalErrorCode>>,
-) -> QueryTerminalErrorCode {
-    renewal_terminal
-        .lock()
-        .ok()
-        .and_then(|reason| *reason)
-        .unwrap_or(QueryTerminalErrorCode::QueryExecutionFailed)
 }
 
 /// Constructs the validated success/degraded terminal for one completed stream.
@@ -358,52 +344,28 @@ fn finish_stream(
     }
 }
 
-/// Releases stream admission exactly once and returns durable completion proof.
-async fn release_admitted(admitted: &mut Option<AdmittedQueryGuard>) -> AdmissionReleaseOutcome {
+/// Releases stream admission exactly once and returns local completion proof.
+fn release_admitted(admitted: &mut Option<AdmittedQueryGuard>) -> AdmissionReleaseOutcome {
     let Some(admitted) = admitted.take() else {
         tracing::error!("Oracle query stream admission owner was already consumed");
-        return AdmissionReleaseOutcome::Incomplete;
+        return AdmissionReleaseOutcome::Released;
     };
-    let result = admitted.release().await;
-    match &result {
-        Ok(AdmissionReleaseStatus::Released) => {}
-        Ok(AdmissionReleaseStatus::NotReleased) => {
-            tracing::warn!("Oracle query terminal admission release was incomplete");
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "Oracle query terminal admission release failed");
-        }
-    }
-    match result {
-        Ok(AdmissionReleaseStatus::Released) => AdmissionReleaseOutcome::Released,
-        Ok(AdmissionReleaseStatus::NotReleased) | Err(_) => AdmissionReleaseOutcome::Incomplete,
-    }
+    admitted.release();
+    AdmissionReleaseOutcome::Released
 }
 
 /// Releases admission, selects the truthful terminal, then finishes telemetry.
-async fn release_and_finish_terminal(
+fn release_and_finish_terminal(
     admitted: &mut Option<AdmittedQueryGuard>,
     query_telemetry: &mut QueryTelemetryGuard,
     gate_lifecycle: Option<&Arc<QueryStreamLifecycle>>,
     candidate: QueryTerminalFrame,
     failed_outcome: &'static str,
-    visibility: VisibilityMode,
-    row_count: u64,
+    _visibility: VisibilityMode,
+    _row_count: u64,
 ) -> QueryTerminalFrame {
-    let release = release_admitted(admitted).await;
-    let terminal = if release == AdmissionReleaseOutcome::Incomplete
-        && matches!(
-            candidate.outcome,
-            QueryTerminalOutcome::Success | QueryTerminalOutcome::Degraded
-        ) {
-        failed_terminal_for_visibility(
-            QueryTerminalErrorCode::QueryExecutionFailed,
-            row_count,
-            visibility,
-        )
-    } else {
-        candidate
-    };
+    let _release = release_admitted(admitted);
+    let terminal = candidate;
     let outcome = if terminal.outcome == QueryTerminalOutcome::Failed {
         failed_outcome
     } else {
@@ -440,11 +402,11 @@ impl OracleQueryStream {
         }
     }
 
-    /// Creates a lazy stream that owns admission guards through terminal output.
+    /// Creates a lazy stream that owns local admission guards through terminal output.
     ///
     /// The returned future retains all cleanup state until the terminal frame
     /// is emitted or the stream is dropped, so cancellation cannot detach a
-    /// lease, permit, or renewal task from its query owner. The caller supplies
+    /// permit or reservation from its query owner. The caller supplies
     /// the encoded schema, leaving no fallible work after guard transfer.
     pub(super) fn new(input: QueryStreamInput) -> Self {
         let QueryStreamInput {
@@ -464,11 +426,10 @@ impl OracleQueryStream {
         #[cfg(feature = "test-support")]
         let resource_probe = Some(admitted.attach_resource_probe());
         let schema_fingerprint = schema_frame.schema_fingerprint.clone();
-        let lease_cancellation = admitted.cancellation.clone();
-        let cancellation = lease_cancellation.clone();
+        let cancellation = admitted.cancellation.clone();
+        let stream_cancellation = cancellation.clone();
         let telemetry_cancelled = query_telemetry.cancellation_marker();
         let stream_telemetry_cancelled = Arc::clone(&telemetry_cancelled);
-        let renewal_terminal = Arc::clone(&admitted.renewal_terminal);
         query_telemetry.start_stream();
         let frames = async_stream::stream! {
             let mut admitted = Some(admitted);
@@ -478,15 +439,14 @@ impl OracleQueryStream {
             query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
             yield Ok(QueryStreamFrame::Schema(schema_frame));
             let candidate = loop {
-                let event = if lease_cancellation.is_cancelled() {
-                    QueryStreamEvent::Failed(renewal_terminal_code(&renewal_terminal))
+                let event = if stream_cancellation.is_cancelled() {
+                    QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
                 } else if let Some(value) = next.take() {
                     QueryStreamEvent::Batch(Some(value))
                 } else {
                     next_query_stream_event(
                         &mut batches,
-                        &lease_cancellation,
-                        &renewal_terminal,
+                        &stream_cancellation,
                         deadline,
                     ).await
                 };
@@ -534,7 +494,7 @@ impl OracleQueryStream {
                 failed_outcome,
                 visibility,
                 row_count,
-            ).await;
+            );
             yield Ok(QueryStreamFrame::Terminal(terminal));
         };
         let stream = Self::assemble(
@@ -593,7 +553,7 @@ impl OracleQueryStream {
     /// Signals cancellation and drains to a terminal frame under a short bound.
     ///
     /// This method is intentionally infallible: a timeout leaves local Drop
-    /// cleanup in place while durable lease expiry remains authoritative.
+    /// cleanup in place while local ownership remains authoritative.
     pub async fn cancel(mut self) {
         self.telemetry_cancelled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -616,13 +576,12 @@ mod tests {
     use crate::oracle::{BifrostError, QuerySchemaFrame, QueryStreamFrame};
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
-    /// Synthetic owner state mirroring admission's local-slot, durable-release,
-    /// and fenced-tail completion invariants.
+    /// Synthetic owner state used to exercise stream cancellation ordering.
     #[derive(Default)]
     struct AdmissionReleaseProbe {
         /// Number of local slots still held by the synthetic owner.
         slots_in_use: AtomicUsize,
-        /// Whether the owner completed its durable admission release.
+        /// Whether the owner completed local admission release.
         release_complete: AtomicBool,
         /// Whether all fenced tail state was released.
         fence_released: AtomicBool,

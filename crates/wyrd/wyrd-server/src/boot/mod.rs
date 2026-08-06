@@ -1206,12 +1206,6 @@ impl<'a> OracleRoleBuilder<'a> {
         let oracle = match Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(catalog),
             vala: state.postgres.vala().clone(),
-            admission_leases: vala_sql::queries::oracle_admission::OracleAdmissionLeases::new(
-                state.postgres.vala().clone(),
-            ),
-            operator_pool: state.postgres.operator_pool().ok_or_else(|| {
-                ServerBootError::OraclePeer("operator pool unavailable".to_owned())
-            })?,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
             local_slots: slots,

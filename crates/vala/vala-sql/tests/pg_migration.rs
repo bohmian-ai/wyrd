@@ -49,15 +49,10 @@ mod pg_tests {
     async fn old_scribe_membership_shape_is_preserved() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.superuser_pool().await.expect("superuser pool");
-        sqlx::raw_sql(
-            "DROP TABLE vala.oracle_admission_nodes;\
-             DROP TABLE vala.oracle_admission_leases;\
-             DROP TABLE vala.oracle_admission_accounting;\
-             DROP TABLE vala.cluster_nodes;",
-        )
-        .execute(&pool)
-        .await
-        .expect("post-11 tables drop");
+        sqlx::raw_sql("DROP TABLE vala.cluster_nodes;")
+            .execute(&pool)
+            .await
+            .expect("post-11 tables drop");
         sqlx::raw_sql(include_str!(
             "../migrations/20260910000003_vala_cluster_nodes.sql"
         ))

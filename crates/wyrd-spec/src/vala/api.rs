@@ -1524,29 +1524,6 @@ mod query_terminal_tests {
                 .is_err()
         );
     }
-
-    /// Oracle admission rejects empty and oversized execution-node selections.
-    #[test]
-    fn oracle_admission_selected_nodes_are_bounded() {
-        let leader = NodeId::new(uuid::Uuid::now_v7());
-        let lease = |selected_node_ids| OracleAdmissionLease {
-            query_id: QueryId::new(uuid::Uuid::now_v7()),
-            data_tenant_id: crate::DataTenantId::new_v7(),
-            query_class: QueryClass::Interactive,
-            slot_units: 1,
-            selected_node_ids,
-            leader_node_id: leader,
-            leader_fencing_token: 1,
-            acquired_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::minutes(1),
-        };
-        assert!(lease(vec![]).validate().is_err());
-        assert!(
-            lease((0..65).map(|_| NodeId::new(uuid::Uuid::now_v7())).collect())
-                .validate()
-                .is_err()
-        );
-    }
 }
 
 /// Stable cluster node identifier.
@@ -1762,73 +1739,6 @@ pub struct ClusterRoleLease {
     pub started_at: DateTime<Utc>,
     /// Latest fenced heartbeat.
     pub heartbeat_at: DateTime<Utc>,
-}
-
-/// Durable Oracle admission lease.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct OracleAdmissionLease {
-    /// Query identity.
-    pub query_id: QueryId,
-    /// Authenticated data tenant.
-    pub data_tenant_id: crate::DataTenantId,
-    /// Server-derived class.
-    pub query_class: QueryClass,
-    /// Total demanded slots.
-    pub slot_units: u32,
-    /// Selected execution nodes.
-    pub selected_node_ids: Vec<NodeId>,
-    /// Leader node identity.
-    pub leader_node_id: NodeId,
-    /// Leader role fence.
-    pub leader_fencing_token: FencingToken,
-    /// Admission timestamp.
-    pub acquired_at: DateTime<Utc>,
-    /// Lease expiry.
-    pub expires_at: DateTime<Utc>,
-}
-
-impl OracleAdmissionLease {
-    /// Validates the pure admitted-node and lease bounds before persistence.
-    ///
-    /// # Errors
-    /// Returns [`QueryContractError`] when selected nodes are outside `1..=64`,
-    /// contain duplicates or omit the leader, slot demand is zero, or expiry
-    /// does not follow acquisition.
-    pub fn validate(&self) -> Result<(), QueryContractError> {
-        if self.selected_node_ids.is_empty() || self.selected_node_ids.len() > 64 {
-            return Err(QueryContractError::TooMany {
-                field: "selected_node_ids",
-                maximum: 64,
-            });
-        }
-        let mut nodes = self.selected_node_ids.clone();
-        nodes.sort();
-        nodes.dedup();
-        if nodes.len() != self.selected_node_ids.len()
-            || !nodes.contains(&self.leader_node_id)
-            || self.slot_units == 0
-            || self.acquired_at >= self.expires_at
-        {
-            return Err(QueryContractError::InvalidTerminal {
-                reason: "invalid Oracle admission lease",
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Canonical admission accounting scope that rejected a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum AdmissionScope {
-    /// Deployment-wide slot ceiling.
-    Cluster,
-    /// Query-class slot ceiling.
-    Class,
-    /// Tenant and query-class slot ceiling.
-    Tenant,
 }
 
 /// Monotonic Scribe writer boot epoch.

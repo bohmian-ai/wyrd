@@ -192,7 +192,6 @@ mod tests {
         QueryOptions, TailTransportDirectory,
     };
     use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
-    use vala_sql::queries::oracle_admission::OracleAdmissionLeases;
     use wyrd_runtime::permission::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
@@ -311,8 +310,6 @@ mod tests {
         cluster.refresh_snapshot().await.expect("Oracle snapshot");
         let oracle = Oracle::new(OracleBuildConfig {
             catalog: crate::test_support::test_redux_catalog().await,
-            admission_leases: OracleAdmissionLeases::new(vala.clone()),
-            operator_pool: crate::test_support::test_operator_pool().await,
             vala,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),

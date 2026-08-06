@@ -39,8 +39,8 @@ use vala_bifrost_redux::oracle::peer::{
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, Oracle,
     OracleAudit, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-    OracleStaleReleaseProbe, QueryOptions, QueryResourceSnapshot, TailTransportDirectory,
-    TestPostgresOracleAudit, VerifiedSecurityContext,
+    QueryOptions, QueryResourceSnapshot, TailTransportDirectory, TestPostgresOracleAudit,
+    VerifiedSecurityContext,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -53,7 +53,6 @@ use vala_bifrost_redux::scribe::tail_rpc::{
     TailFenceConfig, TailReadError, TailReadTransport,
 };
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
-use vala_sql::queries::oracle_admission::OracleAdmissionLeases;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::permission::{Permission, PermissionSet};
 use wyrd_runtime::{Principal, PrincipalKind};
@@ -565,8 +564,6 @@ impl OracleFixture {
         Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(&self.catalog),
             vala: self.pg.vala_postgres().clone(),
-            admission_leases: OracleAdmissionLeases::new(self.pg.vala_postgres().clone()),
-            operator_pool: self.pg.operator_pool().clone(),
             cluster: Arc::clone(&self.cluster),
             local_role: self.role.clone(),
             local_slots: Arc::new(OracleSlotManager::new(16, 16)),
@@ -611,15 +608,6 @@ impl OracleFixture {
             "bifrost_query:read",
         )
         .expect("authorized context")
-    }
-
-    /// Writes one valid hot Parquet object and its tenant-scoped manifest row.
-    ///
-    /// # Panics
-    ///
-    /// Panics when Arrow, storage, or SQL persistence fails.
-    async fn seed_hot_row(&self, value: i64) {
-        let _ = self.seed_hot_rows(&[(value, self.tenant)]).await;
     }
 
     /// Writes one hot Parquet object with explicit row tenants.
@@ -1487,185 +1475,6 @@ async fn published_query(oracle: &Oracle, fixture: &OracleFixture, sql: String) 
     decoded_query(stream).await
 }
 
-/// Returns a short deterministic lease cadence for renewal fault proofs.
-#[must_use]
-fn renewal_test_config() -> OracleConfig {
-    OracleConfig {
-        lease_ttl: Duration::from_millis(500),
-        lease_renew_interval: Duration::from_millis(20),
-        maintenance_interval: Duration::from_secs(1),
-        ..OracleConfig::default()
-    }
-}
-
-/// Returns a cadence that keeps renewal and maintenance outside bounded release tests.
-#[must_use]
-fn terminal_release_test_config() -> OracleConfig {
-    OracleConfig {
-        lease_ttl: Duration::from_secs(300),
-        lease_renew_interval: Duration::from_secs(120),
-        maintenance_interval: Duration::from_secs(120),
-        ..OracleConfig::default()
-    }
-}
-
-/// Reads the sole active admission query identity from an isolated fixture.
-///
-/// # Panics
-///
-/// Panics when the fixture does not contain exactly one active lease.
-async fn sole_lease_id(fixture: &OracleFixture) -> uuid::Uuid {
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query_scalar("SELECT query_id FROM vala.oracle_admission_leases WHERE data_tenant_id=$1")
-        .bind(uuid::Uuid::from(fixture.tenant))
-        .fetch_one(&owner)
-        .await
-        .expect("sole admission lease")
-}
-
-/// Counts active admission leases inside the fixture's tenant boundary.
-///
-/// # Panics
-///
-/// Panics when the tenant connection, count query, or commit fails.
-async fn active_lease_count(fixture: &OracleFixture) -> i64 {
-    let mut conn = fixture
-        .pg
-        .vala_postgres()
-        .tenant_conn(fixture.tenant)
-        .await
-        .expect("tenant connection");
-    let count = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.oracle_admission_leases WHERE data_tenant_id=$1",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("active lease count");
-    conn.commit().await.expect("commit lease count");
-    count
-}
-
-/// Reads active durable admission accounting grouped by the three scopes.
-///
-/// # Panics
-///
-/// Panics when the fixture owner cannot query admission accounting.
-async fn active_admission_accounting(fixture: &OracleFixture) -> HashMap<String, i64> {
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query_as(
-        "SELECT scope_kind, sum(used_slots)::bigint FROM vala.oracle_admission_accounting \
-         WHERE used_slots > 0 AND (data_tenant_id=$1 OR scope_key='global') GROUP BY scope_kind",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .fetch_all(&owner)
-    .await
-    .expect("active admission accounting")
-    .into_iter()
-    .collect()
-}
-
-/// Asserts the lease and all three accounting scopes are active or clear.
-///
-/// # Panics
-///
-/// Panics when durable admission state differs from `active`.
-async fn assert_admission_state(fixture: &OracleFixture, active: bool) {
-    assert_eq!(active_lease_count(fixture).await, i64::from(active));
-    let accounting = active_admission_accounting(fixture).await;
-    if active {
-        assert_eq!(accounting.get("cluster"), Some(&1));
-        assert_eq!(accounting.get("class"), Some(&1));
-        assert_eq!(accounting.get("tenant"), Some(&1));
-    } else {
-        assert!(
-            accounting.is_empty(),
-            "accounting remained active: {accounting:?}"
-        );
-    }
-}
-
-/// Waits for notification-driven cleanup to remove the fixture's sole lease.
-///
-/// # Panics
-///
-/// Panics when durable lease inspection fails or cleanup exceeds the bounded
-/// fixture-operation deadline.
-async fn wait_for_admission_clear(fixture: &OracleFixture) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while active_lease_count(fixture).await != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("notification-driven admission cleanup completes");
-    assert_admission_state(fixture, false).await;
-}
-
-/// Waits until one Oracle cleanup statement is blocked on a PostgreSQL row lock.
-///
-/// # Panics
-///
-/// Panics when PostgreSQL does not observe the blocked release within the
-/// existing fixture-operation bound or lock inspection fails.
-async fn wait_for_blocked_admission_release(owner: &sqlx::PgPool) {
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let blocked: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted)")
-                    .fetch_one(owner)
-                    .await
-                    .expect("inspect blocked admission release");
-            if blocked {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    result.expect("maintenance release reaches the row lock");
-}
-
-/// Starts one real admitted stream without consuming its terminal.
-///
-/// # Panics
-///
-/// Panics when the real Oracle rejects stream construction.
-async fn admitted_release_stream(
-    oracle: &Oracle,
-    fixture: &OracleFixture,
-) -> vala_bifrost_redux::oracle::OracleQueryStream {
-    oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect("admitted release stream")
-}
-
-/// Counts durable read decisions for the isolated fixture tenant.
-///
-/// # Panics
-///
-/// Panics when the fixture owner cannot query the audit outbox.
-async fn read_decision_count(fixture: &OracleFixture) -> i64 {
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox \
-         WHERE data_tenant_id=$1 AND operation='bifrost.query.read_decision'",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .fetch_one(&owner)
-    .await
-    .expect("read-decision count")
-}
-
 /// Real tenant SQL audit appends the exact locked T1 detail and commits it.
 #[tokio::test]
 async fn oracle_postgres_audit_commits_locked_read_decision() {
@@ -2099,7 +1908,7 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
 
 /// Real execution emits required closed metrics and scrubbed span fields.
 #[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_telemetry() {
+async fn pg_bifrost_oracle_multitenant_admission_journey_telemetry() {
     let fixture = OracleFixture::new("oracle_telemetry").await;
     let rows = (0_i64..1_024)
         .map(|value| (value, fixture.tenant))
@@ -2424,28 +2233,18 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
         .await;
     let recorder = wyrd_bench::BenchmarkRecorder::new();
     let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let release_probe = Arc::new(OracleStaleReleaseProbe::default());
-    oracle.bind_stale_release_probe_for_test(Arc::clone(&release_probe));
-    let query = oracle.query_sql(
-        fixture.context(),
-        BifrostQueryRequest {
-            sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(5_000),
-        },
-    );
-    let release_control = async {
-        release_probe.wait_reached().await;
-        assert_eq!(
-            read_decision_count(&fixture).await,
-            1,
-            "the stale first attempt cannot readmit before durable release"
-        );
-        release_probe.resume();
-    };
-    let (query, ()) = tokio::join!(query, release_control);
-    let mut query = query.expect("second stale attempt returns a closed failed stream");
+    let mut query = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect("second stale attempt returns a closed failed stream");
     let mut observed_batch = false;
     let mut observed_terminal = None;
     while let Some(frame) = query.frames.next().await {
@@ -2489,114 +2288,6 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
         &snapshot,
         "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"failed\"}",
     );
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
-}
-
-/// A stale-first-batch fenced release no-op cannot admit a second attempt.
-#[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_stale_first_batch_noop_release_never_readmits() {
-    let fixture = OracleFixture::new("oracle_stale_release_noop").await;
-    fixture.seed_missing_hot_row().await;
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            OracleConfig::default(),
-        )
-        .await;
-    let release_probe = Arc::new(OracleStaleReleaseProbe::default());
-    oracle.bind_stale_release_probe_for_test(Arc::clone(&release_probe));
-    let query = oracle.query_sql(
-        fixture.context(),
-        BifrostQueryRequest {
-            sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(5_000),
-        },
-    );
-    let release_control = async {
-        release_probe.wait_reached().await;
-        let query_id = sole_lease_id(&fixture).await;
-        let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-        sqlx::query(
-            "UPDATE vala.oracle_admission_leases \
-             SET leader_fencing_token=leader_fencing_token+1 \
-             WHERE data_tenant_id=$1 AND query_id=$2",
-        )
-        .bind(uuid::Uuid::from(fixture.tenant))
-        .bind(query_id)
-        .execute(&owner)
-        .await
-        .expect("replace stale-attempt leader fence");
-        release_probe.resume();
-    };
-    let (result, ()) = tokio::join!(query, release_control);
-    assert!(matches!(result, Err(BifrostError::QueryExecutionFailed)));
-    assert_eq!(
-        read_decision_count(&fixture).await,
-        1,
-        "a committed release no-op must not readmit"
-    );
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
-}
-
-/// A stalled stale-first-batch release consumes the original deadline without readmission.
-#[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_stale_first_batch_stalled_release_never_readmits() {
-    let fixture = OracleFixture::new("oracle_stale_release_stall").await;
-    fixture.seed_missing_hot_row().await;
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            OracleConfig::default(),
-        )
-        .await;
-    let release_probe = Arc::new(OracleStaleReleaseProbe::default());
-    oracle.bind_stale_release_probe_for_test(Arc::clone(&release_probe));
-    let query = oracle.query_sql(
-        fixture.context(),
-        BifrostQueryRequest {
-            sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(1_000),
-        },
-    );
-    let release_control = async {
-        release_probe.wait_reached().await;
-        let query_id = sole_lease_id(&fixture).await;
-        let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-        let mut lock = owner.begin().await.expect("lease lock transaction");
-        sqlx::query(
-            "SELECT query_id FROM vala.oracle_admission_leases \
-             WHERE data_tenant_id=$1 AND query_id=$2 FOR UPDATE",
-        )
-        .bind(uuid::Uuid::from(fixture.tenant))
-        .bind(query_id)
-        .fetch_one(&mut *lock)
-        .await
-        .expect("lock stale-attempt lease");
-        release_probe.resume();
-        lock
-    };
-    let (result, lock) = tokio::join!(query, release_control);
-    assert!(matches!(result, Err(BifrostError::QueryTimeout)));
-    assert_eq!(
-        read_decision_count(&fixture).await,
-        1,
-        "a stalled release must not readmit"
-    );
-    lock.rollback().await.expect("release lease lock");
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
@@ -2833,7 +2524,6 @@ async fn fused_audit_failure_releases_every_fence_before_return() {
         .expect_err("audit refusal fails the query");
     assert_eq!(error, BifrostError::QueryAuditUnavailable);
     assert_eq!(releases.load(Ordering::SeqCst), 2);
-    assert_admission_state(&fixture, false).await;
     tokio::task::yield_now().await;
     assert_eq!(releases.load(Ordering::SeqCst), 2);
     oracle
@@ -2871,7 +2561,7 @@ async fn fused_post_acquisition_timeout_releases_before_return() {
                     entered: Arc::clone(&entered),
                 }),
                 tails,
-                terminal_release_test_config(),
+                OracleConfig::default(),
             )
             .await,
     );
@@ -2902,11 +2592,9 @@ async fn fused_post_acquisition_timeout_releases_before_return() {
     tokio::task::yield_now().await;
     assert_eq!(release_polls.load(Ordering::SeqCst), 2);
     assert_eq!(release_completions.load(Ordering::SeqCst), 1);
-    wait_for_admission_clear(&fixture).await;
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
-    assert_admission_state(&fixture, false).await;
 }
 
 /// Typed Fused acquisition failure records no success decision or provider read.
@@ -3130,141 +2818,26 @@ async fn remote_fence_release_failure_is_observed_without_drop_spawn() {
         .await;
 }
 
-/// Startup recovery failure keeps readiness false and rejects query work.
+/// A successful terminal releases local resources before success is observed.
+///
+/// # Panics
+///
+/// Panics when the production query cannot start, emits a non-success terminal,
+/// or fails to release its local resource owner.
 #[tokio::test]
-async fn pg_bifrost_oracle_multitenant_admission_journey_startup_avoids_tenant_scan() {
-    let fixture = OracleFixture::new("oracle_not_ready").await;
-    let spans = SpanProbe::default();
-    let _span_guard = tracing::subscriber::set_default(spans.clone());
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query(
-        "CREATE FUNCTION vala.test_fail_oracle_reconcile() RETURNS trigger \
-         LANGUAGE plpgsql AS $body$ BEGIN \
-         RAISE EXCEPTION 'forced startup reconciliation failure'; \
-         END $body$",
-    )
-    .execute(&owner)
-    .await
-    .expect("failure function");
-    sqlx::query(
-        "CREATE TRIGGER test_fail_oracle_reconcile \
-         BEFORE INSERT OR UPDATE ON vala.oracle_admission_accounting \
-         FOR EACH ROW EXECUTE FUNCTION vala.test_fail_oracle_reconcile()",
-    )
-    .execute(&owner)
-    .await
-    .expect("failure trigger");
-    let oracle = fixture.build_oracle(
-        Arc::new(TestPostgresOracleAudit::new(
-            fixture.pg.vala_postgres().clone(),
-        )),
-        Arc::new(TailTransportDirectory::default()),
-        OracleConfig::default(),
-        64 * 1024 * 1024,
-    );
-    let startup_error = oracle
-        .await_startup()
-        .await
-        .expect_err("startup recovery error propagates");
-    assert!(
-        startup_error
-            .to_string()
-            .contains("Oracle startup admission recovery failed")
-    );
-    assert!(!oracle.is_ready());
-    let error = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(1_000),
-            },
-        )
-        .await
-        .expect_err("startup recovery failure refuses the query");
-    assert_eq!(error, BifrostError::OracleRoleUnavailable);
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
-    let captured = spans.snapshot();
-    assert!(
-        captured.iter().all(|span| {
-            !matches!(
-                span.name.as_str(),
-                "bifrost.oracle.plan"
-                    | "bifrost.oracle.audit"
-                    | "bifrost.oracle.source"
-                    | "bifrost.oracle.slot_reservation"
-                    | "bifrost.oracle.stream"
-            )
-        }),
-        "startup recovery failure must not plan, read, or audit: {captured:?}"
-    );
-    let mut conn = fixture
-        .pg
-        .tenant_conn_for(fixture.tenant)
-        .await
-        .expect("tenant conn");
-    let audit_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND operation IN ('bifrost.query.read_decision', 'bifrost.query.security_violation')",
-    )
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("startup audit count");
-    conn.commit().await.expect("audit count commit");
-    assert_eq!(
-        audit_rows, 0,
-        "startup recovery failure must not append audit"
-    );
-}
-
-/// The durable expiry owner accepts 128 and rejects every larger batch.
-#[tokio::test]
-async fn oracle_admission_expiry_batch_is_capped_at_128() {
-    let fixture = OracleFixture::new("oracle_expiry_cap").await;
-    let leases = OracleAdmissionLeases::new(fixture.pg.vala_postgres().clone());
-    let mut conn = fixture
-        .pg
-        .vala_postgres()
-        .tenant_conn(fixture.tenant)
-        .await
-        .expect("tenant connection");
-    assert!(
-        leases
-            .expire_batch(&mut conn, Utc::now(), 129)
-            .await
-            .is_err()
-    );
-    let report = leases
-        .expire_batch(&mut conn, Utc::now(), 128)
-        .await
-        .expect("maximum expiry batch");
-    conn.commit().await.expect("commit expiry batch");
-    assert_eq!(report.expired_leases, 0);
-    assert_eq!(report.released_slots, 0);
-}
-
-/// A missing durable lease deterministically cancels with execution failure.
-#[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_recovery_terminal_journey_missing_lease_terminal() {
-    let fixture = OracleFixture::new("oracle_renew_missing").await;
-    fixture.seed_hot_row(1).await;
+async fn oracle_terminal_success_releases_local_resources_before_success() {
+    let fixture = OracleFixture::new("oracle_terminal_local_release").await;
+    let _ = fixture.seed_hot_rows(&[(1, fixture.tenant)]).await;
     let oracle = fixture
         .oracle(
             Arc::new(TestPostgresOracleAudit::new(
                 fixture.pg.vala_postgres().clone(),
             )),
             Arc::new(TailTransportDirectory::default()),
-            renewal_test_config(),
+            OracleConfig::default(),
         )
         .await;
-    let recorder = wyrd_bench::BenchmarkRecorder::new();
-    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let query = oracle
+    let mut stream = oracle
         .query_sql(
             fixture.context(),
             BifrostQueryRequest {
@@ -3275,444 +2848,29 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_missing_lease_terminal() {
             },
         )
         .await
-        .expect("leased query");
-    let query_id = sole_lease_id(&fixture).await;
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query("DELETE FROM vala.oracle_admission_leases WHERE data_tenant_id=$1 AND query_id=$2")
-        .bind(uuid::Uuid::from(fixture.tenant))
-        .bind(query_id)
-        .execute(&owner)
-        .await
-        .expect("delete lease");
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let result = decoded_query(query).await;
-    assert!(result.batches.is_empty());
-    assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Failed);
-    assert_eq!(
-        result.terminal.error.expect("renewal terminal").code,
-        QueryTerminalErrorCode::QueryExecutionFailed
-    );
-    assert_counter(
-        &recorder.snapshot(),
-        "bifrost_oracle_lease_renewals_total{outcome=\"missing\"}",
-    );
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
-}
-
-/// A stale leader fence deterministically cancels with peer-security failure.
-#[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_recovery_terminal_journey_stale_fence_terminal() {
-    let fixture = OracleFixture::new("oracle_renew_stale").await;
-    fixture.seed_hot_row(1).await;
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            renewal_test_config(),
-        )
-        .await;
-    let recorder = wyrd_bench::BenchmarkRecorder::new();
-    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let query = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect("leased query");
-    let query_id = sole_lease_id(&fixture).await;
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query(
-        "UPDATE vala.oracle_admission_leases \
-         SET leader_fencing_token=leader_fencing_token+1 \
-         WHERE data_tenant_id=$1 AND query_id=$2",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .bind(query_id)
-    .execute(&owner)
-    .await
-    .expect("replace leader fence");
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let result = decoded_query(query).await;
-    assert!(result.batches.is_empty());
-    assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Failed);
-    assert_eq!(
-        result.terminal.error.expect("renewal terminal").code,
-        QueryTerminalErrorCode::QueryPeerSecurity
-    );
-    assert_counter(
-        &recorder.snapshot(),
-        "bifrost_oracle_lease_renewals_total{outcome=\"stale_leader_fence\"}",
-    );
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
-}
-
-/// A renewal SQL failure deterministically cancels with execution failure.
-#[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_recovery_terminal_journey_lease_sql_failure_terminal() {
-    let fixture = OracleFixture::new("oracle_renew_sql").await;
-    fixture.seed_hot_row(1).await;
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            renewal_test_config(),
-        )
-        .await;
-    let recorder = wyrd_bench::BenchmarkRecorder::new();
-    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let query = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect("leased query");
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query(
-        "CREATE FUNCTION vala.test_fail_oracle_renew() RETURNS trigger \
-         LANGUAGE plpgsql AS $body$ BEGIN \
-         RAISE EXCEPTION 'forced Oracle renewal SQL failure'; \
-         END $body$",
-    )
-    .execute(&owner)
-    .await
-    .expect("renewal failure function");
-    sqlx::query(
-        "CREATE TRIGGER test_fail_oracle_renew \
-         BEFORE UPDATE OF expires_at ON vala.oracle_admission_leases \
-         FOR EACH ROW EXECUTE FUNCTION vala.test_fail_oracle_renew()",
-    )
-    .execute(&owner)
-    .await
-    .expect("renewal failure trigger");
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let result = decoded_query(query).await;
-    assert!(result.batches.is_empty());
-    assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Failed);
-    assert_eq!(
-        result.terminal.error.expect("renewal terminal").code,
-        QueryTerminalErrorCode::QueryExecutionFailed
-    );
-    assert_counter(
-        &recorder.snapshot(),
-        "bifrost_oracle_lease_renewals_total{outcome=\"sql_error\"}",
-    );
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
-}
-
-/// A successful terminal proves its admission lease was durably released first.
-#[tokio::test]
-async fn oracle_terminal_success_requires_released_admission() {
-    let fixture = OracleFixture::new("oracle_terminal_release_success").await;
-    fixture.seed_hot_row(1).await;
-    let recorder = wyrd_bench::BenchmarkRecorder::new();
-    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            terminal_release_test_config(),
-        )
-        .await;
-    let result = terminal(admitted_release_stream(&oracle, &fixture).await).await;
-    assert_eq!(result.outcome, QueryTerminalOutcome::Success);
-    assert!(result.error.is_none());
-    assert_counter(
-        &recorder.snapshot(),
-        "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"success\"}",
-    );
-    assert_admission_state(&fixture, false).await;
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(2))
-        .await;
-    assert_admission_state(&fixture, false).await;
-}
-
-/// A fenced release no-op fails the terminal and remains queued through shutdown drain.
-#[tokio::test]
-async fn oracle_terminal_not_released_fails_and_shutdown_drains() {
-    let fixture = OracleFixture::new("oracle_terminal_release_noop").await;
-    fixture.seed_hot_row(1).await;
-    let recorder = wyrd_bench::BenchmarkRecorder::new();
-    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            terminal_release_test_config(),
-        )
-        .await;
-    let stream = admitted_release_stream(&oracle, &fixture).await;
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    let query_id = sole_lease_id(&fixture).await;
-    let original_fence: i64 = sqlx::query_scalar(
-        "SELECT leader_fencing_token FROM vala.oracle_admission_leases \
-         WHERE data_tenant_id=$1 AND query_id=$2",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .bind(query_id)
-    .fetch_one(&owner)
-    .await
-    .expect("original leader fence");
-    sqlx::query(
-        "UPDATE vala.oracle_admission_leases SET leader_fencing_token=$3 \
-         WHERE data_tenant_id=$1 AND query_id=$2",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .bind(query_id)
-    .bind(original_fence + 1)
-    .execute(&owner)
-    .await
-    .expect("mutate leader fence");
-    let result = terminal(stream).await;
-    assert_eq!(result.outcome, QueryTerminalOutcome::Failed);
-    assert_eq!(
-        result.error.expect("release failure terminal").code,
-        QueryTerminalErrorCode::QueryExecutionFailed
-    );
-    assert_counter(
-        &recorder.snapshot(),
-        "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"failed\"}",
-    );
-    assert_admission_state(&fixture, true).await;
-    let mut transaction = owner.begin().await.expect("fence restore transaction");
-    let restored = sqlx::query(
-        "UPDATE vala.oracle_admission_leases SET leader_fencing_token=$3 \
-         WHERE data_tenant_id=$1 AND query_id=$2",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .bind(query_id)
-    .bind(original_fence)
-    .execute(&mut *transaction)
-    .await
-    .expect("restore leader fence");
-    assert_eq!(restored.rows_affected(), 1);
-    transaction.commit().await.expect("commit fence restore");
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(2))
-        .await;
-    assert_admission_state(&fixture, false).await;
-}
-
-/// A release SQL error fails the terminal and queues durable shutdown cleanup.
-#[tokio::test]
-async fn oracle_terminal_release_sql_error_fails_and_shutdown_drains() {
-    let fixture = OracleFixture::new("oracle_terminal_release_sql_error").await;
-    fixture.seed_hot_row(1).await;
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            terminal_release_test_config(),
-        )
-        .await;
-    let stream = admitted_release_stream(&oracle, &fixture).await;
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query(
-        "CREATE OR REPLACE FUNCTION vala.test_oracle_release_failure() RETURNS trigger \
-         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced release failure'; END $$",
-    )
-    .execute(&owner)
-    .await
-    .expect("install release failure function");
-    sqlx::query(
-        "CREATE TRIGGER test_oracle_release_failure BEFORE DELETE ON vala.oracle_admission_leases \
-         FOR EACH ROW EXECUTE FUNCTION vala.test_oracle_release_failure()",
-    )
-    .execute(&owner)
-    .await
-    .expect("install release failure trigger");
-    let result = terminal(stream).await;
-    assert_eq!(result.outcome, QueryTerminalOutcome::Failed);
-    assert_eq!(
-        result.error.expect("release failure terminal").code,
-        QueryTerminalErrorCode::QueryExecutionFailed
-    );
-    assert_admission_state(&fixture, true).await;
-    sqlx::query("DROP TRIGGER test_oracle_release_failure ON vala.oracle_admission_leases")
-        .execute(&owner)
-        .await
-        .expect("remove release failure trigger");
-    sqlx::query("DROP FUNCTION vala.test_oracle_release_failure()")
-        .execute(&owner)
-        .await
-        .expect("remove release failure function");
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(2))
-        .await;
-    assert_admission_state(&fixture, false).await;
-}
-
-/// A dropped stream wakes real SQL cleanup before the long maintenance interval.
-#[tokio::test]
-async fn oracle_queued_release_notification_precedes_periodic_maintenance() {
-    let fixture = OracleFixture::new("oracle_release_notify").await;
-    fixture.seed_hot_row(1).await;
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            terminal_release_test_config(),
-        )
-        .await;
-    let mut stream = admitted_release_stream(&oracle, &fixture).await;
-    assert!(matches!(
-        stream.frames.next().await,
-        Some(Ok(QueryStreamFrame::Schema(_)))
-    ));
+        .expect("production Oracle stream");
     let probe = stream.resource_probe_for_test();
-    let mut resources = probe.subscribe();
-    let query_id = sole_lease_id(&fixture).await;
-    assert_eq!(uuid::Uuid::from(probe.query_id()), query_id);
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    let mut lock = owner.begin().await.expect("lease lock transaction");
-    sqlx::query(
-        "SELECT query_id FROM vala.oracle_admission_leases \
-         WHERE data_tenant_id=$1 AND query_id=$2 FOR UPDATE",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .bind(query_id)
-    .fetch_one(&mut *lock)
-    .await
-    .expect("lock queued lease identity");
-
-    drop(stream);
-    wait_for_blocked_admission_release(&owner).await;
-    assert_admission_state(&fixture, true).await;
-    lock.rollback().await.expect("unblock notified release");
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while *resources.borrow_and_update() != QueryResourceSnapshot::default() {
-            resources
-                .changed()
-                .await
-                .expect("resource owner remains observable");
+    let mut terminal_frame = None;
+    while let Some(frame) = stream.frames.next().await {
+        match frame.expect("query frame") {
+            QueryStreamFrame::Schema(_) | QueryStreamFrame::Batch(_) => {}
+            QueryStreamFrame::Terminal(frame) => {
+                assert!(terminal_frame.is_none(), "query emitted duplicate terminal");
+                terminal_frame = Some(frame);
+                break;
+            }
         }
-    })
-    .await
-    .expect("notified release clears exact query resources");
-    assert_admission_state(&fixture, false).await;
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(2))
-        .await;
-}
-
-/// Aborted maintenance retains its in-flight FIFO release for shutdown replay.
-#[tokio::test]
-async fn oracle_maintenance_cancellation_retains_release_for_shutdown() {
-    let fixture = OracleFixture::new("oracle_maintenance_release_cancel").await;
-    fixture.seed_hot_row(1).await;
-    let mut config = terminal_release_test_config();
-    config.maintenance_interval = renewal_test_config().lease_renew_interval;
-    let maintenance_interval = config.maintenance_interval;
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            config,
-        )
-        .await;
-    let mut stream = admitted_release_stream(&oracle, &fixture).await;
-    assert!(matches!(
-        stream.frames.next().await,
-        Some(Ok(QueryStreamFrame::Schema(_)))
-    ));
-    let query_id = sole_lease_id(&fixture).await;
-    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    let mut lock = owner.begin().await.expect("lease lock transaction");
-    sqlx::query(
-        "SELECT query_id FROM vala.oracle_admission_leases \
-         WHERE data_tenant_id=$1 AND query_id=$2 FOR UPDATE",
-    )
-    .bind(uuid::Uuid::from(fixture.tenant))
-    .bind(query_id)
-    .fetch_one(&mut *lock)
-    .await
-    .expect("lock queued lease identity");
+    }
+    let terminal = terminal_frame.expect("query stream ended without terminal");
+    assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
+    assert_eq!(probe.snapshot(), QueryResourceSnapshot::default());
+    if let Some(frame) = stream.frames.next().await {
+        panic!("unexpected post-terminal frame: {frame:?}");
+    }
     drop(stream);
-    wait_for_blocked_admission_release(&owner).await;
-    oracle.shutdown(Instant::now() + maintenance_interval).await;
-    assert_admission_state(&fixture, true).await;
-    lock.rollback().await.expect("unblock queued release");
+    assert_eq!(probe.snapshot(), QueryResourceSnapshot::default());
+    drop(probe);
     oracle
-        .shutdown(Instant::now() + Duration::from_secs(2))
+        .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
-    assert_admission_state(&fixture, false).await;
-}
-
-/// A short test cadence proves renewal and drop-driven durable release.
-#[tokio::test]
-async fn oracle_lease_renewal_and_stream_drop_release() {
-    let fixture = OracleFixture::new("oracle_lease").await;
-    fixture.seed_hot_row(1).await;
-    let config = OracleConfig {
-        lease_ttl: Duration::from_millis(200),
-        lease_renew_interval: Duration::from_millis(30),
-        maintenance_interval: Duration::from_millis(20),
-        ..OracleConfig::default()
-    };
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            Arc::new(TailTransportDirectory::default()),
-            config,
-        )
-        .await;
-    let stream = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect("leased stream");
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let active = active_lease_count(&fixture).await;
-    assert_eq!(active, 1);
-    drop(stream);
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(2))
-        .await;
-    assert_eq!(
-        active_lease_count(&fixture).await,
-        0,
-        "shutdown drains the dropped stream's durable lease"
-    );
 }

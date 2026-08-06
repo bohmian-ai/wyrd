@@ -51,7 +51,7 @@ name = "pg_forge_file_list"
 name = "pg_migration"
 
 [[test]]
-name = "pg_oracle_coordination"
+name = "pg_oracle_membership"
 
 [[test]]
 name = "pg_schema_usage"

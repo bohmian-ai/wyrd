@@ -4,8 +4,7 @@
 //! source reconciliation in the Redux crate so later serving adapters cannot
 //! bypass the engine's invariants.  IO-backed execution is intentionally
 //! composed around these small owners.
-
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -24,34 +23,27 @@ use datafusion::physical_plan::{SendableRecordBatchStream, execute_stream};
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use datafusion::sql::resolve::resolve_table_references;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
-use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use num_traits::ToPrimitive;
-use rand::Rng;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use vala_sql::ValaPostgres;
-use vala_sql::row_types::oracle_admission::{
-    AdmissionAcquire, AdmissionReconcileScope, AdmissionRequest, LeaseMutation, RoleFence,
-};
 use wyrd_runtime::Principal;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 #[cfg(feature = "test-support")]
-use wyrd_spec::vala::api::NodeId;
-use wyrd_spec::vala::api::{
-    AdmissionScope, AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
-    BifrostSecurityViolationKind, ClusterCapabilities, OracleAdmissionLease, QueryAuditDigest,
-    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryFreshness, QueryId, QuerySchemaFrame,
-    QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
-    QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome, VisibilityMode,
-};
-#[cfg(feature = "test-support")]
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult};
+use wyrd_spec::vala::api::{
+    AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
+    BifrostSecurityViolationKind, ClusterCapabilities, NodeId, QueryAuditDigest, QueryBatchFrame,
+    QueryClass, QueryExecutionMode, QueryFreshness, QueryId, QuerySchemaFrame, QuerySource,
+    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+    SourceCompletion, SourceCompletionOutcome, VisibilityMode,
+};
 
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, RegisteredRole};
@@ -79,8 +71,8 @@ pub fn query_lifecycle_observer_for_test() -> std::sync::Arc<query_stream::Query
 mod tail_fence;
 pub mod telemetry;
 
+use admission::AdmittedQueryGuard;
 pub use admission::OracleAdmission;
-use admission::{AdmissionReleaseStatus, AdmittedQueryGuard};
 #[cfg(feature = "test-support")]
 pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
 use exec::{HotFileSource, OracleTableInputs, OracleTableProvider};
@@ -205,7 +197,7 @@ pub struct OracleMemoryResources {
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OracleReadinessSnapshot {
-    /// Whether Oracle startup reconciliation completed and remains uncancelled.
+    /// Whether Oracle startup readiness completed and remains uncancelled.
     pub startup_reconciled: bool,
     /// Number of live Oracle memberships in the local immutable cluster snapshot.
     pub live_oracles: usize,
@@ -216,7 +208,7 @@ pub struct OracleReadinessSnapshot {
 /// Bounded local admission slots for one Oracle process.
 #[derive(Debug)]
 pub struct OracleSlotManager {
-    /// Semaphore bounding requests waiting to enter durable admission.
+    /// Semaphore bounding requests waiting to enter pod-local admission.
     pending: Arc<Semaphore>,
     /// Semaphore representing local running slot units.
     running: Arc<Semaphore>,
@@ -398,32 +390,6 @@ impl OracleTelemetry {
             started_at: Instant::now(),
             finished: false,
         }
-    }
-
-    /// Records one canonical admission rejection.
-    fn record_admission_rejection(
-        scope: &'static str,
-        reason: &'static str,
-        query_class: QueryClass,
-    ) {
-        metrics::counter!(
-            "bifrost_oracle_admission_rejections_total",
-            "scope" => scope,
-            "reason" => reason,
-            "query_class" => query_class_label(query_class)
-        )
-        .increment(1);
-    }
-
-    /// Records one local slot reservation result.
-    fn record_slot_reservation(query_class: QueryClass, outcome: &'static str) {
-        metrics::counter!(
-            "bifrost_oracle_slot_reservations_total",
-            "role" => "leader",
-            "query_class" => query_class_label(query_class),
-            "outcome" => outcome
-        )
-        .increment(1);
     }
 
     /// Begins gauge accounting for one acquired local slot reservation.
@@ -769,7 +735,7 @@ impl OracleSlotManager {
     ///
     /// The existing pending semaphore bounds the number of callers that may
     /// enter this wait. The returned permit is transferred into the admitted
-    /// query guard or dropped before any failed durable admission returns.
+    /// query guard or dropped before any failed pod-local admission returns.
     ///
     /// # Errors
     ///
@@ -1178,10 +1144,6 @@ pub struct OracleBuildConfig {
     pub catalog: Arc<BifrostCatalog>,
     /// Tenant-scoped SQL owner.
     pub vala: ValaPostgres,
-    /// Durable admission lease owner.
-    pub admission_leases: vala_sql::queries::oracle_admission::OracleAdmissionLeases,
-    /// Platform-admin pool used for cross-tenant startup recovery.
-    pub operator_pool: vala_sql::OperatorPool,
     /// Immutable membership registry.
     pub cluster: Arc<ClusterRegistry>,
     /// Fenced local Oracle role.
@@ -1219,12 +1181,6 @@ pub struct OracleConfig {
     pub tenant_interactive_slots: u32,
     /// Tenant ceiling for analytical slot units.
     pub tenant_analytical_slots: u32,
-    /// Durable lease lifetime renewed while a query stream remains owned.
-    pub lease_ttl: Duration,
-    /// Cadence for renewing a live durable query lease.
-    pub lease_renew_interval: Duration,
-    /// Cadence for expiry and authoritative tenant-counter maintenance.
-    pub maintenance_interval: Duration,
     /// Maximum remote workers selected per query; leader is additional.
     pub max_workers_per_query: usize,
     /// Maximum sealed files represented by one micro-fragment.
@@ -1243,9 +1199,6 @@ impl Default for OracleConfig {
             planning_permits: 16,
             tenant_interactive_slots: 8,
             tenant_analytical_slots: 4,
-            lease_ttl: Duration::from_mins(1),
-            lease_renew_interval: Duration::from_secs(20),
-            maintenance_interval: Duration::from_secs(5),
             max_workers_per_query: 2,
             fragment_max_files: 16,
             attempt_max_bytes: 64 * 1024 * 1024,
@@ -1271,7 +1224,7 @@ struct SealedDispatchInput<'a> {
     context: &'a AuthorizedQueryContext,
     /// Pinned table cut.
     cut: &'a PinnedSealedTable,
-    /// Admitted leader identity and lease.
+    /// Admitted leader identity and local fencing token.
     admitted: &'a AdmittedQueryGuard,
     /// Immutable query class.
     query_class: QueryClass,
@@ -1359,6 +1312,37 @@ struct SqlAttemptInput<'a> {
     gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
 }
 
+impl<'a> SqlAttemptInput<'a> {
+    /// Splits the immutable attempt envelope into the values consumed by each phase.
+    fn into_parts(
+        self,
+    ) -> (
+        &'a AuthorizedQueryContext,
+        &'a BifrostQueryRequest,
+        &'a [TableRef],
+        Instant,
+        u8,
+        Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
+    ) {
+        let Self {
+            context,
+            request,
+            tables,
+            deadline,
+            retry_ordinal,
+            gate_lifecycle,
+        } = self;
+        (
+            context,
+            request,
+            tables,
+            deadline,
+            retry_ordinal,
+            gate_lifecycle,
+        )
+    }
+}
+
 /// Retained local query engine owner.
 pub struct Oracle {
     /// Planner and floor configuration.
@@ -1388,18 +1372,15 @@ pub struct Oracle {
     telemetry: Arc<OracleTelemetry>,
     /// Lifecycle cancellation token.
     shutdown: CancellationToken,
-    /// Whether startup reconciliation completed.
+    /// Whether local startup readiness completed.
     ready: Arc<AtomicBool>,
-    /// One-shot startup recovery result consumed by the server activation boundary.
+    /// One-shot startup result consumed by the server activation boundary.
     startup_result: Mutex<Option<StartupResultReceiver>>,
-    /// Cancellation-bound admission maintenance task.
+    /// Cancellation-bound local admission lifecycle task.
     maintenance: Mutex<Option<JoinHandle<()>>>,
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
-    /// Test-tier one-shot pause at the stale-first-batch durable-release gate.
-    #[cfg(feature = "test-support")]
-    stale_release_probe: Mutex<Option<Arc<OracleStaleReleaseProbe>>>,
 }
 
 /// Notification-backed test seam for a topology change after worker selection.
@@ -1416,45 +1397,6 @@ pub struct OracleTopologyProbe {
     resume: tokio::sync::Notify,
     /// Remote worker selected by the paused immutable assignment.
     target: Mutex<Option<NodeId>>,
-}
-
-/// Notification-backed test seam at the stale-first-batch release gate.
-#[cfg(feature = "test-support")]
-#[derive(Debug, Default)]
-pub struct OracleStaleReleaseProbe {
-    /// Records that the actual first-batch stale branch reached its release gate.
-    reached: AtomicBool,
-    /// Wakes the regression after the branch has retained its admitted guard.
-    reached_notify: tokio::sync::Notify,
-    /// Records permission for the branch to begin durable release.
-    resumed: AtomicBool,
-    /// Wakes the paused branch after the regression prepares durable state.
-    resume_notify: tokio::sync::Notify,
-}
-
-#[cfg(feature = "test-support")]
-impl OracleStaleReleaseProbe {
-    /// Waits until the stale-first-batch branch retains admission at its release gate.
-    pub async fn wait_reached(&self) {
-        while !self.reached.load(Ordering::Acquire) {
-            self.reached_notify.notified().await;
-        }
-    }
-
-    /// Permits the stale-first-batch branch to begin its bounded durable release.
-    pub fn resume(&self) {
-        self.resumed.store(true, Ordering::Release);
-        self.resume_notify.notify_waiters();
-    }
-
-    /// Pauses the actual stale-first-batch branch before it consumes admission.
-    async fn pause_before_release(&self) {
-        self.reached.store(true, Ordering::Release);
-        self.reached_notify.notify_waiters();
-        while !self.resumed.load(Ordering::Acquire) {
-            self.resume_notify.notified().await;
-        }
-    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1497,7 +1439,7 @@ impl OracleTopologyProbe {
     }
 }
 
-/// One-shot startup recovery result consumed exactly once by activation.
+/// One-shot startup result consumed exactly once by activation.
 type StartupResultReceiver = tokio::sync::oneshot::Receiver<Result<(), BifrostError>>;
 
 impl std::fmt::Debug for Oracle {
@@ -1570,13 +1512,9 @@ impl Oracle {
         if config.config.planning_permits == 0
             || config.config.tenant_interactive_slots == 0
             || config.config.tenant_analytical_slots == 0
-            || config.config.lease_ttl.is_zero()
-            || config.config.lease_renew_interval.is_zero()
-            || config.config.maintenance_interval.is_zero()
         {
             return Err(BifrostError::Internal {
-                detail: "Oracle planning, tenant, lease, and maintenance limits must be positive"
-                    .to_owned(),
+                detail: "Oracle planning and tenant limits must be positive".to_owned(),
             });
         }
         let planner = OraclePlanner::new(config.config);
@@ -1584,15 +1522,12 @@ impl Oracle {
         let admission = Arc::new(OracleAdmission::new(
             config.cluster,
             config.local_slots,
-            Arc::new(config.admission_leases),
             config.local_role,
-            config.config,
-            config.operator_pool,
         ));
         let shutdown = CancellationToken::new();
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
-            admission.start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
+            OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
         let fragment_dispatcher = config.peer_transports.map(|transports| {
             dispatcher::FragmentDispatcher::new(Arc::clone(&config.peer_ticket_minter), transports)
                 .with_memory_governor(config.memory.governor.clone())
@@ -1617,8 +1552,6 @@ impl Oracle {
             maintenance: Mutex::new(Some(maintenance)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
-            #[cfg(feature = "test-support")]
-            stale_release_probe: Mutex::new(None),
         })
     }
 
@@ -1627,27 +1560,6 @@ impl Oracle {
     pub fn bind_topology_probe_for_test(&self, probe: Arc<OracleTopologyProbe>) {
         if let Ok(mut current) = self.topology_probe.lock() {
             *current = Some(probe);
-        }
-    }
-
-    /// Binds a one-shot stale-first-batch release probe for a test-tier query.
-    #[cfg(feature = "test-support")]
-    pub fn bind_stale_release_probe_for_test(&self, probe: Arc<OracleStaleReleaseProbe>) {
-        if let Ok(mut current) = self.stale_release_probe.lock() {
-            *current = Some(probe);
-        }
-    }
-
-    /// Pauses the stale-first-batch branch at its test-tier durable-release gate.
-    #[cfg(feature = "test-support")]
-    async fn pause_stale_release_for_test(&self) {
-        let probe = self
-            .stale_release_probe
-            .lock()
-            .ok()
-            .and_then(|probe| probe.clone());
-        if let Some(probe) = probe {
-            probe.pause_before_release().await;
         }
     }
 
@@ -1806,14 +1718,8 @@ impl Oracle {
         input: SqlAttemptInput<'_>,
         query_telemetry: &mut Option<QueryTelemetryGuard>,
     ) -> Result<Option<OracleQueryStream>, BifrostError> {
-        let SqlAttemptInput {
-            context,
-            request,
-            tables,
-            deadline,
-            retry_ordinal,
-            gate_lifecycle,
-        } = input;
+        let (context, request, tables, deadline, retry_ordinal, gate_lifecycle) =
+            input.into_parts();
         let planned = self
             .plan_sql_attempt(context, &request.sql, tables, deadline)
             .await?;
@@ -1834,7 +1740,7 @@ impl Oracle {
             .await
         {
             Ok(drained) => drained,
-            Err(error) => return release_error(deadline, admitted, error, "audit rejection").await,
+            Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
         };
         admitted.live_reservations = drained.reservations;
         let (schema, mut batches) = match self
@@ -1851,46 +1757,46 @@ impl Oracle {
         {
             Ok(execution) => execution,
             Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
-                await_stale_release(deadline, admitted.release()).await?;
+                admitted.release();
                 record_stale_replan();
                 return Ok(None);
             }
             Err(OracleExecutionError::StaleObject) => {
                 let error = BifrostError::QueryExecutionFailed;
-                return release_error(deadline, admitted, error, "final stale attempt").await;
+                return release_error(deadline, admitted, error, "final stale attempt");
             }
             Err(OracleExecutionError::Public(error)) => {
-                return release_error(deadline, admitted, error, "execution rejection").await;
+                return release_error(deadline, admitted, error, "execution rejection");
             }
         };
-        let (first, admitted) =
-            await_first_batch_or_release(deadline, batches.next(), admitted, |admitted| {
+        let (first, admitted) = await_first_batch_or_release(
+            deadline,
+            batches.next(),
+            admitted,
+            |admitted| async move {
                 release_error(
                     deadline,
                     admitted,
                     BifrostError::QueryTimeout,
                     "first-batch timeout",
                 )
-            })
-            .await?;
+            },
+        )
+        .await?;
         if first.as_ref().is_some_and(|result| {
             retry_ordinal == 0 && result.as_ref().is_err_and(is_stale_file_error)
         }) {
-            #[cfg(feature = "test-support")]
-            self.pause_stale_release_for_test().await;
-            await_stale_release(deadline, admitted.release()).await?;
+            admitted.release();
             record_stale_replan();
             return Ok(None);
         }
         let Some(query_telemetry) = query_telemetry.take() else {
             let error = BifrostError::QueryExecutionFailed;
-            return release_error(deadline, admitted, error, "missing telemetry").await;
+            return release_error(deadline, admitted, error, "missing telemetry");
         };
         let schema_frame = match encode_schema_frame(&schema) {
             Ok(schema_frame) => schema_frame,
-            Err(error) => {
-                return release_error(deadline, admitted, error, "schema preparation").await;
-            }
+            Err(error) => return release_error(deadline, admitted, error, "schema preparation"),
         };
         Ok(Some(OracleQueryStream::new(QueryStreamInput {
             schema_frame,
@@ -1906,7 +1812,7 @@ impl Oracle {
         })))
     }
 
-    /// Acquire the local and durable admission owner for one SQL attempt.
+    /// Acquire the local admission owner for one SQL attempt.
     ///
     /// # Errors
     /// Returns the stable admission, timeout, cancellation, or SQL error from
@@ -2245,7 +2151,7 @@ impl Oracle {
         result
     }
 
-    /// Returns whether startup reconciliation completed and queries may enter admission.
+    /// Returns whether startup readiness completed and queries may enter admission.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.startup_reconciled() && self.admission.is_available()
@@ -2262,7 +2168,7 @@ impl Oracle {
         }
     }
 
-    /// Reports whether local startup reconciliation completed before membership activation.
+    /// Reports whether local startup readiness completed before membership activation.
     ///
     /// Server boot uses this dependency-local phase to avoid waiting on
     /// [`Self::is_ready`], which intentionally also requires the later durable
@@ -2272,7 +2178,7 @@ impl Oracle {
         self.ready.load(Ordering::Acquire) && !self.shutdown.is_cancelled()
     }
 
-    /// Awaits the exact startup recovery result before role activation.
+    /// Awaits the exact startup result before role activation.
     ///
     /// # Errors
     /// Returns the recovery failure, a duplicate-wait invariant, or task loss.
@@ -2288,7 +2194,7 @@ impl Oracle {
                 detail: "Oracle startup result was already consumed".to_owned(),
             })?;
         receiver.await.map_err(|_| BifrostError::Internal {
-            detail: "Oracle startup recovery task ended without a result".to_owned(),
+            detail: "Oracle startup task ended without a result".to_owned(),
         })?
     }
 
@@ -2300,8 +2206,8 @@ impl Oracle {
 
     /// Cancels lifecycle maintenance and drains owned cleanup until `deadline`.
     ///
-    /// Maintenance is aborted at expiry and queued lease releases retain their
-    /// recovery fallback. Dropping this future can leave partial cleanup, but
+    /// The lifecycle task is aborted at expiry. Dropping this future can leave
+    /// local cleanup to guard drop, but
     /// [`Self::begin_shutdown`] has already synchronously rejected new work.
     pub async fn shutdown(&self, deadline: Instant) {
         self.begin_shutdown();
@@ -2321,13 +2227,13 @@ impl Oracle {
                 maintenance.abort();
             }
         }
-        self.admission.drain_lease_releases(deadline).await;
+        let _ = deadline;
     }
 
     /// Cancels Oracle lifecycle work without awaiting cleanup progress.
     ///
     /// This no-await operation is safe at an exhausted process deadline. It
-    /// starts no external cleanup and leaves durable lease recovery authoritative.
+    /// starts no external cleanup and leaves local guard cleanup authoritative.
     pub fn begin_shutdown(&self) {
         self.shutdown.cancel();
     }
@@ -3099,15 +3005,6 @@ const fn visibility_label(visibility: VisibilityMode) -> &'static str {
     }
 }
 
-/// Returns the closed production metric label for one durable admission scope.
-const fn admission_scope_label(scope: AdmissionScope) -> &'static str {
-    match scope {
-        AdmissionScope::Cluster => "cluster",
-        AdmissionScope::Class => "class",
-        AdmissionScope::Tenant => "tenant",
-    }
-}
-
 /// Returns the closed metric label for one stable late terminal code.
 const fn terminal_error_label(code: QueryTerminalErrorCode) -> &'static str {
     match code {
@@ -3195,40 +3092,16 @@ fn record_stale_replan() {
 
 /// Release an admitted query after an attempt-local terminal error.
 ///
-/// Cleanup failure is logged without replacing the stable public error that
-/// caused the attempt to terminate. The original absolute query deadline bounds
-/// the single release poll; cancellation drops the still-pending guard so its
-/// ordinary queue fallback retains durable cleanup ownership exactly once.
-///
 /// # Errors
 ///
 /// Always returns the caller-supplied original error after the cleanup attempt.
-async fn release_error<T>(
-    deadline: Instant,
+fn release_error<T>(
+    _deadline: Instant,
     admitted: AdmittedQueryGuard,
     original: BifrostError,
-    phase: &'static str,
+    _phase: &'static str,
 ) -> Result<T, BifrostError> {
-    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), admitted.release())
-        .await
-    {
-        Ok(Ok(AdmissionReleaseStatus::Released)) => {}
-        Ok(Ok(AdmissionReleaseStatus::NotReleased)) => {
-            tracing::warn!(
-                phase,
-                "Oracle admission cleanup made no durable release while preserving the original query error"
-            );
-        }
-        Ok(Err(error)) => {
-            tracing::error!(error = %error, phase, "Oracle admission cleanup failed while preserving the original query error");
-        }
-        Err(_) => {
-            tracing::warn!(
-                phase,
-                "Oracle admission cleanup reached the query deadline while preserving the original query error"
-            );
-        }
-    }
+    admitted.release();
     Err(original)
 }
 
@@ -3256,36 +3129,6 @@ where
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), first_batch).await {
         Ok(first) => Ok((first, owner)),
         Err(_) => cleanup(owner).await,
-    }
-}
-
-/// Awaits proof that stale-attempt capacity is durably free before readmission.
-///
-/// The absolute query deadline bounds cleanup. A cancelled release future drops
-/// its consuming guard, which retains the ordinary queued-cleanup fallback.
-///
-/// # Errors
-///
-/// Returns query timeout when the absolute deadline expires. SQL/commit errors
-/// and committed no-op mutations map to the existing execution failure rather
-/// than permitting a fresh admission to collide with retained capacity.
-async fn await_stale_release<F, E>(deadline: Instant, release: F) -> Result<(), BifrostError>
-where
-    F: std::future::Future<Output = Result<AdmissionReleaseStatus, E>>,
-{
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(BifrostError::QueryTimeout)?;
-    match tokio::time::timeout(remaining, release).await {
-        Err(_) => Err(BifrostError::QueryTimeout),
-        Ok(Ok(status)) => {
-            if matches!(status, AdmissionReleaseStatus::Released) {
-                Ok(())
-            } else {
-                Err(BifrostError::QueryExecutionFailed)
-            }
-        }
-        Ok(Err(_)) => Err(BifrostError::QueryExecutionFailed),
     }
 }
 
@@ -3375,59 +3218,6 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(owner);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    /// A stalled explicit release times out without authorizing another admission.
-    #[tokio::test]
-    async fn stale_replan_stalled_release_never_readmits() {
-        let admissions = AtomicUsize::new(1);
-        let deadline = Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .expect("test deadline remains representable");
-        let result = await_stale_release(
-            deadline,
-            std::future::pending::<Result<AdmissionReleaseStatus, ()>>(),
-        )
-        .await;
-        if result.is_ok() {
-            admissions.fetch_add(1, Ordering::SeqCst);
-        }
-        assert!(matches!(result, Err(BifrostError::QueryTimeout)));
-        assert_eq!(admissions.load(Ordering::SeqCst), 1);
-    }
-
-    /// SQL failure and a committed no-op both refuse stale-query readmission.
-    #[tokio::test]
-    async fn stale_replan_failed_or_noop_release_never_readmits() {
-        for release in [Err(()), Ok(AdmissionReleaseStatus::NotReleased)] {
-            let admissions = AtomicUsize::new(1);
-            let result = await_stale_release(
-                Instant::now() + Duration::from_secs(1),
-                std::future::ready(release),
-            )
-            .await;
-            if result.is_ok() {
-                admissions.fetch_add(1, Ordering::SeqCst);
-            }
-            assert!(matches!(result, Err(BifrostError::QueryExecutionFailed)));
-            assert_eq!(admissions.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    /// A proven durable release authorizes exactly one fresh admission.
-    #[tokio::test]
-    async fn stale_replan_completed_release_readmits_exactly_once() {
-        let admissions = AtomicUsize::new(1);
-        await_stale_release(
-            Instant::now() + Duration::from_secs(1),
-            std::future::ready(Ok::<AdmissionReleaseStatus, ()>(
-                AdmissionReleaseStatus::Released,
-            )),
-        )
-        .await
-        .expect("committed release authorizes replan");
-        admissions.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(admissions.load(Ordering::SeqCst), 2);
     }
 
     /// Pauses exactly one selected attempt and leaves the replan unblocked.

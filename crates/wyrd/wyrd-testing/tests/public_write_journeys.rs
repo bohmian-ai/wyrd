@@ -984,8 +984,6 @@ async fn run_topology_public_journey(
         };
         assert_eq!(reconciled.read_audit_rows, expected_reads);
         assert!(reconciled.audit_rows >= reconciled.read_audit_rows);
-        assert_eq!(reconciled.active_leases, 0);
-        assert_eq!(reconciled.slots_in_use, 0);
         assert_eq!(reconciled.active_tail_fences, 0);
         for owner in ["scribe", "forge", "oracle"] {
             assert!(
@@ -1197,15 +1195,13 @@ async fn run_multitenant_public_journey() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Assert every server, listener, and durable runtime owner drained at shutdown.
+/// Assert every server, listener, and retained runtime owner drained at shutdown.
 fn assert_drained_shutdown(inspection: wyrd_testing::bifrost::ClusterShutdownInspection) {
     assert!(inspection.servers_stopped);
     assert!(inspection.listeners_stopped);
     assert_eq!(inspection.scribe_queued, 0);
     assert_eq!(inspection.scribe_inflight, 0);
     assert_eq!(inspection.scribe_wal_streams, 0);
-    assert_eq!(inspection.oracle_leases, 0);
-    assert_eq!(inspection.oracle_slots, 0);
     assert_eq!(inspection.forge_active_claims, 0);
     assert_eq!(inspection.forge_active_attempts, 0);
     assert_eq!(inspection.supervised_tasks, 0);

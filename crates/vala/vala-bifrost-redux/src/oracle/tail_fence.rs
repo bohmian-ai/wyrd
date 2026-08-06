@@ -5,6 +5,7 @@
 //! ordinary success or failure path without spawning detached cleanup.
 
 use super::*;
+use futures_util::stream::FuturesUnordered;
 
 /// One query-scoped live-tail route discovered from an authoritative Scribe.
 pub struct DiscoveredTailRoute {
@@ -60,7 +61,7 @@ pub(super) struct TailFenceDrainer<'a> {
     pub(super) query_class: QueryClass,
     /// Absolute deadline shared by fence acquisition and every page read.
     pub(super) deadline: Instant,
-    /// Admission lifecycle cancellation shared with renewal and streaming.
+    /// Admission lifecycle cancellation shared with streaming.
     pub(super) cancellation: CancellationToken,
     /// Caller-selected strict or degraded live-source failure policy.
     pub(super) freshness: wyrd_spec::vala::api::FreshnessPolicy,
@@ -131,7 +132,7 @@ pub(super) struct TailFenceDrainerConfig {
     pub(super) query_class: QueryClass,
     /// Absolute deadline shared by fence acquisition and every page read.
     pub(super) deadline: Instant,
-    /// Admission lifecycle cancellation shared with renewal and streaming.
+    /// Admission lifecycle cancellation shared with streaming.
     pub(super) cancellation: CancellationToken,
     /// Caller-selected strict or degraded live-source failure policy.
     pub(super) freshness: wyrd_spec::vala::api::FreshnessPolicy,

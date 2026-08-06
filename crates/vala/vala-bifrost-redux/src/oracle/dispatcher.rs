@@ -2069,7 +2069,7 @@ mod tests {
 
     /// Expiry cleanup releases pending capacity and release is fenced and idempotent.
     #[test]
-    fn oracle_peer_reservation_expiry_and_release_cleanup() {
+    fn peer_pending_reservation_expires() {
         let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1, 1)), 1);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
@@ -2099,6 +2099,84 @@ mod tests {
         assert!(registry.release(&request, now));
         assert!(registry.release(&request, now));
         assert_ne!(pending.reservation_id, replacement.reservation_id);
+    }
+
+    /// A failed pending-to-running transition removes the pending reservation and permit.
+    #[test]
+    fn peer_transition_failure_releases_reservation() {
+        let slots = Arc::new(OracleSlotManager::new(1, 0));
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let pending = registry
+            .reserve(
+                &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("pending reservation");
+        assert!(matches!(
+            registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
+            Err(DispatchError::Retryable)
+        ));
+        assert_eq!(registry.cleanup_expired(now), 0);
+        registry
+            .reserve(
+                &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("pending permit released after transition failure");
+    }
+
+    /// Worker execution streams release running capacity on completion, cancel, and drop.
+    #[tokio::test]
+    async fn worker_execution_stream_releases_running_capacity() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let permit = slots.try_running(1).expect("completion permit");
+        let completion_stream = async_stream::stream! {
+            let _running = RunningReservation { permit: Some(permit) };
+            if false {
+                yield Err(DispatchError::Retryable);
+            }
+        };
+        let mut completion = WorkerExecution {
+            stream: Box::pin(completion_stream),
+        };
+        assert_eq!(slots.running_in_use(), 1);
+        assert!(completion.stream.next().await.is_none());
+        assert_eq!(slots.running_in_use(), 0);
+        assert!(slots.try_running(1).is_ok());
+
+        let cancellation = CancellationToken::new();
+        let permit = slots.try_running(1).expect("cancellation permit");
+        let observed = cancellation.clone();
+        let cancellation_stream = async_stream::stream! {
+            let _running = RunningReservation { permit: Some(permit) };
+            observed.cancelled().await;
+        };
+        let mut cancellation_stream = Box::pin(cancellation_stream);
+        let waiter = tokio::spawn(async move { cancellation_stream.next().await });
+        tokio::task::yield_now().await;
+        assert_eq!(slots.running_in_use(), 1);
+        cancellation.cancel();
+        assert!(waiter.await.expect("cancellation stream joins").is_none());
+        assert_eq!(slots.running_in_use(), 0);
+        assert!(slots.try_running(1).is_ok());
+
+        let permit = slots.try_running(1).expect("drop permit");
+        let drop_stream = async_stream::stream! {
+            let _running = RunningReservation { permit: Some(permit) };
+            futures_util::future::pending::<()>().await;
+            yield Err(DispatchError::Retryable);
+        };
+        let execution = WorkerExecution {
+            stream: Box::pin(drop_stream),
+        };
+        assert_eq!(slots.running_in_use(), 1);
+        assert!(slots.try_running(1).is_err());
+        drop(execution);
+        assert_eq!(slots.running_in_use(), 0);
+        assert!(slots.try_running(1).is_ok());
     }
 
     /// A retryable reserve failure advances to the next distinct candidate.

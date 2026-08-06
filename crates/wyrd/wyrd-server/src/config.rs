@@ -261,6 +261,9 @@ pub struct OracleRuntimeConfig {
     /// Admission waiters.
     #[serde(default = "default_oracle_admission_waiters")]
     pub admission_waiters: usize,
+    /// Maximum absolute time a query may wait in the local admission queues.
+    #[serde(default = "default_oracle_max_queue_wait_ms")]
+    pub max_queue_wait_ms: u64,
     /// Maximum remote workers, excluding the leader.
     #[serde(default = "default_oracle_max_workers_per_query")]
     pub max_workers_per_query: usize,
@@ -292,6 +295,10 @@ fn default_oracle_planning_permits() -> usize {
 fn default_oracle_admission_waiters() -> usize {
     64
 }
+/// Default maximum absolute Oracle admission queue wait in milliseconds.
+fn default_oracle_max_queue_wait_ms() -> u64 {
+    250
+}
 fn default_oracle_max_workers_per_query() -> usize {
     2
 }
@@ -310,6 +317,7 @@ impl Default for OracleRuntimeConfig {
             spill_limit_bytes: default_oracle_spill_limit_bytes(),
             planning_permits: default_oracle_planning_permits(),
             admission_waiters: default_oracle_admission_waiters(),
+            max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
             max_workers_per_query: default_oracle_max_workers_per_query(),
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
@@ -424,6 +432,172 @@ struct OracleCalibrationClass {
     minimum_slots: u64,
 }
 
+/// Primitive admission values passed from server boot into Redux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OracleAdmissionTranslation {
+    /// Interactive class slots after headroom and share allocation.
+    pub interactive_slots: u32,
+    /// Analytical class slots after headroom and share allocation.
+    pub analytical_slots: u32,
+    /// Single-tenant concurrent ceiling.
+    pub single_tenant_ceiling: u32,
+    /// Multi-tenant concurrent ceiling.
+    pub multi_tenant_ceiling: u32,
+    /// Queue capacity copied from runtime configuration.
+    pub queue_capacity: u32,
+    /// Absolute queue wait cap.
+    pub max_queue_wait: Duration,
+    /// Interactive class memory cap.
+    pub interactive_memory_bytes: u64,
+    /// Analytical class memory cap.
+    pub analytical_memory_bytes: u64,
+    /// Spill cap.
+    pub spill_bytes: u64,
+}
+
+/// Translate validated calibration evidence into private Redux primitives.
+///
+/// # Errors
+/// Returns a message when headroom, class shares, or derived capacities are invalid.
+fn translate_oracle_calibration(
+    profile: &OracleCalibrationProfile,
+    runtime: &OracleRuntimeConfig,
+    raw_slots: u32,
+    parent_memory_bytes: u64,
+) -> Result<OracleAdmissionTranslation, String> {
+    if !profile.slot.headroom.is_finite() || !(0.0..1.0).contains(&profile.slot.headroom) {
+        return Err("slot.headroom must be finite and in [0, 1)".to_owned());
+    }
+    for (name, share) in [
+        ("class.interactive.share", profile.class.interactive.share),
+        ("class.analytical.share", profile.class.analytical.share),
+    ] {
+        if !share.is_finite() || !(0.0..=1.0).contains(&share) {
+            return Err(format!("{name} must be finite and in [0, 1]"));
+        }
+    }
+    let usable_value = f64::from(raw_slots) * (1.0 - profile.slot.headroom);
+    let usable = checked_floor_u32(usable_value, "usable Oracle slots")?;
+    if usable < 2 {
+        return Err("usable Oracle slots must be at least 2".to_owned());
+    }
+    let interactive_minimum = checked_minimum_slots(
+        profile.class.interactive.minimum_slots,
+        "class.interactive.minimum_slots",
+    )?;
+    let analytical_minimum = checked_minimum_slots(
+        profile.class.analytical.minimum_slots,
+        "class.analytical.minimum_slots",
+    )?;
+    let interactive = checked_floor_u32(
+        f64::from(usable) * profile.class.interactive.share,
+        "interactive class allocation",
+    )?
+    .max(interactive_minimum)
+    .max(1);
+    let analytical = checked_floor_u32(
+        f64::from(usable) * profile.class.analytical.share,
+        "analytical class allocation",
+    )?
+    .max(analytical_minimum)
+    .max(1);
+    let allocation_sum = interactive
+        .checked_add(analytical)
+        .ok_or_else(|| "Oracle class allocation sum exceeds u32".to_owned())?;
+    if allocation_sum > usable {
+        return Err(format!(
+            "Oracle class allocation sum {allocation_sum} exceeds usable slots {usable}"
+        ));
+    }
+    let (interactive_slots, analytical_slots) = (interactive, analytical);
+    let single = proposal_u32(&profile.proposal, "tenant.single_tenant_limit")?;
+    let multi = proposal_u32(&profile.proposal, "tenant.multi_tenant_default_limit")?;
+    let memory = proposal_u64(&profile.proposal, "memory.class_limits")?;
+    let spill =
+        proposal_u64(&profile.proposal, "spill.limit_bytes")?.min(runtime.spill_limit_bytes);
+    Ok(OracleAdmissionTranslation {
+        interactive_slots,
+        analytical_slots,
+        single_tenant_ceiling: single.min(interactive_slots.max(analytical_slots)),
+        multi_tenant_ceiling: multi.min(interactive_slots.max(analytical_slots)),
+        queue_capacity: u32::try_from(runtime.admission_waiters)
+            .map_err(|_| "queue capacity exceeds u32".to_owned())?,
+        max_queue_wait: Duration::from_millis(runtime.max_queue_wait_ms),
+        interactive_memory_bytes: memory.min(parent_memory_bytes),
+        analytical_memory_bytes: memory.min(parent_memory_bytes),
+        spill_bytes: spill,
+    })
+}
+
+/// Converts a finite non-negative slot calculation without saturating casts.
+///
+/// # Errors
+/// Returns an error when the value is non-finite, negative, or exceeds `u32`.
+fn checked_floor_u32(value: f64, name: &str) -> Result<u32, String> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{name} must be finite and non-negative"));
+    }
+    let floored = value.floor();
+    if floored > f64::from(u32::MAX) {
+        return Err(format!("{name} exceeds u32"));
+    }
+    u32::try_from(floored as u64).map_err(|_| format!("{name} exceeds u32"))
+}
+
+/// Converts and validates one measured class minimum.
+///
+/// # Errors
+/// Returns an error when the minimum is zero or exceeds `u32`.
+fn checked_minimum_slots(value: u64, name: &str) -> Result<u32, String> {
+    let minimum = u32::try_from(value).map_err(|_| format!("{name} exceeds u32"))?;
+    if minimum == 0 {
+        return Err(format!("{name} must be positive"));
+    }
+    Ok(minimum)
+}
+
+/// Loads the validated calibration profile for server boot translation.
+///
+/// # Errors
+/// Returns a message when a configured profile cannot be read or decoded.
+pub(crate) fn load_oracle_admission_translation(
+    runtime: &OracleRuntimeConfig,
+    raw_slots: u32,
+    parent_memory_bytes: u64,
+) -> Result<Option<OracleAdmissionTranslation>, String> {
+    if runtime.calibration_profile.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&runtime.calibration_profile)
+        .map_err(|error| format!("failed to read Oracle calibration profile: {error}"))?;
+    let profile: OracleCalibrationProfile = toml::from_str(&contents)
+        .map_err(|error| format!("failed to parse Oracle calibration profile: {error}"))?;
+    translate_oracle_calibration(&profile, runtime, raw_slots, parent_memory_bytes).map(Some)
+}
+
+/// Reads one positive integer calibration proposal leaf.
+///
+/// # Errors
+/// Returns an error when the leaf is missing, non-numeric, or non-positive.
+fn proposal_u64(table: &toml::Table, path: &str) -> Result<u64, String> {
+    let value = calibration_evidence_value(table, path)?;
+    value
+        .as_integer()
+        .or_else(|| value.as_float().map(|value| value as i64))
+        .filter(|value| *value > 0)
+        .map(|value| value as u64)
+        .ok_or_else(|| format!("proposal.{path}.value must be positive"))
+}
+
+/// Reads one calibration proposal leaf constrained to a `u32` capacity.
+///
+/// # Errors
+/// Returns an error when the leaf is invalid or exceeds `u32`.
+fn proposal_u32(table: &toml::Table, path: &str) -> Result<u32, String> {
+    u32::try_from(proposal_u64(table, path)?)
+        .map_err(|_| format!("proposal.{path}.value exceeds u32"))
+}
+
 /// Closed activation status accepted from an Oracle calibration profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -451,8 +625,6 @@ const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
     "placement.deadline_millis",
     "placement.jitter_min_millis",
     "placement.jitter_max_millis",
-    "lease.cluster_ttl_seconds",
-    "lease.renew_interval_seconds",
     "reservation.pending_ttl_seconds",
     "membership.expiration_seconds",
     "tail.fence_ttl_seconds",
@@ -539,9 +711,9 @@ impl OracleCalibrationProfile {
         if self.slot.memory_bytes == 0 {
             return Err("slot.memory_bytes must be positive".to_owned());
         }
-        if !self.slot.headroom.is_finite() || self.slot.headroom <= 0.0 || self.slot.headroom > 1.0
+        if !self.slot.headroom.is_finite() || self.slot.headroom < 0.0 || self.slot.headroom >= 1.0
         {
-            return Err("slot.headroom must be finite and in (0, 1]".to_owned());
+            return Err("slot.headroom must be finite and in [0, 1)".to_owned());
         }
         validate_calibration_class("class.interactive", &self.class.interactive)?;
         validate_calibration_class("class.analytical", &self.class.analytical)?;
@@ -1552,6 +1724,7 @@ impl WyrdServerConfig {
             }
             if self.bifrost.oracle.planning_permits == 0
                 || self.bifrost.oracle.admission_waiters == 0
+                || self.bifrost.oracle.max_queue_wait_ms == 0
                 || self.bifrost.oracle.max_frame_bytes == 0
                 || self.bifrost.oracle.spill_limit_bytes == 0
                 || !self.bifrost.oracle.cpu_cores.is_finite()
@@ -3026,5 +3199,105 @@ minimum_slots = 2
         assert!(!ServeMode::Http.serves_grpc());
         assert!(!ServeMode::Grpc.serves_http());
         assert!(ServeMode::Grpc.serves_grpc());
+    }
+
+    /// Calibration translation applies headroom, class shares, and parent caps.
+    #[test]
+    fn oracle_admission_config_translates_calibration() {
+        let leaf = |value: i64| {
+            let mut table = toml::Table::new();
+            table.insert("value".to_owned(), toml::Value::Integer(value));
+            table.insert(
+                "evidence_case_id".to_owned(),
+                toml::Value::String("test".to_owned()),
+            );
+            toml::Value::Table(table)
+        };
+        let mut proposal = toml::Table::new();
+        let mut tenant = toml::Table::new();
+        tenant.insert("single_tenant_limit".to_owned(), leaf(8));
+        tenant.insert("multi_tenant_default_limit".to_owned(), leaf(2));
+        proposal.insert("tenant".to_owned(), toml::Value::Table(tenant));
+        let mut memory = toml::Table::new();
+        memory.insert("class_limits".to_owned(), leaf(1024));
+        proposal.insert("memory".to_owned(), toml::Value::Table(memory));
+        let mut spill = toml::Table::new();
+        spill.insert("limit_bytes".to_owned(), leaf(4096));
+        proposal.insert("spill".to_owned(), toml::Value::Table(spill));
+        let mut profile = OracleCalibrationProfile {
+            schema_version: 1,
+            status: OracleCalibrationStatus::Candidate,
+            generated_from: "test".to_owned(),
+            source_revision: "test".to_owned(),
+            environment: OracleCalibrationEnvironment {
+                hardware: "test".to_owned(),
+                os: "test".to_owned(),
+                runtime: "test".to_owned(),
+            },
+            workload: OracleCalibrationWorkload {
+                hashes: vec!["test".to_owned()],
+                seeds: vec![1],
+                data_volumes_bytes: vec![1],
+                warmup_seconds: 1,
+                measurement_seconds: 1,
+            },
+            matrix: OracleCalibrationMatrix {
+                topology: vec!["test".to_owned()],
+                tenant: vec!["test".to_owned()],
+                class: vec!["test".to_owned()],
+                visibility: vec!["test".to_owned()],
+            },
+            slot: OracleCalibrationSlot {
+                cpu_cores: 1.0,
+                memory_bytes: 1024,
+                headroom: 0.25,
+            },
+            class: OracleCalibrationClasses {
+                interactive: OracleCalibrationClass {
+                    share: 0.5,
+                    minimum_slots: 1,
+                },
+                analytical: OracleCalibrationClass {
+                    share: 0.5,
+                    minimum_slots: 1,
+                },
+            },
+            proposal,
+            measurements: toml::Table::new(),
+        };
+        let runtime = OracleRuntimeConfig::default();
+        let translated =
+            translate_oracle_calibration(&profile, &runtime, 8, 512).expect("translation");
+        assert_eq!(translated.interactive_slots, 3);
+        assert_eq!(translated.analytical_slots, 3);
+        assert_eq!(translated.interactive_memory_bytes, 512);
+        assert_eq!(translated.spill_bytes, 4096.min(runtime.spill_limit_bytes));
+
+        assert!(
+            translate_oracle_calibration(&profile, &runtime, 1, 512)
+                .expect_err("one usable slot must fail closed")
+                .contains("at least 2")
+        );
+        profile.class.interactive.minimum_slots = 0;
+        assert!(
+            translate_oracle_calibration(&profile, &runtime, 8, 512)
+                .expect_err("zero class minimum must fail closed")
+                .contains("must be positive")
+        );
+        profile.class.interactive.minimum_slots = u64::from(u32::MAX) + 1;
+        assert!(
+            translate_oracle_calibration(&profile, &runtime, 8, 512)
+                .expect_err("oversized class minimum must fail closed")
+                .contains("exceeds u32")
+        );
+        profile.class.interactive.minimum_slots = 1;
+        profile.class.analytical.minimum_slots = 1;
+        profile.class.interactive.share = 1.0;
+        profile.class.analytical.share = 1.0;
+        assert!(
+            translate_oracle_calibration(&profile, &runtime, 3, 512)
+                .expect_err("class allocations exceeding usable slots must fail closed")
+                .contains("exceeds usable slots")
+        );
     }
 }

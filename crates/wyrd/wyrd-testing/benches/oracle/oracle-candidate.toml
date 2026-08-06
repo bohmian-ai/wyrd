@@ -55,14 +55,6 @@ evidence_case_id = "p6-fused-interactive-t2"
 value = 5
 evidence_case_id = "p6-fused-interactive-t2"
 
-[proposal."lease.cluster_ttl_seconds"]
-value = 0.079222
-evidence_case_id = "p6-fused-interactive-t2"
-
-[proposal."lease.renew_interval_seconds"]
-value = 0.059187
-evidence_case_id = "p6-fused-interactive-t2"
-
 [proposal."membership.expiration_seconds"]
 value = 0.079222
 evidence_case_id = "p6-fused-interactive-t2"

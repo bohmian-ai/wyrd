@@ -199,9 +199,10 @@ enum AdmissionReleaseOutcome {
 async fn next_query_stream_event(
     batches: &mut SendableRecordBatchStream,
     cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
     deadline: Instant,
 ) -> QueryStreamEvent {
-    if cancellation.is_cancelled() {
+    if cancellation.is_cancelled() || request_cancellation.is_cancelled() {
         return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed);
     }
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -211,11 +212,22 @@ async fn next_query_stream_event(
         () = cancellation.cancelled() => {
             QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
         }
+        () = request_cancellation.cancelled() => {
+            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
+        }
         () = tokio::time::sleep(remaining) => {
             QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout)
         }
         value = batches.next() => QueryStreamEvent::Batch(value),
     }
+}
+
+/// Reports whether either independent query cancellation edge has fired.
+fn cancellation_requested(
+    cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+) -> bool {
+    cancellation.is_cancelled() || request_cancellation.is_cancelled()
 }
 
 /// Constructs the validated success/degraded terminal for one completed stream.
@@ -427,6 +439,7 @@ impl OracleQueryStream {
         let resource_probe = Some(admitted.attach_resource_probe());
         let schema_fingerprint = schema_frame.schema_fingerprint.clone();
         let cancellation = admitted.cancellation.clone();
+        let request_cancellation = admitted.request_cancellation.clone();
         let stream_cancellation = cancellation.clone();
         let telemetry_cancelled = query_telemetry.cancellation_marker();
         let stream_telemetry_cancelled = Arc::clone(&telemetry_cancelled);
@@ -439,7 +452,7 @@ impl OracleQueryStream {
             query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
             yield Ok(QueryStreamFrame::Schema(schema_frame));
             let candidate = loop {
-                let event = if stream_cancellation.is_cancelled() {
+                let event = if cancellation_requested(&stream_cancellation, &request_cancellation) {
                     QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
                 } else if let Some(value) = next.take() {
                     QueryStreamEvent::Batch(Some(value))
@@ -447,6 +460,7 @@ impl OracleQueryStream {
                     next_query_stream_event(
                         &mut batches,
                         &stream_cancellation,
+                        &request_cancellation,
                         deadline,
                     ).await
                 };
@@ -569,11 +583,19 @@ impl OracleQueryStream {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
+    use arrow::datatypes::Schema;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
 
-    use super::{OracleQueryStream, QueryStreamLifecycle};
-    use crate::oracle::{BifrostError, QuerySchemaFrame, QueryStreamFrame};
+    use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle};
+    use crate::oracle::admission::{active_queries_for_test, admitted_guard_for_test};
+    use crate::oracle::{
+        BifrostError, OracleSlotManager, OracleTelemetry, QueryClass, QuerySchemaFrame,
+        QueryStreamFrame, VisibilityMode,
+    };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
     /// Synthetic owner state used to exercise stream cancellation ordering.
@@ -617,6 +639,82 @@ mod tests {
         assert_eq!(owner.slots_in_use.load(Ordering::Acquire), 0);
         assert!(owner.release_complete.load(Ordering::Acquire));
         assert!(owner.fence_released.load(Ordering::Acquire));
+    }
+
+    /// A success terminal is observable only after local ownership is released.
+    #[tokio::test]
+    async fn success_terminal_requires_completed_local_release() {
+        let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
+        let telemetry_owner =
+            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry =
+            telemetry_owner.start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive);
+        let mut stream = OracleQueryStream::new(QueryStreamInput {
+            schema_frame: QuerySchemaFrame {
+                schema_fingerprint: "production".to_owned(),
+                arrow_ipc_schema: Vec::new(),
+            },
+            batches: Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                futures_util::stream::empty(),
+            )),
+            first: None,
+            admitted,
+            deadline: Instant::now() + Duration::from_secs(1),
+            visibility: VisibilityMode::PublishedOnly,
+            degraded: false,
+            stale_replanned: false,
+            query_telemetry: telemetry,
+            gate_lifecycle: None,
+        });
+        let mut terminal_seen = false;
+        while let Some(Ok(frame)) = stream.frames.next().await {
+            if matches!(frame, QueryStreamFrame::Terminal(_)) {
+                terminal_seen = true;
+                assert_eq!(active_queries_for_test(&shared), 0);
+            }
+        }
+        assert!(terminal_seen);
+        assert_eq!(active_queries_for_test(&shared), 0);
+    }
+
+    /// Caller cancellation reaches the production stream without canceling siblings.
+    #[tokio::test]
+    async fn request_cancellation_interrupts_production_stream() {
+        let (admitted, shared, request_cancellation) = admitted_guard_for_test();
+        let telemetry_owner =
+            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let mut stream = OracleQueryStream::new(QueryStreamInput {
+            schema_frame: QuerySchemaFrame {
+                schema_fingerprint: "request-cancel".to_owned(),
+                arrow_ipc_schema: Vec::new(),
+            },
+            batches: Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                futures_util::stream::pending(),
+            )),
+            first: None,
+            admitted,
+            deadline: Instant::now() + Duration::from_secs(1),
+            visibility: VisibilityMode::PublishedOnly,
+            degraded: false,
+            stale_replanned: false,
+            query_telemetry: telemetry_owner
+                .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
+            gate_lifecycle: None,
+        });
+        assert!(matches!(
+            stream.frames.next().await,
+            Some(Ok(QueryStreamFrame::Schema(_)))
+        ));
+        request_cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), stream.frames.next())
+                .await
+                .expect("terminal timeout"),
+            Some(Ok(QueryStreamFrame::Terminal(_)))
+        ));
+        assert_eq!(active_queries_for_test(&shared), 0);
     }
 
     /// Cancellation signals a stalled frame source before bounded drain returns.

@@ -1058,6 +1058,12 @@ impl<'a> OracleRoleBuilder<'a> {
         let memory_slots = (memory_budget_bytes / memory_bytes_per_slot).max(1);
         let raw_slots = u32::try_from(u64::from(cpu_cores).min(memory_slots).max(1))
             .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
+        let calibrated = crate::config::load_oracle_admission_translation(
+            &config.bifrost.oracle,
+            raw_slots,
+            memory_budget_bytes,
+        )
+        .map_err(ServerBootError::OraclePeer)?;
         let capabilities = OracleCapabilitiesV1 {
             peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
                 .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
@@ -1223,6 +1229,41 @@ impl<'a> OracleRoleBuilder<'a> {
                 planning_permits: config.bifrost.oracle.planning_permits,
                 max_workers_per_query: config.bifrost.oracle.max_workers_per_query,
                 attempt_memory_bytes: config.bifrost.oracle.max_frame_bytes.min(8 * 1024 * 1024),
+                interactive_slots: calibrated
+                    .as_ref()
+                    .map_or((raw_slots / 2).max(1), |value| value.interactive_slots),
+                analytical_slots: calibrated
+                    .as_ref()
+                    .map_or((raw_slots.saturating_sub(raw_slots / 2)).max(1), |value| {
+                        value.analytical_slots
+                    }),
+                single_tenant_ceiling: calibrated
+                    .as_ref()
+                    .map_or(raw_slots.max(1), |value| value.single_tenant_ceiling),
+                multi_tenant_ceiling: calibrated
+                    .as_ref()
+                    .map_or((raw_slots / 2).max(1), |value| value.multi_tenant_ceiling),
+                queue_capacity: calibrated.as_ref().map_or(
+                    u32::try_from(config.bifrost.oracle.admission_waiters).map_err(|_| {
+                        ServerBootError::OraclePeer("Oracle queue capacity exceeds u32".to_owned())
+                    })?,
+                    |value| value.queue_capacity,
+                ),
+                max_queue_wait: calibrated.as_ref().map_or(
+                    std::time::Duration::from_millis(config.bifrost.oracle.max_queue_wait_ms),
+                    |value| value.max_queue_wait,
+                ),
+                interactive_memory_bytes: calibrated
+                    .as_ref()
+                    .map_or(memory_budget_bytes, |value| value.interactive_memory_bytes),
+                analytical_memory_bytes: calibrated
+                    .as_ref()
+                    .map_or(memory_budget_bytes, |value| value.analytical_memory_bytes),
+                spill_bytes: calibrated
+                    .as_ref()
+                    .map_or(config.bifrost.oracle.spill_limit_bytes, |value| {
+                        value.spill_bytes
+                    }),
                 ..OracleConfig::default()
             },
         }) {
@@ -1316,6 +1357,7 @@ impl BuiltOracleRole {
             release_failed_oracle_role(&cluster, &role, "snapshot refresh").await;
             return Err(ServerBootError::OraclePeer(error.to_string()));
         }
+        oracle.refresh_membership(&cluster.snapshot());
         if !oracle.is_ready() {
             oracle.shutdown(std::time::Instant::now()).await;
             release_failed_oracle_role(&cluster, &role, "readiness publication").await;

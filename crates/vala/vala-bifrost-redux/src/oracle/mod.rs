@@ -46,7 +46,7 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
-use crate::cluster::{ClusterRegistry, RegisteredRole};
+use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
 use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
@@ -703,10 +703,24 @@ impl OracleSlotManager {
         self.pending_limit
     }
 
+    /// Returns the number of pending worker units currently reserved locally.
+    #[must_use]
+    pub(crate) fn pending_in_use(&self) -> u64 {
+        self.pending_limit
+            .saturating_sub(self.pending.available_permits()) as u64
+    }
+
     /// Returns the currently configured running capacity.
     #[must_use]
     pub fn running_capacity(&self) -> usize {
         self.running_limit
+    }
+
+    /// Returns the number of running worker units currently reserved locally.
+    #[must_use]
+    pub(crate) fn running_in_use(&self) -> u64 {
+        self.running_limit
+            .saturating_sub(self.running.available_permits()) as u64
     }
 
     /// Tries to reserve one bounded pending-admission waiter.
@@ -1189,6 +1203,24 @@ pub struct OracleConfig {
     pub attempt_max_bytes: usize,
     /// In-memory attempt threshold before permission-restricted spill.
     pub attempt_memory_bytes: usize,
+    /// Interactive class capacity.
+    pub interactive_slots: u32,
+    /// Analytical class capacity.
+    pub analytical_slots: u32,
+    /// Single-tenant local ceiling.
+    pub single_tenant_ceiling: u32,
+    /// Multi-tenant local ceiling.
+    pub multi_tenant_ceiling: u32,
+    /// Maximum queued waiters.
+    pub queue_capacity: u32,
+    /// Absolute queue wait cap.
+    pub max_queue_wait: Duration,
+    /// Interactive class memory budget.
+    pub interactive_memory_bytes: u64,
+    /// Analytical class memory budget.
+    pub analytical_memory_bytes: u64,
+    /// Spill budget.
+    pub spill_bytes: u64,
 }
 
 impl Default for OracleConfig {
@@ -1203,6 +1235,15 @@ impl Default for OracleConfig {
             fragment_max_files: 16,
             attempt_max_bytes: 64 * 1024 * 1024,
             attempt_memory_bytes: 8 * 1024 * 1024,
+            interactive_slots: 8,
+            analytical_slots: 4,
+            single_tenant_ceiling: 8,
+            multi_tenant_ceiling: 4,
+            queue_capacity: 64,
+            max_queue_wait: Duration::from_millis(250),
+            interactive_memory_bytes: 256 * 1024 * 1024,
+            analytical_memory_bytes: 256 * 1024 * 1024,
+            spill_bytes: 1 << 30,
         }
     }
 }
@@ -1349,6 +1390,8 @@ pub struct Oracle {
     planner: OraclePlanner,
     /// Admission state and local guards.
     admission: Arc<OracleAdmission>,
+    /// Immutable membership registry retained for planning and worker selection.
+    cluster: Arc<ClusterRegistry>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
@@ -1519,11 +1562,26 @@ impl Oracle {
         }
         let planner = OraclePlanner::new(config.config);
         let telemetry = Arc::new(OracleTelemetry::new(Arc::clone(&config.local_slots)));
-        let admission = Arc::new(OracleAdmission::new(
-            config.cluster,
+        let cluster = Arc::clone(&config.cluster);
+        let membership_available = !cluster.snapshot().live_oracles().is_empty();
+        let admission = Arc::new(OracleAdmission::with_config(
             config.local_slots,
             config.local_role,
+            membership_available,
+            admission::OracleAdmissionConfig {
+                interactive_slots: config.config.interactive_slots,
+                analytical_slots: config.config.analytical_slots,
+                single_tenant_ceiling: config.config.single_tenant_ceiling,
+                multi_tenant_ceiling: config.config.multi_tenant_ceiling,
+                queue_capacity: config.config.queue_capacity,
+                max_queue_wait: config.config.max_queue_wait,
+                interactive_memory_bytes: config.config.interactive_memory_bytes,
+                analytical_memory_bytes: config.config.analytical_memory_bytes,
+                spill_bytes: config.config.spill_bytes,
+            },
         ));
+        let initial_snapshot = cluster.snapshot();
+        admission.refresh(&initial_snapshot);
         let shutdown = CancellationToken::new();
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
@@ -1535,6 +1593,7 @@ impl Oracle {
         Ok(Self {
             planner,
             admission,
+            cluster,
             catalog: config.catalog,
             vala: config.vala,
             memory: config.memory,
@@ -1824,12 +1883,14 @@ impl Oracle {
         deadline: Instant,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
         self.admission
-            .admit(
-                context.data_tenant_id,
+            .admit(admission::PreparedAdmission {
+                tenant: context.data_tenant_id,
                 query_class,
                 deadline,
-                self.shutdown.child_token(),
-            )
+                memory_ceiling: self.memory.reconciliation_limit_bytes as u64,
+                spill_eligible: matches!(query_class, QueryClass::Analytical),
+                cancellation: self.shutdown.child_token(),
+            })
             .await
     }
 
@@ -1842,14 +1903,7 @@ impl Oracle {
         deadline: Instant,
     ) -> Result<PlannedSqlCut, BifrostError> {
         self.planner
-            .pin_and_classify(
-                context,
-                sql,
-                tables,
-                deadline,
-                &self.catalog,
-                &self.admission.cluster,
-            )
+            .pin_and_classify(context, sql, tables, deadline, &self.catalog, &self.cluster)
             .await
     }
 
@@ -1874,7 +1928,7 @@ impl Oracle {
                 freshness: input.request.freshness,
                 query_id: input.admitted.query_id.into(),
                 ticket_minter: self.tail_ticket_minter.clone(),
-                cluster: Some(Arc::clone(&self.admission.cluster)),
+                cluster: Some(Arc::clone(&self.cluster)),
                 discovery: self.tail_discovery_for_query(),
             },
         );
@@ -1992,12 +2046,14 @@ impl Oracle {
         });
         let admitted = self
             .admission
-            .admit(
-                context.data_tenant_id,
-                class,
-                options.deadline,
-                self.shutdown.child_token(),
-            )
+            .admit(admission::PreparedAdmission {
+                tenant: context.data_tenant_id,
+                query_class: class,
+                deadline: options.deadline,
+                memory_ceiling: self.memory.reconciliation_limit_bytes as u64,
+                spill_eligible: true,
+                cancellation: self.shutdown.child_token(),
+            })
             .await?;
         self.execute_typed_plan(&context, plan, options, class, query_telemetry, admitted)
             .await
@@ -2037,7 +2093,7 @@ impl Oracle {
                 freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                 query_id: admitted.query_id.into(),
                 ticket_minter: self.tail_ticket_minter.clone(),
-                cluster: Some(Arc::clone(&self.admission.cluster)),
+                cluster: Some(Arc::clone(&self.cluster)),
                 discovery: self.tail_discovery_for_query(),
             },
         );
@@ -2157,13 +2213,18 @@ impl Oracle {
         self.startup_reconciled() && self.admission.is_available()
     }
 
+    /// Publishes a membership snapshot to future local admissions.
+    pub fn refresh_membership(&self, snapshot: &ClusterSnapshot) {
+        self.admission.refresh(snapshot);
+    }
+
     /// Captures every local readiness input without performing network or SQL IO.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn readiness_snapshot(&self) -> OracleReadinessSnapshot {
         OracleReadinessSnapshot {
             startup_reconciled: self.startup_reconciled(),
-            live_oracles: self.admission.cluster.snapshot().live_oracles().len(),
+            live_oracles: self.cluster.snapshot().live_oracles().len(),
             running_capacity: self.admission.slots.running_capacity(),
         }
     }
@@ -2211,6 +2272,22 @@ impl Oracle {
     /// [`Self::begin_shutdown`] has already synchronously rejected new work.
     pub async fn shutdown(&self, deadline: Instant) {
         self.begin_shutdown();
+        let report = self.admission.shutdown(deadline).await;
+        if report.active_queries != 0
+            || report.queued_queries != 0
+            || report.peer_pending != 0
+            || report.peer_running != 0
+        {
+            tracing::warn!(
+                active_queries = report.active_queries,
+                queued_queries = report.queued_queries,
+                reserved_memory_bytes = report.reserved_memory_bytes,
+                reserved_spill_bytes = report.reserved_spill_bytes,
+                peer_pending = report.peer_pending,
+                peer_running = report.peer_running,
+                "Oracle shutdown reached deadline with residual local admission state"
+            );
+        }
         let maintenance = self
             .maintenance
             .lock()
@@ -2235,6 +2312,7 @@ impl Oracle {
     /// This no-await operation is safe at an exhausted process deadline. It
     /// starts no external cleanup and leaves local guard cleanup authoritative.
     pub fn begin_shutdown(&self) {
+        self.admission.close();
         self.shutdown.cancel();
     }
 
@@ -2524,7 +2602,7 @@ impl Oracle {
                 },
             )
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
-        let snapshot = self.admission.cluster.snapshot();
+        let snapshot = self.cluster.snapshot();
         let leader = input.admitted.leader.node_id;
         let mut eligible = std::collections::BTreeMap::new();
         let mut fences = HashMap::new();

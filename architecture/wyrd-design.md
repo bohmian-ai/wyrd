@@ -1086,6 +1086,15 @@ way it chooses the Drift/Eval evaluation strategy.
 
 ### Bifrost — Wyrd's OLAP warehouse
 
+Oracle query-read admission has one narrow durability exception to the normal
+transactional audit rule: the serving process first fsyncs a versioned,
+CRC-framed local WAL record (including its acceptance timestamp), then a single
+bounded relay calls the canonical tenant hash-chain outbox writer at least once.
+Postgres mutations and every other durable transition remain transactionally
+audited at their own commit boundary. A crash after the outbox commit and
+before the local checkpoint may replay one valid duplicate, but never loses an
+accepted read decision.
+
 `Source` is the external read side ("Wyrd reads, never writes" — Doctrine #7).
 **Bifrost** is its Wyrd-owned counterpart: the public OLAP warehouse surface and
 analytical storage substrate `vala` uses to record Wyrd's **own** observations

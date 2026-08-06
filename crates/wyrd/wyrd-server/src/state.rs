@@ -176,6 +176,8 @@ pub struct BifrostQueryRuntime {
     advertise_ready: Arc<AtomicBool>,
     /// Optional server-owned executor retained for Oracle coordination tasks.
     coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Local WAL publisher retained for the complete Oracle lifecycle.
+    audit: Arc<crate::oracle::OracleAuditPublisher>,
 }
 
 impl BifrostQueryRuntime {
@@ -200,6 +202,7 @@ impl BifrostQueryRuntime {
         peer: Arc<crate::oracle::OraclePeerRuntime>,
         registry: Arc<ClusterRegistry>,
         coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+        audit: Arc<crate::oracle::OracleAuditPublisher>,
     ) -> Self {
         let role_shutdown = CancellationToken::new();
         let advertise_ready = Arc::new(AtomicBool::new(true));
@@ -224,6 +227,7 @@ impl BifrostQueryRuntime {
             lifecycle: Arc::new(RoleLifecycle::serving()),
             advertise_ready,
             coordination_runtime,
+            audit,
         }
     }
 
@@ -284,6 +288,7 @@ impl BifrostQueryRuntime {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
         self.oracle.shutdown(deadline).await;
+        let _ = self.audit.shutdown(deadline).await;
         await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await;
         await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await;
     }

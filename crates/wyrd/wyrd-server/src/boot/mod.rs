@@ -56,7 +56,7 @@ use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::EvalAuditWriter;
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
 use crate::oracle::{
-    OraclePeerAuthority, OraclePeerRuntime, PostgresPeerSecurityAudit, ServerOracleAudit,
+    OracleAuditPublisher, OraclePeerAuthority, OraclePeerRuntime, PostgresPeerSecurityAudit,
     ServerOraclePeerCredentials,
 };
 use crate::postgres::ServerPostgres;
@@ -1166,7 +1166,13 @@ impl<'a> OracleRoleBuilder<'a> {
             .ok_or_else(|| {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
-        let audit = Arc::new(ServerOracleAudit::new(state.postgres.vala().clone()));
+        let audit = OracleAuditPublisher::new(
+            state.postgres.vala().clone(),
+            (&config.bifrost.oracle).into(),
+        )
+        .map_err(|error| {
+            ServerBootError::OraclePeer(format!("Oracle audit WAL recovery failed: {error:?}"))
+        })?;
         let tail_audit = Arc::new(
             crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
                 .await
@@ -1220,7 +1226,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 reconciliation_limit_bytes,
             },
             tails: Arc::new(TailTransportDirectory::default()),
-            audit,
+            audit: audit.clone(),
             peer_ticket_minter,
             tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
@@ -1279,6 +1285,7 @@ impl<'a> OracleRoleBuilder<'a> {
             role,
             peer,
             cluster,
+            audit,
         })
     }
 }
@@ -1316,6 +1323,8 @@ struct BuiltOracleRole {
     peer: Arc<OraclePeerRuntime>,
     /// Cluster owner used for activation and snapshot publication.
     cluster: Arc<ClusterRegistry>,
+    /// Local audit publisher recovered before role activation.
+    audit: Arc<OracleAuditPublisher>,
 }
 
 impl BuiltOracleRole {
@@ -1331,6 +1340,7 @@ impl BuiltOracleRole {
             role,
             peer,
             cluster,
+            audit,
         } = self;
         match tokio::time::timeout(ORACLE_STARTUP_TIMEOUT, oracle.await_startup()).await {
             Ok(Ok(())) => {}
@@ -1365,7 +1375,9 @@ impl BuiltOracleRole {
                 "Oracle role did not become ready after activation".to_owned(),
             ));
         }
-        let query_runtime = Arc::new(BifrostQueryRuntime::new(oracle, role, peer, cluster, None));
+        let query_runtime = Arc::new(BifrostQueryRuntime::new(
+            oracle, role, peer, cluster, None, audit,
+        ));
         Ok(state.with_bifrost_query(query_runtime))
     }
 }
@@ -1433,6 +1445,7 @@ pub async fn attach_test_oracle_runtime_for_node_at(
     let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
+    config.bifrost.oracle.audit_wal_root = Some(test_oracle_audit_root(node_id.as_uuid()));
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1464,6 +1477,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
     let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
+    config.bifrost.oracle.audit_wal_root = Some(test_oracle_audit_root(node_id.as_uuid()));
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1496,6 +1510,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
     let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
+    config.bifrost.oracle.audit_wal_root = Some(test_oracle_audit_root(node_id.as_uuid()));
     config.bifrost.oracle.peer_ca_certificate_path = Some(ca_path);
     config.bifrost.oracle.peer_server_name = Some(server_name);
     OracleRoleBuilder {
@@ -1509,6 +1524,12 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
     }
     .build()
     .await
+}
+
+#[cfg(feature = "test-support")]
+/// Returns a node-stable temporary WAL root so restart tests replay backlog.
+fn test_oracle_audit_root(node_id: uuid::Uuid) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("wyrd-oracle-audit-test-{node_id}"))
 }
 
 /// Releases a reserved or active Oracle fence after partial boot failure.

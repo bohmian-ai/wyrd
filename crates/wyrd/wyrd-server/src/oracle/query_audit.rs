@@ -1,6 +1,13 @@
 //! Transactional outbox audit owner for retained Oracle queries.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, OracleAudit,
     VerifiedSecurityContext,
@@ -9,159 +16,335 @@ use vala_sql::ValaPostgres;
 use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult};
 use wyrd_spec::vala::error::BifrostError;
 
-/// Closed failure phases for the server Oracle audit transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OracleAuditStoreError {
-    /// A tenant-scoped transaction could not be acquired.
-    Acquire,
-    /// The outbox event could not be appended.
-    Append,
-    /// The transaction could not be committed durably.
-    Commit,
-    /// The transaction task failed before returning its result.
-    Join,
-}
+use super::audit_wal::{
+    AuditWal, AuditWalAppendCommand, AuditWalRecord, AuditWalWriter, AuditWalWriterControl,
+    OracleAuditWalConfig,
+};
 
-/// Durable store boundary used by the Oracle audit owner.
-#[async_trait]
-trait OracleAuditStore: Send + Sync {
-    /// Appends and commits one event under the authenticated tenant.
-    ///
-    /// # Errors
-    ///
-    /// Returns the exact failed transaction phase.
-    async fn commit_event(
-        &self,
-        tenant: wyrd_spec::DataTenantId,
-        event: AuditEvent,
-    ) -> Result<(), OracleAuditStoreError>;
-}
+static TEMP_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Production SQL implementation of the Oracle audit store boundary.
-struct PostgresOracleAuditStore {
-    /// Tenant-scoped SQL root used to begin outbox transactions.
-    vala: ValaPostgres,
-}
-
-#[async_trait]
-impl OracleAuditStore for PostgresOracleAuditStore {
-    /// Runs append and commit in one owned task and reports the exact failure phase.
-    ///
-    /// # Errors
-    ///
-    /// Returns acquire, append, commit, or task-join failure without exposing SQL
-    /// details across the public query boundary.
-    async fn commit_event(
-        &self,
-        tenant: wyrd_spec::DataTenantId,
-        event: AuditEvent,
-    ) -> Result<(), OracleAuditStoreError> {
-        let vala = self.vala.clone();
-        tokio::spawn(async move {
-            let mut conn = vala
-                .tenant_conn(tenant)
-                .await
-                .map_err(|_| OracleAuditStoreError::Acquire)?;
-            vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
-                .await
-                .map_err(|_| OracleAuditStoreError::Append)?;
-            conn.commit()
-                .await
-                .map_err(|_| OracleAuditStoreError::Commit)
-        })
-        .await
-        .map_err(|_| OracleAuditStoreError::Join)?
+impl From<&crate::config::OracleRuntimeConfig> for OracleAuditWalConfig {
+    /// Projects server configuration into the WAL owner's validated bounds.
+    fn from(config: &crate::config::OracleRuntimeConfig) -> Self {
+        Self {
+            audit_wal_root: config.audit_wal_root.clone(),
+            audit_wal_max_records: config.audit_wal_max_records,
+            audit_wal_max_bytes: config.audit_wal_max_bytes,
+            audit_wal_max_age_seconds: config.audit_wal_max_age_seconds,
+            audit_relay_batch_records: config.audit_relay_batch_records,
+            audit_relay_attempt_timeout_ms: config.audit_relay_attempt_timeout_ms,
+            audit_relay_backoff_initial_ms: config.audit_relay_backoff_initial_ms,
+            audit_relay_backoff_max_ms: config.audit_relay_backoff_max_ms,
+            audit_relay_shutdown_timeout_ms: config.audit_relay_shutdown_timeout_ms,
+        }
     }
 }
 
-/// Commits Oracle read decisions and tenant violations through the standard outbox.
-#[derive(Clone)]
-pub struct ServerOracleAudit {
-    /// Durable transaction owner used before Oracle performs any row read.
-    store: std::sync::Arc<dyn OracleAuditStore>,
+/// Report returned when an Oracle audit publisher is asked to stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditShutdownReport {
+    /// Number of records checkpointed during shutdown.
+    pub relayed: u64,
+    /// Number of records still durable in the local WAL.
+    pub backlog_records: u64,
+    /// Bytes still durable in the local WAL.
+    pub backlog_bytes: u64,
+    /// Age of the oldest remaining accepted record.
+    pub oldest_backlog_age: Option<Duration>,
 }
 
-impl ServerOracleAudit {
-    /// Creates the production Oracle audit collaborator from the shared SQL owner.
-    #[must_use]
-    pub fn new(vala: ValaPostgres) -> Self {
-        Self {
-            store: std::sync::Arc::new(PostgresOracleAuditStore { vala }),
+/// Guard that pauses the production relay immediately before its SQL attempt.
+#[cfg(feature = "test-support")]
+pub struct AuditRelayPauseGuard {
+    /// Shared control state resumed on guard drop.
+    control: std::sync::Arc<RelayControl>,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for AuditRelayPauseGuard {
+    /// Resumes the sole relay when the test no longer owns the pause guard.
+    fn drop(&mut self) {
+        self.control.paused.store(false, Ordering::Release);
+        self.control.notify.notify_waiters();
+    }
+}
+
+struct RelayControl {
+    /// Pauses relay SQL at the fault-injection seam.
+    paused: AtomicBool,
+    /// Stops relay after a successful commit before checkpoint advancement.
+    fail_after_commit: AtomicBool,
+    /// Wakes the relay when a pause guard is dropped.
+    notify: Notify,
+}
+
+/// Owns local acceptance and the one bounded background relay into Postgres.
+pub struct OracleAuditPublisher {
+    /// Recoverable local WAL protected by its root lock.
+    wal: std::sync::Arc<Mutex<AuditWal>>,
+    /// Bounded ingress to the sole grouped WAL writer.
+    writer_tx: Mutex<Option<mpsc::Sender<AuditWalAppendCommand>>>,
+    /// Retained writer task joined during shutdown.
+    writer: Mutex<Option<JoinHandle<()>>>,
+    /// One-shot grouped-write failure seam.
+    writer_fail_next_group: std::sync::Arc<AtomicBool>,
+    /// Writer pause and sync-count controls used by deterministic test seams.
+    writer_control: std::sync::Arc<AuditWalWriterControl>,
+    /// Shared SQL handle used only by the background relay.
+    vala: ValaPostgres,
+    /// Cancels relay work during ordered shutdown.
+    cancel: CancellationToken,
+    /// Wakes relay after a local fsync acknowledgement.
+    wake: std::sync::Arc<Notify>,
+    /// Test hooks wrapping the production relay state machine.
+    control: std::sync::Arc<RelayControl>,
+    /// Sole retained relay task handle.
+    relay: Mutex<Option<JoinHandle<()>>>,
+    /// Bounded retry, batch, and shutdown settings.
+    config: OracleAuditWalConfig,
+}
+
+impl OracleAuditPublisher {
+    /// Opens and recovers the configured root before Oracle role activation.
+    pub(crate) fn new(
+        vala: ValaPostgres,
+        config: OracleAuditWalConfig,
+    ) -> Result<std::sync::Arc<Self>, BifrostError> {
+        let root = config.audit_wal_root.clone().unwrap_or_else(|| {
+            let sequence = TEMP_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "wyrd-oracle-audit-{}-{sequence}",
+                std::process::id()
+            ))
+        });
+        let wal = AuditWal::recover(&root, &config)?;
+        let wal = std::sync::Arc::new(Mutex::new(wal));
+        let writer_capacity = config.audit_wal_max_records.clamp(1, 1024);
+        let (writer_tx, writer_fail_next_group, writer_control, writer) =
+            AuditWalWriter::spawn(std::sync::Arc::clone(&wal), writer_capacity);
+        let cancel = CancellationToken::new();
+        let publisher = std::sync::Arc::new(Self {
+            wal,
+            writer_tx: Mutex::new(Some(writer_tx)),
+            writer: Mutex::new(Some(writer)),
+            writer_fail_next_group,
+            writer_control,
+            vala,
+            cancel: cancel.clone(),
+            wake: std::sync::Arc::new(Notify::new()),
+            control: std::sync::Arc::new(RelayControl {
+                paused: AtomicBool::new(false),
+                fail_after_commit: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+            relay: Mutex::new(None),
+            config,
+        });
+        let task_owner = std::sync::Arc::clone(&publisher);
+        let handle = tokio::spawn(async move { task_owner.relay_loop().await });
+        if let Ok(mut slot) = publisher.relay.try_lock() {
+            *slot = Some(handle);
+        }
+        Ok(publisher)
+    }
+
+    /// Enqueues a read decision and waits for the local frame fsync.
+    pub async fn publish_read_decision(
+        &self,
+        context: &AuthorizedQueryContext,
+        decision: BifrostQueryReadDecision,
+    ) -> Result<(), BifrostError> {
+        let event = build_event(
+            context,
+            "bifrost.query.read_decision",
+            AuditResult::Success,
+            decision.into_detail(),
+        );
+        self.append(context.data_tenant_id, event).await
+    }
+
+    /// Performs one bounded blocking WAL append and wakes the relay.
+    async fn append(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        event: AuditEvent,
+    ) -> Result<(), BifrostError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let command = AuditWalAppendCommand {
+            tenant,
+            event,
+            ack: ack_tx,
+        };
+        let sender = self
+            .writer_tx
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or(BifrostError::QueryAuditUnavailable)?;
+        sender
+            .try_send(command)
+            .map_err(|_| BifrostError::QueryAuditUnavailable)?;
+        ack_rx
+            .await
+            .map_err(|_| BifrostError::QueryAuditUnavailable)??;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// Drains accepted records until the caller's deadline and reports residue.
+    pub async fn shutdown(&self, deadline: Instant) -> AuditShutdownReport {
+        let deadline = effective_shutdown_deadline(
+            Instant::now(),
+            deadline,
+            self.config.audit_relay_shutdown_timeout_ms,
+        );
+        let before = self.wal.lock().await.snapshot();
+        self.writer_tx.lock().await.take();
+        let mut writer = self.writer.lock().await;
+        if let Some(mut task) = writer.take() {
+            let _ =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut task).await;
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+        self.wake.notify_waiters();
+        self.cancel.cancel();
+        let mut slot = self.relay.lock().await;
+        if let Some(mut task) = slot.take() {
+            let _ =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut task).await;
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+        let snapshot = self.wal.lock().await.snapshot();
+        AuditShutdownReport {
+            relayed: before.0.saturating_sub(snapshot.0),
+            backlog_records: snapshot.0,
+            backlog_bytes: snapshot.1,
+            oldest_backlog_age: snapshot.2,
         }
     }
 
-    /// Appends and commits one scrubbed event under the authenticated tenant.
-    ///
-    /// The transaction is released before Oracle performs any row read. A failed
-    /// append or commit is therefore fail-closed and cannot leak a response frame.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::QueryAuditUnavailable`] when tenant connection
-    /// acquisition, outbox append, or commit fails.
-    async fn commit(
-        &self,
-        context: &AuthorizedQueryContext,
-        operation: &str,
-        result: AuditResult,
-        detail: AuditDetail,
-    ) -> Result<(), BifrostError> {
-        let event = AuditEvent::new(
-            context.request_id.clone(),
-            context.trace_id.clone(),
-            operation.to_owned(),
-            "bifrost.query".to_owned(),
-            context.principal.card_ref().cloned(),
-            context.principal.id,
-            context.principal.kind.tag(),
-            context.auth_method,
-            context.permission.clone(),
-            AuditDecision::Allow,
-            result,
-            "scrubbed Bifrost query decision".to_owned(),
-        )
-        .with_detail(detail);
-        self.store
-            .commit_event(context.data_tenant_id, event)
-            .await
-            .map_err(|_| BifrostError::QueryAuditUnavailable)
+    /// Pauses the production relay before its next Postgres transaction.
+    #[cfg(feature = "test-support")]
+    pub fn pause_relay_before_postgres(&self) -> AuditRelayPauseGuard {
+        self.control.paused.store(true, Ordering::Release);
+        AuditRelayPauseGuard {
+            control: std::sync::Arc::clone(&self.control),
+        }
+    }
+
+    /// Terminates the relay after its next successful Postgres commit.
+    #[cfg(feature = "test-support")]
+    pub fn fail_after_next_postgres_commit_before_checkpoint(&self) {
+        self.control
+            .fail_after_commit
+            .store(true, Ordering::Release);
+    }
+
+    /// Forces the next grouped local sync to fan out a durable failure.
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_wal_group_for_test(&self) {
+        self.writer_fail_next_group.store(true, Ordering::Release);
+    }
+
+    /// Pauses the sole writer before it receives a group for saturation tests.
+    #[cfg(feature = "test-support")]
+    pub fn pause_writer_before_group_for_test(&self) -> super::audit_wal::AuditWalWriterPauseGuard {
+        self.writer_control.paused.store(true, Ordering::Release);
+        super::audit_wal::AuditWalWriterPauseGuard {
+            control: std::sync::Arc::clone(&self.writer_control),
+        }
+    }
+
+    /// Returns the number of completed grouped append-and-sync operations.
+    #[cfg(feature = "test-support")]
+    pub fn writer_sync_count_for_test(&self) -> u64 {
+        self.writer_control.sync_count.load(Ordering::Acquire)
+    }
+
+    /// Returns the pending record, byte, and age snapshot used by restart tests.
+    #[cfg(feature = "test-support")]
+    pub fn wal_snapshot(&self) -> (u64, u64, Option<Duration>) {
+        self.wal
+            .try_lock()
+            .map_or((0, 0, None), |wal| wal.snapshot())
+    }
+
+    /// Relays bounded snapshots and checkpoints only after SQL commit.
+    async fn relay_loop(self: std::sync::Arc<Self>) {
+        let mut backoff = Duration::from_millis(self.config.audit_relay_backoff_initial_ms);
+        loop {
+            let records = self
+                .wal
+                .lock()
+                .await
+                .pending(self.config.audit_relay_batch_records);
+            if records.is_empty() {
+                if self.cancel.is_cancelled() {
+                    return;
+                }
+                tokio::select! { _ = self.wake.notified() => {}, _ = self.cancel.cancelled() => {} }
+                continue;
+            }
+            let mut progressed = false;
+            for record in records {
+                while self.control.paused.load(Ordering::Acquire) {
+                    self.control.notify.notified().await;
+                }
+                let result = tokio::time::timeout(
+                    Duration::from_millis(self.config.audit_relay_attempt_timeout_ms),
+                    relay_record(&self.vala, &record),
+                )
+                .await;
+                match result {
+                    Ok(Ok(())) => {
+                        if self.control.fail_after_commit.swap(false, Ordering::AcqRel) {
+                            return;
+                        }
+                        if self.wal.lock().await.checkpoint(record.lsn).is_err() {
+                            return;
+                        }
+                        progressed = true;
+                        backoff = Duration::from_millis(self.config.audit_relay_backoff_initial_ms);
+                    }
+                    _ => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_millis(
+                            self.config.audit_relay_backoff_max_ms,
+                        ));
+                        break;
+                    }
+                }
+            }
+            if !progressed && self.cancel.is_cancelled() {
+                return;
+            }
+        }
     }
 }
 
 #[async_trait]
-impl OracleAudit for ServerOracleAudit {
-    /// Commits the immutable read decision before Oracle reads query rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit unavailable when the standard outbox transaction cannot
-    /// commit.
+impl OracleAudit for OracleAuditPublisher {
+    /// Accepts the immutable read decision in the local WAL before any row read.
     async fn append_read_decision(
         &self,
         context: &AuthorizedQueryContext,
         decision: BifrostQueryReadDecision,
     ) -> Result<(), BifrostError> {
-        self.commit(
-            context,
-            "bifrost.query.read_decision",
-            AuditResult::Success,
-            decision.into_detail(),
-        )
-        .await
+        self.publish_read_decision(context, decision).await
     }
 
-    /// Commits a verified tenant-source violation as an independent failure event.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit unavailable when the standard outbox transaction cannot
-    /// commit.
+    /// Accepts a verified security violation in the local WAL.
     async fn append_security_violation(
         &self,
         context: VerifiedSecurityContext,
         violation: BifrostSecurityViolation,
     ) -> Result<(), BifrostError> {
-        self.commit(
+        let event = build_event(
             &context.query,
             "bifrost.query.security_violation",
             AuditResult::Failure,
@@ -170,67 +353,71 @@ impl OracleAudit for ServerOracleAudit {
                 phase: violation.phase,
                 query_digest: context.query_digest,
             },
-        )
-        .await
+        );
+        self.append(context.query.data_tenant_id, event).await
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+/// Caps a caller deadline at the configured shutdown drain window.
+fn effective_shutdown_deadline(
+    started_at: Instant,
+    caller_deadline: Instant,
+    timeout_ms: u64,
+) -> Instant {
+    caller_deadline.min(started_at + Duration::from_millis(timeout_ms))
+}
+
+/// Builds the scrubbed event shared by local read and violation acceptance.
+fn build_event(
+    context: &AuthorizedQueryContext,
+    operation: &str,
+    result: AuditResult,
+    detail: AuditDetail,
+) -> AuditEvent {
+    AuditEvent::new(
+        context.request_id.clone(),
+        context.trace_id.clone(),
+        operation.to_owned(),
+        "bifrost.query".to_owned(),
+        context.principal.card_ref().cloned(),
+        context.principal.id,
+        context.principal.kind.tag(),
+        context.auth_method,
+        context.permission.clone(),
+        AuditDecision::Allow,
+        result,
+        "scrubbed Bifrost query decision".to_owned(),
+    )
+    .with_detail(detail)
+}
+
+/// Appends and commits one tenant event through the canonical SQL writer.
+async fn relay_record(vala: &ValaPostgres, record: &AuditWalRecord) -> Result<(), ()> {
+    let mut conn = vala.tenant_conn(record.tenant).await.map_err(|_| ())?;
+    vala_sql::queries::audit_outbox::append_audit(&mut conn, &record.event)
+        .await
+        .map_err(|_| ())?;
+    conn.commit().await.map_err(|_| ())
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod pg_tests {
     use std::time::{Duration, Instant};
 
-    use arrow::datatypes::{DataType, Field, Schema};
-    use axum::http::{StatusCode, header};
-    use datafusion::catalog::default_table_source::provider_as_source;
-    use datafusion::datasource::empty::EmptyTable;
-    use datafusion::logical_expr::LogicalPlanBuilder;
-    use vala_bifrost_redux::cluster::ClusterRegistry;
-    use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use vala_bifrost_redux::oracle::{
-        Oracle, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-        QueryOptions, TailTransportDirectory,
-    };
-    use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
+    use vala_bifrost_redux::oracle::AuthorizedQueryContext;
+    use vala_bifrost_redux::oracle::BifrostQueryReadDecision;
     use wyrd_runtime::permission::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        AuthMethod, BifrostSecurityPhase, BifrostSecurityViolationKind, OracleCapabilitiesV1,
-        QueryClass, VisibilityMode,
+        AuditDetail, AuthMethod, QueryAuditDigest, QueryClass, QueryExecutionMode, VisibilityMode,
     };
 
     use super::*;
 
-    /// Deterministic store that fails at one requested transaction phase.
-    struct FailingStore {
-        /// Failure returned to the server audit owner.
-        failure: OracleAuditStoreError,
-    }
-
-    #[async_trait]
-    impl OracleAuditStore for FailingStore {
-        /// Returns the configured append or commit failure.
-        ///
-        /// # Errors
-        ///
-        /// Always returns the configured transaction failure.
-        async fn commit_event(
-            &self,
-            _tenant: wyrd_spec::DataTenantId,
-            _event: AuditEvent,
-        ) -> Result<(), OracleAuditStoreError> {
-            Err(self.failure)
-        }
-    }
-
-    /// Builds one internally authenticated query context for the supplied tenant.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the principal and tenant cannot form a valid query context.
-    fn context_for(tenant: wyrd_spec::DataTenantId) -> AuthorizedQueryContext {
+    /// Builds the valid tenant-bound context used by relay integration tests.
+    fn context(tenant: wyrd_spec::DataTenantId) -> AuthorizedQueryContext {
         let principal = Principal::new(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
@@ -249,195 +436,150 @@ mod tests {
         .expect("matching tenant context")
     }
 
-    /// Builds one internally authenticated query context for unit-only audit tests.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the static tenant literal cannot be parsed or cannot form a
-    /// valid authenticated context.
-    fn context() -> AuthorizedQueryContext {
-        context_for(
-            "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
-                .parse()
-                .expect("static tenant"),
-        )
-    }
-
-    /// Builds a bounded structured detail for transaction fault tests.
-    fn detail() -> AuditDetail {
-        AuditDetail::BifrostSecurityViolation {
-            violation: BifrostSecurityViolationKind::TenantRow,
-            phase: BifrostSecurityPhase::Source,
-            query_digest: None,
-        }
-    }
-
-    /// Builds a ready Oracle whose production server audit fails at one store phase.
-    ///
-    /// # Panics
-    ///
-    /// Panics when shared SQL/catalog fixtures, membership, Oracle construction,
-    /// or startup reconciliation fail.
-    async fn oracle_with_failure(
-        failure: OracleAuditStoreError,
-    ) -> (
-        Oracle,
-        Arc<ClusterRegistry>,
-        vala_bifrost_redux::cluster::RegisteredRole,
-    ) {
-        let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
-        let vala = crate::test_support::test_vala_postgres().await;
-        let cluster = Arc::new(ClusterRegistry::new(vala.clone(), node_id));
-        let role = cluster
-            .reserve_oracle(
-                "127.0.0.1:50052",
-                OracleCapabilitiesV1 {
-                    peer_protocol_version: 1,
-                    storage_protocol_version: 1,
-                    cpu_cores: 16.0,
-                    memory_budget_bytes: 1024 * 1024 * 1024,
-                    cpu_cores_per_slot: 1.0,
-                    memory_bytes_per_slot: 64 * 1024 * 1024,
-                    raw_slots: 16,
-                    usable_slots: 16,
-                    supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
-                    max_workers_per_query: 0,
-                },
-            )
-            .await
-            .expect("reserve Oracle");
-        cluster.activate(&role).await.expect("activate Oracle");
-        cluster.refresh_snapshot().await.expect("Oracle snapshot");
-        let oracle = Oracle::new(OracleBuildConfig {
-            catalog: crate::test_support::test_redux_catalog().await,
-            vala,
-            cluster: Arc::clone(&cluster),
-            local_role: role.clone(),
-            local_slots: Arc::new(OracleSlotManager::new(16, 16)),
-            memory: OracleMemoryResources {
-                governor: BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("memory governor"),
-                reconciliation_limit_bytes: 64 * 1024 * 1024,
-            },
-            tails: Arc::new(TailTransportDirectory::default()),
-            audit: Arc::new(ServerOracleAudit {
-                store: Arc::new(FailingStore { failure }),
-            }),
-            peer_ticket_minter: Arc::new(
-                vala_bifrost_redux::oracle::peer::DeterministicTestSigner {
-                    key_id: "test".to_owned(),
-                },
-            ),
-            tail_ticket_minter: None,
-            tail_discovery: None,
-            peer_transports: None,
-            config: OracleConfig {
-                tenant_interactive_slots: 16,
-                tenant_analytical_slots: 16,
-                max_workers_per_query: 0,
-                ..OracleConfig::default()
-            },
+    /// Builds one valid read decision accepted by the production publisher.
+    fn decision() -> BifrostQueryReadDecision {
+        let digest = |value: &str| QueryAuditDigest::new(value).expect("valid digest");
+        BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
+            query_digest: digest("sha256:query"),
+            query_class: QueryClass::Interactive,
+            visibility: VisibilityMode::PublishedOnly,
+            binding_digests: vec![digest("sha256:binding")],
+            snapshot_digest: digest("sha256:snapshot"),
+            manifest_digest: digest("sha256:manifest"),
+            projection_digest: digest("sha256:projection"),
+            permission_digest: digest("sha256:permission"),
+            execution: QueryExecutionMode::Local,
+            selected_node_count: 1,
+            worker_count: 0,
+            slot_units: 1,
+            retry_ordinal: 0,
+            deadline_ms: 1_000,
         })
-        .expect("Oracle");
-        oracle
-            .await_startup()
-            .await
-            .expect("Oracle startup reconciliation");
-        assert!(oracle.is_ready(), "Oracle must be ready after startup");
-        (oracle, cluster, role)
+        .expect("valid decision")
     }
 
-    /// Proves append and commit faults both refuse a query before streaming.
-    #[tokio::test]
-    async fn append_and_commit_failures_are_fail_closed() {
-        for failure in [OracleAuditStoreError::Append, OracleAuditStoreError::Commit] {
-            let audit = ServerOracleAudit {
-                store: Arc::new(FailingStore { failure }),
-            };
-            let error = audit
-                .commit(
-                    &context(),
-                    "bifrost.query.read_decision",
-                    AuditResult::Success,
-                    detail(),
-                )
-                .await
-                .expect_err("audit transaction fault must refuse query");
-            assert_eq!(error, BifrostError::QueryAuditUnavailable);
-        }
+    /// Runs one async test on the process-lifetime runtime used by PgFixture.
+    fn run<F: std::future::Future<Output = ()>>(future: F) {
+        wyrd_runtime::runtime().block_on(future);
     }
 
-    /// Proves Oracle audit faults reach both transports before any frame exists.
     #[test]
-    fn oracle_audit_faults_are_prebyte_http_and_grpc_errors() {
-        wyrd_runtime::runtime().block_on(async {
-            for failure in [OracleAuditStoreError::Append, OracleAuditStoreError::Commit] {
-                let (oracle, cluster, role) = oracle_with_failure(failure).await;
-                let tenant = crate::test_support::test_tenant().await;
-                let table = vala_bifrost_redux::catalog::TableRef::new(
-                    BifrostNamespace::Datasets,
-                    "oracle_audit_fixture",
-                );
-                crate::test_support::test_redux_catalog()
-                    .await
-                    .register_dataset(
-                        tenant,
-                        table.clone(),
-                        vec![Field::new("value", DataType::Int64, false)],
-                        None,
-                    )
-                    .await
-                    .expect("register audit fixture");
-                let source =
-                    provider_as_source(Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
-                        Field::new("value", DataType::Int64, false),
-                    ])))));
-                let plan = LogicalPlanBuilder::scan(table.fqn(), source, None)
-                    .expect("fixture scan")
-                    .build()
-                    .expect("bound empty read plan");
-                let result = oracle
-                    .query_plan(
-                        context_for(tenant),
-                        plan,
-                        QueryOptions {
-                            visibility: VisibilityMode::PublishedOnly,
-                            deadline: Instant::now() + Duration::from_secs(2),
-                        },
-                    )
-                    .await;
-                assert!(
-                    result.is_err(),
-                    "audit failure must not construct an Oracle frame stream"
-                );
-                let error =
-                    result.expect_err("audit failure must precede Oracle stream construction");
-                assert_eq!(error, BifrostError::QueryAuditUnavailable);
-
-                let http = crate::query::routes::query_error_response(error.clone().into());
-                assert_eq!(http.status(), StatusCode::SERVICE_UNAVAILABLE);
-                assert!(
-                    !http.headers().contains_key("x-wyrd-schema-fingerprint"),
-                    "audit failure must occur before HTTP schema metadata"
-                );
-                assert_ne!(
-                    http.headers().get(header::CONTENT_TYPE),
-                    Some(
-                        &"application/vnd.wyrd.bifrost-query-stream"
-                            .parse()
-                            .expect("static query media type")
-                    )
-                );
-                let grpc = crate::grpc::query::query_status(error.into());
-                assert_eq!(grpc.code(), wyrd_tonic::tonic::Code::Unavailable);
-
-                oracle
-                    .shutdown(Instant::now() + Duration::from_secs(1))
-                    .await;
-                cluster
-                    .shutdown_role(role)
-                    .await
-                    .expect("unregister Oracle");
-            }
+    /// Proves a locally fsynced tenant event reaches the canonical outbox.
+    fn oracle_audit_relay_appends_tenant_scoped_event() {
+        run(async {
+            let vala = crate::test_support::test_vala_postgres().await;
+            let tenant = crate::test_support::test_tenant().await;
+            let root = tempfile::tempdir().expect("WAL root");
+            let config = OracleAuditWalConfig {
+                audit_wal_root: Some(root.path().to_owned()),
+                ..OracleAuditWalConfig::default()
+            };
+            let publisher = OracleAuditPublisher::new(vala.clone(), config).expect("publisher");
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("local acceptance");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count");
+            assert_eq!(count, 1);
+            publisher
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await;
         });
+    }
+
+    #[test]
+    /// Proves a commit-before-checkpoint crash window replays an accepted event.
+    fn oracle_audit_relay_replays_uncheckpointed_record_pg() {
+        run(async {
+            let vala = crate::test_support::test_vala_postgres().await;
+            let tenant = crate::test_support::test_tenant().await;
+            let root = tempfile::tempdir().expect("WAL root");
+            let config = OracleAuditWalConfig {
+                audit_wal_root: Some(root.path().to_owned()),
+                ..OracleAuditWalConfig::default()
+            };
+            let publisher =
+                OracleAuditPublisher::new(vala.clone(), config.clone()).expect("publisher");
+            let _pause = publisher.pause_relay_before_postgres();
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("local acceptance");
+            publisher.fail_after_next_postgres_commit_before_checkpoint();
+            drop(_pause);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            publisher
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await;
+            drop(publisher);
+            let restarted = OracleAuditPublisher::new(vala.clone(), config).expect("restart");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count");
+            assert!(
+                count >= 2,
+                "commit/checkpoint window replays a valid duplicate"
+            );
+            restarted
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await;
+        });
+    }
+
+    #[test]
+    /// Proves relay delivery preserves the existing tenant hash-chain order.
+    fn oracle_audit_relay_preserves_hash_chain_pg() {
+        run(async {
+            let vala = crate::test_support::test_vala_postgres().await;
+            let tenant = crate::test_support::test_tenant().await;
+            let root = tempfile::tempdir().expect("WAL root");
+            let config = OracleAuditWalConfig {
+                audit_wal_root: Some(root.path().to_owned()),
+                ..OracleAuditWalConfig::default()
+            };
+            let publisher = OracleAuditPublisher::new(vala.clone(), config).expect("publisher");
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("first acceptance");
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("second acceptance");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
+            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT seq, prev_hash, entry_hash FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision' ORDER BY seq DESC LIMIT 2").fetch_all(&mut **conn.transaction()).await.expect("chain rows");
+            assert!(rows.len() >= 2);
+            assert_eq!(rows[0].1, rows[1].2, "newest prev hash links prior entry");
+            publisher
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// Proves a caller deadline later than configuration is capped by the owner.
+    fn shutdown_deadline_caps_later_caller_deadline() {
+        let started = Instant::now();
+        let caller = started + Duration::from_secs(30);
+        assert_eq!(
+            effective_shutdown_deadline(started, caller, 10),
+            started + Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    /// Proves an earlier caller deadline is preserved and never extended.
+    fn shutdown_deadline_preserves_earlier_caller_deadline() {
+        let started = Instant::now();
+        let caller = started + Duration::from_millis(2);
+        assert_eq!(effective_shutdown_deadline(started, caller, 10), caller);
     }
 }

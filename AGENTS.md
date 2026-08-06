@@ -107,6 +107,11 @@ Locked cross-cutting decisions that any contributor must honor:
   explicit scopes.
 - Audit is foundational across CLI, UI, MCP, Python SDK, `wyrd-server`, and
   Vala surfaces.
+- Oracle query reads are the narrow exception to synchronous Postgres audit:
+  the server must fsync a versioned, CRC-framed local WAL acceptance before
+  permitting rows, then relay at least once into the canonical tenant
+  hash-chained outbox. Every Postgres mutation and other durable transition
+  remains transactionally audited at its commit boundary.
 
 ## 3. Ownership Boundaries
 

@@ -189,3 +189,8 @@ appends an `vala.audit_outbox` row in the same transaction as the
 mutation. The single writer is
 `crates/vala/vala-sql/src/queries/audit_outbox.rs::append_audit`. Do not
 create parallel writers.
+
+The one narrow exception is Oracle query-read admission: it first fsyncs a
+versioned CRC-framed local WAL record, then a single bounded background relay
+calls the same `append_audit` writer at least once. This exception does not
+apply to Postgres mutations or any other durable transition.

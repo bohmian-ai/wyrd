@@ -4,6 +4,7 @@ use std::sync::Arc;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker;
 
+mod audit_wal;
 mod peer_audit;
 mod peer_authority;
 mod peer_credentials;
@@ -17,7 +18,9 @@ pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerOraclePeerCredentials;
 pub use peer_service::OraclePeerGrpc;
-pub use query_audit::ServerOracleAudit;
+#[cfg(feature = "test-support")]
+pub use query_audit::AuditRelayPauseGuard;
+pub use query_audit::{AuditShutdownReport, OracleAuditPublisher};
 pub use tail_audit::PostgresTailSecurityAudit;
 pub use tail_authority::ScribeTailAuthority;
 pub use tail_discovery::RegistryTailStreamDiscovery;

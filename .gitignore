@@ -11,6 +11,9 @@ build/
 .vite/
 dist/
 
+# Native addon build artifacts (compiled outputs, never commit)
+*.node
+
 # Python / uv / maturin
 __pycache__/
 *.pyc

@@ -104,6 +104,9 @@ impl BifrostQueryService for BifrostQueryGrpc {
     /// Dropping the returned stream propagates cancellation through Oracle's
     /// retained stream guards.
     ///
+    /// The stream-query future is boxed solely to bound the generated tonic
+    /// trait future's compile-time layout; its runtime semantics are unchanged.
+    ///
     /// # Errors
     ///
     /// Returns stable authentication, request-validation, authorization,
@@ -115,9 +118,13 @@ impl BifrostQueryService for BifrostQueryGrpc {
         let caller = caller(self.state.clone(), request.metadata().clone()).await?;
         let request = wyrd_spec::vala::api::BifrostQueryRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let result = crate::query::service::stream_query(self.state.clone(), caller, request)
-            .await
-            .map_err(query_status)?;
+        let result = Box::pin(crate::query::service::stream_query(
+            self.state.clone(),
+            caller,
+            request,
+        ))
+        .await
+        .map_err(query_status)?;
         Ok(query_stream_response(result))
     }
 }

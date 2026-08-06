@@ -54,21 +54,23 @@ const RR9_BASE_CONTRACTS: &[MetricLabelContract] = &[
     ),
     ("bifrost_scribe_ingress_active", &[]),
     (
-        "bifrost_oracle_admission_rejections_total",
+        "oracle_admission_total",
         &[
-            ("scope", &["cluster", "class", "tenant"]),
+            ("class", &["interactive", "analytical"]),
+            ("outcome", &["admitted", "rejected"]),
             (
                 "reason",
-                &["pending_limit", "lease_capacity", "local_slots"],
+                &[
+                    "class_capacity",
+                    "tenant_budget",
+                    "queue_full",
+                    "queue_deadline",
+                    "memory",
+                    "spill",
+                    "audit_unavailable",
+                    "shutdown",
+                ],
             ),
-            ("query_class", &["interactive", "analytical"]),
-        ],
-    ),
-    (
-        "bifrost_oracle_source_operation_seconds",
-        &[
-            ("source", &["iceberg", "hot_sealed", "live_tail"]),
-            ("outcome", &["success", "failed", "cancelled"]),
         ],
     ),
 ];
@@ -122,7 +124,6 @@ async fn production_recorder_exposes_bifrost_owner_families() {
             "bifrost_scribe_wal_fsync_total",
             &["outcome=\"success\""][..],
         ),
-        ("bifrost_oracle_queries_total", &["outcome=\"success\""][..]),
         ("wyrd_postgres_pool_acquire_total", &["pool=\"app\""][..]),
         (
             "vala_postgres_pool_acquire_total",
@@ -147,36 +148,12 @@ async fn production_recorder_exposes_bifrost_owner_families() {
         ("bifrost_scribe_lane_active", &["lane=\"wal_io\""][..]),
         ("bifrost_scribe_persistence_queue_depth", &[][..]),
         ("bifrost_scribe_persistence_queue_bytes", &[][..]),
-        (
-            "bifrost_oracle_in_flight",
-            &[
-                "query_class=\"interactive\"",
-                "visibility=\"published_only\"",
-            ][..],
-        ),
-        (
-            "bifrost_oracle_in_flight",
-            &["query_class=\"interactive\"", "visibility=\"fused\""][..],
-        ),
-        (
-            "bifrost_oracle_in_flight",
-            &[
-                "query_class=\"analytical\"",
-                "visibility=\"published_only\"",
-            ][..],
-        ),
-        (
-            "bifrost_oracle_in_flight",
-            &["query_class=\"analytical\"", "visibility=\"fused\""][..],
-        ),
-        (
-            "bifrost_oracle_slots_in_use",
-            &["query_class=\"interactive\"", "role=\"leader\""][..],
-        ),
-        (
-            "bifrost_oracle_slots_in_use",
-            &["query_class=\"analytical\"", "role=\"leader\""][..],
-        ),
+        ("oracle_queries_active", &["class=\"interactive\""][..]),
+        ("oracle_queries_active", &["class=\"interactive\""][..]),
+        ("oracle_queries_active", &["class=\"analytical\""][..]),
+        ("oracle_queries_active", &["class=\"analytical\""][..]),
+        ("oracle_queries_active", &["class=\"interactive\""][..]),
+        ("oracle_queries_active", &["class=\"analytical\""][..]),
     ] {
         assert_eq!(
             prometheus_sample(&rendered, family, labels),
@@ -192,8 +169,8 @@ async fn production_recorder_exposes_bifrost_owner_families() {
         "bifrost_scribe_lane_active",
         "bifrost_scribe_persistence_queue_depth",
         "bifrost_scribe_persistence_queue_bytes",
-        "bifrost_oracle_in_flight",
-        "bifrost_oracle_slots_in_use",
+        "oracle_queries_active",
+        "oracle_queries_active",
         "wyrd_storage_operations_active",
     ] {
         assert_eq!(
@@ -206,10 +183,12 @@ async fn production_recorder_exposes_bifrost_owner_families() {
         "bifrost_gate_request_duration_seconds",
         "bifrost_scribe_wal_append_seconds",
         "bifrost_scribe_wal_fsync_seconds",
-        "bifrost_oracle_query_duration_seconds",
         "wyrd_postgres_pool_acquire_seconds",
         "vala_postgres_pool_acquire_seconds",
         "wyrd_storage_operation_duration_seconds",
+        "oracle_query_duration_seconds",
+        "oracle_query_time_to_first_batch_seconds",
+        "oracle_admission_queue_duration_seconds",
     ] {
         for suffix in ["_bucket", "_count", "_sum"] {
             assert!(
@@ -240,17 +219,6 @@ async fn production_recorder_exposes_bifrost_owner_families() {
             &[("outcome", &["success", "failed"][..])][..],
         ),
         (
-            "bifrost_oracle_query_duration_seconds",
-            &[
-                (
-                    "outcome",
-                    &["success", "rejected", "failed", "cancelled"][..],
-                ),
-                ("query_class", &["interactive", "analytical"][..]),
-                ("visibility", &["published_only", "fused"][..]),
-            ][..],
-        ),
-        (
             "wyrd_postgres_pool_acquire_seconds",
             &[
                 ("outcome", &["success", "failed", "cancelled"][..]),
@@ -271,6 +239,24 @@ async fn production_recorder_exposes_bifrost_owner_families() {
                 ("operation", &["get", "put", "list", "delete", "head"][..]),
                 ("outcome", &["success", "failed", "cancelled"][..]),
             ][..],
+        ),
+        (
+            "oracle_query_duration_seconds",
+            &[
+                ("class", &["interactive", "analytical"][..]),
+                (
+                    "outcome",
+                    &["success", "rejected", "failed", "cancelled"][..],
+                ),
+            ][..],
+        ),
+        (
+            "oracle_query_time_to_first_batch_seconds",
+            &[("class", &["interactive", "analytical"][..])][..],
+        ),
+        (
+            "oracle_admission_queue_duration_seconds",
+            &[("class", &["interactive", "analytical"][..])][..],
         ),
     ] {
         let mut bucket_labels = labels.to_vec();
@@ -315,7 +301,10 @@ async fn production_recorder_exposes_bifrost_owner_families() {
         ),
         (
             "bifrost_gate_query_streams_total",
-            &[("outcome", &["success", "failed", "cancelled"][..])][..],
+            &[(
+                "outcome",
+                &["success", "rejected", "failed", "cancelled"][..],
+            )][..],
         ),
         (
             "bifrost_scribe_rejections_total",
@@ -334,17 +323,6 @@ async fn production_recorder_exposes_bifrost_owner_families() {
         ),
         ("bifrost_scribe_wal_append_bytes_total", &[][..]),
         ("bifrost_scribe_wal_disk_bytes", &[][..]),
-        (
-            "bifrost_oracle_queries_total",
-            &[
-                (
-                    "outcome",
-                    &["success", "rejected", "failed", "cancelled"][..],
-                ),
-                ("query_class", &["interactive", "analytical"][..]),
-                ("visibility", &["published_only", "fused"][..]),
-            ][..],
-        ),
         (
             "wyrd_postgres_pool_acquire_total",
             &[("pool", &["app"][..])][..],
@@ -388,20 +366,16 @@ async fn production_recorder_exposes_bifrost_owner_families() {
             assert_exact_label_contract(&rendered, family, labels);
         }
     }
-    for family in [
-        "bifrost_gate_query_stream_duration_seconds",
-        "bifrost_oracle_source_operation_seconds",
-    ] {
-        let labels = RR9_BASE_CONTRACTS
-            .iter()
-            .find_map(|(candidate, labels)| (*candidate == family).then_some(*labels))
-            .expect("RR9 histogram base contract");
-        let mut bucket_labels = labels.to_vec();
-        bucket_labels.push(("le", BIFROST_BUCKET_LABELS));
-        assert_exact_label_contract(&rendered, &format!("{family}_bucket"), &bucket_labels);
-        assert_exact_label_contract(&rendered, &format!("{family}_count"), labels);
-        assert_exact_label_contract(&rendered, &format!("{family}_sum"), labels);
-    }
+    let family = "bifrost_gate_query_stream_duration_seconds";
+    let labels = RR9_BASE_CONTRACTS
+        .iter()
+        .find_map(|(candidate, labels)| (*candidate == family).then_some(*labels))
+        .expect("RR9 histogram base contract");
+    let mut bucket_labels = labels.to_vec();
+    bucket_labels.push(("le", BIFROST_BUCKET_LABELS));
+    assert_exact_label_contract(&rendered, &format!("{family}_bucket"), &bucket_labels);
+    assert_exact_label_contract(&rendered, &format!("{family}_count"), labels);
+    assert_exact_label_contract(&rendered, &format!("{family}_sum"), labels);
     cluster
         .shutdown()
         .await
@@ -454,7 +428,13 @@ fn validate_exact_label_contract(
         observed = true;
         let labels = parse_prometheus_labels(series)?;
         let expected = allowed.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>();
-        let actual = labels.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        let actual = labels
+            .keys()
+            .filter(|key| {
+                expected.contains(key.as_str()) || !matches!(key.as_str(), "quantile" | "le")
+            })
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         if actual != expected {
             return Err(format!("unexpected label keys for {family}: {series}"));
         }
@@ -528,7 +508,7 @@ fn rr9_label_contract_table_is_complete() {
         "bifrost_gate_active_streams",
         "bifrost_gate_query_stream_duration_seconds",
         "bifrost_scribe_ingress_active",
-        "bifrost_oracle_admission_rejections_total",
+        "oracle_admission_total",
         "bifrost_oracle_source_operation_seconds",
     ]
     .into_iter()

@@ -116,10 +116,11 @@ cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_publ
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_fused_reconcile_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_role_separated_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_distributed_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_multitenant_admission_journey --ignored --test-threads=1
-cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_multitenant_isolation_and_fairness_journey --ignored --test-threads=1
+cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_isolation_and_fairness_journey --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_peer_security_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_recovery_terminal_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_audit_relay_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- public_grpc_matches_http_frames --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- public_grpc_without_oracle_is_unavailable --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- public_grpc_drop_releases_query_resources --ignored --test-threads=1
@@ -127,7 +128,7 @@ cargo test --locked -p wyrd-testing --test integration -- typed_vala_route_uses_
 cargo test --locked -p wyrd-mcp --test bifrost_rbac -- bifrost_query_zero_rows_returns_authoritative_schema --ignored --test-threads=1
 cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_recovery_terminal_journey --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- oracle_production_telemetry_contract --ignored --test-threads=1
-cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan --test-threads=1
+cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_stale_file_replan --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- otlp_negative_journeys --test-threads=1
 """
 
@@ -193,6 +194,14 @@ run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifro
 [tasks."check:bifrost-oracle-deploy"]
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
 run = "cargo test --locked -p wyrd-testing bifrost_deployment_contract -- --nocapture"
+
+[tasks."check:bifrost-oracle-deleted-vocabulary"]
+description = "Reject deleted Oracle lease and reconciliation telemetry vocabulary"
+run = "scripts/checks/bifrost-oracle-deleted-vocabulary.sh"
+
+[tasks."test:bifrost-oracle-deleted-vocabulary"]
+description = "Self-test the deleted Oracle vocabulary checker against tracked fixtures"
+run = "bash scripts/checks/test-bifrost-oracle-deleted-vocabulary.sh"
 
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.

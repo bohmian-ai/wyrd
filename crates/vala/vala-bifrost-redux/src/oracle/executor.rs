@@ -2,9 +2,11 @@
 
 use std::fmt;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, Scalar, StringArray,
@@ -16,18 +18,207 @@ use arrow::compute::kernels::filter::filter_record_batch;
 use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
 use iceberg::arrow::ArrowFileReader;
-use iceberg::io::FileIO;
+use iceberg::io::{FileIO, FileRead};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+use parquet::file::reader::{ChunkReader, Length};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use wyrd_spec::vala::api::{QueryAuditDigest, WorkerAttemptFrame, WorkerFooter};
+use wyrd_spec::vala::api::{QueryAuditDigest, QueryClass, WorkerAttemptFrame, WorkerFooter};
 
-use super::fragment::{ClosedLeafPredicate, LeafComparison, LeafScalar, SealedScanFragment};
+use super::fragment::{
+    ClosedLeafPredicate, LeafComparison, LeafScalar, SealedScanFile, SealedScanFragment,
+};
+use super::query_class_label;
 use crate::scribe::memory::BifrostMemoryGovernor;
+
+/// Worker-owned physical demand collected for one sealed fragment attempt.
+#[derive(Debug)]
+struct WorkerScanCollector {
+    /// Query class used for the closed production metric label.
+    query_class: QueryClass,
+    /// Requested physical bytes, including requests that later fail.
+    requested_bytes: AtomicU64,
+    /// Files that issued at least one physical request.
+    files: AtomicU64,
+    /// One partition marker for the fragment when any request was issued.
+    partitions: AtomicU64,
+    /// Prevents duplicate emission when stream and wrappers both drop.
+    finalized: AtomicBool,
+}
+
+impl WorkerScanCollector {
+    /// Creates a collector whose terminal emission is owned by the attempt stream.
+    fn new(query_class: QueryClass) -> Arc<Self> {
+        Arc::new(Self {
+            query_class,
+            requested_bytes: AtomicU64::new(0),
+            files: AtomicU64::new(0),
+            partitions: AtomicU64::new(0),
+            finalized: AtomicBool::new(false),
+        })
+    }
+
+    /// Records one request immediately before the underlying read begins.
+    fn record_request(&self, bytes: u64, first_file_request: bool) {
+        self.requested_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if first_file_request {
+            self.files.fetch_add(1, Ordering::Relaxed);
+            self.partitions.store(1, Ordering::Release);
+        }
+    }
+
+    /// Returns the collected values for focused worker tests.
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.requested_bytes.load(Ordering::Acquire),
+            self.files.load(Ordering::Acquire),
+            self.partitions.load(Ordering::Acquire),
+        )
+    }
+
+    /// Emits terminal counters once for normal completion and drop paths.
+    fn finalize(&self) {
+        if self.finalized.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (bytes, files, partitions) = self.snapshot();
+        let class = query_class_label(self.query_class);
+        metrics::counter!("oracle_query_bytes_scanned_total", "class" => class).increment(bytes);
+        metrics::counter!("oracle_query_files_scanned_total", "class" => class).increment(files);
+        metrics::counter!("oracle_query_partitions_scanned_total", "class" => class)
+            .increment(partitions);
+    }
+}
+
+impl Drop for WorkerScanCollector {
+    /// Emits requested demand once, including failed, cancelled, and dropped attempts.
+    fn drop(&mut self) {
+        self.finalize();
+    }
+}
+
+/// Per-file request marker shared by ranged readers and their returned streams.
+#[derive(Debug)]
+struct WorkerFileScanCollector {
+    /// Attempt-level demand owner.
+    attempt: Arc<WorkerScanCollector>,
+    /// Ensures a file contributes one file count on its first request.
+    started: AtomicBool,
+}
+
+impl WorkerFileScanCollector {
+    /// Creates one file marker within an attempt collector.
+    fn new(attempt: Arc<WorkerScanCollector>) -> Arc<Self> {
+        Arc::new(Self {
+            attempt,
+            started: AtomicBool::new(false),
+        })
+    }
+
+    /// Records one physical request and marks the file on its first request.
+    fn record_request(&self, bytes: u64) {
+        let first = !self.started.swap(true, Ordering::AcqRel);
+        self.attempt.record_request(bytes, first);
+    }
+}
+
+/// `FileIO` reader wrapper that records each requested range before awaiting it.
+struct CountingFileRead {
+    /// Underlying Iceberg reader.
+    inner: Box<dyn FileRead>,
+    /// Per-file demand marker.
+    metrics: Arc<WorkerFileScanCollector>,
+}
+
+#[async_trait]
+impl FileRead for CountingFileRead {
+    /// Records the requested range before delegating to object storage.
+    ///
+    /// # Errors
+    /// Propagates the underlying Iceberg reader's storage or cancellation error.
+    async fn read(&self, range: std::ops::Range<u64>) -> iceberg::Result<bytes::Bytes> {
+        self.metrics
+            .record_request(range.end.saturating_sub(range.start));
+        self.inner.read(range).await
+    }
+}
+
+/// Local Parquet reader wrapper that records random and sequential requests.
+#[derive(Debug)]
+struct CountingChunkReader<R> {
+    /// Underlying concrete Parquet reader.
+    inner: R,
+    /// Per-file demand marker.
+    metrics: Arc<WorkerFileScanCollector>,
+}
+
+impl<R> Length for CountingChunkReader<R>
+where
+    R: Length,
+{
+    /// Returns the underlying file length without counting metadata access.
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+}
+
+impl<R> ChunkReader for CountingChunkReader<R>
+where
+    R: ChunkReader,
+{
+    type T = CountingRead<R::T>;
+
+    /// Opens a sequential reader while retaining the per-file counter.
+    ///
+    /// # Errors
+    /// Propagates the underlying Parquet reader's seek or storage error.
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        let reader = self.inner.get_read(start)?;
+        Ok(CountingRead {
+            inner: reader,
+            metrics: Arc::clone(&self.metrics),
+        })
+    }
+
+    /// Records a random-access request before delegating the byte fetch.
+    ///
+    /// # Errors
+    /// Propagates the underlying Parquet reader's random-access or storage error.
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+        self.metrics
+            .record_request(u64::try_from(length).unwrap_or(u64::MAX));
+        self.inner.get_bytes(start, length)
+    }
+}
+
+/// Read wrapper that counts each returned buffer from a local Parquet stream.
+#[derive(Debug)]
+struct CountingRead<R> {
+    /// Underlying sequential reader.
+    inner: R,
+    /// Per-file demand marker.
+    metrics: Arc<WorkerFileScanCollector>,
+}
+
+impl<R> Read for CountingRead<R>
+where
+    R: Read,
+{
+    /// Counts the requested buffer before delegating the read operation.
+    ///
+    /// # Errors
+    /// Propagates the underlying filesystem or buffered-reader error.
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.metrics
+            .record_request(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        self.inner.read(buffer)
+    }
+}
 
 /// Executor validation or sealed-read failure.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -71,6 +262,13 @@ pub enum ExecutorError {
 pub type WorkerFrameStream =
     Pin<Box<dyn Stream<Item = Result<WorkerAttemptFrame, ExecutorError>> + Send>>;
 
+/// Incremental decoded batches for one sealed file before worker framing.
+type WorkerBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, ExecutorError>> + Send>>;
+
+/// Test-only factory for an existing [`FileRead`] implementation.
+#[cfg(test)]
+type TestFileReadFactory = Arc<dyn Fn() -> Box<dyn FileRead> + Send + Sync>;
+
 /// Shared executor used by local and remote adapters.
 #[derive(Clone, Default)]
 pub struct SealedFragmentExecutor {
@@ -78,16 +276,32 @@ pub struct SealedFragmentExecutor {
     file_io: Option<FileIO>,
     /// Optional process-wide governor required by production worker construction.
     memory_governor: Option<BifrostMemoryGovernor>,
+    /// Deterministic existing-interface reader used only by focused tests.
+    #[cfg(test)]
+    reader_override: Option<TestFileReadFactory>,
 }
 
 impl fmt::Debug for SealedFragmentExecutor {
     /// Redacts backend configuration while showing whether remote IO is available.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SealedFragmentExecutor")
-            .field("object_store_configured", &self.file_io.is_some())
-            .field("memory_governed", &self.memory_governor.is_some())
-            .finish()
+        #[cfg(test)]
+        {
+            let mut debug = formatter.debug_struct("SealedFragmentExecutor");
+            debug.field("object_store_configured", &self.file_io.is_some());
+            debug.field("memory_governed", &self.memory_governor.is_some());
+            debug.field(
+                "reader_override_configured",
+                &self.reader_override.is_some(),
+            );
+            debug.finish()
+        }
+        #[cfg(not(test))]
+        {
+            let mut debug = formatter.debug_struct("SealedFragmentExecutor");
+            debug.field("object_store_configured", &self.file_io.is_some());
+            debug.field("memory_governed", &self.memory_governor.is_some());
+            debug.finish()
+        }
     }
 }
 
@@ -98,6 +312,8 @@ impl SealedFragmentExecutor {
         Self {
             file_io: Some(file_io),
             memory_governor: None,
+            #[cfg(test)]
+            reader_override: None,
         }
     }
 
@@ -107,7 +323,16 @@ impl SealedFragmentExecutor {
         Self {
             file_io: Some(file_io),
             memory_governor: Some(memory_governor),
+            #[cfg(test)]
+            reader_override: None,
         }
+    }
+
+    /// Installs one deterministic existing-interface reader for focused tests.
+    #[cfg(test)]
+    fn with_test_reader(mut self, reader: TestFileReadFactory) -> Self {
+        self.reader_override = Some(reader);
+        self
     }
 
     /// Validates every closed field required before object-store or Parquet access.
@@ -148,6 +373,144 @@ impl SealedFragmentExecutor {
         Ok(())
     }
 
+    /// Opens one remote Parquet file as a counted asynchronous batch stream.
+    ///
+    /// Metadata validation remains before the first physical read. The returned
+    /// stream owns the reader and its per-file collector, so dropping it retains
+    /// any request recorded immediately before a failed or cancelled read.
+    ///
+    /// # Errors
+    /// Returns storage, size, or Parquet decode errors before the batch stream
+    /// is returned; subsequent read failures are yielded by that stream.
+    async fn open_remote_batches(
+        &self,
+        file: &SealedScanFile,
+        selected_groups: Vec<usize>,
+        collector: Arc<WorkerScanCollector>,
+    ) -> Result<WorkerBatchStream, ExecutorError> {
+        #[cfg(test)]
+        if let Some(factory) = &self.reader_override {
+            let reader = CountingFileRead {
+                inner: factory(),
+                metrics: WorkerFileScanCollector::new(collector),
+            };
+            let bytes = reader
+                .read(0..file.size_bytes)
+                .await
+                .map_err(|error| classify_storage_error(&error))?;
+            if u64::try_from(bytes.len()).map_err(|_| ExecutorError::Size)? != file.size_bytes {
+                return Err(ExecutorError::Size);
+            }
+            let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .map_err(|_| ExecutorError::Decode)?;
+            if !selected_groups.is_empty() {
+                builder = builder.with_row_groups(selected_groups);
+            }
+            let batches = builder
+                .with_batch_size(8_192)
+                .build()
+                .map_err(|_| ExecutorError::Decode)?;
+            let stream = futures_util::stream::iter(
+                batches.map(|batch| batch.map_err(|_| ExecutorError::Decode)),
+            );
+            return Ok(Box::pin(stream));
+        }
+        let file_io = self.file_io.as_ref().ok_or(ExecutorError::Storage)?;
+        let input = file_io
+            .new_input(&file.location)
+            .map_err(|error| classify_storage_error(&error))?;
+        let metadata = input
+            .metadata()
+            .await
+            .map_err(|error| classify_storage_error(&error))?;
+        if metadata.size != file.size_bytes {
+            return Err(ExecutorError::Size);
+        }
+        let reader = input
+            .reader()
+            .await
+            .map_err(|error| classify_storage_error(&error))?;
+        let arrow_reader = ArrowFileReader::new(
+            metadata,
+            Box::new(CountingFileRead {
+                inner: reader,
+                metrics: WorkerFileScanCollector::new(collector),
+            }),
+        );
+        let mut builder = ParquetRecordBatchStreamBuilder::new(arrow_reader)
+            .await
+            .map_err(|error| classify_decode_error(&error))?;
+        if !selected_groups.is_empty() {
+            builder = builder.with_row_groups(selected_groups);
+        }
+        let mut batches = builder
+            .with_batch_size(8_192)
+            .build()
+            .map_err(|_| ExecutorError::Decode)?;
+        let stream = async_stream::try_stream! {
+            while let Some(batch) = batches.next().await {
+                yield batch.map_err(|error| classify_decode_error(&error))?;
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    /// Opens one local Parquet file as a counted synchronous batch stream.
+    ///
+    /// The concrete chunk reader records each requested buffer before delegating
+    /// to the filesystem. The iterator is boxed only at this file boundary so
+    /// the outer attempt preserves incremental framing and cancellation.
+    ///
+    /// # Errors
+    /// Returns storage, size, or Parquet decode errors before the batch stream
+    /// is returned.
+    fn open_local_batches(
+        file: &SealedScanFile,
+        selected_groups: Vec<usize>,
+        collector: Arc<WorkerScanCollector>,
+    ) -> Result<WorkerBatchStream, ExecutorError> {
+        let metadata =
+            std::fs::metadata(&file.location).map_err(|error| classify_storage_error(&error))?;
+        if metadata.len() != file.size_bytes {
+            return Err(ExecutorError::Size);
+        }
+        let reader = CountingChunkReader {
+            inner: File::open(&file.location).map_err(|error| classify_storage_error(&error))?,
+            metrics: WorkerFileScanCollector::new(collector),
+        };
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|_| ExecutorError::Decode)?;
+        if !selected_groups.is_empty() {
+            builder = builder.with_row_groups(selected_groups);
+        }
+        let batches = builder
+            .with_batch_size(8_192)
+            .build()
+            .map_err(|_| ExecutorError::Decode)?;
+        let stream = futures_util::stream::iter(
+            batches.map(|batch| batch.map_err(|_| ExecutorError::Decode)),
+        );
+        Ok(Box::pin(stream))
+    }
+
+    /// Opens one sealed file through the configured remote or local backend.
+    ///
+    /// # Errors
+    /// Propagates the selected backend's storage, size, and decode errors.
+    async fn open_file_batches(
+        &self,
+        file: &SealedScanFile,
+        selected_groups: Vec<usize>,
+        collector: Arc<WorkerScanCollector>,
+    ) -> Result<WorkerBatchStream, ExecutorError> {
+        if self.file_io.is_some() {
+            self.open_remote_batches(file, selected_groups, collector)
+                .await
+        } else {
+            Self::open_local_batches(file, selected_groups, collector)
+        }
+    }
+
     /// Opens an incremental immutable fragment attempt.
     ///
     /// Production remote reads use Parquet's async ranged reader over Iceberg
@@ -162,6 +525,7 @@ impl SealedFragmentExecutor {
     pub fn execute(
         &self,
         fragment: &SealedScanFragment,
+        query_class: QueryClass,
     ) -> Result<WorkerFrameStream, ExecutorError> {
         self.validate(fragment)?;
         let memory_reservation = self
@@ -176,9 +540,11 @@ impl SealedFragmentExecutor {
             })
             .transpose()?;
         let fragment = fragment.clone();
-        let file_io = self.file_io.clone();
+        let executor = self.clone();
+        let metrics = WorkerScanCollector::new(query_class);
         let output = async_stream::try_stream! {
             let _memory_reservation = memory_reservation;
+            let attempt_metrics = metrics;
             let mut encoder = AttemptEncoder::default();
             for file in &fragment.files {
                 if fragment.deadline_unix_ms <= Utc::now().timestamp_millis() {
@@ -190,72 +556,16 @@ impl SealedFragmentExecutor {
                     .copied()
                     .map(|group| usize::try_from(group).map_err(|_| ExecutorError::Decode))
                     .collect::<Result<Vec<_>, _>>()?;
-                if let Some(file_io) = &file_io {
-                    let input = file_io
-                        .new_input(&file.location)
-                        .map_err(|error| classify_storage_error(&error))?;
-                    let metadata = input
-                        .metadata()
-                        .await
-                        .map_err(|error| classify_storage_error(&error))?;
-                    if metadata.size != file.size_bytes {
-                        Err(ExecutorError::Size)?;
+                let mut batches = executor
+                    .open_file_batches(file, selected_groups, Arc::clone(&attempt_metrics))
+                    .await?;
+                while let Some(batch) = batches.next().await {
+                    let batch = prepare_batch(batch?, &fragment)?;
+                    let (schema, batch) = encoder.encode(&batch)?;
+                    if let Some(schema) = schema {
+                        yield schema;
                     }
-                    let reader = input
-                        .reader()
-                        .await
-                        .map_err(|error| classify_storage_error(&error))?;
-                    let arrow_reader = ArrowFileReader::new(metadata, reader);
-                    let mut builder = ParquetRecordBatchStreamBuilder::new(arrow_reader)
-                        .await
-                        .map_err(|error| classify_decode_error(&error))?;
-                    if !selected_groups.is_empty() {
-                        builder = builder.with_row_groups(selected_groups);
-                    }
-                    let mut batches = builder
-                        .with_batch_size(8_192)
-                        .build()
-                        .map_err(|_| ExecutorError::Decode)?;
-                    while let Some(batch) = batches.next().await {
-                        let batch = prepare_batch(
-                            batch.map_err(|error| classify_decode_error(&error))?,
-                            &fragment,
-                        )?;
-                        let (schema, batch) = encoder.encode(&batch)?;
-                        if let Some(schema) = schema {
-                            yield schema;
-                        }
-                        yield batch;
-                    }
-                } else {
-                    let metadata = std::fs::metadata(&file.location)
-                        .map_err(|error| classify_storage_error(&error))?;
-                    if metadata.len() != file.size_bytes {
-                        Err(ExecutorError::Size)?;
-                    }
-                    let mut builder = ParquetRecordBatchReaderBuilder::try_new(
-                        File::open(&file.location)
-                            .map_err(|error| classify_storage_error(&error))?,
-                    )
-                    .map_err(|_| ExecutorError::Decode)?;
-                    if !selected_groups.is_empty() {
-                        builder = builder.with_row_groups(selected_groups);
-                    }
-                    let batches = builder
-                        .with_batch_size(8_192)
-                        .build()
-                        .map_err(|_| ExecutorError::Decode)?;
-                    for batch in batches {
-                        let batch = prepare_batch(
-                            batch.map_err(|_| ExecutorError::Decode)?,
-                            &fragment,
-                        )?;
-                        let (schema, batch) = encoder.encode(&batch)?;
-                        if let Some(schema) = schema {
-                            yield schema;
-                        }
-                        yield batch;
-                    }
+                    yield batch;
                 }
             }
             yield encoder.finish(&fragment)?;
@@ -642,8 +952,122 @@ impl AttemptEncoder {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use arrow::datatypes::Field;
+    use parquet::arrow::ArrowWriter;
+    use tempfile::NamedTempFile;
+    use tokio::sync::Notify;
+
+    use crate::oracle::exec::OracleQueryScanStats;
+
+    /// Deterministic existing-reader behavior used to drive wrapper outcomes.
+    #[derive(Clone)]
+    enum DeterministicRead {
+        /// Return an exact byte payload immediately.
+        Success(bytes::Bytes),
+        /// Return one immediate Iceberg storage error.
+        Error,
+        /// Remain pending until the consumer drops the read future.
+        Pending(Arc<Notify>),
+    }
+
+    /// Test-only `FileRead` implementation for causal wrapper assertions.
+    struct DeterministicFileRead {
+        /// Outcome returned by every requested range.
+        outcome: DeterministicRead,
+    }
+
+    #[async_trait]
+    impl FileRead for DeterministicFileRead {
+        /// Returns the configured result after the caller has registered demand.
+        async fn read(&self, _range: std::ops::Range<u64>) -> iceberg::Result<bytes::Bytes> {
+            match &self.outcome {
+                DeterministicRead::Success(bytes) => Ok(bytes.clone()),
+                DeterministicRead::Error => Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "deterministic reader failure",
+                )),
+                DeterministicRead::Pending(notify) => {
+                    notify.notified().await;
+                    Err(iceberg::Error::new(
+                        iceberg::ErrorKind::Unexpected,
+                        "pending reader released",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Wraps a deterministic read outcome in the executor's existing reader interface.
+    fn deterministic_reader_factory(outcome: DeterministicRead) -> TestFileReadFactory {
+        Arc::new(move || {
+            Box::new(DeterministicFileRead {
+                outcome: outcome.clone(),
+            })
+        })
+    }
+
+    /// Write one temporary Parquet object and return its pinned scan metadata.
+    fn local_parquet_fixture() -> (NamedTempFile, SealedScanFile, SchemaRef) {
+        let mut file = NamedTempFile::new().expect("temporary Parquet file");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("fixture batch matches schema");
+        let mut writer = ArrowWriter::try_new(file.as_file_mut(), Arc::clone(&schema), None)
+            .expect("Parquet writer");
+        writer.write(&batch).expect("Parquet batch");
+        writer.close().expect("Parquet close");
+        let size_bytes = file.as_file().metadata().expect("file metadata").len();
+        let scan_file = SealedScanFile {
+            location: file.path().to_string_lossy().into_owned(),
+            row_groups: vec![0],
+            size_bytes,
+            estimated_rows: 3,
+        };
+        (file, scan_file, schema)
+    }
+
+    /// Builds one validated fragment while allowing a deterministic request size.
+    fn fragment_for_file(
+        scan_file: &SealedScanFile,
+        schema: &SchemaRef,
+        size_bytes: u64,
+    ) -> SealedScanFragment {
+        let leaf = crate::oracle::fragment::PreparedSealedLeaf {
+            binding: Path::new(&scan_file.location)
+                .parent()
+                .expect("fixture parent")
+                .to_string_lossy()
+                .into_owned(),
+            tier: crate::oracle::fragment::SealedSourceTier::Iceberg,
+            pinned_digest: "test-digest".to_owned(),
+            files: vec![SealedScanFile {
+                location: scan_file.location.clone(),
+                row_groups: scan_file.row_groups.clone(),
+                size_bytes,
+                estimated_rows: scan_file.estimated_rows,
+            }],
+            projection: vec!["value".to_owned()],
+            predicates: Vec::new(),
+            schema_fingerprint: crate::oracle::sealed_fragment_schema_fingerprint(schema),
+            deadline_unix_ms: Utc::now().timestamp_millis() + 60_000,
+        };
+        crate::oracle::fragment::FragmentPlanner
+            .plan(&leaf, &crate::oracle::fragment::FragmentConfig::default())
+            .expect("validated deterministic fragment")
+            .into_iter()
+            .next()
+            .expect("one deterministic fragment")
+    }
 
     /// Closed predicates filter before projection without admitting SQL text.
     #[test]
@@ -728,5 +1152,205 @@ mod tests {
 
         assert_eq!(classify_storage_error(&stale), ExecutorError::StaleObject);
         assert_eq!(classify_storage_error(&outage), ExecutorError::Storage);
+    }
+
+    /// Production worker wrappers retain success, error, pending-drop, retry,
+    /// class, and exact requested-demand evidence through the recorder.
+    #[tokio::test]
+    async fn worker_wrappers_record_causal_outcomes_once() {
+        let (_file, scan_file, schema) = local_parquet_fixture();
+        let requested = scan_file.size_bytes;
+        let success_fragment = fragment_for_file(&scan_file, &schema, requested);
+        let failed_fragment = fragment_for_file(&scan_file, &schema, 7);
+        let pending_fragment = fragment_for_file(&scan_file, &schema, 11);
+        let executor = SealedFragmentExecutor::new(FileIO::new_with_fs());
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let notify = Arc::new(Notify::new());
+
+        validate_worker_success_and_leader_conversion(
+            &executor,
+            &success_fragment,
+            &scan_file,
+            &schema,
+            &recorder,
+        )
+        .await;
+
+        let failed_executor = executor
+            .clone()
+            .with_test_reader(deterministic_reader_factory(DeterministicRead::Error));
+        let mut failed_stream = failed_executor
+            .execute(&failed_fragment, QueryClass::Interactive)
+            .expect("failed execution");
+        assert!(failed_stream.next().await.expect("failed frame").is_err());
+        drop(failed_stream);
+
+        let pending_executor = executor
+            .clone()
+            .with_test_reader(deterministic_reader_factory(DeterministicRead::Pending(
+                Arc::clone(&notify),
+            )));
+        let mut pending_stream = pending_executor
+            .execute(&pending_fragment, QueryClass::Interactive)
+            .expect("pending execution");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pending_stream.next())
+                .await
+                .is_err()
+        );
+        drop(pending_stream);
+        drop(notify);
+
+        for _attempt in 0..2 {
+            let retry_executor = executor
+                .clone()
+                .with_test_reader(deterministic_reader_factory(DeterministicRead::Success(
+                    bytes::Bytes::from(
+                        std::fs::read(&scan_file.location).expect("retry Parquet bytes"),
+                    ),
+                )));
+            let mut retry_stream = retry_executor
+                .execute(&success_fragment, QueryClass::Interactive)
+                .expect("retry execution");
+            while let Some(frame) = retry_stream.next().await {
+                frame.expect("retry worker frame");
+            }
+            drop(retry_stream);
+        }
+
+        let snapshot = recorder.snapshot();
+        let expected_bytes = requested.saturating_mul(3).saturating_add(18);
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_bytes_scanned_total{class=\"interactive\"}"),
+            Some(&expected_bytes)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_files_scanned_total{class=\"interactive\"}"),
+            Some(&5)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_partitions_scanned_total{class=\"interactive\"}"),
+            Some(&5)
+        );
+    }
+
+    /// Executes a valid worker attempt and converts its validated batches to
+    /// the leader memory source without recording a second physical read.
+    async fn validate_worker_success_and_leader_conversion(
+        executor: &SealedFragmentExecutor,
+        fragment: &SealedScanFragment,
+        scan_file: &SealedScanFile,
+        schema: &SchemaRef,
+        recorder: &wyrd_bench::BenchmarkRecorder,
+    ) {
+        let success_executor = executor
+            .clone()
+            .with_test_reader(deterministic_reader_factory(DeterministicRead::Success(
+                bytes::Bytes::from(
+                    std::fs::read(&scan_file.location).expect("success Parquet bytes"),
+                ),
+            )));
+        let mut success_stream = success_executor
+            .execute(fragment, QueryClass::Interactive)
+            .expect("success execution");
+        let mut success_frames = Vec::new();
+        while let Some(frame) = success_stream.next().await {
+            success_frames.push(frame.expect("success worker frame"));
+        }
+        drop(success_stream);
+        assert!(
+            success_frames
+                .iter()
+                .any(|frame| matches!(frame, WorkerAttemptFrame::Footer(_)))
+        );
+        let before_conversion = recorder.snapshot().counters.clone();
+        let mut attempt_buffer = crate::oracle::attempt::AttemptBuffer::new(1 << 20);
+        for frame in success_frames {
+            attempt_buffer.push(frame).expect("worker frame validates");
+        }
+        let validated = attempt_buffer.finish().expect("worker attempt validates");
+        let mut validated_batches = Vec::new();
+        crate::oracle::decode_attempt_batches(validated, &mut validated_batches)
+            .expect("validated batches decode");
+        let leader_source =
+            crate::oracle::test_validated_memory_source(&validated_batches, Arc::clone(schema))
+                .expect("leader memory conversion");
+        let after_conversion = recorder.snapshot().counters;
+        assert_eq!(after_conversion, before_conversion);
+        let leader_stats = OracleQueryScanStats::from_plan(leader_source.as_ref(), 0);
+        assert_eq!(
+            (
+                leader_stats.physical_bytes_scanned,
+                leader_stats.files_scanned,
+                leader_stats.partitions_scanned
+            ),
+            (None, 0, 0)
+        );
+    }
+
+    /// A real local Parquet read records exact bytes, one file, one partition, and class.
+    #[tokio::test]
+    async fn sealed_executor_local_read_projects_source_demand() {
+        let (_file, scan_file, _schema) = local_parquet_fixture();
+        let collector = WorkerScanCollector::new(QueryClass::Analytical);
+        let executor = SealedFragmentExecutor::default();
+        let mut batches = executor
+            .open_file_batches(&scan_file, vec![0], Arc::clone(&collector))
+            .await
+            .expect("local source opens");
+        let mut rows = 0;
+        while let Some(batch) = batches.next().await {
+            rows += batch.expect("local source decodes").num_rows();
+        }
+        assert_eq!(rows, 3);
+        let (bytes, files, partitions) = collector.snapshot();
+        assert!(bytes > 0);
+        assert_eq!((files, partitions), (1, 1));
+        assert_eq!(collector.query_class, QueryClass::Analytical);
+    }
+
+    /// Production local reader wrappers retain drop/cancel demand and emit one
+    /// class-labelled terminal sample for each retry without a leader duplicate.
+    #[tokio::test]
+    async fn sealed_executor_wrappers_cover_drop_retry_and_exactly_once() {
+        let (_file, scan_file, _schema) = local_parquet_fixture();
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let executor = SealedFragmentExecutor::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        for _retry in 0..2 {
+            let collector = WorkerScanCollector::new(QueryClass::Interactive);
+            let mut batches = executor
+                .open_file_batches(&scan_file, vec![0], Arc::clone(&collector))
+                .await
+                .expect("local source opens through production wrappers");
+            let _ = batches.next().await;
+            drop(collector);
+            drop(batches);
+        }
+        let snapshot = recorder.snapshot();
+        let sample = snapshot
+            .counters
+            .get("oracle_query_bytes_scanned_total{class=\"interactive\"}")
+            .expect("dropped wrapper emits requested bytes");
+        assert!(*sample > 0);
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_files_scanned_total{class=\"interactive\"}"),
+            Some(&2)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_partitions_scanned_total{class=\"interactive\"}"),
+            Some(&2)
+        );
     }
 }

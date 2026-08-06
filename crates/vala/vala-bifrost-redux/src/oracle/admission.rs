@@ -314,6 +314,20 @@ pub(crate) struct PreparedAdmission {
     pub(crate) cancellation: CancellationToken,
 }
 
+/// Queued waiter state transferred from enqueueing into the async grant wait.
+struct PreparedWaiter {
+    /// Class charged by the eventual grant and cancellation cleanup.
+    class_kind: AdmissionClass,
+    /// Tenant removed from the queue when cancellation wins.
+    tenant: DataTenantId,
+    /// Monotonic queue identity used by cancellation cleanup.
+    waiter_id: u64,
+    /// Fixed absolute deadline selected before queue insertion.
+    wait_deadline: Instant,
+    /// One-shot grant notification owned by the waiting future.
+    receiver: tokio::sync::oneshot::Receiver<Grant>,
+}
+
 /// Admission owner for bounded local capacity and refreshed membership state.
 pub struct OracleAdmission {
     /// Existing peer pending/running slot owner.
@@ -536,6 +550,24 @@ impl OracleAdmission {
         }
     }
 
+    /// Captures current local admission and peer reservations without waiting.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn runtime_inspection(&self) -> OracleRuntimeInspection {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .expect("Oracle admission state invariant");
+        OracleRuntimeInspection {
+            active_queries: state.active_queries,
+            queued_queries: u64::from(state.queued),
+            reserved_memory_bytes: state.interactive.memory_used + state.analytical.memory_used,
+            reserved_spill_bytes: state.interactive.spill_used + state.analytical.spill_used,
+            peer_pending: self.slots.pending_in_use(),
+            peer_running: self.slots.running_in_use(),
+        }
+    }
+
     /// Acquires one class/tenant/memory/spill aggregate with a fixed absolute wait deadline.
     ///
     /// # Errors
@@ -555,13 +587,54 @@ impl OracleAdmission {
             cancellation,
         } = request;
         if memory_ceiling == 0 {
+            OracleTelemetry::record_admission(
+                query_class,
+                OracleAdmissionOutcome::Rejected,
+                OracleAdmissionReason::Memory,
+            );
             return Err(BifrostError::QueryAdmissionRejected);
         }
-        let mut waiter_telemetry = OracleTelemetry::start_admission_waiter(query_class);
         let class_kind = AdmissionClass::from(query_class);
         let enqueue = Instant::now();
         let wait_deadline = deadline.min(enqueue + self.max_queue_wait());
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let waiter_telemetry = OracleTelemetry::start_admission_waiter(query_class);
+        let waiter = self.enqueue_waiter(
+            tenant,
+            class_kind,
+            wait_deadline,
+            memory_ceiling,
+            spill_eligible,
+            query_class,
+        )?;
+        let grant = self
+            .wait_for_grant(waiter, cancellation.clone(), query_class)
+            .await?;
+        OracleTelemetry::record_admission(
+            query_class,
+            OracleAdmissionOutcome::Admitted,
+            OracleAdmissionReason::ClassCapacity,
+        );
+        let mut waiter_telemetry = waiter_telemetry;
+        waiter_telemetry.finish("class", "acquired");
+        self.build_admitted_guard(&grant, cancellation)
+    }
+
+    /// Enqueues one waiter and immediately grants any newly eligible requests.
+    ///
+    /// # Errors
+    /// Returns an internal error when the admission state lock is poisoned, or
+    /// a query-admission rejection when shutdown or queue capacity prevents
+    /// insertion.
+    fn enqueue_waiter(
+        &self,
+        tenant: DataTenantId,
+        class_kind: AdmissionClass,
+        wait_deadline: Instant,
+        memory_ceiling: u64,
+        spill_eligible: bool,
+        query_class: QueryClass,
+    ) -> Result<PreparedWaiter, BifrostError> {
+        let (tx, receiver) = tokio::sync::oneshot::channel();
         let waiter_id = self.shared.next_waiter.fetch_add(1, Ordering::Relaxed);
         let notifications = {
             let mut state = self
@@ -572,6 +645,16 @@ impl OracleAdmission {
                     detail: "Oracle admission state lock poisoned".to_owned(),
                 })?;
             if state.closed || state.queued >= state.queue_capacity {
+                let reason = if state.closed {
+                    OracleAdmissionReason::Shutdown
+                } else {
+                    OracleAdmissionReason::QueueFull
+                };
+                OracleTelemetry::record_admission(
+                    query_class,
+                    OracleAdmissionOutcome::Rejected,
+                    reason,
+                );
                 return Err(BifrostError::QueryAdmissionRejected);
             }
             let class = match class_kind {
@@ -590,32 +673,77 @@ impl OracleAdmission {
             grant_waiters(&self.shared, &mut state)
         };
         notify_grants(&self.shared, notifications);
-        let grant = tokio::select! {
-            grant = &mut rx => grant.map_err(|_| BifrostError::QueryAdmissionRejected)?,
+        Ok(PreparedWaiter {
+            class_kind,
+            tenant,
+            waiter_id,
+            wait_deadline,
+            receiver,
+        })
+    }
+
+    /// Waits for a grant while preserving absolute deadlines and rollback.
+    ///
+    /// # Errors
+    /// Returns query-admission rejection when the grant channel closes, the
+    /// deadline expires, or either cancellation token wins the race.
+    async fn wait_for_grant(
+        &self,
+        waiter: PreparedWaiter,
+        cancellation: CancellationToken,
+        query_class: QueryClass,
+    ) -> Result<Grant, BifrostError> {
+        let PreparedWaiter {
+            class_kind,
+            tenant,
+            waiter_id,
+            wait_deadline,
+            mut receiver,
+        } = waiter;
+        tokio::select! {
+            grant = &mut receiver => grant.map_err(|_| BifrostError::QueryAdmissionRejected),
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline)) => {
-                self.cancel_waiter(class_kind, tenant, waiter_id);
-                if let Ok(grant) = rx.try_recv() {
-                    self.rollback_grant(&grant);
-                }
-                return Err(BifrostError::QueryAdmissionRejected);
+                self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
+                OracleTelemetry::record_admission(
+                    query_class,
+                    OracleAdmissionOutcome::Rejected,
+                    OracleAdmissionReason::QueueDeadline,
+                );
+                Err(BifrostError::QueryAdmissionRejected)
             }
             () = cancellation.cancelled() => {
-                self.cancel_waiter(class_kind, tenant, waiter_id);
-                if let Ok(grant) = rx.try_recv() {
-                    self.rollback_grant(&grant);
-                }
-                return Err(BifrostError::QueryAdmissionRejected);
+                self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
+                OracleTelemetry::record_admission(
+                    query_class,
+                    OracleAdmissionOutcome::Rejected,
+                    OracleAdmissionReason::Shutdown,
+                );
+                Err(BifrostError::QueryAdmissionRejected)
             }
             () = self.shared.root_cancel.cancelled() => {
-                self.cancel_waiter(class_kind, tenant, waiter_id);
-                if let Ok(grant) = rx.try_recv() {
-                    self.rollback_grant(&grant);
-                }
-                return Err(BifrostError::QueryAdmissionRejected);
+                self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
+                OracleTelemetry::record_admission(
+                    query_class,
+                    OracleAdmissionOutcome::Rejected,
+                    OracleAdmissionReason::Shutdown,
+                );
+                Err(BifrostError::QueryAdmissionRejected)
             }
-        };
-        waiter_telemetry.finish("class", "acquired");
-        self.build_admitted_guard(&grant, cancellation)
+        }
+    }
+
+    /// Removes a canceled waiter and returns any raced grant to the pool.
+    fn rollback_waiter(
+        &self,
+        class_kind: AdmissionClass,
+        tenant: DataTenantId,
+        waiter_id: u64,
+        receiver: &mut tokio::sync::oneshot::Receiver<Grant>,
+    ) {
+        self.cancel_waiter(class_kind, tenant, waiter_id);
+        if let Ok(grant) = receiver.try_recv() {
+            self.rollback_grant(&grant);
+        }
     }
 
     /// Converts one granted aggregate into the stream-owned lifecycle guard.
@@ -655,7 +783,6 @@ impl OracleAdmission {
             },
             running: None,
             local_permit: Some(permit),
-            slot_telemetry: None,
             live_reservations: Vec::new(),
             cancellation: self.shared.root_cancel.child_token(),
             request_cancellation: cancellation,
@@ -834,7 +961,6 @@ pub(super) struct AdmittedQueryGuard {
     /// Aggregate leader-local class, tenant, memory, and spill permit.
     local_permit: Option<LocalPermit>,
     /// Canonical local slot-use gauge retained with the running permit.
-    pub(super) slot_telemetry: Option<SlotTelemetryGuard>,
     /// Parent reservations retaining drained live batches through stream cleanup.
     pub(super) live_reservations: Vec<AccountedMemoryReservation>,
     /// Cancellation shared with stream and peer dispatch.
@@ -855,7 +981,6 @@ impl Drop for AdmittedQueryGuard {
             permit.release_inner();
         }
         self.running.take();
-        self.slot_telemetry.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -890,7 +1015,6 @@ impl AdmittedQueryGuard {
             permit.release_inner();
         }
         self.running.take();
-        self.slot_telemetry.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -943,7 +1067,6 @@ pub(super) fn admitted_guard_for_test()
                 spill: 0,
                 released: AtomicBool::new(false),
             }),
-            slot_telemetry: None,
             live_reservations: Vec::new(),
             cancellation: cancellation.clone(),
             request_cancellation: request_cancellation.clone(),
@@ -1138,16 +1261,14 @@ mod tests {
     #[tokio::test]
     async fn membership_refresh_affects_only_new_admission() {
         let owner = owner(OracleAdmissionConfig::default());
-        fn request() -> PreparedAdmission {
-            PreparedAdmission {
-                tenant: DataTenantId::new_v7(),
-                query_class: QueryClass::Interactive,
-                deadline: Instant::now() + Duration::from_secs(1),
-                memory_ceiling: 1024,
-                spill_eligible: false,
-                cancellation: CancellationToken::new(),
-            }
-        }
+        let request = || PreparedAdmission {
+            tenant: DataTenantId::new_v7(),
+            query_class: QueryClass::Interactive,
+            deadline: Instant::now() + Duration::from_secs(1),
+            memory_ceiling: 1024,
+            spill_eligible: false,
+            cancellation: CancellationToken::new(),
+        };
         let active = owner.admit(request()).await.expect("active admission");
         owner.refresh(&ClusterSnapshot::default());
         assert!(!owner.is_available());
@@ -1293,16 +1414,14 @@ mod tests {
             queue_capacity: 1,
             ..Default::default()
         });
-        fn request() -> PreparedAdmission {
-            PreparedAdmission {
-                tenant: DataTenantId::new_v7(),
-                query_class: QueryClass::Interactive,
-                deadline: Instant::now() + Duration::from_secs(2),
-                memory_ceiling: 1024,
-                spill_eligible: false,
-                cancellation: CancellationToken::new(),
-            }
-        }
+        let request = || PreparedAdmission {
+            tenant: DataTenantId::new_v7(),
+            query_class: QueryClass::Interactive,
+            deadline: Instant::now() + Duration::from_secs(2),
+            memory_ceiling: 1024,
+            spill_eligible: false,
+            cancellation: CancellationToken::new(),
+        };
         let first = owner.admit(request()).await.expect("first admission");
         let queued_owner = Arc::clone(&owner);
         let queued = tokio::spawn(async move { queued_owner.admit(request()).await });
@@ -1432,9 +1551,8 @@ mod tests {
         drop(second);
     }
 
-    /// Production admission releases local ownership across every terminal edge.
-    #[tokio::test]
-    async fn production_admission_release_matrix() {
+    /// Covers successful, unavailable, and deadline admission releases.
+    async fn production_release_prefix() {
         let success_owner = owner(OracleAdmissionConfig::default());
         let success = success_owner
             .admit(PreparedAdmission {
@@ -1509,6 +1627,12 @@ mod tests {
             .await;
         assert!(matches!(timeout, Err(BifrostError::QueryAdmissionRejected)));
         drop(held);
+    }
+
+    /// Production admission releases local ownership across every terminal edge.
+    #[tokio::test]
+    async fn production_admission_release_matrix() {
+        production_release_prefix().await;
 
         let request_owner = owner(OracleAdmissionConfig {
             interactive_slots: 1,

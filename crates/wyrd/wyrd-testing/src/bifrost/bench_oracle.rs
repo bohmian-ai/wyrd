@@ -241,13 +241,10 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
                 .snapshot()
                 .map_err(|error| super::cluster::ClusterError::Telemetry(error.to_string()))?
             {
-                if matches!(
-                    sample.family.as_str(),
-                    "bifrost_oracle_memory_bytes" | "bifrost_oracle_class_memory_bytes"
-                ) {
+                if matches!(sample.family.as_str(), "oracle_tenant_budget_pressure") {
                     memory = memory.max(sample.value.max(0.0) as u64);
                 }
-                if sample.family == "bifrost_oracle_slots_in_use" {
+                if sample.family == "oracle_queries_active" {
                     slots = slots.max(sample.value.max(0.0) as u32);
                 }
             }
@@ -281,7 +278,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .audit_rows
         .saturating_sub(audit_checkpoint);
     let query_metric = telemetry.metrics.iter().any(|sample| {
-        sample.family == "bifrost_oracle_queries_total"
+        sample.family == "oracle_query_duration_seconds"
             && sample.value >= f64::from(samples.saturating_mul(scenario.tenants))
     });
 
@@ -335,7 +332,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .map(|sample| sample.ttfb_us)
         .collect::<Vec<_>>();
     let measured_queries = u32::try_from(measurements.len())?;
-    let retries = metric_sum(&telemetry.metrics, "bifrost_oracle_stale_replans_total")
+    let retries = metric_sum(&telemetry.metrics, "oracle_query_cancellations_total")
         + metric_sum(&telemetry.metrics, "bifrost_oracle_peer_attempts_total").max(0.0)
         - metric_sum_matching(
             &telemetry.metrics,
@@ -343,8 +340,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
             "outcome",
             "success",
         );
-    let source_rows = metric_sum(&telemetry.metrics, "bifrost_oracle_source_rows_total").max(0.0);
-    let source_bytes = metric_sum(&telemetry.metrics, "bifrost_oracle_source_bytes_total").max(0.0);
+    let source_rows = metric_sum(&telemetry.metrics, "oracle_query_rows_total").max(0.0);
+    let source_bytes = metric_sum(&telemetry.metrics, "oracle_query_bytes_scanned_total").max(0.0);
     let case_evidence = OracleCaseEvidence {
         warmup_queries,
         measurement_queries: measured_queries,
@@ -361,7 +358,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
             .max()
             .unwrap_or_default()
             .max(probe_peak_memory),
-        spill_bytes: metric_sum(&telemetry.metrics, "bifrost_oracle_spill_bytes_total").max(0.0)
+        spill_bytes: metric_sum(&telemetry.metrics, "oracle_query_spill_bytes_total").max(0.0)
             as u64,
         cpu_seconds,
         object_store_ms: span_duration_ms(&telemetry.spans, "bifrost.oracle.source"),
@@ -757,10 +754,10 @@ async fn measured_query(
         first_batch_us.get_or_insert(u64::try_from(started.elapsed().as_micros())?);
         rows = rows.saturating_add(u64::try_from(batch.num_rows())?);
         for sample in telemetry.snapshot()? {
-            if sample.family == "bifrost_oracle_memory_bytes" {
+            if sample.family == "oracle_tenant_budget_pressure" {
                 peak_memory_bytes = peak_memory_bytes.max(sample.value.max(0.0) as u64);
             }
-            if sample.family == "bifrost_oracle_slots_in_use" {
+            if sample.family == "oracle_queries_active" {
                 peak_slots = peak_slots.max(sample.value.max(0.0) as u32);
             }
         }

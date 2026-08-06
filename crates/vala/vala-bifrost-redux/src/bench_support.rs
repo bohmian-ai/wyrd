@@ -4,12 +4,80 @@ use std::path::Path;
 
 use bytes::Bytes;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::vala::api::QueryTerminalOutcome;
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::wal::{PreparedWalAppend, WalConfig, WalWriter};
+
+/// Closed Oracle telemetry label domains exported only for benchmark contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleTelemetryLabelDomains {
+    /// Query class values emitted by production Oracle metrics.
+    pub classes: [&'static str; 2],
+    /// Admission outcome values emitted by production Oracle metrics.
+    pub outcomes: [&'static str; 2],
+    /// Admission reason values emitted by production Oracle metrics.
+    pub reasons: [&'static str; 8],
+    /// Query terminal outcomes emitted by the Oracle stream owner.
+    pub terminal_outcomes: [&'static str; 3],
+    /// Query cancellation reasons emitted by the Oracle stream owner.
+    pub cancellation_reasons: [&'static str; 4],
+    /// Fragment terminal outcomes emitted by the Oracle dispatcher.
+    pub fragment_outcomes: [&'static str; 2],
+}
+
+/// Return the production Oracle closed label domains for projection contracts.
+#[must_use]
+pub const fn oracle_telemetry_label_domains() -> OracleTelemetryLabelDomains {
+    use crate::oracle::telemetry::{
+        FragmentOutcome, OracleAdmissionOutcome, OracleAdmissionReason, OracleCancellationReason,
+        OracleQueryClassLabel,
+    };
+
+    let classes = OracleQueryClassLabel::ALL;
+    let outcomes = OracleAdmissionOutcome::ALL;
+    let reasons = OracleAdmissionReason::ALL;
+    let cancellation_reasons = OracleCancellationReason::ALL;
+    let fragment_outcomes = FragmentOutcome::ALL;
+    OracleTelemetryLabelDomains {
+        classes: [classes[0].as_str(), classes[1].as_str()],
+        outcomes: [outcomes[0].as_str(), outcomes[1].as_str()],
+        reasons: [
+            reasons[0].as_str(),
+            reasons[1].as_str(),
+            reasons[2].as_str(),
+            reasons[3].as_str(),
+            reasons[4].as_str(),
+            reasons[5].as_str(),
+            reasons[6].as_str(),
+            reasons[7].as_str(),
+        ],
+        terminal_outcomes: [
+            query_terminal_outcome_label(QueryTerminalOutcome::Success),
+            query_terminal_outcome_label(QueryTerminalOutcome::Degraded),
+            query_terminal_outcome_label(QueryTerminalOutcome::Failed),
+        ],
+        cancellation_reasons: [
+            cancellation_reasons[0].as_str(),
+            cancellation_reasons[1].as_str(),
+            cancellation_reasons[2].as_str(),
+            cancellation_reasons[3].as_str(),
+        ],
+        fragment_outcomes: [fragment_outcomes[0].as_str(), fragment_outcomes[1].as_str()],
+    }
+}
+
+/// Projects the shared wire terminal enum into the production metric labels.
+const fn query_terminal_outcome_label(value: QueryTerminalOutcome) -> &'static str {
+    match value {
+        QueryTerminalOutcome::Success => "success",
+        QueryTerminalOutcome::Degraded => "degraded",
+        QueryTerminalOutcome::Failed => "failed",
+    }
+}
 
 /// A prepared v3 WAL append. Preparation performs the production payload
 /// accounting, but no filesystem work.

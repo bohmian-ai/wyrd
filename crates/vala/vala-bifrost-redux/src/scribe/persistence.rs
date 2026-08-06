@@ -1226,6 +1226,11 @@ mod tests {
                 )
                 .expect("WAL writer"),
             );
+            std::fs::create_dir_all(crate::scribe::replay::stream_directory(
+                wal_root.path(),
+                stream,
+            ))
+            .expect("WAL stream directory");
             let memory = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
                 .expect("memory governor")
                 .scribe_budget();
@@ -1272,6 +1277,37 @@ mod tests {
             );
             let binding =
                 TenantTableBinding::resolve((self.tenant, table.clone())).expect("binding");
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(
+                    wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+                arrow::datatypes::Field::new(
+                    wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+                    arrow::datatypes::DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    ),
+                    false,
+                ),
+                arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            ]));
+            let rows = vec![
+                arrow::record_batch::RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(arrow::array::StringArray::from(vec![
+                            self.tenant.to_string(),
+                        ])),
+                        Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                            1_767_225_600_000_000_i64,
+                        ])),
+                        Arc::new(arrow::array::Int64Array::from(vec![1_i64])),
+                    ],
+                )
+                .expect("valid persistence fixture batch"),
+            ];
             let (completion_tx, mut completion_rx) = mpsc::channel(1);
             self.runtime
                 .try_submit(PersistenceJob {
@@ -1284,11 +1320,11 @@ mod tests {
                         wal_lsn_max: WalLsn::ZERO,
                         wal_segments: Vec::new(),
                         wal: self.wal.handle_for_shard(0).expect("WAL handle"),
-                        rows: Vec::new(),
-                        schema: Arc::new(arrow::datatypes::Schema::empty()),
+                        rows,
+                        schema,
                         audit_events: Vec::new(),
                         append_metas: Vec::new(),
-                        row_count: 0,
+                        row_count: 1,
                         arrow_bytes: 1,
                         opened_at: std::time::Instant::now(),
                         closed_at: std::time::Instant::now(),
@@ -1300,11 +1336,18 @@ mod tests {
                 .expect("bounded persistence submission");
             let completion = completion_rx.recv().await.expect("persistence completion");
             let crate::scribe::shards::ShardCommand::PersistenceComplete {
-                visibility_result, ..
+                completion,
+                visibility_result,
+                ..
             } = completion
             else {
                 panic!("worker must return one persistence completion");
             };
+            assert!(
+                completion.error.is_none(),
+                "persistence completion failed before visibility acknowledgment: {:?}",
+                completion.error
+            );
             visibility_result
                 .send(Ok(()))
                 .expect("visibility acknowledgment");

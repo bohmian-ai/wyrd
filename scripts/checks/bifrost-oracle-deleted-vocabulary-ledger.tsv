@@ -1,0 +1,102 @@
+# RR7 deletion ledger; source baseline: 4cf66014b
+# token	classification	evidence or allowlist
+bifrost_oracle_lease_renewals_total	deleted	Removed Oracle lease lifecycle family; checker-enforced.
+bifrost_oracle_lease_release_queue_total	deleted	Removed Oracle lease lifecycle family; checker-enforced.
+bifrost_oracle_admission_reconcile_total	deleted	Removed admission reconciliation family; checker-enforced.
+bifrost_oracle_admission_reconcile_queue_total	deleted	Removed admission reconciliation family; checker-enforced.
+bifrost_oracle_source_bytes_total	deleted	Source-byte accounting was removed with the old source metric path.
+bifrost_oracle_source_rows_total	deleted	RR7 removes the parallel source-row metric; D65 query rows remains the proof.
+bifrost_oracle_admission_wait_seconds	deleted	Replaced by canonical oracle_admission_queue_duration_seconds.
+bifrost_oracle_admission_rejections_total	deleted	Replaced by canonical admission outcome/reason families.
+bifrost_oracle_slots_total	deleted	Replaced by canonical slot/admission gauges.
+bifrost_oracle_slots_in_use	deleted	Replaced by canonical active/queued and guard-owned state.
+bifrost_oracle_admission_waiters	deleted	Removed waiter gauge; waiter lifecycle is guard-owned.
+bifrost_oracle_in_flight	deleted	Removed visibility-specific in-flight gauge.
+bifrost_oracle_classification_total	deleted	Removed classification counter family.
+bifrost_oracle_predicted_scan_seconds	deleted	Removed prediction histogram.
+bifrost_oracle_queries_total	deleted	Removed legacy query counter.
+bifrost_oracle_query_duration_seconds	deleted	Replaced by canonical oracle_query_duration_seconds.
+bifrost_oracle_time_to_first_batch_seconds	deleted	Replaced by canonical query first-batch histogram.
+bifrost_oracle_audit_seconds	deleted	Removed duplicate audit histogram.
+bifrost_oracle_spill_operations_total	deleted	Removed duplicate spill operation counter.
+bifrost_oracle_spill_bytes_total	deleted	Removed duplicate spill byte counter.
+bifrost_oracle_stale_replans_total	deleted	Removed duplicate replan counter.
+bifrost_oracle_streams_total	deleted	Removed stream counter.
+bifrost_oracle_stream_rows_total	deleted	Removed stream-row counter.
+bifrost_oracle_stream_bytes_total	deleted	Removed stream-byte counter.
+bifrost_oracle_slot_reservations_total	deleted	Removed slot reservation counter.
+oracle_source_rows	deleted	Removed old binding identifier.
+oracle_slots	deleted	Removed old binding identifier.
+cleanup.oracle_in_flight	deleted	Removed cleanup binding identifier.
+cleanup.oracle_slots	deleted	Removed cleanup binding identifier.
+oracle.slots_final	deleted	Removed slot finalization binding identifier.
+oracle.slots_peak.analytical	deleted	Removed analytical peak binding identifier.
+oracle.classification.interactive_scan	deleted	Removed classification binding identifier.
+oracle.classification.predicted_scan	deleted	Removed classification binding identifier.
+oracle.classification.global_operator	deleted	Removed classification binding identifier.
+oracle.admission.pending_limit	deleted	Removed admission binding identifier.
+oracle.admission.lease_timeout	deleted	Removed admission binding identifier.
+oracle.admission.lease_cluster	deleted	Removed admission binding identifier.
+oracle.admission.lease_class	deleted	Removed admission binding identifier.
+oracle.admission.lease_tenant	deleted	Removed admission binding identifier.
+oracle.admission.local_slots	deleted	Removed admission binding identifier.
+oracle.source_rows	deleted	Removed source-row phase binding identifier.
+phase.oracle_source_rows	deleted	Removed source-row phase binding identifier.
+pillars.oracle_analytical_slots_peak	deleted	Removed pillar binding identifier.
+pillars.oracle_class_lease_rejections	deleted	Removed pillar binding identifier.
+pillars.oracle_cluster_lease_rejections	deleted	Removed pillar binding identifier.
+pillars.oracle_global_operator_classifications	deleted	Removed pillar binding identifier.
+pillars.oracle_interactive_scan_classifications	deleted	Removed pillar binding identifier.
+pillars.oracle_lease_timeout_rejections	deleted	Removed pillar binding identifier.
+pillars.oracle_local_slot_rejections	deleted	Removed pillar binding identifier.
+pillars.oracle_pending_limit_rejections	deleted	Removed pillar binding identifier.
+pillars.oracle_predicted_scan_classifications	deleted	Removed pillar binding identifier.
+pillars.oracle_tenant_lease_rejections	deleted	Removed pillar binding identifier.
+oracle_analytical_slots_peak	deleted	Removed legacy metric family.
+oracle_slots_total	deleted	Removed legacy metric family.
+oracle_interactive_scan_classifications	deleted	Removed legacy metric family.
+oracle_predicted_scan_classifications	deleted	Removed legacy metric family.
+oracle_global_operator_classifications	deleted	Removed legacy metric family.
+oracle_pending_limit_rejections	deleted	Removed legacy metric family.
+oracle_lease_timeout_rejections	deleted	Removed legacy metric family.
+oracle_cluster_lease_rejections	deleted	Removed legacy metric family.
+oracle_class_lease_rejections	deleted	Removed legacy metric family.
+oracle_tenant_lease_rejections	deleted	Removed legacy metric family.
+oracle_local_slot_rejections	deleted	Removed legacy metric family.
+oracle_lease_scope	deleted	Removed legacy lease binding identifier.
+slots_peak	deleted	Removed legacy slot binding suffix.
+slots_final	deleted	Removed legacy slot binding suffix.
+"lease_class"	deleted	Removed legacy admission label.
+"lease_cluster"	deleted	Removed legacy admission label.
+"lease_tenant"	deleted	Removed legacy admission label.
+"lease_capacity"	deleted	Removed legacy admission label.
+"lease_timeout"	deleted	Removed legacy admission label.
+"pending_limit"	deleted	Removed legacy admission label.
+"local_slots"	deleted	Removed legacy admission label.
+estimated_scan	current_unrelated	Retained classification reason in the canonical query planner; not a deleted metric name.
+predicted_scan	current_unrelated	Retained classification reason in the canonical query planner; not a deleted metric name.
+global_operator	current_unrelated	Retained classification reason in the canonical query planner; not a deleted metric name.
+published_only	current_unrelated	Retained visibility mode in the public query contract.
+fused	current_unrelated	Retained visibility mode in the public query contract.
+bifrost_oracle_class_memory_bytes	deleted	Removed legacy Oracle class-memory metric family; checker-enforced.
+bifrost_oracle_memory_bytes	deleted	Removed legacy Oracle memory metric family; checker-enforced.
+bifrost_oracle_files_pruned_total	current_unrelated	Retained duplicate-pruning counter.
+bifrost_oracle_fragment_bytes_total	deleted	Removed legacy Oracle fragment-byte metric family; checker-enforced.
+bifrost_oracle_fragment_seconds	deleted	Removed legacy Oracle fragment-timing metric family; checker-enforced.
+bifrost_oracle_fragments_in_flight	deleted	Removed legacy Oracle fragment in-flight metric family; checker-enforced.
+bifrost_oracle_fragments_total	current_unrelated	Retained fragment lifecycle counter.
+bifrost_oracle_peer_attempts_total	current_unrelated	Retained peer execution counter.
+bifrost_oracle_rows_deduplicated_total	current_unrelated	Retained deduplication counter.
+bifrost_oracle_security_events_total	current_unrelated	Retained security audit counter.
+bifrost_oracle_source_operation_seconds	current_unrelated	Retained source-operation timing family.
+bifrost_oracle_tail_fence_hold_seconds	current_unrelated	Retained tail fencing timing family.
+bifrost_oracle_tail_fences_total	current_unrelated	Retained tail fencing counter.
+bifrost_oracle_tail_page_seconds	current_unrelated	Retained tail-page timing family.
+bifrost_oracle_tail_pages_total	current_unrelated	Retained tail-page counter.
+bifrost_gate_active_streams	current_unrelated	Gate subsystem metric, outside Oracle lease vocabulary.
+bifrost_gate_query_stream_duration_seconds	current_unrelated	Gate subsystem metric, outside Oracle lease vocabulary.
+bifrost_gate_request_duration_seconds	current_unrelated	Gate subsystem metric, outside Oracle lease vocabulary.
+bifrost_scribe_wal_fsync_seconds	current_unrelated	Scribe subsystem metric, outside Oracle lease vocabulary.
+oracle.rows	current_unrelated	Canonical query row binding remains in recorder metadata where required.
+oracle.stream_bytes	current_unrelated	Canonical stream byte binding remains in recorder metadata where required.
+phase.oracle_stream_bytes	current_unrelated	Retained phase binding is not an Oracle metric family.

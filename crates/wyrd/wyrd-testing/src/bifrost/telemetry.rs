@@ -61,6 +61,8 @@ pub(crate) enum TelemetryUnit {
     Bytes,
     /// Seconds.
     Seconds,
+    /// Dimensionless budget-pressure ratio.
+    Ratio,
 }
 
 /// Closed requirement policy for the current representative workload.
@@ -115,36 +117,62 @@ pub(crate) struct TelemetryBinding {
     allowed_label_values: &'static [TelemetryLabelValues],
 }
 
-/// Closed production labels carried by every Oracle admission rejection.
-const ORACLE_ADMISSION_REJECTION_LABELS: &[TelemetryLabelValues] = &[
+/// Closed production labels emitted by the Oracle admission owner.
+const ORACLE_ADMISSION_LABELS: &[TelemetryLabelValues] = &[
     TelemetryLabelValues {
-        key: "scope",
-        values: &["cluster", "class", "tenant"],
+        key: "class",
+        values: &["interactive", "analytical"],
+    },
+    TelemetryLabelValues {
+        key: "outcome",
+        values: &["admitted", "rejected"],
     },
     TelemetryLabelValues {
         key: "reason",
         values: &[
-            "pending_limit",
-            "lease_timeout",
-            "lease_capacity",
-            "local_slots",
+            "class_capacity",
+            "tenant_budget",
+            "queue_full",
+            "queue_deadline",
+            "memory",
+            "spill",
+            "audit_unavailable",
+            "shutdown",
         ],
-    },
-    TelemetryLabelValues {
-        key: "query_class",
-        values: &["interactive", "analytical"],
     },
 ];
 
-/// Closed production labels carried by Oracle classification decisions.
-const ORACLE_CLASSIFICATION_LABELS: &[TelemetryLabelValues] = &[
+/// Closed query terminal labels emitted by the Oracle stream owner.
+#[cfg(test)]
+const ORACLE_TERMINAL_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
+    key: "outcome",
+    values: &["success", "degraded", "failed"],
+}];
+
+/// Closed query cancellation labels emitted by the Oracle stream owner.
+#[cfg(test)]
+const ORACLE_CANCELLATION_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
+    key: "reason",
+    values: &["client_drop", "deadline", "shutdown", "peer_failure"],
+}];
+
+/// Closed fragment terminal labels emitted by the Oracle dispatcher.
+#[cfg(test)]
+const ORACLE_FRAGMENT_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
+    key: "outcome",
+    values: &["success", "failed"],
+}];
+
+/// Closed relay labels emitted by the server audit publisher.
+#[cfg(test)]
+const ORACLE_AUDIT_RELAY_LABELS: &[TelemetryLabelValues] = &[
     TelemetryLabelValues {
-        key: "query_class",
-        values: &["interactive", "analytical"],
+        key: "outcome",
+        values: &["committed", "retried_transient", "failed"],
     },
     TelemetryLabelValues {
         key: "reason",
-        values: &["estimated_scan", "predicted_scan", "global_operator"],
+        values: &["postgres", "timeout", "serialization"],
     },
 ];
 
@@ -380,42 +408,17 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_values: &[],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("cleanup.oracle_in_flight"),
+        id: TelemetryBindingId("cleanup.oracle_active"),
         selected_label_values: &[],
-        family: "bifrost_oracle_in_flight",
+        family: "oracle_queries_active",
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[
-            TelemetryLabelValues {
-                key: "query_class",
-                values: &["interactive", "analytical"],
-            },
-            TelemetryLabelValues {
-                key: "visibility",
-                values: &["published_only", "fused"],
-            },
-        ],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("cleanup.oracle_slots"),
-        selected_label_values: &[],
-        family: "bifrost_oracle_slots_in_use",
-        kind: BifrostMetricKind::Gauge,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[
-            TelemetryLabelValues {
-                key: "query_class",
-                values: &["interactive", "analytical"],
-            },
-            TelemetryLabelValues {
-                key: "role",
-                values: &["leader"],
-            },
-        ],
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("cleanup.storage_active"),
@@ -521,234 +524,40 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_values: &[],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("oracle.slots_final"),
+        id: TelemetryBindingId("oracle.admission"),
         selected_label_values: &[],
-        family: "bifrost_oracle_slots_total",
-        kind: BifrostMetricKind::Gauge,
+        family: "oracle_admission_total",
+        kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Final,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: ORACLE_ADMISSION_LABELS,
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.admission_queue"),
+        selected_label_values: &[],
+        family: "oracle_admission_queue_duration_seconds",
+        kind: BifrostMetricKind::HistogramBucket,
+        unit: TelemetryUnit::Seconds,
+        aggregation: TelemetryAggregation::P99,
         requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
-            key: "role",
-            values: &["leader"],
+            key: "class",
+            values: &["interactive", "analytical"],
         }],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("oracle.slots_peak.analytical"),
-        selected_label_values: &[TelemetrySelectedLabel {
-            key: "query_class",
-            value: "analytical",
-        }],
-        family: "bifrost_oracle_slots_in_use",
+        id: TelemetryBindingId("oracle.tenant_pressure_peak"),
+        selected_label_values: &[],
+        family: "oracle_tenant_budget_pressure",
         kind: BifrostMetricKind::Gauge,
-        unit: TelemetryUnit::Count,
+        unit: TelemetryUnit::Ratio,
         aggregation: TelemetryAggregation::Peak,
         requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[
-            TelemetryLabelValues {
-                key: "query_class",
-                values: &["interactive", "analytical"],
-            },
-            TelemetryLabelValues {
-                key: "role",
-                values: &["leader"],
-            },
-        ],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.classification.interactive_scan"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "interactive",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "estimated_scan",
-            },
-        ],
-        family: "bifrost_oracle_classification_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_CLASSIFICATION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.classification.predicted_scan"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "analytical",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "predicted_scan",
-            },
-        ],
-        family: "bifrost_oracle_classification_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_CLASSIFICATION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.classification.global_operator"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "analytical",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "global_operator",
-            },
-        ],
-        family: "bifrost_oracle_classification_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_CLASSIFICATION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.admission.pending_limit"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "scope",
-                value: "cluster",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "pending_limit",
-            },
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "interactive",
-            },
-        ],
-        family: "bifrost_oracle_admission_rejections_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.admission.lease_timeout"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "scope",
-                value: "cluster",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "lease_timeout",
-            },
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "interactive",
-            },
-        ],
-        family: "bifrost_oracle_admission_rejections_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.admission.lease_cluster"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "scope",
-                value: "cluster",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "lease_capacity",
-            },
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "interactive",
-            },
-        ],
-        family: "bifrost_oracle_admission_rejections_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.admission.lease_class"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "scope",
-                value: "class",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "lease_capacity",
-            },
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "interactive",
-            },
-        ],
-        family: "bifrost_oracle_admission_rejections_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.admission.lease_tenant"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "scope",
-                value: "tenant",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "lease_capacity",
-            },
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "interactive",
-            },
-        ],
-        family: "bifrost_oracle_admission_rejections_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.admission.local_slots"),
-        selected_label_values: &[
-            TelemetrySelectedLabel {
-                key: "scope",
-                value: "cluster",
-            },
-            TelemetrySelectedLabel {
-                key: "reason",
-                value: "local_slots",
-            },
-            TelemetrySelectedLabel {
-                key: "query_class",
-                value: "interactive",
-            },
-        ],
-        family: "bifrost_oracle_admission_rejections_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: ORACLE_ADMISSION_REJECTION_LABELS,
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("scribe.wal_bytes"),
@@ -844,48 +653,107 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("oracle.source_rows"),
-        selected_label_values: &[],
-        family: "bifrost_oracle_source_rows_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["iceberg", "hot_sealed", "live_tail"],
-        }],
-    },
-    TelemetryBinding {
         id: TelemetryBindingId("oracle.rows"),
-        selected_label_values: &[TelemetrySelectedLabel {
-            key: "outcome",
-            value: "success",
-        }],
-        family: "bifrost_oracle_stream_rows_total",
+        selected_label_values: &[],
+        family: "oracle_query_rows_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
-            key: "outcome",
-            values: &["success", "failed", "cancelled", "client_drop"],
+            key: "class",
+            values: &["interactive", "analytical"],
         }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("oracle.stream_bytes"),
-        selected_label_values: &[TelemetrySelectedLabel {
-            key: "outcome",
-            value: "success",
-        }],
-        family: "bifrost_oracle_stream_bytes_total",
+        selected_label_values: &[],
+        family: "oracle_query_bytes_returned_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
-            key: "outcome",
-            values: &["success", "failed", "cancelled", "client_drop"],
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.logical_bytes"),
+        selected_label_values: &[],
+        family: "oracle_query_logical_bytes_selected_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.physical_bytes"),
+        selected_label_values: &[],
+        family: "oracle_query_bytes_scanned_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.files"),
+        selected_label_values: &[],
+        family: "oracle_query_files_scanned_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.partitions"),
+        selected_label_values: &[],
+        family: "oracle_query_partitions_scanned_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.queued_peak"),
+        selected_label_values: &[],
+        family: "oracle_queries_queued",
+        kind: BifrostMetricKind::Gauge,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Peak,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.spill_bytes"),
+        selected_label_values: &[],
+        family: "oracle_query_spill_bytes_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Bytes,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
         }],
     },
     TelemetryBinding {
@@ -997,8 +865,7 @@ const COMPLETE_BINDING_IDS: &[&str] = &[
     "cleanup.scribe_lane_active",
     "cleanup.scribe_lane_queued",
     "cleanup.scribe_persistence_queue",
-    "cleanup.oracle_in_flight",
-    "cleanup.oracle_slots",
+    "cleanup.oracle_active",
     "cleanup.storage_active",
     "gate.query_streams",
     "gate.query_streams.cancelled",
@@ -1006,17 +873,9 @@ const COMPLETE_BINDING_IDS: &[&str] = &[
     "gate.query_stream_duration",
     "scribe.rows",
     "forge.backlog_peak",
-    "oracle.slots_final",
-    "oracle.slots_peak.analytical",
-    "oracle.classification.interactive_scan",
-    "oracle.classification.predicted_scan",
-    "oracle.classification.global_operator",
-    "oracle.admission.pending_limit",
-    "oracle.admission.lease_timeout",
-    "oracle.admission.lease_cluster",
-    "oracle.admission.lease_class",
-    "oracle.admission.lease_tenant",
-    "oracle.admission.local_slots",
+    "oracle.admission",
+    "oracle.admission_queue",
+    "oracle.tenant_pressure_peak",
     "scribe.wal_bytes",
     "scribe.seal_rows",
     "forge.publications",
@@ -1024,9 +883,14 @@ const COMPLETE_BINDING_IDS: &[&str] = &[
     "forge.rewrite_input_bytes",
     "forge.rewrite_output_files",
     "forge.rewrite_output_bytes",
-    "oracle.source_rows",
     "oracle.rows",
     "oracle.stream_bytes",
+    "oracle.logical_bytes",
+    "oracle.physical_bytes",
+    "oracle.files",
+    "oracle.partitions",
+    "oracle.queued_peak",
+    "oracle.spill_bytes",
     "postgres.acquire",
     "postgres.transactions",
     "storage.duration",
@@ -1050,8 +914,7 @@ const CLEANUP_BINDING_IDS: &[&str] = &[
     "cleanup.scribe_lane_active",
     "cleanup.scribe_lane_queued",
     "cleanup.scribe_persistence_queue",
-    "cleanup.oracle_in_flight",
-    "cleanup.oracle_slots",
+    "cleanup.oracle_active",
     "cleanup.storage_active",
 ];
 
@@ -1106,8 +969,6 @@ pub(crate) struct ClusterPhaseTelemetryEvidence {
     pub(crate) gate_active_streams: u64,
     /// Scribe rows accepted in the sampled phase.
     pub(crate) scribe_rows: u64,
-    /// Rows decoded from all Oracle sources.
-    pub(crate) oracle_source_rows: u64,
     /// Rows returned by successful Oracle streams.
     pub(crate) oracle_stream_rows: u64,
     /// Bytes returned by successful Oracle streams.
@@ -1174,28 +1035,6 @@ pub(crate) struct ClusterPillarTelemetryEvidence {
     pub(crate) forge_publications: u64,
     /// Rows decoded by successful Oracle streams.
     pub(crate) oracle_decoded_rows: u64,
-    /// Peak analytical slot units retained concurrently by local Oracle leaders.
-    pub(crate) oracle_analytical_slots_peak: u64,
-    /// Final configured local Oracle slot capacity exposed by the process.
-    pub(crate) oracle_slots_total: u64,
-    /// Queries classified interactive by the estimated-scan rule.
-    pub(crate) oracle_interactive_scan_classifications: u64,
-    /// Queries classified analytical by the predicted-scan rule.
-    pub(crate) oracle_predicted_scan_classifications: u64,
-    /// Queries classified analytical because an unbounded global operator remains.
-    pub(crate) oracle_global_operator_classifications: u64,
-    /// Analytical requests rejected because the local pending waiter bound was full.
-    pub(crate) oracle_pending_limit_rejections: u64,
-    /// Admission attempts that exhausted the bounded durable lease-acquisition window.
-    pub(crate) oracle_lease_timeout_rejections: u64,
-    /// Analytical requests rejected by the durable cluster slot ceiling.
-    pub(crate) oracle_cluster_lease_rejections: u64,
-    /// Analytical requests rejected by the durable class slot ceiling.
-    pub(crate) oracle_class_lease_rejections: u64,
-    /// Analytical requests rejected by the durable per-tenant slot ceiling.
-    pub(crate) oracle_tenant_lease_rejections: u64,
-    /// Analytical requests rejected by the selected leader's local slot guard.
-    pub(crate) oracle_local_slot_rejections: u64,
 }
 
 /// Canonical dependency observations without a dependency on benchmark reports.
@@ -1288,8 +1127,6 @@ pub(crate) struct ClusterCleanupTelemetryEvidence {
     pub(crate) scribe_persistence_queue: Option<u64>,
     /// Final in-flight Oracle queries.
     pub(crate) oracle_in_flight: Option<u64>,
-    /// Final Oracle admission slots in use.
-    pub(crate) oracle_slots: Option<u64>,
     /// Final active storage operations.
     pub(crate) storage_active: Option<u64>,
 }
@@ -1306,7 +1143,6 @@ impl ClusterCleanupTelemetryEvidence {
             self.scribe_lane_queued,
             self.scribe_persistence_queue,
             self.oracle_in_flight,
-            self.oracle_slots,
             self.storage_active,
         ]
         .into_iter()
@@ -2184,7 +2020,6 @@ fn project_cluster_phase_evidence(
         gate_query_stream_terminals: counter("gate.query_streams"),
         gate_active_streams: gauge_final("gate.active"),
         scribe_rows: counter("scribe.rows"),
-        oracle_source_rows: counter("oracle.source_rows"),
         oracle_stream_rows: counter("oracle.rows"),
         oracle_stream_bytes: counter("oracle.stream_bytes"),
         forge_input_files: counter("forge.rewrite_input_files"),
@@ -2245,58 +2080,6 @@ impl ClusterTelemetryProjection {
                 scribe_wal_bytes: binding_counter(&bindings, "scribe.wal_bytes").unwrap_or(0),
                 forge_publications: binding_counter(&bindings, "forge.publications").unwrap_or(0),
                 oracle_decoded_rows: binding_counter(&bindings, "oracle.rows").unwrap_or(0),
-                oracle_analytical_slots_peak: binding_gauge_peak(
-                    &bindings,
-                    "oracle.slots_peak.analytical",
-                )
-                .unwrap_or(0),
-                oracle_slots_total: binding_gauge_final(&bindings, "oracle.slots_final")
-                    .unwrap_or(0),
-                oracle_interactive_scan_classifications: binding_counter(
-                    &bindings,
-                    "oracle.classification.interactive_scan",
-                )
-                .unwrap_or(0),
-                oracle_predicted_scan_classifications: binding_counter(
-                    &bindings,
-                    "oracle.classification.predicted_scan",
-                )
-                .unwrap_or(0),
-                oracle_global_operator_classifications: binding_counter(
-                    &bindings,
-                    "oracle.classification.global_operator",
-                )
-                .unwrap_or(0),
-                oracle_pending_limit_rejections: binding_counter(
-                    &bindings,
-                    "oracle.admission.pending_limit",
-                )
-                .unwrap_or(0),
-                oracle_lease_timeout_rejections: binding_counter(
-                    &bindings,
-                    "oracle.admission.lease_timeout",
-                )
-                .unwrap_or(0),
-                oracle_cluster_lease_rejections: binding_counter(
-                    &bindings,
-                    "oracle.admission.lease_cluster",
-                )
-                .unwrap_or(0),
-                oracle_class_lease_rejections: binding_counter(
-                    &bindings,
-                    "oracle.admission.lease_class",
-                )
-                .unwrap_or(0),
-                oracle_tenant_lease_rejections: binding_counter(
-                    &bindings,
-                    "oracle.admission.lease_tenant",
-                )
-                .unwrap_or(0),
-                oracle_local_slot_rejections: binding_counter(
-                    &bindings,
-                    "oracle.admission.local_slots",
-                )
-                .unwrap_or(0),
             },
             dependencies: ClusterDependencyTelemetryEvidence {
                 postgres_pool_wait_us: binding_p99(&bindings, "postgres.acquire"),
@@ -2321,8 +2104,7 @@ impl ClusterTelemetryProjection {
                     &bindings,
                     "cleanup.scribe_persistence_queue",
                 ),
-                oracle_in_flight: binding_gauge_final(&bindings, "cleanup.oracle_in_flight"),
-                oracle_slots: binding_gauge_final(&bindings, "cleanup.oracle_slots"),
+                oracle_in_flight: binding_gauge_final(&bindings, "cleanup.oracle_active"),
                 storage_active: binding_gauge_final(&bindings, "cleanup.storage_active"),
             },
         })
@@ -2392,17 +2174,6 @@ fn binding_gauge_final(
 ) -> Option<u64> {
     match bindings.get(id) {
         Some(EvaluatedBindingValue::Gauge { final_value, .. }) => Some(*final_value),
-        _ => None,
-    }
-}
-
-/// Return one exact peak gauge destination without synthesizing absence.
-fn binding_gauge_peak(
-    bindings: &BTreeMap<&'static str, EvaluatedBindingValue>,
-    id: &str,
-) -> Option<u64> {
-    match bindings.get(id) {
-        Some(EvaluatedBindingValue::Gauge { peak, .. }) => Some(*peak),
         _ => None,
     }
 }
@@ -2555,8 +2326,14 @@ fn validate_binding_unit(binding: &TelemetryBinding) -> Result<(), BifrostTeleme
         TelemetryUnit::Count => {
             !binding.family.ends_with("_seconds") && !binding.family.ends_with("_bytes_total")
         }
-        TelemetryUnit::Bytes => binding.family.ends_with("_bytes_total"),
+        TelemetryUnit::Bytes => {
+            binding.family.ends_with("_bytes_total")
+                || (binding.family.contains("_bytes_") && binding.family.ends_with("_total"))
+        }
         TelemetryUnit::Seconds => binding.family.ends_with("_seconds"),
+        TelemetryUnit::Ratio => {
+            !binding.family.ends_with("_seconds") && !binding.family.ends_with("_bytes_total")
+        }
     };
     if valid {
         Ok(())
@@ -3536,7 +3313,7 @@ mod tests {
             value,
             kind: if labels.iter().any(|(key, _)| *key == "le") {
                 BifrostMetricKind::HistogramBucket
-            } else if family.ends_with("_total") && family != "bifrost_oracle_slots_total" {
+            } else if family.ends_with("_total") && family != "oracle_queries_active" {
                 BifrostMetricKind::Counter
             } else {
                 BifrostMetricKind::Gauge
@@ -3584,15 +3361,15 @@ mod tests {
         }
     }
 
-    /// Slot capacity is an up/down gauge even though its legacy family ends in `_total`.
+    /// Active Oracle queries are an up/down gauge despite their bounded labels.
     #[test]
-    fn oracle_slot_capacity_is_not_monotonic() {
+    fn oracle_active_queries_are_not_monotonic() {
         let types = BTreeMap::from([(
-            "bifrost_oracle_slots_total".to_owned(),
+            "oracle_queries_active".to_owned(),
             PrometheusFamilyType::Gauge,
         )]);
         assert_eq!(
-            parse_sample("bifrost_oracle_slots_total{role=\"leader\"}", 1.0, &types,)
+            parse_sample("oracle_queries_active{class=\"analytical\"}", 1.0, &types,)
                 .unwrap()
                 .kind,
             BifrostMetricKind::Gauge
@@ -3975,7 +3752,8 @@ mod tests {
             let mut wrong_unit = *binding;
             wrong_unit.unit = match binding.unit {
                 TelemetryUnit::Count => TelemetryUnit::Seconds,
-                TelemetryUnit::Bytes | TelemetryUnit::Seconds => TelemetryUnit::Count,
+                TelemetryUnit::Bytes | TelemetryUnit::Ratio => TelemetryUnit::Seconds,
+                TelemetryUnit::Seconds => TelemetryUnit::Count,
             };
             assert!(matches!(
                 validate_binding_unit(&wrong_unit),
@@ -4254,7 +4032,7 @@ mod tests {
         use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
         use TelemetryAggregation::{Delta, Final, P99, Peak};
         use TelemetryRequirement::{Always, Role};
-        use TelemetryUnit::{Bytes, Count, Seconds};
+        use TelemetryUnit::{Bytes, Count, Ratio, Seconds};
         vec![
             EmitterContractFixture {
                 id: "gate.requests.success",
@@ -4431,34 +4209,16 @@ mod tests {
                 destination: "cleanup.scribe_persistence_queue",
             },
             EmitterContractFixture {
-                id: "cleanup.oracle_in_flight",
+                id: "cleanup.oracle_active",
                 selectors: &[],
-                family: "bifrost_oracle_in_flight",
+                family: "oracle_queries_active",
                 kind: Gauge,
-                keys: &["query_class", "visibility"],
-                domains: &[
-                    ("query_class", &["interactive", "analytical"]),
-                    ("visibility", &["published_only", "fused"]),
-                ],
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
                 unit: Count,
                 aggregation: Final,
                 requirement: Role("oracle"),
-                destination: "cleanup.oracle_in_flight",
-            },
-            EmitterContractFixture {
-                id: "cleanup.oracle_slots",
-                selectors: &[],
-                family: "bifrost_oracle_slots_in_use",
-                kind: Gauge,
-                keys: &["query_class", "role"],
-                domains: &[
-                    ("query_class", &["interactive", "analytical"]),
-                    ("role", &["leader"]),
-                ],
-                unit: Count,
-                aggregation: Final,
-                requirement: Role("oracle"),
-                destination: "cleanup.oracle_slots",
+                destination: "cleanup.oracle_active",
             },
             EmitterContractFixture {
                 id: "cleanup.storage_active",
@@ -4551,253 +4311,56 @@ mod tests {
                 destination: "binding validation",
             },
             EmitterContractFixture {
-                id: "oracle.slots_final",
+                id: "oracle.admission",
                 selectors: &[],
-                family: "bifrost_oracle_slots_total",
-                kind: Gauge,
-                keys: &["role"],
-                domains: &[("role", &["leader"])],
+                family: "oracle_admission_total",
+                kind: Counter,
+                keys: &["class", "outcome", "reason"],
+                domains: &[
+                    ("class", &["interactive", "analytical"]),
+                    ("outcome", &["admitted", "rejected"]),
+                    (
+                        "reason",
+                        &[
+                            "class_capacity",
+                            "tenant_budget",
+                            "queue_full",
+                            "queue_deadline",
+                            "memory",
+                            "spill",
+                            "audit_unavailable",
+                            "shutdown",
+                        ],
+                    ),
+                ],
                 unit: Count,
-                aggregation: Final,
+                aggregation: Delta,
                 requirement: Role("oracle"),
                 destination: "binding validation",
             },
             EmitterContractFixture {
-                id: "oracle.slots_peak.analytical",
-                selectors: &[("query_class", "analytical")],
-                family: "bifrost_oracle_slots_in_use",
+                id: "oracle.admission_queue",
+                selectors: &[],
+                family: "oracle_admission_queue_duration_seconds",
+                kind: HistogramBucket,
+                keys: &["class", "le"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Seconds,
+                aggregation: P99,
+                requirement: Role("oracle"),
+                destination: "oracle admission queue",
+            },
+            EmitterContractFixture {
+                id: "oracle.tenant_pressure_peak",
+                selectors: &[],
+                family: "oracle_tenant_budget_pressure",
                 kind: Gauge,
-                keys: &["query_class", "role"],
-                domains: &[
-                    ("query_class", &["interactive", "analytical"]),
-                    ("role", &["leader"]),
-                ],
-                unit: Count,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Ratio,
                 aggregation: Peak,
                 requirement: Role("oracle"),
-                destination: "pillars.oracle_analytical_slots_peak",
-            },
-            EmitterContractFixture {
-                id: "oracle.classification.interactive_scan",
-                selectors: &[("query_class", "interactive"), ("reason", "estimated_scan")],
-                family: "bifrost_oracle_classification_total",
-                kind: Counter,
-                keys: &["query_class", "reason"],
-                domains: &[
-                    ("query_class", &["interactive", "analytical"]),
-                    (
-                        "reason",
-                        &["estimated_scan", "predicted_scan", "global_operator"],
-                    ),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_interactive_scan_classifications",
-            },
-            EmitterContractFixture {
-                id: "oracle.classification.predicted_scan",
-                selectors: &[("query_class", "analytical"), ("reason", "predicted_scan")],
-                family: "bifrost_oracle_classification_total",
-                kind: Counter,
-                keys: &["query_class", "reason"],
-                domains: &[
-                    ("query_class", &["interactive", "analytical"]),
-                    (
-                        "reason",
-                        &["estimated_scan", "predicted_scan", "global_operator"],
-                    ),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_predicted_scan_classifications",
-            },
-            EmitterContractFixture {
-                id: "oracle.classification.global_operator",
-                selectors: &[("query_class", "analytical"), ("reason", "global_operator")],
-                family: "bifrost_oracle_classification_total",
-                kind: Counter,
-                keys: &["query_class", "reason"],
-                domains: &[
-                    ("query_class", &["interactive", "analytical"]),
-                    (
-                        "reason",
-                        &["estimated_scan", "predicted_scan", "global_operator"],
-                    ),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_global_operator_classifications",
-            },
-            EmitterContractFixture {
-                id: "oracle.admission.pending_limit",
-                selectors: &[
-                    ("scope", "cluster"),
-                    ("reason", "pending_limit"),
-                    ("query_class", "interactive"),
-                ],
-                family: "bifrost_oracle_admission_rejections_total",
-                kind: Counter,
-                keys: &["scope", "reason", "query_class"],
-                domains: &[
-                    ("scope", &["cluster", "class", "tenant"]),
-                    (
-                        "reason",
-                        &[
-                            "pending_limit",
-                            "lease_timeout",
-                            "lease_capacity",
-                            "local_slots",
-                        ],
-                    ),
-                    ("query_class", &["interactive", "analytical"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_pending_limit_rejections",
-            },
-            EmitterContractFixture {
-                id: "oracle.admission.lease_timeout",
-                selectors: &[
-                    ("scope", "cluster"),
-                    ("reason", "lease_timeout"),
-                    ("query_class", "interactive"),
-                ],
-                family: "bifrost_oracle_admission_rejections_total",
-                kind: Counter,
-                keys: &["scope", "reason", "query_class"],
-                domains: &[
-                    ("scope", &["cluster", "class", "tenant"]),
-                    (
-                        "reason",
-                        &[
-                            "pending_limit",
-                            "lease_timeout",
-                            "lease_capacity",
-                            "local_slots",
-                        ],
-                    ),
-                    ("query_class", &["interactive", "analytical"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_lease_timeout_rejections",
-            },
-            EmitterContractFixture {
-                id: "oracle.admission.lease_cluster",
-                selectors: &[
-                    ("scope", "cluster"),
-                    ("reason", "lease_capacity"),
-                    ("query_class", "interactive"),
-                ],
-                family: "bifrost_oracle_admission_rejections_total",
-                kind: Counter,
-                keys: &["scope", "reason", "query_class"],
-                domains: &[
-                    ("scope", &["cluster", "class", "tenant"]),
-                    (
-                        "reason",
-                        &[
-                            "pending_limit",
-                            "lease_timeout",
-                            "lease_capacity",
-                            "local_slots",
-                        ],
-                    ),
-                    ("query_class", &["interactive", "analytical"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_cluster_lease_rejections",
-            },
-            EmitterContractFixture {
-                id: "oracle.admission.lease_class",
-                selectors: &[
-                    ("scope", "class"),
-                    ("reason", "lease_capacity"),
-                    ("query_class", "interactive"),
-                ],
-                family: "bifrost_oracle_admission_rejections_total",
-                kind: Counter,
-                keys: &["scope", "reason", "query_class"],
-                domains: &[
-                    ("scope", &["cluster", "class", "tenant"]),
-                    (
-                        "reason",
-                        &[
-                            "pending_limit",
-                            "lease_timeout",
-                            "lease_capacity",
-                            "local_slots",
-                        ],
-                    ),
-                    ("query_class", &["interactive", "analytical"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_class_lease_rejections",
-            },
-            EmitterContractFixture {
-                id: "oracle.admission.lease_tenant",
-                selectors: &[
-                    ("scope", "tenant"),
-                    ("reason", "lease_capacity"),
-                    ("query_class", "interactive"),
-                ],
-                family: "bifrost_oracle_admission_rejections_total",
-                kind: Counter,
-                keys: &["scope", "reason", "query_class"],
-                domains: &[
-                    ("scope", &["cluster", "class", "tenant"]),
-                    (
-                        "reason",
-                        &[
-                            "pending_limit",
-                            "lease_timeout",
-                            "lease_capacity",
-                            "local_slots",
-                        ],
-                    ),
-                    ("query_class", &["interactive", "analytical"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_tenant_lease_rejections",
-            },
-            EmitterContractFixture {
-                id: "oracle.admission.local_slots",
-                selectors: &[
-                    ("scope", "cluster"),
-                    ("reason", "local_slots"),
-                    ("query_class", "interactive"),
-                ],
-                family: "bifrost_oracle_admission_rejections_total",
-                kind: Counter,
-                keys: &["scope", "reason", "query_class"],
-                domains: &[
-                    ("scope", &["cluster", "class", "tenant"]),
-                    (
-                        "reason",
-                        &[
-                            "pending_limit",
-                            "lease_timeout",
-                            "lease_capacity",
-                            "local_slots",
-                        ],
-                    ),
-                    ("query_class", &["interactive", "analytical"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "pillars.oracle_local_slot_rejections",
+                destination: "oracle tenant pressure",
             },
             EmitterContractFixture {
                 id: "scribe.wal_bytes",
@@ -4892,46 +4455,100 @@ mod tests {
                 destination: "phase.forge_output_bytes",
             },
             EmitterContractFixture {
-                id: "oracle.source_rows",
-                selectors: &[],
-                family: "bifrost_oracle_source_rows_total",
-                kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["iceberg", "hot_sealed", "live_tail"])],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "phase.oracle_source_rows",
-            },
-            EmitterContractFixture {
                 id: "oracle.rows",
-                selectors: &[("outcome", "success")],
-                family: "bifrost_oracle_stream_rows_total",
+                selectors: &[],
+                family: "oracle_query_rows_total",
                 kind: Counter,
-                keys: &["outcome"],
-                domains: &[(
-                    "outcome",
-                    &["success", "failed", "cancelled", "client_drop"],
-                )],
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("oracle"),
-                destination: "pillars.oracle_decoded_rows/reconciliation.oracle_rows(outcome=success)",
+                destination: "pillars.oracle_decoded_rows/reconciliation.oracle_rows",
             },
             EmitterContractFixture {
                 id: "oracle.stream_bytes",
-                selectors: &[("outcome", "success")],
-                family: "bifrost_oracle_stream_bytes_total",
+                selectors: &[],
+                family: "oracle_query_bytes_returned_total",
                 kind: Counter,
-                keys: &["outcome"],
-                domains: &[(
-                    "outcome",
-                    &["success", "failed", "cancelled", "client_drop"],
-                )],
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
                 unit: Bytes,
                 aggregation: Delta,
                 requirement: Role("oracle"),
                 destination: "phase.oracle_stream_bytes",
+            },
+            EmitterContractFixture {
+                id: "oracle.logical_bytes",
+                selectors: &[],
+                family: "oracle_query_logical_bytes_selected_total",
+                kind: Counter,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "oracle logical bytes",
+            },
+            EmitterContractFixture {
+                id: "oracle.physical_bytes",
+                selectors: &[],
+                family: "oracle_query_bytes_scanned_total",
+                kind: Counter,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "oracle physical bytes",
+            },
+            EmitterContractFixture {
+                id: "oracle.files",
+                selectors: &[],
+                family: "oracle_query_files_scanned_total",
+                kind: Counter,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "oracle files",
+            },
+            EmitterContractFixture {
+                id: "oracle.partitions",
+                selectors: &[],
+                family: "oracle_query_partitions_scanned_total",
+                kind: Counter,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "oracle partitions",
+            },
+            EmitterContractFixture {
+                id: "oracle.queued_peak",
+                selectors: &[],
+                family: "oracle_queries_queued",
+                kind: Gauge,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Count,
+                aggregation: Peak,
+                requirement: Role("oracle"),
+                destination: "oracle queued peak",
+            },
+            EmitterContractFixture {
+                id: "oracle.spill_bytes",
+                selectors: &[],
+                family: "oracle_query_spill_bytes_total",
+                kind: Counter,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Bytes,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "oracle spill bytes",
             },
             EmitterContractFixture {
                 id: "postgres.acquire",
@@ -5054,6 +4671,72 @@ mod tests {
         }
     }
 
+    /// Prove the projection's Oracle admission domains are sourced from production enums.
+    #[test]
+    fn oracle_admission_domains_match_production_closed_labels() {
+        let production = vala_bifrost_redux::bench_support::oracle_telemetry_label_domains();
+        let classes = CLUSTER_BINDINGS
+            .iter()
+            .find(|binding| binding.id.0 == "oracle.rows")
+            .expect("Oracle rows binding exists")
+            .allowed_label_values[0]
+            .values;
+        assert_eq!(classes, production.classes);
+        let admission = CLUSTER_BINDINGS
+            .iter()
+            .find(|binding| binding.id.0 == "oracle.admission")
+            .expect("Oracle admission binding exists")
+            .allowed_label_values;
+        assert_eq!(admission[0].values, production.classes);
+        assert_eq!(admission[1].values, production.outcomes);
+        assert_eq!(admission[2].values, production.reasons);
+
+        assert_eq!(
+            ORACLE_TERMINAL_LABELS[0].values,
+            production.terminal_outcomes
+        );
+        assert_eq!(
+            ORACLE_CANCELLATION_LABELS[0].values,
+            production.cancellation_reasons
+        );
+        assert_eq!(
+            ORACLE_FRAGMENT_LABELS[0].values,
+            production.fragment_outcomes
+        );
+
+        let audit = wyrd_server::oracle::audit_telemetry_label_domains();
+        assert_eq!(ORACLE_AUDIT_RELAY_LABELS[0].values, audit.outcomes);
+        assert_eq!(ORACLE_AUDIT_RELAY_LABELS[1].values, audit.failure_reasons);
+
+        let redux_keys = [
+            ORACLE_ADMISSION_LABELS
+                .iter()
+                .map(|domain| domain.key)
+                .collect::<Vec<_>>(),
+            ORACLE_TERMINAL_LABELS
+                .iter()
+                .map(|domain| domain.key)
+                .collect::<Vec<_>>(),
+            ORACLE_CANCELLATION_LABELS
+                .iter()
+                .map(|domain| domain.key)
+                .collect::<Vec<_>>(),
+            ORACLE_FRAGMENT_LABELS
+                .iter()
+                .map(|domain| domain.key)
+                .collect::<Vec<_>>(),
+        ];
+        assert_eq!(redux_keys[0], vec!["class", "outcome", "reason"]);
+        assert_eq!(redux_keys[1], vec!["outcome"]);
+        assert_eq!(redux_keys[2], vec!["reason"]);
+        assert_eq!(redux_keys[3], vec!["outcome"]);
+        let audit_keys = ORACLE_AUDIT_RELAY_LABELS
+            .iter()
+            .map(|domain| domain.key)
+            .collect::<Vec<_>>();
+        assert_eq!(audit_keys, vec!["outcome", "reason"]);
+    }
+
     /// Return whether every selector pair belongs to its allowed emitter domain.
     fn selectors_match_allowed_domains(binding: &TelemetryBinding) -> bool {
         binding.selected_label_values.iter().all(|selected| {
@@ -5170,7 +4853,6 @@ mod tests {
         assert_eq!(phase.gate_query_stream_terminals, 2);
         assert_eq!(phase.gate_active_streams, 1);
         assert_eq!(phase.scribe_rows, 1);
-        assert_eq!(phase.oracle_source_rows, 1);
         assert_eq!(phase.oracle_stream_rows, 1);
         assert_eq!(phase.oracle_stream_bytes, 1);
         assert_eq!(phase.forge_input_files, 1);
@@ -5185,7 +4867,7 @@ mod tests {
         let mut delta = canonical_binding_delta();
         delta
             .metrics
-            .retain(|sample| sample.family != "bifrost_oracle_stream_bytes_total");
+            .retain(|sample| sample.family != "oracle_query_bytes_returned_total");
         assert!(matches!(
             evaluate_cluster_bindings(&delta),
             Err(BifrostTelemetryReportError::InvalidBinding { id, .. })

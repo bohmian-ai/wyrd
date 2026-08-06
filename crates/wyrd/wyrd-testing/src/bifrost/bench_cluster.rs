@@ -662,17 +662,6 @@ fn capacity_stage_report(
                     scribe_wal_bytes: 0,
                     forge_publications: 0,
                     oracle_decoded_rows: 0,
-                    oracle_analytical_slots_peak: 0,
-                    oracle_slots_total: 0,
-                    oracle_interactive_scan_classifications: 0,
-                    oracle_predicted_scan_classifications: 0,
-                    oracle_global_operator_classifications: 0,
-                    oracle_pending_limit_rejections: 0,
-                    oracle_lease_timeout_rejections: 0,
-                    oracle_cluster_lease_rejections: 0,
-                    oracle_class_lease_rejections: 0,
-                    oracle_tenant_lease_rejections: 0,
-                    oracle_local_slot_rejections: 0,
                     status: EvidenceStatus::Failed,
                     missing_required: Vec::new(),
                     invalid: invalid.clone(),
@@ -805,23 +794,6 @@ fn adapt_pillars(evidence: &ClusterTelemetryEvidence) -> PillarTelemetryDelta {
         scribe_wal_bytes: evidence.pillars.scribe_wal_bytes,
         forge_publications: evidence.pillars.forge_publications,
         oracle_decoded_rows: evidence.pillars.oracle_decoded_rows,
-        oracle_analytical_slots_peak: evidence.pillars.oracle_analytical_slots_peak,
-        oracle_slots_total: evidence.pillars.oracle_slots_total,
-        oracle_interactive_scan_classifications: evidence
-            .pillars
-            .oracle_interactive_scan_classifications,
-        oracle_predicted_scan_classifications: evidence
-            .pillars
-            .oracle_predicted_scan_classifications,
-        oracle_global_operator_classifications: evidence
-            .pillars
-            .oracle_global_operator_classifications,
-        oracle_pending_limit_rejections: evidence.pillars.oracle_pending_limit_rejections,
-        oracle_lease_timeout_rejections: evidence.pillars.oracle_lease_timeout_rejections,
-        oracle_cluster_lease_rejections: evidence.pillars.oracle_cluster_lease_rejections,
-        oracle_class_lease_rejections: evidence.pillars.oracle_class_lease_rejections,
-        oracle_tenant_lease_rejections: evidence.pillars.oracle_tenant_lease_rejections,
-        oracle_local_slot_rejections: evidence.pillars.oracle_local_slot_rejections,
         status: EvidenceStatus::Complete,
         missing_required: Vec::new(),
         invalid: Vec::new(),
@@ -4113,8 +4085,8 @@ mod tests {
                 "bifrost_scribe_rows_total" => {
                     BTreeMap::from([("status".to_owned(), "accepted".to_owned())])
                 }
-                "bifrost_oracle_stream_rows_total" => {
-                    BTreeMap::from([("outcome".to_owned(), "success".to_owned())])
+                "oracle_query_rows_total" => {
+                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())])
                 }
                 "vala_postgres_pool_acquire_seconds" => BTreeMap::from([
                     ("le".to_owned(), "0.001".to_owned()),
@@ -4165,18 +4137,13 @@ mod tests {
             "bifrost_gate_requests_total",
             "bifrost_gate_rows_total",
             "bifrost_gate_query_streams_total",
-            "bifrost_gate_request_duration_seconds",
-            "bifrost_gate_query_stream_duration_seconds",
             "bifrost_scribe_rows_total",
             "bifrost_scribe_seal_rows_total",
             "bifrost_scribe_wal_append_bytes_total",
             "bifrost_forge_complete_gauge_publications_total",
-            "bifrost_oracle_stream_rows_total",
-            "vala_postgres_pool_acquire_seconds",
+            "oracle_query_rows_total",
             "vala_postgres_pool_acquire_total",
-            "wyrd_storage_operation_duration_seconds",
             "wyrd_storage_bytes_total",
-            "bifrost_scribe_wal_fsync_seconds",
         ]
         .into_iter()
         .map(metric)
@@ -4213,40 +4180,16 @@ mod tests {
             value: 0.0,
             kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
         });
-        for (scope, reason) in [
-            ("cluster", "pending_limit"),
-            ("cluster", "lease_timeout"),
-            ("cluster", "lease_capacity"),
-            ("class", "lease_capacity"),
-            ("tenant", "lease_capacity"),
-            ("cluster", "local_slots"),
-        ] {
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: "bifrost_oracle_admission_rejections_total".to_owned(),
-                labels: BTreeMap::from([
-                    ("scope".to_owned(), scope.to_owned()),
-                    ("reason".to_owned(), reason.to_owned()),
-                    ("query_class".to_owned(), "interactive".to_owned()),
-                ]),
-                value: 0.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
-            });
-        }
-        for (query_class, reason, value) in [
-            ("interactive", "estimated_scan", 1.0),
-            ("analytical", "predicted_scan", 0.0),
-            ("analytical", "global_operator", 0.0),
-        ] {
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: "bifrost_oracle_classification_total".to_owned(),
-                labels: BTreeMap::from([
-                    ("query_class".to_owned(), query_class.to_owned()),
-                    ("reason".to_owned(), reason.to_owned()),
-                ]),
-                value,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
-            });
-        }
+        metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+            family: "oracle_admission_total".to_owned(),
+            labels: BTreeMap::from([
+                ("class".to_owned(), "interactive".to_owned()),
+                ("outcome".to_owned(), "admitted".to_owned()),
+                ("reason".to_owned(), "class_capacity".to_owned()),
+            ]),
+            value: 1.0,
+            kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
+        });
         for (family, labels) in [
             ("bifrost_gate_frame_bytes_total", BTreeMap::new()),
             (
@@ -4266,12 +4209,32 @@ mod tests {
                 BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
             ),
             (
-                "bifrost_oracle_source_rows_total",
-                BTreeMap::from([("source".to_owned(), "iceberg".to_owned())]),
+                "oracle_query_rows_total",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
             ),
             (
-                "bifrost_oracle_stream_bytes_total",
-                BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
+                "oracle_query_logical_bytes_selected_total",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+            ),
+            (
+                "oracle_query_bytes_scanned_total",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+            ),
+            (
+                "oracle_query_bytes_returned_total",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+            ),
+            (
+                "oracle_query_files_scanned_total",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+            ),
+            (
+                "oracle_query_partitions_scanned_total",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+            ),
+            (
+                "oracle_query_spill_bytes_total",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
             ),
         ] {
             metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
@@ -4312,7 +4275,19 @@ mod tests {
                 "bifrost_gate_query_stream_duration_seconds",
                 BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
             ),
+            (
+                "oracle_admission_queue_duration_seconds",
+                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+            ),
         ] {
+            let mut finite = labels.clone();
+            finite.insert("le".to_owned(), "0.001".to_owned());
+            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
+                family: family.to_owned(),
+                labels: finite,
+                value: 1.0,
+                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket,
+            });
             let mut infinity = labels.clone();
             infinity.insert("le".to_owned(), "+Inf".to_owned());
             metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
@@ -4342,29 +4317,30 @@ mod tests {
                 kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
             },
             crate::bifrost::telemetry::BifrostMetricSample {
-                family: "bifrost_oracle_slots_in_use".to_owned(),
-                labels: BTreeMap::from([
-                    ("query_class".to_owned(), "analytical".to_owned()),
-                    ("role".to_owned(), "leader".to_owned()),
-                ]),
+                family: "oracle_queries_active".to_owned(),
+                labels: BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
                 value: 4.0,
                 kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
             },
-        ];
-        let mut gauge_final = vec![
             crate::bifrost::telemetry::BifrostMetricSample {
-                family: "bifrost_oracle_slots_total".to_owned(),
-                labels: BTreeMap::from([("role".to_owned(), "leader".to_owned())]),
-                value: 8.0,
+                family: "oracle_queries_queued".to_owned(),
+                labels: BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+                value: 2.0,
                 kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
             },
             crate::bifrost::telemetry::BifrostMetricSample {
-                family: "bifrost_gate_active_streams".to_owned(),
-                labels: BTreeMap::from([("operation".to_owned(), "query".to_owned())]),
-                value: 0.0,
+                family: "oracle_tenant_budget_pressure".to_owned(),
+                labels: BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+                value: 0.5,
                 kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
             },
         ];
+        let mut gauge_final = vec![crate::bifrost::telemetry::BifrostMetricSample {
+            family: "bifrost_gate_active_streams".to_owned(),
+            labels: BTreeMap::from([("operation".to_owned(), "query".to_owned())]),
+            value: 0.0,
+            kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
+        }];
         gauge_final.extend(
             [
                 ("bifrost_scribe_ingress_active", BTreeMap::new()),
@@ -4378,18 +4354,16 @@ mod tests {
                 ),
                 ("bifrost_scribe_persistence_queue_depth", BTreeMap::new()),
                 (
-                    "bifrost_oracle_in_flight",
-                    BTreeMap::from([
-                        ("query_class".to_owned(), "analytical".to_owned()),
-                        ("visibility".to_owned(), "published_only".to_owned()),
-                    ]),
+                    "oracle_queries_active",
+                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
                 ),
                 (
-                    "bifrost_oracle_slots_in_use",
-                    BTreeMap::from([
-                        ("query_class".to_owned(), "analytical".to_owned()),
-                        ("role".to_owned(), "leader".to_owned()),
-                    ]),
+                    "oracle_queries_queued",
+                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
+                ),
+                (
+                    "oracle_tenant_budget_pressure",
+                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
                 ),
                 (
                     "wyrd_storage_operations_active",
@@ -4569,7 +4543,6 @@ mod tests {
                 gate_query_stream_terminals: 0,
                 gate_active_streams: 0,
                 scribe_rows: 0,
-                oracle_source_rows: 0,
                 oracle_stream_rows: 0,
                 oracle_stream_bytes: 0,
                 forge_input_files: 0,
@@ -4582,17 +4555,6 @@ mod tests {
                 scribe_wal_bytes: 12,
                 forge_publications: 13,
                 oracle_decoded_rows: 14,
-                oracle_analytical_slots_peak: 4,
-                oracle_slots_total: 8,
-                oracle_interactive_scan_classifications: 11,
-                oracle_predicted_scan_classifications: 0,
-                oracle_global_operator_classifications: 0,
-                oracle_pending_limit_rejections: 0,
-                oracle_lease_timeout_rejections: 0,
-                oracle_cluster_lease_rejections: 0,
-                oracle_class_lease_rejections: 0,
-                oracle_tenant_lease_rejections: 0,
-                oracle_local_slot_rejections: 0,
             },
             dependencies: crate::bifrost::telemetry::ClusterDependencyTelemetryEvidence {
                 postgres_pool_wait_us: Some(21),
@@ -4635,7 +4597,6 @@ mod tests {
                 scribe_lane_queued: Some(0),
                 scribe_persistence_queue: Some(0),
                 oracle_in_flight: Some(0),
-                oracle_slots: Some(0),
                 storage_active: Some(0),
             },
         }

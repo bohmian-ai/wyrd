@@ -53,6 +53,78 @@ pub struct AuditShutdownReport {
     pub oldest_backlog_age: Option<Duration>,
 }
 
+/// Closed relay result used by the production audit metric owner.
+#[derive(Clone, Copy)]
+enum AuditRelayOutcome {
+    /// SQL commit and WAL checkpoint both completed.
+    Committed,
+    /// The record remains durable and will be retried.
+    RetriedTransient,
+    /// Relay stopped after a durable commit/checkpoint failure.
+    Failed,
+}
+
+impl AuditRelayOutcome {
+    /// Returns the bounded metric label.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::RetriedTransient => "retried_transient",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Closed relay failure reason used by the production audit metric owner.
+#[derive(Clone, Copy)]
+enum AuditRelayFailureReason {
+    /// Postgres transaction failed.
+    Postgres,
+    /// Relay attempt exceeded its timeout.
+    Timeout,
+    /// WAL checkpoint or framing failed.
+    Serialization,
+}
+
+impl AuditRelayFailureReason {
+    /// Returns the bounded metric label.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Timeout => "timeout",
+            Self::Serialization => "serialization",
+        }
+    }
+}
+
+/// Test-support projection of the relay owner's closed metric domains.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditTelemetryLabelDomains {
+    /// Relay outcomes emitted by the publisher.
+    pub outcomes: [&'static str; 3],
+    /// Relay failure reasons emitted by the publisher.
+    pub failure_reasons: [&'static str; 3],
+}
+
+/// Returns relay label domains directly from the production emitter enums.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub const fn audit_telemetry_label_domains() -> AuditTelemetryLabelDomains {
+    AuditTelemetryLabelDomains {
+        outcomes: [
+            AuditRelayOutcome::Committed.as_str(),
+            AuditRelayOutcome::RetriedTransient.as_str(),
+            AuditRelayOutcome::Failed.as_str(),
+        ],
+        failure_reasons: [
+            AuditRelayFailureReason::Postgres.as_str(),
+            AuditRelayFailureReason::Timeout.as_str(),
+            AuditRelayFailureReason::Serialization.as_str(),
+        ],
+    }
+}
+
 /// Guard that pauses the production relay immediately before its SQL attempt.
 #[cfg(feature = "test-support")]
 pub struct AuditRelayPauseGuard {
@@ -140,6 +212,37 @@ impl OracleAuditPublisher {
             relay: Mutex::new(None),
             config,
         });
+        for outcome in [
+            AuditRelayOutcome::Committed,
+            AuditRelayOutcome::RetriedTransient,
+            AuditRelayOutcome::Failed,
+        ] {
+            metrics::counter!("oracle_audit_relay_total", "outcome" => outcome.as_str())
+                .increment(0);
+        }
+        for reason in [
+            AuditRelayFailureReason::Postgres,
+            AuditRelayFailureReason::Timeout,
+            AuditRelayFailureReason::Serialization,
+        ] {
+            metrics::counter!(
+                "oracle_audit_relay_failures_total",
+                "reason" => reason.as_str()
+            )
+            .increment(0);
+        }
+        metrics::gauge!("oracle_audit_wal_records").set(0.0);
+        metrics::gauge!("oracle_audit_wal_bytes").set(0.0);
+        metrics::gauge!("oracle_audit_oldest_record_age_seconds").set(0.0);
+        metrics::gauge!("oracle_audit_relay_lag_seconds").set(0.0);
+        metrics::gauge!("oracle_audit_relay_batch_size").set(0.0);
+        if let Ok(wal) = publisher.wal.try_lock() {
+            let (records, bytes, oldest) = wal.snapshot();
+            metrics::gauge!("oracle_audit_wal_records").set(records as f64);
+            metrics::gauge!("oracle_audit_wal_bytes").set(bytes as f64);
+            metrics::gauge!("oracle_audit_oldest_record_age_seconds")
+                .set(oldest.map_or(0.0, |age| age.as_secs_f64()));
+        }
         let task_owner = std::sync::Arc::clone(&publisher);
         let handle = tokio::spawn(async move { task_owner.relay_loop().await });
         if let Ok(mut slot) = publisher.relay.try_lock() {
@@ -169,6 +272,7 @@ impl OracleAuditPublisher {
         tenant: wyrd_spec::DataTenantId,
         event: AuditEvent,
     ) -> Result<(), BifrostError> {
+        let started = Instant::now();
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AuditWalAppendCommand {
             tenant,
@@ -188,8 +292,20 @@ impl OracleAuditPublisher {
         ack_rx
             .await
             .map_err(|_| BifrostError::QueryAuditUnavailable)??;
+        metrics::histogram!("oracle_audit_append_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        self.record_wal_metrics().await;
         self.wake.notify_one();
         Ok(())
+    }
+
+    /// Publishes the bounded local WAL residual gauges used by operators.
+    async fn record_wal_metrics(&self) {
+        let (records, bytes, oldest) = self.wal.lock().await.snapshot();
+        metrics::gauge!("oracle_audit_wal_records").set(records as f64);
+        metrics::gauge!("oracle_audit_wal_bytes").set(bytes as f64);
+        metrics::gauge!("oracle_audit_oldest_record_age_seconds")
+            .set(oldest.map_or(0.0, |age| age.as_secs_f64()));
     }
 
     /// Drains accepted records until the caller's deadline and reports residue.
@@ -220,11 +336,28 @@ impl OracleAuditPublisher {
             }
         }
         let snapshot = self.wal.lock().await.snapshot();
+        self.record_wal_metrics().await;
         AuditShutdownReport {
             relayed: before.0.saturating_sub(snapshot.0),
             backlog_records: snapshot.0,
             backlog_bytes: snapshot.1,
             oldest_backlog_age: snapshot.2,
+        }
+    }
+
+    /// Aborts background WAL tasks so an abrupt test restart releases the root lock.
+    #[cfg(feature = "test-support")]
+    pub async fn abort_for_test(&self) {
+        self.writer_tx.lock().await.take();
+        if let Some(task) = self.writer.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.cancel.cancel();
+        self.wake.notify_waiters();
+        if let Some(task) = self.relay.lock().await.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -283,6 +416,7 @@ impl OracleAuditPublisher {
                 .lock()
                 .await
                 .pending(self.config.audit_relay_batch_records);
+            metrics::gauge!("oracle_audit_relay_batch_size").set(records.len() as f64);
             if records.is_empty() {
                 if self.cancel.is_cancelled() {
                     return;
@@ -306,12 +440,35 @@ impl OracleAuditPublisher {
                             return;
                         }
                         if self.wal.lock().await.checkpoint(record.lsn).is_err() {
+                            record_relay_metric(
+                                AuditRelayOutcome::Failed,
+                                Some(AuditRelayFailureReason::Serialization),
+                            );
                             return;
                         }
+                        record_relay_metric(AuditRelayOutcome::Committed, None);
+                        metrics::gauge!("oracle_audit_relay_lag_seconds")
+                            .set(record_age_seconds(&record).unwrap_or_default());
+                        self.record_wal_metrics().await;
                         progressed = true;
                         backoff = Duration::from_millis(self.config.audit_relay_backoff_initial_ms);
                     }
-                    _ => {
+                    Err(_) => {
+                        record_relay_metric(
+                            AuditRelayOutcome::RetriedTransient,
+                            Some(AuditRelayFailureReason::Timeout),
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_millis(
+                            self.config.audit_relay_backoff_max_ms,
+                        ));
+                        break;
+                    }
+                    Ok(Err(())) => {
+                        record_relay_metric(
+                            AuditRelayOutcome::RetriedTransient,
+                            Some(AuditRelayFailureReason::Postgres),
+                        );
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_millis(
                             self.config.audit_relay_backoff_max_ms,
@@ -324,6 +481,25 @@ impl OracleAuditPublisher {
                 return;
             }
         }
+    }
+}
+
+/// Computes accepted-record age for the relay lag gauge.
+fn record_age_seconds(record: &AuditWalRecord) -> Option<f64> {
+    let accepted = u64::try_from(record.accepted_at_micros).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_micros() as u64;
+    Some(now.saturating_sub(accepted) as f64 / 1_000_000.0)
+}
+
+/// Emits one bounded relay outcome and optional failure reason.
+fn record_relay_metric(outcome: AuditRelayOutcome, reason: Option<AuditRelayFailureReason>) {
+    metrics::counter!("oracle_audit_relay_total", "outcome" => outcome.as_str()).increment(1);
+    if let Some(reason) = reason {
+        metrics::counter!("oracle_audit_relay_failures_total", "reason" => reason.as_str())
+            .increment(1);
     }
 }
 

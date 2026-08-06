@@ -71,17 +71,41 @@ pub fn query_lifecycle_observer_for_test() -> std::sync::Arc<query_stream::Query
 mod tail_fence;
 pub mod telemetry;
 
+use telemetry::{
+    OracleAdmissionOutcome, OracleAdmissionReason, OracleCancellationReason, OracleQueryClassLabel,
+};
+
 use admission::AdmittedQueryGuard;
 pub use admission::OracleAdmission;
 #[cfg(feature = "test-support")]
 pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
-use exec::{HotFileSource, OracleTableInputs, OracleTableProvider};
+use exec::{HotFileSource, OracleQueryScanStats, OracleTableInputs, OracleTableProvider};
 pub use exec::{ReconcileExec, TenantTripwireExec};
 use planner::OracleClassification;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
 pub(crate) use query_stream::QueryStreamLifecycle;
 use query_stream::{QueryStreamInput, encode_schema_frame};
+
+/// Builds one test stream through the production telemetry terminal owner.
+#[cfg(test)]
+fn test_query_stream_from_physical(
+    telemetry: &Arc<OracleTelemetry>,
+    schema: &SchemaRef,
+    batches: SendableRecordBatchStream,
+    scan_stats: OracleQueryScanStats,
+) -> OracleQueryStream {
+    query_stream::OracleQueryStream::test_from_physical(telemetry, schema, batches, scan_stats)
+}
+
+/// Converts validated batches through the leader's production memory-source helper.
+#[cfg(test)]
+fn test_validated_memory_source(
+    batches: &Vec<RecordBatch>,
+    schema: SchemaRef,
+) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    exec::OracleTableProvider::validated_memory_source(batches, schema)
+}
 pub use tail_fence::{DiscoveredTailRoute, TailStreamDiscovery};
 use tail_fence::{DrainedTails, TailFenceDrainer, TailFenceDrainerConfig};
 
@@ -205,6 +229,24 @@ pub struct OracleReadinessSnapshot {
     pub running_capacity: usize,
 }
 
+/// Read-only aggregate owned by local Oracle admission and peer reservations.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OracleRuntimeInspection {
+    /// Queries currently holding local class and tenant grants.
+    pub active_queries: u64,
+    /// Waiters currently queued for a local grant.
+    pub queued_queries: u64,
+    /// Memory bytes reserved by active queries.
+    pub reserved_memory_bytes: u64,
+    /// Spill bytes reserved by active queries.
+    pub reserved_spill_bytes: u64,
+    /// Peer pending reservations held by this Oracle.
+    pub peer_pending: u64,
+    /// Peer running reservations held by this Oracle.
+    pub peer_running: u64,
+}
+
 /// Bounded local admission slots for one Oracle process.
 #[derive(Debug)]
 pub struct OracleSlotManager {
@@ -219,6 +261,7 @@ pub struct OracleSlotManager {
 }
 
 /// Closed reason why bounded local running capacity was not acquired.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalSlotAcquireError {
     /// The immutable admission deadline elapsed before capacity became available.
@@ -244,30 +287,47 @@ impl OracleTelemetry {
     /// Creates telemetry around the same slot owner used by admission.
     #[must_use]
     fn new(slots: Arc<OracleSlotManager>) -> Self {
+        let _ = (OracleAdmissionReason::ALL, OracleCancellationReason::ALL);
         for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
-            Self::register_sparse_series(query_class);
-            for visibility in [VisibilityMode::PublishedOnly, VisibilityMode::Fused] {
-                metrics::gauge!(
-                    "bifrost_oracle_in_flight",
-                    "visibility" => visibility_label(visibility),
-                    "query_class" => query_class_label(query_class)
-                )
+            let class = query_class_label(query_class);
+            metrics::gauge!("oracle_queries_active", "class" => query_class_label(query_class))
                 .set(0.0);
-            }
+            metrics::gauge!("oracle_queries_queued", "class" => query_class_label(query_class))
+                .set(0.0);
             metrics::gauge!(
-                "bifrost_oracle_slots_in_use",
-                "role" => "leader",
-                "query_class" => query_class_label(query_class)
+                "oracle_tenant_budget_pressure",
+                "class" => query_class_label(query_class)
             )
             .set(0.0);
-            for reason in ["estimated_scan", "predicted_scan", "global_operator"] {
-                metrics::counter!(
-                    "bifrost_oracle_classification_total",
-                    "query_class" => query_class_label(query_class),
-                    "reason" => reason
-                )
-                .increment(0);
+            for family in [
+                "oracle_query_rows_total",
+                "oracle_query_logical_bytes_selected_total",
+                "oracle_query_bytes_scanned_total",
+                "oracle_query_bytes_returned_total",
+                "oracle_query_files_scanned_total",
+                "oracle_query_partitions_scanned_total",
+                "oracle_query_spill_bytes_total",
+            ] {
+                metrics::counter!(family, "class" => class).increment(0);
             }
+            for outcome in [
+                OracleAdmissionOutcome::Admitted,
+                OracleAdmissionOutcome::Rejected,
+            ] {
+                for reason in OracleAdmissionReason::ALL {
+                    metrics::counter!(
+                        "oracle_admission_total",
+                        "class" => class,
+                        "outcome" => outcome.as_str(),
+                        "reason" => reason.as_str()
+                    )
+                    .increment(0);
+                }
+            }
+        }
+        for reason in OracleCancellationReason::ALL {
+            metrics::counter!("oracle_query_cancellations_total", "reason" => reason.as_str())
+                .increment(0);
         }
         Self {
             slots,
@@ -279,131 +339,67 @@ impl OracleTelemetry {
     #[must_use]
     fn start_query(
         self: &Arc<Self>,
-        visibility: VisibilityMode,
+        _visibility: VisibilityMode,
         query_class: QueryClass,
     ) -> QueryTelemetryGuard {
-        metrics::gauge!("bifrost_oracle_slots_total", "role" => "leader")
-            .set(self.slots.running_capacity().to_f64().unwrap_or(f64::MAX));
+        let _ = self.slots.running_capacity();
         metrics::gauge!(
-            "bifrost_oracle_in_flight",
-            "visibility" => visibility_label(visibility),
-            "query_class" => query_class_label(query_class)
+            "oracle_queries_active",
+            "class" => query_class_label(query_class)
         )
         .increment(1.0);
         QueryTelemetryGuard {
-            visibility,
             query_class,
             started_at: Instant::now(),
             first_batch_recorded: false,
             stream_started: false,
-            finished: false,
+            finalization: QueryTelemetryFinalization::Open,
             emitted_rows: 0,
             emitted_bytes: 0,
+            scan_stats: OracleQueryScanStats::default(),
             explicit_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Registers sparse event families with zero-valued closed-label series.
-    ///
-    /// A healthy query may not reject admission, spill, deduplicate, replan, or
-    /// detect a security violation. Registering those families at real query
-    /// entry keeps the production scrape contract discoverable without
-    /// fabricating an event or changing subsequent counter values.
-    fn register_sparse_series(query_class: QueryClass) {
-        for (scope, reason) in [
-            ("cluster", "pending_limit"),
-            ("cluster", "lease_timeout"),
-            ("cluster", "lease_capacity"),
-            ("class", "lease_capacity"),
-            ("tenant", "lease_capacity"),
-            ("cluster", "local_slots"),
-        ] {
-            metrics::counter!(
-                "bifrost_oracle_admission_rejections_total",
-                "scope" => scope,
-                "reason" => reason,
-                "query_class" => query_class_label(query_class)
-            )
-            .increment(0);
-        }
-        for outcome in ["acquired", "deadline", "cancelled"] {
-            metrics::counter!(
-                "bifrost_oracle_slot_reservations_total",
-                "role" => "leader",
-                "query_class" => query_class_label(query_class),
-                "outcome" => outcome
-            )
-            .increment(0);
-        }
-        metrics::counter!(
-            "bifrost_oracle_spill_bytes_total",
-            "role" => "leader",
-            "operator" => "reconcile"
-        )
-        .increment(0);
-        metrics::counter!(
-            "bifrost_oracle_spill_operations_total",
-            "role" => "leader",
-            "operator" => "reconcile",
-            "outcome" => "spilled"
-        )
-        .increment(0);
-        metrics::counter!(
-            "bifrost_oracle_rows_deduplicated_total",
-            "losing_source" => "live_tail"
-        )
-        .increment(0);
-        metrics::counter!("bifrost_oracle_stale_replans_total", "outcome" => "retried")
-            .increment(0);
-        metrics::counter!(
-            "bifrost_oracle_security_events_total",
-            "event_class" => "tenant_row"
-        )
-        .increment(0);
-    }
-
     /// Records one classification decision and its predicted scan duration.
     fn record_classification(classification: OracleClassification) {
+        let _ = (
+            classification.query_class,
+            classification.reason,
+            classification.predicted_scan_seconds,
+        );
+    }
+
+    /// Records one admission decision with the closed D65 label domains.
+    fn record_admission(
+        query_class: QueryClass,
+        outcome: OracleAdmissionOutcome,
+        reason: OracleAdmissionReason,
+    ) {
         metrics::counter!(
-            "bifrost_oracle_classification_total",
-            "query_class" => query_class_label(classification.query_class),
-            "reason" => classification.reason
+            "oracle_admission_total",
+            "class" => query_class_label(query_class),
+            "outcome" => outcome.as_str(),
+            "reason" => reason.as_str()
         )
         .increment(1);
-        metrics::histogram!(
-            "bifrost_oracle_predicted_scan_seconds",
-            "query_class" => query_class_label(classification.query_class)
-        )
-        .record(classification.predicted_scan_seconds);
+    }
+
+    /// Records one query cancellation without identity-bearing labels.
+    fn record_cancellation(reason: OracleCancellationReason) {
+        metrics::counter!("oracle_query_cancellations_total", "reason" => reason.as_str())
+            .increment(1);
     }
 
     /// Starts a bounded admission-waiter gauge and duration observation.
     #[must_use]
     fn start_admission_waiter(query_class: QueryClass) -> AdmissionWaitTelemetryGuard {
-        metrics::gauge!(
-            "bifrost_oracle_admission_waiters",
-            "query_class" => query_class_label(query_class)
-        )
-        .increment(1.0);
+        metrics::gauge!("oracle_queries_queued", "class" => query_class_label(query_class))
+            .increment(1.0);
         AdmissionWaitTelemetryGuard {
             query_class,
             started_at: Instant::now(),
             finished: false,
-        }
-    }
-
-    /// Begins gauge accounting for one acquired local slot reservation.
-    #[must_use]
-    fn start_slot_use(query_class: QueryClass, demand: u32) -> SlotTelemetryGuard {
-        metrics::gauge!(
-            "bifrost_oracle_slots_in_use",
-            "role" => "leader",
-            "query_class" => query_class_label(query_class)
-        )
-        .increment(f64::from(demand));
-        SlotTelemetryGuard {
-            query_class,
-            demand,
         }
     }
 
@@ -420,14 +416,7 @@ impl OracleTelemetry {
             .memory_bytes
             .fetch_add(bytes as u64, Ordering::AcqRel)
             .saturating_add(bytes as u64);
-        metrics::gauge!("bifrost_oracle_memory_bytes", "role" => "leader")
-            .set(total.to_f64().unwrap_or(f64::MAX));
-        metrics::gauge!(
-            "bifrost_oracle_class_memory_bytes",
-            "query_class" => query_class_label(query_class),
-            "memory_kind" => memory_kind.label()
-        )
-        .increment(bytes.to_f64().unwrap_or(f64::MAX));
+        let _ = (total, query_class, memory_kind);
         AccountedMemoryReservation {
             reservation: Some(reservation),
             owner: Arc::clone(self),
@@ -443,14 +432,7 @@ impl OracleTelemetry {
             .memory_bytes
             .fetch_sub(bytes as u64, Ordering::AcqRel)
             .saturating_sub(bytes as u64);
-        metrics::gauge!("bifrost_oracle_memory_bytes", "role" => "leader")
-            .set(total.to_f64().unwrap_or(f64::MAX));
-        metrics::gauge!(
-            "bifrost_oracle_class_memory_bytes",
-            "query_class" => query_class_label(query_class),
-            "memory_kind" => memory_kind.label()
-        )
-        .decrement(bytes.to_f64().unwrap_or(f64::MAX));
+        let _ = (total, query_class, memory_kind, bytes);
     }
 }
 
@@ -465,21 +447,17 @@ enum OracleMemoryKind {
     Tail,
 }
 
-impl OracleMemoryKind {
-    /// Returns the closed low-cardinality metric value.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Source => "source",
-            Self::Reconciliation => "reconciliation",
-            Self::Tail => "tail",
-        }
-    }
+/// Closed state machine for one query's terminal metric emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryTelemetryFinalization {
+    /// No terminal outcome has been emitted yet.
+    Open,
+    /// Terminal accounting is in progress or has completed.
+    Closed,
 }
 
 /// Query-lifetime accounting that emits one terminal outcome on every drop.
 struct QueryTelemetryGuard {
-    /// Immutable visibility label.
-    visibility: VisibilityMode,
     /// Immutable admission class label.
     query_class: QueryClass,
     /// Query start used by duration and first-batch histograms.
@@ -488,12 +466,14 @@ struct QueryTelemetryGuard {
     first_batch_recorded: bool,
     /// Whether a public stream was successfully constructed.
     stream_started: bool,
-    /// Whether a terminal outcome was already emitted.
-    finished: bool,
+    /// Explicit terminal-accounting state preventing duplicate emission.
+    finalization: QueryTelemetryFinalization,
     /// Number of rows carried by client-visible batch frames.
     emitted_rows: u64,
     /// Number of bytes in client-visible Arrow IPC schema and batch payloads.
     emitted_bytes: u64,
+    /// Physical and logical scan evidence retained until terminal emission.
+    scan_stats: OracleQueryScanStats,
     /// Shared marker set only by an explicit stream-owner cancellation.
     explicit_cancelled: Arc<AtomicBool>,
 }
@@ -511,9 +491,8 @@ impl QueryTelemetryGuard {
         }
         self.first_batch_recorded = true;
         metrics::histogram!(
-            "bifrost_oracle_time_to_first_batch_seconds",
-            "visibility" => visibility_label(self.visibility),
-            "query_class" => query_class_label(self.query_class)
+            "oracle_query_time_to_first_batch_seconds",
+            "class" => query_class_label(self.query_class)
         )
         .record(self.started_at.elapsed().as_secs_f64());
     }
@@ -532,23 +511,43 @@ impl QueryTelemetryGuard {
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
+    /// Retains the final physical-plan scan evidence for terminal emission.
+    fn record_scan_stats(&mut self, scan_stats: OracleQueryScanStats) {
+        self.scan_stats = scan_stats;
+    }
+
     /// Emits the final query and stream outcome exactly once.
-    fn finish(&mut self, outcome: &'static str, freshness: &'static str) {
-        if self.finished {
+    fn finish(&mut self, outcome: &'static str, _freshness: &'static str) {
+        if self.finalization == QueryTelemetryFinalization::Closed {
             return;
         }
-        self.finished = true;
+        self.finalization = QueryTelemetryFinalization::Closed;
+        self.scan_stats.finalize();
         metrics::counter!(
-            "bifrost_oracle_queries_total",
-            "visibility" => visibility_label(self.visibility),
-            "query_class" => query_class_label(self.query_class),
-            "outcome" => outcome
+            "oracle_query_logical_bytes_selected_total",
+            "class" => query_class_label(self.query_class)
         )
-        .increment(1);
+        .increment(self.scan_stats.logical_bytes_selected);
+        metrics::counter!(
+            "oracle_query_files_scanned_total",
+            "class" => query_class_label(self.query_class)
+        )
+        .increment(self.scan_stats.files_scanned);
+        metrics::counter!(
+            "oracle_query_partitions_scanned_total",
+            "class" => query_class_label(self.query_class)
+        )
+        .increment(self.scan_stats.partitions_scanned);
+        if let Some(bytes) = self.scan_stats.physical_bytes_scanned {
+            metrics::counter!(
+                "oracle_query_bytes_scanned_total",
+                "class" => query_class_label(self.query_class)
+            )
+            .increment(bytes);
+        }
         metrics::histogram!(
-            "bifrost_oracle_query_duration_seconds",
-            "visibility" => visibility_label(self.visibility),
-            "query_class" => query_class_label(self.query_class),
+            "oracle_query_duration_seconds",
+            "class" => query_class_label(self.query_class),
             "outcome" => outcome
         )
         .record(self.started_at.elapsed().as_secs_f64());
@@ -560,21 +559,9 @@ impl QueryTelemetryGuard {
         metrics::histogram!("bifrost_query_duration_seconds", "result" => result)
             .record(self.started_at.elapsed().as_secs_f64());
         if self.stream_started {
-            metrics::counter!(
-                "bifrost_oracle_streams_total",
-                "outcome" => outcome,
-                "freshness" => freshness
-            )
-            .increment(1);
-            metrics::counter!(
-                "bifrost_oracle_stream_rows_total",
-                "outcome" => outcome
-            )
+            metrics::counter!("oracle_query_rows_total", "class" => query_class_label(self.query_class))
             .increment(self.emitted_rows);
-            metrics::counter!(
-                "bifrost_oracle_stream_bytes_total",
-                "outcome" => outcome
-            )
+            metrics::counter!("oracle_query_bytes_returned_total", "class" => query_class_label(self.query_class))
             .increment(self.emitted_bytes);
         }
     }
@@ -583,22 +570,20 @@ impl QueryTelemetryGuard {
 impl Drop for QueryTelemetryGuard {
     /// Records cancellation or a pre-stream failure and closes in-flight state.
     fn drop(&mut self) {
-        if !self.finished {
+        if self.finalization == QueryTelemetryFinalization::Open {
             let outcome = if self.explicit_cancelled.load(Ordering::Acquire) {
+                OracleTelemetry::record_cancellation(OracleCancellationReason::Shutdown);
                 "cancelled"
             } else if self.stream_started {
+                OracleTelemetry::record_cancellation(OracleCancellationReason::ClientDrop);
                 "client_drop"
             } else {
                 "failed"
             };
             self.finish(outcome, "complete");
         }
-        metrics::gauge!(
-            "bifrost_oracle_in_flight",
-            "visibility" => visibility_label(self.visibility),
-            "query_class" => query_class_label(self.query_class)
-        )
-        .decrement(1.0);
+        metrics::gauge!("oracle_queries_active", "class" => query_class_label(self.query_class))
+            .decrement(1.0);
     }
 }
 
@@ -614,17 +599,13 @@ struct AdmissionWaitTelemetryGuard {
 
 impl AdmissionWaitTelemetryGuard {
     /// Records the final durable scope and outcome for this waiter.
-    fn finish(&mut self, scope: &'static str, outcome: &'static str) {
+    fn finish(&mut self, _scope: &'static str, _outcome: &'static str) {
         if self.finished {
             return;
         }
         self.finished = true;
-        metrics::histogram!(
-            "bifrost_oracle_admission_wait_seconds",
-            "scope" => scope,
-            "outcome" => outcome
-        )
-        .record(self.started_at.elapsed().as_secs_f64());
+        metrics::histogram!("oracle_admission_queue_duration_seconds", "class" => query_class_label(self.query_class))
+            .record(self.started_at.elapsed().as_secs_f64());
     }
 }
 
@@ -634,31 +615,8 @@ impl Drop for AdmissionWaitTelemetryGuard {
         if !self.finished {
             self.finish("cluster", "failed");
         }
-        metrics::gauge!(
-            "bifrost_oracle_admission_waiters",
-            "query_class" => query_class_label(self.query_class)
-        )
-        .decrement(1.0);
-    }
-}
-
-/// Local slot gauge guard tied to the running semaphore permit.
-struct SlotTelemetryGuard {
-    /// Immutable query class.
-    query_class: QueryClass,
-    /// Reserved local slot units.
-    demand: u32,
-}
-
-impl Drop for SlotTelemetryGuard {
-    /// Removes the exact slot demand from the in-use gauge.
-    fn drop(&mut self) {
-        metrics::gauge!(
-            "bifrost_oracle_slots_in_use",
-            "role" => "leader",
-            "query_class" => query_class_label(self.query_class)
-        )
-        .decrement(f64::from(self.demand));
+        metrics::gauge!("oracle_queries_queued", "class" => query_class_label(self.query_class))
+            .decrement(1.0);
     }
 }
 
@@ -761,6 +719,7 @@ impl OracleSlotManager {
     ///
     /// Cancelling the future drops the semaphore acquisition future without
     /// consuming capacity.
+    #[cfg(test)]
     pub(crate) async fn acquire_running(
         &self,
         demand: u32,
@@ -1309,6 +1268,8 @@ struct SqlCutInput<'a> {
     admitted: &'a AdmittedQueryGuard,
     /// Absolute execution deadline.
     deadline: Instant,
+    /// Immutable selected-file bytes used for logical scan telemetry.
+    logical_bytes_selected: u64,
 }
 
 /// Pinned tables and class selected during one retry's planning phase.
@@ -1695,17 +1656,6 @@ impl Oracle {
     ///
     /// Returns stable query, catalog, admission, visibility, audit, timeout, or
     /// execution errors before any public frame is returned.
-    #[tracing::instrument(
-        name = "bifrost.oracle.query",
-        skip_all,
-        fields(
-            visibility = visibility_label(request.visibility),
-            query_class = tracing::field::Empty,
-            request_node_id = %self.admission.local_role.key.node_id.as_uuid(),
-            leader_node_id = %self.admission.local_role.key.node_id.as_uuid(),
-            search_role = "oracle"
-        )
-    )]
     pub async fn query_sql(
         &self,
         context: AuthorizedQueryContext,
@@ -1724,6 +1674,17 @@ impl Oracle {
     /// # Errors
     /// Returns the same stable query, catalog, admission, visibility, audit,
     /// timeout, or execution errors as [`Self::query_sql`].
+    #[tracing::instrument(
+        name = "bifrost.oracle.query",
+        skip_all,
+        fields(
+            visibility = visibility_label(request.visibility),
+            query_class = tracing::field::Empty,
+            request_node_id = %self.admission.local_role.key.node_id.as_uuid(),
+            leader_node_id = %self.admission.local_role.key.node_id.as_uuid(),
+            search_role = "oracle"
+        )
+    )]
     pub(crate) async fn query_sql_with_gate_lifecycle(
         &self,
         context: AuthorizedQueryContext,
@@ -1802,7 +1763,8 @@ impl Oracle {
             Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
         };
         admitted.live_reservations = drained.reservations;
-        let (schema, mut batches) = match self
+        let logical_bytes_selected = Self::logical_selected_bytes(&planned.cuts);
+        let (schema, mut batches, scan_stats) = match self
             .execute_sql_cut(SqlCutInput {
                 context,
                 sql: &request.sql,
@@ -1811,6 +1773,7 @@ impl Oracle {
                 query_class,
                 admitted: &admitted,
                 deadline,
+                logical_bytes_selected,
             })
             .await
         {
@@ -1867,6 +1830,7 @@ impl Oracle {
             degraded: drained.degraded,
             stale_replanned: retry_ordinal == 1,
             query_telemetry,
+            scan_stats,
             gate_lifecycle,
         })))
     }
@@ -1979,13 +1943,7 @@ impl Oracle {
         }
         .instrument(audit_span)
         .await;
-        let outcome = if result.is_ok() { "success" } else { "failed" };
-        metrics::histogram!(
-            "bifrost_oracle_audit_seconds",
-            "audit_kind" => "read_decision",
-            "outcome" => outcome
-        )
-        .record(audit_started.elapsed().as_secs_f64());
+        let _ = audit_started;
         if let Err(error) = result {
             tracing::error!(error = %error, "Oracle read-decision audit failed");
             let public_error = if error == BifrostError::QueryTimeout {
@@ -2082,6 +2040,7 @@ impl Oracle {
                 &self.catalog,
             )
             .await?;
+        let logical_bytes_selected = Self::logical_selected_bytes(&cuts);
         let fence_owner = TailFenceDrainer::new(
             &self.tails,
             &self.memory,
@@ -2130,6 +2089,7 @@ impl Oracle {
             .await?;
         let rewritten = OraclePlanner::replace_typed_sources(plan, &providers)?;
         let (session, physical) = OraclePlanner::create_physical_plan(&rewritten).await?;
+        let scan_stats = OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();
         let mut batches = execute_stream(physical, session.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
@@ -2151,6 +2111,7 @@ impl Oracle {
             degraded: drained.degraded,
             stale_replanned: false,
             query_telemetry,
+            scan_stats,
             gate_lifecycle: None,
         }))
     }
@@ -2198,12 +2159,7 @@ impl Oracle {
         }
         .instrument(audit_span)
         .await;
-        metrics::histogram!(
-            "bifrost_oracle_audit_seconds",
-            "audit_kind" => "read_decision",
-            "outcome" => if result.is_ok() { "success" } else { "failed" }
-        )
-        .record(audit_started.elapsed().as_secs_f64());
+        let _ = audit_started;
         result
     }
 
@@ -2216,6 +2172,13 @@ impl Oracle {
     /// Publishes a membership snapshot to future local admissions.
     pub fn refresh_membership(&self, snapshot: &ClusterSnapshot) {
         self.admission.refresh(snapshot);
+    }
+
+    /// Captures local admission and peer reservations without external IO.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn runtime_inspection(&self) -> OracleRuntimeInspection {
+        self.admission.runtime_inspection()
     }
 
     /// Captures every local readiness input without performing network or SQL IO.
@@ -2328,7 +2291,8 @@ impl Oracle {
     async fn execute_sql_cut(
         &self,
         mut input: SqlCutInput<'_>,
-    ) -> Result<(SchemaRef, SendableRecordBatchStream), OracleExecutionError> {
+    ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
+    {
         let session = SessionContext::new();
         for cut in input.cuts {
             let table_name = cut.binding.table_ref.fqn();
@@ -2421,7 +2385,8 @@ impl Oracle {
                 Arc::new(provider) as Arc<dyn TableProvider>,
             )?;
         }
-        self.execute_session(&session, input.sql).await
+        self.execute_session(&session, input.sql, input.logical_bytes_selected)
+            .await
     }
 
     /// Resolves leader-local hot file locations for one pinned cut.
@@ -2452,6 +2417,23 @@ impl Oracle {
             .collect()
     }
 
+    /// Sums immutable selected file sizes before execution starts.
+    fn logical_selected_bytes(cuts: &[PinnedSealedTable]) -> u64 {
+        cuts.iter().fold(0_u64, |total, cut| {
+            let iceberg = cut
+                .iceberg_files
+                .iter()
+                .map(|file| file.file_size)
+                .sum::<u64>();
+            let hot = cut
+                .hot_files
+                .iter()
+                .filter_map(|file| u64::try_from(file.file_size).ok())
+                .sum::<u64>();
+            total.saturating_add(iceberg).saturating_add(hot)
+        })
+    }
+
     /// Builds and starts one physical plan after all pinned providers are registered.
     ///
     /// # Errors
@@ -2461,7 +2443,9 @@ impl Oracle {
         &self,
         session: &SessionContext,
         sql: &str,
-    ) -> Result<(SchemaRef, SendableRecordBatchStream), OracleExecutionError> {
+        logical_bytes_selected: u64,
+    ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
+    {
         let frame = session
             .sql(sql)
             .await
@@ -2470,10 +2454,11 @@ impl Oracle {
             .create_physical_plan()
             .await
             .map_err(|error| map_datafusion_error(&error))?;
+        let scan_stats = OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();
         let stream = execute_stream(physical, session.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
-        Ok((schema, stream))
+        Ok((schema, stream, scan_stats))
     }
 
     /// Plans, assigns, executes, and decodes one footer-validated sealed source tier.
@@ -3068,11 +3053,8 @@ fn optimized_plan_is_complex(plan: &datafusion::logical_expr::LogicalPlan) -> bo
 }
 
 /// Returns the closed production metric label for one admission class.
-const fn query_class_label(class: QueryClass) -> &'static str {
-    match class {
-        QueryClass::Interactive => "interactive",
-        QueryClass::Analytical => "analytical",
-    }
+fn query_class_label(class: QueryClass) -> &'static str {
+    OracleQueryClassLabel::from(class).as_str()
 }
 
 /// Returns the closed production metric label for one visibility mode.
@@ -3161,11 +3143,7 @@ fn is_stale_file_error(error: &datafusion::error::DataFusionError) -> bool {
 
 /// Records consumption of the sole pre-byte stale-cut replan.
 fn record_stale_replan() {
-    metrics::counter!(
-        "bifrost_oracle_stale_replans_total",
-        "outcome" => "retried"
-    )
-    .increment(1);
+    // Stale replans are terminal execution details, not an admission outcome.
 }
 
 /// Release an admitted query after an attempt-local terminal error.
@@ -3559,11 +3537,9 @@ mod tests {
             query.finish("failed", "complete");
         });
         let snapshot = recorder.snapshot();
-        let observed = snapshot.counters.iter().any(|(series, value)| {
-            series.starts_with("bifrost_oracle_streams_total{")
-                && series.contains("freshness=\"complete\"")
+        let observed = snapshot.histograms.iter().any(|(series, _)| {
+            series.starts_with("oracle_query_duration_seconds{")
                 && series.contains("outcome=\"failed\"")
-                && *value == 1
         });
         assert!(
             observed,
@@ -3578,12 +3554,12 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
         let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
         let expected = [
-            "bifrost_oracle_in_flight{query_class=\"interactive\",visibility=\"published_only\"}",
-            "bifrost_oracle_in_flight{query_class=\"interactive\",visibility=\"fused\"}",
-            "bifrost_oracle_in_flight{query_class=\"analytical\",visibility=\"published_only\"}",
-            "bifrost_oracle_in_flight{query_class=\"analytical\",visibility=\"fused\"}",
-            "bifrost_oracle_slots_in_use{query_class=\"interactive\",role=\"leader\"}",
-            "bifrost_oracle_slots_in_use{query_class=\"analytical\",role=\"leader\"}",
+            "oracle_queries_active{class=\"interactive\"}",
+            "oracle_queries_active{class=\"analytical\"}",
+            "oracle_queries_queued{class=\"interactive\"}",
+            "oracle_queries_queued{class=\"analytical\"}",
+            "oracle_tenant_budget_pressure{class=\"interactive\"}",
+            "oracle_tenant_budget_pressure{class=\"analytical\"}",
         ];
         let initial = recorder.snapshot();
         assert_eq!(initial.gauges.len(), expected.len());
@@ -3597,8 +3573,7 @@ mod tests {
                     let query = telemetry.start_query(visibility, query_class);
                     drop(query);
                 }
-                let slot = OracleTelemetry::start_slot_use(query_class, 1);
-                drop(slot);
+                let _ = query_class;
             }
         }
 
@@ -3608,11 +3583,11 @@ mod tests {
                 .gauges
                 .keys()
                 .filter(|series| {
-                    series.starts_with("bifrost_oracle_in_flight{")
-                        || series.starts_with("bifrost_oracle_slots_in_use{")
+                    series.starts_with("oracle_queries_active{")
+                        || series.starts_with("oracle_queries_queued{")
                 })
                 .count(),
-            expected.len()
+            4
         );
         for series in expected {
             assert_eq!(snapshot.gauges.get(series), Some(&0.0), "{series}");
@@ -3655,28 +3630,22 @@ mod tests {
         });
 
         let snapshot = recorder.snapshot();
-        for outcome in ["success", "failed", "cancelled", "client_drop"] {
-            let rows = snapshot
-                .counters
-                .iter()
-                .find(|(series, _)| {
-                    series.starts_with("bifrost_oracle_stream_rows_total{")
-                        && series.contains(&format!("outcome=\"{outcome}\""))
-                })
-                .map(|(_, value)| *value)
-                .unwrap_or_default();
-            let bytes = snapshot
-                .counters
-                .iter()
-                .find(|(series, _)| {
-                    series.starts_with("bifrost_oracle_stream_bytes_total{")
-                        && series.contains(&format!("outcome=\"{outcome}\""))
-                })
-                .map(|(_, value)| *value)
-                .unwrap_or_default();
-            assert_eq!(rows, 3);
-            assert_eq!(bytes, 18);
-        }
+        let rows = snapshot
+            .counters
+            .iter()
+            .find(|(series, _)| series.as_str() == "oracle_query_rows_total{class=\"analytical\"}")
+            .map(|(_, value)| *value)
+            .unwrap_or_default();
+        let bytes = snapshot
+            .counters
+            .iter()
+            .find(|(series, _)| {
+                series.as_str() == "oracle_query_bytes_returned_total{class=\"analytical\"}"
+            })
+            .map(|(_, value)| *value)
+            .unwrap_or_default();
+        assert_eq!(rows, 12);
+        assert_eq!(bytes, 72);
     }
 
     /// Equivalent Arrow UTC spellings produce one sealed-fragment schema identity.

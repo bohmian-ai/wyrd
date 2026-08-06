@@ -31,8 +31,8 @@ use wyrd_telemetry::{CapturedSpan, TelemetryConfig, TelemetryGuard, TestTraceCap
 use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
 use crate::bifrost::telemetry::BifrostTelemetryCapture;
 use crate::server::{
-    TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
-    provision_oracle_peer_credentials, test_catalog, test_redux_catalog,
+    OracleRuntimeInspection, TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder,
+    WyrdTestServerError, provision_oracle_peer_credentials, test_catalog, test_redux_catalog,
 };
 
 /// Supported role topology for a Bifrost cluster journey.
@@ -346,6 +346,24 @@ pub struct OracleInspection {
     pub audit_rows: u64,
     /// Durable Oracle read-decision audit rows observed across tenants.
     pub read_audit_rows: u64,
+    /// Active local Oracle queries across running pods.
+    pub active_queries: u64,
+    /// Queued local Oracle queries across running pods.
+    pub queued_queries: u64,
+    /// Memory reservations retained by Oracle queries.
+    pub reserved_memory_bytes: u64,
+    /// Spill reservations retained by Oracle queries.
+    pub reserved_spill_bytes: u64,
+    /// Peer pending reservations across Oracle pods.
+    pub peer_pending: u64,
+    /// Peer running reservations across Oracle pods.
+    pub peer_running: u64,
+    /// Accepted audit records retained in pod-local WALs.
+    pub audit_wal_records: u64,
+    /// Bytes retained in pod-local WALs.
+    pub audit_wal_bytes: u64,
+    /// Oldest accepted audit record retained in any pod WAL.
+    pub audit_oldest_age: Option<Duration>,
     /// Forge tasks still holding a durable claim.
     pub forge_active_claims: u64,
     /// Distinct Forge attempts still in a non-terminal claimed execution state.
@@ -538,6 +556,8 @@ struct NodeResources {
     wal_root: Option<Arc<tempfile::TempDir>>,
     /// Retained Oracle/Forge spill root, absent on Scribe-only nodes.
     spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Retained Oracle audit WAL root, absent on query-only nodes.
+    audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Fixed public HTTP bind retained across a restart.
     http_addr: std::net::SocketAddr,
     /// Fixed private/public gRPC bind retained across a restart.
@@ -603,6 +623,8 @@ pub struct RetainedNodeRoots {
     pub wal_root: Option<PathBuf>,
     /// Oracle/Forge spill root retained for replacement startup.
     pub spill_root: Option<PathBuf>,
+    /// Oracle audit WAL root retained for relay recovery.
+    pub audit_wal_root: Option<PathBuf>,
     /// HTTP address proven closed by abrupt termination.
     pub previous_http_addr: std::net::SocketAddr,
     /// gRPC address proven closed by abrupt termination.
@@ -751,6 +773,10 @@ impl WyrdTestCluster {
                 .spill_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
+            audit_wal_root: resources
+                .audit_wal_root
+                .as_ref()
+                .map(|root| root.path().to_path_buf()),
             previous_http_addr: resources.http_addr,
             previous_grpc_addr: resources.grpc_addr,
             previous_writer_epoch,
@@ -782,6 +808,10 @@ impl WyrdTestCluster {
             previous_writer_epoch: roots.previous_writer_epoch,
             spill_root: resources
                 .spill_root
+                .as_ref()
+                .map(|root| root.path().to_path_buf()),
+            audit_wal_root: resources
+                .audit_wal_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
         };
@@ -1321,6 +1351,13 @@ impl WyrdTestCluster {
             } else {
                 None
             };
+            let audit_wal_root = if node.roles.contains(&BifrostRuntimeRole::Oracle) {
+                Some(Arc::new(tempfile::tempdir().map_err(|error| {
+                    ClusterError::Resource(error.to_string())
+                })?))
+            } else {
+                None
+            };
             let process_role =
                 if node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge) {
                     ForgeProcessRole::ForgeWorker
@@ -1342,6 +1379,7 @@ impl WyrdTestCluster {
                     spec: node,
                     wal_root,
                     spill_root,
+                    audit_wal_root,
                     http_addr: reserve_loopback_addr()?,
                     grpc_addr: reserve_loopback_addr()?,
                     process_role,
@@ -1392,6 +1430,7 @@ impl WyrdTestCluster {
             .with_bifrost_roots(
                 resources.wal_root.as_ref().map(Arc::clone),
                 resources.spill_root.as_ref().map(Arc::clone),
+                resources.audit_wal_root.as_ref().map(Arc::clone),
             )
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
             .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
@@ -1561,6 +1600,37 @@ impl WyrdTestCluster {
                     .map(|count| total.saturating_add(count))
                     .map_err(|error| ClusterError::Resource(error.to_string()))
             })?;
+        let mut runtime = OracleRuntimeInspection::default();
+        for server in self.servers.values().flatten() {
+            if let Ok(snapshot) = server.oracle_runtime_inspection() {
+                runtime.active_queries = runtime
+                    .active_queries
+                    .saturating_add(snapshot.active_queries);
+                runtime.queued_queries = runtime
+                    .queued_queries
+                    .saturating_add(snapshot.queued_queries);
+                runtime.reserved_memory_bytes = runtime
+                    .reserved_memory_bytes
+                    .saturating_add(snapshot.reserved_memory_bytes);
+                runtime.reserved_spill_bytes = runtime
+                    .reserved_spill_bytes
+                    .saturating_add(snapshot.reserved_spill_bytes);
+                runtime.peer_pending = runtime.peer_pending.saturating_add(snapshot.peer_pending);
+                runtime.peer_running = runtime.peer_running.saturating_add(snapshot.peer_running);
+                runtime.audit_wal_records = runtime
+                    .audit_wal_records
+                    .saturating_add(snapshot.audit_wal_records);
+                runtime.audit_wal_bytes = runtime
+                    .audit_wal_bytes
+                    .saturating_add(snapshot.audit_wal_bytes);
+                runtime.audit_oldest_age =
+                    match (runtime.audit_oldest_age, snapshot.audit_oldest_age) {
+                        (None, age) => age,
+                        (age, None) => age,
+                        (Some(left), Some(right)) => Some(left.max(right)),
+                    };
+            }
+        }
         Ok(OracleInspection {
             memberships,
             active_tail_fences,
@@ -1568,6 +1638,15 @@ impl WyrdTestCluster {
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
             read_audit_rows: u64::try_from(read_audit_rows)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            active_queries: runtime.active_queries,
+            queued_queries: runtime.queued_queries,
+            reserved_memory_bytes: runtime.reserved_memory_bytes,
+            reserved_spill_bytes: runtime.reserved_spill_bytes,
+            peer_pending: runtime.peer_pending,
+            peer_running: runtime.peer_running,
+            audit_wal_records: runtime.audit_wal_records,
+            audit_wal_bytes: runtime.audit_wal_bytes,
+            audit_oldest_age: runtime.audit_oldest_age,
             forge_active_claims: u64::try_from(forge_active_claims)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
             forge_active_attempts: u64::try_from(forge_active_attempts)
@@ -2193,13 +2272,12 @@ mod tests {
     #[test]
     fn metric_parser_preserves_exact_labels() {
         let sample = parse_metric_sample(
-            "bifrost_oracle_query_duration_seconds_bucket{visibility=\"fused\",query_class=\"interactive\",outcome=\"success\",le=\"1\"}",
+            "oracle_query_duration_seconds_bucket{class=\"interactive\",outcome=\"success\",le=\"1\"}",
             2.0,
         )
         .expect("metric parses");
-        assert_eq!(sample.family, "bifrost_oracle_query_duration_seconds");
-        assert_eq!(sample.labels["visibility"], "fused");
-        assert_eq!(sample.labels["query_class"], "interactive");
+        assert_eq!(sample.family, "oracle_query_duration_seconds");
+        assert_eq!(sample.labels["class"], "interactive");
         assert_eq!(sample.labels["outcome"], "success");
     }
 }

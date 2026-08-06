@@ -19,7 +19,9 @@ pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerOraclePeerCredentials;
 pub use peer_service::OraclePeerGrpc;
 #[cfg(feature = "test-support")]
-pub use query_audit::AuditRelayPauseGuard;
+pub use query_audit::{
+    AuditRelayPauseGuard, AuditTelemetryLabelDomains, audit_telemetry_label_domains,
+};
 pub use query_audit::{AuditShutdownReport, OracleAuditPublisher};
 pub use tail_audit::PostgresTailSecurityAudit;
 pub use tail_authority::ScribeTailAuthority;

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -241,6 +241,37 @@ impl BifrostQueryRuntime {
     #[must_use]
     pub fn peer(&self) -> Arc<crate::oracle::OraclePeerRuntime> {
         Arc::clone(&self.peer)
+    }
+
+    /// Captures production-owned Oracle resource reservations and WAL backlog.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn oracle_runtime_inspection(
+        &self,
+    ) -> (
+        vala_bifrost_redux::oracle::OracleRuntimeInspection,
+        (u64, u64, Option<Duration>),
+    ) {
+        (self.oracle.runtime_inspection(), self.audit.wal_snapshot())
+    }
+
+    /// Pauses relay SQL at the production fault-injection seam.
+    #[cfg(feature = "test-support")]
+    pub fn pause_audit_relay_for_test(&self) -> crate::oracle::AuditRelayPauseGuard {
+        self.audit.pause_relay_before_postgres()
+    }
+
+    /// Injects the documented commit-before-checkpoint replay window.
+    #[cfg(feature = "test-support")]
+    pub fn fail_audit_after_commit_for_test(&self) {
+        self.audit
+            .fail_after_next_postgres_commit_before_checkpoint();
+    }
+
+    /// Aborts production audit tasks so an abrupt test restart releases WAL locks.
+    #[cfg(feature = "test-support")]
+    pub async fn abort_audit_tasks_for_test(&self) {
+        self.audit.abort_for_test().await;
     }
 
     /// Reports startup reconciliation and lifecycle readiness, excluding saturation.

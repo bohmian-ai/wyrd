@@ -83,17 +83,6 @@ pub const BIFROST_FORGE_SCHEDULER_DURATION_SECONDS: &str =
     "bifrost_forge_scheduler_duration_seconds";
 /// Forge stage latency, including its typed publication stage.
 pub const BIFROST_FORGE_STAGE_SECONDS: &str = "bifrost_forge_stage_seconds";
-/// Oracle admission wait latency.
-pub const BIFROST_ORACLE_ADMISSION_WAIT_SECONDS: &str = "bifrost_oracle_admission_wait_seconds";
-/// Oracle source-operation latency.
-pub const BIFROST_ORACLE_SOURCE_OPERATION_SECONDS: &str = "bifrost_oracle_source_operation_seconds";
-/// Oracle fragment execution latency.
-pub const BIFROST_ORACLE_FRAGMENT_SECONDS: &str = "bifrost_oracle_fragment_seconds";
-/// Oracle time to the first result batch.
-pub const BIFROST_ORACLE_TIME_TO_FIRST_BATCH_SECONDS: &str =
-    "bifrost_oracle_time_to_first_batch_seconds";
-/// Oracle total query latency.
-pub const BIFROST_ORACLE_QUERY_DURATION_SECONDS: &str = "bifrost_oracle_query_duration_seconds";
 /// Wyrd PostgreSQL tenant-pool acquisition latency.
 pub const WYRD_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "wyrd_postgres_pool_acquire_seconds";
 /// Vala PostgreSQL tenant-pool acquisition latency.
@@ -118,11 +107,11 @@ const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
     BIFROST_FORGE_STAGE_SECONDS,
     BIFROST_FORGE_TASK_DURATION_SECONDS,
     BIFROST_FORGE_CLEANUP_DURATION_SECONDS,
-    BIFROST_ORACLE_ADMISSION_WAIT_SECONDS,
-    BIFROST_ORACLE_SOURCE_OPERATION_SECONDS,
-    BIFROST_ORACLE_FRAGMENT_SECONDS,
-    BIFROST_ORACLE_TIME_TO_FIRST_BATCH_SECONDS,
-    BIFROST_ORACLE_QUERY_DURATION_SECONDS,
+    "oracle_admission_queue_duration_seconds",
+    "oracle_query_duration_seconds",
+    "oracle_query_time_to_first_batch_seconds",
+    "oracle_fragment_duration_seconds",
+    "oracle_audit_append_duration_seconds",
     WYRD_POSTGRES_POOL_ACQUIRE_SECONDS,
     VALA_POSTGRES_POOL_ACQUIRE_SECONDS,
     WYRD_STORAGE_OPERATION_DURATION_SECONDS,

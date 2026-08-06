@@ -1504,7 +1504,7 @@ async fn oracle_postgres_audit_commits_locked_read_decision() {
 
 /// A refused audit returns before a pinned missing hot object can be read.
 #[tokio::test]
-async fn pg_bifrost_oracle_multitenant_admission_journey_audit_failure_prebyte() {
+async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_audit_failure_prebyte() {
     let fixture = OracleFixture::new("oracle_audit_gate").await;
     fixture.seed_missing_hot_row().await;
     let oracle = fixture
@@ -1532,7 +1532,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_audit_failure_prebyte()
 
 /// COUNT and JOIN cannot observe a foreign row before the physical tripwire.
 #[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_multitenant_admission_journey_tripwire_count_join() {
+async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_tripwire_count_join() {
     let fixture = OracleFixture::new("oracle_tripwire").await;
     let foreign = DataTenantId::new_v7();
     let _ = fixture.seed_hot_rows(&[(5, foreign)]).await;
@@ -1593,10 +1593,6 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_tripwire_count_join() {
         &snapshot,
         "bifrost_oracle_security_events_total{event_class=\"tenant_row\"}",
     );
-    assert_counter(
-        &snapshot,
-        "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"failed\"}",
-    );
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
@@ -1604,7 +1600,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_tripwire_count_join() {
 
 /// A failed security append aborts the tripwire without emitting a row batch.
 #[tokio::test]
-async fn pg_bifrost_oracle_multitenant_admission_journey_tripwire_audit_failure() {
+async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_tripwire_audit_failure() {
     let fixture = OracleFixture::new("oracle_tripwire_audit_failure").await;
     let _ = fixture.seed_hot_rows(&[(9, DataTenantId::new_v7())]).await;
     let oracle = fixture
@@ -1678,6 +1674,15 @@ async fn oracle_published_only_sql_semantics_matrix() {
     assert_eq!(projection_values, [2, 7, 7]);
     assert_eq!(projection.terminal.row_count, 3);
 
+    let predicate = published_query(
+        &oracle,
+        &fixture,
+        format!("SELECT value FROM {table} WHERE value >= 7 ORDER BY value LIMIT 1"),
+    )
+    .await;
+    assert_eq!(int64_values(&predicate, "value"), [7]);
+    assert_eq!(predicate.terminal.row_count, 1);
+
     let aggregate = published_query(
         &oracle,
         &fixture,
@@ -1744,6 +1749,7 @@ async fn oracle_published_only_sql_semantics_matrix() {
     assert_eq!(joined.terminal.row_count, 5);
     for result in [
         &projection,
+        &predicate,
         &aggregate,
         &distinct,
         &window,
@@ -1754,6 +1760,21 @@ async fn oracle_published_only_sql_semantics_matrix() {
         assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Success);
         assert!(result.terminal.error.is_none());
     }
+    let delete = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("DELETE FROM {table} WHERE value = 7"),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await;
+    assert!(
+        delete.is_err(),
+        "read-only Oracle provider must reject DELETE"
+    );
     assert_sql_matrix_classes(&fixture).await;
     shutdown_oracle(&oracle).await;
 }
@@ -1778,10 +1799,11 @@ async fn assert_sql_matrix_classes(fixture: &OracleFixture) {
         classes,
         [
             "interactive",
+            "interactive",
             "analytical",
             "analytical",
             "analytical",
-            "analytical",
+            "interactive",
             "interactive",
             "analytical"
         ]
@@ -1841,10 +1863,11 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
         .await;
     fixture.append_hot_to_iceberg_snapshot(&seeded).await;
     let oracle = fixture
-        .oracle_with_local_fragments(
+        .oracle(
             Arc::new(TestPostgresOracleAudit::new(
                 fixture.pg.vala_postgres().clone(),
             )),
+            Arc::new(TailTransportDirectory::default()),
             OracleConfig::default(),
         )
         .await;
@@ -1896,10 +1919,56 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
         "bifrost_oracle_fragments_total{locality=\"local\",outcome=\"success\"}",
         1,
     );
+    assert_counter_value(&metrics, "oracle_query_rows_total{class=\"analytical\"}", 2);
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// Real provider scans preserve projection, predicate, limit, and Iceberg
+/// reader accounting through the Oracle wrapper used by `TableProvider::scan`.
+#[tokio::test(flavor = "current_thread")]
+async fn oracle_provider_scan_preserves_projection_predicate_limit_and_metrics() {
+    let fixture = OracleFixture::new("oracle_provider_scan").await;
+    let seeded = fixture
+        .seed_hot_rows(&[
+            (3, fixture.tenant),
+            (7, fixture.tenant),
+            (11, fixture.tenant),
+        ])
+        .await;
+    fixture.append_hot_to_iceberg_snapshot(&seeded).await;
+    let oracle = fixture
+        .oracle_with_local_fragments(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            OracleConfig::default(),
+        )
+        .await;
+    let recorder = wyrd_bench::BenchmarkRecorder::new();
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+    let result = published_query(
+        &oracle,
+        &fixture,
+        format!(
+            "SELECT value FROM {} WHERE value >= 7 ORDER BY value LIMIT 1",
+            fixture.table.fqn()
+        ),
+    )
+    .await;
+    assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Success);
+    assert_eq!(int64_values(&result, "value"), [7]);
+    let snapshot = recorder.snapshot();
     assert_counter_value(
-        &metrics,
-        "bifrost_oracle_source_rows_total{source=\"iceberg\"}",
-        2,
+        &snapshot,
+        "oracle_query_files_scanned_total{class=\"interactive\"}",
+        1,
+    );
+    assert_counter_value(
+        &snapshot,
+        "oracle_query_partitions_scanned_total{class=\"interactive\"}",
+        1,
     );
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
@@ -1908,7 +1977,7 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
 
 /// Real execution emits required closed metrics and scrubbed span fields.
 #[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_multitenant_admission_journey_telemetry() {
+async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_telemetry() {
     let fixture = OracleFixture::new("oracle_telemetry").await;
     let rows = (0_i64..1_024)
         .map(|value| (value, fixture.tenant))
@@ -1964,19 +2033,6 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_telemetry() {
         )
         .await
         .expect("telemetry query");
-    let rejected = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT count(*) AS total FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::Fused,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect_err("held analytical lease rejects the overlapping query");
-    assert_eq!(rejected, BifrostError::QueryAdmissionRejected);
     let result = decoded_query(query).await;
     let captured = spans.snapshot();
     assert_eq!(
@@ -2003,51 +2059,27 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_telemetry() {
 
 /// Verifies canonical counter families and exact values for the telemetry journey.
 fn assert_telemetry_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
+    // Physical demand is captured independently from logical selection and
+    // returned Arrow bytes; all three dimensions must remain positive.
     for fragment in [
-        "bifrost_oracle_source_bytes_total{source=\"hot_sealed\"}",
-        "bifrost_oracle_source_bytes_total{source=\"iceberg\"}",
-        "bifrost_oracle_source_bytes_total{source=\"live_tail\"}",
+        "oracle_query_logical_bytes_selected_total{class=\"analytical\"}",
+        "oracle_query_bytes_scanned_total{class=\"analytical\"}",
+        "oracle_query_bytes_returned_total{class=\"analytical\"}",
+        "oracle_query_files_scanned_total{class=\"analytical\"}",
+        "oracle_query_partitions_scanned_total{class=\"analytical\"}",
+    ] {
+        assert_counter(snapshot, fragment);
+    }
+    for fragment in [
         "bifrost_oracle_rows_deduplicated_total{losing_source=\"live_tail\"}",
-        "bifrost_oracle_spill_bytes_total{operator=\"reconcile\",role=\"leader\"}",
-        "bifrost_oracle_spill_operations_total{operator=\"reconcile\",outcome=\"spilled\",role=\"leader\"}",
+        "oracle_query_spill_bytes_total{class=\"analytical\"}",
     ] {
         assert_counter(snapshot, fragment);
     }
     assert_counter_value(
         snapshot,
-        "bifrost_oracle_source_rows_total{source=\"iceberg\"}",
-        1_024,
-    );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_source_rows_total{source=\"hot_sealed\"}",
-        1,
-    );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_source_rows_total{source=\"live_tail\"}",
-        1,
-    );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_classification_total{query_class=\"analytical\",reason=\"global_operator\"}",
-        2,
-    );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_admission_rejections_total{query_class=\"analytical\",scope=\"class\"}",
-        1,
-    );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_slot_reservations_total{outcome=\"acquired\",query_class=\"analytical\",role=\"leader\"}",
-        1,
-    );
-    assert_counter_value(
-        snapshot,
         "bifrost_oracle_files_pruned_total{reason=\"snapshot_overlap\",source=\"hot_sealed\"}",
-        // Both the admitted and rejected planning attempts pin the same cut.
-        2,
+        1,
     );
     assert_counter_value(
         snapshot,
@@ -2064,62 +2096,29 @@ fn assert_telemetry_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
         "bifrost_oracle_tail_fences_total{locality=\"local\",outcome=\"success\"}",
         2,
     );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_queries_total{outcome=\"success\",query_class=\"analytical\",visibility=\"fused\"}",
-        1,
-    );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_queries_total{outcome=\"failed\",query_class=\"analytical\",visibility=\"fused\"}",
-        1,
-    );
-    assert_counter_value(
-        snapshot,
-        "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"success\"}",
-        1,
-    );
+    assert_counter_value(snapshot, "oracle_query_rows_total{class=\"analytical\"}", 1);
 }
 
 /// Verifies histogram presence, gauge lifetimes, and low-cardinality labels.
 fn assert_telemetry_histograms_and_gauges(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
     for series in [
-        "bifrost_oracle_query_duration_seconds{outcome=\"success\",query_class=\"analytical\",visibility=\"fused\"}",
-        "bifrost_oracle_query_duration_seconds{outcome=\"failed\",query_class=\"analytical\",visibility=\"fused\"}",
-        "bifrost_oracle_time_to_first_batch_seconds{query_class=\"analytical\",visibility=\"fused\"}",
-        "bifrost_oracle_predicted_scan_seconds{query_class=\"analytical\"}",
-        "bifrost_oracle_admission_wait_seconds{outcome=\"acquired\",scope=\"cluster\"}",
-        "bifrost_oracle_admission_wait_seconds{outcome=\"rejected\",scope=\"class\"}",
+        "oracle_query_duration_seconds{class=\"analytical\",outcome=\"success\"}",
+        "oracle_query_time_to_first_batch_seconds{class=\"analytical\"}",
+        "oracle_admission_queue_duration_seconds{class=\"analytical\"}",
         "bifrost_oracle_tail_page_seconds{locality=\"local\",outcome=\"success\"}",
         "bifrost_oracle_tail_fence_hold_seconds{locality=\"local\",outcome=\"success\"}",
-        "bifrost_oracle_audit_seconds{audit_kind=\"read_decision\",outcome=\"success\"}",
     ] {
         assert_histogram(snapshot, series);
     }
     for series in [
-        "bifrost_oracle_in_flight{query_class=\"analytical\",visibility=\"fused\"}",
-        "bifrost_oracle_slots_in_use{query_class=\"analytical\",role=\"leader\"}",
-        "bifrost_oracle_admission_waiters{query_class=\"analytical\"}",
-        "bifrost_oracle_memory_bytes{role=\"leader\"}",
-        "bifrost_oracle_class_memory_bytes{memory_kind=\"source\",query_class=\"analytical\"}",
-        "bifrost_oracle_class_memory_bytes{memory_kind=\"tail\",query_class=\"analytical\"}",
-        "bifrost_oracle_class_memory_bytes{memory_kind=\"reconciliation\",query_class=\"analytical\"}",
+        "oracle_queries_active{class=\"analytical\"}",
+        "oracle_queries_queued{class=\"analytical\"}",
     ] {
         assert_gauge_peak(snapshot, series);
     }
-    assert_gauge_value(
-        snapshot,
-        "bifrost_oracle_slots_total{role=\"leader\"}",
-        16.0,
-    );
     for series in [
-        "bifrost_oracle_in_flight{query_class=\"analytical\",visibility=\"fused\"}",
-        "bifrost_oracle_slots_in_use{query_class=\"analytical\",role=\"leader\"}",
-        "bifrost_oracle_admission_waiters{query_class=\"analytical\"}",
-        "bifrost_oracle_memory_bytes{role=\"leader\"}",
-        "bifrost_oracle_class_memory_bytes{memory_kind=\"source\",query_class=\"analytical\"}",
-        "bifrost_oracle_class_memory_bytes{memory_kind=\"tail\",query_class=\"analytical\"}",
-        "bifrost_oracle_class_memory_bytes{memory_kind=\"reconciliation\",query_class=\"analytical\"}",
+        "oracle_queries_active{class=\"analytical\"}",
+        "oracle_queries_queued{class=\"analytical\"}",
     ] {
         assert_gauge_value(snapshot, series, 0.0);
     }
@@ -2163,9 +2162,11 @@ fn assert_telemetry_spans(captured: &[CapturedSpan]) {
         .iter()
         .find(|span| span.name == "bifrost.oracle.admission")
         .expect("admit span");
-    assert_eq!(
-        admit_span.fields.get("query_class").map(String::as_str),
-        Some("analytical")
+    assert!(
+        admit_span
+            .fields
+            .keys()
+            .all(|field| !["tenant", "principal", "request_id", "sql"].contains(&field.as_str()))
     );
     let acquire_span = captured
         .iter()
@@ -2191,9 +2192,7 @@ fn assert_telemetry_spans(captured: &[CapturedSpan]) {
         "bifrost.oracle.plan",
         "bifrost.oracle.audit",
         "bifrost.oracle.source",
-        "bifrost.oracle.slot_reservation",
         "bifrost.oracle.reconcile",
-        "bifrost.oracle.stream",
     ] {
         assert!(
             captured.iter().any(|span| span.name == name),
@@ -2219,7 +2218,7 @@ fn assert_telemetry_spans(captured: &[CapturedSpan]) {
 
 /// A missing pinned file triggers exactly one whole-cut pre-byte retry.
 #[tokio::test(flavor = "current_thread")]
-async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
+async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_stale_file_replan() {
     let fixture = OracleFixture::new("oracle_stale").await;
     fixture.seed_missing_hot_row().await;
     let oracle = fixture
@@ -2282,11 +2281,22 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
     let snapshot = recorder.snapshot();
     assert_counter(
         &snapshot,
-        "bifrost_oracle_stale_replans_total{outcome=\"retried\"}",
+        "oracle_query_bytes_scanned_total{class=\"interactive\"}",
     );
     assert_counter(
         &snapshot,
-        "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"failed\"}",
+        "oracle_query_files_scanned_total{class=\"interactive\"}",
+    );
+    assert_counter(
+        &snapshot,
+        "oracle_query_partitions_scanned_total{class=\"interactive\"}",
+    );
+    assert!(
+        snapshot
+            .histograms
+            .keys()
+            .any(|series| series.contains("oracle_query_duration_seconds")),
+        "stale retry must record terminal query duration"
     );
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))

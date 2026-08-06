@@ -201,6 +201,8 @@ struct WyrdTestServerInner {
     _scribe_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for the Forge DataFusion spill directory.
     _forge_spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Lifetime guard for the cluster-retained Oracle audit WAL root.
+    _oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
@@ -249,6 +251,29 @@ pub struct BifrostQueryResourceSnapshot {
     pub tail_fences: u64,
 }
 
+/// Production-owner Oracle residual state captured without a test adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OracleRuntimeInspection {
+    /// Queries holding local admission grants.
+    pub active_queries: u64,
+    /// Queries waiting for local admission.
+    pub queued_queries: u64,
+    /// Memory bytes reserved by active queries.
+    pub reserved_memory_bytes: u64,
+    /// Spill bytes reserved by active queries.
+    pub reserved_spill_bytes: u64,
+    /// Peer reservations waiting for worker execution.
+    pub peer_pending: u64,
+    /// Peer reservations executing worker streams.
+    pub peer_running: u64,
+    /// Accepted audit records retained in the local WAL.
+    pub audit_wal_records: u64,
+    /// Bytes retained in the local WAL.
+    pub audit_wal_bytes: u64,
+    /// Age of the oldest retained WAL record.
+    pub audit_oldest_age: Option<Duration>,
+}
+
 /// Stable pointer identities for one server-owned runtime pool graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PostgresPoolIdentity {
@@ -291,6 +316,8 @@ pub struct WyrdTestServerBuilder {
     scribe_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Cluster-retained Forge/Oracle spill root reused across restarts.
     oracle_spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Cluster-retained Oracle audit WAL root reused across restarts.
+    oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Process-installed production telemetry guard shared by every node.
     telemetry: Option<Arc<TelemetryGuard>>,
     /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
@@ -352,6 +379,7 @@ impl Default for WyrdTestServerBuilder {
             .collect(),
             scribe_wal_root: None,
             oracle_spill_root: None,
+            oracle_audit_wal_root: None,
             telemetry: None,
             bind_addrs: None,
             oracle_peer_credentials: None,
@@ -487,6 +515,9 @@ impl WyrdTestServer {
     /// Returns an error only when the supervisor join reports a panic. Normal
     /// task cancellation is treated as the expected abrupt termination path.
     pub async fn terminate_abruptly_for_test(mut self) -> Result<(), WyrdTestServerError> {
+        if let Some(query) = self.inner.state.bifrost_query() {
+            query.abort_audit_tasks_for_test().await;
+        }
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
@@ -699,6 +730,52 @@ impl WyrdTestServer {
             })?;
         let probe = stall.resource_probe().map_err(WyrdTestServerError::Start)?;
         Ok(probe.query_id().as_uuid().to_string())
+    }
+
+    /// Captures residual state directly from the production Oracle owners.
+    ///
+    /// # Errors
+    /// Returns a start error when this server does not host an Oracle role.
+    pub fn oracle_runtime_inspection(
+        &self,
+    ) -> Result<OracleRuntimeInspection, WyrdTestServerError> {
+        let runtime =
+            self.inner.state.bifrost_query().ok_or_else(|| {
+                WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
+            })?;
+        let (admission, (records, bytes, oldest)) = runtime.oracle_runtime_inspection();
+        Ok(OracleRuntimeInspection {
+            active_queries: admission.active_queries,
+            queued_queries: admission.queued_queries,
+            reserved_memory_bytes: admission.reserved_memory_bytes,
+            reserved_spill_bytes: admission.reserved_spill_bytes,
+            peer_pending: admission.peer_pending,
+            peer_running: admission.peer_running,
+            audit_wal_records: records,
+            audit_wal_bytes: bytes,
+            audit_oldest_age: oldest,
+        })
+    }
+
+    /// Pauses the production audit relay before its next Postgres attempt.
+    pub fn pause_audit_relay_for_test(
+        &self,
+    ) -> Result<wyrd_server::oracle::AuditRelayPauseGuard, WyrdTestServerError> {
+        let runtime =
+            self.inner.state.bifrost_query().ok_or_else(|| {
+                WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
+            })?;
+        Ok(runtime.pause_audit_relay_for_test())
+    }
+
+    /// Injects a commit-before-checkpoint relay crash window.
+    pub fn fail_audit_after_commit_for_test(&self) -> Result<(), WyrdTestServerError> {
+        let runtime =
+            self.inner.state.bifrost_query().ok_or_else(|| {
+                WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
+            })?;
+        runtime.fail_audit_after_commit_for_test();
+        Ok(())
     }
 
     /// Captures exact durable and in-memory query resource ownership.
@@ -2064,9 +2141,11 @@ impl WyrdTestServerBuilder {
         mut self,
         scribe_wal_root: Option<Arc<tempfile::TempDir>>,
         oracle_spill_root: Option<Arc<tempfile::TempDir>>,
+        oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     ) -> Self {
         self.scribe_wal_root = scribe_wal_root;
         self.oracle_spill_root = oracle_spill_root;
+        self.oracle_audit_wal_root = oracle_audit_wal_root;
         self
     }
 
@@ -2548,23 +2627,32 @@ impl WyrdTestServerBuilder {
                 },
             );
             state = if let Some(tls) = &self.oracle_peer_tls {
-                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
+                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and_root(
                     state,
                     node_id,
                     SecretString::from(crate::keys::private_key_pem().to_owned()),
                     advertise_addr,
                     credentials,
-                    tls.ca_path.clone(),
-                    tls.server_name.clone(),
+                    wyrd_server::boot::TestOracleTlsAttachment {
+                        ca_path: tls.ca_path.clone(),
+                        server_name: tls.server_name.clone(),
+                        audit_wal_root: self
+                            .oracle_audit_wal_root
+                            .as_ref()
+                            .map(|root| root.path().to_owned()),
+                    },
                 )
                 .await
             } else {
-                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials(
+                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
                     state,
                     node_id,
                     SecretString::from(crate::keys::private_key_pem().to_owned()),
                     advertise_addr,
                     credentials,
+                    self.oracle_audit_wal_root
+                        .as_ref()
+                        .map(|root| root.path().to_owned()),
                 )
                 .await
             }
@@ -2612,6 +2700,7 @@ impl WyrdTestServerBuilder {
                 _storage_root: storage_root,
                 _scribe_wal_root: scribe_wal_root,
                 _forge_spill_root: spill_root,
+                _oracle_audit_wal_root: self.oracle_audit_wal_root,
                 state,
                 router,
                 verifier,

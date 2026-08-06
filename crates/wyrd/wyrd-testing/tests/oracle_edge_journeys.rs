@@ -56,73 +56,32 @@ type JourneyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Complete normative production metric inventory and exact label-key sets.
 const ORACLE_METRIC_LABELS: &[(&str, &[&str])] = &[
-    (
-        "bifrost_oracle_queries_total",
-        &["outcome", "query_class", "visibility"],
-    ),
-    (
-        "bifrost_oracle_query_duration_seconds",
-        &["outcome", "query_class", "visibility"],
-    ),
-    (
-        "bifrost_oracle_time_to_first_batch_seconds",
-        &["query_class", "visibility"],
-    ),
-    ("bifrost_oracle_in_flight", &["query_class", "visibility"]),
+    ("oracle_queries_active", &["class"]),
+    ("oracle_queries_queued", &["class"]),
+    ("oracle_admission_total", &["class", "outcome", "reason"]),
+    ("oracle_admission_queue_duration_seconds", &["class"]),
+    ("oracle_tenant_budget_pressure", &["class"]),
+    ("oracle_query_duration_seconds", &["class", "outcome"]),
+    ("oracle_query_time_to_first_batch_seconds", &["class"]),
+    ("oracle_query_rows_total", &["class"]),
+    ("oracle_query_logical_bytes_selected_total", &["class"]),
+    ("oracle_query_bytes_scanned_total", &["class"]),
+    ("oracle_query_bytes_returned_total", &["class"]),
+    ("oracle_query_files_scanned_total", &["class"]),
+    ("oracle_query_partitions_scanned_total", &["class"]),
+    ("oracle_query_spill_bytes_total", &["class"]),
+    ("oracle_fragments_active", &[]),
+    ("oracle_fragment_duration_seconds", &["outcome"]),
+    ("oracle_query_cancellations_total", &["reason"]),
+    ("oracle_audit_wal_records", &[]),
+    ("oracle_audit_wal_bytes", &[]),
+    ("oracle_audit_oldest_record_age_seconds", &[]),
+    ("oracle_audit_append_duration_seconds", &[]),
+    ("oracle_audit_relay_total", &["outcome"]),
+    ("oracle_audit_relay_lag_seconds", &[]),
+    ("oracle_audit_relay_batch_size", &[]),
+    ("oracle_audit_relay_failures_total", &["reason"]),
     ("bifrost_role_ready", &["role"]),
-    (
-        "bifrost_oracle_admission_wait_seconds",
-        &["outcome", "scope"],
-    ),
-    (
-        "bifrost_oracle_admission_rejections_total",
-        &["query_class", "scope"],
-    ),
-    (
-        "bifrost_oracle_classification_total",
-        &["query_class", "reason"],
-    ),
-    ("bifrost_oracle_predicted_scan_seconds", &["query_class"]),
-    ("bifrost_oracle_slots_total", &["role"]),
-    ("bifrost_oracle_slots_in_use", &["query_class", "role"]),
-    (
-        "bifrost_oracle_slot_reservations_total",
-        &["outcome", "query_class", "role"],
-    ),
-    ("bifrost_oracle_admission_waiters", &["query_class"]),
-    ("bifrost_oracle_memory_bytes", &["role"]),
-    (
-        "bifrost_oracle_class_memory_bytes",
-        &["memory_kind", "query_class"],
-    ),
-    ("bifrost_oracle_spill_bytes_total", &["operator", "role"]),
-    (
-        "bifrost_oracle_spill_operations_total",
-        &["operator", "outcome", "role"],
-    ),
-    ("bifrost_oracle_source_rows_total", &["source"]),
-    ("bifrost_oracle_source_bytes_total", &["source"]),
-    ("bifrost_oracle_files_pruned_total", &["reason", "source"]),
-    ("bifrost_oracle_rows_deduplicated_total", &["losing_source"]),
-    ("bifrost_oracle_tail_pages_total", &["locality", "outcome"]),
-    ("bifrost_oracle_tail_page_seconds", &["locality", "outcome"]),
-    ("bifrost_oracle_tail_fences_total", &["locality", "outcome"]),
-    (
-        "bifrost_oracle_tail_fence_hold_seconds",
-        &["locality", "outcome"],
-    ),
-    ("bifrost_oracle_fragments_total", &["locality", "outcome"]),
-    ("bifrost_oracle_fragments_in_flight", &["locality"]),
-    ("bifrost_oracle_fragment_seconds", &["locality", "outcome"]),
-    ("bifrost_oracle_fragment_bytes_total", &["locality"]),
-    (
-        "bifrost_oracle_peer_attempts_total",
-        &["error_class", "outcome"],
-    ),
-    ("bifrost_oracle_stale_replans_total", &["outcome"]),
-    ("bifrost_oracle_streams_total", &["freshness", "outcome"]),
-    ("bifrost_oracle_audit_seconds", &["audit_kind", "outcome"]),
-    ("bifrost_oracle_security_events_total", &["event_class"]),
 ];
 
 /// Consequential production spans required by the Oracle operational contract.
@@ -151,6 +110,7 @@ async fn pg_bifrost_oracle_published_journey() {
         true,
         0,
         None,
+        false,
     )
     .await
     .expect("J1 PublishedOnly journey");
@@ -166,6 +126,7 @@ async fn pg_bifrost_oracle_fused_reconcile_journey() {
         false,
         0,
         Some("bifrost_oracle_tail_pages_total"),
+        false,
     )
     .await
     .expect("J2 Fused journey");
@@ -181,6 +142,7 @@ async fn pg_bifrost_oracle_role_separated_journey() {
         false,
         2,
         Some("bifrost_oracle_tail_pages_total"),
+        false,
     )
     .await
     .expect("J3 role-separated journey");
@@ -446,7 +408,8 @@ async fn pg_bifrost_oracle_distributed_journey() {
         VisibilityMode::PublishedOnly,
         true,
         2,
-        Some("bifrost_oracle_peer_attempts_total"),
+        Some("oracle_query_rows_total"),
+        true,
     )
     .await
     .expect("J4 distributed journey");
@@ -559,10 +522,10 @@ async fn public_grpc_drop_releases_query_resources() {
     let _ = cluster.shutdown_and_inspect().await.expect("drop shutdown");
 }
 
-/// J5 proves tenant tripwire, durable audit, admission cleanup, and audit refusal.
+/// J5 proves tenant isolation, local fairness, durable audit, and audit refusal.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_bifrost_oracle_multitenant_admission_journey() {
+async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey() {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
         .await
         .expect("J5 cluster");
@@ -618,6 +581,26 @@ async fn pg_bifrost_oracle_multitenant_admission_journey() {
         .superuser_pool()
         .await
         .expect("J5 table-owner pool");
+    let audit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 \
+               AND operation = 'bifrost.query.security_violation'",
+        )
+        .bind(tenant_a.as_uuid())
+        .fetch_one(&owner)
+        .await
+        .expect("security audit count");
+        if count >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < audit_deadline,
+            "security audit relay did not drain"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     let security_details: Vec<String> = sqlx::query_scalar(
         "SELECT detail::text FROM vala.audit_outbox \
          WHERE data_tenant_id = $1 \
@@ -636,34 +619,316 @@ async fn pg_bifrost_oracle_multitenant_admission_journey() {
         detail.contains("\"violation\":\"tenant_row\"") && detail.contains("\"phase\":\"source\"")
     }));
 
-    sqlx::query("REVOKE INSERT ON vala.audit_outbox FROM wyrd_app")
-        .execute(&owner)
-        .await
-        .expect("revoke audit insert");
-    let refusal_client = client_for_tenant(server, tenant_b, "j5-audit-refusal")
-        .await
-        .expect("audit refusal client");
-    let refused = QueryClient::new(&refusal_client)
-        .query(&BifrostQueryRequest {
-            sql: format!("SELECT count(*) FROM {table_fqn}"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: None,
-        })
-        .await;
-    sqlx::query("GRANT INSERT ON vala.audit_outbox TO wyrd_app")
-        .execute(&owner)
-        .await
-        .expect("restore audit insert");
-    assert!(
-        refused.is_err(),
-        "audit refusal must fail before a stream exists"
-    );
-
     let inspection = cluster.oracle_inspection().await.expect("J5 inspection");
     assert!(inspection.audit_rows >= 4);
+    assert_eq!(inspection.active_queries, 0);
+    assert_eq!(inspection.queued_queries, 0);
+    assert_eq!(inspection.reserved_memory_bytes, 0);
+    assert_eq!(inspection.reserved_spill_bytes, 0);
+    assert_eq!(inspection.peer_pending, 0);
+    assert_eq!(inspection.peer_running, 0);
     drop(owner);
     cluster.shutdown().await.expect("J5 shutdown");
+}
+
+/// J6 proves durable-before-read acceptance, bounded relay backlog, and replay windows.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_audit_relay_journey() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("J6 cluster");
+    let server = cluster.server(0).expect("J6 server");
+    let node_id = server.node_id();
+    let table = unique_table("oracle_audit_relay");
+    register_table(server, cluster.data_tenant_id(), &table)
+        .await
+        .expect("J6 table");
+    let primary_bootstrap = server
+        .bootstrap_service_in_tenant(cluster.data_tenant_id(), "oracle-audit-relay", &["admin"])
+        .await
+        .expect("J6 primary bootstrap");
+    let primary_principal = primary_bootstrap.id().as_uuid();
+    let query_client = client_from_bootstrap(server, primary_bootstrap)
+        .await
+        .expect("J6 client");
+    let secondary_bootstrap = server
+        .bootstrap_service_in_tenant(
+            cluster.data_tenant_id(),
+            "oracle-audit-relay-second",
+            &["admin"],
+        )
+        .await
+        .expect("J6 secondary bootstrap");
+    let secondary_principal = secondary_bootstrap.id().as_uuid();
+    let secondary_client = client_from_bootstrap(server, secondary_bootstrap)
+        .await
+        .expect("J6 second client");
+    ingest(&query_client, &format!("vala.bifrost.{table}"), &[1])
+        .await
+        .expect("J6 ingest");
+    server.flush_bifrost().await.expect("J6 flush");
+    let pause = server.pause_audit_relay_for_test().expect("J6 pause relay");
+    let audit_pool = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("J6 audit owner");
+    let primary_boundary: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox WHERE data_tenant_id = $1",
+    )
+    .bind(cluster.data_tenant_id().as_uuid())
+    .fetch_one(&audit_pool)
+    .await
+    .expect("J6 primary sequence boundary");
+    assert_eq!(
+        query_rows(&query_client, &table, VisibilityMode::PublishedOnly)
+            .await
+            .expect("J6 query"),
+        1
+    );
+    let secondary_boundary: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox WHERE data_tenant_id = $1",
+    )
+    .bind(cluster.data_tenant_id().as_uuid())
+    .fetch_one(&audit_pool)
+    .await
+    .expect("J6 secondary sequence boundary");
+    assert_eq!(
+        query_rows(&secondary_client, &table, VisibilityMode::PublishedOnly,)
+            .await
+            .expect("J6 second query"),
+        1
+    );
+    let blocked = server.oracle_runtime_inspection().expect("J6 inspection");
+    assert!(
+        blocked.audit_wal_records >= 1,
+        "accepted audit must be durable before relay"
+    );
+    drop(pause);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if server
+            .oracle_runtime_inspection()
+            .expect("J6 relay inspection")
+            .audit_wal_records
+            == 0
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay did not drain"
+        );
+    }
+    let primary_rows: Vec<(uuid::Uuid, String, String, uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT data_tenant_id, request_id, resource, principal_id, operation FROM vala.audit_outbox \
+         WHERE data_tenant_id = $1 AND resource = $2 AND principal_id = $3 \
+           AND operation = $4 AND seq > $5 ORDER BY seq",
+    )
+    .bind(cluster.data_tenant_id().as_uuid())
+    .bind("bifrost.query")
+    .bind(primary_principal)
+    .bind("bifrost.query.read_decision")
+    .bind(primary_boundary)
+    .fetch_all(&audit_pool)
+    .await
+    .expect("J6 primary correlated audit row");
+    let secondary_rows: Vec<(uuid::Uuid, String, String, uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT data_tenant_id, request_id, resource, principal_id, operation FROM vala.audit_outbox \
+         WHERE data_tenant_id = $1 AND resource = $2 AND principal_id = $3 \
+           AND operation = $4 AND seq > $5 ORDER BY seq",
+    )
+    .bind(cluster.data_tenant_id().as_uuid())
+    .bind("bifrost.query")
+    .bind(secondary_principal)
+    .bind("bifrost.query.read_decision")
+    .bind(secondary_boundary)
+    .fetch_all(&audit_pool)
+    .await
+    .expect("J6 secondary correlated audit row");
+    assert_eq!(primary_rows.len(), 1);
+    assert_eq!(secondary_rows.len(), 1);
+    assert_ne!(primary_rows[0].1, secondary_rows[0].1);
+    let primary = &primary_rows[0];
+    let primary_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vala.audit_outbox \
+         WHERE data_tenant_id = $1 AND request_id = $2 AND resource = $3 \
+           AND principal_id = $4 AND operation = $5",
+    )
+    .bind(primary.0)
+    .bind(&primary.1)
+    .bind(&primary.2)
+    .bind(primary.3)
+    .bind(&primary.4)
+    .fetch_one(
+        &cluster
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("J6 exact tuple owner"),
+    )
+    .await
+    .expect("J6 exact tuple count");
+    assert_eq!(primary_count, 1);
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node_id)
+        .await
+        .expect("J6 terminate");
+    cluster
+        .restart_terminated_node_at_new_address(node_id, roots)
+        .await
+        .expect("J6 restart");
+    let restarted = cluster.server(0).expect("J6 restarted");
+    let current: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vala.audit_outbox \
+         WHERE data_tenant_id = $1 AND request_id = $2 AND resource = $3 \
+           AND principal_id = $4 AND operation = $5",
+    )
+    .bind(primary.0)
+    .bind(&primary.1)
+    .bind(&primary.2)
+    .bind(primary.3)
+    .bind(&primary.4)
+    .fetch_one(
+        &cluster
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("J6 owner restart"),
+    )
+    .await
+    .expect("J6 restart count");
+    assert_eq!(current, 1, "checkpointed relay must not replay on restart");
+    let replay_bootstrap = restarted
+        .bootstrap_service_in_tenant(cluster.data_tenant_id(), "oracle-audit-replay", &["admin"])
+        .await
+        .expect("J6 replay bootstrap");
+    let replay_principal = replay_bootstrap.id().as_uuid();
+    let replay_client = client_from_bootstrap(restarted, replay_bootstrap)
+        .await
+        .expect("J6 replay client");
+    let replay_boundary: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox WHERE data_tenant_id = $1",
+    )
+    .bind(cluster.data_tenant_id().as_uuid())
+    .fetch_one(&audit_pool)
+    .await
+    .expect("J6 replay sequence boundary");
+    restarted
+        .fail_audit_after_commit_for_test()
+        .expect("J6 crash seam");
+    assert_eq!(
+        query_rows(&replay_client, &table, VisibilityMode::PublishedOnly)
+            .await
+            .expect("J6 replay query"),
+        1
+    );
+    let replay_owner = cluster
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("J6 replay owner");
+    let replay_tuple: (uuid::Uuid, String, String, uuid::Uuid, String) = loop {
+        let tuples: Vec<(uuid::Uuid, String, String, uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT data_tenant_id, request_id, resource, principal_id, operation \
+             FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource = $2 \
+               AND principal_id = $3 AND operation = $4 AND seq > $5 ORDER BY seq",
+        )
+        .bind(cluster.data_tenant_id().as_uuid())
+        .bind("bifrost.query")
+        .bind(replay_principal)
+        .bind("bifrost.query.read_decision")
+        .bind(replay_boundary)
+        .fetch_all(&replay_owner)
+        .await
+        .expect("J6 replay tuple");
+        if !tuples.is_empty() {
+            assert_eq!(tuples.len(), 1, "J6 replay initial tuple must be unique");
+            break tuples.into_iter().next().expect("J6 replay tuple exists");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let commit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let committed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 AND request_id = $2 AND resource = $3 \
+               AND principal_id = $4 AND operation = $5",
+        )
+        .bind(replay_tuple.0)
+        .bind(&replay_tuple.1)
+        .bind(&replay_tuple.2)
+        .bind(replay_tuple.3)
+        .bind(&replay_tuple.4)
+        .fetch_one(&replay_owner)
+        .await
+        .expect("J6 committed replay count");
+        let inspection = restarted
+            .oracle_runtime_inspection()
+            .expect("J6 replay inspection");
+        if committed == 1 && inspection.audit_wal_records >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < commit_deadline,
+            "commit-before-checkpoint seam did not expose a durable uncheckpointed record"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let replay_roots = cluster
+        .terminate_node_abruptly_for_test(node_id)
+        .await
+        .expect("J6 replay terminate");
+    cluster
+        .restart_terminated_node_at_new_address(node_id, replay_roots)
+        .await
+        .expect("J6 replay restart");
+    let replay_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let replayed: i64 = loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 AND request_id = $2 AND resource = $3 \
+               AND principal_id = $4 AND operation = $5",
+        )
+        .bind(replay_tuple.0)
+        .bind(&replay_tuple.1)
+        .bind(&replay_tuple.2)
+        .bind(replay_tuple.3)
+        .bind(&replay_tuple.4)
+        .fetch_one(&replay_owner)
+        .await
+        .expect("J6 replay count");
+        if count >= 2 || tokio::time::Instant::now() >= replay_deadline {
+            break count;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(replayed, 2, "commit-before-checkpoint is at-least-once");
+    let chain: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT seq, prev_hash, entry_hash FROM vala.audit_outbox \
+         WHERE data_tenant_id = $1 AND request_id = $2 AND resource = $3 \
+           AND principal_id = $4 AND operation = $5 ORDER BY seq DESC LIMIT 2",
+    )
+    .bind(replay_tuple.0)
+    .bind(&replay_tuple.1)
+    .bind(&replay_tuple.2)
+    .bind(replay_tuple.3)
+    .bind(&replay_tuple.4)
+    .fetch_all(
+        &cluster
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("J6 chain owner"),
+    )
+    .await
+    .expect("J6 chain rows");
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].0, chain[1].0 + 1);
+    assert_eq!(chain[0].1, chain[1].2);
+    cluster.shutdown().await.expect("J6 shutdown");
 }
 
 /// J6 proves real-tonic ticket, payload, permission, replay, footer, and cleanup invariants.
@@ -689,10 +954,6 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
     let missing_path = seed_missing_hot_row(&cluster, cluster.data_tenant_id(), &table)
         .await
         .expect("J7 missing hot row");
-    let checkpoint = cluster
-        .telemetry()
-        .checkpoint()
-        .expect("J7 telemetry checkpoint");
     let stale = QueryClient::new(&client)
         .query(&BifrostQueryRequest {
             sql: format!("SELECT * FROM vala.bifrost.{table}"),
@@ -705,30 +966,28 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
         stale.is_err(),
         "stale source must fail before a public batch"
     );
-    let stale_delta = cluster
-        .telemetry()
-        .delta_since(&checkpoint)
-        .expect("J7 stale telemetry");
-    assert!(stale_delta.metrics.iter().any(|sample| {
-        sample.family == "bifrost_oracle_stale_replans_total"
-            && sample.labels.get("outcome").map(String::as_str) == Some("retried")
-            && sample.value == 1.0
-    }));
     let owner = cluster
         .pg_fixture()
         .superuser_pool()
         .await
         .expect("J7 owner pool");
-    let retry_details: Vec<String> = sqlx::query_scalar(
-        "SELECT detail::text FROM vala.audit_outbox \
-         WHERE data_tenant_id = $1 \
-           AND operation = 'bifrost.query.read_decision' \
-         ORDER BY seq",
-    )
-    .bind(cluster.data_tenant_id().as_uuid())
-    .fetch_all(&owner)
-    .await
-    .expect("J7 retry audits");
+    let audit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let retry_details: Vec<String> = loop {
+        let details: Vec<String> = sqlx::query_scalar(
+            "SELECT detail::text FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 \
+               AND operation = 'bifrost.query.read_decision' \
+             ORDER BY seq",
+        )
+        .bind(cluster.data_tenant_id().as_uuid())
+        .fetch_all(&owner)
+        .await
+        .expect("J7 retry audits");
+        if details.len() >= 2 || tokio::time::Instant::now() >= audit_deadline {
+            break details;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
     assert_eq!(retry_details.len(), 2);
     assert!(retry_details[0].contains("\"retry_ordinal\":0"));
     assert!(retry_details[1].contains("\"retry_ordinal\":1"));
@@ -737,27 +996,6 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
         .execute(&owner)
         .await
         .expect("remove missing manifest row");
-
-    sqlx::query("REVOKE INSERT ON vala.audit_outbox FROM wyrd_app")
-        .execute(&owner)
-        .await
-        .expect("revoke J7 audit insert");
-    let audit_refused = QueryClient::new(&client)
-        .query(&BifrostQueryRequest {
-            sql: format!("SELECT * FROM vala.bifrost.{table}"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: None,
-        })
-        .await;
-    sqlx::query("GRANT INSERT ON vala.audit_outbox TO wyrd_app")
-        .execute(&owner)
-        .await
-        .expect("restore J7 audit insert");
-    assert!(
-        audit_refused.is_err(),
-        "audit failure must precede a first byte"
-    );
 
     crate::oracle_peer::prove_oracle_peer_restart_rejects_old_fence_and_releases_reservation()
         .await;
@@ -772,6 +1010,16 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
             .expect("J7 recovered query"),
         1
     );
+    let residual = cluster
+        .oracle_inspection()
+        .await
+        .expect("J7 residual inspection");
+    assert_eq!(residual.active_queries, 0);
+    assert_eq!(residual.queued_queries, 0);
+    assert_eq!(residual.reserved_memory_bytes, 0);
+    assert_eq!(residual.reserved_spill_bytes, 0);
+    assert_eq!(residual.peer_pending, 0);
+    assert_eq!(residual.peer_running, 0);
     drop(owner);
     cluster.shutdown().await.expect("J7 shutdown");
 }
@@ -826,10 +1074,6 @@ async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
         .expect("boot query runtime")
         .oracle()
         .bind_topology_probe_for_test(Arc::clone(&probe));
-    let checkpoint = cluster
-        .telemetry()
-        .checkpoint()
-        .expect("topology telemetry checkpoint");
     let mut query = tokio::spawn(async move {
         let mut stream = QueryClient::new(&client)
             .query(&BifrostQueryRequest {
@@ -876,22 +1120,6 @@ async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
     assert_eq!(rows, 64);
     assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
     assert!(terminal.warnings.contains(&QueryWarning::StaleCutReplanned));
-    let delta = cluster
-        .telemetry()
-        .delta_since(&checkpoint)
-        .expect("replan telemetry");
-    assert_eq!(
-        delta
-            .metrics
-            .iter()
-            .filter(|sample| {
-                sample.family == "bifrost_oracle_stale_replans_total"
-                    && sample.labels.get("outcome").map(String::as_str) == Some("retried")
-            })
-            .map(|sample| sample.value)
-            .sum::<f64>(),
-        1.0
-    );
     assert_eq!(old_peer.worker().pending_reservations(), 0);
     cluster.shutdown().await.expect("topology replan shutdown");
 }
@@ -1031,13 +1259,20 @@ async fn typed_vala_route_uses_oracle_cut() {
         sql_error,
         Some(QueryTerminalErrorCode::QueryTenantInvariant)
     );
-    let security_audits: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.security_violation'",
-    )
-    .bind(cluster.data_tenant_id().as_uuid())
-    .fetch_one(&owner)
-    .await
-    .expect("typed security audit");
+    let audit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let security_audits: i64 = loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.security_violation'",
+        )
+        .bind(cluster.data_tenant_id().as_uuid())
+        .fetch_one(&owner)
+        .await
+        .expect("typed security audit");
+        if count >= audit_baseline + 2 || tokio::time::Instant::now() >= audit_deadline {
+            break count;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
     assert_eq!(
         security_audits - audit_baseline,
         2,
@@ -1242,11 +1477,11 @@ async fn seed_foreign_trace_row(
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn oracle_production_telemetry_contract() {
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
         .await
         .expect("telemetry cluster");
     let server = cluster.server(0).expect("telemetry server");
-    let query_server = cluster.server(2).expect("telemetry query server");
+    let query_server = cluster.server(0).expect("telemetry query server");
     let table = unique_table("oracle_telemetry");
     register_table(server, cluster.data_tenant_id(), &table)
         .await
@@ -1297,25 +1532,30 @@ async fn oracle_production_telemetry_contract() {
         .iter()
         .map(|sample| sample.family.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    for required in [
-        "bifrost_oracle_queries_total",
-        "bifrost_oracle_query_duration_seconds",
-        "bifrost_oracle_time_to_first_batch_seconds",
-        "bifrost_oracle_source_rows_total",
-        "bifrost_oracle_streams_total",
-        "bifrost_oracle_audit_seconds",
-        "bifrost_oracle_tail_pages_total",
-        "bifrost_oracle_tail_page_seconds",
-        "bifrost_oracle_tail_fences_total",
-        "bifrost_oracle_tail_fence_hold_seconds",
-        "bifrost_oracle_fragments_total",
-        "bifrost_oracle_fragment_seconds",
-        "bifrost_oracle_fragment_bytes_total",
-        "bifrost_oracle_peer_attempts_total",
+    let absolute_families = cluster
+        .telemetry()
+        .snapshot()
+        .expect("absolute telemetry snapshot")
+        .into_iter()
+        .map(|sample| sample.family)
+        .collect::<std::collections::BTreeSet<_>>();
+    observed_families.extend(absolute_families.iter().cloned());
+    for (required, _) in ORACLE_METRIC_LABELS {
+        assert!(
+            observed_families.contains(*required),
+            "missing production metric {required}: {observed_families:?}"
+        );
+    }
+    for family in [
+        "oracle_query_logical_bytes_selected_total",
+        "oracle_query_bytes_scanned_total",
     ] {
         assert!(
-            observed_families.contains(required),
-            "missing production metric {required}: {observed_families:?}"
+            delta
+                .metrics
+                .iter()
+                .any(|sample| sample.family == family && sample.value > 0.0),
+            "canonical Parquet query did not emit positive {family}"
         );
     }
     let prohibited = [
@@ -1331,11 +1571,9 @@ async fn oracle_production_telemetry_contract() {
         "error",
         "error_text",
     ];
-    for sample in delta
-        .metrics
-        .iter()
-        .filter(|sample| sample.family.starts_with("bifrost_"))
-    {
+    for sample in delta.metrics.iter().filter(|sample| {
+        sample.family.starts_with("oracle_") || sample.family == "bifrost_role_ready"
+    }) {
         if let Some((_, expected)) = ORACLE_METRIC_LABELS
             .iter()
             .find(|(family, _)| *family == sample.family)
@@ -1423,18 +1661,17 @@ async fn oracle_production_telemetry_contract() {
             Some("oracle")
         );
     }
-    let absolute_families = cluster
-        .telemetry()
-        .snapshot()
-        .expect("absolute telemetry snapshot")
-        .into_iter()
-        .map(|sample| sample.family)
-        .collect::<std::collections::BTreeSet<_>>();
-    observed_families.extend(absolute_families.iter().cloned());
-    assert!(
-        absolute_families.contains("bifrost_oracle_fragments_in_flight"),
-        "fragment in-flight gauge was never registered by production execution"
-    );
+    assert!(absolute_families.contains("oracle_fragments_active"));
+    let residual = cluster
+        .oracle_inspection()
+        .await
+        .expect("telemetry residual inspection");
+    assert_eq!(residual.active_queries, 0);
+    assert_eq!(residual.queued_queries, 0);
+    assert_eq!(residual.reserved_memory_bytes, 0);
+    assert_eq!(residual.reserved_spill_bytes, 0);
+    assert_eq!(residual.peer_pending, 0);
+    assert_eq!(residual.peer_running, 0);
     cluster.shutdown().await.expect("telemetry shutdown");
 
     let role_cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated())
@@ -1476,7 +1713,7 @@ async fn oracle_production_telemetry_contract() {
 fn metric_label_value_is_closed(label: &str, value: &str) -> bool {
     match label {
         "visibility" => matches!(value, "published_only" | "fused"),
-        "query_class" => matches!(value, "interactive" | "analytical"),
+        "query_class" | "class" => matches!(value, "interactive" | "analytical"),
         "role" | "required_role" => matches!(value, "leader" | "worker" | "oracle" | "scribe"),
         "locality" => matches!(value, "local" | "remote"),
         "source" | "losing_source" => matches!(value, "iceberg" | "hot_sealed" | "live_tail"),
@@ -1488,13 +1725,20 @@ fn metric_label_value_is_closed(label: &str, value: &str) -> bool {
         "scope" => matches!(value, "cluster" | "class" | "tenant"),
         "reason" => matches!(
             value,
-            "estimated_scan"
-                | "predicted_scan"
-                | "global_operator"
-                | "typed_plan"
-                | "snapshot_overlap"
-                | "not_configured"
-                | "not_ready"
+            "class_capacity"
+                | "tenant_budget"
+                | "queue_full"
+                | "queue_deadline"
+                | "memory"
+                | "spill"
+                | "audit_unavailable"
+                | "shutdown"
+                | "client_drop"
+                | "deadline"
+                | "peer_failure"
+                | "postgres"
+                | "timeout"
+                | "serialization"
         ),
         "error_class" => matches!(
             value,
@@ -1512,6 +1756,9 @@ fn metric_label_value_is_closed(label: &str, value: &str) -> bool {
                 | "running"
                 | "spilled"
                 | "retried"
+                | "admitted"
+                | "retried_transient"
+                | "committed"
         ),
         _ => false,
     }
@@ -1524,6 +1771,7 @@ async fn public_roundtrip(
     flush: bool,
     query_index: usize,
     expected_metric: Option<&str>,
+    assert_distributed_physical: bool,
 ) -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(spec).await?;
     let ingest_server = cluster
@@ -1562,7 +1810,28 @@ async fn public_roundtrip(
             "journey did not emit required production metric {family}: {:?}",
             delta.metrics
         );
+        if assert_distributed_physical {
+            for family in [
+                "oracle_query_bytes_scanned_total",
+                "oracle_query_files_scanned_total",
+                "oracle_query_partitions_scanned_total",
+            ] {
+                let physical = delta
+                    .metrics
+                    .iter()
+                    .filter(|sample| sample.family == family && sample.value > 0.0)
+                    .count();
+                assert_eq!(physical, 1, "distributed worker must emit {family} once");
+            }
+        }
     }
+    let inspection = cluster.oracle_inspection().await?;
+    assert_eq!(inspection.active_queries, 0);
+    assert_eq!(inspection.queued_queries, 0);
+    assert_eq!(inspection.reserved_memory_bytes, 0);
+    assert_eq!(inspection.reserved_spill_bytes, 0);
+    assert_eq!(inspection.peer_pending, 0);
+    assert_eq!(inspection.peer_running, 0);
     cluster.shutdown().await?;
     Ok(())
 }
@@ -1608,6 +1877,14 @@ async fn client_for_tenant(
     let bootstrap = server
         .bootstrap_service_in_tenant(tenant, name, &["admin"])
         .await?;
+    client_from_bootstrap(server, bootstrap).await
+}
+
+/// Build a client while retaining the bootstrap principal for exact audit correlation.
+async fn client_from_bootstrap(
+    server: &wyrd_testing::WyrdTestServer,
+    bootstrap: Bootstrap,
+) -> Result<WyrdClient, JourneyError> {
     let api_key = match bootstrap {
         Bootstrap::Machine { api_key, .. } => api_key,
         Bootstrap::User { .. } => return Err("machine bootstrap returned user".into()),

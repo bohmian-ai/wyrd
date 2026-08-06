@@ -385,28 +385,6 @@ pub struct PillarTelemetryDelta {
     pub forge_publications: u64,
     /// Oracle decoded rows.
     pub oracle_decoded_rows: u64,
-    /// Peak analytical slot units held concurrently by Oracle leaders.
-    pub oracle_analytical_slots_peak: u64,
-    /// Final configured local Oracle slot capacity exposed by the process.
-    pub oracle_slots_total: u64,
-    /// Queries classified interactive by the estimated-scan rule.
-    pub oracle_interactive_scan_classifications: u64,
-    /// Queries classified analytical by the predicted-scan rule.
-    pub oracle_predicted_scan_classifications: u64,
-    /// Queries classified analytical because an unbounded global operator remains.
-    pub oracle_global_operator_classifications: u64,
-    /// Interactive admission rejections from the local pending waiter bound.
-    pub oracle_pending_limit_rejections: u64,
-    /// Admission attempts that exhausted the bounded durable lease-acquisition window.
-    pub oracle_lease_timeout_rejections: u64,
-    /// Interactive admission rejections from the durable cluster ceiling.
-    pub oracle_cluster_lease_rejections: u64,
-    /// Interactive admission rejections from the durable class ceiling.
-    pub oracle_class_lease_rejections: u64,
-    /// Interactive admission rejections from the durable tenant ceiling.
-    pub oracle_tenant_lease_rejections: u64,
-    /// Interactive admission rejections from the selected leader's local slots.
-    pub oracle_local_slot_rejections: u64,
     /// Validation status across the exact closed pillar bindings.
     pub status: EvidenceStatus,
     /// Bounded identifiers for required bindings that were absent.

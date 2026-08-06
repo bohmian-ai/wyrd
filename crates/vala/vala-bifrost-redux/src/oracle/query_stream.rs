@@ -171,6 +171,8 @@ pub(super) struct QueryStreamInput {
     pub(super) stale_replanned: bool,
     /// Production query telemetry retained through terminal emission.
     pub(super) query_telemetry: QueryTelemetryGuard,
+    /// Final physical scan evidence retained through terminal emission.
+    pub(super) scan_stats: OracleQueryScanStats,
     /// Optional Gate lifecycle retained through frame consumption.
     pub(super) gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
 }
@@ -181,6 +183,122 @@ enum QueryStreamEvent {
     Batch(Option<Result<RecordBatch, datafusion::error::DataFusionError>>),
     /// Stable terminal failure selected before another batch is exposed.
     Failed(QueryTerminalErrorCode),
+}
+
+/// Inputs retained by the lazy frame stream until terminal cleanup.
+struct FrameBuildInput {
+    /// Encoded public schema frame.
+    schema_frame: QuerySchemaFrame,
+    /// Physical batch stream.
+    batches: SendableRecordBatchStream,
+    /// Optional pre-read batch.
+    first: Option<Result<RecordBatch, datafusion::error::DataFusionError>>,
+    /// Admission guard retained through terminal output.
+    admitted: AdmittedQueryGuard,
+    /// Absolute stream deadline.
+    deadline: Instant,
+    /// Visibility contract for terminal mapping.
+    visibility: VisibilityMode,
+    /// Whether the live read degraded.
+    degraded: bool,
+    /// Whether stale replanning was consumed.
+    stale_replanned: bool,
+    /// Query telemetry guard.
+    query_telemetry: super::QueryTelemetryGuard,
+    /// Optional gate lifecycle guard.
+    gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
+    /// Stream cancellation token.
+    stream_cancellation: CancellationToken,
+    /// Request cancellation token.
+    request_cancellation: CancellationToken,
+    /// Cancellation marker shared with telemetry.
+    stream_telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Builds the lazy frame stream that owns terminal cleanup state.
+fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameStream>> {
+    let FrameBuildInput {
+        schema_frame,
+        mut batches,
+        first,
+        admitted,
+        deadline,
+        visibility,
+        degraded,
+        stale_replanned,
+        mut query_telemetry,
+        gate_lifecycle,
+        stream_cancellation,
+        request_cancellation,
+        stream_telemetry_cancelled,
+    } = input;
+    let frames = async_stream::stream! {
+        let mut admitted = Some(admitted);
+        let mut next = first;
+        let mut row_count = 0_u64;
+        query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
+        yield Ok(QueryStreamFrame::Schema(schema_frame));
+        let candidate = loop {
+            let event = if cancellation_requested(&stream_cancellation, &request_cancellation) {
+                QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
+            } else if let Some(value) = next.take() {
+                QueryStreamEvent::Batch(Some(value))
+            } else {
+                next_query_stream_event(
+                    &mut batches,
+                    &stream_cancellation,
+                    &request_cancellation,
+                    deadline,
+                ).await
+            };
+            match event {
+                QueryStreamEvent::Batch(Some(Ok(batch))) => {
+                    query_telemetry.first_batch();
+                    let batch_rows = batch.num_rows() as u64;
+                    row_count = row_count.saturating_add(batch_rows);
+                    let Ok(frame) = encode_batch_frame(&batch) else {
+                        break failed_terminal_for_visibility(
+                            QueryTerminalErrorCode::QueryExecutionFailed,
+                            row_count,
+                            visibility,
+                        );
+                    };
+                    query_telemetry.record_payload(batch_rows, frame.arrow_ipc_batch.len());
+                    yield Ok(QueryStreamFrame::Batch(frame));
+                }
+                QueryStreamEvent::Batch(Some(Err(error))) => {
+                    let code = terminal_error_code(&error);
+                    tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
+                    break failed_terminal_for_visibility(code, row_count, visibility);
+                }
+                QueryStreamEvent::Batch(None) => break successful_terminal(
+                    visibility,
+                    degraded,
+                    stale_replanned,
+                    row_count,
+                ),
+                QueryStreamEvent::Failed(code) => {
+                    break failed_terminal_for_visibility(code, row_count, visibility);
+                }
+            }
+        };
+        let failed_outcome = if candidate.outcome == QueryTerminalOutcome::Failed {
+            failed_stream_outcome(&stream_telemetry_cancelled)
+        } else {
+            "failed"
+        };
+        let terminal = release_and_finish_terminal(
+            &mut admitted,
+            &mut query_telemetry,
+            gate_lifecycle.as_ref(),
+            candidate,
+            failed_outcome,
+            visibility,
+            row_count,
+        );
+        yield Ok(QueryStreamFrame::Terminal(terminal));
+    };
+    Box::pin(frames)
 }
 
 /// Closed proof returned by one explicit local admission-release attempt.
@@ -414,6 +532,32 @@ impl OracleQueryStream {
         }
     }
 
+    /// Builds a test stream through the production telemetry and admission owners.
+    #[cfg(test)]
+    pub(super) fn test_from_physical(
+        telemetry: &Arc<super::OracleTelemetry>,
+        schema: &arrow::datatypes::SchemaRef,
+        batches: datafusion::physical_plan::SendableRecordBatchStream,
+        scan_stats: super::OracleQueryScanStats,
+    ) -> Self {
+        let (admitted, _shared, _request_cancellation) =
+            super::admission::admitted_guard_for_test();
+        Self::new(QueryStreamInput {
+            schema_frame: encode_schema_frame(schema).expect("test schema frame"),
+            batches,
+            first: None,
+            admitted,
+            deadline: Instant::now() + Duration::from_secs(1),
+            visibility: VisibilityMode::PublishedOnly,
+            degraded: false,
+            stale_replanned: false,
+            query_telemetry: telemetry
+                .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
+            scan_stats,
+            gate_lifecycle: None,
+        })
+    }
+
     /// Creates a lazy stream that owns local admission guards through terminal output.
     ///
     /// The returned future retains all cleanup state until the terminal frame
@@ -421,6 +565,7 @@ impl OracleQueryStream {
     /// permit or reservation from its query owner. The caller supplies
     /// the encoded schema, leaving no fallible work after guard transfer.
     pub(super) fn new(input: QueryStreamInput) -> Self {
+        let _stream_span = tracing::info_span!("bifrost.oracle.stream").entered();
         let QueryStreamInput {
             schema_frame,
             batches,
@@ -431,6 +576,7 @@ impl OracleQueryStream {
             degraded,
             stale_replanned,
             mut query_telemetry,
+            scan_stats,
             gate_lifecycle,
         } = input;
         #[cfg(feature = "test-support")]
@@ -443,77 +589,26 @@ impl OracleQueryStream {
         let stream_cancellation = cancellation.clone();
         let telemetry_cancelled = query_telemetry.cancellation_marker();
         let stream_telemetry_cancelled = Arc::clone(&telemetry_cancelled);
+        query_telemetry.record_scan_stats(scan_stats);
         query_telemetry.start_stream();
-        let frames = async_stream::stream! {
-            let mut admitted = Some(admitted);
-            let mut batches = batches;
-            let mut next = first;
-            let mut row_count = 0_u64;
-            query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
-            yield Ok(QueryStreamFrame::Schema(schema_frame));
-            let candidate = loop {
-                let event = if cancellation_requested(&stream_cancellation, &request_cancellation) {
-                    QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
-                } else if let Some(value) = next.take() {
-                    QueryStreamEvent::Batch(Some(value))
-                } else {
-                    next_query_stream_event(
-                        &mut batches,
-                        &stream_cancellation,
-                        &request_cancellation,
-                        deadline,
-                    ).await
-                };
-                match event {
-                    QueryStreamEvent::Batch(Some(Ok(batch))) => {
-                        query_telemetry.first_batch();
-                        let batch_rows = batch.num_rows() as u64;
-                        row_count = row_count.saturating_add(batch_rows);
-                        let Ok(frame) = encode_batch_frame(&batch) else {
-                            break failed_terminal_for_visibility(
-                                QueryTerminalErrorCode::QueryExecutionFailed,
-                                row_count,
-                                visibility,
-                            );
-                        };
-                        query_telemetry.record_payload(batch_rows, frame.arrow_ipc_batch.len());
-                        yield Ok(QueryStreamFrame::Batch(frame));
-                    }
-                    QueryStreamEvent::Batch(Some(Err(error))) => {
-                        let code = terminal_error_code(&error);
-                        tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                        break failed_terminal_for_visibility(code, row_count, visibility);
-                    }
-                    QueryStreamEvent::Batch(None) => break successful_terminal(
-                        visibility,
-                        degraded,
-                        stale_replanned,
-                        row_count,
-                    ),
-                    QueryStreamEvent::Failed(code) => {
-                        break failed_terminal_for_visibility(code, row_count, visibility);
-                    }
-                }
-            };
-            let failed_outcome = if candidate.outcome == QueryTerminalOutcome::Failed {
-                failed_stream_outcome(&stream_telemetry_cancelled)
-            } else {
-                "failed"
-            };
-            let terminal = release_and_finish_terminal(
-                &mut admitted,
-                &mut query_telemetry,
-                gate_lifecycle.as_ref(),
-                candidate,
-                failed_outcome,
-                visibility,
-                row_count,
-            );
-            yield Ok(QueryStreamFrame::Terminal(terminal));
-        };
+        let frames = build_frames(FrameBuildInput {
+            schema_frame,
+            batches,
+            first,
+            admitted,
+            deadline,
+            visibility,
+            degraded,
+            stale_replanned,
+            query_telemetry,
+            gate_lifecycle,
+            stream_cancellation,
+            request_cancellation,
+            stream_telemetry_cancelled,
+        });
         let stream = Self::assemble(
             schema_fingerprint,
-            Box::pin(frames),
+            frames,
             cancellation,
             telemetry_cancelled,
         );
@@ -592,6 +687,7 @@ mod tests {
 
     use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle};
     use crate::oracle::admission::{active_queries_for_test, admitted_guard_for_test};
+    use crate::oracle::exec::OracleQueryScanStats;
     use crate::oracle::{
         BifrostError, OracleSlotManager, OracleTelemetry, QueryClass, QuerySchemaFrame,
         QueryStreamFrame, VisibilityMode,
@@ -665,6 +761,7 @@ mod tests {
             degraded: false,
             stale_replanned: false,
             query_telemetry: telemetry,
+            scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
         });
         let mut terminal_seen = false;
@@ -701,6 +798,7 @@ mod tests {
             stale_replanned: false,
             query_telemetry: telemetry_owner
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
+            scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
         });
         assert!(matches!(

@@ -1473,11 +1473,33 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
     advertise_addr: String,
     peer_credentials: Arc<dyn OraclePeerCredentials>,
 ) -> Result<AppState, ServerBootError> {
+    attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
+        state,
+        node_id,
+        signing_key,
+        advertise_addr,
+        peer_credentials,
+        None,
+    )
+    .await
+}
+
+/// Attach a test Oracle role while retaining an explicit harness-owned WAL root.
+#[cfg(feature = "test-support")]
+pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
+    state: AppState,
+    node_id: wyrd_spec::vala::api::NodeId,
+    signing_key: secrecy::SecretString,
+    advertise_addr: String,
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
+    audit_wal_root: Option<std::path::PathBuf>,
+) -> Result<AppState, ServerBootError> {
     let node_id = ClusterNodeId::new(node_id.as_uuid());
     let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
-    config.bifrost.oracle.audit_wal_root = Some(test_oracle_audit_root(node_id.as_uuid()));
+    config.bifrost.oracle.audit_wal_root =
+        Some(audit_wal_root.unwrap_or_else(|| test_oracle_audit_root(node_id.as_uuid())));
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1506,13 +1528,52 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
     ca_path: std::path::PathBuf,
     server_name: String,
 ) -> Result<AppState, ServerBootError> {
+    attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and_root(
+        state,
+        node_id,
+        signing_key,
+        advertise_addr,
+        peer_credentials,
+        TestOracleTlsAttachment {
+            ca_path,
+            server_name,
+            audit_wal_root: None,
+        },
+    )
+    .await
+}
+
+/// TLS and durable-root inputs for a test Oracle attachment.
+#[cfg(feature = "test-support")]
+pub struct TestOracleTlsAttachment {
+    /// Peer CA certificate path.
+    pub ca_path: std::path::PathBuf,
+    /// Expected peer DNS name.
+    pub server_name: String,
+    /// Harness-owned audit WAL root.
+    pub audit_wal_root: Option<std::path::PathBuf>,
+}
+
+/// Attach a TLS test Oracle role with an explicit harness-owned WAL root.
+#[cfg(feature = "test-support")]
+pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and_root(
+    state: AppState,
+    node_id: wyrd_spec::vala::api::NodeId,
+    signing_key: secrecy::SecretString,
+    advertise_addr: String,
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
+    tls: TestOracleTlsAttachment,
+) -> Result<AppState, ServerBootError> {
     let node_id = ClusterNodeId::new(node_id.as_uuid());
     let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
-    config.bifrost.oracle.audit_wal_root = Some(test_oracle_audit_root(node_id.as_uuid()));
-    config.bifrost.oracle.peer_ca_certificate_path = Some(ca_path);
-    config.bifrost.oracle.peer_server_name = Some(server_name);
+    config.bifrost.oracle.audit_wal_root = Some(
+        tls.audit_wal_root
+            .unwrap_or_else(|| test_oracle_audit_root(node_id.as_uuid())),
+    );
+    config.bifrost.oracle.peer_ca_certificate_path = Some(tls.ca_path);
+    config.bifrost.oracle.peer_server_name = Some(tls.server_name);
     OracleRoleBuilder {
         state,
         config: &config,

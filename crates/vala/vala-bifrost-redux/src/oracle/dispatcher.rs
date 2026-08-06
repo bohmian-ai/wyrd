@@ -96,6 +96,8 @@ struct PendingReservation {
 /// Running worker reservation retained through attempt-stream completion.
 #[derive(Debug)]
 pub struct RunningReservation {
+    /// Authenticated query class carried into worker-owned scan telemetry.
+    pub(crate) query_class: QueryClass,
     /// Remote-worker slot permit released on stream completion, failure, or drop.
     ///
     /// Leader-local execution leaves this empty because the admitted query guard
@@ -228,6 +230,7 @@ impl ReservationRegistry {
     /// # Errors
     /// Returns terminal for missing/mismatched ownership and retryable for a
     /// concurrent running-capacity change.
+    #[tracing::instrument(name = "bifrost.oracle.slot_reservation", skip_all)]
     pub fn take_for_execute(
         &self,
         reservation_id: ReservationId,
@@ -257,6 +260,7 @@ impl ReservationRegistry {
             .slots
             .try_running(demand)
             .map(|permit| RunningReservation {
+                query_class,
                 permit: Some(permit),
             })
             .map_err(|_| DispatchError::Retryable);
@@ -280,6 +284,7 @@ impl ReservationRegistry {
     ///
     /// # Errors
     /// Returns terminal for missing, expired, or mismatched ownership.
+    #[tracing::instrument(name = "bifrost.oracle.slot_reservation", skip_all)]
     fn take_for_local_leader_execute(
         &self,
         reservation_id: ReservationId,
@@ -304,7 +309,10 @@ impl ReservationRegistry {
             .remove(&reservation_id)
             .ok_or(DispatchError::Terminal)?;
         record_slot(query_class, SlotOutcome::Running);
-        Ok(RunningReservation { permit: None })
+        Ok(RunningReservation {
+            query_class,
+            permit: None,
+        })
     }
 
     /// Reclaims expired pending reservations and returns the number still held.
@@ -564,7 +572,7 @@ impl OraclePeerWorker {
             security_audit: Arc::clone(&self.security_audit),
             tenant_id,
         };
-        let frames = match self.executor.execute(&fragment) {
+        let frames = match self.executor.execute(&fragment, running.query_class) {
             Ok(frames) => frames,
             Err(error) => return Err(mapper.classify(error).await),
         };
@@ -2034,6 +2042,7 @@ mod tests {
         let running = registry
             .take_for_execute(pending.reservation_id, query, leader, 7, now)
             .expect("matching transition");
+        assert_eq!(running.query_class, QueryClass::Interactive);
         drop(running);
     }
 
@@ -2058,6 +2067,7 @@ mod tests {
             .take_for_local_leader_execute(pending.reservation_id, query, leader, 11, now)
             .expect("leader-local transition");
 
+        assert_eq!(running.query_class, QueryClass::Interactive);
         assert!(running.permit.is_none());
         assert!(slots.try_pending().is_err());
         assert!(slots.try_running(1).is_err());
@@ -2134,7 +2144,7 @@ mod tests {
         let slots = Arc::new(OracleSlotManager::new(1, 1));
         let permit = slots.try_running(1).expect("completion permit");
         let completion_stream = async_stream::stream! {
-            let _running = RunningReservation { permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
             if false {
                 yield Err(DispatchError::Retryable);
             }
@@ -2151,7 +2161,7 @@ mod tests {
         let permit = slots.try_running(1).expect("cancellation permit");
         let observed = cancellation.clone();
         let cancellation_stream = async_stream::stream! {
-            let _running = RunningReservation { permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
             observed.cancelled().await;
         };
         let mut cancellation_stream = Box::pin(cancellation_stream);
@@ -2165,7 +2175,7 @@ mod tests {
 
         let permit = slots.try_running(1).expect("drop permit");
         let drop_stream = async_stream::stream! {
-            let _running = RunningReservation { permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
             futures_util::future::pending::<()>().await;
             yield Err(DispatchError::Retryable);
         };

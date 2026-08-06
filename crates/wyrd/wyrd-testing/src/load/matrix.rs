@@ -54,7 +54,6 @@ const MEASURED_BINDINGS: &[&str] = &[
 /// Exact bindings required to reconcile final public reads.
 const FINAL_BINDINGS: &[&str] = &[
     "gate.requests.query_success",
-    "oracle.source_rows",
     "oracle.rows",
     "oracle.stream_bytes",
 ];
@@ -95,8 +94,7 @@ const PUBLICATION_CLEANUP: &[&str] = &[
 /// Exact cleanup finals required after query and cancellation phases.
 const QUERY_CLEANUP: &[&str] = &[
     "gate.active",
-    "cleanup.oracle_in_flight",
-    "cleanup.oracle_slots",
+    "cleanup.oracle_active",
     "cleanup.storage_active",
 ];
 /// Trace operations required while acknowledging warmup writes and publishing them.
@@ -1270,15 +1268,6 @@ fn reconcile_matrix_telemetry(
         .values()
         .map(|tenant| tenant.final_rows)
         .sum::<u64>();
-    let final_source_rows = results
-        .values()
-        .map(|tenant| {
-            tenant.acknowledged_rows.saturating_add(
-                u64::from(tenant.warmup_acknowledged_batches)
-                    .saturating_mul(u64::from(profile.rows_per_batch)),
-            )
-        })
-        .sum::<u64>();
     let queried_rows = results
         .values()
         .map(|tenant| tenant.queried_rows)
@@ -1294,7 +1283,6 @@ fn reconcile_matrix_telemetry(
     assert_phase_counter("warmup Gate rows", warmup.gate_rows, warmup_rows)?;
     assert_phase_counter("warmup Gate bytes", warmup.gate_bytes, warmup_bytes)?;
     assert_phase_counter("warmup Scribe rows", warmup.scribe_rows, warmup_rows)?;
-    assert_phase_counter("warmup Oracle source rows", warmup.oracle_source_rows, 0)?;
     assert_phase_counter("warmup Oracle stream rows", warmup.oracle_stream_rows, 0)?;
     assert_phase_counter(
         "warmup Oracle read audits",
@@ -1318,11 +1306,6 @@ fn reconcile_matrix_telemetry(
         expected_measured_bytes,
     )?;
     assert_phase_counter("measured Scribe rows", measured.scribe_rows, measured_rows)?;
-    assert_phase_counter(
-        "measured Oracle source rows",
-        measured.oracle_source_rows,
-        queried_rows,
-    )?;
     assert_phase_counter(
         "measured Oracle stream rows",
         measured.oracle_stream_rows,
@@ -1350,11 +1333,6 @@ fn reconcile_matrix_telemetry(
         "measured Gate non-success retry/rejection outcomes",
         measured.gate_rejected + measured.gate_failed,
         rejected.saturating_add(retries),
-    )?;
-    assert_phase_counter(
-        "final Oracle source rows",
-        final_verification.oracle_source_rows,
-        final_source_rows,
     )?;
     assert_phase_counter(
         "final Oracle stream rows",

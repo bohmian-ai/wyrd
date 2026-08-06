@@ -3,13 +3,15 @@
 #[cfg(feature = "bench")]
 pub mod bench_cluster;
 #[cfg(feature = "bench")]
+pub mod bench_dataset;
+#[cfg(feature = "bench")]
 pub mod bench_forge;
 #[cfg(feature = "bench")]
 pub mod bench_oracle;
 #[cfg(feature = "bench")]
 pub mod bench_otlp;
 #[cfg(feature = "bench")]
-pub(crate) mod bench_report;
+pub mod bench_report;
 #[cfg(feature = "bench")]
 pub mod bench_scribe;
 pub mod calibration;

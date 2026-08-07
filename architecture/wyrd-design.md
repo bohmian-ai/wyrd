@@ -1266,6 +1266,17 @@ state. Exactly-once delivery therefore requires no cross-shard coordination:
 the WAL record, `synced_not_inserted` set, and SQL unique constraint are all
 shard-local.
 
+Correctness is gateway-independent (D81): the fenced-publication
+`AppendSliceId` uniqueness constraint is the sole authoritative cross-pod
+exactly-once mechanism, and the Scribe storage identities
+(`(node_id, writer_epoch, shard_id, seg_seq)` WAL segments and the
+`vala.file_list` replay key) prevent cross-pod collisions. Gateway
+batch-identity affinity is an optional efficiency optimization — it reduces
+duplicate buffering and WAL work when a retry reaches the same pod — and must
+not be treated as a correctness requirement. The tail-merge `AppendSliceId`
+dedup named in D81 is the tracked prerequisite for any future multi-pod
+ingest topology; until it ships, multi-pod ingest is out of scope.
+
 Control operations (seal-key freeze, live-tail snapshot, pressure flush, WAL
 pressure flush) that were previously addressed to the one shard computed by
 `shard_for(tenant, table)` are now broadcast to all sixteen shards. Shards that

@@ -16,7 +16,7 @@ use serde::{Serialize, Serializer};
 use thiserror::Error;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use vala_sdk::{
     BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, CollectedQueryResult, QueryClient,
 };
@@ -413,6 +413,7 @@ impl BifrostClusterLoad {
                 AdmissionConfig {
                     memory_limit_bytes: 512 * 1024 * 1024,
                     scribe_memory_limit_bytes: Some(256 * 1024),
+                    event_time_window: EventTimeWindow::default(),
                 },
             )
             .await

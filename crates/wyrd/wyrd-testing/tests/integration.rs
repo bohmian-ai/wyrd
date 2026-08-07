@@ -36,6 +36,8 @@ mod otlp_trace_export_http;
 mod pg_bifrost_cluster_load;
 #[path = "pg_bifrost_materializer.rs"]
 mod pg_bifrost_materializer;
+#[path = "pg_event_time_window_journey.rs"]
+mod pg_event_time_window_journey;
 #[path = "pg_grpc_mount.rs"]
 mod pg_grpc_mount;
 #[path = "public_write_journeys.rs"]

@@ -218,6 +218,20 @@ pub struct ScribeRuntimeConfig {
     /// Optional Scribe WAL disk budget. When absent, filesystem capacity is authoritative.
     #[serde(default)]
     pub wal_disk_limit_bytes: Option<u64>,
+    /// Optional past-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
+    ///
+    /// A caller-supplied `wyrd_event_time` older than this many seconds before server receipt
+    /// time is rejected with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`. When absent the D85
+    /// default of 30 days applies. Per-tenant overrides are not supported.
+    #[serde(default)]
+    pub event_time_past_window_secs: Option<u64>,
+    /// Optional future-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
+    ///
+    /// A caller-supplied `wyrd_event_time` more than this many seconds ahead of server receipt
+    /// time is rejected with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`. When absent the D85
+    /// default of 24 hours applies. Per-tenant overrides are not supported.
+    #[serde(default)]
+    pub event_time_future_window_secs: Option<u64>,
 }
 
 /// Independently deployable Bifrost server role.
@@ -955,6 +969,8 @@ impl Default for ScribeRuntimeConfig {
             wal_io_threads: default_scribe_wal_io_threads(),
             memory_limit_bytes: None,
             wal_disk_limit_bytes: None,
+            event_time_past_window_secs: None,
+            event_time_future_window_secs: None,
         }
     }
 }

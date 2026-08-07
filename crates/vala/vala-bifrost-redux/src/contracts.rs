@@ -130,6 +130,25 @@ pub enum ScribeError {
     #[error("ingest frame validation failed")]
     InvalidFrame,
 
+    /// A caller-supplied `wyrd_event_time` value falls outside the server
+    /// acceptance window evaluated against per-batch receipt time.
+    ///
+    /// The entire batch is rejected pre-admission; no rows are written. The
+    /// caller must supply a value within the configured window or omit the
+    /// column to let the server stamp receipt time.
+    #[error(
+        "wyrd_event_time {value_micros} µs is outside acceptance window \
+         [{past_bound_micros}, {future_bound_micros}] µs"
+    )]
+    EventTimeOutOfRange {
+        /// The offending `wyrd_event_time` value in epoch-microseconds.
+        value_micros: i64,
+        /// The inclusive past bound (receipt − past window) in epoch-microseconds.
+        past_bound_micros: i64,
+        /// The inclusive future bound (receipt + future window) in epoch-microseconds.
+        future_bound_micros: i64,
+    },
+
     #[error("ingest card scope validation failed")]
     CardScopeDenied,
 
@@ -174,6 +193,15 @@ impl ScribeError {
                 limit: *limit,
             },
             Self::InvalidFrame => Self::InvalidFrame,
+            Self::EventTimeOutOfRange {
+                value_micros,
+                past_bound_micros,
+                future_bound_micros,
+            } => Self::EventTimeOutOfRange {
+                value_micros: *value_micros,
+                past_bound_micros: *past_bound_micros,
+                future_bound_micros: *future_bound_micros,
+            },
             Self::CardScopeDenied => Self::CardScopeDenied,
             Self::CardUnresolved => Self::CardUnresolved,
             Self::IngressClosed => Self::IngressClosed,

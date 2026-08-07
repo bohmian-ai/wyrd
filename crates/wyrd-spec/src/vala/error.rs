@@ -632,4 +632,29 @@ pub enum BifrostError {
         /// Human-readable decode error detail.
         detail: String,
     },
+
+    /// A caller-supplied `wyrd_event_time` value falls outside the server
+    /// acceptance window evaluated against per-batch receipt time.
+    ///
+    /// The entire batch is rejected pre-admission; no rows are written. Either
+    /// supply a `wyrd_event_time` within the configured window (default: 30 days
+    /// past to 24 hours future of server receipt time) or omit the column to let
+    /// the server stamp receipt time. The window cannot be overridden per-tenant.
+    #[error("event time out of acceptance window: {value} not in [{past_bound}, {future_bound}]")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
+        status = 400,
+        title = "Event time outside acceptance window",
+        remediation = "Supply a wyrd_event_time within the server acceptance window \
+(default 30 days past to 24 hours future of server receipt time), or omit the \
+column to let the server stamp receipt time."
+    )]
+    EventTimeOutOfRange {
+        /// The offending `wyrd_event_time` value (epoch-microseconds rendered as a string).
+        value: String,
+        /// The inclusive past bound used for this batch (epoch-microseconds rendered as a string).
+        past_bound: String,
+        /// The inclusive future bound used for this batch (epoch-microseconds rendered as a string).
+        future_bound: String,
+    },
 }

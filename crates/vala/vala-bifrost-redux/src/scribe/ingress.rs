@@ -64,7 +64,6 @@ impl ScribeImpl {
             )?,
         };
         memory.attach_shard(self.memory.shard_accounting(), shard);
-
         #[cfg(any(test, feature = "test-support"))]
         self.pause_admitted_ingest_for_test().await;
 
@@ -76,6 +75,7 @@ impl ScribeImpl {
                 frame.expected_schema_fingerprint,
                 frame.request_id.clone(),
                 frame.batch_id,
+                self.admission.config().event_time_window,
             )
             .await?;
         memory.transfer_category(MemoryCategory::Decode);
@@ -121,11 +121,7 @@ impl ScribeImpl {
         durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
-        metrics::counter!("bifrost_scribe_frames_total", "status" => "accepted").increment(1);
-        metrics::counter!("bifrost_scribe_rows_total", "status" => "accepted")
-            .increment(rows_accepted);
-        metrics::histogram!("bifrost_scribe_ack_seconds")
-            .record(append_started.elapsed().as_secs_f64());
+        record_accepted_frame(rows_accepted, append_started.elapsed());
         Ok(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted,
@@ -229,6 +225,17 @@ impl ScribeImpl {
             stall.release.notified().await;
         }
     }
+}
+
+/// Emits the accepted-frame counters and ACK latency histogram.
+///
+/// Extracted from `prepare_and_dispatch` to keep that function within the
+/// line-length limit; all metrics writes are stateless and have no natural
+/// owner struct, so a free function is appropriate here.
+fn record_accepted_frame(rows_accepted: u64, elapsed: std::time::Duration) {
+    metrics::counter!("bifrost_scribe_frames_total", "status" => "accepted").increment(1);
+    metrics::counter!("bifrost_scribe_rows_total", "status" => "accepted").increment(rows_accepted);
+    metrics::histogram!("bifrost_scribe_ack_seconds").record(elapsed.as_secs_f64());
 }
 
 #[cfg(test)]

@@ -825,6 +825,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                         IngestError::PayloadTooLarge { .. } => "payload_limit",
                         IngestError::RequestValidation(_)
                         | IngestError::Decode(_)
+                        | IngestError::EventTimeOutOfRange { .. }
                         | IngestError::TooManyRows { .. } => "validation",
                         IngestError::TableNotFound { .. } | IngestError::SchemaMismatch { .. } => {
                             "catalog"

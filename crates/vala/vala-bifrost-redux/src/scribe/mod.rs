@@ -1445,6 +1445,7 @@ impl Scribe for ScribeImpl {
                     ScribeError::PayloadTooLarge { .. }
                     | ScribeError::TooManyRows { .. }
                     | ScribeError::InvalidFrame
+                    | ScribeError::EventTimeOutOfRange { .. }
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::CardScopeDenied
                     | ScribeError::CardUnresolved

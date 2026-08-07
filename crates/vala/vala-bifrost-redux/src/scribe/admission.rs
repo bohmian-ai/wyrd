@@ -18,6 +18,56 @@ pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
 /// Fixed pod-global in-flight item ceiling from the Scribe contract.
 pub const GLOBAL_INFLIGHT_ITEMS: usize = 4_096;
 
+/// Bounded acceptance window for caller-supplied `wyrd_event_time`.
+///
+/// Both the native Arrow IPC path and the projected OTLP path evaluate a
+/// present `wyrd_event_time` column against this window at admission time.
+/// Values that fall outside the window are rejected with
+/// [`ScribeError::EventTimeOutOfRange`]; values within the window (inclusive
+/// at both edges) are preserved verbatim. When the column is absent the
+/// server stamps receipt time and no check runs.
+///
+/// A single per-batch receipt instant governs all rows so an in-flight clock
+/// tick cannot split a batch verdict.
+#[derive(Debug, Clone, Copy)]
+pub struct EventTimeWindow {
+    /// Maximum age below the per-batch server receipt time.
+    ///
+    /// Default: 30 days, accommodating backfill workloads.
+    pub past: std::time::Duration,
+    /// Maximum lead above receipt time for clock-skew tolerance.
+    ///
+    /// Default: 24 hours.
+    pub future: std::time::Duration,
+}
+
+impl EventTimeWindow {
+    /// Returns `true` when `event_micros` lies within the inclusive window
+    /// `[receipt_micros - past, receipt_micros + future]`.
+    ///
+    /// Duration-to-micros conversions saturate at `i64::MAX`/`i64::MIN` rather
+    /// than panicking so a pathologically large window cannot overflow.
+    #[must_use]
+    pub fn contains(&self, event_micros: i64, receipt_micros: i64) -> bool {
+        // Saturating cast: past_micros fits an i64 for any sane Duration.
+        let past_micros = i64::try_from(self.past.as_micros()).unwrap_or(i64::MAX);
+        let future_micros = i64::try_from(self.future.as_micros()).unwrap_or(i64::MAX);
+        let lo = receipt_micros.saturating_sub(past_micros);
+        let hi = receipt_micros.saturating_add(future_micros);
+        event_micros >= lo && event_micros <= hi
+    }
+}
+
+impl Default for EventTimeWindow {
+    fn default() -> Self {
+        const SECS_PER_DAY: u64 = 86_400;
+        Self {
+            past: std::time::Duration::from_secs(30 * SECS_PER_DAY),
+            future: std::time::Duration::from_secs(SECS_PER_DAY),
+        }
+    }
+}
+
 /// Fixed pod-wide admission settings.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionConfig {
@@ -25,6 +75,13 @@ pub struct AdmissionConfig {
     pub memory_limit_bytes: usize,
     /// Optional explicit Scribe child budget under the detected pod budget.
     pub scribe_memory_limit_bytes: Option<usize>,
+    /// Acceptance window for caller-supplied `wyrd_event_time` values.
+    ///
+    /// Applied uniformly to both the native Arrow IPC and projected OTLP
+    /// ingest surfaces. Values outside the window are rejected with
+    /// `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; the absent-column server-stamp
+    /// path is unaffected. Defaults to 30 days past / 24 hours future per D85.
+    pub event_time_window: EventTimeWindow,
 }
 
 impl Default for AdmissionConfig {
@@ -32,6 +89,7 @@ impl Default for AdmissionConfig {
         Self {
             memory_limit_bytes: 1024 * 1024 * 1024,
             scribe_memory_limit_bytes: None,
+            event_time_window: EventTimeWindow::default(),
         }
     }
 }
@@ -321,6 +379,7 @@ mod tests {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
             scribe_memory_limit_bytes: None,
+            event_time_window: EventTimeWindow::default(),
         });
         let reservation = admission
             .try_reserve("vala.bifrost.events", 10)
@@ -337,6 +396,7 @@ mod tests {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
             scribe_memory_limit_bytes: None,
+            event_time_window: EventTimeWindow::default(),
         });
         let mut reservations = Vec::with_capacity(GLOBAL_INFLIGHT_ITEMS);
         for _ in 0..GLOBAL_INFLIGHT_ITEMS {
@@ -394,6 +454,7 @@ mod tests {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
             scribe_memory_limit_bytes: None,
+            event_time_window: EventTimeWindow::default(),
         });
         admission
             .try_reserve_active("events", 90)

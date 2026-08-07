@@ -174,6 +174,7 @@ impl PersistenceFixture {
         let admission = vala_bifrost_redux::scribe::admission::AdmissionConfig {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             scribe_memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
+            event_time_window: vala_bifrost_redux::scribe::admission::EventTimeWindow::default(),
         };
         let first = first_replay_scribe(operator.clone(), wal.clone(), node_id, admission, &memory);
         first.replay_wal_async().await.expect("empty WAL replay");

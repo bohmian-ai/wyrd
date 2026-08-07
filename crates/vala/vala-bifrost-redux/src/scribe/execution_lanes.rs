@@ -18,6 +18,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError};
 use crate::schema::fingerprint::SchemaFingerprint;
+use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memory::ScribeMemoryBudget;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
@@ -135,6 +136,17 @@ impl ScribeIngressCpuPool {
     }
 
     /// Submit one native decode without waiting for an application queue slot.
+    ///
+    /// The `window` argument carries the pod-wide event-time acceptance bounds
+    /// sourced from [`AdmissionConfig`] by the caller. It is passed by value
+    /// into the Rayon closure so no heap allocation is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated,
+    /// and propagates any error produced by the free [`decode`] function,
+    /// including [`ScribeError::EventTimeOutOfRange`] when a present
+    /// `wyrd_event_time` value falls outside the acceptance window.
     pub(crate) async fn decode(
         &self,
         payload: IngressPayload,
@@ -142,6 +154,7 @@ impl ScribeIngressCpuPool {
         expected_schema_fingerprint: SchemaFingerprint,
         request_id: RequestId,
         batch_id: uuid::Uuid,
+        window: EventTimeWindow,
     ) -> Result<RecordBatch, ScribeError> {
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
@@ -178,6 +191,7 @@ impl ScribeIngressCpuPool {
                     expected_schema_fingerprint,
                     &request_id,
                     batch_id,
+                    window,
                 )
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
@@ -313,13 +327,15 @@ impl ScribeIngressCpuPool {
 /// MAY additionally carry an optional caller-supplied `wyrd_event_time` column.
 /// When present, that column MUST be exactly the managed physical type
 /// (`Timestamp(Microsecond, UTC)`), MUST NOT be nullable-with-nulls, and MUST
-/// NOT be duplicated; it is then preserved verbatim as the authoritative event
-/// time rather than server-stamped. When absent, the server stamps
-/// `wyrd_event_time` with the ingest receipt time, matching the historical
-/// native contract. Projected payloads retain their correlation and event-time
-/// fields as supplied by the projection path. In either mode, user schema
-/// fingerprinting excludes correlation and managed columns, so accepting a
-/// caller event-time column never perturbs a registered-schema fingerprint.
+/// NOT be duplicated; it is then validated against the acceptance `window` and,
+/// if in range, preserved verbatim as the authoritative event time. When absent,
+/// the server stamps `wyrd_event_time` with the ingest receipt time. Projected
+/// payloads retain their event-time field as supplied; a present projected
+/// `wyrd_event_time` is also validated against the same window.
+///
+/// In either mode, user schema fingerprinting excludes correlation and managed
+/// columns, so accepting a caller event-time column never perturbs a
+/// registered-schema fingerprint.
 ///
 /// All other managed columns (`wyrd_ingested_at`, `wyrd_batch_id`,
 /// `wyrd_row_ordinal`, `wyrd_request_id`, `data_tenant_id`, principal, and card
@@ -330,14 +346,17 @@ impl ScribeIngressCpuPool {
 /// server-owned column supplied by the caller, a `wyrd_event_time` column with
 /// the wrong Arrow type, unit, timezone, nullability with nulls, or a duplicate
 /// managed field, and for failed physical assembly; returns
-/// [`ScribeError::FingerprintMismatch`] or authorization errors when the
-/// admitted payload does not match the registered table contract.
+/// [`ScribeError::EventTimeOutOfRange`] when a present `wyrd_event_time` value
+/// falls outside the acceptance `window`; returns [`ScribeError::FingerprintMismatch`]
+/// or authorization errors when the admitted payload does not match the registered
+/// table contract.
 fn decode(
     payload: IngressPayload,
     principal: &Principal,
     expected_schema_fingerprint: SchemaFingerprint,
     request_id: &RequestId,
     batch_id: uuid::Uuid,
+    window: EventTimeWindow,
 ) -> Result<RecordBatch, ScribeError> {
     let native_payload = matches!(payload, IngressPayload::ArrowIpc(_));
     let batches = match payload {
@@ -398,7 +417,14 @@ fn decode(
         });
     }
     validate_card_scope(&rows, principal)?;
-    stamp_correlation_columns(&rows, principal, request_id, batch_id, native_payload)
+    stamp_correlation_columns(
+        &rows,
+        principal,
+        request_id,
+        batch_id,
+        native_payload,
+        window,
+    )
 }
 
 fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
@@ -448,30 +474,55 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
 ///
 /// Event time is governed by presence, identically for both payload modes: when
 /// the admitted batch already carries `wyrd_event_time` the caller value is
-/// preserved verbatim (kept in the user projection so it is written exactly
-/// once, never duplicated and never re-stamped); when it is absent the server
-/// stamps `wyrd_event_time` with the ingest receipt time. A caller-supplied
-/// native `wyrd_event_time` is validated up front against the managed physical
-/// type before it is trusted. `wyrd_ingested_at` is always the server receipt
-/// time regardless of caller event time. Projected payloads retain their
-/// correlation values unchanged.
+/// first validated against the managed physical type (native path only), then
+/// checked against the bounded acceptance `window`, and — if accepted — preserved
+/// verbatim (kept in the user projection so it is written exactly once, never
+/// duplicated and never re-stamped); when the column is absent the server stamps
+/// `wyrd_event_time` with the ingest receipt time. `wyrd_ingested_at` is always
+/// the server receipt time regardless of caller event time. Projected payloads
+/// retain their correlation values unchanged.
+///
+/// The `window` check uses a single `receipt_micros` computed once at the
+/// entry of this function so an in-flight clock tick cannot split a batch
+/// verdict.
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] when a native payload supplies a
 /// `wyrd_event_time` column that is not exactly `Timestamp(Microsecond, UTC)`,
-/// contains any null, or is duplicated. Returns a typed Scribe error when
-/// correlation resolution, timestamp construction, managed-array construction,
-/// or final batch validation fails.
+/// contains any null, or is duplicated. Returns [`ScribeError::EventTimeOutOfRange`]
+/// when a present `wyrd_event_time` value (either mode) falls outside the
+/// acceptance `window`. Returns a typed Scribe error when correlation resolution,
+/// timestamp construction, managed-array construction, or final batch validation
+/// fails.
 fn stamp_correlation_columns(
     rows: &RecordBatch,
     principal: &Principal,
     request_id: &RequestId,
     batch_id: uuid::Uuid,
     native_payload: bool,
+    window: EventTimeWindow,
 ) -> Result<RecordBatch, ScribeError> {
     let row_count = rows.num_rows();
+    // Compute one receipt instant for the whole batch so clock ticks mid-batch
+    // cannot split the verdict.
+    let receipt_micros: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("system clock is before UNIX epoch: {error}"),
+        })?
+        .as_micros()
+        .try_into()
+        .map_err(|_| ScribeError::Internal {
+            detail: "receipt timestamp exceeds Arrow range".to_owned(),
+        })?;
+    // Native type/null/duplicate checks come first (T38). A malformed column
+    // stays `InvalidFrame` regardless of window membership.
     if native_payload {
         validate_native_event_time(rows)?;
+    }
+    // Enforce the acceptance window for a present column in either payload mode.
+    if rows.schema().index_of(WYRD_EVENT_TIME).is_ok() {
+        enforce_event_time_window(rows, window, receipt_micros)?;
     }
     let stamp_event_time = rows.schema().index_of(WYRD_EVENT_TIME).is_err();
     let native_run_id = if native_payload {
@@ -536,9 +587,13 @@ fn stamp_correlation_columns(
 /// `Timestamp(Microsecond)` with the `UTC` timezone — appears exactly once, and
 /// contains no nulls. This mirrors how the server-stamped column is
 /// constructed so caller and server values are physically interchangeable, and
-/// keeps [`split_batch_by_event_day`](crate::scribe::seal_key) able to derive a
-/// non-null partition day for every row. A batch with no `wyrd_event_time`
-/// column is valid (the server stamps the value) and returns `Ok(())`.
+/// keeps the day-partition splitter able to derive a non-null partition day for
+/// every row. A batch with no `wyrd_event_time` column is valid (the server
+/// stamps the value) and returns `Ok(())`.
+///
+/// Value-range checking is a separate concern handled by
+/// [`enforce_event_time_window`], which runs after this function for the native
+/// path and independently for the projected path.
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] when the column is duplicated, is not
@@ -562,6 +617,72 @@ fn validate_native_event_time(rows: &RecordBatch) -> Result<(), ScribeError> {
     }
     if rows.column(index).null_count() != 0 {
         return Err(ScribeError::InvalidFrame);
+    }
+    Ok(())
+}
+
+/// Enforces the bounded acceptance `window` for a present `wyrd_event_time`
+/// column against a single per-batch `receipt_micros` instant.
+///
+/// This helper is the single enforcement point for both the native Arrow IPC
+/// and projected OTLP surfaces. It must be called only when the schema already
+/// contains `WYRD_EVENT_TIME` (the caller checks presence before calling).
+/// For the native path, [`validate_native_event_time`] must run first so only
+/// well-typed, non-null values reach this function.
+///
+/// On the first out-of-range element the function returns immediately with
+/// [`ScribeError::EventTimeOutOfRange`] carrying that element's value and both
+/// bound instants. The entire batch is therefore rejected pre-admission and no
+/// rows are written.
+///
+/// # Errors
+/// Returns [`ScribeError::EventTimeOutOfRange`] when any non-null element of
+/// the `wyrd_event_time` column falls outside the inclusive window
+/// `[receipt_micros − past, receipt_micros + future]`. Returns
+/// [`ScribeError::Internal`] when the column cannot be downcast to
+/// `TimestampMicrosecondArray` (which would imply a caller error on the
+/// projected path that bypassed type validation).
+fn enforce_event_time_window(
+    rows: &RecordBatch,
+    window: EventTimeWindow,
+    receipt_micros: i64,
+) -> Result<(), ScribeError> {
+    let index = rows
+        .schema()
+        .index_of(WYRD_EVENT_TIME)
+        .map_err(|_| ScribeError::Internal {
+            detail: "enforce_event_time_window called without wyrd_event_time column".to_owned(),
+        })?;
+    let column = rows.column(index);
+    let array = column
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "wyrd_event_time column is not TimestampMicrosecondArray".to_owned(),
+        })?;
+    // Compute bounds once for the whole batch.
+    let past_micros = i64::try_from(window.past.as_micros()).unwrap_or(i64::MAX);
+    let future_micros = i64::try_from(window.future.as_micros()).unwrap_or(i64::MAX);
+    let lo = receipt_micros.saturating_sub(past_micros);
+    let hi = receipt_micros.saturating_add(future_micros);
+    for idx in 0..array.len() {
+        if array.is_null(idx) {
+            // Null values are tolerated here; the native path already rejects
+            // nulls in validate_native_event_time. Projected paths may
+            // legitimately carry nulls in other columns; a null event time
+            // on the projected path falls through to server stamping because
+            // stamp_event_time is presence-governed (schema-level, not
+            // value-level).
+            continue;
+        }
+        let value = array.value(idx);
+        if value < lo || value > hi {
+            return Err(ScribeError::EventTimeOutOfRange {
+                value_micros: value,
+                past_bound_micros: lo,
+                future_bound_micros: hi,
+            });
+        }
     }
     Ok(())
 }
@@ -1290,7 +1411,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray,
+        Array, ArrayRef, Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::ipc::writer::StreamWriter;
@@ -1306,12 +1427,15 @@ mod tests {
         WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
     };
 
+    use bytes::Bytes;
+
     use super::{
         ScribeIngressCpuPool, ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribeWalIoPool,
         decode, record_lane_saturation, source_schema_fingerprint, stamp_correlation_columns,
     };
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::schema::SchemaFingerprint;
+    use crate::scribe::admission::EventTimeWindow;
     use crate::scribe::replay::ReplayedSealKey;
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::StreamIdentity;
@@ -1343,6 +1467,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             false,
+            EventTimeWindow::default(),
         )
         .expect("stamp");
         let value_index = stamped.schema().index_of("value").expect("value column");
@@ -1363,6 +1488,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             true,
+            EventTimeWindow::default(),
         )
         .expect("stamp native batch");
 
@@ -1576,6 +1702,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect("projected run_id is correlation data");
         let run_id = error
@@ -1585,6 +1712,15 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("run_id is Utf8");
         assert_eq!(run_id.value(0), "client-run");
+    }
+
+    /// Encodes a `RecordBatch` as Arrow IPC bytes for native ingress tests.
+    fn ipc_bytes(b: &RecordBatch) -> Bytes {
+        let mut payload = Vec::new();
+        let mut w = StreamWriter::try_new(&mut payload, b.schema().as_ref()).expect("IPC writer");
+        w.write(b).expect("IPC write");
+        w.finish().expect("IPC finish");
+        payload.into()
     }
 
     /// Native payloads preserve one valid client run identifier while stamping
@@ -1619,18 +1755,12 @@ mod tests {
             ],
         );
         let native = decode(
-            IngressPayload::ArrowIpc({
-                let mut payload = Vec::new();
-                let mut writer = StreamWriter::try_new(&mut payload, rows.schema().as_ref())
-                    .expect("IPC writer initializes");
-                writer.write(&rows).expect("IPC batch writes");
-                writer.finish().expect("IPC writer finishes");
-                payload.into()
-            }),
+            IngressPayload::ArrowIpc(ipc_bytes(&rows)),
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect("native run_id is preserved and canonicalized");
         assert_eq!(
@@ -1656,19 +1786,12 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64]))],
         );
         let invalid = decode(
-            IngressPayload::ArrowIpc({
-                let mut payload = Vec::new();
-                let mut writer =
-                    StreamWriter::try_new(&mut payload, invalid_type.schema().as_ref())
-                        .expect("IPC writer initializes");
-                writer.write(&invalid_type).expect("IPC batch writes");
-                writer.finish().expect("IPC writer finishes");
-                payload.into()
-            }),
+            IngressPayload::ArrowIpc(ipc_bytes(&invalid_type)),
             &principal,
             source_schema_fingerprint(invalid_type.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect_err("native run_id type is validated");
         assert!(matches!(invalid, ScribeError::InvalidFrame));
@@ -1683,22 +1806,16 @@ mod tests {
                 Arc::new(StringArray::from(vec!["second"])),
             ],
         );
-        let duplicate_error = decode(
-            IngressPayload::ArrowIpc({
-                let mut payload = Vec::new();
-                let mut writer = StreamWriter::try_new(&mut payload, duplicate.schema().as_ref())
-                    .expect("IPC writer initializes");
-                writer.write(&duplicate).expect("IPC batch writes");
-                writer.finish().expect("IPC writer finishes");
-                payload.into()
-            }),
+        let dup_err = decode(
+            IngressPayload::ArrowIpc(ipc_bytes(&duplicate)),
             &principal,
             source_schema_fingerprint(duplicate.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect_err("duplicate native physical fields fail closed");
-        assert!(matches!(duplicate_error, ScribeError::InvalidFrame));
+        assert!(matches!(dup_err, ScribeError::InvalidFrame));
     }
 
     #[test]
@@ -1726,6 +1843,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect_err("card outside scope");
         assert!(matches!(
@@ -1752,6 +1870,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect("schema is valid");
         assert_eq!(decoded.schema().field(0).name(), "second");
@@ -1789,6 +1908,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             batch_id,
+            EventTimeWindow::default(),
         )
         .expect("schema is valid");
         assert!(decoded.schema().index_of(DATA_TENANT_ID).is_ok());
@@ -1812,6 +1932,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect("schema is valid");
         let ordinal = decoded
@@ -1836,6 +1957,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect("schema is valid");
         let schema = decoded.schema();
@@ -1859,6 +1981,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect_err("unrepresentable ordinal range fails before WAL dispatch");
         assert!(matches!(
@@ -1881,6 +2004,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect_err("row identity is server-owned");
         assert!(matches!(error, ScribeError::InvalidFrame));
@@ -1934,7 +2058,10 @@ mod tests {
     #[test]
     fn native_caller_event_time_is_preserved_without_fingerprint_drift() {
         let (principal, card) = scoped_service_principal();
-        let (event_field, event_array) = managed_event_time(vec![10_i64, 172_800_000_000_i64]);
+        // Use recent timestamps within the default window (within 1 day of now).
+        let recent_a = now_micros_offset(-60); // 60 seconds ago
+        let recent_b = now_micros_offset(-120); // 120 seconds ago
+        let (event_field, event_array) = managed_event_time(vec![recent_a, recent_b]);
         let rows_with = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
@@ -1969,6 +2096,7 @@ mod tests {
             source_schema_fingerprint(rows_with.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect("native caller event time is accepted");
         assert_eq!(
@@ -1987,8 +2115,8 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("event time is TimestampMicrosecond");
-        assert_eq!(event.value(0), 10_i64);
-        assert_eq!(event.value(1), 172_800_000_000_i64);
+        assert_eq!(event.value(0), recent_a);
+        assert_eq!(event.value(1), recent_b);
     }
 
     /// A native payload WITHOUT `wyrd_event_time` is still server-stamped exactly
@@ -2012,6 +2140,7 @@ mod tests {
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
             Uuid::now_v7(),
+            EventTimeWindow::default(),
         )
         .expect("native ingest without event time is server-stamped");
         let event_field = decoded
@@ -2109,10 +2238,343 @@ mod tests {
                 source_schema_fingerprint(rows.schema().as_ref()),
                 &RequestId::now_v7(),
                 Uuid::now_v7(),
+                EventTimeWindow::default(),
             )
             .expect_err("invalid native event time fails closed");
             assert!(matches!(error, ScribeError::InvalidFrame), "{error:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Event-time acceptance window tests (T42 / D85)
+    // -----------------------------------------------------------------------
+
+    /// Computes epoch-microseconds for `now + offset_secs` without panicking.
+    fn now_micros_offset(offset_secs: i64) -> i64 {
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is post-epoch")
+            .as_micros();
+        let now = i64::try_from(now_u128).unwrap_or(i64::MAX);
+        now.saturating_add(offset_secs.saturating_mul(1_000_000))
+    }
+
+    /// A narrow window used by several tests: 2 days past, 2 hours future.
+    fn narrow_window() -> EventTimeWindow {
+        const SECS_PER_HOUR: u64 = 3_600;
+        const SECS_PER_DAY: u64 = 86_400;
+        EventTimeWindow {
+            past: std::time::Duration::from_secs(2 * SECS_PER_DAY),
+            future: std::time::Duration::from_secs(2 * SECS_PER_HOUR),
+        }
+    }
+
+    /// Native batch with event times inside the default window is accepted and
+    /// the values are preserved verbatim.
+    #[test]
+    fn native_event_time_within_window_accepted() {
+        let (principal, card) = scoped_service_principal();
+        let t = now_micros_offset(-3600); // 1 hour ago
+        let (event_field, event_array) = managed_event_time(vec![t]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+                event_array,
+            ],
+        );
+        let decoded = decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect("in-window native event time is accepted");
+        let arr = decoded
+            .column_by_name(WYRD_EVENT_TIME)
+            .expect("event time present")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecond");
+        assert_eq!(arr.value(0), t, "value is preserved verbatim");
+    }
+
+    /// Value exactly at the past edge (receipt − past) is accepted (inclusive).
+    #[test]
+    fn native_event_time_past_edge_accepted() {
+        let (principal, card) = scoped_service_principal();
+        let window = narrow_window();
+        // past_secs − 1 s safety margin to absorb any clock tick between
+        // the test value computation and the window enforcement.
+        let edge = now_micros_offset(-(2 * 24 * 60 * 60 - 1));
+        let (event_field, event_array) = managed_event_time(vec![edge]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+                event_array,
+            ],
+        );
+        decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            window,
+        )
+        .expect("past-edge value is accepted (inclusive bound)");
+    }
+
+    /// Value exactly at the future edge (receipt + future) is accepted (inclusive).
+    #[test]
+    fn native_event_time_future_edge_accepted() {
+        let (principal, card) = scoped_service_principal();
+        let window = narrow_window();
+        // future_secs − 1 s safety margin.
+        let edge = now_micros_offset(2 * 60 * 60 - 1);
+        let (event_field, event_array) = managed_event_time(vec![edge]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+                event_array,
+            ],
+        );
+        decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            window,
+        )
+        .expect("future-edge value is accepted (inclusive bound)");
+    }
+
+    /// A value older than the past bound is rejected with `EventTimeOutOfRange`.
+    /// The whole batch is refused; no partial write occurs.
+    #[test]
+    fn native_event_time_before_past_bound_rejected() {
+        let (principal, card) = scoped_service_principal();
+        // 31 days ago, well outside the default 30-day past window.
+        let old = now_micros_offset(-(31 * 24 * 60 * 60));
+        let (event_field, event_array) = managed_event_time(vec![old]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+                event_array,
+            ],
+        );
+        let err = decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect_err("31-day-old value must be rejected");
+        assert!(
+            matches!(
+                err,
+                ScribeError::EventTimeOutOfRange {
+                    value_micros,
+                    ..
+                } if value_micros == old
+            ),
+            "expected EventTimeOutOfRange with the offending value; got {err:?}"
+        );
+    }
+
+    /// A value further in the future than the future bound is rejected with
+    /// `EventTimeOutOfRange`.
+    #[test]
+    fn native_event_time_after_future_bound_rejected() {
+        let (principal, card) = scoped_service_principal();
+        // 25 hours ahead, outside the default 24-hour future window.
+        let future = now_micros_offset(25 * 60 * 60);
+        let (event_field, event_array) = managed_event_time(vec![future]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+                event_array,
+            ],
+        );
+        let err = decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect_err("25-hour-future value must be rejected");
+        assert!(
+            matches!(
+                err,
+                ScribeError::EventTimeOutOfRange {
+                    value_micros,
+                    ..
+                } if value_micros == future
+            ),
+            "expected EventTimeOutOfRange with the offending value; got {err:?}"
+        );
+    }
+
+    /// A projected (OTLP) batch with an in-window event time is accepted.
+    #[test]
+    fn projected_event_time_within_window_accepted() {
+        let t = now_micros_offset(-3600);
+        let (event_field, event_array) = managed_event_time(vec![t]);
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false), event_field],
+            vec![Arc::new(Int64Array::from(vec![1_i64])), event_array],
+        );
+        let decoded = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect("projected in-window event time is accepted");
+        let arr = decoded
+            .column_by_name(WYRD_EVENT_TIME)
+            .expect("event time present")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecond");
+        assert_eq!(arr.value(0), t, "projected value is preserved verbatim");
+    }
+
+    /// A projected (OTLP) batch with an out-of-range event time is rejected with
+    /// `EventTimeOutOfRange` — proving both paths share enforcement.
+    #[test]
+    fn projected_event_time_out_of_range_rejected() {
+        let old = now_micros_offset(-(31 * 24 * 60 * 60));
+        let (event_field, event_array) = managed_event_time(vec![old]);
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false), event_field],
+            vec![Arc::new(Int64Array::from(vec![1_i64])), event_array],
+        );
+        let err = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect_err("projected out-of-range event time must be rejected");
+        assert!(
+            matches!(
+                err,
+                ScribeError::EventTimeOutOfRange {
+                    value_micros,
+                    ..
+                } if value_micros == old
+            ),
+            "expected EventTimeOutOfRange; got {err:?}"
+        );
+    }
+
+    /// When `wyrd_event_time` is absent the server stamps receipt time and no
+    /// window check runs — behavior is byte-identical to the prior contract.
+    #[test]
+    fn absent_event_time_unchanged_regression() {
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        );
+        // Very tight window (1 second past/future) to confirm no spurious check.
+        let tight_window = EventTimeWindow {
+            past: std::time::Duration::from_secs(1),
+            future: std::time::Duration::from_secs(1),
+        };
+        let decoded = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            tight_window,
+        )
+        .expect("absent event time is server-stamped without window check");
+        assert!(
+            decoded.schema().index_of(WYRD_EVENT_TIME).is_ok(),
+            "server-stamped event time must be present"
+        );
+        // Confirm it is NOT the tight_window that rejected it.
+        let arr = decoded
+            .column_by_name(WYRD_EVENT_TIME)
+            .expect("event time stamped")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecond");
+        assert!(!arr.is_null(0), "server-stamped event time is non-null");
+    }
+
+    /// `EventTimeWindow::contains` arithmetic — boundary and overflow cases.
+    #[test]
+    fn event_time_window_contains_boundary_and_overflow() {
+        let window = EventTimeWindow {
+            past: std::time::Duration::from_secs(1),
+            future: std::time::Duration::from_millis(500),
+        };
+        let receipt = 2_000_000_i64;
+        // Inclusive past edge.
+        assert!(window.contains(1_000_000, receipt));
+        // Inclusive future edge.
+        assert!(window.contains(2_500_000, receipt));
+        // One µs before past edge → rejected.
+        assert!(!window.contains(999_999, receipt));
+        // One µs after future edge → rejected.
+        assert!(!window.contains(2_500_001, receipt));
+        // Saturating arithmetic at i64 boundaries must not panic.
+        // Duration::MAX saturates past_micros/future_micros to i64::MAX,
+        // so lo = receipt.saturating_sub(i64::MAX) and hi = receipt.saturating_add(i64::MAX).
+        // With receipt = 0: lo = i64::MIN + 1, hi = i64::MAX.
+        let wide = EventTimeWindow {
+            past: std::time::Duration::MAX,
+            future: std::time::Duration::MAX,
+        };
+        // i64::MIN is excluded because lo = i64::MIN + 1 after saturating_sub.
+        assert!(!wide.contains(i64::MIN, 0));
+        // i64::MIN + 1 is the lowest accepted value.
+        assert!(wide.contains(i64::MIN + 1, 0));
+        // i64::MAX is always accepted.
+        assert!(wide.contains(i64::MAX, 0));
     }
 
     /// Managed columns other than `wyrd_event_time` remain reserved and are
@@ -2142,6 +2604,7 @@ mod tests {
                 source_schema_fingerprint(rows.schema().as_ref()),
                 &RequestId::now_v7(),
                 Uuid::now_v7(),
+                EventTimeWindow::default(),
             )
             .expect_err("server-owned managed columns are reserved");
             assert!(matches!(error, ScribeError::InvalidFrame), "{reserved}");

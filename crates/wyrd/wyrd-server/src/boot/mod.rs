@@ -27,7 +27,7 @@ use vala_bifrost_redux::oracle::{
     Oracle, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
     TailTransportDirectory,
 };
-use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -499,6 +499,16 @@ async fn build_bifrost_parts_from_boot(
             admission: AdmissionConfig {
                 memory_limit_bytes: pod_memory_limit,
                 scribe_memory_limit_bytes: scribe_config.memory_limit_bytes,
+                event_time_window: EventTimeWindow {
+                    past: scribe_config
+                        .event_time_past_window_secs
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or_else(|| std::time::Duration::from_secs(30 * 24 * 60 * 60)),
+                    future: scribe_config
+                        .event_time_future_window_secs
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
+                },
             },
             coordination_runtime: coordination_runtime.handle().clone(),
             execution_pools,

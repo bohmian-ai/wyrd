@@ -186,9 +186,48 @@ fn bifrost_error_from_code(
                 .to_owned(),
         },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
+        "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE" => {
+            let (value, past_bound, future_bound) = event_time_window_bounds_from_message(message);
+            BifrostError::EventTimeOutOfRange {
+                value,
+                past_bound,
+                future_bound,
+            }
+        }
         _ => return None,
     };
     Some(WyrdError::Vala { error })
+}
+
+/// Reconstruct the three `EventTimeOutOfRange` fields from a wire error message.
+///
+/// The server renders this Bifrost error through the variant's `#[error(...)]`
+/// form, `"event time out of acceptance window: {value} not in [{past_bound},
+/// {future_bound}]"`, and that `Display` text is the only field source carried
+/// on **both** transports: the HTTP `problem+json` `detail` and the gRPC
+/// `Status` message. The gRPC `ErrorInfo` metadata for Bifrost errors is empty,
+/// so the structured `details` object cannot be relied on across transports —
+/// which is why the sibling single-field arms parse the message too. The three
+/// values are epoch-microsecond strings with no embedded separators, so the
+/// bracketed list splits unambiguously. On any shape mismatch every field falls
+/// back to `"<unknown>"`, mirroring the `<unknown>` fallback the single-field
+/// arms use, so reconstruction never fails the typed-variant mapping.
+fn event_time_window_bounds_from_message(message: &str) -> (String, String, String) {
+    let parsed = message
+        .strip_prefix("event time out of acceptance window: ")
+        .and_then(|rest| rest.split_once(" not in ["))
+        .and_then(|(value, bounds)| {
+            let (past_bound, future_bound) = bounds.strip_suffix(']')?.split_once(", ")?;
+            Some((
+                value.to_owned(),
+                past_bound.to_owned(),
+                future_bound.to_owned(),
+            ))
+        });
+    parsed.unwrap_or_else(|| {
+        let unknown = "<unknown>".to_owned();
+        (unknown.clone(), unknown.clone(), unknown)
+    })
 }
 
 #[cfg(test)]
@@ -263,6 +302,40 @@ mod tests {
         }));
         assert_eq!(admission.status(), 429);
         assert_eq!(admission.code(), "WYRD_VALA_429_QUERY_ADMISSION_REJECTED");
+    }
+
+    /// Proves the stable `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE` code
+    /// reconstructs the typed `BifrostError::EventTimeOutOfRange` variant with
+    /// its real permanent 400 status and preserved code — never the
+    /// retryable-looking 502 `UpstreamFailure` an unmapped Bifrost code would
+    /// collapse onto — and that the offending value and both window bounds are
+    /// recovered from the wire message, the only field source carried on both
+    /// the HTTP and gRPC transports.
+    #[test]
+    fn bifrost_event_time_out_of_range_reconstructs_typed_400() {
+        let err = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
+            "detail": "event time out of acceptance window: 100 not in [200, 300]",
+            "details": {},
+        }));
+        assert_eq!(err.code(), "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE");
+        assert_eq!(
+            err.status(),
+            400,
+            "out-of-range is a permanent 400, not a retryable 502 UpstreamFailure"
+        );
+        let json = err.as_problem_json();
+        assert_eq!(
+            json["details"]["variant"].as_str(),
+            Some("event_time_out_of_range"),
+            "typed variant must be reconstructed, not the UpstreamFailure catch-all"
+        );
+        assert_eq!(json["details"]["data"]["value"].as_str(), Some("100"));
+        assert_eq!(json["details"]["data"]["past_bound"].as_str(), Some("200"));
+        assert_eq!(
+            json["details"]["data"]["future_bound"].as_str(),
+            Some("300")
+        );
     }
 
     #[test]

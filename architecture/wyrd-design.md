@@ -515,8 +515,10 @@ Consequences, stated so they stop drifting:
   **per row** (every distinct card in the batch must be in the principal's scope),
   validates the client-generated UUIDv7 `wyrd_batch_id`, stamps
   request-scoped `data_tenant_id`, `wyrd_request_id`, and
-  `wyrd_ingested_at`, validates or normalizes `wyrd_event_time`, and assigns
-  one `wyrd_row_ordinal` per row across the complete logical batch.
+  `wyrd_ingested_at`, validates caller-supplied `wyrd_event_time` against a
+  bounded acceptance window and rejects out-of-range values (never clamps or
+  normalizes them), and assigns one `wyrd_row_ordinal` per row across the
+  complete logical batch.
 
 - **`card_ref` is authorized, not trusted.** The server checks the asserted
   `card_ref` against the principal's **card scope**. For Service and Agent
@@ -1330,6 +1332,21 @@ organized by shard lane so the header value is authoritative for replay dispatch
 
 The pod-global LSN counter (`next_lsn`) is shared across all shard lanes via an
 `Arc<AtomicU64>`; no per-shard LSN counter is needed.
+
+**Bifrost event-time acceptance window (D85, T42).** D82/T38 opened the native
+Arrow IPC path to an optional caller-supplied `wyrd_event_time` column. D85
+narrows that opening before the contract ships: caller-supplied `wyrd_event_time`
+values on both the native (D82/T38) and projected OTLP surfaces are validated
+against a bounded acceptance window (default: 30 days past, 24 hours future,
+relative to server receipt time). Values outside the window are **rejected** with
+the stable error code `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE` carrying the
+offending value and both bound instants. Rejection is never a clamp or
+normalization — silently rewriting a caller timestamp is data corruption and
+incoherent beside idempotent ingest. When the column is absent the server stamps
+receipt time and no window check runs. The window is a single server-level knob
+(`ScribeRuntimeConfig::event_time_past_window_secs` /
+`event_time_future_window_secs`) defaulting to the D85 values; per-tenant
+overrides are a future Policy concern, not in scope here.
 
 **`ValaQueryService` — typed observability query surface (accepted, Stage 4).** `wyrd-server`
 exposes `wyrd.v1.ValaQueryService` (gRPC-first) with an axum HTTP projection as the

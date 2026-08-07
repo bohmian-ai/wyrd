@@ -249,7 +249,13 @@ pub struct OracleRuntimeConfig {
     /// CPU budget used for admission calibration.
     #[serde(default = "default_oracle_cpu_cores")]
     pub cpu_cores: f64,
-    /// Optional memory budget.
+    /// Optional Oracle child memory budget in bytes.
+    ///
+    /// When unset, the governor applies the D79 default: `25%` of pod memory
+    /// clamped to `[256 MiB, 8 GiB]`. The explicit value must be at least
+    /// `256 MiB`; the sum of this child plus the Scribe child must not exceed
+    /// the Bifrost parent ceiling (`70%` of pod memory). Both constraints are
+    /// enforced fail-closed at governor construction.
     #[serde(default)]
     pub memory_limit_bytes: Option<usize>,
     /// Spill byte ceiling.
@@ -1823,6 +1829,16 @@ impl WyrdServerConfig {
                 .scribe
                 .validate()
                 .map_err(|message| ConfigError::Invalid { message })?;
+            if let Some(value) = self.bifrost.oracle.memory_limit_bytes {
+                let min_bytes = 256 * 1024 * 1024;
+                if value < min_bytes {
+                    return Err(ConfigError::Invalid {
+                        message:
+                            "bifrost.oracle.memory_limit_bytes must be at least 268435456 bytes"
+                                .to_owned(),
+                    });
+                }
+            }
             self.validate_oracle_calibration()?;
 
             if self.grpc.certificate_chain_path.is_some() != self.grpc.private_key_path.is_some() {

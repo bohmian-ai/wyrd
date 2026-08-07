@@ -1085,7 +1085,8 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
-            governor: BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("test memory governor"),
+            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let drained = drainer(&tails, &memory)
@@ -1111,7 +1112,8 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
-            governor: BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("test memory governor"),
+            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let result = drainer(&tails, &memory)
@@ -1139,7 +1141,8 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
-            governor: BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("test memory governor"),
+            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let mut fence = acquired(Arc::clone(&transport) as Arc<dyn TailReadTransport>);
@@ -1165,7 +1168,8 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
-            governor: BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("test memory governor"),
+            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let mut fence = acquired(Arc::clone(&transport) as Arc<dyn TailReadTransport>);

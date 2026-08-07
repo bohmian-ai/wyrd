@@ -2624,7 +2624,7 @@ mod tests {
         );
         let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
         let memory = OracleMemoryResources {
-            governor: crate::scribe::memory::BifrostMemoryGovernor::new(512 * 1024 * 1024)
+            governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("memory governor"),
             reconciliation_limit_bytes: 1024 * 1024,
         };
@@ -2665,7 +2665,7 @@ mod tests {
             None,
         )
         .expect("test memory source");
-        let governor = crate::scribe::memory::BifrostMemoryGovernor::new(512 * 1024 * 1024)
+        let governor = crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
             .expect("minimum test governor");
         let plan = ReconcileExec::new(
             input,
@@ -2956,7 +2956,7 @@ mod tests {
         let size = usize::try_from(std::fs::metadata(&path).expect("hot metadata").len())
             .expect("hot size fits usize");
         let memory = OracleMemoryResources {
-            governor: crate::scribe::memory::BifrostMemoryGovernor::new(512 * 1024 * 1024)
+            governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("hot memory governor"),
             reconciliation_limit_bytes: 1024 * 1024,
         };
@@ -3088,7 +3088,7 @@ mod tests {
         let fixture = build_hot_causal_fixture();
         let requested = fixture.bytes.len();
         let memory = OracleMemoryResources {
-            governor: crate::scribe::memory::BifrostMemoryGovernor::new(512 * 1024 * 1024)
+            governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("hot causal governor"),
             reconciliation_limit_bytes: 1024 * 1024,
         };

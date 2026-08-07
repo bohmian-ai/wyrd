@@ -717,9 +717,10 @@ impl ScribeImpl {
     /// the fixed one-gibibyte invariant or a shard WAL handle cannot be built.
     fn build(config: ScribeBuildConfig) -> Self {
         let memory = config.memory_budget.clone().unwrap_or_else(|| {
-            memory::BifrostMemoryGovernor::new_with_scribe_limit(
+            memory::BifrostMemoryGovernor::new_with_child_limits(
                 config.admission.memory_limit_bytes,
                 config.admission.scribe_memory_limit_bytes,
+                None,
             )
             .or_else(|_| memory::BifrostMemoryGovernor::detect(1024 * 1024 * 1024))
             .unwrap_or_else(|_| {

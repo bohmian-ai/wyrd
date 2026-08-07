@@ -7,7 +7,7 @@ use crate::contracts::{Scribe, ScribeAppend, ScribeError};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::audit_envelope::encode_audit_event;
-use crate::scribe::memory::{BifrostMemoryGovernor, MIN_MEMORY_BYTES, MemoryCategory};
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
 use crate::scribe::replay::replay_wal_directory;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::stream_identity::NodeId;
@@ -494,7 +494,8 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
 #[test]
 /// Parent and Scribe hard limits reject before any WAL mutation.
 fn parent_scribe_and_wal_hard_limits_reject_before_append() {
-    let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES).expect("memory governor");
+    // Use 4 GiB so both default 25% children fit within the 70% parent.
+    let governor = BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024).expect("memory governor");
     let parent = governor
         .try_reserve_parent(governor.bifrost_limit_bytes())
         .expect("parent limit reservation");

@@ -415,13 +415,15 @@ async fn build_bifrost_parts_from_boot(
     let pod_memory_limit = BifrostMemoryGovernor::detect(1024 * 1024 * 1024)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?
         .pod_limit_bytes();
-    let bifrost_memory = BifrostMemoryGovernor::new_with_scribe_limit(
+    let bifrost_memory = BifrostMemoryGovernor::new_with_child_limits(
         pod_memory_limit,
         scribe_config.memory_limit_bytes,
+        bifrost_config.oracle.memory_limit_bytes,
     )
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
-    let bifrost_datafusion_memory_pool =
-        Arc::new(BifrostDataFusionMemoryPool::new(bifrost_memory.clone()));
+    let bifrost_datafusion_memory_pool = Arc::new(BifrostDataFusionMemoryPool::for_oracle(
+        bifrost_memory.clone(),
+    ));
     let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
@@ -554,8 +556,11 @@ async fn build_bifrost_parts_from_boot(
 
     let forge = if roles.contains(&BifrostRuntimeRole::Forge) {
         let forge_config = ForgeConfig::default();
+        let forge_datafusion_memory_pool = Arc::new(BifrostDataFusionMemoryPool::for_parent(
+            bifrost_memory.clone(),
+        ));
         let rewrite_runtime = ForgeRewriteRuntime::new(
-            bifrost_datafusion_memory_pool.clone(),
+            forge_datafusion_memory_pool,
             &wal_dir.join("forge-spill"),
             forge_config.spill_limit_bytes,
         )?;
@@ -1048,11 +1053,8 @@ impl<'a> OracleRoleBuilder<'a> {
         let cpu_cores = u32::try_from(cpu_cores)
             .map_err(|_| ServerBootError::OraclePeer("CPU count exceeds u32".to_owned()))?;
         let memory_bytes_per_slot = 256_u64 * 1024 * 1024;
-        let memory_budget = config
-            .bifrost
-            .oracle
-            .memory_limit_bytes
-            .unwrap_or_else(|| memory.bifrost_limit_bytes());
+        // Derive Oracle sizing from the resolved child limit — no unbounded-parent fallback (D79).
+        let memory_budget = memory.oracle_limit_bytes();
         let memory_budget_bytes = u64::try_from(memory_budget)
             .map_err(|_| ServerBootError::OraclePeer("memory budget exceeds u64".to_owned()))?;
         let memory_slots = (memory_budget_bytes / memory_bytes_per_slot).max(1);

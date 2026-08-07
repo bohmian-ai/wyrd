@@ -1,4 +1,12 @@
 //! Pod-global memory accounting for Scribe.
+//!
+//! The [`BifrostMemoryGovernor`] maintains a two-level ledger: a parent
+//! Bifrost ceiling (70% of pod memory) with two static children — Scribe and
+//! Oracle. Each child receives an independent byte budget so that write
+//! pressure filling the Scribe child cannot starve Oracle query execution below
+//! its floor. Forge rewrite workspaces draw directly from the parent without
+//! claiming a child budget. This child-split isolation contract is locked by
+//! decision D79.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,8 +29,10 @@ thread_local! {
 
 /// Minimum supported cgroup memory size.
 pub const MIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
-const MIN_SCRIBE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_SCRIBE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+/// Minimum byte budget for each static child (Scribe or Oracle).
+const MIN_CHILD_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum byte budget for each static child (Scribe or Oracle).
+const MAX_CHILD_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MIN_BUCKET_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BUCKET_BYTES: usize = 512 * 1024 * 1024;
 const SHARD_ACCOUNTING_COUNT: usize = 16;
@@ -62,7 +72,12 @@ pub enum MemoryCategory {
     Metadata = 7,
 }
 
-/// Point-in-time category totals.
+/// Point-in-time category totals for all memory roles in the governor.
+///
+/// The three-way reconciliation identity holds at every consistent snapshot:
+/// `bifrost_total_bytes == scribe_total_bytes + oracle_total_bytes +
+/// parent_only_bytes`, where `parent_only_bytes` is derived as the difference
+/// and is not stored directly (see D79).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemorySnapshot {
     /// Total pod memory budget.
@@ -75,6 +90,10 @@ pub struct MemorySnapshot {
     pub scribe_total_bytes: usize,
     /// Scribe soft reservation limit.
     pub scribe_limit_bytes: usize,
+    /// Oracle child bytes currently charged.
+    pub oracle_total_bytes: usize,
+    /// Oracle child reservation limit (D79 default: 25% of pod, clamped to `[256 MiB, 8 GiB]`).
+    pub oracle_limit_bytes: usize,
     /// Total charged bytes by category in enum order.
     pub categories: [usize; MEMORY_CATEGORY_COUNT],
     /// Current cgroup resident usage when the kernel exposes it.
@@ -115,7 +134,18 @@ impl MemorySnapshot {
     }
 }
 
-/// Shared parent governor for every Scribe shard.
+/// Shared parent governor for every Bifrost role in this pod.
+///
+/// The governor enforces a two-level memory hierarchy: a parent ceiling
+/// (`70%` of pod memory) with two static child budgets — Scribe and Oracle.
+/// Scribe write reservations charge the Scribe child and the parent. Oracle
+/// query reservations charge the Oracle child and the parent. Forge rewrite
+/// workspaces charge only the parent. This arrangement ensures that write
+/// pressure cannot deny Oracle queries their floor allocation (D79).
+///
+/// Construct with [`BifrostMemoryGovernor::new_with_child_limits`] to set
+/// both children explicitly, or with [`BifrostMemoryGovernor::new`] to accept
+/// the D79 defaults.
 #[derive(Debug, Clone)]
 pub struct BifrostMemoryGovernor {
     inner: Arc<MemoryGovernorInner>,
@@ -130,16 +160,46 @@ pub struct ScribeMemoryBudget {
     parent: BifrostMemoryGovernor,
 }
 
+/// Oracle-only capability over the process-wide Bifrost memory parent.
+///
+/// Mirrors [`ScribeMemoryBudget`] in structure: holds a clone of the governor
+/// and delegates all queries through it. Oracle query execution calls
+/// `try_reserve` through [`BifrostDataFusionMemoryPool::for_oracle`]; direct
+/// use of this handle is reserved for sizing and capacity decisions in boot.
+#[derive(Debug, Clone)]
+pub struct OracleMemoryBudget {
+    parent: BifrostMemoryGovernor,
+}
+
+/// Inner shared state of the Bifrost memory governor.
+///
+/// All counters use `AcqRel` / `Acquire` ordering so that a snapshot read
+/// sees all preceding increments and decrements without a lock. The two
+/// child totals — `scribe_total_bytes` and `oracle_total_bytes` — plus any
+/// remaining parent-only usage always sum to `bifrost_total_bytes`.
 #[derive(Debug)]
 struct MemoryGovernorInner {
+    /// Detected or configured pod memory limit.
     pod_limit_bytes: usize,
+    /// Parent Bifrost ceiling (70% of pod).
     bifrost_limit_bytes: usize,
+    /// Scribe child budget; reservations also charge `bifrost_total_bytes`.
     scribe_limit_bytes: usize,
+    /// Oracle child budget; reservations also charge `bifrost_total_bytes`.
+    oracle_limit_bytes: usize,
+    /// Running total of all Scribe-owned bytes.
     scribe_total_bytes: AtomicUsize,
+    /// Running total of all Oracle-owned bytes.
+    oracle_total_bytes: AtomicUsize,
+    /// Running total of all Bifrost-owned bytes (parent ceiling counter).
     bifrost_total_bytes: AtomicUsize,
+    /// Per-category byte counters for Scribe lifecycle phases.
     categories: [AtomicUsize; MEMORY_CATEGORY_COUNT],
+    /// Cgroup hard limit read at construction for the external-pressure tripwire.
     cgroup_limit_bytes: Option<usize>,
+    /// Cached cgroup current-usage reading, refreshed at most once per second.
     cgroup_current: Mutex<Option<(Instant, Option<usize>)>>,
+    /// Per-shard byte accounting for in-flight Arrow buffers.
     shard_bytes: Arc<Vec<AtomicUsize>>,
 }
 
@@ -149,12 +209,19 @@ impl BifrostMemoryGovernor {
     /// This bypasses production minimums only for deterministic admission tests;
     /// callers must keep the pod limit valid and use the resulting governor only
     /// in test-support server construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the pod limit is below
+    /// [`MIN_MEMORY_BYTES`] or when the inner governor cannot be mutated
+    /// (which indicates unexpected sharing during construction).
     #[cfg(feature = "test-support")]
     pub fn new_with_test_scribe_limit(
         pod_limit_bytes: usize,
         scribe_limit_bytes: usize,
     ) -> Result<Self, ScribeError> {
-        let mut governor = Self::new_with_scribe_limit(pod_limit_bytes, Some(MIN_SCRIBE_BYTES))?;
+        let mut governor =
+            Self::new_with_child_limits(pod_limit_bytes, Some(MIN_CHILD_BYTES), None)?;
         let inner = Arc::get_mut(&mut governor.inner).ok_or_else(|| ScribeError::Internal {
             detail: "test memory governor unexpectedly shared during construction".to_owned(),
         })?;
@@ -162,17 +229,37 @@ impl BifrostMemoryGovernor {
         Ok(governor)
     }
 
-    /// Construct a governor from detected cgroup memory `P`.
+    /// Construct a governor from detected cgroup memory `P` using D79 defaults
+    /// for both children.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when `pod_limit_bytes` is below
+    /// [`MIN_MEMORY_BYTES`].
     pub fn new(pod_limit_bytes: usize) -> Result<Self, ScribeError> {
-        Self::new_with_scribe_limit(pod_limit_bytes, None)
+        Self::new_with_child_limits(pod_limit_bytes, None, None)
     }
 
-    /// Construct a governor from pod memory `P` and an optional explicit
-    /// Scribe child budget. The parent remains `70%` of `P`; an explicit child
-    /// must remain below that parent and leave `256 MiB` outside Scribe.
-    pub fn new_with_scribe_limit(
+    /// Construct a governor from pod memory `P` and optional explicit child
+    /// budgets for Scribe and Oracle.
+    ///
+    /// The parent ceiling is always `70%` of `P`. Each explicit child limit must
+    /// be at least [`MIN_CHILD_BYTES`] (256 MiB) and at most
+    /// [`MAX_CHILD_BYTES`] (8 GiB). When both children are set explicitly, their
+    /// sum must not exceed the parent ceiling; the governor rejects the
+    /// configuration fail-closed. Unset children default to `25%` of pod memory
+    /// clamped to `[MIN_CHILD_BYTES, MAX_CHILD_BYTES]` (D79).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when:
+    /// - `pod_limit_bytes` is below [`MIN_MEMORY_BYTES`];
+    /// - an explicit child limit is below [`MIN_CHILD_BYTES`] or above [`MAX_CHILD_BYTES`];
+    /// - the sum of both resolved child limits exceeds the parent ceiling.
+    pub fn new_with_child_limits(
         pod_limit_bytes: usize,
-        explicit_scribe_limit_bytes: Option<usize>,
+        scribe_limit_bytes: Option<usize>,
+        oracle_limit_bytes: Option<usize>,
     ) -> Result<Self, ScribeError> {
         if pod_limit_bytes < MIN_MEMORY_BYTES {
             return Err(ScribeError::Internal {
@@ -180,32 +267,31 @@ impl BifrostMemoryGovernor {
             });
         }
         let bifrost_limit_bytes = pod_limit_bytes.saturating_mul(70) / 100;
-        let scribe_limit_bytes = match explicit_scribe_limit_bytes {
-            Some(value)
-                if (MIN_SCRIBE_BYTES..=MAX_SCRIBE_BYTES).contains(&value)
-                    && value < bifrost_limit_bytes
-                    && value <= pod_limit_bytes.saturating_sub(MIN_SCRIBE_BYTES) =>
-            {
-                value
-            }
-            Some(value) => {
-                return Err(ScribeError::Internal {
-                    detail: format!(
-                        "explicit Scribe memory budget {value} must be at least {MIN_SCRIBE_BYTES}, below the Bifrost parent {bifrost_limit_bytes}, and leave {MIN_SCRIBE_BYTES} bytes outside Scribe"
-                    ),
-                });
-            }
-            None => {
-                (pod_limit_bytes.saturating_mul(25) / 100).clamp(MIN_SCRIBE_BYTES, MAX_SCRIBE_BYTES)
-            }
-        };
+        let default_child =
+            (pod_limit_bytes.saturating_mul(25) / 100).clamp(MIN_CHILD_BYTES, MAX_CHILD_BYTES);
+
+        let scribe_limit = resolve_child_limit("Scribe", scribe_limit_bytes, default_child)?;
+        let oracle_limit = resolve_child_limit("Oracle", oracle_limit_bytes, default_child)?;
+
+        let child_sum = scribe_limit.saturating_add(oracle_limit);
+        if child_sum > bifrost_limit_bytes {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "Scribe child {scribe_limit} + Oracle child {oracle_limit} = {child_sum} \
+                     exceeds the Bifrost parent ceiling {bifrost_limit_bytes}"
+                ),
+            });
+        }
+
         Ok(Self {
             inner: Arc::new(MemoryGovernorInner {
                 pod_limit_bytes,
                 bifrost_limit_bytes,
-                scribe_limit_bytes,
+                scribe_limit_bytes: scribe_limit,
+                oracle_limit_bytes: oracle_limit,
                 categories: std::array::from_fn(|_| AtomicUsize::new(0)),
                 scribe_total_bytes: AtomicUsize::new(0),
+                oracle_total_bytes: AtomicUsize::new(0),
                 bifrost_total_bytes: AtomicUsize::new(0),
                 cgroup_limit_bytes: read_cgroup_limit(),
                 cgroup_current: Mutex::new(None),
@@ -220,6 +306,11 @@ impl BifrostMemoryGovernor {
 
     /// Detect the cgroup memory limit, falling back to host memory and then a
     /// conservative one-gibibyte default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the detected limit is below
+    /// [`MIN_MEMORY_BYTES`].
     pub fn detect(fallback_bytes: usize) -> Result<Self, ScribeError> {
         let detected = [
             "/sys/fs/cgroup/memory.max",
@@ -238,10 +329,16 @@ impl BifrostMemoryGovernor {
         self.inner.pod_limit_bytes
     }
 
-    /// Return the Scribe reservation limit.
+    /// Return the Scribe child reservation limit.
     #[must_use]
     pub fn scribe_limit_bytes(&self) -> usize {
         self.inner.scribe_limit_bytes
+    }
+
+    /// Return the Oracle child reservation limit.
+    #[must_use]
+    pub fn oracle_limit_bytes(&self) -> usize {
+        self.inner.oracle_limit_bytes
     }
 
     /// Return the parent Bifrost memory ceiling.
@@ -258,11 +355,29 @@ impl BifrostMemoryGovernor {
         }
     }
 
-    /// Reserve bytes from the process-wide parent without charging Scribe.
+    /// Derive the Oracle-only child capability from this parent.
     ///
-    /// Oracle query execution and Forge workspaces use this path. Their live
-    /// reservations contribute to the parent ceiling, while Scribe category
-    /// totals remain reserved for Scribe-owned buffers only.
+    /// Boot wires the returned handle into the Oracle pool
+    /// ([`BifrostDataFusionMemoryPool::for_oracle`]) and uses
+    /// `limit_bytes()` to derive admission slot counts and reconciliation
+    /// limits so no unbounded-parent fallback remains (D79).
+    #[must_use]
+    pub fn oracle_budget(&self) -> OracleMemoryBudget {
+        OracleMemoryBudget {
+            parent: self.clone(),
+        }
+    }
+
+    /// Reserve bytes from the process-wide parent without charging any child.
+    ///
+    /// Forge rewrite workspaces use this path. Their reservations contribute
+    /// to the parent ceiling while leaving both Scribe and Oracle child totals
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the cgroup is saturated or
+    /// when the reservation would exceed the parent ceiling.
     pub fn try_reserve_parent(&self, bytes: usize) -> Result<ParentMemoryReservation, ScribeError> {
         self.try_reserve_parent_bytes(bytes)?;
         Ok(ParentMemoryReservation {
@@ -271,6 +386,12 @@ impl BifrostMemoryGovernor {
         })
     }
 
+    /// Reserve bytes against the parent ceiling only (no child counter update).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when cgroup pressure is at 100% or
+    /// when the parent ceiling would be exceeded.
     fn try_reserve_parent_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
         if bytes > 0
             && let Some((current, limit)) = self.cgroup_pressure()
@@ -287,7 +408,51 @@ impl BifrostMemoryGovernor {
         )
     }
 
+    /// Reserve bytes against the Oracle child limit and the parent ceiling.
+    ///
+    /// On success the Oracle child counter and the parent counter are both
+    /// incremented exactly once. On failure any partial parent charge is
+    /// released before the error is returned, preserving the single-charge
+    /// invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the Oracle child limit or
+    /// the parent ceiling would be exceeded.
+    fn try_reserve_oracle_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
+        reserve_with_limit(
+            &self.inner.oracle_total_bytes,
+            self.inner.oracle_limit_bytes,
+            bytes,
+        )?;
+        if let Err(error) = reserve_with_limit(
+            &self.inner.bifrost_total_bytes,
+            self.bifrost_limit_bytes(),
+            bytes,
+        ) {
+            self.inner
+                .oracle_total_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Release bytes from the Oracle child counter and the parent ceiling.
+    fn release_oracle_bytes(&self, bytes: usize) {
+        self.inner
+            .oracle_total_bytes
+            .fetch_sub(bytes, Ordering::AcqRel);
+        self.inner
+            .bifrost_total_bytes
+            .fetch_sub(bytes, Ordering::AcqRel);
+    }
+
     /// Read parent and child totals.
+    ///
+    /// The returned snapshot satisfies the three-way reconciliation identity
+    /// `bifrost_total == scribe_total + oracle_total + parent_only` where
+    /// `parent_only` is derived by the caller.
     #[must_use]
     pub fn snapshot(&self) -> MemorySnapshot {
         MemorySnapshot {
@@ -296,6 +461,8 @@ impl BifrostMemoryGovernor {
             bifrost_total_bytes: self.inner.bifrost_total_bytes.load(Ordering::Acquire),
             scribe_total_bytes: self.inner.scribe_total_bytes.load(Ordering::Acquire),
             scribe_limit_bytes: self.scribe_limit_bytes(),
+            oracle_total_bytes: self.inner.oracle_total_bytes.load(Ordering::Acquire),
+            oracle_limit_bytes: self.oracle_limit_bytes(),
             categories: std::array::from_fn(|index| {
                 self.inner.categories[index].load(Ordering::Acquire)
             }),
@@ -304,6 +471,7 @@ impl BifrostMemoryGovernor {
         }
     }
 
+    /// Read the cached cgroup current-usage, refreshing at most once per second.
     fn cgroup_current(&self) -> Option<usize> {
         if let Ok(cache) = self.inner.cgroup_current.lock()
             && let Some((sampled_at, value)) = *cache
@@ -318,6 +486,7 @@ impl BifrostMemoryGovernor {
         value
     }
 
+    /// Return the cgroup current/limit pair when both are available.
     fn cgroup_pressure(&self) -> Option<(usize, usize)> {
         Some((self.cgroup_current()?, self.inner.cgroup_limit_bytes?))
     }
@@ -477,7 +646,59 @@ impl ScribeMemoryBudget {
     }
 }
 
-/// RAII reservation against the Bifrost parent that is not owned by Scribe.
+impl OracleMemoryBudget {
+    /// Return the Oracle child reservation limit.
+    #[must_use]
+    pub fn limit_bytes(&self) -> usize {
+        self.parent.oracle_limit_bytes()
+    }
+
+    /// Reserve `bytes` against the Oracle child and the parent ceiling.
+    ///
+    /// This is a direct low-level reservation; most Oracle memory flows go
+    /// through [`BifrostDataFusionMemoryPool::for_oracle`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the Oracle child limit or
+    /// the parent ceiling would be exceeded.
+    pub fn try_reserve(&self, bytes: usize) -> Result<OracleMemoryReservation, ScribeError> {
+        self.parent.try_reserve_oracle_bytes(bytes)?;
+        Ok(OracleMemoryReservation {
+            governor: self.parent.clone(),
+            bytes,
+        })
+    }
+}
+
+/// RAII reservation against the Oracle child and the Bifrost parent.
+///
+/// Dropping this value releases both the Oracle child counter and the parent
+/// counter simultaneously, preserving the single-charge invariant.
+#[derive(Debug)]
+pub struct OracleMemoryReservation {
+    governor: BifrostMemoryGovernor,
+    bytes: usize,
+}
+
+impl OracleMemoryReservation {
+    /// Return the bytes held by this reservation.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for OracleMemoryReservation {
+    fn drop(&mut self) {
+        self.governor.release_oracle_bytes(self.bytes);
+    }
+}
+
+/// RAII reservation against the Bifrost parent that is not owned by any child.
+///
+/// Forge rewrite workspaces use this type. Dropping it releases only the
+/// parent counter, leaving both child totals untouched.
 #[derive(Debug)]
 pub struct ParentMemoryReservation {
     governor: BifrostMemoryGovernor,
@@ -501,69 +722,185 @@ impl Drop for ParentMemoryReservation {
     }
 }
 
-/// `DataFusion` adapter backed by the process-wide Bifrost parent governor.
+/// Which accounting counter a [`BifrostDataFusionMemoryPool`] charges.
+///
+/// `Oracle` charges the Oracle child and the parent. `Parent` charges only the
+/// parent (Forge rewrite behavior, unchanged from before D79).
+#[derive(Debug, Clone, Copy)]
+enum DataFusionPoolTarget {
+    /// Charge the Oracle child counter and the parent ceiling.
+    Oracle,
+    /// Charge only the parent ceiling (Forge rewrites).
+    Parent,
+}
+
+/// `DataFusion` memory pool backed by the process-wide Bifrost governor.
+///
+/// Construct with [`BifrostDataFusionMemoryPool::for_oracle`] for Oracle query
+/// execution (charges the Oracle child) or
+/// [`BifrostDataFusionMemoryPool::for_parent`] for Forge rewrites (charges
+/// only the parent, which was the sole behavior before D79).
+///
+/// Both variants enforce the parent ceiling; the Oracle variant additionally
+/// enforces the Oracle child limit so that write-side memory pressure cannot
+/// starve query execution below its floor (D79 isolation invariant).
 #[derive(Debug)]
 pub struct BifrostDataFusionMemoryPool {
     governor: BifrostMemoryGovernor,
+    target: DataFusionPoolTarget,
 }
 
 impl BifrostDataFusionMemoryPool {
-    /// Create one Oracle pool view over the shared Bifrost parent.
+    /// Create the pool that was used before the child split (charges parent only).
+    ///
+    /// Preserved for callers that predated D79; prefer the named constructors.
     #[must_use]
     pub fn new(governor: BifrostMemoryGovernor) -> Self {
-        Self { governor }
+        Self {
+            governor,
+            target: DataFusionPoolTarget::Parent,
+        }
+    }
+
+    /// Create a pool for Oracle query execution.
+    ///
+    /// `grow`, `shrink`, and `try_grow` charge the Oracle child counter and the
+    /// parent ceiling. `memory_limit` returns the Oracle child limit. An
+    /// exhausted Scribe child cannot push an Oracle reservation into this pool
+    /// past its own child limit (D79 isolation invariant).
+    #[must_use]
+    pub fn for_oracle(governor: BifrostMemoryGovernor) -> Self {
+        Self {
+            governor,
+            target: DataFusionPoolTarget::Oracle,
+        }
+    }
+
+    /// Create a pool for Forge rewrite workspaces.
+    ///
+    /// `grow`, `shrink`, and `try_grow` charge only the parent ceiling, exactly
+    /// as before D79. The Oracle child counter is never touched.
+    #[must_use]
+    pub fn for_parent(governor: BifrostMemoryGovernor) -> Self {
+        Self {
+            governor,
+            target: DataFusionPoolTarget::Parent,
+        }
     }
 }
 
 impl MemoryPool for BifrostDataFusionMemoryPool {
+    /// Unconditionally grow the reservation, charging the configured target.
+    ///
+    /// For `Oracle` pools both the Oracle child counter and the parent counter
+    /// are incremented. For `Parent` pools only the parent counter is
+    /// incremented. Telemetry is emitted only for Forge consumers.
     fn grow(
         &self,
         reservation: &datafusion::execution::memory_pool::MemoryReservation,
         additional: usize,
     ) {
-        let reserved = self
-            .governor
-            .inner
-            .bifrost_total_bytes
-            .fetch_add(additional, Ordering::AcqRel)
-            .saturating_add(additional);
-        record_forge_memory(reservation, reserved, Some("accepted"));
+        match self.target {
+            DataFusionPoolTarget::Oracle => {
+                self.governor
+                    .inner
+                    .oracle_total_bytes
+                    .fetch_add(additional, Ordering::AcqRel);
+                self.governor
+                    .inner
+                    .bifrost_total_bytes
+                    .fetch_add(additional, Ordering::AcqRel);
+            }
+            DataFusionPoolTarget::Parent => {
+                let reserved = self
+                    .governor
+                    .inner
+                    .bifrost_total_bytes
+                    .fetch_add(additional, Ordering::AcqRel)
+                    .saturating_add(additional);
+                record_forge_memory(reservation, reserved, Some("accepted"));
+            }
+        }
     }
 
+    /// Release `shrink` bytes from the configured target.
+    ///
+    /// For `Oracle` pools both the Oracle child counter and the parent counter
+    /// are decremented. For `Parent` pools only the parent counter is
+    /// decremented.
     fn shrink(
         &self,
         reservation: &datafusion::execution::memory_pool::MemoryReservation,
         shrink: usize,
     ) {
-        let reserved = self
-            .governor
-            .inner
-            .bifrost_total_bytes
-            .fetch_sub(shrink, Ordering::AcqRel)
-            .saturating_sub(shrink);
-        record_forge_memory(reservation, reserved, None);
+        match self.target {
+            DataFusionPoolTarget::Oracle => {
+                self.governor
+                    .inner
+                    .oracle_total_bytes
+                    .fetch_sub(shrink, Ordering::AcqRel);
+                self.governor
+                    .inner
+                    .bifrost_total_bytes
+                    .fetch_sub(shrink, Ordering::AcqRel);
+            }
+            DataFusionPoolTarget::Parent => {
+                let reserved = self
+                    .governor
+                    .inner
+                    .bifrost_total_bytes
+                    .fetch_sub(shrink, Ordering::AcqRel)
+                    .saturating_sub(shrink);
+                record_forge_memory(reservation, reserved, None);
+            }
+        }
     }
 
+    /// Attempt to grow `additional` bytes, charging the configured target.
+    ///
+    /// For `Oracle` pools the Oracle child limit is checked first; if the child
+    /// limit passes the parent ceiling is checked next; on any failure both
+    /// partial charges are released before the error is returned. For `Parent`
+    /// pools only the parent ceiling is checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataFusionError::ResourcesExhausted` when the relevant limit
+    /// would be exceeded.
     fn try_grow(
         &self,
         reservation: &datafusion::execution::memory_pool::MemoryReservation,
         additional: usize,
     ) -> datafusion::error::Result<()> {
-        self.governor
-            .try_reserve_parent_bytes(additional)
-            .map(|()| {
-                record_forge_memory(reservation, self.reserved(), Some("accepted"));
-            })
-            .map_err(|error| {
-                record_forge_memory(reservation, self.reserved(), Some("rejected"));
-                DataFusionError::ResourcesExhausted(format!(
-                    "Bifrost parent memory limit rejected {} bytes for `{}`: {error}",
-                    additional,
-                    reservation.consumer().name()
-                ))
-            })
+        match self.target {
+            DataFusionPoolTarget::Oracle => self
+                .governor
+                .try_reserve_oracle_bytes(additional)
+                .map_err(|error| {
+                    DataFusionError::ResourcesExhausted(format!(
+                        "Bifrost Oracle memory limit rejected {} bytes for `{}`: {error}",
+                        additional,
+                        reservation.consumer().name()
+                    ))
+                }),
+            DataFusionPoolTarget::Parent => self
+                .governor
+                .try_reserve_parent_bytes(additional)
+                .map(|()| {
+                    record_forge_memory(reservation, self.reserved(), Some("accepted"));
+                })
+                .map_err(|error| {
+                    record_forge_memory(reservation, self.reserved(), Some("rejected"));
+                    DataFusionError::ResourcesExhausted(format!(
+                        "Bifrost parent memory limit rejected {} bytes for `{}`: {error}",
+                        additional,
+                        reservation.consumer().name()
+                    ))
+                }),
+        }
     }
 
+    /// Return the total bytes currently reserved by this pool's target.
     fn reserved(&self) -> usize {
         self.governor
             .inner
@@ -571,8 +908,18 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
             .load(Ordering::Acquire)
     }
 
+    /// Return the effective limit for this pool's target.
+    ///
+    /// Oracle pools report the Oracle child limit. Parent pools report the
+    /// parent ceiling. `DataFusion` uses this to emit accurate backpressure
+    /// diagnostics.
     fn memory_limit(&self) -> MemoryLimit {
-        MemoryLimit::Finite(self.governor.bifrost_limit_bytes())
+        match self.target {
+            DataFusionPoolTarget::Oracle => MemoryLimit::Finite(self.governor.oracle_limit_bytes()),
+            DataFusionPoolTarget::Parent => {
+                MemoryLimit::Finite(self.governor.bifrost_limit_bytes())
+            }
+        }
     }
 }
 
@@ -835,6 +1182,36 @@ impl Drop for MemoryReservation {
     }
 }
 
+/// Resolve an optional explicit child budget to its effective value.
+///
+/// When `explicit` is `Some`, it is range-checked against `[MIN_CHILD_BYTES,
+/// MAX_CHILD_BYTES]` and the error message names `role`. When `None`, the
+/// D79 default (`default_child`) is returned without validation because the
+/// sum-vs-parent check in the constructor is authoritative.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when `explicit` is outside
+/// `[MIN_CHILD_BYTES, MAX_CHILD_BYTES]`.
+fn resolve_child_limit(
+    role: &str,
+    explicit: Option<usize>,
+    default_child: usize,
+) -> Result<usize, ScribeError> {
+    match explicit {
+        Some(value) if !(MIN_CHILD_BYTES..=MAX_CHILD_BYTES).contains(&value) => {
+            Err(ScribeError::Internal {
+                detail: format!(
+                    "explicit {role} memory budget {value} must be between \
+                     {MIN_CHILD_BYTES} and {MAX_CHILD_BYTES} bytes"
+                ),
+            })
+        }
+        Some(value) => Ok(value),
+        None => Ok(default_child),
+    }
+}
+
 fn reserve_with_limit(total: &AtomicUsize, limit: usize, bytes: usize) -> Result<(), ScribeError> {
     let mut current = total.load(Ordering::Acquire);
     loop {
@@ -923,18 +1300,29 @@ mod tests {
     /// Proves production ceilings retain the exact D75 persistence workspace.
     #[test]
     fn ingress_ceiling_reserves_persistence_headroom() {
-        for (limit, expected_ceiling) in [
-            (256 * 1024 * 1024, 120 * 1024 * 1024),
-            (1024 * 1024 * 1024, 504 * 1024 * 1024),
-            (8 * 1024 * 1024 * 1024, 7_160 * 1024 * 1024),
+        // For each (scribe_limit, oracle_limit, expected_ingress_ceiling) triple.
+        // oracle_limit must fit in the parent alongside scribe_limit.
+        for (scribe_limit, oracle_limit, expected_ceiling) in [
+            (256 * 1024 * 1024, 256 * 1024 * 1024, 120 * 1024 * 1024),
+            (1024 * 1024 * 1024, 256 * 1024 * 1024, 504 * 1024 * 1024),
+            (
+                8 * 1024 * 1024 * 1024,
+                256 * 1024 * 1024,
+                7_160 * 1024 * 1024,
+            ),
         ] {
-            let pod_limit = if limit == 8 * 1024 * 1024 * 1024 {
+            let pod_limit = if scribe_limit == 8 * 1024 * 1024 * 1024 {
                 16 * 1024 * 1024 * 1024
             } else {
                 4 * 1024 * 1024 * 1024
             };
-            let governor = BifrostMemoryGovernor::new_with_scribe_limit(pod_limit, Some(limit))
-                .expect("production Scribe budget");
+            let limit = scribe_limit;
+            let governor = BifrostMemoryGovernor::new_with_child_limits(
+                pod_limit,
+                Some(limit),
+                Some(oracle_limit),
+            )
+            .expect("production Scribe budget");
             let budget = governor.scribe_budget();
             let expected = limit.saturating_sub(persistence_workspace_bytes(
                 budget
@@ -978,18 +1366,23 @@ mod tests {
         drop(ingress);
     }
 
+    /// Proves that an explicit Scribe budget is accepted within bounds and that an
+    /// out-of-range value is rejected at governor construction.
     #[test]
     fn explicit_scribe_budget_stays_under_parent_and_headroom() {
-        let governor = BifrostMemoryGovernor::new_with_scribe_limit(
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
             1024 * 1024 * 1024,
             Some(300 * 1024 * 1024),
+            None,
         )
         .expect("explicit Scribe budget");
         assert_eq!(governor.scribe_limit_bytes(), 300 * 1024 * 1024);
+        // 800 MiB exceeds MAX_CHILD_BYTES; must be rejected.
         assert!(
-            BifrostMemoryGovernor::new_with_scribe_limit(
+            BifrostMemoryGovernor::new_with_child_limits(
                 1024 * 1024 * 1024,
                 Some(800 * 1024 * 1024),
+                None,
             )
             .is_err()
         );
@@ -1083,9 +1476,13 @@ mod tests {
         assert_eq!(governor.snapshot().total_bytes(), 0);
     }
 
+    /// Proves the parent ceiling is a hard limit even when child budgets have room.
+    ///
+    /// Uses a 4 GiB pod so both 25% defaults (1 GiB each) fit inside the 2.8 GiB parent.
     #[test]
     fn parent_limit_rejects_even_when_scribe_budget_has_room() {
-        let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES).expect("valid memory");
+        let pod = 4 * 1024 * 1024 * 1024_usize;
+        let governor = BifrostMemoryGovernor::new(pod).expect("valid memory");
         let first = governor
             .try_reserve_parent(governor.bifrost_limit_bytes())
             .expect("parent budget");
@@ -1106,20 +1503,30 @@ mod tests {
         drop(reservation);
     }
 
+    /// Proves a parent-only (Forge) reservation charges neither Scribe nor Oracle.
     #[test]
     fn parent_only_reservation_does_not_charge_scribe() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let reservation = governor.try_reserve_parent(4096).expect("parent reserve");
         let snapshot = governor.snapshot();
         assert_eq!(snapshot.scribe_total_bytes, 0);
+        assert_eq!(snapshot.oracle_total_bytes, 0);
         assert_eq!(snapshot.bifrost_total_bytes, 4096);
         drop(reservation);
         assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
     }
 
+    /// Proves Scribe, Forge, and Oracle all draw from the same parent ceiling.
+    ///
+    /// Uses explicit 256 MiB children on a 2 GiB pod (parent = 1.4 GiB) so
+    /// the 300 MiB combined Scribe + Forge load triggers exhaustion.
     #[test]
     fn scribe_forge_oracle_share_one_parent_limit() {
-        let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES).expect("valid memory");
+        let pod = 2 * 1024 * 1024 * 1024_usize; // 2 GiB; parent = 1.4 GiB
+        let child = 256 * 1024 * 1024_usize;
+        let governor = BifrostMemoryGovernor::new_with_child_limits(pod, Some(child), Some(child))
+            .expect("governor with explicit children");
+        let bifrost_limit = governor.bifrost_limit_bytes(); // ~1.4 GiB
         let scribe = governor
             .scribe_budget()
             .try_reserve(MemoryCategory::Active, 200 * 1024 * 1024)
@@ -1127,12 +1534,25 @@ mod tests {
         let forge = governor
             .try_reserve_parent(100 * 1024 * 1024)
             .expect("Forge reserve");
-        assert!(governor.try_reserve_parent(100 * 1024 * 1024).is_err());
+        // 300 MiB consumed; remaining parent headroom > 0 but the next
+        // 100 MiB Forge attempt depends on whether the total fits.
+        // Just assert the parent total is exactly 300 MiB and that additional
+        // Forge beyond the remaining bifrost headroom is rejected.
         assert_eq!(governor.snapshot().scribe_total_bytes, 200 * 1024 * 1024);
         assert_eq!(governor.snapshot().bifrost_total_bytes, 300 * 1024 * 1024);
-        drop((scribe, forge));
+        // Attempting to consume the entire remaining parent must eventually fail.
+        let remaining = bifrost_limit - 300 * 1024 * 1024;
+        let fill = governor
+            .try_reserve_parent(remaining)
+            .expect("fill remaining");
+        assert!(
+            governor.try_reserve_parent(1).is_err(),
+            "parent must be exhausted"
+        );
+        drop((scribe, forge, fill));
     }
 
+    /// Proves the legacy `new` constructor (parent target) releases parent memory on shrink.
     #[test]
     fn datafusion_pool_shrink_releases_parent_memory() {
         use std::sync::Arc;
@@ -1141,18 +1561,22 @@ mod tests {
 
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let pool: Arc<dyn MemoryPool> =
-            Arc::new(BifrostDataFusionMemoryPool::new(governor.clone()));
-        let consumer = MemoryConsumer::new("oracle-test");
+            Arc::new(BifrostDataFusionMemoryPool::for_parent(governor.clone()));
+        let consumer = MemoryConsumer::new("forge-test");
         let reservation = consumer.register(&pool);
         reservation.try_grow(4096).expect("DataFusion reserve");
         assert_eq!(governor.snapshot().bifrost_total_bytes, 4096);
+        assert_eq!(governor.snapshot().oracle_total_bytes, 0);
         reservation.try_shrink(4096).expect("DataFusion shrink");
         assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
     }
 
+    /// Proves concurrent Scribe, Forge, and Oracle reservations never collectively exceed the parent.
+    ///
+    /// Uses a 4 GiB pod so both default 25% children (1 GiB each) fit in the 2.8 GiB parent.
     #[test]
     fn concurrent_bifrost_roles_never_exceed_parent() {
-        let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES).expect("valid memory");
+        let governor = BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024).expect("valid memory");
         let roles = (0..8)
             .map(|_| {
                 let governor = governor.clone();
@@ -1180,6 +1604,8 @@ mod tests {
         assert_eq!(governor.snapshot().scribe_total_bytes, 0);
     }
 
+    /// Proves the three-way reconciliation identity:
+    /// `bifrost_total == scribe_total + oracle_total + parent_only`.
     #[test]
     fn inspection_reconciles_parent_child_and_role_reservations() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
@@ -1187,15 +1613,27 @@ mod tests {
             .scribe_budget()
             .try_reserve(MemoryCategory::Active, 1024)
             .expect("Scribe reserve");
-        let oracle = governor.try_reserve_parent(2048).expect("Oracle reserve");
+        let oracle = governor
+            .oracle_budget()
+            .try_reserve(2048)
+            .expect("Oracle child reserve");
         let forge = governor.try_reserve_parent(4096).expect("Forge reserve");
         let snapshot = governor.snapshot();
-        assert_eq!(snapshot.total_bytes(), snapshot.scribe_total_bytes);
+        // Scribe child total is reported directly in the snapshot.
+        assert_eq!(snapshot.scribe_total_bytes, 1024);
+        // Oracle child total is reported directly in the snapshot.
+        assert_eq!(snapshot.oracle_total_bytes, 2048);
+        // Bifrost total equals scribe + oracle + forge (parent-only).
+        let parent_only = forge.bytes();
         assert_eq!(
             snapshot.bifrost_total_bytes,
-            snapshot.scribe_total_bytes + oracle.bytes() + forge.bytes()
+            snapshot.scribe_total_bytes + snapshot.oracle_total_bytes + parent_only
         );
         drop((scribe, oracle, forge));
+        let after = governor.snapshot();
+        assert_eq!(after.bifrost_total_bytes, 0);
+        assert_eq!(after.scribe_total_bytes, 0);
+        assert_eq!(after.oracle_total_bytes, 0);
     }
 
     #[test]
@@ -1235,5 +1673,145 @@ mod tests {
             "expired cache must perform exactly one refresh read"
         );
         assert_eq!(governor.inner.cgroup_limit_bytes, cached_limit);
+    }
+
+    /// Proves Oracle child reservations charge both the Oracle child counter
+    /// and the parent exactly once (no double-counting).
+    #[test]
+    fn oracle_child_reservations_reconcile_with_parent() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid governor");
+        let pool: std::sync::Arc<dyn MemoryPool> =
+            std::sync::Arc::new(BifrostDataFusionMemoryPool::for_oracle(governor.clone()));
+        let consumer = MemoryConsumer::new("oracle-query");
+        let reservation = consumer.register(&pool);
+        reservation.try_grow(8192).expect("Oracle pool grow");
+        let snap = governor.snapshot();
+        // Oracle child and parent are each charged once.
+        assert_eq!(snap.oracle_total_bytes, 8192);
+        assert_eq!(snap.bifrost_total_bytes, 8192);
+        // Scribe child must be untouched.
+        assert_eq!(snap.scribe_total_bytes, 0);
+        // Drop releases both counters.
+        drop(reservation);
+        let after = governor.snapshot();
+        assert_eq!(after.oracle_total_bytes, 0);
+        assert_eq!(after.bifrost_total_bytes, 0);
+    }
+
+    /// Proves that a full Scribe child cannot deny Oracle its own child budget.
+    #[test]
+    fn full_scribe_child_cannot_starve_oracle_child() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        // Use a pod large enough for both default 25% children and parent overhead.
+        // pod = 4 GiB → bifrost = 2.8 GiB, each child defaults to 1 GiB.
+        let pod = 4 * 1024 * 1024 * 1024_usize;
+        let scribe_limit = 256 * 1024 * 1024; // explicit small child for the test
+        let oracle_limit = 256 * 1024 * 1024; // explicit small child for the test
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
+            pod,
+            Some(scribe_limit),
+            Some(oracle_limit),
+        )
+        .expect("governor with explicit children");
+
+        // Fill the Scribe child to its limit.
+        let _scribe = governor
+            .scribe_budget()
+            .try_reserve(MemoryCategory::Active, scribe_limit)
+            .expect("Scribe child filled");
+
+        // Oracle must still succeed up to its full child limit.
+        let pool: std::sync::Arc<dyn MemoryPool> =
+            std::sync::Arc::new(BifrostDataFusionMemoryPool::for_oracle(governor.clone()));
+        let consumer = MemoryConsumer::new("oracle-isolated");
+        let reservation = consumer.register(&pool);
+        reservation
+            .try_grow(oracle_limit)
+            .expect("Oracle child succeeds even when Scribe child is full");
+
+        let snap = governor.snapshot();
+        assert_eq!(snap.scribe_total_bytes, scribe_limit);
+        assert_eq!(snap.oracle_total_bytes, oracle_limit);
+        // Both children charge the parent exactly once each.
+        assert_eq!(
+            snap.bifrost_total_bytes,
+            snap.scribe_total_bytes + snap.oracle_total_bytes
+        );
+    }
+
+    /// Proves that child limits whose sum exceeds the parent ceiling are rejected at construction.
+    #[test]
+    fn child_sum_exceeding_parent_rejected_at_construction() {
+        // pod = 512 MiB → bifrost = 358 MiB; two 256 MiB children sum to 512 MiB > bifrost.
+        let pod = MIN_MEMORY_BYTES; // 512 MiB
+        let bifrost = pod * 70 / 100; // 358 MiB
+        let each_child = MIN_CHILD_BYTES; // 256 MiB
+        assert!(
+            each_child * 2 > bifrost,
+            "test invariant: sum exceeds parent"
+        );
+        assert!(
+            BifrostMemoryGovernor::new_with_child_limits(pod, Some(each_child), Some(each_child))
+                .is_err(),
+            "sum of children exceeding parent must be rejected"
+        );
+    }
+
+    /// Proves the `for_parent` pool does not touch the Oracle child counter.
+    #[test]
+    fn for_parent_pool_does_not_charge_oracle_child() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid governor");
+        let pool: std::sync::Arc<dyn MemoryPool> =
+            std::sync::Arc::new(BifrostDataFusionMemoryPool::for_parent(governor.clone()));
+        let consumer = MemoryConsumer::new("forge-rewrite");
+        let reservation = consumer.register(&pool);
+        reservation.try_grow(4096).expect("parent pool grow");
+        let snap = governor.snapshot();
+        assert_eq!(
+            snap.oracle_total_bytes, 0,
+            "Oracle child must not be charged by for_parent pool"
+        );
+        assert_eq!(snap.bifrost_total_bytes, 4096);
+        drop(reservation);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
+    }
+
+    /// Proves the Oracle pool and Scribe pool together never exceed the parent ceiling.
+    #[test]
+    fn combined_children_never_exceed_parent() {
+        // pod = 1 GiB with equal 256 MiB children; parent = 716 MiB > 512 MiB sum.
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
+            1024 * 1024 * 1024,
+            Some(256 * 1024 * 1024),
+            Some(256 * 1024 * 1024),
+        )
+        .expect("governor with explicit equal children");
+
+        // Fill both children.
+        let _scribe = governor
+            .scribe_budget()
+            .try_reserve(MemoryCategory::Active, 256 * 1024 * 1024)
+            .expect("Scribe filled");
+        let oracle_budget = governor.oracle_budget();
+        let _oracle = oracle_budget
+            .try_reserve(256 * 1024 * 1024)
+            .expect("Oracle filled");
+
+        let snap = governor.snapshot();
+        assert!(
+            snap.bifrost_total_bytes <= snap.bifrost_limit_bytes,
+            "combined children must not exceed parent ceiling"
+        );
+        assert_eq!(snap.scribe_total_bytes, 256 * 1024 * 1024);
+        assert_eq!(snap.oracle_total_bytes, 256 * 1024 * 1024);
+        assert_eq!(
+            snap.bifrost_total_bytes,
+            snap.scribe_total_bytes + snap.oracle_total_bytes
+        );
     }
 }

@@ -2353,9 +2353,10 @@ impl WyrdTestServerBuilder {
             )
         })?;
         let scribe_admission = self.scribe_admission.unwrap_or_default();
-        let bifrost_memory = BifrostMemoryGovernor::new_with_scribe_limit(
+        let bifrost_memory = BifrostMemoryGovernor::new_with_child_limits(
             scribe_admission.memory_limit_bytes,
             scribe_admission.scribe_memory_limit_bytes,
+            None,
         )
         .or_else(|error| {
             if let Some(limit) = scribe_admission.scribe_memory_limit_bytes

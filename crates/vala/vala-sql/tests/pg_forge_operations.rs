@@ -2307,15 +2307,18 @@ mod pg_tests {
                     .join("\n");
             assert!(
                 fair_plan.contains("forge_tasks_ready")
-                    && fair_plan.contains("forge_tasks_publication_active")
-                    && fair_plan.contains("forge_large_lane_lease_pkey"),
-                "production fair claim uses bounded ready/active/singleton indexes: {fair_plan}"
+                    && fair_plan.contains("forge_tasks_publication_active"),
+                "production fair claim uses bounded ready/active indexes: {fair_plan}"
+            );
+            assert!(
+                !fair_plan.contains("forge_large_lane_lease"),
+                "fair claim no longer touches the removed cluster-wide large-lane lease: {fair_plan}"
             );
             assert!(
                 FAIR_CLAIM_SQL.contains("SKIP LOCKED")
                     && FAIR_CLAIM_SQL.contains("eligible_tenants")
                     && FAIR_CLAIM_SQL.contains("last_tenant_id")
-                    && FAIR_CLAIM_SQL.contains("large_lock"),
+                    && FAIR_CLAIM_SQL.contains("large_singleton"),
                 "explained statement is the complete production fair-claim CTE"
             );
             let status_plan=sqlx::query_scalar::<sqlx::Postgres,String>("EXPLAIN (FORMAT TEXT) SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY updated_at DESC,task_id LIMIT 9").bind(tenant.as_uuid()).fetch_all(&superuser).await.expect("explain bounded status").join("\n");

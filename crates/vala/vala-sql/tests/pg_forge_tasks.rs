@@ -19,15 +19,6 @@ mod pg_tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-    /// Exact persisted singleton large-lane state used by rollback assertions.
-    type LargeLeaseSnapshot = (
-        Option<Uuid>,
-        Option<Uuid>,
-        Option<Uuid>,
-        i64,
-        Option<chrono::DateTime<Utc>>,
-    );
-
     /// Starts one isolated migrated database and returns its administrative pool.
     ///
     /// # Panics
@@ -212,16 +203,15 @@ mod pg_tests {
                 .await
                 .expect("rollback cancellation");
         }
-        let rolled_back: (String, Option<Uuid>, i64, i64) = sqlx::query_as(
-            "SELECT t.state,l.task_id,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox) FROM vala.forge_tasks t CROSS JOIN vala.forge_large_lane_lease l WHERE t.task_id=$1 AND l.singleton",
+        let rolled_back: (String, i64, i64) = sqlx::query_as(
+            "SELECT t.state,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox) FROM vala.forge_tasks t WHERE t.task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
         .await
         .expect("rolled-back cancellation state");
         assert_eq!(rolled_back.0, "claimed");
-        assert_eq!(rolled_back.1, Some(task_id));
-        assert_eq!((rolled_back.2, rolled_back.3), (0, 0));
+        assert_eq!((rolled_back.1, rolled_back.2), (0, 0));
 
         let mut commit = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
@@ -234,15 +224,14 @@ mod pg_tests {
             .commit()
             .await
             .expect("commit superseded cancellation");
-        let terminal: (String, Option<Uuid>, Option<Uuid>, Option<Uuid>, i64, i64) =
-            sqlx::query_as(
-                "SELECT t.state,t.attempt_id,t.claimed_by,l.task_id,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox WHERE operation='forge.task.cancelled') FROM vala.forge_tasks t CROSS JOIN vala.forge_large_lane_lease l WHERE t.task_id=$1 AND l.singleton",
-            )
-            .bind(task_id)
-            .fetch_one(&admin)
-            .await
-            .expect("committed cancellation state");
-        assert_eq!(terminal, ("cancelled".to_owned(), None, None, None, 1, 1));
+        let terminal: (String, Option<Uuid>, Option<Uuid>, i64, i64) = sqlx::query_as(
+            "SELECT t.state,t.attempt_id,t.claimed_by,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox WHERE operation='forge.task.cancelled') FROM vala.forge_tasks t WHERE t.task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(&admin)
+        .await
+        .expect("committed cancellation state");
+        assert_eq!(terminal, ("cancelled".to_owned(), None, None, 1, 1));
         assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 0);
     }
 
@@ -361,13 +350,101 @@ mod pg_tests {
         unschedulable.commit().await.expect("commit unschedulable");
     }
 
-    /// Proves persisted tenant rotation survives scheduler takeover and large-lane exclusion is cluster-wide.
+    /// Proves the durable tenant cursor rotates strictly forward across a
+    /// scheduler takeover: after a leader claims one tenant's work and its fence
+    /// expires, a successor leader resumes at the next tenant. The worker cursor
+    /// is independent of scheduler leadership, so heartbeat expiry and reclaim
+    /// of the first claim do not rewind the ring.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or a fencing assertion fails.
+    /// Panics when PostgreSQL setup or a cursor assertion fails.
     #[tokio::test]
-    async fn scheduler_takeover_preserves_cursor_and_large_lane_is_singleton() {
+    async fn scheduler_takeover_preserves_cursor() {
         let (fixture, admin) = setup().await;
+        let op = fixture.operator_pool();
+        let tasks = ForgeTasks::new(op.clone());
+        let tenant_a = fixture.data_tenant_id();
+        let tenant_b = DataTenantId::new_v7();
+        fixture
+            .seed_additional_tenant_with_uuid(tenant_b, "forge-second")
+            .await
+            .expect("seed tenant");
+        tasks
+            .enqueue(&task(tenant_a, "rotate-a", ForgeTaskLane::Ordinary, 2))
+            .await
+            .expect("a");
+        tasks
+            .enqueue(&task(tenant_b, "rotate-b", ForgeTaskLane::Ordinary, 3))
+            .await
+            .expect("b");
+        let leader = Uuid::now_v7();
+        let _fence = tasks
+            .acquire_scheduler(leader, 30)
+            .await
+            .expect("leader")
+            .expect("fence");
+        let claim_limits = ForgeClaimLimits {
+            lease_seconds: 1,
+            ..limits(1)
+        };
+        let first = tasks
+            .claim_fair(leader, claim_limits)
+            .await
+            .expect("first claim")
+            .expect("first tenant");
+        let first_attempt = first.attempt_id.expect("attempt");
+        assert!(
+            tasks
+                .heartbeat(first.task_id, Uuid::now_v7(), leader, 3)
+                .await
+                .is_err(),
+            "wrong attempt cannot renew"
+        );
+        assert!(
+            tasks
+                .heartbeat(first.task_id, first_attempt, Uuid::now_v7(), 3)
+                .await
+                .is_err(),
+            "wrong owner cannot renew"
+        );
+        sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second'").execute(&admin).await.expect("expire leader");
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1").bind(first.task_id).execute(&admin).await.expect("expire claim");
+        assert!(
+            tasks
+                .heartbeat(first.task_id, first_attempt, leader, 3)
+                .await
+                .is_err(),
+            "expired claim cannot be revived by heartbeat"
+        );
+        assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 1);
+        let successor = Uuid::now_v7();
+        let _successor_fence = tasks
+            .acquire_scheduler(successor, 30)
+            .await
+            .expect("successor")
+            .expect("takeover fence");
+        let second = tasks
+            .claim_fair(successor, claim_limits)
+            .await
+            .expect("successor claim")
+            .expect("next tenant");
+        assert_ne!(
+            first.data_tenant_id, second.data_tenant_id,
+            "cursor resumes strictly after prior tenant"
+        );
+    }
+
+    /// Proves oversized single-file compactions on distinct tables run
+    /// concurrently across owners, bounded only by the per-owner
+    /// one-active-large rule (D78): two owners each claim a large task in the
+    /// same window, while a second large claim by an owner that already holds an
+    /// active large task is refused. Replaces the removed cluster-wide singleton.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or a concurrency assertion fails.
+    #[tokio::test]
+    async fn large_tasks_on_distinct_tables_claim_concurrently_across_owners() {
+        let (fixture, _admin) = setup().await;
         let op = fixture.operator_pool();
         let tasks = ForgeTasks::new(op.clone());
         let tenant_a = fixture.data_tenant_id();
@@ -384,88 +461,136 @@ mod pg_tests {
             .enqueue(&task(tenant_b, "large-b", ForgeTaskLane::LargeSingleton, 3))
             .await
             .expect("b");
-        let leader = Uuid::now_v7();
-        let _fence = tasks
-            .acquire_scheduler(leader, 30)
-            .await
-            .expect("leader")
-            .expect("fence");
-        let claim_limits = ForgeClaimLimits {
-            lease_seconds: 1,
-            ..limits(1)
-        };
+        let owner_a = Uuid::now_v7();
+        let owner_b = Uuid::now_v7();
         let (left, right) = tokio::join!(
-            tasks.claim_fair(leader, claim_limits),
-            tasks.claim_fair(leader, claim_limits)
+            tasks.claim_fair(owner_a, limits(1)),
+            tasks.claim_fair(owner_b, limits(1))
         );
-        let claims = [left.expect("left"), right.expect("right")];
+        let claims = [
+            left.expect("left").expect("owner A claims a large task"),
+            right.expect("right").expect("owner B claims a large task"),
+        ];
         assert_eq!(
-            claims.iter().filter(|v| v.is_some()).count(),
-            1,
-            "large lane admits one cluster-wide"
+            claims
+                .iter()
+                .filter(|c| c.lane == ForgeTaskLane::LargeSingleton)
+                .count(),
+            2,
+            "both large tasks on distinct tables claim concurrently across owners"
         );
-        let first = claims.into_iter().flatten().next().expect("first");
-        let first_attempt = first.attempt_id.expect("large attempt");
-        tasks
-            .heartbeat(first.task_id, first_attempt, leader, 3)
-            .await
-            .expect("renew task and large lane");
-        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
-        assert!(
-            tasks
-                .claim_fair(leader, claim_limits)
-                .await
-                .expect("post-renew claim")
-                .is_none(),
-            "renewed large generation blocks a second large claim beyond the original interval"
-        );
-        assert!(
-            tasks
-                .heartbeat(first.task_id, Uuid::now_v7(), leader, 3)
-                .await
-                .is_err()
-        );
-        assert!(
-            tasks
-                .heartbeat(first.task_id, first_attempt, Uuid::now_v7(), 3)
-                .await
-                .is_err()
-        );
-        sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second'").execute(&admin).await.expect("expire leader");
-        sqlx::query("UPDATE vala.forge_large_lane_lease SET expires_at=statement_timestamp()-interval '1 second'").execute(&admin).await.expect("expire large lane");
-        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1").bind(first.task_id).execute(&admin).await.expect("expire claim");
-        assert!(
-            tasks
-                .heartbeat(first.task_id, first_attempt, leader, 3)
-                .await
-                .is_err(),
-            "expired task/large generation cannot be revived by heartbeat"
-        );
-        assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 1);
-        let released: Option<Uuid> =
-            sqlx::query_scalar("SELECT task_id FROM vala.forge_large_lane_lease WHERE singleton")
-                .fetch_one(&admin)
-                .await
-                .expect("large lease after reclaim");
-        assert!(
-            released.is_none(),
-            "reclaim releases the exact large-lane generation atomically"
-        );
-        let successor = Uuid::now_v7();
-        let _successor_fence = tasks
-            .acquire_scheduler(successor, 30)
-            .await
-            .expect("successor")
-            .expect("takeover fence");
-        let second = tasks
-            .claim_fair(successor, claim_limits)
-            .await
-            .expect("successor claim")
-            .expect("next tenant");
         assert_ne!(
-            first.data_tenant_id, second.data_tenant_id,
-            "cursor resumes strictly after prior tenant"
+            claims[0].task_id, claims[1].task_id,
+            "each owner claims a distinct large task"
         );
+
+        // The per-owner rule refuses a second concurrent large claim: enqueue a
+        // third large task on a new table and prove owner A cannot take it while
+        // its first large task is still active.
+        tasks
+            .enqueue(&task(
+                tenant_a,
+                "large-a-second",
+                ForgeTaskLane::LargeSingleton,
+                4,
+            ))
+            .await
+            .expect("second large for owner A tenant");
+        assert!(
+            tasks
+                .claim_fair(owner_a, limits(4))
+                .await
+                .expect("owner A second large claim")
+                .is_none(),
+            "owner A cannot hold two active large tasks at once"
+        );
+    }
+
+    /// Proves an owner holding one active large task cannot claim a second large
+    /// task until its first reaches a terminal state, at which point the freed
+    /// per-owner slot admits the next large claim (D78).
+    ///
+    /// # Panics
+    /// Panics when the per-owner large bound does not release on terminalization.
+    #[tokio::test]
+    async fn same_owner_second_large_claim_refused_until_terminal() {
+        let (fixture, _admin) = setup().await;
+        let op = fixture.operator_pool();
+        let tasks = ForgeTasks::new(op.clone());
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let first_id = tasks
+            .enqueue(&task(
+                tenant,
+                "large-first",
+                ForgeTaskLane::LargeSingleton,
+                21,
+            ))
+            .await
+            .expect("first large");
+        tasks
+            .enqueue(&task(
+                tenant,
+                "large-second",
+                ForgeTaskLane::LargeSingleton,
+                22,
+            ))
+            .await
+            .expect("second large");
+        let first = tasks
+            .claim_fair(owner, limits(4))
+            .await
+            .expect("first claim")
+            .expect("owner claims first large");
+        assert_eq!(first.task_id, first_id);
+        let attempt = first.attempt_id.expect("attempt");
+        assert!(
+            tasks
+                .claim_fair(owner, limits(4))
+                .await
+                .expect("second claim")
+                .is_none(),
+            "second large claim refused while first is active"
+        );
+
+        // Drive the first large task to a terminal state, freeing the owner's slot.
+        tasks
+            .start(
+                first_id,
+                attempt,
+                owner,
+                SnapshotWatermark {
+                    snapshot_id: 21,
+                    timestamp_ms: 21,
+                },
+            )
+            .await
+            .expect("start first large");
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        tasks
+            .terminal(
+                &mut conn,
+                ForgeTaskTransition {
+                    task_id: first_id,
+                    attempt_id: attempt,
+                    owner,
+                    expected: ForgeTaskState::Running,
+                    next: ForgeTaskState::Failed,
+                },
+                &event("forge.task.failed", first_id),
+            )
+            .await
+            .expect("terminalize first large");
+        conn.commit().await.expect("commit terminal");
+        let second = tasks
+            .claim_fair(owner, limits(4))
+            .await
+            .expect("post-terminal claim")
+            .expect("owner claims second large after first terminal");
+        assert_eq!(second.lane, ForgeTaskLane::LargeSingleton);
+        assert_ne!(second.task_id, first_id, "distinct second large task");
     }
 
     /// Proves claimability excludes an active table generation before FIFO
@@ -519,13 +644,15 @@ mod pg_tests {
         assert_eq!(deferred, "ready");
     }
 
-    /// Proves an occupied large lane does not hide ordinary work and the
-    /// database rejects a multi-file singleton-large row.
+    /// Proves that an owner holding an active large task still makes ordinary
+    /// progress, that a same-owner second large claim is refused (D78), and that
+    /// the database rejects a multi-file singleton-large row.
     ///
     /// # Panics
-    /// Panics when ordinary progress stalls or the durable lane check weakens.
+    /// Panics when ordinary progress stalls, the per-owner large bound leaks, or
+    /// the durable single-file check weakens.
     #[tokio::test]
-    async fn occupied_large_lane_allows_ordinary_progress_and_rejects_multi_file_large() {
+    async fn active_large_allows_ordinary_progress_refuses_second_large_and_rejects_multi_file() {
         let (fixture, admin) = setup().await;
         let op = fixture.operator_pool();
         let tasks = ForgeTasks::new(op.clone());
@@ -561,6 +688,25 @@ mod pg_tests {
                 .task_id,
             ordinary_id
         );
+        // A second large task on a distinct table is refused for the same owner
+        // while its first large task is active, even though ordinary work flows.
+        tasks
+            .enqueue(&task(
+                tenant,
+                "large-second",
+                ForgeTaskLane::LargeSingleton,
+                73,
+            ))
+            .await
+            .expect("second large task");
+        assert!(
+            tasks
+                .claim_fair(owner, limits(4))
+                .await
+                .expect("second large claim")
+                .is_none(),
+            "same owner cannot hold two active large tasks"
+        );
         let invalid = sqlx::query(
             "UPDATE vala.forge_tasks SET lane='large_singleton',estimated_files=2 WHERE task_id=$1",
         )
@@ -573,7 +719,7 @@ mod pg_tests {
         );
     }
 
-    /// Proves malformed returned rows roll back claim, cursor, and large-lane writes.
+    /// Proves malformed returned rows roll back the claim and cursor writes.
     ///
     /// # Panics
     /// Panics when malformed-row rollback is incomplete.
@@ -605,7 +751,6 @@ mod pg_tests {
         .fetch_one(&admin)
         .await
         .expect("scheduler before");
-        let large_before: LargeLeaseSnapshot = sqlx::query_as("SELECT task_id,attempt_id,owner,fencing_token,expires_at FROM vala.forge_large_lane_lease WHERE singleton").fetch_one(&admin).await.expect("large before");
         assert!(
             tasks.claim_fair(owner, limits(1)).await.is_err(),
             "unknown persisted plan fails claim conversion"
@@ -631,11 +776,6 @@ mod pg_tests {
         assert_eq!(
             scheduler_after, scheduler_before,
             "cursor and generation rolled back"
-        );
-        let large_after: LargeLeaseSnapshot = sqlx::query_as("SELECT task_id,attempt_id,owner,fencing_token,expires_at FROM vala.forge_large_lane_lease WHERE singleton").fetch_one(&admin).await.expect("large after");
-        assert_eq!(
-            large_after, large_before,
-            "large-lane acquisition rolled back"
         );
     }
 
@@ -973,6 +1113,93 @@ mod pg_tests {
             taken[0].claimed_by,
             Some(owner) if owner == successor_a || owner == successor_b
         ));
+    }
+
+    /// Proves prepared-reconciliation takeover works for a large task without
+    /// the removed cluster-wide lease (D78): a successor owner assumes an expired
+    /// Prepared large attempt via `claim_expires_at` expiry alone, keeping the
+    /// committing generation and evidence.
+    ///
+    /// # Panics
+    /// Panics when large-task Prepared takeover does not preserve its generation.
+    #[tokio::test]
+    async fn prepared_reconciliation_takeover_recovers_large_task() {
+        let (fixture, admin) = setup().await;
+        let op = fixture.operator_pool();
+        let tasks = ForgeTasks::new(op.clone());
+        let tenant = fixture.data_tenant_id();
+        let original_owner = Uuid::now_v7();
+        let task_id = tasks
+            .enqueue(&task(
+                tenant,
+                "large-prepared-takeover",
+                ForgeTaskLane::LargeSingleton,
+                74,
+            ))
+            .await
+            .expect("enqueue");
+        let claimed = tasks
+            .claim_fair(original_owner, limits(1))
+            .await
+            .expect("claim")
+            .expect("task");
+        assert_eq!(claimed.task_id, task_id);
+        assert_eq!(claimed.lane, ForgeTaskLane::LargeSingleton);
+        let attempt = claimed.attempt_id.expect("attempt");
+        tasks
+            .start(
+                task_id,
+                attempt,
+                original_owner,
+                SnapshotWatermark {
+                    snapshot_id: 74,
+                    timestamp_ms: 74,
+                },
+            )
+            .await
+            .expect("start");
+        let evidence = ForgeTaskEvidence {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            committed_snapshot_id: Some(740),
+            committed_metadata_location: Some("metadata/v740.json".to_owned()),
+            committed_metadata_digest: Some(format!("sha256:{}", "4".repeat(64))),
+            cleanup_candidates: Vec::new(),
+            deleted_candidate_count: 0,
+        };
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        tasks
+            .prepared(
+                &mut conn,
+                task_id,
+                attempt,
+                original_owner,
+                &evidence,
+                &event("forge.task.prepared", task_id),
+            )
+            .await
+            .expect("Prepared transition");
+        conn.commit().await.expect("commit Prepared");
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(&admin)
+        .await
+        .expect("expire Prepared owner");
+
+        let successor = Uuid::now_v7();
+        let taken = tasks
+            .claim_prepared_for_reconciliation(successor, 30)
+            .await
+            .expect("takeover")
+            .expect("large Prepared task recovered");
+        assert_eq!(taken.task_id, task_id);
+        assert_eq!(taken.attempt_id, Some(attempt));
+        assert_eq!(taken.state, ForgeTaskState::Prepared);
+        assert_eq!(taken.evidence, Some(evidence));
+        assert_eq!(taken.claimed_by, Some(successor));
     }
 
     /// Proves bounded watermark/status failure modes, pruning safety, RLS, and grants.

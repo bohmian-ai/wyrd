@@ -1195,6 +1195,20 @@ the eval consolidation dissolved the former `vala-http` crate, per the principle
 below. Python-visible Bifrost behavior lives in `vala-sdk` (the
 approved Vala Python owner crate) behind its optional `python` feature.
 
+**Forge compaction concurrency bounds.** Forge maintenance work is scheduled
+through durable Postgres claims and bounded by exactly three rules, with no
+redacted
+reference of a per-table in-flight track plus per-compactor parallelism
+budgets). First, the partial unique index `forge_tasks_publication_active`
+admits at most one active compaction per (tenant, catalog, namespace, table).
+Second, a per-tenant active cap bounds a single tenant's fan-out. Third, an
+oversized single-file compaction (`large_singleton` lane) is governed by a
+per-owner one-active-large rule: a worker may hold at most one active large task,
+so large compactions on distinct tables run concurrently across workers instead
+of serializing through a former cluster-wide singleton lease. A crashed owner's
+large task is freed for reclaim by the same `claim_expires_at` lease expiry as
+any other claim; there is no separate large-lane reservation row.
+
 **Principle — wyrd-server is the only serving surface.** `vala-*` crates are
 engine and data-plane libraries; they are never HTTP or gRPC serving crates.
 The Redux Gate may implement approved tonic protocol adapters and bearer-token

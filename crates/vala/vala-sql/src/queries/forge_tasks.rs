@@ -45,7 +45,9 @@ pub struct ForgeClaimLimits {
     pub max_memory_bytes: u64,
     /// Maximum task spill bytes.
     pub max_spill_bytes: u64,
-    /// Maximum singleton large-lane bytes.
+    /// Per-task size ceiling for a `large_singleton` claim, applied together
+    /// with the task's own `large_task_ceiling_bytes`. This bounds one large
+    /// task's input size; it is not a cluster-wide large-lane cap (D78).
     pub max_large_task_bytes: u64,
 }
 
@@ -406,18 +408,25 @@ impl ForgeTasks {
 
     /// Claims one FIFO task for the next eligible tenant in the durable ring.
     ///
-    /// The singleton scheduler row is locked first. PostgreSQL 16-compatible
+    /// The worker-cursor row is locked first. PostgreSQL 16-compatible
     /// `FOR UPDATE SKIP LOCKED` then selects one row and advances the cursor in
-    /// the same transaction. Large tasks additionally acquire the singleton
-    /// large-lane row. The returned attempt UUID is a generation for output
-    /// identity, not publication authority.
+    /// the same transaction. Three durable bounds govern concurrency (D78):
+    /// the retained per-table publication index
+    /// (`forge_tasks_publication_active`) admits one active task per
+    /// (tenant, catalog, namespace, table); the per-tenant active cap
+    /// (`max_active_per_tenant`) bounds a single tenant's fan-out; and a
+    /// per-owner one-active-large rule lets `large_singleton` candidates claim
+    /// concurrently on distinct tables across workers while refusing a second
+    /// large claim by an owner that already holds one. There is no cluster-wide
+    /// large-lane singleton. The returned attempt UUID is a generation for
+    /// output identity, not publication authority.
     ///
     /// # Errors
     /// Returns [`SqlError::Conflict`] for zero limits, invariant errors for
     /// malformed persisted rows, and query errors for transaction failures.
     ///
     /// # Cancellation
-    /// Cancellation rolls back the claim, cursor, and large-lane acquisition.
+    /// Cancellation rolls back both the claim and the cursor advance.
     pub async fn claim_fair(
         &self,
         owner: Uuid,
@@ -481,15 +490,21 @@ impl ForgeTasks {
     /// Takes over one expired Prepared attempt without changing its generation.
     ///
     /// Prepared evidence belongs to the committing attempt, so recovery keeps
-    /// that attempt UUID while assigning a new compute owner. A large-lane task
-    /// reacquires its singleton capacity lease in the same transaction.
+    /// that attempt UUID while assigning a new compute owner. Recovery is
+    /// governed by the same per-owner one-active-large rule as the fair claim
+    /// (D78): a `large_singleton` Prepared task is taken over only when the
+    /// recovering owner holds no other active large task. There is no separate
+    /// lease row to reacquire; the retained per-table publication index and the
+    /// task's own `claim_expires_at` expiry are the recovery authority. Because
+    /// a candidate's own Prepared row is excluded from the per-owner scan, an
+    /// owner that already holds it can renew ownership without self-blocking.
     ///
     /// # Errors
     /// Returns conflict for a zero lease, invariant errors for malformed rows,
     /// and SQL errors when the atomic takeover cannot complete.
     ///
     /// # Cancellation
-    /// Cancellation rolls back both task ownership and large-lane acquisition.
+    /// Cancellation rolls back the task ownership takeover.
     pub async fn claim_prepared_for_reconciliation(
         &self,
         owner: Uuid,
@@ -501,7 +516,7 @@ impl ForgeTasks {
             });
         }
         let sql = format!(
-            "WITH candidate AS MATERIALIZED (SELECT task_id,data_tenant_id,lane,attempt_id FROM vala.forge_tasks WHERE state='prepared' AND claim_expires_at<statement_timestamp() AND attempt_id IS NOT NULL ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT 1), large_lock AS MATERIALIZED (UPDATE vala.forge_large_lane_lease l SET task_id=c.task_id,owner=$1,attempt_id=c.attempt_id,fencing_token=l.fencing_token+1,expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE l.singleton AND c.lane='large_singleton' AND (l.expires_at IS NULL OR l.expires_at<statement_timestamp()) RETURNING l.task_id), claimed AS (UPDATE vala.forge_tasks t SET claimed_by=$1,claim_expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id AND (c.lane='ordinary' OR EXISTS(SELECT 1 FROM large_lock)) RETURNING t.*) SELECT c.data_tenant_id AS execution_tenant_id,{CLAIM_TASK_PROJECTION} FROM claimed t JOIN candidate c USING(task_id)"
+            "WITH candidate AS MATERIALIZED (SELECT task_id,data_tenant_id,lane,attempt_id FROM vala.forge_tasks c WHERE c.state='prepared' AND c.claim_expires_at<statement_timestamp() AND c.attempt_id IS NOT NULL AND (c.lane='ordinary' OR NOT EXISTS (SELECT 1 FROM vala.forge_tasks held WHERE held.claimed_by=$1 AND held.lane='large_singleton' AND held.state IN ('claimed','running','prepared') AND held.task_id<>c.task_id)) ORDER BY c.claim_expires_at,c.task_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE vala.forge_tasks t SET claimed_by=$1,claim_expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id RETURNING t.*) SELECT c.data_tenant_id AS execution_tenant_id,{CLAIM_TASK_PROJECTION} FROM claimed t JOIN candidate c USING(task_id)"
         );
         let mut tx = self
             .operator_pool
@@ -541,12 +556,15 @@ impl ForgeTasks {
 
     /// Extends a live exact claim without producing an audit row.
     ///
+    /// Since the cluster-wide large-lane lease was removed (D78), a large task
+    /// carries no separate reservation; this single-table update renews only
+    /// the task's own `claim_expires_at`, identically for both lanes.
+    ///
     /// # Errors
     /// Returns conflict for stale identity/state/expiry, or SQL errors.
     ///
     /// # Cancellation
-    /// Task and matching large-lane renewal share one statement and cannot
-    /// commit partial heartbeat progress.
+    /// The single statement cannot commit partial heartbeat progress.
     pub async fn heartbeat(
         &self,
         task_id: Uuid,
@@ -559,22 +577,22 @@ impl ForgeTasks {
                 detail: "heartbeat lease must be positive".to_owned(),
             });
         }
-        let changed:i64=sqlx::query_scalar("WITH candidate AS MATERIALIZED (SELECT task_id,lane FROM vala.forge_tasks WHERE task_id=$1 AND state IN ('claimed','running','prepared') AND attempt_id=$2 AND claimed_by=$3 AND claim_expires_at>statement_timestamp() FOR UPDATE), renewed AS (UPDATE vala.forge_large_lane_lease l SET expires_at=statement_timestamp()+($4*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE l.singleton AND c.lane='large_singleton' AND l.task_id=$1 AND l.attempt_id=$2 AND l.owner=$3 AND l.expires_at>statement_timestamp() RETURNING l.task_id), changed AS (UPDATE vala.forge_tasks t SET claim_expires_at=statement_timestamp()+($4*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id AND (c.lane='ordinary' OR EXISTS(SELECT 1 FROM renewed)) RETURNING t.task_id) SELECT count(*) FROM changed").bind(task_id).bind(attempt).bind(owner).bind(i64::from(lease_seconds)).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;
-        exact_one(
-            u64::try_from(changed).map_err(|_| SqlError::InvariantViolation {
-                detail: "negative Forge heartbeat row count".to_owned(),
-            })?,
-            "heartbeat",
-        )
+        let changed=sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()+($4*interval '1 second'),updated_at=statement_timestamp() WHERE task_id=$1 AND state IN ('claimed','running','prepared') AND attempt_id=$2 AND claimed_by=$3 AND claim_expires_at>statement_timestamp()").bind(task_id).bind(attempt).bind(owner).bind(i64::from(lease_seconds)).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        exact_one(changed, "heartbeat")
     }
 
     /// Returns an exact Claimed or Running attempt to Retryable with a new eligibility time.
+    ///
+    /// Retrying a large task frees it for reclaim purely by clearing its own
+    /// ownership columns; with the cluster-wide large-lane lease removed (D78)
+    /// there is no separate reservation row to release, so this is one
+    /// single-table update for both lanes.
     ///
     /// # Errors
     /// Returns conflict for stale task/attempt/owner/state or SQL errors.
     ///
     /// # Cancellation
-    /// Task retry and matching large-lane release share one statement.
+    /// The single statement cannot commit partial retry progress.
     pub async fn retry(
         &self,
         task_id: Uuid,
@@ -582,13 +600,8 @@ impl ForgeTasks {
         owner: Uuid,
         ready_at: DateTime<Utc>,
     ) -> Result<(), SqlError> {
-        let changed:i64=sqlx::query_scalar("WITH changed AS (UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=$4,updated_at=statement_timestamp() WHERE task_id=$1 AND state IN ('claimed','running') AND attempt_id=$2 AND claimed_by=$3 RETURNING task_id), released AS (UPDATE vala.forge_large_lane_lease SET task_id=NULL,owner=NULL,attempt_id=NULL,expires_at=NULL,updated_at=statement_timestamp() WHERE singleton AND task_id=$1 AND attempt_id=$2 AND owner=$3 AND EXISTS(SELECT 1 FROM changed) RETURNING singleton) SELECT count(*) FROM changed").bind(task_id).bind(attempt).bind(owner).bind(ready_at).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;
-        exact_one(
-            u64::try_from(changed).map_err(|_| SqlError::InvariantViolation {
-                detail: "negative Forge retry row count".to_owned(),
-            })?,
-            "retry",
-        )
+        let changed=sqlx::query("UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=$4,updated_at=statement_timestamp() WHERE task_id=$1 AND state IN ('claimed','running') AND attempt_id=$2 AND claimed_by=$3").bind(task_id).bind(attempt).bind(owner).bind(ready_at).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        exact_one(changed, "retry")
     }
 
     /// Atomically records Prepared evidence and the supplied tenant audit event.
@@ -693,17 +706,19 @@ impl ForgeTasks {
 
     /// Atomically cancels a superseded claimed attempt and requests a fresh plan.
     ///
-    /// The audited terminal transition releases the exact attempt and matching
-    /// large-lane reservation before the same tenant transaction advances the
-    /// periodic demand generation.
+    /// The audited terminal transition clears the exact attempt ownership
+    /// before the same tenant transaction advances the periodic demand
+    /// generation. With the cluster-wide large-lane lease removed (D78), a
+    /// cancelled large task frees its per-owner slot by that ownership clear
+    /// alone.
     ///
     /// # Errors
     /// Returns conflict unless the transition is an exact Claimed-to-Cancelled
     /// transition for the supplied tenant/table, or returns SQL/audit errors.
     ///
     /// # Cancellation
-    /// Caller-owned rollback removes the cancellation, audit, lane release, and
-    /// successor demand together.
+    /// Caller-owned rollback removes the cancellation, audit, and successor
+    /// demand together.
     pub async fn cancel_superseded(
         &self,
         conn: &mut TenantConn<'_>,
@@ -765,16 +780,18 @@ impl ForgeTasks {
     /// Reclaims expired Claimed or Running attempts into Retryable with no audit.
     /// Prepared is intentionally excluded because it may represent an uncertain external effect.
     ///
+    /// A reclaimed large task frees its per-owner slot by clearing its own
+    /// ownership columns; with the cluster-wide large-lane lease removed (D78)
+    /// there is no separate reservation row to release.
+    ///
     /// # Errors
     /// Returns SQL errors from the bounded operator update.
     ///
     /// # Cancellation
-    /// Reclaim and matching large-lane releases share one bounded statement.
+    /// Reclaim is one bounded statement and cannot commit partial progress.
     pub async fn reclaim_expired(&self, cap: u32) -> Result<u64, SqlError> {
-        let changed:i64=sqlx::query_scalar("WITH victims AS (SELECT task_id,attempt_id,claimed_by FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1), changed AS (UPDATE vala.forge_tasks t SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp(),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id RETURNING t.task_id), released AS (UPDATE vala.forge_large_lane_lease l SET task_id=NULL,owner=NULL,attempt_id=NULL,expires_at=NULL,updated_at=statement_timestamp() FROM victims v WHERE l.singleton AND l.task_id=v.task_id AND l.attempt_id=v.attempt_id AND l.owner=v.claimed_by AND EXISTS(SELECT 1 FROM changed c WHERE c.task_id=v.task_id) RETURNING l.singleton) SELECT count(*) FROM changed").bind(i64::from(cap)).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;
-        u64::try_from(changed).map_err(|_| SqlError::InvariantViolation {
-            detail: "negative Forge reclaim row count".to_owned(),
-        })
+        let changed=sqlx::query("WITH victims AS (SELECT task_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE vala.forge_tasks t SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp(),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id").bind(i64::from(cap)).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        Ok(changed)
     }
 
     /// Reads active watermarks for one table with explicit overflow detection.
@@ -885,12 +902,16 @@ impl ForgeTasks {
 
     /// Applies an exact tenant mutation and audit append inside the caller transaction.
     ///
+    /// Reaching a terminal state frees the task's per-owner large slot simply by
+    /// clearing its ownership columns; with the cluster-wide large-lane lease
+    /// removed (D78) there is no separate reservation row to release here.
+    ///
     /// # Errors
-    /// Returns conflicts for stale transitions and SQL errors for state, lease,
-    /// or audit writes.
+    /// Returns conflicts for stale transitions and SQL errors for state or audit
+    /// writes.
     ///
     /// # Cancellation
-    /// The caller transaction rolls back state, large-lane release, and audit.
+    /// The caller transaction rolls back both state and audit.
     async fn audited_transition(
         &self,
         conn: &mut TenantConn<'_>,
@@ -911,15 +932,6 @@ impl ForgeTasks {
             }
         }
         exact_one(changed, "audited transition")?;
-        if transition.next.is_terminal() {
-            let _: bool = sqlx::query_scalar("SELECT vala.release_forge_large_lane($1,$2,$3)")
-                .bind(transition.task_id)
-                .bind(transition.attempt_id)
-                .bind(transition.owner)
-                .fetch_one(&mut **conn.transaction())
-                .await
-                .map_err(SqlError::from)?;
-        }
         append_audit(conn, event).await?;
         Ok(ForgeTaskTransitionOutcome::Applied)
     }

@@ -23,11 +23,12 @@ WITH cursor AS MATERIALIZED (
               t.lane = 'large_singleton'
               AND t.estimated_files <= $5
               AND t.estimated_bytes <= LEAST(t.large_task_ceiling_bytes, $10)
-              AND EXISTS (
+              AND NOT EXISTS (
                   SELECT 1
-                  FROM vala.forge_large_lane_lease lease
-                  WHERE lease.singleton
-                    AND (lease.task_id IS NULL OR lease.expires_at < statement_timestamp())
+                  FROM vala.forge_tasks held
+                  WHERE held.claimed_by = $1
+                    AND held.lane = 'large_singleton'
+                    AND held.state IN ('claimed', 'running', 'prepared')
               )
           )
       )
@@ -57,16 +58,6 @@ WITH cursor AS MATERIALIZED (
     ORDER BY t.ready_at, t.task_id
     FOR UPDATE OF t SKIP LOCKED
     LIMIT 1
-), large_lock AS MATERIALIZED (
-    UPDATE vala.forge_large_lane_lease l
-    SET task_id = c.task_id, owner = $1, attempt_id = $3,
-        fencing_token = l.fencing_token + 1,
-        expires_at = statement_timestamp() + ($4 * interval '1 second'),
-        updated_at = statement_timestamp()
-    FROM candidate c
-    WHERE l.singleton AND c.lane = 'large_singleton'
-      AND (l.task_id IS NULL OR l.expires_at < statement_timestamp())
-    RETURNING l.task_id
 ), claimed AS (
     UPDATE vala.forge_tasks t
     SET state = 'claimed', attempt_id = $3, claimed_by = $1,
@@ -75,7 +66,6 @@ WITH cursor AS MATERIALIZED (
     FROM candidate c
     WHERE t.task_id = c.task_id
       AND t.state IN ('ready', 'retryable')
-      AND (c.lane = 'ordinary' OR EXISTS (SELECT 1 FROM large_lock))
     RETURNING t.*
 ), cursor_update AS (
     UPDATE vala.forge_worker_claim_state s

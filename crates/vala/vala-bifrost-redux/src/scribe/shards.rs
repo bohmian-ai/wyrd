@@ -422,6 +422,12 @@ pub(crate) struct ScribeShardStartConfig {
     pub(crate) admission: AdmissionController,
     /// Writable-byte threshold that triggers active-bucket rotation.
     pub(crate) rotation_bytes: usize,
+    /// Active-generation max age consulted by the age seal predicate.
+    ///
+    /// Threaded from [`crate::scribe::ScribePressureConfig::seal_max_age`] into
+    /// each owner's memtable the same way `rotation_bytes` is, so the age
+    /// trigger uses the configured seconds-scale value (D83 default 30 s).
+    pub(crate) seal_max_age: std::time::Duration,
     /// Shared WAL writer used to create shard handles.
     pub(crate) wal: Arc<WalWriter>,
     /// Bounded CPU lane for replay and persistence preparation.
@@ -527,6 +533,7 @@ impl ScribeShardRuntime {
         let ScribeShardStartConfig {
             admission,
             rotation_bytes,
+            seal_max_age,
             wal,
             persistence_cpu,
             wal_io,
@@ -568,7 +575,7 @@ impl ScribeShardRuntime {
                 pending_generations: PendingGenerationsByKey::new(),
                 retained_generations: HashMap::new(),
                 admission: admission.clone(),
-                memtable: Memtable::new_with_rotation(rotation_bytes),
+                memtable: Memtable::new_with_config(rotation_bytes, seal_max_age),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
@@ -680,25 +687,30 @@ impl ScribeShardRuntime {
         Ok(merged)
     }
 
-    /// Freeze one key across all shards and return the first non-empty result.
+    /// Freeze one key across all shards and return every frozen memtable.
     ///
     /// Under batch-spread routing a single seal key may have buckets on any
     /// subset of the sixteen shard lanes. This method broadcasts a
     /// [`ShardCommand::FreezeKey`] to every shard; shards with no bucket for
-    /// the key no-op and return `None`. The first `Some` result is returned
-    /// to the caller.
+    /// the key no-op and return `None`, and every `Some` is collected into the
+    /// returned vector (mirroring [`Self::freeze_tenant`]). Returning only the
+    /// first shard's result — the prior behavior — orphaned the other shards'
+    /// frozen Arrow data, which had already been moved active→immutable in the
+    /// memory ledger, with no path to persistence (the latent T35 hazard this
+    /// fixes). The caller pre-commits every returned entry.
     ///
     /// After this call returns, every shard's bucket for the key is sealed.
     ///
     /// # Errors
     /// Returns [`ScribeError::IngressClosed`] when any shard has stopped, or
-    /// [`ScribeError::Internal`] when no shard holds a bucket for the key,
-    /// or the first shard-level freeze error.
+    /// [`ScribeError::Internal`] when no shard holds a bucket for the key
+    /// (preserving the existing not-found contract), or the first shard-level
+    /// freeze error.
     pub(crate) async fn freeze_key(
         &self,
         seal_key: crate::scribe::seal_key::SealKey,
-    ) -> Result<crate::scribe::memtable::FrozenMemtable, ScribeError> {
-        let mut merged: Option<crate::scribe::memtable::FrozenMemtable> = None;
+    ) -> Result<Vec<crate::scribe::memtable::FrozenMemtable>, ScribeError> {
+        let mut per_shard = Vec::with_capacity(self.senders.len());
         for sender in &self.senders {
             let (response, result) = tokio::sync::oneshot::channel();
             sender
@@ -709,18 +721,40 @@ impl ScribeShardRuntime {
                 })
                 .await
                 .map_err(|_| ScribeError::IngressClosed)?;
-            let maybe_frozen = result.await.map_err(|_| ScribeError::Internal {
+            // Shards that hold no bucket for the key return None; retain every
+            // shard's optional result so the collection step keeps them all.
+            per_shard.push(result.await.map_err(|_| ScribeError::Internal {
                 detail: "shard dropped freeze response".to_owned(),
-            })??;
-            // Shards that hold no bucket for the key return None; keep the
-            // first real frozen result across the fan-out.
-            if merged.is_none() {
-                merged = maybe_frozen;
-            }
+            })??);
         }
-        merged.ok_or_else(|| ScribeError::Internal {
-            detail: format!("freeze_key: no shard holds a bucket for {seal_key}"),
-        })
+        Self::finalize_frozen_fan_out(per_shard, &seal_key)
+    }
+
+    /// Flatten the per-shard freeze fan-out into every frozen memtable, failing
+    /// closed when no shard held a bucket for the key.
+    ///
+    /// Under batch-spread routing a single seal key may have buckets on any
+    /// subset of the sixteen lanes; each shard returns `Some(frozen)` when it
+    /// owned a bucket and `None` otherwise, so the flattened vector has exactly
+    /// one entry per non-empty shard — the fix for the latent T35 hazard that
+    /// previously kept only the first shard's frozen memtable and orphaned the
+    /// rest. An all-`None` fan-out means no shard holds the key; that is mapped
+    /// to [`ScribeError::Internal`] to preserve the existing not-found contract
+    /// rather than reporting a silent no-op as a completed seal.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when every shard returned `None`.
+    fn finalize_frozen_fan_out(
+        per_shard: Vec<Option<crate::scribe::memtable::FrozenMemtable>>,
+        seal_key: &crate::scribe::seal_key::SealKey,
+    ) -> Result<Vec<crate::scribe::memtable::FrozenMemtable>, ScribeError> {
+        let frozen = per_shard.into_iter().flatten().collect::<Vec<_>>();
+        if frozen.is_empty() {
+            return Err(ScribeError::Internal {
+                detail: format!("freeze_key: no shard holds a bucket for {seal_key}"),
+            });
+        }
+        Ok(frozen)
     }
 
     /// Freeze all keys for one tenant through their owning shard(s).
@@ -2810,6 +2844,130 @@ mod tests {
             none_result.is_none(),
             "shard with no bucket must return None during fan-out"
         );
+    }
+
+    /// Proves the runtime `freeze_key` aggregator returns **every** shard's
+    /// frozen memtable for a batch-spread seal key — one entry per non-empty
+    /// shard, none orphaned — and still fails closed when no shard holds a
+    /// bucket.
+    ///
+    /// This exercises the collection contract at the heart of the T35 hazard
+    /// fix directly on [`ScribeShardRuntime::finalize_frozen_fan_out`] using
+    /// real [`FrozenMemtable`] values produced by two owners on distinct lanes
+    /// (0 and 5) — exactly how batch-spread routing scatters one key's buckets
+    /// — plus an empty shard that contributes `None`. The prior behavior kept
+    /// only the first `Some` and discarded the rest; here both frozen memtables
+    /// must survive with their owning `shard_id` intact.
+    #[test]
+    fn freeze_key_returns_every_shard_frozen_memtable() {
+        let key = owner_key();
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+
+        // Owner A — shard 0 holds a bucket for the key.
+        let memtable_a = Memtable::new();
+        memtable_a
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner A insert");
+        let wal_handle_a = wal.handle_for_shard(0).expect("WAL handle A");
+        let mut owner_a = owner_for_completion_test(memtable_a, &wal, wal_handle_a, stream);
+        owner_a.id = 0;
+
+        // Owner B — shard 5 holds a bucket for the same key (different route).
+        let memtable_b = Memtable::new();
+        memtable_b
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner B insert");
+        let wal_handle_b = wal.handle_for_shard(5).expect("WAL handle B");
+        let mut owner_b = owner_for_completion_test(memtable_b, &wal, wal_handle_b, stream);
+        owner_b.id = 5;
+
+        // Empty owner — shard 3 holds no bucket and must contribute None.
+        let wal_handle_c = wal.handle_for_shard(3).expect("WAL handle C");
+        let mut empty_owner =
+            owner_for_completion_test(Memtable::new(), &wal, wal_handle_c, stream);
+        empty_owner.id = 3;
+
+        let frozen_a = Some(
+            owner_a
+                .freeze_key(&key)
+                .expect("owner A freeze")
+                .expect("bucket A"),
+        );
+        let absent = empty_owner.freeze_key(&key).expect("empty owner freeze");
+        assert!(
+            absent.is_none(),
+            "empty shard contributes None to the fan-out"
+        );
+        let frozen_b = Some(
+            owner_b
+                .freeze_key(&key)
+                .expect("owner B freeze")
+                .expect("bucket B"),
+        );
+
+        // The fan-out over [Some(A), None, Some(B)] keeps both frozen memtables.
+        let collected =
+            ScribeShardRuntime::finalize_frozen_fan_out(vec![frozen_a, absent, frozen_b], &key)
+                .expect("a batch-spread key yields one frozen memtable per non-empty shard");
+        assert_eq!(
+            collected.len(),
+            2,
+            "one frozen memtable per non-empty shard, none orphaned"
+        );
+        let mut lanes = collected
+            .iter()
+            .map(|frozen| frozen.shard_id)
+            .collect::<Vec<_>>();
+        lanes.sort_unstable();
+        assert_eq!(
+            lanes,
+            vec![0, 5],
+            "each frozen memtable keeps its owning lane"
+        );
+
+        // A fan-out where no shard held a bucket fails closed (not-found contract).
+        assert!(
+            matches!(
+                ScribeShardRuntime::finalize_frozen_fan_out(vec![None, None], &key),
+                Err(ScribeError::Internal { .. })
+            ),
+            "an all-None fan-out must fail closed rather than return an empty seal set"
+        );
+    }
+
+    /// Proves the runtime `freeze_key` aggregator fails closed on an absent key
+    /// instead of silently returning an empty seal set.
+    ///
+    /// The aggregator fans a `FreezeKey` command to every one of the sixteen
+    /// lanes and extends a single `Vec` with each shard's frozen result. When no
+    /// shard holds a bucket for the key the collected vector is empty; returning
+    /// it as success would let a caller (`ScribeImpl::seal_one`) treat a
+    /// no-op as a completed seal. The aggregator therefore maps the empty case
+    /// to [`ScribeError::Internal`] so an orphaned or already-drained key is a
+    /// hard error, not a silent success.
+    #[tokio::test]
+    async fn freeze_key_absent_key_fails_closed_across_all_shards() {
+        let scribe = crate::scribe::ScribeImpl::new();
+        let key = owner_key();
+        let result = scribe.shards.freeze_key(key).await;
+        assert!(
+            matches!(result, Err(ScribeError::Internal { .. })),
+            "an absent key must fail closed rather than return an empty seal set"
+        );
+        scribe
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
     }
 
     /// Proves that a snapshot fan-out merges results from multiple shards.

@@ -130,4 +130,102 @@ mod pg_tests {
         );
         cluster.shutdown().await.expect("cluster stops");
     }
+
+    /// Prove the H1 pressure seal drains ingress occupancy during ingest with no
+    /// manual flush — the write-path falsifier of the pre-H1 livelock (D83).
+    ///
+    /// The full smoke `pg_bifrost_materializer_smoke_shape` reads each day back
+    /// through the Oracle query path to assert the materialized layout; that
+    /// read-back is deliberately out of this test's scope. This sibling instead
+    /// drives the identical two-tenant `DatasetShape(2, 160_000)` write path and
+    /// polls the typed Scribe inspection snapshot mid-ingest to observe ingress
+    /// occupancy cross the high-water mark and then fall back below the low-water
+    /// mark — the coordinated pressure seal freeing capacity — while the client
+    /// issues no manual flush (the materializer flushes only at a day boundary,
+    /// after this test has already observed the drain and cancelled). It never
+    /// reaches the day-boundary read-back, so it isolates the H1 write-path drain
+    /// from the Oracle read path. Before H1 occupancy pinned at the ingress
+    /// ceiling and never fell (the livelock); after H1 it must oscillate within
+    /// the hysteresis band.
+    #[tokio::test]
+    #[ignore = "requires managed Postgres and the real public Gate cluster"]
+    async fn pg_bifrost_pressure_seal_drains_ingress_without_manual_flush() {
+        let cluster = WyrdTestCluster::start(1, BifrostTopology::OnePod)
+            .await
+            .expect("cluster starts");
+        let tenant = cluster
+            .add_tenant("pressure-drain-tenant")
+            .await
+            .expect("second tenant starts");
+        let dataset = BifrostQualificationDataset::new(
+            DatasetShape::new(2, 160_000).expect("locked smoke shape"),
+        )
+        .expect("dataset builds");
+        let run_root = tempdir().expect("run root");
+        let token = CancellationToken::new();
+        let materializer = BifrostDatasetMaterializer::from_server(
+            cluster.server(0).expect("server exists"),
+            dataset,
+            vec![cluster.data_tenant_id(), tenant],
+            BackpressurePolicy::with_deadline(Instant::now() + Duration::from_secs(180)),
+            run_root.path(),
+            token.clone(),
+        )
+        .await
+        .expect("materializer setup");
+
+        let drained = {
+            let server = cluster.server(0).expect("server exists");
+            let materialize_future = materializer.materialize();
+            tokio::pin!(materialize_future);
+            let evidence_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+            let mut crossed_high = false;
+            let mut peak_occupancy = 0_usize;
+            let observed = loop {
+                let snapshot = server
+                    .scribe_inspection_snapshot()
+                    .expect("Scribe inspection snapshot");
+                peak_occupancy = peak_occupancy.max(snapshot.ingress_used_memory);
+                // The watermark decision keys on ingress occupancy against the
+                // ingress ceiling, not the larger Scribe child limit.
+                if snapshot.ingress_high_water_memory > 0
+                    && snapshot.ingress_used_memory >= snapshot.ingress_high_water_memory
+                {
+                    crossed_high = true;
+                }
+                // Once occupancy has crossed high-water, a coordinated pressure
+                // seal (no manual flush) must drain it back below the low-water
+                // mark. Observing that ordering proves the drain, not a lull.
+                if crossed_high && snapshot.ingress_used_memory < snapshot.ingress_low_water_memory
+                {
+                    break true;
+                }
+                assert!(
+                    tokio::time::Instant::now() < evidence_deadline,
+                    "pressure seal never drained ingress below low-water \
+                     (crossed_high={crossed_high}, peak_occupancy={peak_occupancy})"
+                );
+                tokio::select! {
+                    result = &mut materialize_future => {
+                        panic!(
+                            "materializer reached the day-boundary read-back before the \
+                             mid-ingest drain was observed: {result:?}"
+                        );
+                    }
+                    _ = tokio::task::yield_now() => {}
+                }
+            };
+            // Stop before the day-boundary Oracle read-back, which is out of this
+            // write-path test's scope; the run directory is cleaned on cancel.
+            token.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(30), &mut materialize_future).await;
+            observed
+        };
+        drop(materializer);
+        assert!(
+            drained,
+            "pressure seal drained ingress occupancy below low-water without manual flush"
+        );
+        cluster.shutdown().await.expect("cluster stops");
+    }
 }

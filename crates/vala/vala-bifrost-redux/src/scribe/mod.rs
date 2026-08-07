@@ -43,6 +43,7 @@ use crate::scribe::admission::{AdmissionConfig, AdmissionController};
 pub use crate::scribe::execution_lanes::{
     ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
+pub use crate::scribe::memtable::SealTriggerReason;
 pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::FetchLiveTailService;
@@ -59,6 +60,7 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use num_traits::ToPrimitive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use uuid::Uuid;
 use vala_sql::TenantConn;
@@ -205,6 +207,11 @@ pub struct ScribeImpl {
     admission: AdmissionController,
     /// Scribe-only child capability over the pod-global Bifrost governor.
     memory: memory::ScribeMemoryBudget,
+    /// Runtime pressure and lifecycle thresholds (D83 watermarks and max age).
+    ///
+    /// Shared by the admission path and the periodic age scanner so the
+    /// flush-first hysteresis is defined once.
+    pressure_config: ScribePressureConfig,
     /// Shared active/immutable Arrow ownership ledger.
     memory_ledger: memory::MemoryLedger,
     /// Bounded persistence CPU lane retained for replay and seal preparation.
@@ -401,6 +408,68 @@ impl Drop for IngestStallCompletion<'_> {
     /// Publish completion whether the write resumes or its transport is cancelled.
     fn drop(&mut self) {
         self.0.complete();
+    }
+}
+
+/// Runtime-tunable Scribe pressure and lifecycle thresholds (D83).
+///
+/// This carrier owns the three knobs that govern the flush-first response to
+/// ingress memory pressure: the ingress-occupancy high-water mark that triggers
+/// a coordinated pressure seal, the low-water mark that seal drains toward, and
+/// the active-generation max age that bounds trickle-workload visibility. It is
+/// owned by the Scribe runtime and constructed beside the other Scribe build
+/// config; the D83 defaults are production-ready with no config file required.
+///
+/// The `low_water < high_water` hysteresis invariant is enforced at
+/// construction ([`ScribePressureConfig::new`] / [`ScribePressureConfig::default`]),
+/// so an invalid config can never invert the watermark decision.
+///
+/// The field names and their D83 defaults are a normative interface: T40
+/// (18-H2) reads them to set the watermark gauges and the seal-trigger labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScribePressureConfig {
+    /// Ingress occupancy fraction (percent of `ingress_limit_bytes`) at or
+    /// above which a coordinated pressure seal is triggered. Default 75.
+    pub ingress_high_water_percent: usize,
+    /// Ingress occupancy fraction (percent of `ingress_limit_bytes`) that
+    /// pressure sealing drains toward. Default 50. Must be < high-water.
+    pub ingress_low_water_percent: usize,
+    /// Maximum age of an active generation before age-based sealing.
+    /// Default 30 s (was 10 min).
+    pub seal_max_age: Duration,
+}
+
+impl ScribePressureConfig {
+    /// Construct a pressure config, clamping the low-water mark strictly below
+    /// the high-water mark to preserve the hysteresis invariant.
+    ///
+    /// A caller-supplied `ingress_low_water_percent` at or above
+    /// `ingress_high_water_percent` is clamped to `high_water - 1` (and a
+    /// zero high-water is treated as low-water `0`), so the returned config can
+    /// never invert the seal decision. `seal_max_age` is stored verbatim.
+    #[must_use]
+    pub fn new(
+        ingress_high_water_percent: usize,
+        ingress_low_water_percent: usize,
+        seal_max_age: Duration,
+    ) -> Self {
+        let ingress_low_water_percent = if ingress_low_water_percent >= ingress_high_water_percent {
+            ingress_high_water_percent.saturating_sub(1)
+        } else {
+            ingress_low_water_percent
+        };
+        Self {
+            ingress_high_water_percent,
+            ingress_low_water_percent,
+            seal_max_age,
+        }
+    }
+}
+
+impl Default for ScribePressureConfig {
+    /// The locked D83 defaults: 75% high-water, 50% low-water, 30 s max age.
+    fn default() -> Self {
+        Self::new(75, 50, Duration::from_secs(30))
     }
 }
 
@@ -769,10 +838,12 @@ impl ScribeImpl {
                 &coordination_runtime,
             )
         });
+        let pressure_config = ScribePressureConfig::default();
         let shards = shards::ScribeShardRuntime::start(
             shards::ScribeShardStartConfig {
                 admission: admission.clone(),
                 rotation_bytes: memory.active_bucket_target_bytes(),
+                seal_max_age: pressure_config.seal_max_age,
                 wal: Arc::clone(&wal),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
@@ -782,12 +853,7 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
-        metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
-        for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
-            metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
-        }
-        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
-            .set(wal.bytes_on_disk().to_f64().unwrap_or(f64::MAX));
+        Self::install_boot_metrics(wal.bytes_on_disk());
         Self {
             operator,
             wal,
@@ -796,6 +862,7 @@ impl ScribeImpl {
             writer_epoch,
             admission,
             memory,
+            pressure_config,
             memory_ledger,
             persistence_cpu,
             wal_io,
@@ -814,6 +881,22 @@ impl ScribeImpl {
             #[cfg(feature = "test-support")]
             publication_observer: ScribePublicationObserver::default(),
         }
+    }
+
+    /// Publish the zero-initialized Scribe boot telemetry.
+    ///
+    /// Called once from [`Self::build`] so the ingress-active gauge, every named
+    /// rejection counter, and the WAL disk-bytes gauge exist at value zero (or
+    /// the current WAL residency) before the first request, giving scrapers a
+    /// stable series set from process start. `wal_disk_bytes` is the current
+    /// on-disk WAL byte count read from the freshly recovered writer.
+    fn install_boot_metrics(wal_disk_bytes: u64) {
+        metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
+        for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
+            metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
+        }
+        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
+            .set(wal_disk_bytes.to_f64().unwrap_or(f64::MAX));
     }
 
     /// Construct a stub `ScribeImpl` for tests (memory backend, stub node identity, temp WAL).
@@ -1139,27 +1222,72 @@ impl ScribeImpl {
         self.admission.snapshot().items
     }
 
+    /// Read a governor snapshot enriched with the runtime ingress watermarks.
+    ///
+    /// The governor fills `ingress_occupancy_bytes` and `ingress_limit_bytes`;
+    /// this method layers the D83 high/low-water bytes from
+    /// [`ScribeImpl::pressure_config`] so every watermark decision — admission
+    /// and the periodic age scanner alike — reads one consistent snapshot.
+    #[must_use]
+    fn pressure_snapshot(&self) -> memory::MemorySnapshot {
+        self.memory.snapshot().with_ingress_watermarks(
+            self.pressure_config.ingress_high_water_percent,
+            self.pressure_config.ingress_low_water_percent,
+        )
+    }
+
+    /// Request a coordinated pressure seal that drains ingress toward low-water.
+    ///
+    /// This is the single definition of the flush-first hysteresis, shared by
+    /// the admission path ([`Self::prepare_and_dispatch`]) and the periodic age
+    /// scanner ([`Self::check_age`]). It is a no-op below the high-water mark;
+    /// at or above it, it selects the largest writable buckets aggregated across
+    /// all shards (shard-count-invariant, via
+    /// [`memtable::Memtable::select_pressure_victims`]) sufficient to release
+    /// occupancy down to the low-water target, and fans a fire-and-forget flush
+    /// signal to their owners. It never blocks or busy-waits: freezing and
+    /// persistence proceed asynchronously, and callers retry the reservation
+    /// once (admission) or wait for the next tick (scanner).
+    fn request_pressure_seal_toward_low_water(&self) {
+        let snapshot = self.pressure_snapshot();
+        let Some(to_release) =
+            snapshot.pressure_release_bytes(self.pressure_config.ingress_high_water_percent)
+        else {
+            return;
+        };
+        let candidates = self
+            .shards
+            .memtable_snapshots()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|snapshot| snapshot.pressure_candidates)
+            .collect::<Vec<_>>();
+        let victims = memtable::Memtable::select_pressure_victims(candidates, to_release);
+        tracing::debug!(
+            trigger = SealTriggerReason::Pressure.as_label(),
+            to_release,
+            victims = victims.len(),
+            "requesting coordinated ingress-pressure seal"
+        );
+        self.shards.request_pressure_flush(&victims);
+    }
+
     /// Publish one coalescing lifecycle age tick to every shard owner.
+    ///
+    /// The ingress-pressure branch shares its hysteresis with admission through
+    /// [`Self::request_pressure_seal_toward_low_water`]: crossing the ingress
+    /// high-water mark seals down toward low-water; below low-water it no-ops.
+    /// The independent WAL-disk soft-pressure branch is unchanged.
     pub fn check_age(&self, now: std::time::Instant) {
         self.shards.request_expired_flush(now);
-        let snapshot = self.memory.snapshot();
-        let owner_snapshots = self.shards.memtable_snapshots().unwrap_or_default();
-        if snapshot.effective_pressure_percent() >= 75 {
-            let target = snapshot.scribe_limit_bytes.saturating_mul(65) / 100;
-            let candidates = owner_snapshots
-                .iter()
-                .flat_map(|snapshot| snapshot.pressure_candidates.clone())
-                .collect::<Vec<_>>();
-            let victims = memtable::Memtable::select_pressure_victims(
-                candidates,
-                snapshot.total_bytes().saturating_sub(target),
-            );
-            self.shards.request_pressure_flush(&victims);
-        }
+        self.request_pressure_seal_toward_low_water();
         if self.wal.disk_pressure().soft {
-            let candidates = owner_snapshots
-                .iter()
-                .flat_map(|snapshot| snapshot.pressure_candidates.clone())
+            let candidates = self
+                .shards
+                .memtable_snapshots()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|snapshot| snapshot.pressure_candidates)
                 .collect::<Vec<_>>();
             let victim = memtable::Memtable::select_oldest_wal_victim(&candidates);
             self.shards.request_wal_pressure_flush(victim);
@@ -1215,13 +1343,24 @@ impl ScribeImpl {
     /// Repo rule (`check:from-pools-allowlist`): this signature MUST take
     /// `&mut vala_sql::TenantConn<'_>` and MUST NOT accept `sqlx::PgPool`.
     ///
+    /// Under batch-spread routing a seal key may have buckets on several shards,
+    /// so [`crate::scribe::shards::ScribeShardRuntime::freeze_key`] now returns
+    /// every shard's frozen memtable. Each is pre-committed within the caller's
+    /// transaction and returned as a separate [`seal::SealCommit`], so no frozen
+    /// Arrow data is orphaned. If any pre-commit fails after earlier ones
+    /// succeeded, the already-committed generations are aborted back to the
+    /// active ledger before the error is returned, mirroring
+    /// [`Self::force_seal`].
+    ///
     /// # Errors
-    /// Returns [`ScribeError`] if any seal stage fails.
+    /// Returns [`ScribeError`] if tenant validation, freezing, or any seal stage
+    /// fails. On a mid-batch failure the partial post-commit state is rolled
+    /// back before the error surfaces.
     pub async fn seal_one(
         &self,
         seal_key: &SealKey,
         conn: &mut TenantConn<'_>,
-    ) -> Result<seal::SealCommit, ScribeError> {
+    ) -> Result<Vec<seal::SealCommit>, ScribeError> {
         use crate::scribe::seal::SealDriver;
 
         let binding = TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
@@ -1235,17 +1374,31 @@ impl ScribeImpl {
             })?;
 
         let driver = SealDriver::new_with_lane(self.operator.clone(), self.persistence_cpu.clone());
-        let frozen = self.shards.freeze_key(seal_key.clone()).await?;
-        driver
-            .pre_commit_frozen(
-                &frozen,
-                seal_key,
-                &binding,
-                conn,
-                &self.node_id,
-                self.writer_epoch,
-            )
-            .await
+        let frozen_set = self.shards.freeze_key(seal_key.clone()).await?;
+        let mut commits = Vec::with_capacity(frozen_set.len());
+        for frozen in &frozen_set {
+            match driver
+                .pre_commit_frozen(
+                    frozen,
+                    seal_key,
+                    &binding,
+                    conn,
+                    &self.node_id,
+                    self.writer_epoch,
+                )
+                .await
+            {
+                Ok(commit) => commits.push(commit),
+                Err(error) => {
+                    // Roll back the generations already pre-committed in this
+                    // batch so no shard is left with orphaned immutable state.
+                    let tokens = commits.into_iter().map(|commit| commit.token).collect();
+                    let _ = self.abort_post_commit(seal::PostCommitBatch(tokens)).await;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(commits)
     }
 }
 
@@ -1317,6 +1470,34 @@ impl Drop for ScribeIngressTelemetryGuard {
     /// Release one active ingress ownership unit.
     fn drop(&mut self) {
         self.0.decrement(1.0);
+    }
+}
+
+#[cfg(test)]
+mod pressure_config_tests {
+    use super::ScribePressureConfig;
+    use std::time::Duration;
+
+    /// The D83 defaults are the locked 75/50/30 s triple that T40 reads.
+    #[test]
+    fn default_is_the_locked_d83_triple() {
+        let config = ScribePressureConfig::default();
+        assert_eq!(config.ingress_high_water_percent, 75);
+        assert_eq!(config.ingress_low_water_percent, 50);
+        assert_eq!(config.seal_max_age, Duration::from_secs(30));
+    }
+
+    /// A low-water at or above high-water is clamped strictly below it, so the
+    /// hysteresis invariant `low < high` can never be inverted by config.
+    #[test]
+    fn new_clamps_low_water_strictly_below_high_water() {
+        let inverted = ScribePressureConfig::new(60, 90, Duration::from_secs(5));
+        assert_eq!(inverted.ingress_high_water_percent, 60);
+        assert_eq!(inverted.ingress_low_water_percent, 59);
+        assert!(inverted.ingress_low_water_percent < inverted.ingress_high_water_percent);
+
+        let equal = ScribePressureConfig::new(75, 75, Duration::from_secs(5));
+        assert_eq!(equal.ingress_low_water_percent, 74);
     }
 }
 
@@ -1413,7 +1594,10 @@ impl ScribeImpl {
     /// Return the bounded setup and ownership snapshot used by test harnesses.
     pub fn inspection_snapshot(&self) -> Result<ScribeInspectionSnapshot, ScribeError> {
         let stats = self.memtable_stats()?;
-        let memory = self.memory.snapshot();
+        let memory = self.memory.snapshot().with_ingress_watermarks(
+            self.pressure_config.ingress_high_water_percent,
+            self.pressure_config.ingress_low_water_percent,
+        );
         let owner_snapshots = self.shards.memtable_snapshots()?;
         let bucket_memory = owner_snapshots
             .iter()
@@ -1469,6 +1653,10 @@ impl ScribeImpl {
             parent_memory_limit: memory.bifrost_limit_bytes,
             scribe_used_memory: memory.scribe_total_bytes,
             scribe_memory_limit: memory.scribe_limit_bytes,
+            ingress_used_memory: memory.ingress_occupancy_bytes,
+            ingress_memory_limit: memory.ingress_limit_bytes,
+            ingress_high_water_memory: memory.ingress_high_water_bytes,
+            ingress_low_water_memory: memory.ingress_low_water_bytes,
             wal_disk_bytes: self.wal.bytes_on_disk(),
         })
     }

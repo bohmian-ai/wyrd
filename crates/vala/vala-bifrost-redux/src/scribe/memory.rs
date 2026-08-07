@@ -50,6 +50,40 @@ pub(crate) fn persistence_workspace_bytes(arrow_bytes: usize) -> usize {
         .saturating_add(8 * 1024 * 1024)
 }
 
+/// Target size for one active bucket (`S / 4`) within the fixed bucket bounds.
+///
+/// Pure function of the Scribe child limit `scribe_limit`; shared by
+/// [`ScribeMemoryBudget::active_bucket_target_bytes`] and the governor snapshot
+/// so both derive the identical value without duplicating the formula (D75).
+#[must_use]
+fn active_bucket_target_for(scribe_limit: usize) -> usize {
+    (scribe_limit / 4).clamp(MIN_BUCKET_BYTES, MAX_BUCKET_BYTES)
+}
+
+/// Persistence workspace that ingress must never consume, from `scribe_limit`.
+///
+/// Pure function of the Scribe child limit; see
+/// [`ScribeMemoryBudget::persistence_headroom_bytes`] for the reservation
+/// rationale. Extracted so the governor snapshot can derive the ingress ceiling
+/// without a [`ScribeMemoryBudget`] handle (D75 formula unchanged).
+#[must_use]
+fn persistence_headroom_for(scribe_limit: usize) -> usize {
+    persistence_workspace_bytes(active_bucket_target_for(scribe_limit).max(2 * MAX_REQUEST_BYTES))
+}
+
+/// Child-budget ceiling available to ingress reservations, from `scribe_limit`.
+///
+/// Pure function of the Scribe child limit; see
+/// [`ScribeMemoryBudget::ingress_limit_bytes`] for the semantics. Shared with
+/// the governor snapshot so `MemorySnapshot::ingress_limit_bytes` matches the
+/// admission ceiling exactly (D75 formula unchanged).
+#[must_use]
+fn ingress_limit_for(scribe_limit: usize) -> usize {
+    scribe_limit
+        .saturating_sub(persistence_headroom_for(scribe_limit))
+        .max(scribe_limit / 4)
+}
+
 /// Memory categories charged by the Scribe lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -100,6 +134,29 @@ pub struct MemorySnapshot {
     pub cgroup_current_bytes: Option<usize>,
     /// Cgroup memory limit used for the external-pressure tripwire.
     pub cgroup_limit_bytes: Option<usize>,
+    /// Current ingress bytes charged (the value ingress admission counts).
+    ///
+    /// This equals `scribe_total_bytes`: ingress admission charges the whole
+    /// Scribe child total against the ingress ceiling, so the pressure-seal
+    /// watermark decision keys on this value rather than
+    /// [`MemorySnapshot::effective_pressure_percent`] (D83).
+    pub ingress_occupancy_bytes: usize,
+    /// Ingress reservation ceiling (`limit_bytes() - persistence_headroom`).
+    ///
+    /// This is the denominator the watermark decision divides by; it is smaller
+    /// than `scribe_limit_bytes`, so a run pinned at the ingress ceiling can sit
+    /// below the effective-pressure threshold yet be at 100% ingress occupancy.
+    pub ingress_limit_bytes: usize,
+    /// High-water byte threshold = `ingress_limit_bytes * high_water / 100`.
+    ///
+    /// Populated by [`MemorySnapshot::with_ingress_watermarks`] from the
+    /// runtime [`ScribePressureConfig`]; a bare governor snapshot leaves it `0`.
+    pub ingress_high_water_bytes: usize,
+    /// Low-water byte target = `ingress_limit_bytes * low_water / 100`.
+    ///
+    /// The release target pressure sealing drains toward. Populated by
+    /// [`MemorySnapshot::with_ingress_watermarks`]; `0` on a bare snapshot.
+    pub ingress_low_water_bytes: usize,
 }
 
 impl MemorySnapshot {
@@ -131,6 +188,74 @@ impl MemorySnapshot {
             _ => 0,
         };
         managed.max(parent).max(cgroup)
+    }
+
+    /// Ingress occupancy as a percent of the ingress ceiling.
+    ///
+    /// This is `ingress_occupancy_bytes * 100 / ingress_limit_bytes` with a
+    /// saturating multiply and an `ingress_limit_bytes.max(1)` denominator so a
+    /// degenerate zero ceiling reports 100% rather than dividing by zero. This
+    /// is the only ratio the pressure-seal watermark decision consults;
+    /// [`MemorySnapshot::effective_pressure_percent`] (whose denominator is the
+    /// larger `scribe_limit_bytes`) is deliberately not used for admission (D83).
+    #[must_use]
+    pub fn ingress_occupancy_percent(self) -> usize {
+        self.ingress_occupancy_bytes
+            .saturating_mul(100)
+            .checked_div(self.ingress_limit_bytes.max(1))
+            .unwrap_or(100)
+    }
+
+    /// Return a copy of this snapshot with the ingress watermark bytes filled
+    /// from the runtime high/low-water percents.
+    ///
+    /// The governor snapshot populates `ingress_occupancy_bytes` and
+    /// `ingress_limit_bytes` but cannot know the runtime
+    /// [`crate::scribe::ScribePressureConfig`] percents, so the Scribe runtime
+    /// applies them here before making a watermark decision (and before T40
+    /// exports the four ingress gauges). `high_water_percent` and
+    /// `low_water_percent` are percents of `ingress_limit_bytes`; the caller is
+    /// responsible for the `low_water < high_water` invariant, which
+    /// [`crate::scribe::ScribePressureConfig`] enforces at construction.
+    #[must_use]
+    pub fn with_ingress_watermarks(
+        mut self,
+        high_water_percent: usize,
+        low_water_percent: usize,
+    ) -> Self {
+        self.ingress_high_water_bytes =
+            self.ingress_limit_bytes.saturating_mul(high_water_percent) / 100;
+        self.ingress_low_water_bytes =
+            self.ingress_limit_bytes.saturating_mul(low_water_percent) / 100;
+        self
+    }
+
+    /// Decide the pressure-seal release target from the ingress watermarks.
+    ///
+    /// This is the single, pure hysteresis decision shared by the admission
+    /// path and the periodic age scanner (both call it through
+    /// [`crate::scribe::ScribeImpl`]), so the seal contract is defined once:
+    ///
+    /// * Below `high_water_percent` of the ingress ceiling, or already at/below
+    ///   the low-water byte target, it returns `None` — the no-op half of the
+    ///   band that keeps the decision from thrashing on every tick.
+    /// * At or above the high-water mark it returns `Some(bytes_to_release)`,
+    ///   where the release target is the low-water byte mark filled by
+    ///   [`Self::with_ingress_watermarks`]:
+    ///   `ingress_occupancy_bytes - ingress_low_water_bytes` (saturating).
+    ///
+    /// The comparison uses [`Self::ingress_occupancy_percent`], whose
+    /// denominator is `ingress_limit_bytes`, not the larger `scribe_limit_bytes`
+    /// of [`Self::effective_pressure_percent`] (D83).
+    #[must_use]
+    pub fn pressure_release_bytes(self, high_water_percent: usize) -> Option<usize> {
+        if self.ingress_occupancy_percent() < high_water_percent {
+            return None;
+        }
+        let to_release = self
+            .ingress_occupancy_bytes
+            .saturating_sub(self.ingress_low_water_bytes);
+        (to_release > 0).then_some(to_release)
     }
 }
 
@@ -455,11 +580,12 @@ impl BifrostMemoryGovernor {
     /// `parent_only` is derived by the caller.
     #[must_use]
     pub fn snapshot(&self) -> MemorySnapshot {
+        let scribe_total_bytes = self.inner.scribe_total_bytes.load(Ordering::Acquire);
         MemorySnapshot {
             pod_limit_bytes: self.pod_limit_bytes(),
             bifrost_limit_bytes: self.bifrost_limit_bytes(),
             bifrost_total_bytes: self.inner.bifrost_total_bytes.load(Ordering::Acquire),
-            scribe_total_bytes: self.inner.scribe_total_bytes.load(Ordering::Acquire),
+            scribe_total_bytes,
             scribe_limit_bytes: self.scribe_limit_bytes(),
             oracle_total_bytes: self.inner.oracle_total_bytes.load(Ordering::Acquire),
             oracle_limit_bytes: self.oracle_limit_bytes(),
@@ -468,6 +594,16 @@ impl BifrostMemoryGovernor {
             }),
             cgroup_current_bytes: self.cgroup_current(),
             cgroup_limit_bytes: self.inner.cgroup_limit_bytes,
+            // Ingress admission charges the whole Scribe child total against the
+            // ingress ceiling, so occupancy is `scribe_total_bytes` over the
+            // ceiling derived from the Scribe child limit. High/low-water bytes
+            // depend on the runtime pressure config and are filled by
+            // `MemorySnapshot::with_ingress_watermarks`; a bare snapshot leaves
+            // them zero.
+            ingress_occupancy_bytes: scribe_total_bytes,
+            ingress_limit_bytes: ingress_limit_for(self.scribe_limit_bytes()),
+            ingress_high_water_bytes: 0,
+            ingress_low_water_bytes: 0,
         }
     }
 
@@ -502,7 +638,7 @@ impl ScribeMemoryBudget {
     /// Target size for one active bucket (`S / 4`) within the fixed bounds.
     #[must_use]
     pub fn active_bucket_target_bytes(&self) -> usize {
-        (self.limit_bytes() / 4).clamp(MIN_BUCKET_BYTES, MAX_BUCKET_BYTES)
+        active_bucket_target_for(self.limit_bytes())
     }
 
     /// Returns the persistence workspace that ingress must never consume.
@@ -513,7 +649,7 @@ impl ScribeMemoryBudget {
     /// from headroom that ingress admission can never consume.
     #[must_use]
     pub fn persistence_headroom_bytes(&self) -> usize {
-        persistence_workspace_bytes(self.active_bucket_target_bytes().max(2 * MAX_REQUEST_BYTES))
+        persistence_headroom_for(self.limit_bytes())
     }
 
     /// Returns the child-budget ceiling available to ingress reservations.
@@ -524,9 +660,7 @@ impl ScribeMemoryBudget {
     /// persistable from headroom that ingress admission can never consume.
     #[must_use]
     pub fn ingress_limit_bytes(&self) -> usize {
-        self.limit_bytes()
-            .saturating_sub(self.persistence_headroom_bytes())
-            .max(self.limit_bytes() / 4)
+        ingress_limit_for(self.limit_bytes())
     }
 
     /// Reserve category bytes without waiting.
@@ -536,6 +670,22 @@ impl ScribeMemoryBudget {
         bytes: usize,
     ) -> Result<MemoryReservation, ScribeError> {
         self.try_reserve_with_limit(category, bytes, self.limit_bytes())
+    }
+
+    /// Reports whether the cgroup memory tripwire is engaged at or above 90%.
+    ///
+    /// This mirrors the immediate fail-closed guard inside
+    /// [`Self::try_reserve_with_limit`]. Admission consults it to keep the
+    /// cgroup tripwire an immediate `IngestBusy` rather than routing it through
+    /// the ingress-pressure seal-and-retry path, which cannot relieve
+    /// container-level pressure. Returns `false` when no cgroup limit is
+    /// observable.
+    #[must_use]
+    pub fn cgroup_tripwire_engaged(&self) -> bool {
+        matches!(
+            self.parent.cgroup_pressure(),
+            Some((current, limit)) if current.saturating_mul(100) >= limit.saturating_mul(90)
+        )
     }
 
     /// Reserve ingress bytes without consuming persistence headroom.
@@ -1364,6 +1514,82 @@ mod tests {
         assert_eq!(budget.snapshot().total_bytes(), budget.limit_bytes());
         drop(maintenance);
         drop(ingress);
+    }
+
+    /// `ingress_occupancy_percent` divides by the ingress ceiling, not the
+    /// larger Scribe child limit, so a run pinned at the ingress ceiling reports
+    /// 100% occupancy while effective pressure stays well below it (D83).
+    #[test]
+    fn ingress_occupancy_percent_uses_ingress_limit_denominator() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let ceiling = budget.ingress_limit_bytes();
+        let reservation = budget
+            .try_reserve_ingress(MemoryCategory::Raw, ceiling)
+            .expect("fill ingress ceiling");
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.ingress_limit_bytes, ceiling);
+        assert_eq!(snapshot.ingress_occupancy_bytes, ceiling);
+        assert_eq!(snapshot.ingress_occupancy_percent(), 100);
+        // The identical occupancy over the larger Scribe child limit is strictly
+        // below 100%, proving the two ratios use different denominators.
+        assert!(snapshot.effective_pressure_percent() < 100);
+        drop(reservation);
+    }
+
+    /// `with_ingress_watermarks` fills the high/low-water bytes as percents of
+    /// the ingress ceiling, giving the pressure decision its hysteresis band.
+    #[test]
+    fn with_ingress_watermarks_fills_hysteresis_band_from_ingress_limit() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let ceiling = budget.ingress_limit_bytes();
+        let snapshot = budget.snapshot().with_ingress_watermarks(75, 50);
+        assert_eq!(snapshot.ingress_high_water_bytes, ceiling * 75 / 100);
+        assert_eq!(snapshot.ingress_low_water_bytes, ceiling * 50 / 100);
+        assert!(snapshot.ingress_low_water_bytes < snapshot.ingress_high_water_bytes);
+    }
+
+    /// `pressure_release_bytes` is the pure hysteresis decision: at or above the
+    /// high-water mark it requests a seal that drains to the low-water target
+    /// (`occupancy - low_water`), and below the high-water mark it is a no-op.
+    /// The `low_water < high_water` band is preserved by `with_ingress_watermarks`.
+    #[test]
+    fn watermark_hysteresis_seals_from_high_to_low() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let ceiling = budget.ingress_limit_bytes();
+
+        // Occupancy above the 75% high-water mark: a seal is requested and its
+        // release target is exactly the distance down to the low-water byte mark.
+        let above = budget
+            .try_reserve_ingress(MemoryCategory::Raw, ceiling * 80 / 100)
+            .expect("reserve above the high-water mark");
+        let high = budget.snapshot().with_ingress_watermarks(75, 50);
+        assert!(high.ingress_occupancy_percent() >= 75);
+        assert!(high.ingress_low_water_bytes < high.ingress_high_water_bytes);
+        let to_release = high
+            .pressure_release_bytes(75)
+            .expect("occupancy above high-water requests a seal");
+        assert_eq!(
+            to_release,
+            high.ingress_occupancy_bytes - high.ingress_low_water_bytes,
+            "release target drains occupancy down to the low-water mark"
+        );
+        drop(above);
+
+        // Occupancy below the high-water mark: no seal is requested (no-op half).
+        let below = budget
+            .try_reserve_ingress(MemoryCategory::Raw, ceiling * 60 / 100)
+            .expect("reserve below the high-water mark");
+        let low = budget.snapshot().with_ingress_watermarks(75, 50);
+        assert!(low.ingress_occupancy_percent() < 75);
+        assert_eq!(
+            low.pressure_release_bytes(75),
+            None,
+            "below high-water the pressure decision is a no-op"
+        );
+        drop(below);
     }
 
     /// Proves that an explicit Scribe budget is accepted within bounds and that an

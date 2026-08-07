@@ -52,15 +52,17 @@ impl ScribeImpl {
             .measured_wire_bytes
             .saturating_add(REQUEST_OVERHEAD_BYTES);
         let mut reservation = self.admission.try_reserve(table.clone(), initial_bytes)?;
-        let mut memory = self
+        let mut memory = match self
             .memory
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
-            .map_err(|_| {
-                super::record_scribe_rejection("memory");
-                ScribeError::IngestBusy {
-                    table: table.clone(),
-                }
-            })?;
+        {
+            Ok(reservation) => reservation,
+            Err(_) => self.reserve_ingress_after_pressure_seal(
+                MemoryCategory::Raw,
+                initial_bytes,
+                &table,
+            )?,
+        };
         memory.attach_shard(self.memory.shard_accounting(), shard);
 
         #[cfg(any(test, feature = "test-support"))]
@@ -82,12 +84,7 @@ impl ScribeImpl {
             .saturating_add(frame.measured_wire_bytes)
             .saturating_add(REQUEST_OVERHEAD_BYTES);
         reservation.resize(estimated_bytes)?;
-        memory.resize_ingress(estimated_bytes).map_err(|_| {
-            super::record_scribe_rejection("memory");
-            ScribeError::IngestBusy {
-                table: table.clone(),
-            }
-        })?;
+        self.resize_ingress_after_pressure_seal(&mut memory, estimated_bytes, &table)?;
         memory.transfer_category(MemoryCategory::Prepared);
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
@@ -135,6 +132,77 @@ impl ScribeImpl {
         })
     }
 
+    /// Reserve ingress bytes after one coordinated pressure seal and single retry.
+    ///
+    /// This is the admission-side realization of the D83 flush-first contract:
+    /// on an ingress ceiling rejection, request a shard-count-invariant pressure
+    /// seal toward the low-water mark ([`ScribeImpl::request_pressure_seal_toward_low_water`]),
+    /// then retry the reservation exactly once. The cgroup 90% tripwire is left
+    /// as an immediate `IngestBusy` — a container-level limit that a Scribe
+    /// pressure seal cannot relieve — and is not retried. A retry that still
+    /// fails records the memory rejection and returns `IngestBusy`, deferring to
+    /// D71 client backoff for eventual admission. There is no busy-wait: freezing
+    /// and persistence proceed asynchronously between the seal request and retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the cgroup tripwire is engaged or
+    /// when the single post-seal retry still cannot fit under the ingress ceiling.
+    fn reserve_ingress_after_pressure_seal(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+        table: &str,
+    ) -> Result<crate::scribe::memory::MemoryReservation, ScribeError> {
+        if !self.memory.cgroup_tripwire_engaged() {
+            self.request_pressure_seal_toward_low_water();
+            if let Ok(reservation) = self.memory.try_reserve_ingress(category, bytes) {
+                return Ok(reservation);
+            }
+        }
+        super::record_scribe_rejection("memory");
+        Err(ScribeError::IngestBusy {
+            table: table.to_owned(),
+        })
+    }
+
+    /// Grow an existing ingress reservation after one pressure seal and retry.
+    ///
+    /// The decode step raises the required ingress bytes from the pre-decode
+    /// estimate to the measured Arrow size, so the reservation must grow. This
+    /// mirrors [`Self::reserve_ingress_after_pressure_seal`] for the in-place
+    /// resize path: on an ingress ceiling rejection it requests a
+    /// shard-count-invariant pressure seal toward the low-water mark and retries
+    /// the resize exactly once, while the cgroup 90% tripwire stays an immediate
+    /// `IngestBusy` that a Scribe seal cannot relieve. A retry that still fails
+    /// records the memory rejection and returns `IngestBusy`, deferring to D71
+    /// client backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the cgroup tripwire is engaged or
+    /// when the single post-seal resize retry still exceeds the ingress ceiling.
+    fn resize_ingress_after_pressure_seal(
+        &self,
+        memory: &mut crate::scribe::memory::MemoryReservation,
+        estimated_bytes: usize,
+        table: &str,
+    ) -> Result<(), ScribeError> {
+        if memory.resize_ingress(estimated_bytes).is_ok() {
+            return Ok(());
+        }
+        if !self.memory.cgroup_tripwire_engaged() {
+            self.request_pressure_seal_toward_low_water();
+            if memory.resize_ingress(estimated_bytes).is_ok() {
+                return Ok(());
+            }
+        }
+        super::record_scribe_rejection("memory");
+        Err(ScribeError::IngestBusy {
+            table: table.to_owned(),
+        })
+    }
+
     /// Pause one admitted write at the deterministic test-support barrier.
     #[cfg(any(test, feature = "test-support"))]
     async fn pause_admitted_ingest_for_test(&self) {
@@ -148,5 +216,55 @@ impl ScribeImpl {
             let _completion = super::IngestStallCompletion(&stall);
             stall.release.notified().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScribeImpl;
+    use crate::contracts::ScribeError;
+    use crate::scribe::memory::MemoryCategory;
+    use std::time::{Duration, Instant};
+
+    /// The admission memory path rejects with `IngestBusy` **only** when the
+    /// coordinated pressure seal cannot free ingress capacity (the D83
+    /// reject-only-when-backlogged contract), and admits as soon as capacity is
+    /// available.
+    ///
+    /// A freshly constructed Scribe holds no writable buckets, so a pressure
+    /// seal selects no victims and cannot drain a pinned ceiling: the single
+    /// post-seal retry must still reject. Once the pin is released (capacity
+    /// available, as it would be after an asynchronous seal completed), the
+    /// same admission path admits instead of rejecting — proving the rejection
+    /// is conditional on genuine backlog rather than unconditional.
+    #[tokio::test]
+    async fn admission_rejects_only_when_seal_cannot_free() {
+        let scribe = ScribeImpl::new();
+        let ceiling = scribe.memory.ingress_limit_bytes();
+
+        // Pin ingress at its ceiling: no bucket exists to seal, so the retry
+        // after the pressure-seal request cannot fit and must reject.
+        let pinned = scribe
+            .memory
+            .try_reserve_ingress(MemoryCategory::Raw, ceiling)
+            .expect("pin ingress at the ceiling");
+        assert!(
+            matches!(
+                scribe.reserve_ingress_after_pressure_seal(MemoryCategory::Raw, 1, "table"),
+                Err(ScribeError::IngestBusy { .. })
+            ),
+            "a backlogged ceiling must reject after the seal request"
+        );
+
+        // Release the pin so capacity is available; the same path now admits.
+        drop(pinned);
+        let admitted = scribe
+            .reserve_ingress_after_pressure_seal(MemoryCategory::Raw, ceiling / 2, "table")
+            .expect("admits once ingress capacity is available");
+        drop(admitted);
+
+        scribe
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
     }
 }

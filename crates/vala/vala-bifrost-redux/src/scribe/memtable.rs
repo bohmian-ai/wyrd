@@ -23,8 +23,48 @@ use crate::scribe::wal::ScribeAppendMeta;
 
 /// Estimated Arrow bytes at which the active generation rotates.
 pub const MEMTABLE_ROTATION_BYTES: usize = 512 * 1024 * 1024;
-/// Maximum age of an active generation before the lifecycle scanner requests rotation.
+/// Fallback active-generation max age used by [`Memtable::new`] and
+/// [`Memtable::new_with_rotation`] when no runtime value is supplied.
+///
+/// Production wiring threads the D83 seconds-scale
+/// [`crate::scribe::ScribePressureConfig::seal_max_age`] (30 s) through the
+/// shard runtime instead of reading this constant, so trickle workloads get
+/// bounded visibility latency. This value is retained only so bare-`Memtable`
+/// unit tests keep compiling.
 pub const ACTIVE_GENERATION_MAX_AGE: Duration = Duration::from_mins(10);
+
+/// Closed reason a memtable bucket was sealed/rotated (D83/D84 seam).
+///
+/// Every seal or rotation event classifies into exactly one variant.
+/// [`MemtableBucket::should_seal_at`] distinguishes [`SealTriggerReason::Size`]
+/// from [`SealTriggerReason::Age`]; the coordinated ingress-pressure path tags
+/// [`SealTriggerReason::Pressure`]. T40 (18-H2) reads this to label the
+/// `bifrost_scribe_seal_total{trigger}` counter, so the variant names are a
+/// normative interface, not implementor latitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealTriggerReason {
+    /// `bytes_accumulated >= rotation_bytes` (size trigger).
+    Size,
+    /// Active generation exceeded `seal_max_age` (age trigger).
+    Age,
+    /// Coordinated ingress-pressure seal toward the low-water mark.
+    Pressure,
+}
+
+impl SealTriggerReason {
+    /// Return the stable lowercase label used by seal telemetry.
+    ///
+    /// The returned string is the value T40 attaches as the `trigger` label on
+    /// `bifrost_scribe_seal_total`; keep it stable across changes.
+    #[must_use]
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::Age => "age",
+            Self::Pressure => "pressure",
+        }
+    }
+}
 
 /// Memtable — in-memory row buffer keyed by seal-key.
 ///
@@ -42,6 +82,13 @@ pub struct Memtable {
     pub(crate) immutable: Arc<Mutex<HashMap<SealKey, Vec<ImmutableEntry>>>>,
     next_seal_id: Arc<AtomicU64>,
     rotation_bytes: usize,
+    /// Runtime active-generation max age consulted by the seal predicates.
+    ///
+    /// Threaded from [`crate::scribe::ScribePressureConfig::seal_max_age`]
+    /// through the shard runtime the same way `rotation_bytes` is threaded, so
+    /// the age trigger uses the configured seconds-scale value rather than the
+    /// [`ACTIVE_GENERATION_MAX_AGE`] constant.
+    seal_max_age: Duration,
 }
 
 /// Aggregate memory and generation state for a Scribe pod.
@@ -101,22 +148,41 @@ impl Memtable {
         Self::new_with_rotation(MEMTABLE_ROTATION_BYTES)
     }
 
-    /// Construct a memtable with an explicit active-bucket rotation byte threshold.
+    /// Construct a memtable with an explicit rotation threshold and the fallback
+    /// [`ACTIVE_GENERATION_MAX_AGE`].
     ///
     /// The grace-period parameter that previously existed here has been removed.
     /// Committed generations are immediately retirement-eligible; there is no
-    /// configurable delay.
+    /// configurable delay. Production wiring uses [`Memtable::new_with_config`]
+    /// to supply the runtime [`crate::scribe::ScribePressureConfig::seal_max_age`];
+    /// this constructor retains the constant fallback for bare-`Memtable` tests.
     ///
     /// # Errors
     ///
     /// This constructor is infallible; it always returns a fresh, empty memtable.
     #[must_use]
     pub fn new_with_rotation(rotation_bytes: usize) -> Self {
+        Self::new_with_config(rotation_bytes, ACTIVE_GENERATION_MAX_AGE)
+    }
+
+    /// Construct a memtable with an explicit rotation threshold and max age.
+    ///
+    /// This is the constructor production wiring uses: the shard runtime threads
+    /// `rotation_bytes` (the active-bucket target) and the configured
+    /// `seal_max_age` (D83 default 30 s) so the size and age seal predicates read
+    /// runtime values rather than module constants.
+    ///
+    /// # Errors
+    ///
+    /// This constructor is infallible; it always returns a fresh, empty memtable.
+    #[must_use]
+    pub fn new_with_config(rotation_bytes: usize, seal_max_age: Duration) -> Self {
         Self {
             writable: Arc::new(Mutex::new(HashMap::new())),
             immutable: Arc::new(Mutex::new(HashMap::new())),
             next_seal_id: Arc::new(AtomicU64::new(1)),
             rotation_bytes,
+            seal_max_age,
         }
     }
 
@@ -319,7 +385,9 @@ impl Memtable {
         })?;
 
         if let Some(bucket) = buckets.get(seal_key) {
-            Ok(bucket.should_seal_at(Instant::now(), self.rotation_bytes))
+            Ok(bucket
+                .should_seal_at(Instant::now(), self.rotation_bytes, self.seal_max_age)
+                .is_some())
         } else {
             Ok(false)
         }
@@ -488,7 +556,7 @@ impl Memtable {
             })?;
         Ok(buckets
             .iter()
-            .filter(|(_, bucket)| bucket.is_age_expired(now))
+            .filter(|(_, bucket)| bucket.is_age_expired(now, self.seal_max_age))
             .map(|(seal_key, _)| seal_key.clone())
             .collect())
     }
@@ -966,13 +1034,32 @@ impl MemtableBucket {
         self.last_insert_at = Instant::now();
     }
 
-    fn should_seal_at(&self, now: Instant, rotation_bytes: usize) -> bool {
-        self.bytes_accumulated >= rotation_bytes
-            || now.saturating_duration_since(self.first_insert_at) >= ACTIVE_GENERATION_MAX_AGE
+    /// Classify whether this bucket should seal, and why, at `now`.
+    ///
+    /// Returns [`SealTriggerReason::Size`] when accumulated Arrow bytes have
+    /// reached `rotation_bytes`, otherwise [`SealTriggerReason::Age`] when the
+    /// active generation has lived at least `seal_max_age`, otherwise `None`.
+    /// Size takes precedence so a bucket that is both full and old is labelled
+    /// by the primary (size) trigger. The pressure path does not flow through
+    /// this predicate; it tags [`SealTriggerReason::Pressure`] directly.
+    fn should_seal_at(
+        &self,
+        now: Instant,
+        rotation_bytes: usize,
+        seal_max_age: Duration,
+    ) -> Option<SealTriggerReason> {
+        if self.bytes_accumulated >= rotation_bytes {
+            Some(SealTriggerReason::Size)
+        } else if self.is_age_expired(now, seal_max_age) {
+            Some(SealTriggerReason::Age)
+        } else {
+            None
+        }
     }
 
-    fn is_age_expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.first_insert_at) >= ACTIVE_GENERATION_MAX_AGE
+    /// Report whether the active generation has reached `seal_max_age` at `now`.
+    fn is_age_expired(&self, now: Instant, seal_max_age: Duration) -> bool {
+        now.saturating_duration_since(self.first_insert_at) >= seal_max_age
     }
 
     fn freeze(self, seal_id: u64) -> FrozenMemtable {
@@ -1735,6 +1822,101 @@ mod tests {
             150,
         );
         assert_eq!(selected, vec![first]);
+    }
+
+    /// Victim selection depends only on the aggregated candidate set, never on
+    /// how a seal-key's buckets were partitioned across shards.
+    ///
+    /// This pins the D83 shard-count invariance: T35 batch-spread routing
+    /// scatters one seal-key's buckets over 16 shards, and the pressure path
+    /// flattens every shard's `pressure_candidates` before selecting. Whether
+    /// the same three buckets arrive as one list or split across four shard
+    /// sub-lists (one empty), the flattened selection is identical.
+    #[test]
+    fn pressure_selection_is_shard_count_invariant() {
+        let base = make_test_seal_key();
+        let candidate = |day: u32, bytes: usize| PressureCandidate {
+            seal_key: SealKey::new(
+                base.tenant,
+                base.table.clone(),
+                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, day).expect("valid date")),
+            ),
+            writable_bytes: bytes,
+            first_insert_at: Instant::now(),
+            oldest_wal_lsn: None,
+        };
+        let a = candidate(10, 300);
+        let b = candidate(11, 200);
+        let c = candidate(12, 100);
+        let to_release = 450;
+
+        let one_shard = vec![a.clone(), b.clone(), c.clone()];
+        let four_shards: Vec<PressureCandidate> = vec![
+            vec![a.clone()],
+            Vec::new(),
+            vec![b.clone(), c.clone()],
+            Vec::new(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        assert_eq!(
+            Memtable::select_pressure_victims(one_shard, to_release),
+            Memtable::select_pressure_victims(four_shards, to_release),
+        );
+    }
+
+    /// The configured `seal_max_age` threads through `should_seal` so the age
+    /// trigger fires on the runtime value rather than the 10-minute constant.
+    ///
+    /// A zero max-age makes the active generation immediately age-expired, so a
+    /// freshly inserted (sub-rotation) bucket seals at once — proving the value
+    /// passed to [`Memtable::new_with_config`] reaches the age predicate.
+    #[test]
+    fn configured_seal_max_age_threads_into_age_trigger() {
+        let memtable = Memtable::new_with_config(1_000_000, Duration::from_secs(0));
+        let key = make_test_seal_key();
+        memtable
+            .insert(
+                &key,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("insert");
+        assert!(memtable.should_seal(&key).expect("should_seal"));
+    }
+
+    /// The age trigger fires exactly at `seal_max_age`, and size takes priority.
+    ///
+    /// Below `rotation_bytes` only the age trigger can fire: at `29s` the bucket
+    /// is not yet expired, at the configured `30s` it seals as
+    /// [`SealTriggerReason::Age`].
+    #[test]
+    fn age_trigger_seals_at_configured_thirty_seconds() {
+        let seal_max_age = Duration::from_secs(30);
+        let memtable = Memtable::new_with_config(1_000_000, seal_max_age);
+        let key = make_test_seal_key();
+        memtable
+            .insert(
+                &key,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("insert");
+        let buckets = memtable.writable.lock().expect("writable lock");
+        let bucket = buckets.get(&key).expect("bucket");
+        let opened = bucket.first_insert_at;
+        assert_eq!(
+            bucket.should_seal_at(opened + Duration::from_secs(29), 1_000_000, seal_max_age),
+            None,
+        );
+        assert_eq!(
+            bucket.should_seal_at(opened + seal_max_age, 1_000_000, seal_max_age),
+            Some(SealTriggerReason::Age),
+        );
     }
 
     #[test]

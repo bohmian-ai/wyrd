@@ -46,6 +46,20 @@ pub struct ScribeInspectionSnapshot {
     pub scribe_used_memory: usize,
     /// Scribe child memory ceiling.
     pub scribe_memory_limit: usize,
+    /// Current ingress bytes charged against the ingress ceiling.
+    ///
+    /// Equals `scribe_used_memory`; ingress admission charges the whole Scribe
+    /// child total against the (smaller) ingress ceiling. Exposed so harnesses
+    /// can observe the D83 pressure-seal watermark decision — occupancy against
+    /// [`Self::ingress_memory_limit`] and the high/low-water marks below —
+    /// without recomputing the runtime pressure config.
+    pub ingress_used_memory: usize,
+    /// Ingress reservation ceiling (`limit_bytes - persistence_headroom`).
+    pub ingress_memory_limit: usize,
+    /// High-water byte threshold that triggers a coordinated pressure seal.
+    pub ingress_high_water_memory: usize,
+    /// Low-water byte target that pressure sealing drains toward.
+    pub ingress_low_water_memory: usize,
     /// WAL bytes retained on disk.
     pub wal_disk_bytes: u64,
 }

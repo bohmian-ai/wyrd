@@ -1294,9 +1294,33 @@ ingest topology; until it ships, multi-pod ingest is out of scope.
 Control operations (seal-key freeze, live-tail snapshot, pressure flush, WAL
 pressure flush) that were previously addressed to the one shard computed by
 `shard_for(tenant, table)` are now broadcast to all sixteen shards. Shards that
-hold no bucket for a given key no-op and return empty or `None` results; the
-caller collects the first real result (for freeze) or the merged union (for
-snapshot and flush). No new cross-shard state is introduced.
+hold no bucket for a given key no-op and return `None`; the caller collects the
+merged union across every lane. Because `batch_id` spreads one seal-key's
+buckets over multiple lanes, `freeze_key` collects **every** shard's frozen
+memtable (not the first), pre-commits each within the caller's tenant
+transaction, and rolls back any already-committed generations if a later one
+fails — so no frozen Arrow data is orphaned. An empty aggregate (no lane held
+the key) is a fail-closed `Internal` error, not a silent success. No new
+cross-shard state is introduced.
+
+**Scribe ingress pressure sealing (D83).** Admission is gated by ingress
+*occupancy*, not effective child pressure: occupancy is
+`scribe_total_bytes / ingress_limit_bytes`, where the ingress ceiling excludes
+the persistence headroom (D75). A single hysteresis band drives every seal
+decision — configured by `ScribePressureConfig` with D83 defaults of a 75%
+high-water mark, a 50% low-water target, and a 30-second active-generation
+`seal_max_age` (a `low < high` invariant is enforced at construction). Both the
+admission path and the periodic age scanner call one shared helper: at or above
+the high-water mark it seals the largest writable buckets aggregated across all
+sixteen lanes (shard-count-invariant) toward the low-water target and returns;
+below low-water it no-ops. Sealing is flush-first and drain-before-reject — a
+memory-ceiling rejection returns `IngestBusy` only after a pressure seal is
+requested and a single reservation retry still fails, deferring to D71 client
+backoff for eventual admission. Freezing only recategorizes bytes; persistence
+encode-and-retire frees them asynchronously, so there is no synchronous
+busy-wait. The cgroup 90% tripwire remains an immediate `IngestBusy`: a
+container-level limit that a Scribe-scoped seal cannot relieve is never routed
+through the seal-and-retry path.
 
 Crash recovery reads the shard lane from the WAL segment header (`shard_id`
 field) and dispatches each replayed state directly to `shard_senders[shard_id]`

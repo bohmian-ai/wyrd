@@ -13,8 +13,12 @@ use opendal::services::Memory;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
-use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
-use vala_bifrost_redux::contracts::{Scribe, ScribeAppend, ScribeError};
+use vala_bifrost_redux::catalog::{
+    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
+};
+use vala_bifrost_redux::contracts::{
+    IngressPayload, Scribe, ScribeAppend, ScribeError, ScribeIngressFrame,
+};
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
@@ -972,5 +976,125 @@ async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
     }
     assert_eq!(audit_count(&fixture).await, 4);
     assert_eq!(object_paths(&fixture).await.len(), 4);
+    fixture.stop().await;
+}
+
+/// Builds a native Arrow IPC frame carrying a caller-supplied `wyrd_event_time`
+/// column whose two rows fall on two distinct UTC partition days.
+///
+/// The `wyrd_event_time` field uses the managed physical type
+/// (`Timestamp(Microsecond, UTC)`) so the native ingest contract accepts it as
+/// the authoritative event time instead of stamping the server receipt time.
+fn native_event_time_frame(
+    tenant: DataTenantId,
+    table_ref: &TableRef,
+    first_day_micros: i64,
+    second_day_micros: i64,
+) -> ScribeIngressFrame {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![first_day_micros, second_day_micros])
+                    .with_timezone("UTC"),
+            ),
+        ],
+    )
+    .expect("native caller event-time batch is valid");
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer");
+    writer.write(&batch).expect("IPC batch");
+    writer.finish().expect("IPC finish");
+
+    let user_only = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+    let request_id = RequestId::now_v7();
+    ScribeIngressFrame {
+        principal: principal(tenant),
+        binding: TenantTableBinding::resolve((tenant, table_ref.clone())).expect("binding"),
+        expected_schema_fingerprint: SchemaFingerprint::from_arrow_schema(&user_only),
+        request_id: request_id.clone(),
+        batch_id: uuid::Uuid::now_v7(),
+        audit_event: audit_event("bifrost.append", request_id),
+        measured_wire_bytes: bytes.len(),
+        payload: IngressPayload::ArrowIpc(bytes.into()),
+    }
+}
+
+/// End-to-end proof that native ingest honours a caller-supplied event time:
+/// two rows stamped with event times on two distinct UTC days land in two
+/// distinct partition-day objects, matching the projected (OTLP) contract.
+#[tokio::test]
+async fn native_caller_event_time_lands_on_two_partition_days() {
+    let fixture = PersistenceFixture::start().await;
+    // 2026-07-14T12:00:00Z and 2026-07-16T12:00:00Z: two distinct partition days.
+    let first_day_micros = chrono::NaiveDate::from_ymd_opt(2026, 7, 14)
+        .expect("valid day")
+        .and_hms_opt(12, 0, 0)
+        .expect("valid time")
+        .and_utc()
+        .timestamp_micros();
+    let second_day_micros = chrono::NaiveDate::from_ymd_opt(2026, 7, 16)
+        .expect("valid day")
+        .and_hms_opt(12, 0, 0)
+        .expect("valid time")
+        .and_utc()
+        .timestamp_micros();
+    let table_ref = table("native_event_time_events");
+    let frame = native_event_time_frame(
+        fixture.tenant,
+        &table_ref,
+        first_day_micros,
+        second_day_micros,
+    );
+    fixture
+        .scribe
+        .ingest_frame(frame)
+        .await
+        .expect("native caller event time is admitted");
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("flush native event-time rows");
+    wait_for_state(&fixture, 0).await;
+
+    let persisted = rows_for_table(&fixture, "native_event_time_events").await;
+    assert_eq!(
+        persisted.len(),
+        2,
+        "two distinct event days must publish two file-list entries"
+    );
+    let day_paths: Vec<String> = object_paths(&fixture)
+        .await
+        .into_iter()
+        .filter(|path| path.contains("day="))
+        .collect();
+    assert_eq!(
+        day_paths.len(),
+        2,
+        "two distinct event days must land in two partition-day objects: {day_paths:?}"
+    );
+    let mut days: Vec<String> = day_paths
+        .iter()
+        .filter_map(|path| {
+            path.split('/')
+                .find(|segment| segment.starts_with("day="))
+                .map(str::to_owned)
+        })
+        .collect();
+    days.sort();
+    days.dedup();
+    assert_eq!(days.len(), 2, "partition days must be distinct: {days:?}");
+    assert!(days.iter().any(|day| day.contains("2026-07-14")));
+    assert!(days.iter().any(|day| day.contains("2026-07-16")));
     fixture.stop().await;
 }

@@ -293,14 +293,27 @@ impl ScribeIngressCpuPool {
 /// Decode one admitted Arrow payload, validate its projected schema and card
 /// scope, then stamp the server-owned physical columns before persistence.
 ///
-/// Native payloads may carry one nullable Utf8 `run_id` correlation field;
-/// projected payloads retain their correlation fields as supplied by the
-/// projection path. In either mode, user schema fingerprinting excludes
-/// correlation and managed columns.
+/// Native payloads may carry one nullable Utf8 `run_id` correlation field and
+/// MAY additionally carry an optional caller-supplied `wyrd_event_time` column.
+/// When present, that column MUST be exactly the managed physical type
+/// (`Timestamp(Microsecond, UTC)`), MUST NOT be nullable-with-nulls, and MUST
+/// NOT be duplicated; it is then preserved verbatim as the authoritative event
+/// time rather than server-stamped. When absent, the server stamps
+/// `wyrd_event_time` with the ingest receipt time, matching the historical
+/// native contract. Projected payloads retain their correlation and event-time
+/// fields as supplied by the projection path. In either mode, user schema
+/// fingerprinting excludes correlation and managed columns, so accepting a
+/// caller event-time column never perturbs a registered-schema fingerprint.
+///
+/// All other managed columns (`wyrd_ingested_at`, `wyrd_batch_id`,
+/// `wyrd_row_ordinal`, `wyrd_request_id`, `data_tenant_id`, principal, and card
+/// columns) remain unconditionally server-owned and are rejected when supplied.
 ///
 /// # Errors
-/// Returns [`ScribeError::InvalidFrame`] for malformed IPC, duplicate or
-/// invalid managed fields, and failed physical assembly; returns
+/// Returns [`ScribeError::InvalidFrame`] for malformed IPC, a reserved
+/// server-owned column supplied by the caller, a `wyrd_event_time` column with
+/// the wrong Arrow type, unit, timezone, nullability with nulls, or a duplicate
+/// managed field, and for failed physical assembly; returns
 /// [`ScribeError::FingerprintMismatch`] or authorization errors when the
 /// admitted payload does not match the registered table contract.
 fn decode(
@@ -340,12 +353,21 @@ fn decode(
         });
     }
     for field in rows.schema().fields() {
-        let reserved = match field.name().as_str() {
-            CARD_UID | PRINCIPAL_ID | DATA_TENANT_ID | WYRD_BATCH_ID | WYRD_ROW_ORDINAL
-            | WYRD_INGESTED_AT | WYRD_REQUEST_ID => true,
-            WYRD_EVENT_TIME => native_payload,
-            _ => false,
-        };
+        // `wyrd_event_time` is intentionally absent from this reserved set:
+        // native payloads MAY supply it as the authoritative event time (it is
+        // then validated and preserved in `stamp_correlation_columns`), and
+        // projected payloads already carry it from the projection path. Every
+        // other managed column remains unconditionally server-owned.
+        let reserved = matches!(
+            field.name().as_str(),
+            CARD_UID
+                | PRINCIPAL_ID
+                | DATA_TENANT_ID
+                | WYRD_BATCH_ID
+                | WYRD_ROW_ORDINAL
+                | WYRD_INGESTED_AT
+                | WYRD_REQUEST_ID
+        );
         let native_run_id = native_payload && field.name() == "run_id";
         let projected_correlation =
             !native_payload && matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id");
@@ -407,11 +429,23 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
 /// Native Arrow payloads may supply one valid nullable `run_id` correlation
 /// field; it is removed from the user projection and reinserted exactly once as
 /// the canonical nullable physical column. Omitted native values become null.
-/// Projected payloads retain their correlation values unchanged.
+///
+/// Event time is governed by presence, identically for both payload modes: when
+/// the admitted batch already carries `wyrd_event_time` the caller value is
+/// preserved verbatim (kept in the user projection so it is written exactly
+/// once, never duplicated and never re-stamped); when it is absent the server
+/// stamps `wyrd_event_time` with the ingest receipt time. A caller-supplied
+/// native `wyrd_event_time` is validated up front against the managed physical
+/// type before it is trusted. `wyrd_ingested_at` is always the server receipt
+/// time regardless of caller event time. Projected payloads retain their
+/// correlation values unchanged.
 ///
 /// # Errors
-/// Returns a typed Scribe error when correlation resolution, timestamp
-/// construction, managed-array construction, or final batch validation fails.
+/// Returns [`ScribeError::InvalidFrame`] when a native payload supplies a
+/// `wyrd_event_time` column that is not exactly `Timestamp(Microsecond, UTC)`,
+/// contains any null, or is duplicated. Returns a typed Scribe error when
+/// correlation resolution, timestamp construction, managed-array construction,
+/// or final batch validation fails.
 fn stamp_correlation_columns(
     rows: &RecordBatch,
     principal: &Principal,
@@ -420,7 +454,10 @@ fn stamp_correlation_columns(
     native_payload: bool,
 ) -> Result<RecordBatch, ScribeError> {
     let row_count = rows.num_rows();
-    let stamp_event_time = native_payload || rows.schema().index_of(WYRD_EVENT_TIME).is_err();
+    if native_payload {
+        validate_native_event_time(rows)?;
+    }
+    let stamp_event_time = rows.schema().index_of(WYRD_EVENT_TIME).is_err();
     let native_run_id = if native_payload {
         let schema = rows.schema();
         let matches = schema
@@ -475,11 +512,54 @@ fn stamp_correlation_columns(
         .map_err(|_| ScribeError::InvalidFrame)
 }
 
+/// Validates a caller-supplied native `wyrd_event_time` column before it is
+/// trusted as the authoritative event time.
+///
+/// Native ingest MAY carry `wyrd_event_time`, but only when it is exactly the
+/// managed physical type that [`append_managed_columns`] stamps —
+/// `Timestamp(Microsecond)` with the `UTC` timezone — appears exactly once, and
+/// contains no nulls. This mirrors how the server-stamped column is
+/// constructed so caller and server values are physically interchangeable, and
+/// keeps [`split_batch_by_event_day`](crate::scribe::seal_key) able to derive a
+/// non-null partition day for every row. A batch with no `wyrd_event_time`
+/// column is valid (the server stamps the value) and returns `Ok(())`.
+///
+/// # Errors
+/// Returns [`ScribeError::InvalidFrame`] when the column is duplicated, is not
+/// `Timestamp(Microsecond, UTC)`, or contains any null value.
+fn validate_native_event_time(rows: &RecordBatch) -> Result<(), ScribeError> {
+    let schema = rows.schema();
+    let matches = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() == WYRD_EVENT_TIME)
+        .collect::<Vec<_>>();
+    let (index, field) = match matches.as_slice() {
+        [] => return Ok(()),
+        [single] => *single,
+        _ => return Err(ScribeError::InvalidFrame),
+    };
+    let expected = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    if field.data_type() != &expected {
+        return Err(ScribeError::InvalidFrame);
+    }
+    if rows.column(index).null_count() != 0 {
+        return Err(ScribeError::InvalidFrame);
+    }
+    Ok(())
+}
+
 /// Return physical columns excluded from user projection for one payload mode.
 ///
-/// `stamp_event_time` is independent from `native_payload`: projected payloads
-/// that omit event time still receive the server-managed timestamp, while only
-/// native payloads replace the inbound `run_id` field.
+/// The two switches are independent. `native_payload` governs only the inbound
+/// `run_id` field, which native payloads relinquish so the canonical nullable
+/// physical `run_id` can be stamped exactly once. `stamp_event_time` governs
+/// only `wyrd_event_time`: it is excluded (and re-stamped by
+/// [`append_managed_columns`]) when the server owns the value, and retained in
+/// the user projection when the caller supplied a valid event time in either
+/// payload mode. Every remaining managed column is unconditionally server-owned
+/// and therefore always excluded from the user projection.
 fn server_owned_columns(native_payload: bool, stamp_event_time: bool) -> Vec<&'static str> {
     let mut columns = vec![
         CARD_REF,
@@ -552,20 +632,35 @@ fn resolve_card_uids(
         .collect()
 }
 
+/// Appends the always-server-owned managed columns to a partially-stamped batch.
+///
+/// The receipt timestamp, batch id, row ordinal, tenant, card uid, principal,
+/// and request id are unconditionally server-owned and always appended here.
+/// `wyrd_ingested_at` is always the server receipt time. `stamp_event_time`
+/// selects only whether this function also materializes the canonical
+/// server-stamped `wyrd_event_time` column (receipt time): it is `true` when the
+/// admitted batch did not carry a caller event time, and `false` when a valid
+/// caller-supplied `wyrd_event_time` was already retained in the user
+/// projection and must not be duplicated or overwritten.
+///
+/// # Errors
+/// Returns [`ScribeError::Internal`] when the system clock precedes the UNIX
+/// epoch, the receipt timestamp exceeds Arrow's range, or batch-id stamping
+/// fails, and [`ScribeError::TooManyRows`] when a row ordinal exceeds `i32`.
 fn append_managed_columns(
     fields: &mut Vec<Field>,
     columns: &mut Vec<ArrayRef>,
     principal: &Principal,
     batch_id: uuid::Uuid,
     row_count: usize,
-    native_payload: bool,
+    stamp_event_time: bool,
 ) -> Result<(), ScribeError> {
     fields.extend([
         Field::new(CARD_UID, DataType::Utf8, true),
         Field::new(PRINCIPAL_ID, DataType::Utf8, false),
         Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
     ]);
-    if native_payload {
+    if stamp_event_time {
         fields.push(Field::new(
             WYRD_EVENT_TIME,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -595,7 +690,7 @@ fn append_managed_columns(
     let timestamp_array =
         Arc::new(TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"))
             as ArrayRef;
-    if native_payload {
+    if stamp_event_time {
         columns.push(Arc::clone(&timestamp_array));
     }
     columns.push(timestamp_array);
@@ -1175,8 +1270,10 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int32Array, Int64Array, NullArray, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{
+        ArrayRef, Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use uuid::Uuid;
@@ -1767,5 +1864,267 @@ mod tests {
         )
         .expect_err("row identity is server-owned");
         assert!(matches!(error, ScribeError::InvalidFrame));
+    }
+
+    /// Builds a card-scoped service principal used by native ingest arms.
+    fn scoped_service_principal() -> (Principal, CardRef) {
+        let card = CardRef::from_str("test/Service/python-integration-writer@1.0.0").expect("card");
+        let card = CardRef {
+            uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
+            ..card
+        };
+        let principal = Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalKind::Service {
+                card_ref: card.clone(),
+                card_ref_scope: CardRefScope::own(&card),
+            },
+            crate::test_support::tenant(),
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        (principal, card)
+    }
+
+    /// Encodes one record batch as a native Arrow IPC stream payload.
+    fn ipc_payload(rows: &RecordBatch) -> IngressPayload {
+        let mut payload = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut payload, rows.schema().as_ref())
+            .expect("IPC writer initializes");
+        writer.write(rows).expect("IPC batch writes");
+        writer.finish().expect("IPC writer finishes");
+        IngressPayload::ArrowIpc(payload.into())
+    }
+
+    /// Constructs the managed physical `wyrd_event_time` field and matching array.
+    fn managed_event_time(values: Vec<i64>) -> (Field, ArrayRef) {
+        let field = Field::new(
+            WYRD_EVENT_TIME,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        );
+        let array =
+            Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
+        (field, array)
+    }
+
+    /// A native payload MAY carry a valid caller `wyrd_event_time`: its values
+    /// survive decode+stamp unchanged, exactly once, and the user-schema
+    /// fingerprint is identical to the same payload without the column.
+    #[test]
+    fn native_caller_event_time_is_preserved_without_fingerprint_drift() {
+        let (principal, card) = scoped_service_principal();
+        let (event_field, event_array) = managed_event_time(vec![10_i64, 172_800_000_000_i64]);
+        let rows_with = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
+                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
+                event_array,
+            ],
+        );
+        let rows_without = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
+                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
+            ],
+        );
+        assert_eq!(
+            source_schema_fingerprint(rows_with.schema().as_ref()),
+            source_schema_fingerprint(rows_without.schema().as_ref()),
+            "caller event time must not perturb the registered-schema fingerprint",
+        );
+
+        let decoded = decode(
+            ipc_payload(&rows_with),
+            &principal,
+            source_schema_fingerprint(rows_with.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect("native caller event time is accepted");
+        assert_eq!(
+            decoded
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() == WYRD_EVENT_TIME)
+                .count(),
+            1,
+            "caller event time must not be duplicated",
+        );
+        let event = decoded
+            .column_by_name(WYRD_EVENT_TIME)
+            .expect("event time column present")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("event time is TimestampMicrosecond");
+        assert_eq!(event.value(0), 10_i64);
+        assert_eq!(event.value(1), 172_800_000_000_i64);
+    }
+
+    /// A native payload WITHOUT `wyrd_event_time` is still server-stamped exactly
+    /// as before, and `wyrd_ingested_at` remains the server receipt time.
+    #[test]
+    fn native_without_event_time_is_server_stamped() {
+        let (principal, card) = scoped_service_principal();
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+            ],
+        );
+        let decoded = decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect("native ingest without event time is server-stamped");
+        let event_field = decoded
+            .schema()
+            .field_with_name(WYRD_EVENT_TIME)
+            .expect("server-stamped event time exists")
+            .clone();
+        assert_eq!(
+            event_field.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        );
+        assert!(!event_field.is_nullable());
+        assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
+    }
+
+    /// A native `wyrd_event_time` with the wrong Arrow type, unit, timezone,
+    /// nulls, or a duplicate field fails closed with `InvalidFrame`.
+    #[test]
+    fn native_event_time_physical_type_is_validated() {
+        let (principal, card) = scoped_service_principal();
+        let card_column = || Arc::new(StringArray::from(vec![card.to_string()])) as ArrayRef;
+
+        let wrong_type = batch(
+            vec![
+                Field::new(WYRD_EVENT_TIME, DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![Arc::new(Int64Array::from(vec![1_i64])), card_column()],
+        );
+        let wrong_unit = batch(
+            vec![
+                Field::new(
+                    WYRD_EVENT_TIME,
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    false,
+                ),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(
+                    arrow::array::TimestampNanosecondArray::from(vec![1_i64]).with_timezone("UTC"),
+                ),
+                card_column(),
+            ],
+        );
+        let missing_timezone = batch(
+            vec![
+                Field::new(
+                    WYRD_EVENT_TIME,
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![1_i64])),
+                card_column(),
+            ],
+        );
+        let null_value = batch(
+            vec![
+                Field::new(
+                    WYRD_EVENT_TIME,
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                ),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
+                card_column(),
+            ],
+        );
+        let (dup_field_a, dup_array_a) = managed_event_time(vec![1_i64]);
+        let (dup_field_b, dup_array_b) = managed_event_time(vec![2_i64]);
+        let duplicated = batch(
+            vec![
+                dup_field_a,
+                dup_field_b,
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![dup_array_a, dup_array_b, card_column()],
+        );
+
+        for rows in [
+            wrong_type,
+            wrong_unit,
+            missing_timezone,
+            null_value,
+            duplicated,
+        ] {
+            let error = decode(
+                ipc_payload(&rows),
+                &principal,
+                source_schema_fingerprint(rows.schema().as_ref()),
+                &RequestId::now_v7(),
+                Uuid::now_v7(),
+            )
+            .expect_err("invalid native event time fails closed");
+            assert!(matches!(error, ScribeError::InvalidFrame), "{error:?}");
+        }
+    }
+
+    /// Managed columns other than `wyrd_event_time` remain reserved and are
+    /// rejected when a native payload supplies them.
+    #[test]
+    fn native_other_reserved_columns_still_rejected() {
+        let (principal, card) = scoped_service_principal();
+        for reserved in [
+            WYRD_INGESTED_AT,
+            WYRD_BATCH_ID,
+            WYRD_REQUEST_ID,
+            DATA_TENANT_ID,
+        ] {
+            let rows = batch(
+                vec![
+                    Field::new(reserved, DataType::Utf8, false),
+                    Field::new(CARD_REF, DataType::Utf8, false),
+                ],
+                vec![
+                    Arc::new(StringArray::from(vec!["caller"])),
+                    Arc::new(StringArray::from(vec![card.to_string()])),
+                ],
+            );
+            let error = decode(
+                ipc_payload(&rows),
+                &principal,
+                source_schema_fingerprint(rows.schema().as_ref()),
+                &RequestId::now_v7(),
+                Uuid::now_v7(),
+            )
+            .expect_err("server-owned managed columns are reserved");
+            assert!(matches!(error, ScribeError::InvalidFrame), "{reserved}");
+        }
     }
 }

@@ -314,6 +314,34 @@ impl Memtable {
         }
     }
 
+    /// Reports whether an append would push a non-empty writable bucket past rotation.
+    ///
+    /// Empty and absent buckets return `false`, allowing one oversized append
+    /// to land before the existing post-insert rotation seals it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] if the writable-bucket lock is poisoned.
+    pub fn would_cross_rotation(
+        &self,
+        seal_key: &SealKey,
+        incoming: &RecordBatch,
+    ) -> Result<bool, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable bucket lock poisoned: {error}"),
+            })?;
+        Ok(buckets.get(seal_key).is_some_and(|bucket| {
+            bucket.bytes_accumulated > 0
+                && bucket
+                    .bytes_accumulated
+                    .saturating_add(estimate_batch_bytes(incoming))
+                    > self.rotation_bytes
+        }))
+    }
+
     /// Freeze a seal-key and return the immutable snapshot.
     ///
     /// Detaches the bucket's state into a pending immutable generation.
@@ -1438,6 +1466,56 @@ mod tests {
 
         assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
         assert_eq!(memtable.row_count(&seal_key).expect("row_count"), 60_000);
+    }
+
+    /// Proves only a non-empty bucket crossing the target requests a pre-insert seal.
+    #[test]
+    fn would_cross_rotation_bounds_generation() {
+        let incoming = make_test_batch(2);
+        let incoming_bytes = estimate_batch_bytes(&incoming);
+        let memtable = Memtable::new_with_limits(Duration::from_mins(1), incoming_bytes + 1);
+        let seal_key = make_test_seal_key();
+
+        assert!(
+            !memtable
+                .would_cross_rotation(&seal_key, &make_test_batch(100))
+                .expect("absent bucket")
+        );
+        memtable
+            .insert(
+                &seal_key,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("seed bucket");
+        {
+            let mut buckets = memtable.writable.lock().expect("writable lock");
+            buckets
+                .get_mut(&seal_key)
+                .expect("seed bucket")
+                .bytes_accumulated = memtable.rotation_bytes - 1;
+        }
+        assert!(
+            memtable
+                .would_cross_rotation(&seal_key, &incoming)
+                .expect("crossing bucket")
+        );
+
+        let empty_key = SealKey::new(
+            seal_key.tenant,
+            seal_key.table.clone(),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 16).expect("valid date")),
+        );
+        memtable.writable.lock().expect("writable lock").insert(
+            empty_key.clone(),
+            MemtableBucket::new(empty_key.clone(), incoming.schema()),
+        );
+        assert!(
+            !memtable
+                .would_cross_rotation(&empty_key, &make_test_batch(100))
+                .expect("empty oversized bucket")
+        );
     }
 
     #[test]

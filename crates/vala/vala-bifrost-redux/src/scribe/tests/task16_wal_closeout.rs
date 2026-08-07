@@ -217,7 +217,7 @@ async fn scribe_memory_rejection_emits_exact_owner_reason() {
     let (_wal, scribe) = scribe(&wal_root, NodeId::new(Uuid::now_v7()));
     let held = scribe
         .memory
-        .try_reserve_ingress(MemoryCategory::Raw, scribe.memory.limit_bytes() * 90 / 100)
+        .try_reserve_ingress(MemoryCategory::Raw, scribe.memory.ingress_limit_bytes())
         .expect("reserve Scribe ingress breaker capacity");
 
     let error = append(&scribe, DataTenantId::new_v7(), "memory", Uuid::now_v7())

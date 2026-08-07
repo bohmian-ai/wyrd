@@ -23,7 +23,7 @@ use crate::scribe::execution_lanes::{
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
-use crate::scribe::memory::{MemoryCategory, ScribeMemoryBudget};
+use crate::scribe::memory::{MemoryCategory, ScribeMemoryBudget, persistence_workspace_bytes};
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::seal_key::SealKey;
@@ -654,8 +654,9 @@ impl PersistenceWorker {
 
     /// Processes one queued generation and reports completion to its shard.
     ///
-    /// The method reserves bounded workspace, performs the ordered persistence
-    /// stages, and always sends a completion outcome back to the owning shard.
+    /// The method reserves the shared generation-derived workspace, performs
+    /// the ordered persistence stages, and always sends a completion outcome
+    /// back to the owning shard.
     /// A failed stage leaves the immutable generation retained for retry; an
     /// interrupted task may have already written an idempotent object or SQL
     /// row and is reconciled by replay.
@@ -680,10 +681,7 @@ impl PersistenceWorker {
             wal_lsn_max = generation.wal_lsn_max.as_u64(),
             "persisting immutable Scribe generation"
         );
-        let workspace_bytes = generation
-            .arrow_bytes
-            .saturating_mul(2)
-            .saturating_add(8 * 1024 * 1024);
+        let workspace_bytes = persistence_workspace_bytes(generation.arrow_bytes);
         let result = match self
             .memory
             .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)

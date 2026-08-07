@@ -10,6 +10,7 @@ use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use num_traits::ToPrimitive;
 
 use crate::contracts::ScribeError;
+use crate::scribe::admission::MAX_REQUEST_BYTES;
 
 #[cfg(test)]
 static CGROUP_CURRENT_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -27,6 +28,17 @@ const MAX_BUCKET_BYTES: usize = 512 * 1024 * 1024;
 const SHARD_ACCOUNTING_COUNT: usize = 16;
 /// Number of bounded lifecycle memory categories.
 pub const MEMORY_CATEGORY_COUNT: usize = 8;
+
+/// Returns the workspace persistence must reserve to encode one generation.
+///
+/// The reservation covers a sort copy, Parquet output, and the fixed eight
+/// mebibytes of encoder overhead.
+#[must_use]
+pub(crate) fn persistence_workspace_bytes(arrow_bytes: usize) -> usize {
+    arrow_bytes
+        .saturating_mul(2)
+        .saturating_add(8 * 1024 * 1024)
+}
 
 /// Memory categories charged by the Scribe lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +336,30 @@ impl ScribeMemoryBudget {
         (self.limit_bytes() / 4).clamp(MIN_BUCKET_BYTES, MAX_BUCKET_BYTES)
     }
 
+    /// Returns the persistence workspace that ingress must never consume.
+    ///
+    /// The largest admissible generation is either a rotation-target bucket
+    /// or one append whose decoded Arrow reaches twice the wire cap. For every
+    /// production budget, any generation Scribe admits must be persistable
+    /// from headroom that ingress admission can never consume.
+    #[must_use]
+    pub fn persistence_headroom_bytes(&self) -> usize {
+        persistence_workspace_bytes(self.active_bucket_target_bytes().max(2 * MAX_REQUEST_BYTES))
+    }
+
+    /// Returns the child-budget ceiling available to ingress reservations.
+    ///
+    /// The ceiling leaves persistence headroom outside ingress ownership. The
+    /// quarter-limit floor exists only for sub-production test governors; for
+    /// every production budget, any generation Scribe admits must be
+    /// persistable from headroom that ingress admission can never consume.
+    #[must_use]
+    pub fn ingress_limit_bytes(&self) -> usize {
+        self.limit_bytes()
+            .saturating_sub(self.persistence_headroom_bytes())
+            .max(self.limit_bytes() / 4)
+    }
+
     /// Reserve category bytes without waiting.
     pub fn try_reserve(
         &self,
@@ -333,13 +369,13 @@ impl ScribeMemoryBudget {
         self.try_reserve_with_limit(category, bytes, self.limit_bytes())
     }
 
-    /// Reserve ingress bytes below the 90% Scribe breaker.
+    /// Reserve ingress bytes without consuming persistence headroom.
     pub fn try_reserve_ingress(
         &self,
         category: MemoryCategory,
         bytes: usize,
     ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit(category, bytes, self.limit_bytes() * 90 / 100)
+        self.try_reserve_with_limit(category, bytes, self.ingress_limit_bytes())
     }
 
     /// Reserve bounded maintenance bytes up to the full parent and child caps.
@@ -697,9 +733,9 @@ impl MemoryReservation {
         self.resize_with_limit(bytes, self.governor.limit_bytes())
     }
 
-    /// Resize an ingress reservation without crossing the 90% hard breaker.
+    /// Resize an ingress reservation without consuming persistence headroom.
     pub fn resize_ingress(&mut self, bytes: usize) -> Result<(), ScribeError> {
-        self.resize_with_limit(bytes, self.governor.limit_bytes() * 90 / 100)
+        self.resize_with_limit(bytes, self.governor.ingress_limit_bytes())
     }
 
     fn resize_with_limit(&mut self, bytes: usize, limit: usize) -> Result<(), ScribeError> {
@@ -884,6 +920,64 @@ mod tests {
         );
     }
 
+    /// Proves production ceilings retain the exact D75 persistence workspace.
+    #[test]
+    fn ingress_ceiling_reserves_persistence_headroom() {
+        for (limit, expected_ceiling) in [
+            (256 * 1024 * 1024, 120 * 1024 * 1024),
+            (1024 * 1024 * 1024, 504 * 1024 * 1024),
+            (8 * 1024 * 1024 * 1024, 7_160 * 1024 * 1024),
+        ] {
+            let pod_limit = if limit == 8 * 1024 * 1024 * 1024 {
+                16 * 1024 * 1024 * 1024
+            } else {
+                4 * 1024 * 1024 * 1024
+            };
+            let governor = BifrostMemoryGovernor::new_with_scribe_limit(pod_limit, Some(limit))
+                .expect("production Scribe budget");
+            let budget = governor.scribe_budget();
+            let expected = limit.saturating_sub(persistence_workspace_bytes(
+                budget
+                    .active_bucket_target_bytes()
+                    .max(2 * MAX_REQUEST_BYTES),
+            ));
+            assert_eq!(budget.ingress_limit_bytes(), expected);
+            assert_eq!(budget.ingress_limit_bytes(), expected_ceiling);
+            assert!(expected > limit / 4);
+        }
+
+        let mut governor =
+            BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("test-tier governor base");
+        Arc::get_mut(&mut governor.inner)
+            .expect("unshared test governor")
+            .scribe_limit_bytes = 64 * 1024 * 1024;
+        let budget = governor.scribe_budget();
+        assert_eq!(budget.ingress_limit_bytes(), budget.limit_bytes() / 4);
+    }
+
+    /// Proves ingress cannot consume the workspace needed by an admitted generation.
+    #[test]
+    fn ingress_reservation_respects_derived_ceiling() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let ingress = budget
+            .try_reserve_ingress(MemoryCategory::Raw, budget.ingress_limit_bytes())
+            .expect("derived ingress ceiling");
+        assert!(matches!(
+            budget.try_reserve_ingress(MemoryCategory::Raw, 1),
+            Err(ScribeError::IngestBusy { .. })
+        ));
+        let maintenance = budget
+            .try_reserve_maintenance(
+                MemoryCategory::Persistence,
+                budget.persistence_headroom_bytes(),
+            )
+            .expect("reserved persistence headroom");
+        assert_eq!(budget.snapshot().total_bytes(), budget.limit_bytes());
+        drop(maintenance);
+        drop(ingress);
+    }
+
     #[test]
     fn explicit_scribe_budget_stays_under_parent_and_headroom() {
         let governor = BifrostMemoryGovernor::new_with_scribe_limit(
@@ -999,14 +1093,15 @@ mod tests {
         drop(first);
     }
 
+    /// Proves the WAL path rejects ingress only after the persistence-derived ceiling is exhausted.
     #[test]
-    fn ninety_percent_pressure_rejects_before_wal_append() {
+    fn derived_ingress_ceiling_rejects_before_wal_append() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let budget = governor.scribe_budget();
-        let limit = governor.scribe_limit_bytes() * 90 / 100;
+        let limit = budget.ingress_limit_bytes();
         let reservation = budget
             .try_reserve_ingress(MemoryCategory::Raw, limit)
-            .expect("90% ingress reservation");
+            .expect("derived ingress reservation");
         assert!(budget.try_reserve_ingress(MemoryCategory::Raw, 1).is_err());
         drop(reservation);
     }

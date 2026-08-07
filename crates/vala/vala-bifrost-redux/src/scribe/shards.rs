@@ -1863,9 +1863,17 @@ impl ShardOwner {
 
     /// Inserts WAL-synced slices into this owner's memtable and clears retry state.
     ///
+    /// Before each insert, the owner seals a non-empty bucket that the incoming
+    /// slice would push past its rotation target. This bounds every
+    /// multi-append generation while preserving the existing single-append
+    /// oversized-generation behavior.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when insertion or active-memory release fails.
+    /// Returns [`ScribeError`] when writable-bucket inspection or insertion
+    /// fails. A required pre-insert flush also propagates failures from bucket
+    /// freezing or generation preparation, table binding, WAL retention, and
+    /// active-to-immutable accounting transfer.
     fn insert_group(
         &mut self,
         durable: Vec<DurableSlice>,
@@ -1876,6 +1884,23 @@ impl ShardOwner {
         while let Some(slice) = slices.next() {
             touched_keys.insert(slice.seal_key.clone());
             let rows = slice.rows.num_rows();
+            let pre_insert_flush = self
+                .memtable
+                .would_cross_rotation(&slice.seal_key, &slice.rows);
+            let pre_insert_result = match pre_insert_flush {
+                Ok(true) => self.flush_keys(vec![slice.seal_key.clone()]),
+                Ok(false) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = pre_insert_result {
+                self.admission.release_active(slice.memtable_bytes);
+                let _ = self.memory_ledger.release_active(slice.memtable_bytes);
+                for remaining in slices {
+                    self.admission.release_active(remaining.memtable_bytes);
+                    let _ = self.memory_ledger.release_active(remaining.memtable_bytes);
+                }
+                return Err(error);
+            }
             if let Err(error) = self.memtable.insert(
                 &slice.seal_key,
                 slice.audit_event,
@@ -1968,6 +1993,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use chrono::NaiveDate;
     use std::sync::Arc;
+    use std::time::Duration;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
@@ -2214,6 +2240,73 @@ mod tests {
             pending: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
         }
+    }
+
+    /// Proves shard insertion seals a full bucket before a crossing append lands.
+    #[test]
+    fn insert_group_pre_seals_full_bucket() {
+        let key = owner_key();
+        let first = owner_batch();
+        let rotation_bytes = first
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum();
+        let memtable = Memtable::new_with_limits(Duration::from_mins(1), rotation_bytes);
+        memtable
+            .insert(&key, owner_event(), owner_meta(&key), first)
+            .expect("seed full bucket");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
+        owner
+            .memory_ledger
+            .reserve_active(rotation_bytes.saturating_mul(2))
+            .expect("active ledger reservation");
+        owner
+            .admission
+            .try_reserve_active("owner-test", rotation_bytes.saturating_mul(2))
+            .expect("active admission accounting");
+
+        let next_batch = owner_batch();
+        let next_id = *uuid::Uuid::now_v7().as_bytes();
+        let touched = owner
+            .insert_group(
+                vec![DurableSlice {
+                    seal_key: key.clone(),
+                    audit_event: owner_event(),
+                    rows: next_batch,
+                    memtable_bytes: rotation_bytes,
+                    batch_id: next_id,
+                    lsn: WalLsn::new(2),
+                }],
+                &mut HashMap::new(),
+            )
+            .expect("crossing insert");
+        assert_eq!(touched, HashSet::from([key.clone()]));
+        owner
+            .flush_keys(vec![key.clone()])
+            .expect("seal second generation");
+
+        let immutable = owner.memtable.immutable.lock().expect("immutable lock");
+        let generations = immutable.get(&key).expect("two generations");
+        assert_eq!(generations.len(), 2);
+        assert!(
+            generations
+                .iter()
+                .all(|entry| entry.frozen.arrow_bytes <= rotation_bytes)
+        );
     }
 
     /// Builds the immutable generation paired with one frozen owner bucket.

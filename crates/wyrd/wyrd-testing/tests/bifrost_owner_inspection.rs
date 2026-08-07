@@ -16,19 +16,28 @@ use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_testing::bifrost::BifrostHarness;
 
+/// Finds a table name whose shard-routing probe (using `Uuid::nil` as the stable
+/// batch-id sentinel) lands on `target_shard`.
+///
+/// After T35 (batch-spread routing), the actual runtime shard depends on both
+/// the table and the per-request `batch_id`; this helper uses a nil UUID as a
+/// deterministic probe so the fixture can construct a predictable topology for
+/// inspection purposes.  Real appends use per-request UUIDs and will spread
+/// across shards regardless.
 fn table_for_shard(
     tenant: wyrd_spec::DataTenantId,
     target_shard: usize,
     prefix: &str,
     candidate: &mut usize,
 ) -> TableRef {
+    let probe = Uuid::nil();
     loop {
         let table = TableRef::new(
             BifrostNamespace::Bifrost,
             format!("{prefix}_{}", *candidate),
         );
         *candidate += 1;
-        if shard_for(tenant, &table) == target_shard {
+        if shard_for(tenant, &table, probe) == target_shard {
             return table;
         }
     }
@@ -124,9 +133,11 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
         .collect::<Vec<_>>();
 
     let concentrated_tenant = tenants[0];
+    // Use the nil UUID as a stable probe batch-id; see `table_for_shard`.
     let concentrated_target = shard_for(
         concentrated_tenant,
         &TableRef::new(BifrostNamespace::Bifrost, "task15_concentrated_seed"),
+        Uuid::nil(),
     );
     let mut candidate = 0_usize;
 

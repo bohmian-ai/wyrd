@@ -1631,10 +1631,15 @@ impl Forge {
 
     /// Reset a recovered compaction whose output was never committed.
     ///
+    /// Gated to `test-support` because its sole consumer is the
+    /// `reset_reconciled_for_test` wrapper; the production recovery path never
+    /// resets reconciled input files.
+    ///
     /// # Errors
     ///
     /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
     /// error. Dropping the caller-owned transaction rolls back every mutation.
+    #[cfg(feature = "test-support")]
     async fn reset_reconciled(
         &self,
         lease: &mut ForgeLease,

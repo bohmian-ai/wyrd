@@ -9,7 +9,6 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, StringArray};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
@@ -1837,91 +1836,37 @@ pub struct HotBatch {
     pub rows: arrow::record_batch::RecordBatch,
 }
 
-/// Arrow IPC bytes for one complete admitted frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArrowIpcBatch {
-    /// LSN of the append on the target stream.
-    pub lsn: WalLsn,
-    /// Idempotency batch ID copied from the append metadata.
-    pub batch_id: [u8; 16],
-    /// Arrow IPC-encoded `RecordBatch` bytes.
-    pub arrow_ipc: Vec<u8>,
-}
-
-/// Terminal and data frames for one bounded tail fetch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TailFrame {
-    /// One complete, atomically emitted admitted frame.
-    Batch(ArrowIpcBatch),
-    /// All currently readable records after the requested LSN were emitted.
-    Complete,
-    /// The caller should resume strictly after this emitted LSN.
-    Exhausted { resume_after_lsn: WalLsn },
-}
-
-/// Configuration for a live-tail reader.
-#[derive(Debug, Clone, Copy)]
-pub struct TailConfig {
-    /// Maximum encoded Arrow bytes emitted before a terminal frame.
-    pub max_bytes: usize,
-}
-
-impl Default for TailConfig {
-    fn default() -> Self {
-        Self {
-            max_bytes: 16 * 1024 * 1024,
-        }
-    }
-}
-
 /// Pod-local live-tail service over the Scribe memtable.
 #[derive(Debug)]
 pub struct FetchLiveTailService {
     stream: StreamIdentity,
     memtable: Option<Arc<Memtable>>,
     shards: Option<Arc<ScribeShardRuntime>>,
-    config: TailConfig,
 }
 
 impl FetchLiveTailService {
-    /// Construct a reader with the default bounded response size.
+    /// Construct a reader over a direct in-process memtable.
+    ///
+    /// The direct-memtable branch backs the narrow in-process adapter used by
+    /// unit tests; production readers submit shard snapshots through
+    /// [`Self::with_runtime`].
     #[must_use]
     pub fn new(stream: StreamIdentity, memtable: Arc<Memtable>) -> Self {
-        Self::with_config(stream, memtable, TailConfig::default())
-    }
-
-    /// Construct a reader with an explicit byte budget.
-    #[must_use]
-    pub fn with_config(
-        stream: StreamIdentity,
-        memtable: Arc<Memtable>,
-        config: TailConfig,
-    ) -> Self {
         Self {
             stream,
             memtable: Some(memtable),
             shards: None,
-            config: TailConfig {
-                max_bytes: config.max_bytes.max(1),
-            },
         }
     }
 
     /// Construct a production reader that submits snapshots to the owning
     /// shard command queue instead of traversing Scribe state directly.
     #[must_use]
-    pub(crate) fn with_runtime(
-        stream: StreamIdentity,
-        shards: Arc<ScribeShardRuntime>,
-        config: TailConfig,
-    ) -> Self {
+    pub(crate) fn with_runtime(stream: StreamIdentity, shards: Arc<ScribeShardRuntime>) -> Self {
         Self {
             stream,
             memtable: None,
             shards: Some(shards),
-            config: TailConfig {
-                max_bytes: config.max_bytes.max(1),
-            },
         }
     }
 
@@ -1958,57 +1903,6 @@ impl FetchLiveTailService {
     #[must_use]
     pub fn shard_id(&self, request: &FetchLiveTailRequest) -> usize {
         request.shard_id()
-    }
-
-    /// Return the current writable and immutable batches for one shard.
-    ///
-    /// Stream, scope, day range, and projection validation happen before an
-    /// Arrow response is encoded. Production calls pass through the bounded
-    /// shard command queue; the direct memtable branch is only for the narrow
-    /// in-process adapter used by unit tests.
-    #[cfg(feature = "test-support")]
-    pub async fn fetch_live_tail(
-        &self,
-        req: FetchLiveTailRequest,
-    ) -> Result<Vec<TailFrame>, ScribeError> {
-        if req.target_stream != self.stream {
-            return Err(ScribeError::StreamMismatch {
-                requested: req.target_stream,
-                actual: self.stream,
-            });
-        }
-
-        if req.start_day > req.end_day {
-            return Err(ScribeError::Internal {
-                detail: "live-tail start day is after end day".to_owned(),
-            });
-        }
-
-        let hot_batches = if let Some(shards) = &self.shards {
-            shards.snapshot(req.clone()).await?
-        } else {
-            self.memtable
-                .as_ref()
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "direct tail memtable is not configured".to_owned(),
-                })?
-                .readable_batches_for_range(
-                    req.binding.tenant,
-                    &req.binding.table_ref,
-                    req.start_day,
-                    req.end_day,
-                    &req.required_columns,
-                )?
-                .into_iter()
-                .map(|readable| HotBatch {
-                    partition_day: readable.partition_day,
-                    wal_lsn: readable.meta.wal_lsn_max,
-                    batch_id: readable.meta.batch_id,
-                    rows: readable.batch,
-                })
-                .collect()
-        };
-        self.encode_frames(hot_batches, req.after_lsn, req.binding.tenant)
     }
 
     /// Return direct local Arrow handles for Oracle's `MemoryExec` path.
@@ -2052,96 +1946,6 @@ impl FetchLiveTailService {
             })
             .collect())
     }
-
-    fn encode_frames(
-        &self,
-        readable: Vec<HotBatch>,
-        after_lsn: WalLsn,
-        tenant: DataTenantId,
-    ) -> Result<Vec<TailFrame>, ScribeError> {
-        let mut candidates = Vec::new();
-        for readable_batch in readable {
-            let lsn = readable_batch.wal_lsn;
-            if after_lsn != WalLsn::ZERO && lsn <= after_lsn {
-                continue;
-            }
-            let arrow_ipc = encode_arrow_batch(&readable_batch.rows, tenant)?;
-            candidates.push(ArrowIpcBatch {
-                lsn,
-                batch_id: readable_batch.batch_id,
-                arrow_ipc,
-            });
-        }
-        candidates.sort_by_key(|batch| batch.lsn);
-        let candidate_count = candidates.len();
-
-        let mut frames = Vec::new();
-        let mut bytes = 0usize;
-        let mut last_emitted = None;
-        for (index, batch) in candidates.into_iter().enumerate() {
-            let batch_bytes = batch.arrow_ipc.len();
-            if last_emitted.is_some() && bytes.saturating_add(batch_bytes) > self.config.max_bytes {
-                frames.push(TailFrame::Exhausted {
-                    resume_after_lsn: last_emitted.ok_or_else(|| ScribeError::Internal {
-                        detail: "tail budget exhausted without a resume LSN".to_owned(),
-                    })?,
-                });
-                return Ok(frames);
-            }
-
-            bytes = bytes.saturating_add(batch_bytes);
-            last_emitted = Some(batch.lsn);
-            frames.push(TailFrame::Batch(batch));
-
-            if index == candidate_count.saturating_sub(1) {
-                frames.push(TailFrame::Complete);
-                return Ok(frames);
-            }
-        }
-
-        frames.push(TailFrame::Complete);
-        Ok(frames)
-    }
-}
-
-fn encode_arrow_batch(
-    batch: &arrow::record_batch::RecordBatch,
-    tenant: DataTenantId,
-) -> Result<Vec<u8>, ScribeError> {
-    let tenant_column =
-        batch
-            .column_by_name("data_tenant_id")
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "live-tail batch is missing data_tenant_id".to_owned(),
-            })?;
-    let tenant_values = tenant_column
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "live-tail data_tenant_id must be Utf8".to_owned(),
-        })?;
-    let expected = tenant.to_string();
-    for row in 0..tenant_values.len() {
-        if tenant_values.is_null(row) || tenant_values.value(row) != expected {
-            return Err(ScribeError::Internal {
-                detail: format!("live-tail batch contains a row outside tenant {tenant}"),
-            });
-        }
-    }
-
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("live-tail Arrow IPC writer init failed: {error}"),
-        }
-    })?;
-    writer.write(batch).map_err(|error| ScribeError::Internal {
-        detail: format!("live-tail Arrow IPC write failed: {error}"),
-    })?;
-    writer.finish().map_err(|error| ScribeError::Internal {
-        detail: format!("live-tail Arrow IPC finish failed: {error}"),
-    })?;
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -2405,15 +2209,16 @@ mod tests {
                 .expect("duplicate release remains idempotent")
                 .released
         );
-        let registry = reader.fences.lock().expect("registry lock");
-        assert!(!registry.retained.contains_key(&second.fence_id));
-        assert_eq!(registry.retained_bytes, 0);
-        assert_eq!(registry.released.len(), 2);
-        assert!(
-            registry.released.contains_key(&first.fence_id),
-            "oldest valid tombstone remains idempotent"
-        );
-        drop(registry);
+        {
+            let registry = reader.fences.lock().expect("registry lock");
+            assert!(!registry.retained.contains_key(&second.fence_id));
+            assert_eq!(registry.retained_bytes, 0);
+            assert_eq!(registry.released.len(), 2);
+            assert!(
+                registry.released.contains_key(&first.fence_id),
+                "oldest valid tombstone remains idempotent"
+            );
+        }
         assert!(
             reader
                 .release_fence(first.fence_id)
@@ -2424,13 +2229,14 @@ mod tests {
             reader.acquire_fence(empty_fence_request(tenant)).await,
             Err(TailReadError::Capacity)
         ));
-        let mut registry = reader.fences.lock().expect("registry lock");
-        for (expiry, _) in registry.released.values_mut() {
-            *expiry = Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("one second is within monotonic range");
+        {
+            let mut registry = reader.fences.lock().expect("registry lock");
+            for (expiry, _) in registry.released.values_mut() {
+                *expiry = Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("one second is within monotonic range");
+            }
         }
-        drop(registry);
         reader
             .acquire_fence(empty_fence_request(tenant))
             .await

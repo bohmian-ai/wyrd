@@ -1723,6 +1723,30 @@ mod tests {
         payload.into()
     }
 
+    /// Decode one native ingress payload with fixed request, batch-id, and
+    /// event-window fixtures, deriving the expected fingerprint from `schema`.
+    ///
+    /// The `run_id` canonicalization cases differ only in their input schema, so
+    /// this helper keeps the boilerplate `decode` arguments out of each case.
+    ///
+    /// # Errors
+    /// Returns the same [`ScribeError`] as [`decode`] when the payload fails
+    /// native decoding, schema validation, or physical-field canonicalization.
+    fn decode_native(
+        payload: IngressPayload,
+        principal: &Principal,
+        schema: &Schema,
+    ) -> Result<RecordBatch, ScribeError> {
+        decode(
+            payload,
+            principal,
+            source_schema_fingerprint(schema),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+    }
+
     /// Native payloads preserve one valid client run identifier while stamping
     /// exactly one authoritative nullable `run_id` column for the physical record.
     #[test]
@@ -1754,13 +1778,10 @@ mod tests {
                 Arc::new(StringArray::from(vec![card.to_string()])),
             ],
         );
-        let native = decode(
+        let native = decode_native(
             IngressPayload::ArrowIpc(ipc_bytes(&rows)),
             &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
+            rows.schema().as_ref(),
         )
         .expect("native run_id is preserved and canonicalized");
         assert_eq!(
@@ -1785,13 +1806,10 @@ mod tests {
             vec![Field::new("run_id", DataType::Int64, false)],
             vec![Arc::new(Int64Array::from(vec![1_i64]))],
         );
-        let invalid = decode(
+        let invalid = decode_native(
             IngressPayload::ArrowIpc(ipc_bytes(&invalid_type)),
             &principal,
-            source_schema_fingerprint(invalid_type.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
+            invalid_type.schema().as_ref(),
         )
         .expect_err("native run_id type is validated");
         assert!(matches!(invalid, ScribeError::InvalidFrame));
@@ -1806,13 +1824,10 @@ mod tests {
                 Arc::new(StringArray::from(vec!["second"])),
             ],
         );
-        let dup_err = decode(
+        let dup_err = decode_native(
             IngressPayload::ArrowIpc(ipc_bytes(&duplicate)),
             &principal,
-            source_schema_fingerprint(duplicate.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
+            duplicate.schema().as_ref(),
         )
         .expect_err("duplicate native physical fields fail closed");
         assert!(matches!(dup_err, ScribeError::InvalidFrame));

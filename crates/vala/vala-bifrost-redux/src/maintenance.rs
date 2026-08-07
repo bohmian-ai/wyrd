@@ -97,6 +97,15 @@ impl StagingFileInbox {
     }
 
     /// Poll for a wake-up without waiting for Scribe persistence.
+    ///
+    /// Gated to `test`/`test-support` because its only consumers are the inline
+    /// lifecycle test and the `try_recv_for_test` wrapper; the production drain
+    /// loop uses [`StagingFileInbox::recv`].
+    ///
+    /// # Errors
+    /// Returns [`tokio::sync::mpsc::error::TryRecvError::Empty`] when no signal
+    /// is currently queued, or `Closed` after the publisher is dropped.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn try_recv(
         &mut self,
     ) -> Result<StagingFileCommitted, tokio::sync::mpsc::error::TryRecvError> {

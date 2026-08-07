@@ -20,7 +20,3 @@ mod pg_scribe_registry;
 mod pg_scribe_seal;
 #[path = "tail_rpc.rs"]
 mod tail_rpc;
-#[path = "tail_rpc_backpressure.rs"]
-mod tail_rpc_backpressure;
-#[path = "tail_rpc_terminal_frames.rs"]
-mod tail_rpc_terminal_frames;

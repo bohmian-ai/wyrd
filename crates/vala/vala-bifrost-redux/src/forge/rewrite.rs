@@ -111,6 +111,12 @@ pub(crate) struct ForgeAttemptGeneration(Uuid);
 
 impl ForgeAttemptGeneration {
     /// Create a fresh time-ordered generation for one rewrite execution.
+    ///
+    /// Gated to `test-support`: its only caller is the `test-support`-gated
+    /// [`replace_live_group`](super::live_replace) seam. The production task path
+    /// derives its generation from the durable attempt via
+    /// [`Self::from_attempt`].
+    #[cfg(feature = "test-support")]
     #[must_use]
     pub(crate) fn now_v7() -> Self {
         Self(Uuid::now_v7())

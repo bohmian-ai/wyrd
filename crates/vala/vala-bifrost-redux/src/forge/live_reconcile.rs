@@ -40,6 +40,11 @@ pub(crate) struct IcebergReconciliationOutcome {
     /// Operations with canonical but inconclusive evidence.
     pub unresolved: usize,
     /// Whether the open-operation query found a cap sentinel.
+    ///
+    /// Gated to `test-support`: the only reader is the
+    /// `LiveReconciliationTestOutcome` projection, which is itself
+    /// `test-support`-only.
+    #[cfg(feature = "test-support")]
     pub overflowed: bool,
     /// Validated outputs protected by pending or unresolved work.
     pub protected_output_paths: BTreeSet<String>,
@@ -212,6 +217,7 @@ impl Forge {
                 reset: 0,
                 pending: 0,
                 unresolved: 0,
+                #[cfg(feature = "test-support")]
                 overflowed: true,
                 protected_output_paths: BTreeSet::new(),
                 destructive_maintenance: DestructiveMaintenance::Blocked,
@@ -223,6 +229,7 @@ impl Forge {
                 reset: 0,
                 pending: 0,
                 unresolved: 0,
+                #[cfg(feature = "test-support")]
                 overflowed: false,
                 protected_output_paths: BTreeSet::new(),
                 destructive_maintenance: DestructiveMaintenance::Allowed,
@@ -233,6 +240,7 @@ impl Forge {
             reset: 0,
             pending: 0,
             unresolved: 0,
+            #[cfg(feature = "test-support")]
             overflowed: false,
             protected_output_paths: BTreeSet::new(),
             destructive_maintenance: DestructiveMaintenance::Allowed,
@@ -1057,6 +1065,7 @@ mod tests {
             reset: 0,
             pending: 1,
             unresolved: 1,
+            #[cfg(feature = "test-support")]
             overflowed: false,
             protected_output_paths: BTreeSet::new(),
             destructive_maintenance: DestructiveMaintenance::Blocked,

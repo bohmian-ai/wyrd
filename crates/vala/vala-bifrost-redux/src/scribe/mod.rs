@@ -2093,7 +2093,6 @@ impl ScribeImpl {
         Ok(FetchLiveTailService::with_runtime(
             stream,
             Arc::clone(&self.shards),
-            crate::scribe::tail_rpc::TailConfig::default(),
         ))
     }
 

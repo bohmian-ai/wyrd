@@ -94,6 +94,17 @@ async fn scribe_owner_fixed_topology_and_memory_reconciliation() {
     harness.shutdown().await.expect("harness shutdown");
 }
 
+/// Exercises the T35 batch-spread routing contract end to end through the
+/// Scribe append path and pod-local shard inspection.
+///
+/// The shard key is `(tenant, table, batch_id)`, so this journey proves two
+/// complementary properties against real memory-by-shard accounting: (a)
+/// appends that share one `(tenant, table, batch_id)` — a client retrying a
+/// single logical batch — occupy exactly the one lane `shard_for` selects, so
+/// dedup state stays lane-local; and (b) a hot `(tenant, table)` pair that
+/// mints a fresh `batch_id` per request spreads its write load across more than
+/// one lane. It then reasserts the fixed 16-shard topology and the
+/// 1000-bucket memory-accounting invariants for a mixed three-tenant workload.
 #[tokio::test]
 #[ignore = "requires the embedded Postgres and object-store fixtures"]
 async fn scribe_owner_dynamic_keys_preserve_topology() {
@@ -133,20 +144,90 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
         .collect::<Vec<_>>();
 
     let concentrated_tenant = tenants[0];
-    // Use the nil UUID as a stable probe batch-id; see `table_for_shard`.
-    let concentrated_target = shard_for(
-        concentrated_tenant,
-        &TableRef::new(BifrostNamespace::Bifrost, "task15_concentrated_seed"),
-        Uuid::nil(),
-    );
-    let mut candidate = 0_usize;
+    let concentrated_table = TableRef::new(BifrostNamespace::Bifrost, "task15_concentrated_0");
+    // A fixed batch id models a client retrying one logical batch. Every attempt
+    // must route to the same shard lane so the lane's dedup state absorbs it.
+    let shared_batch = Uuid::now_v7();
+    let shared_lane = shard_for(concentrated_tenant, &concentrated_table, shared_batch);
+    for _ in 0..3_usize {
+        scribe
+            .append_durable(ScribeAppend {
+                principal: principals[0].clone(),
+                table: concentrated_table.clone(),
+                rows: rows.clone(),
+                schema_fingerprint: fingerprint,
+                request_id: RequestId::now_v7(),
+                batch_id: shared_batch,
+                measured_wire_bytes: 0,
+            })
+            .await
+            .expect("retried same-key durable ACK");
+    }
 
-    for _ in 0..400_usize {
-        let table = table_for_shard(
-            concentrated_tenant,
-            concentrated_target,
-            "task15_concentrated",
-            &mut candidate,
+    // (a) Appends sharing one (tenant, table, batch_id) occupy exactly one
+    // non-empty lane — the lane `shard_for` selects for that key.
+    let shared_snapshot = harness
+        .inspection_snapshots()
+        .expect("shared-key inspection snapshot")
+        .remove(0);
+    assert_eq!(
+        shared_snapshot
+            .memory_by_shard
+            .iter()
+            .filter(|bytes| **bytes > 0)
+            .count(),
+        1,
+        "one (tenant, table, batch_id) must occupy exactly one shard lane"
+    );
+    assert!(
+        shared_snapshot.memory_by_shard[shared_lane] > 0,
+        "the occupied lane must be the shard_for-selected lane"
+    );
+
+    // (b) Distinct batch ids for the same (tenant, table) spread that hot pair
+    // across more than one lane. Re-appending `concentrated_table` under fresh
+    // batch ids keeps it a single bucket while dispersing its write load.
+    for _ in 0..64_usize {
+        scribe
+            .append_durable(ScribeAppend {
+                principal: principals[0].clone(),
+                table: concentrated_table.clone(),
+                rows: rows.clone(),
+                schema_fingerprint: fingerprint,
+                request_id: RequestId::now_v7(),
+                batch_id: Uuid::now_v7(),
+                measured_wire_bytes: 0,
+            })
+            .await
+            .expect("batch-spread durable ACK");
+    }
+
+    // Capture the spread snapshot before any non-concentrated append lands, so
+    // the >1-lane count reflects only `concentrated_table`. A route-by-(tenant,
+    // table) regression that ignored `batch_id` would collapse this hot table
+    // onto a single lane and fail here; taking the snapshot after the fill loop
+    // below would mask that, since the fill's distinct table FQNs spread lanes
+    // on their own.
+    let concentrated_snapshot = harness
+        .inspection_snapshots()
+        .expect("concentrated inspection snapshot")
+        .remove(0);
+    assert!(
+        concentrated_snapshot
+            .memory_by_shard
+            .iter()
+            .filter(|bytes| **bytes > 0)
+            .count()
+            > 1,
+        "distinct batch ids must spread the hot table across more than one lane"
+    );
+
+    // Fill the concentrated section to 400 distinct buckets so the aggregate
+    // bucket-count contract below (400 concentrated + 600 dispersed) holds.
+    for index in 1..400_usize {
+        let table = TableRef::new(
+            BifrostNamespace::Bifrost,
+            format!("task15_concentrated_{index}"),
         );
         scribe
             .append_durable(ScribeAppend {
@@ -159,23 +240,9 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
                 measured_wire_bytes: 0,
             })
             .await
-            .expect("dynamic-key durable ACK");
+            .expect("concentrated fill durable ACK");
     }
-
-    let concentrated_snapshot = harness
-        .inspection_snapshots()
-        .expect("concentrated inspection snapshot")
-        .remove(0);
-    assert_eq!(
-        concentrated_snapshot
-            .memory_by_shard
-            .iter()
-            .filter(|bytes| **bytes > 0)
-            .count(),
-        1,
-        "concentrated keys must stay on one shard"
-    );
-    assert!(concentrated_snapshot.memory_by_shard[concentrated_target] > 0);
+    let mut candidate = 0_usize;
 
     for index in 0..600_usize {
         let tenant_index = index % tenants.len();

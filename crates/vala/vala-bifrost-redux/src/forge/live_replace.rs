@@ -161,6 +161,12 @@ impl Forge {
     ///
     /// Cancellation before `Prepared` prevents publication. After `Prepared`,
     /// cancellation never deletes outputs or claims a terminal audit phase.
+    ///
+    /// Gated to `test-support`: its sole consumer is `replace_live_group_for_test`.
+    /// The production task path uses [`Self::replace_live_group_for_task`], which
+    /// calls [`Self::replace_live_group_inner`] directly with the durable attempt
+    /// identity.
+    #[cfg(feature = "test-support")]
     pub(crate) async fn replace_live_group(
         &self,
         lease: &mut ForgeLease,

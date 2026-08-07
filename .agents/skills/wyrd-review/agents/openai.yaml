@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wyrd Review"
+  short_description: "Review Wyrd conformance or supply static review policy"
+  default_prompt: "Use $wyrd-review to adversarially falsify this Wyrd implementation's correctness, proof, architecture fit, simplicity, and consumer closure. In an orchestrated binding mode, return static findings without writing another artifact, running verification, or routing work."
+
+policy:
+  allow_implicit_invocation: true

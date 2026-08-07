@@ -21,21 +21,6 @@ Test, compiler, formatter, Clippy, rustdoc, command, fixture, and local
 environment failures are refinement inputs. They are not terminal conditions
 by themselves.
 
-`$name` denotes a Wyrd skill; load it with the `Skill` tool. `Luna`, `Terra`,
-and `Sol` in a task packet are risk tiers, not model names.
-
-## When dispatched by $wyrd-implement-plan
-
-The orchestrator supplies the worktree path, execution branch, active task, and
-diff base. Work only inside that worktree and commit nothing — the orchestrator
-owns every commit, task-status change, and acceptance decision.
-
-Return a terminal `COMPLETE` or `BLOCKED` report. If you return a nonterminal
-progress report, the orchestrator will resume **this same agent** with your
-context intact rather than replacing you, so do not restate prior work or
-re-derive what you already established. Route material questions to the
-orchestrator, never to the user.
-
 ## Load the task and repository
 
 Before editing:
@@ -43,7 +28,7 @@ Before editing:
 1. Read the active task, referenced approved-plan context, and applicable
    `AGENTS.md` files completely.
 2. For a standardized Wyrd task, read
-   `.claude/skills/wyrd-plan/references/task-packet-format.md` and validate its
+   `.agents/skills/wyrd-plan/references/task-packet-format.md` and validate its
    parent plan directory. The task must be `Ready`.
 3. Read `architecture/agent-rules.md` and `architecture/wyrd-design.md`. Read
    `architecture/wyrd-doctrine.mdx` before changing Wyrd contracts, APIs,
@@ -66,6 +51,16 @@ Build a checklist from required changes, acceptance criteria, required tests,
 focused commands, and completion evidence. Continue until every item is
 checked or a material boundary prevents it.
 
+When resuming after review, require an active orchestrator-owned `Remediation
+revision RR<N>` in the canonical task. Treat the original task plus that
+revision as the executable assignment. The revision must be decision-complete
+at the same level as the original task: exact correction, owners and symbols,
+interfaces, consequential pseudocode, edge behavior, tests and assertions,
+verification, scope, prohibited fixes, escalation boundaries, and finding
+closure. Findings, review prose, a diff, or a desired outcome alone are not an
+implementation assignment. Return `BLOCKED` for missing specification before
+guessing at the fix.
+
 ### Architecture reference routing
 
 | Reference | Load when the task touches |
@@ -73,7 +68,7 @@ checked or a material boundary prevents it.
 | `architecture/references/languages/implementation-execution.md` | Every task: authority boundaries, verification recovery, test integrity, diff audit, and completion evidence |
 | `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, or removed concepts |
 | `architecture/references/doctrine/architecture-constraints.md` | Tier boundaries, deployment, or observation identity |
-| `architecture/references/architecture/patterns.md` | Crate placement and server/client/storage/provider/audit patterns |
+| `architecture/references/architecture/patterns.md` | Ownership boundaries, contract placement, and server/client/storage/provider/audit patterns |
 | `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, and idioms |
 | `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, and registration |
 | `architecture/references/languages/errors.md` | Stable errors and boundary mappings |
@@ -81,7 +76,15 @@ checked or a material boundary prevents it.
 | `architecture/references/languages/testing-workflows.md` | Test tiers, verification levels, and boundary checks |
 | `architecture/references/languages/agent-harness.md` | MCP and other agent-facing contracts |
 | `architecture/references/languages/typescript-guide.md` | `@wyrd/sdk` and napi conventions |
-| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, and object storage |
+| `architecture/references/domain/vala-architecture.md` | Vala ownership, Bifrost boundaries, observations, and analytical placement |
+| `architecture/references/domain/telemetry-observations.md` | OpenTelemetry, observation identity, correlation, or payload sensitivity |
+| `architecture/references/domain/evaluation.md` | Eval Cards, scenarios, judges, scoring, or evidence |
+| `architecture/references/domain/drift-monitoring.md` | Drift signals, baselines, thresholds, or alert behavior |
+| `architecture/references/domain/olap-serving.md` | Bifrost ingest/query serving, admission, or tenant-safe analytical APIs |
+| `architecture/references/domain/iceberg.md` | Iceberg snapshots, catalog, partitioning, schema evolution, or compaction |
+| `architecture/references/domain/datafusion.md` | DataFusion planning, provider pushdown, pruning, memory, or spills |
+| `architecture/references/domain/arrow-analytical-interop.md` | Arrow, Parquet, RecordBatch, PyArrow, or analytical Python boundaries |
+| `architecture/references/domain/analytical-operations-reliability.md` | Backpressure, durability, leases, repair, retention, or recovery |
 
 When an approved task explicitly supersedes a Wyrd design decision, update the
 named design authority with the implementation and update doctrine when the
@@ -115,6 +118,9 @@ replaced with equivalent non-weaker proof.
   material contracts, acceptance criteria, tests, features, and commands.
 - Reconstruct prior progress from the task, current diff, and verification
   evidence after any interruption or context compaction.
+- For remediation, map every active finding to its prescribed correction and
+  closure assertion. Stop before editing when any finding lacks a
+  decision-complete remediation revision or leaves a material choice open.
 
 ### Localize
 

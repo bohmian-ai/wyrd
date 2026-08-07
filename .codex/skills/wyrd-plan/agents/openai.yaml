@@ -1,7 +1,0 @@
-interface:
-  display_name: "Wyrd Plan"
-  short_description: "Create executable Wyrd plans and task packets"
-  default_prompt: "Use $wyrd-plan to investigate this Wyrd change and produce an approved implementation specification with executable Terra/Luna task packets."
-
-policy:
-  allow_implicit_invocation: true

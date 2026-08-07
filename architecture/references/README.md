@@ -33,10 +33,10 @@ references/
 
 ## Consumers
 
-- `.claude/skills/wyrd-implement/SKILL.md`
-- `.codex/skills/wyrd-plan/SKILL.md`
-- `.codex/skills/wyrd-implement/SKILL.md`
-- Global Claude and Codex `wyrd-plan-reviewer` skills
+- `.agents/skills/wyrd-plan/SKILL.md`
+- `.agents/skills/wyrd-implement/SKILL.md`
+- `.agents/skills/wyrd-review/SKILL.md`
+- Global Claude and Codex `plan-readiness-reviewer` skills
 
 New skills that need shared doctrine route here instead of carrying their
 own copy. Add new files only when a doctrine gap forces it — extend an

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wyrd Plan"
+  short_description: "Create rehearsed, executable Wyrd plans"
+  default_prompt: "Use $wyrd-plan to trace this Wyrd change, prove task executability, and produce rehearsed, risk-routed Luna/Terra/Sol task packets."
+
+policy:
+  allow_implicit_invocation: true

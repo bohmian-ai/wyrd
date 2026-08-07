@@ -7,6 +7,8 @@ pub mod bench_dataset;
 #[cfg(feature = "bench")]
 pub mod bench_forge;
 #[cfg(feature = "bench")]
+pub mod bench_materializer;
+#[cfg(feature = "bench")]
 pub mod bench_oracle;
 #[cfg(feature = "bench")]
 pub mod bench_otlp;

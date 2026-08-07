@@ -34,6 +34,8 @@ mod otlp_trace_export;
 mod otlp_trace_export_http;
 #[path = "pg_bifrost_cluster_load.rs"]
 mod pg_bifrost_cluster_load;
+#[path = "pg_bifrost_materializer.rs"]
+mod pg_bifrost_materializer;
 #[path = "pg_grpc_mount.rs"]
 mod pg_grpc_mount;
 #[path = "public_write_journeys.rs"]

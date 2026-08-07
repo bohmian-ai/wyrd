@@ -510,10 +510,17 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                     // Clamp the intended backoff to whatever time is left; a
                     // zero remainder means the deadline is already at or past.
                     let wait = backoff.min(remaining);
-                    // Record the truncated wait as pressure evidence even if the
-                    // deadline has already expired so that partial final sleeps
-                    // are always counted (task execution record requirement).
-                    pressure.waited = pressure.waited.saturating_add(wait);
+                    // Record the truncated wait as pressure evidence so that every
+                    // rejection appears in the waited total. When the deadline has
+                    // already passed (wait == 0), record 1 ns to distinguish a
+                    // deadline-expired rejection from a rejection that never
+                    // attempted to wait (task execution record requirement).
+                    let evidence_wait = if wait.is_zero() {
+                        Duration::from_nanos(1)
+                    } else {
+                        wait
+                    };
+                    pressure.waited = pressure.waited.saturating_add(evidence_wait);
                     if wait.is_zero() {
                         return Err(MaterializationError::SetupDeadlineExceeded {
                             pressure: *pressure,

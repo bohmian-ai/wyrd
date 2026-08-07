@@ -208,7 +208,17 @@ fn assert_rejection(recorder: &wyrd_bench::BenchmarkRecorder, reason: &str, coun
     }));
 }
 
-/// The production memory breaker emits exactly one bounded owner rejection.
+/// Pinning ingress at its sublimit trips exactly one D84 ceiling-labelled reason.
+///
+/// The scenario pins the whole ingress sublimit
+/// ([`crate::scribe::memory::ScribeMemoryBudget::ingress_limit_bytes`]) with a
+/// held [`MemoryCategory::Raw`] reservation, so the append's post-seal retry
+/// cannot fit under the ingress ceiling. Per D84 that rejection is labelled by
+/// the closed ceiling that tripped — here
+/// [`crate::scribe::memory::ScribeRejectionCeiling::IngressSublimit`], recorded as
+/// `reason="ingress_sublimit"` rather than the superseded collapsed
+/// `reason="memory"`. The assertion still proves exactly one terminal rejection
+/// reason, no identity-bearing labels, and a drained ingress gauge.
 #[tokio::test(flavor = "current_thread")]
 async fn scribe_memory_rejection_emits_exact_owner_reason() {
     let recorder = wyrd_bench::BenchmarkRecorder::default();
@@ -224,7 +234,7 @@ async fn scribe_memory_rejection_emits_exact_owner_reason() {
         .await
         .expect_err("memory breaker rejects append");
     assert!(matches!(error, ScribeError::IngestBusy { .. }));
-    assert_rejection(&recorder, "memory", 1);
+    assert_rejection(&recorder, "ingress_sublimit", 1);
     drop(held);
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))

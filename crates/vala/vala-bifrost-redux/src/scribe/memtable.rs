@@ -18,7 +18,6 @@ use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
 use crate::scribe::file_list_writer::FileListCommitKey;
-use crate::scribe::routing::shard_for;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
 
@@ -276,6 +275,9 @@ impl Memtable {
         let arrow_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
         Ok(FrozenMemtable {
             seal_id: 0,
+            // shard_id is assigned by the owning ShardOwner using the
+            // recorded shard_id from the ReplayedSealKey before dispatch.
+            shard_id: 0,
             seal_key: replayed.seal_key.clone(),
             schema,
             batches,
@@ -427,19 +429,22 @@ impl Memtable {
             .collect())
     }
 
-    /// Snapshot active seal-keys owned by one fixed shard.
+    /// Snapshot all active seal-keys held by this shard's memtable.
+    ///
+    /// Under batch-spread routing a shard may hold buckets for any (tenant,
+    /// table) combination, so this method returns every bucket the shard
+    /// actually holds rather than filtering by a recomputed routing key.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
     pub(crate) fn active_seal_keys_for_shard(
         &self,
-        shard: usize,
+        _shard: usize,
     ) -> Result<Vec<SealKey>, ScribeError> {
         let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
-        Ok(buckets
-            .keys()
-            .filter(|key| shard_for(key.tenant, &key.table) == shard)
-            .cloned()
-            .collect())
+        Ok(buckets.keys().cloned().collect())
     }
 
     /// Snapshot writable and pending immutable seal keys for one tenant.
@@ -462,10 +467,17 @@ impl Memtable {
         Ok(keys)
     }
 
-    /// Snapshot age-expired buckets owned by one fixed shard.
+    /// Snapshot age-expired buckets held by this shard's memtable.
+    ///
+    /// Under batch-spread routing a shard may hold buckets for any (tenant,
+    /// table) combination. This method returns all age-expired buckets the
+    /// shard actually holds rather than filtering by a recomputed routing key.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the writable bucket lock is poisoned.
     pub(crate) fn expired_seal_keys_for_shard(
         &self,
-        shard: usize,
+        _shard: usize,
         now: Instant,
     ) -> Result<Vec<SealKey>, ScribeError> {
         let buckets = self
@@ -476,9 +488,7 @@ impl Memtable {
             })?;
         Ok(buckets
             .iter()
-            .filter(|(seal_key, bucket)| {
-                shard_for(seal_key.tenant, &seal_key.table) == shard && bucket.is_age_expired(now)
-            })
+            .filter(|(_, bucket)| bucket.is_age_expired(now))
             .map(|(seal_key, _)| seal_key.clone())
             .collect())
     }
@@ -974,6 +984,10 @@ impl MemtableBucket {
 
         FrozenMemtable {
             seal_id,
+            // shard_id is assigned by the owning ShardOwner after freeze so
+            // that post-commit routing can target the correct lane. Default 0
+            // is replaced before the FrozenMemtable leaves the ShardOwner.
+            shard_id: 0,
             seal_key: self.seal_key,
             schema: self.schema,
             batches,
@@ -1120,12 +1134,23 @@ pub struct WalRange {
 /// append batches so live tail reads preserve WAL/append granularity. A merged
 /// batch is materialized only inside the bounded persistence encoder; retaining
 /// both forms here would double the Arrow memory charged to Scribe.
+///
+/// The `shard_id` field carries the pod-local shard lane that froze this
+/// generation. It is set by the [`crate::scribe::shards::ShardOwner`] after
+/// freezing so that post-commit routing can dispatch back to the correct lane
+/// without recomputing the routing key.
 #[derive(Debug, Clone)]
 pub struct FrozenMemtable {
     /// Local immutable-generation identity.
     pub seal_id: u64,
     /// The seal-key this snapshot belongs to.
     pub seal_key: SealKey,
+    /// Pod-local shard lane that owns this frozen generation.
+    ///
+    /// Populated by the shard owner that performed the freeze; zero until
+    /// explicitly set. Post-commit routing MUST use this field rather than
+    /// recomputing the route from `seal_key`.
+    pub shard_id: usize,
     /// Arrow schema shared by all append batches.
     pub schema: SchemaRef,
     /// Original append batches, preserved for LSN-granular live tail reads.
@@ -1300,6 +1325,7 @@ mod tests {
                 crate::scribe::stream_identity::WriterEpoch::new(1),
             ),
             seal_key: seal_key.clone(),
+            shard_id: 0,
             audit_events: vec![make_test_event()],
             data_records: vec![bytes],
             append_metas: vec![ReplayedAppendMeta {

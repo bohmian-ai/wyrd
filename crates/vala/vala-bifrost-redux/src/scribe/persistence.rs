@@ -169,6 +169,11 @@ pub struct ImmutableGeneration {
     pub generation_id: GenerationId,
     /// WAL stream identity used for file-list and manifest publication.
     pub stream: StreamIdentity,
+    /// Pod-local shard lane that owns this generation.
+    ///
+    /// Used for approximate memory-accounting attribution under batch-spread
+    /// routing. The originating shard is the lane that froze the writable bucket.
+    pub shard_id: usize,
     /// Inclusive minimum WAL LSN.
     pub wal_lsn_min: WalLsn,
     /// Inclusive maximum WAL LSN.
@@ -222,6 +227,7 @@ impl ImmutableGeneration {
             seal_key: frozen.seal_key.clone(),
             generation_id: GenerationId(frozen.seal_id),
             stream,
+            shard_id: frozen.shard_id,
             wal_lsn_min,
             wal_lsn_max,
             wal_segments,
@@ -240,6 +246,7 @@ impl ImmutableGeneration {
     fn frozen_snapshot(&self) -> FrozenMemtable {
         FrozenMemtable {
             seal_id: self.generation_id.0,
+            shard_id: self.shard_id,
             seal_key: self.seal_key.clone(),
             schema: self.schema.clone(),
             batches: self.rows.clone(),
@@ -687,13 +694,11 @@ impl PersistenceWorker {
             .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
         {
             Ok(mut reservation) => {
-                reservation.attach_shard(
-                    self.memory.shard_accounting(),
-                    crate::scribe::routing::shard_for(
-                        generation.seal_key.tenant,
-                        &generation.seal_key.table,
-                    ),
-                );
+                // Attribution-only: the exact originating shard is unavailable
+                // here; `generation.shard_id` carries the recorded lane but
+                // the memory-accounting shard is approximate under batch-spread
+                // routing and does not affect correctness.
+                reservation.attach_shard(self.memory.shard_accounting(), generation.shard_id);
                 let result = self.persist_once(&generation, &job.binding).await;
                 drop(reservation);
                 result
@@ -1326,6 +1331,7 @@ mod tests {
                         arrow_bytes: 1,
                         opened_at: std::time::Instant::now(),
                         closed_at: std::time::Instant::now(),
+                        shard_id: 0,
                     }),
                     binding,
                     completion_tx,

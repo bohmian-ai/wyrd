@@ -1763,6 +1763,10 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Append a raw WAL frame for test scenarios, routing by the decoded batch id.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when the frame cannot be decoded or appended.
     #[cfg(test)]
     pub(crate) fn append_frame_for_test(
         &self,
@@ -1777,26 +1781,42 @@ impl WalWriter {
             Bytes::copy_from_slice(decoded.data),
         )
         .for_slice(seal_key.clone(), [0; 32]);
+        // Use the decoded batch_id for routing, matching the production path.
         prepared.shard_id = Some(
             u8::try_from(crate::scribe::routing::shard_for(
                 seal_key.tenant,
                 &seal_key.table,
+                uuid::Uuid::from_bytes(decoded.batch_id),
             ))
             .expect("fixed shard count fits in u8"),
         );
         Ok(self.append_prepared(prepared)?.lsn)
     }
 
+    /// Sync the WAL segment for one seal-key's shard to disk.
+    ///
+    /// The shard is derived from a zero-UUID placeholder because this
+    /// test helper is used only for WAL durability probes; the exact
+    /// shard is not significant.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when the sync fails.
     #[cfg(test)]
     pub(crate) fn sync_data_for_test(&self, seal_key: &SealKey) -> Result<(), ScribeError> {
+        // Attribution-only shard for WAL sync probing; placeholder batch_id.
         let shard_id = u8::try_from(crate::scribe::routing::shard_for(
             seal_key.tenant,
             &seal_key.table,
+            uuid::Uuid::nil(),
         ))
         .expect("fixed shard count fits in u8");
         self.sync_data_for_shard(shard_id)
     }
 
+    /// Append one WAL record and fsync, routing by the provided batch id.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when the append or sync fails.
     #[cfg(any(test, feature = "test-support"))]
     fn append_and_fsync_for_key(
         &self,
@@ -1812,10 +1832,12 @@ impl WalWriter {
             Bytes::copy_from_slice(data_payload),
         )
         .for_slice(seal_key.clone(), [0; 32]);
+        // Route using the batch_id to match the production dispatch path.
         prepared.shard_id = Some(
             u8::try_from(crate::scribe::routing::shard_for(
                 seal_key.tenant,
                 &seal_key.table,
+                uuid::Uuid::from_bytes(batch_id),
             ))
             .expect("fixed shard count fits in u8"),
         );
@@ -2107,17 +2129,21 @@ impl WalReader {
         Ok(all_records)
     }
 
-    /// Visit records together with the self-described stream that owns them.
+    /// Visit records together with the self-described stream and shard that
+    /// owns them.
     ///
     /// Recovery uses this form so records from an earlier writer epoch retain
-    /// their original publication and manifest identity.
+    /// their original publication and manifest identity, and the exact
+    /// `shard_id` from the segment header is threaded through to the visitor
+    /// so that replayed appends can be dispatched back to their recorded lane
+    /// without recomputing the routing key.
     ///
     /// # Errors
     /// Returns [`ScribeError`] when a segment cannot be read or its records
     /// fail WAL validation.
     pub(crate) fn for_each_stream_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
     where
-        F: FnMut(StreamIdentity, PathBuf, WalRecord) -> Result<(), ScribeError>,
+        F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
         for segment in &self.segments {
             let header = segment.header();
@@ -2125,8 +2151,9 @@ impl WalReader {
                 crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_bytes(header.node_id)),
                 crate::scribe::stream_identity::WriterEpoch::new(header.writer_epoch),
             );
+            let shard_id = header.shard_id;
             let path = segment.path().to_path_buf();
-            segment.for_each_record(|record| visit(stream, path.clone(), record))?;
+            segment.for_each_record(|record| visit(stream, shard_id, path.clone(), record))?;
         }
         Ok(())
     }
@@ -2406,10 +2433,13 @@ mod tests {
         )
         .expect("writer");
 
-        // Write appends totaling >500 bytes (each record has overhead)
+        // Write appends totaling >500 bytes (each record has overhead).
+        // All appends use the same batch_id so they route to the same shard and
+        // the per-shard seg_seq counter increments monotonically.  (The WAL does
+        // not deduplicate; only replay does.)
+        let batch_id = [1u8; 16];
         for i in 0u8..10 {
             let payload = format!("data-{i:03}").repeat(20); // ~100 bytes per payload
-            let batch_id = [i; 16];
             writer
                 .append_and_fsync_for_test(
                     &test_seal_key(tenant_id),
@@ -2457,8 +2487,12 @@ mod tests {
         };
 
         let writer = WalWriter::new(temp_dir.path(), node_id, 1, config).expect("reopened writer");
+        // Use the same batch_id as the first append so both writes route to the
+        // same shard and the per-shard seg_seq counter advances to 1 after the
+        // first segment fills.  The WAL itself does not deduplicate; only replay
+        // does.
         let second_lsn = writer
-            .append_and_fsync_for_test(&key, [2_u8; 16], b"audit", &data)
+            .append_and_fsync_for_test(&key, [1_u8; 16], b"audit", &data)
             .expect("second append");
 
         assert_eq!(first_lsn, WalLsn::new(0));
@@ -2486,11 +2520,14 @@ mod tests {
             },
         )
         .expect("writer");
+        // Use a fixed batch_id so all appends route to the same shard and the
+        // per-shard segment sequence advances predictably across the 500-byte limit.
+        let batch_id = [1u8; 16];
         for index in 0u8..10 {
             writer
                 .append_and_fsync_for_test(
                     &test_seal_key(crate::test_support::tenant()),
-                    [index; 16],
+                    batch_id,
                     b"audit",
                     &[index; 120],
                 )
@@ -2595,11 +2632,14 @@ mod tests {
             },
         )
         .expect("writer");
+        // Use a fixed batch_id so all appends route to the same shard and
+        // produce a contiguous sequence of segments on that shard's directory.
+        let batch_id = [1u8; 16];
         for index in 0u8..10 {
             writer
                 .append_and_fsync_for_test(
                     &test_seal_key(crate::test_support::tenant()),
-                    [index; 16],
+                    batch_id,
                     b"audit",
                     &[index; 120],
                 )
@@ -2655,14 +2695,15 @@ mod tests {
         let writer =
             WalWriter::new(temp_dir.path(), node_id, 1, WalConfig::default()).expect("writer");
 
-        // Write 2 appends to segment 0
-        let batch_id1 = [1u8; 16];
-        let batch_id2 = [2u8; 16];
+        // Write 2 appends to segment 0.  Use the same batch_id so both writes
+        // route to the same shard and land in a single segment.  The WAL does
+        // not deduplicate; both records are stored.
+        let batch_id = [1u8; 16];
         writer
-            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id1, b"audit1", b"data1")
+            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"audit1", b"data1")
             .expect("append 1");
         writer
-            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id2, b"audit2", b"data2")
+            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"audit2", b"data2")
             .expect("append 2");
 
         // Manually create a .tmp file to simulate crash during segment creation

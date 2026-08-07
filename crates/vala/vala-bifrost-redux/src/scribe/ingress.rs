@@ -6,6 +6,7 @@ use crate::scribe::admission::{MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES};
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::AdmittedAppend;
+use crate::scribe::routing::shard_for;
 use std::time::Instant;
 
 impl ScribeImpl {
@@ -32,8 +33,11 @@ impl ScribeImpl {
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
         let table = frame.binding.table_ref.fqn();
-        let shard =
-            crate::scribe::routing::shard_for(frame.principal.tenant_id, &frame.binding.table_ref);
+        let shard = shard_for(
+            frame.principal.tenant_id,
+            &frame.binding.table_ref,
+            frame.batch_id,
+        );
         frame
             .binding
             .validate_authenticated_tenant(frame.principal.tenant_id)
@@ -87,8 +91,6 @@ impl ScribeImpl {
         memory.transfer_category(MemoryCategory::Prepared);
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
-        let tenant = frame.principal.tenant_id;
-        let table_ref = frame.binding.table_ref.clone();
         let admitted = AdmittedAppend {
             batch_id: frame.batch_id,
             audit_event: frame.audit_event,
@@ -97,8 +99,8 @@ impl ScribeImpl {
             admitted_bytes: reservation.bytes(),
             reservation,
             memory,
-            tenant,
-            table: table_ref.clone(),
+            tenant: frame.principal.tenant_id,
+            table: frame.binding.table_ref.clone(),
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
         };

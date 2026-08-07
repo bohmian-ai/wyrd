@@ -46,7 +46,6 @@ use crate::oracle::{
     AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions, QueryStreamLifecycle,
 };
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::routing::shard_for;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 
@@ -619,7 +618,6 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngestError::from_catalog(error)
             })?;
         let table = TableRef::new(namespace, name);
-        let _shard = shard_for(auth.tenant, &table);
         let binding = TenantTableBinding::resolve((auth.tenant, table.clone()))
             .map_err(|_| IngestError::Internal("invalid tenant/table binding".to_owned()))?;
         let audit_event = wyrd_spec::vala::api::AuditEvent {
@@ -722,7 +720,6 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngestError::from_catalog(error)
             })?;
         let table = TableRef::new(namespace, name);
-        let _shard = shard_for(auth.tenant, &table);
         let binding = TenantTableBinding::resolve((auth.tenant, table.clone()))
             .map_err(|_| IngestError::Internal("invalid tenant/table binding".to_owned()))?;
         let audit_event = wyrd_spec::vala::api::AuditEvent {

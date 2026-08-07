@@ -60,6 +60,7 @@ use num_traits::ToPrimitive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 use vala_sql::TenantConn;
 
 /// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
@@ -1152,7 +1153,7 @@ impl ScribeImpl {
                 candidates,
                 snapshot.total_bytes().saturating_sub(target),
             );
-            self.shards.request_pressure_flush(victims);
+            self.shards.request_pressure_flush(&victims);
         }
         if self.wal.disk_pressure().soft {
             let candidates = owner_snapshots
@@ -1422,8 +1423,14 @@ impl ScribeImpl {
         let mut bucket_total = 0_usize;
         for bucket in bucket_memory {
             let bytes = bucket.writable_bytes.saturating_add(bucket.immutable_bytes);
-            let shard =
-                crate::scribe::routing::shard_for(bucket.seal_key.tenant, &bucket.seal_key.table);
+            // Attribution-only: under batch-spread routing a bucket's shard
+            // depends on the client batch_id (not available here), so a
+            // stable placeholder is used for approximate telemetry attribution.
+            let shard = crate::scribe::routing::shard_for(
+                bucket.seal_key.tenant,
+                &bucket.seal_key.table,
+                Uuid::nil(),
+            );
             memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
             bucket_total = bucket_total.saturating_add(bytes);
             memory_by_bucket.push(ScribeBucketMemorySnapshot {
@@ -1569,6 +1576,7 @@ impl ScribeImpl {
                 self.shards
                     .complete_post_commit(
                         token.seal_id,
+                        token.shard_id,
                         &token.seal_key,
                         token.memtable_bytes,
                         token.file_list_key.clone(),
@@ -1610,7 +1618,7 @@ impl ScribeImpl {
         for mut token in post_commit.into().0 {
             let result = async {
                 self.shards
-                    .abort_post_commit(token.seal_id, &token.seal_key)
+                    .abort_post_commit(token.seal_id, token.shard_id, &token.seal_key)
                     .await?;
                 self.admission
                     .transfer_immutable_to_active(token.memtable_bytes);
@@ -1689,6 +1697,7 @@ impl ScribeImpl {
                 self.shards
                     .complete_post_commit(
                         token.seal_id,
+                        token.shard_id,
                         &token.seal_key,
                         token.memtable_bytes,
                         key.clone(),
@@ -1703,7 +1712,7 @@ impl ScribeImpl {
                 Ok(true)
             } else {
                 self.shards
-                    .abort_post_commit(token.seal_id, &token.seal_key)
+                    .abort_post_commit(token.seal_id, token.shard_id, &token.seal_key)
                     .await?;
                 Ok(false)
             }

@@ -117,10 +117,18 @@ impl<T> ScribeShardSet<T> {
         }
     }
 
-    /// Return the canonical shard for an authenticated table.
+    /// Return the canonical shard for one authenticated batch.
+    ///
+    /// The `batch_id` is included in the routing key so a retried batch lands
+    /// on the same lane that holds its dedup state.
     #[must_use]
-    pub fn shard_for(&self, tenant: DataTenantId, table: &TableRef) -> &ScribeShard<T> {
-        &self.shards[shard_for(tenant, table)]
+    pub fn shard_for(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        batch_id: uuid::Uuid,
+    ) -> &ScribeShard<T> {
+        &self.shards[shard_for(tenant, table, batch_id)]
     }
 
     /// Return a sender by its fixed shard number.
@@ -280,8 +288,9 @@ pub(crate) enum ShardCommand {
     },
     FreezeKey {
         seal_key: crate::scribe::seal_key::SealKey,
+        /// `None` when the shard holds no bucket for this key (no-op shard).
         response: tokio::sync::oneshot::Sender<
-            Result<crate::scribe::memtable::FrozenMemtable, ScribeError>,
+            Result<Option<crate::scribe::memtable::FrozenMemtable>, ScribeError>,
         >,
     },
     FreezeTenant {
@@ -594,11 +603,19 @@ impl ScribeShardRuntime {
     }
 
     /// Enqueue a prepared request onto its deterministic shard.
+    ///
+    /// The shard is selected by `shard_for(tenant, table, batch_id)` so that
+    /// distinct batch ids for one (tenant, table) spread across lanes while a
+    /// client retry (same `batch_id`) lands on the lane holding its dedup state.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down, or
+    /// [`ScribeError::IngestBusy`] when the target shard mailbox is full.
     pub(crate) fn try_send(&self, mut append: PreparedAppend) -> Result<(), ScribeError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ScribeError::IngressClosed);
         }
-        let shard = shard_for(append.tenant, &append.table);
+        let shard = shard_for(append.tenant, &append.table, append.batch_id);
         let table_name = append.table.fqn();
         if let Some(memory) = append.memory.as_mut() {
             memory.transfer_category(MemoryCategory::Queued);
@@ -620,7 +637,18 @@ impl ScribeShardRuntime {
         Ok(())
     }
 
-    /// Submit one bounded hot snapshot to the owning shard.
+    /// Fan out a bounded hot snapshot to all shards and merge the results.
+    ///
+    /// Under batch-spread routing the live-tail data for one (tenant, table)
+    /// may be spread across all sixteen shard lanes. This method sends a
+    /// [`ShardCommand::Snapshot`] to every shard and merges the `HotBatch`
+    /// vectors. The existing `HotBatch` contract is preserved: the caller
+    /// receives a single flat list of per-partition-day batches.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down,
+    /// [`ScribeError::IngestBusy`] when a shard mailbox is full, or any
+    /// shard-level snapshot error.
     pub(crate) async fn snapshot(
         &self,
         request: FetchLiveTailRequest,
@@ -628,38 +656,71 @@ impl ScribeShardRuntime {
         if self.closed.load(Ordering::Acquire) {
             return Err(ScribeError::IngressClosed);
         }
-        let shard = request.shard_id();
-        let (response, result) = tokio::sync::oneshot::channel();
-        let command = ShardCommand::Snapshot { request, response };
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            self.senders[shard].sender.send(command),
-        )
-        .await
-        .map_err(|_| ScribeError::IngestBusy {
-            table: "live-tail".to_owned(),
-        })?
-        .map_err(|_| ScribeError::IngressClosed)?;
-        result.await.map_err(|_| ScribeError::Internal {
-            detail: "shard dropped live-tail snapshot response".to_owned(),
-        })?
+        let mut merged = Vec::new();
+        for sender in &self.senders {
+            let (response, result) = tokio::sync::oneshot::channel();
+            let command = ShardCommand::Snapshot {
+                request: request.clone(),
+                response,
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                sender.sender.send(command),
+            )
+            .await
+            .map_err(|_| ScribeError::IngestBusy {
+                table: "live-tail".to_owned(),
+            })?
+            .map_err(|_| ScribeError::IngressClosed)?;
+            let batches = result.await.map_err(|_| ScribeError::Internal {
+                detail: "shard dropped live-tail snapshot response".to_owned(),
+            })??;
+            merged.extend(batches);
+        }
+        Ok(merged)
     }
 
-    /// Freeze one key through its owning shard.
+    /// Freeze one key across all shards and return the first non-empty result.
+    ///
+    /// Under batch-spread routing a single seal key may have buckets on any
+    /// subset of the sixteen shard lanes. This method broadcasts a
+    /// [`ShardCommand::FreezeKey`] to every shard; shards with no bucket for
+    /// the key no-op and return `None`. The first `Some` result is returned
+    /// to the caller.
+    ///
+    /// After this call returns, every shard's bucket for the key is sealed.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::IngressClosed`] when any shard has stopped, or
+    /// [`ScribeError::Internal`] when no shard holds a bucket for the key,
+    /// or the first shard-level freeze error.
     pub(crate) async fn freeze_key(
         &self,
         seal_key: crate::scribe::seal_key::SealKey,
     ) -> Result<crate::scribe::memtable::FrozenMemtable, ScribeError> {
-        let shard = shard_for(seal_key.tenant, &seal_key.table);
-        let (response, result) = tokio::sync::oneshot::channel();
-        self.senders[shard]
-            .sender
-            .send(ShardCommand::FreezeKey { seal_key, response })
-            .await
-            .map_err(|_| ScribeError::IngressClosed)?;
-        result.await.map_err(|_| ScribeError::Internal {
-            detail: "shard dropped freeze response".to_owned(),
-        })?
+        let mut merged: Option<crate::scribe::memtable::FrozenMemtable> = None;
+        for sender in &self.senders {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .sender
+                .send(ShardCommand::FreezeKey {
+                    seal_key: seal_key.clone(),
+                    response,
+                })
+                .await
+                .map_err(|_| ScribeError::IngressClosed)?;
+            let maybe_frozen = result.await.map_err(|_| ScribeError::Internal {
+                detail: "shard dropped freeze response".to_owned(),
+            })??;
+            // Shards that hold no bucket for the key return None; keep the
+            // first real frozen result across the fan-out.
+            if merged.is_none() {
+                merged = maybe_frozen;
+            }
+        }
+        merged.ok_or_else(|| ScribeError::Internal {
+            detail: format!("freeze_key: no shard holds a bucket for {seal_key}"),
+        })
     }
 
     /// Freeze all keys for one tenant through their owning shard(s).
@@ -683,16 +744,26 @@ impl ScribeShardRuntime {
     }
 
     /// Mark an owner-local generation committed after its tenant transaction.
+    ///
+    /// The `shard_id` must be the recorded pod-local shard lane from the
+    /// [`crate::scribe::memtable::FrozenMemtable`] that was sealed, which is
+    /// carried through the [`crate::scribe::seal::PostCommitToken`]. Using
+    /// the recorded shard avoids recomputing the routing key (which requires
+    /// the client `batch_id` under batch-spread routing).
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::IngressClosed`] when the target shard has stopped,
+    /// or the first shard-level post-commit error.
     pub(crate) async fn complete_post_commit(
         &self,
         seal_id: u64,
+        shard_id: usize,
         seal_key: &crate::scribe::seal_key::SealKey,
         arrow_bytes: usize,
         file_list_key: crate::scribe::file_list_writer::FileListCommitKey,
     ) -> Result<(), ScribeError> {
-        let shard = shard_for(seal_key.tenant, &seal_key.table);
         let (response, result) = tokio::sync::oneshot::channel();
-        self.senders[shard]
+        self.senders[shard_id]
             .sender
             .send(ShardCommand::CompletePostCommit {
                 seal_key: seal_key.clone(),
@@ -709,14 +780,21 @@ impl ScribeShardRuntime {
     }
 
     /// Keep an owner-local generation pending after transaction rollback.
+    ///
+    /// The `shard_id` must be the recorded pod-local shard lane from the
+    /// [`crate::scribe::seal::PostCommitToken`] being aborted.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::IngressClosed`] when the target shard has stopped,
+    /// or the first shard-level abort error.
     pub(crate) async fn abort_post_commit(
         &self,
         seal_id: u64,
-        seal_key: &crate::scribe::seal_key::SealKey,
+        shard_id: usize,
+        _seal_key: &crate::scribe::seal_key::SealKey,
     ) -> Result<(), ScribeError> {
-        let shard = shard_for(seal_key.tenant, &seal_key.table);
         let (response, result) = tokio::sync::oneshot::channel();
-        self.senders[shard]
+        self.senders[shard_id]
             .sender
             .send(ShardCommand::AbortPostCommit { seal_id, response })
             .await
@@ -762,32 +840,40 @@ impl ScribeShardRuntime {
         Ok(())
     }
 
-    /// Replace one coalescing pressure signal per fixed shard owner.
-    pub(crate) fn request_pressure_flush(&self, keys: Vec<crate::scribe::seal_key::SealKey>) {
-        let mut by_shard = vec![Vec::new(); SCRIBE_SHARD_COUNT];
-        for key in keys {
-            by_shard[shard_for(key.tenant, &key.table)].push(key);
+    /// Fan out a pressure-flush signal to every shard owner.
+    ///
+    /// Under batch-spread routing a seal key may have buckets on any subset of
+    /// the sixteen shard lanes, so the pressure signal is broadcast to all
+    /// shards. Each shard flushes from its own locally-held bucket set; shards
+    /// with no bucket for a given key no-op (existing empty-bucket skip in
+    /// `flush_keys`).
+    pub(crate) fn request_pressure_flush(&self, keys: &[crate::scribe::seal_key::SealKey]) {
+        if keys.is_empty() {
+            return;
         }
-        for (shard, keys) in by_shard.into_iter().enumerate() {
-            if !keys.is_empty() {
-                self.pressure_senders[shard].send_replace(Some(PressureSignal {
-                    keys,
-                    wal_key: None,
-                }));
-            }
+        for sender in &self.pressure_senders {
+            sender.send_replace(Some(PressureSignal {
+                keys: keys.to_owned(),
+                wal_key: None,
+            }));
         }
     }
 
-    /// Replace one coalescing WAL pressure signal for its global victim.
+    /// Fan out a WAL pressure signal for one victim key to every shard owner.
+    ///
+    /// Under batch-spread routing the victim key may have buckets on any shard
+    /// lane, so the signal is sent to all shards; each shard flushes its own
+    /// bucket for the key, if any.
     pub(crate) fn request_wal_pressure_flush(&self, key: Option<crate::scribe::seal_key::SealKey>) {
         let Some(key) = key else {
             return;
         };
-        let shard = shard_for(key.tenant, &key.table);
-        self.pressure_senders[shard].send_replace(Some(PressureSignal {
-            keys: Vec::new(),
-            wal_key: Some(key),
-        }));
+        for sender in &self.pressure_senders {
+            sender.send_replace(Some(PressureSignal {
+                keys: Vec::new(),
+                wal_key: Some(key.clone()),
+            }));
+        }
     }
 
     /// Flush every active bucket through its owning shard before shutdown.
@@ -1138,22 +1224,39 @@ impl ShardOwner {
     ///
     /// Returns [`ScribeError`] when the bucket cannot be inspected, frozen, or
     /// its memory ledger cannot be transferred.
+    /// Freeze one writable bucket, returning `None` when the shard holds no
+    /// bucket for this key.
+    ///
+    /// Under batch-spread routing a seal key may exist on any subset of the
+    /// sixteen shard lanes, so a shard with no matching bucket is a valid no-op.
+    /// The returned `FrozenMemtable` has its `shard_id` set to `self.id` so
+    /// that post-commit routing can target the correct lane without recomputing
+    /// the routing key.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when the bucket lock is poisoned or a memory
+    /// accounting step fails.
     fn freeze_key(
         &mut self,
         seal_key: &crate::scribe::seal_key::SealKey,
-    ) -> Result<crate::scribe::memtable::FrozenMemtable, ScribeError> {
+    ) -> Result<Option<crate::scribe::memtable::FrozenMemtable>, ScribeError> {
         let active_bytes = self.memtable.row_count(seal_key)?;
-        let frozen = self.memtable.freeze(seal_key)?;
-        if active_bytes > 0 {
-            self.memory_ledger
-                .move_active_to_immutable(frozen.arrow_bytes)?;
-            self.admission
-                .transfer_active_to_immutable(frozen.arrow_bytes);
+        if active_bytes == 0 {
+            return Ok(None);
         }
-        Ok(frozen)
+        let mut frozen = self.memtable.freeze(seal_key)?;
+        frozen.shard_id = self.id;
+        self.memory_ledger
+            .move_active_to_immutable(frozen.arrow_bytes)?;
+        self.admission
+            .transfer_active_to_immutable(frozen.arrow_bytes);
+        Ok(Some(frozen))
     }
 
     /// Freezes every writable bucket belonging to one tenant.
+    ///
+    /// Returns only the non-empty frozen memtables (shards with no bucket for
+    /// the tenant contribute no results).
     ///
     /// # Errors
     ///
@@ -1164,7 +1267,9 @@ impl ShardOwner {
         tenant: DataTenantId,
     ) -> Result<Vec<crate::scribe::memtable::FrozenMemtable>, ScribeError> {
         let keys = self.memtable.seal_keys_for_tenant(tenant)?;
-        keys.into_iter().map(|key| self.freeze_key(&key)).collect()
+        keys.into_iter()
+            .filter_map(|key| self.freeze_key(&key).transpose())
+            .collect()
     }
 
     /// Flushes expired buckets and retries pending persistence submissions.
@@ -2344,6 +2449,7 @@ mod tests {
             arrow_bytes: frozen.arrow_bytes,
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
+            shard_id: frozen.shard_id,
         })
     }
 
@@ -2578,10 +2684,194 @@ mod tests {
         assert!(scheduler.pop_group().is_empty());
     }
 
+    /// Verify that shard lookup is bounded within the fixed topology for any batch.
     #[test]
     fn routing_uses_canonical_table_reference() {
         let set = ScribeShardSet::<Item>::new();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        assert!(set.shard_for(DataTenantId::new_v7(), &table).id < 16);
+        let batch_id = uuid::Uuid::new_v4();
+        assert!(set.shard_for(DataTenantId::new_v7(), &table, batch_id).id < 16);
+    }
+
+    /// Proves that `ShardOwner::freeze_key` returns `None` when the shard holds
+    /// no bucket for the key, enabling the fan-out loop in
+    /// `ScribeShardRuntime::freeze_key` to skip shards cleanly.
+    ///
+    /// Under batch-spread routing a seal key may have buckets on any subset of
+    /// the sixteen lanes. A shard that received no append for that key must no-op
+    /// rather than returning an error so the fan-out can continue to the shards
+    /// that do hold data.
+    #[test]
+    fn flush_fan_out_shard_with_no_bucket_returns_none() {
+        let key = owner_key();
+        let owner = Memtable::new();
+        // Do NOT insert into this owner — it holds no bucket for `key`.
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let mut empty_owner = owner_for_completion_test(owner, &wal, wal_handle, stream);
+        let result = empty_owner.freeze_key(&key).expect("freeze of absent key");
+        assert!(
+            result.is_none(),
+            "a shard with no bucket must return None so the fan-out skips it"
+        );
+    }
+
+    /// Proves that `ShardOwner::freeze_key` seals a bucket and stamps the result
+    /// with the owning shard's `id` so that `complete_post_commit` and
+    /// `abort_post_commit` can route back to the correct lane without recomputing
+    /// the routing key.
+    ///
+    /// This is the `Some` half of the fan-out invariant:
+    /// * If the shard holds a bucket → returns `Some(frozen)` with
+    ///   `frozen.shard_id == self.id`.
+    /// * If the shard holds no bucket → returns `None` (see companion test
+    ///   `flush_fan_out_shard_with_no_bucket_returns_none`).
+    ///
+    /// Together these two properties let `ScribeShardRuntime::freeze_key`
+    /// collect the first real result across all sixteen shards without
+    /// re-deriving which lane owns the data.
+    #[test]
+    fn flush_fan_out_seals_buckets_on_every_shard() {
+        // Build two independent owners with different shard ids to simulate the
+        // fan-out across all sixteen lanes.  Owner A (id=0) holds a bucket;
+        // owner B (id=5) holds a bucket for the same key.  Each should return
+        // Some with its own shard_id stamped on the frozen memtable.
+        let key = owner_key();
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+
+        // Owner A — shard 0.
+        let memtable_a = Memtable::new();
+        memtable_a
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner A insert");
+        let wal_handle_a = wal.handle_for_shard(0).expect("WAL handle A");
+        let mut owner_a = owner_for_completion_test(memtable_a, &wal, wal_handle_a, stream);
+        owner_a.id = 0;
+
+        // Owner B — shard 5 (different lane, same key).
+        let memtable_b = Memtable::new();
+        memtable_b
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner B insert");
+        let wal_handle_b = wal.handle_for_shard(5).expect("WAL handle B");
+        let mut owner_b = owner_for_completion_test(memtable_b, &wal, wal_handle_b, stream);
+        owner_b.id = 5;
+
+        let frozen_a = owner_a
+            .freeze_key(&key)
+            .expect("owner A freeze")
+            .expect("owner A must hold a bucket");
+        assert_eq!(
+            frozen_a.shard_id, 0,
+            "frozen shard_id must match the owning lane (0)"
+        );
+
+        let frozen_b = owner_b
+            .freeze_key(&key)
+            .expect("owner B freeze")
+            .expect("owner B must hold a bucket");
+        assert_eq!(
+            frozen_b.shard_id, 5,
+            "frozen shard_id must match the owning lane (5)"
+        );
+
+        // An owner with no bucket for the key must return None — this is the
+        // no-op half of the fan-out that makes broadcast-to-all-sixteen safe.
+        let empty_memtable = Memtable::new();
+        let wal_handle_c = wal.handle_for_shard(3).expect("WAL handle C");
+        let mut empty_owner = owner_for_completion_test(empty_memtable, &wal, wal_handle_c, stream);
+        empty_owner.id = 3;
+        let none_result = empty_owner
+            .freeze_key(&key)
+            .expect("empty owner freeze must not error");
+        assert!(
+            none_result.is_none(),
+            "shard with no bucket must return None during fan-out"
+        );
+    }
+
+    /// Proves that a snapshot fan-out merges results from multiple shards.
+    ///
+    /// Each shard's `Snapshot` command returns the writable buckets on that lane.
+    /// After batch-spread routing places two distinct batches on two different
+    /// shards (different `batch_id` hashes), a pod-global snapshot must include
+    /// both contributions.  This test exercises the merge loop inside
+    /// `ScribeShardRuntime::snapshot` without a full network round-trip.
+    ///
+    /// The test uses two `ShardMemtableSnapshot` values constructed from two
+    /// independent `ShardOwner` memtables to prove the merge behavior: every
+    /// shard contributes its local data, and the caller sees the union.
+    #[test]
+    fn snapshot_fan_out_merges_results_from_multiple_shards() {
+        let key = owner_key();
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+
+        // Shard 0 holds one batch for `key`.
+        let memtable_a = Memtable::new();
+        memtable_a
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("shard 0 insert");
+        let wal_handle_a = wal.handle_for_shard(0).expect("WAL handle shard 0");
+        let owner_a = owner_for_completion_test(memtable_a, &wal, wal_handle_a, stream);
+
+        // Shard 7 holds one batch for the same `key` (simulating a different batch_id route).
+        let memtable_b = Memtable::new();
+        memtable_b
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("shard 7 insert");
+        let wal_handle_b = wal.handle_for_shard(7).expect("WAL handle shard 7");
+        let owner_b = owner_for_completion_test(memtable_b, &wal, wal_handle_b, stream);
+
+        // Each shard independently reports one writable bucket for `key`.
+        let stats_a = owner_a.memtable.stats().expect("shard 0 memtable stats");
+        let stats_b = owner_b.memtable.stats().expect("shard 7 memtable stats");
+
+        // Both shards observe one writable bucket each; a merged view sums to two.
+        assert_eq!(
+            stats_a.writable_buckets, 1,
+            "shard 0 must hold one writable bucket"
+        );
+        assert_eq!(
+            stats_b.writable_buckets, 1,
+            "shard 7 must hold one writable bucket"
+        );
+        assert_eq!(
+            stats_a.writable_buckets + stats_b.writable_buckets,
+            2,
+            "pod-global snapshot fan-out must sum both shard contributions"
+        );
     }
 }

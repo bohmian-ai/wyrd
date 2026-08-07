@@ -1206,10 +1206,13 @@ fn execute_wal_io(
                     let crate::scribe::replay::ReplayChunk { states, memory } = chunk;
                     drop(memory);
                     for state in states.into_values() {
-                        let shard = crate::scribe::routing::shard_for(
-                            state.seal_key.tenant,
-                            &state.seal_key.table,
-                        );
+                        // Use the shard_id recorded in the WAL segment header
+                        // rather than recomputing the routing key. Under
+                        // batch-spread routing the routing key includes the
+                        // client batch_id, which is unavailable here; the
+                        // recorded lane is the authoritative dispatch target
+                        // that holds the per-shard dedup state.
+                        let shard = usize::from(state.shard_id);
                         let (response, receiver) = tokio::sync::oneshot::channel();
                         shard_senders[shard]
                             .blocking_send(crate::scribe::shards::ShardCommand::Replay {
@@ -1501,6 +1504,7 @@ mod tests {
                 crate::scribe::stream_identity::WriterEpoch::new(1),
             ),
             seal_key: idle_seal_key(),
+            shard_id: 0,
             audit_events: Vec::new(),
             data_records: Vec::new(),
             append_metas: Vec::new(),

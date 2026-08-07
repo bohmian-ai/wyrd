@@ -362,6 +362,7 @@ mod tests {
         FrozenMemtable {
             seal_id: 0,
             seal_key,
+            shard_id: 0,
             schema,
             batches: vec![batch],
             events: vec![],
@@ -610,6 +611,7 @@ mod tests {
                 TableRef::new(BifrostNamespace::Bifrost, "events"),
                 EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
             ),
+            shard_id: 0,
             schema,
             batches: vec![batch],
             events: vec![],

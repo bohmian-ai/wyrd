@@ -1803,10 +1803,24 @@ pub struct FetchLiveTailRequest {
 }
 
 impl FetchLiveTailRequest {
-    /// Return the fixed shard selected by the tenant/table route.
+    /// Return any consistent shard index for attribution purposes.
+    ///
+    /// Under batch-spread routing the live-tail data for one (tenant, table)
+    /// may be spread across multiple shard lanes, so this value is used only
+    /// for approximate attribution and diagnostics — not for dispatch. Use
+    /// [`crate::scribe::shards::ScribeShardRuntime::snapshot`] for the
+    /// fan-out that merges results across all shards.
     #[must_use]
     pub fn shard_id(&self) -> usize {
-        shard_for(self.binding.tenant, &self.binding.table_ref)
+        // Use a stable zero-UUID as the batch_id placeholder so the
+        // attribution-only shard is deterministic across calls on the same
+        // request. The fan-out dispatch in ScribeShardRuntime::snapshot is the
+        // authoritative multi-shard read path.
+        shard_for(
+            self.binding.tenant,
+            &self.binding.table_ref,
+            uuid::Uuid::nil(),
+        )
     }
 }
 

@@ -1252,6 +1252,36 @@ and `BifrostQuery`. Generic record writes must not write reserved or
 system-managed Bifrost tables. There is no `wyrd.warehouse` submodule and no
 `WarehouseCard`.
 
+**Scribe write-path horizontal-scale contract.** The Scribe ingest engine inside
+one pod partitions writes across sixteen fixed shard lanes. Each lane owns an
+independent memtable, WAL segment directory, and `synced_not_inserted` dedup
+index. This topology is stable: it is pod-local, requires no coordination
+between pods, and has no migration cost.
+
+The shard routing key is `(tenant_id, table, batch_id)`. Including `batch_id`
+means distinct client batches for the same (tenant, table) spread across lanes
+— removing the per-table serialization bottleneck — while a client retry
+(same `batch_id`) always lands on the same lane that already holds its dedup
+state. Exactly-once delivery therefore requires no cross-shard coordination:
+the WAL record, `synced_not_inserted` set, and SQL unique constraint are all
+shard-local.
+
+Control operations (seal-key freeze, live-tail snapshot, pressure flush, WAL
+pressure flush) that were previously addressed to the one shard computed by
+`shard_for(tenant, table)` are now broadcast to all sixteen shards. Shards that
+hold no bucket for a given key no-op and return empty or `None` results; the
+caller collects the first real result (for freeze) or the merged union (for
+snapshot and flush). No new cross-shard state is introduced.
+
+Crash recovery reads the shard lane from the WAL segment header (`shard_id`
+field) and dispatches each replayed state directly to `shard_senders[shard_id]`
+rather than recomputing the routing key. The client `batch_id` is not available
+during replay, so re-deriving the lane would be incorrect. WAL segment paths are
+organized by shard lane so the header value is authoritative for replay dispatch.
+
+The pod-global LSN counter (`next_lsn`) is shared across all shard lanes via an
+`Arc<AtomicU64>`; no per-shard LSN counter is needed.
+
 **`ValaQueryService` — typed observability query surface (accepted, Stage 4).** `wyrd-server`
 exposes `wyrd.v1.ValaQueryService` (gRPC-first) with an axum HTTP projection as the
 **query-only** typed surface for the observability domain namespaces. There is no

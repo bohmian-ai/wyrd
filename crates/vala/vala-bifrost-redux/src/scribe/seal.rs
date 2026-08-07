@@ -22,12 +22,19 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::WalLsn;
 
 /// Capability returned by `pre_commit` and consumed after the SQL transaction commits.
+///
+/// The `shard_id` records which pod-local shard lane owns the frozen generation.
+/// Under batch-spread routing, a seal key may be spread across shards, so the
+/// `shard_id` must be threaded from the shard that performed the freeze through
+/// `complete_post_commit` and `abort_post_commit` to avoid recomputing the route.
 #[derive(Debug)]
 pub struct PostCommitToken {
     /// Local immutable generation identity.
     pub seal_id: u64,
     /// Seal scope represented by the generation.
     pub seal_key: SealKey,
+    /// Pod-local shard lane that owns this frozen generation.
+    pub shard_id: usize,
     /// Exact durable file-list identity.
     pub file_list_key: FileListCommitKey,
     /// Durable file-list row identity.
@@ -136,6 +143,7 @@ mod tests {
         let token = PostCommitToken {
             seal_id: 9,
             seal_key: key,
+            shard_id: 0,
             file_list_key: FileListCommitKey {
                 data_tenant_id: tenant,
                 namespace: "vala.bifrost".to_owned(),
@@ -388,6 +396,8 @@ impl SealDriver {
             token: PostCommitToken {
                 seal_id: frozen.seal_id,
                 seal_key: seal_key.clone(),
+                // Carry the recorded shard lane through to post-commit routing.
+                shard_id: frozen.shard_id,
                 file_list_key: insert_outcome.commit_key,
                 file_list_row_id: insert_outcome.id,
                 batch_ids: frozen

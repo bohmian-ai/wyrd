@@ -27,12 +27,23 @@ pub const REPLAY_BATCH_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 const REPLAY_RECORD_OVERHEAD_BYTES: usize = 1024;
 
 /// Replayed state for one seal-key.
+///
+/// The `shard_id` field carries the pod-local shard lane recorded in the WAL
+/// segment header. Replay dispatch MUST use this value rather than recomputing
+/// a shard via `shard_for`, because the routing key now includes the client
+/// `batch_id` and a re-derived key would produce the wrong lane.
 #[derive(Debug, Clone)]
 pub struct ReplayedSealKey {
     /// Original WAL stream that owns the recovered records.
     pub stream: StreamIdentity,
     /// The seal-key this state belongs to.
     pub seal_key: SealKey,
+    /// Recorded pod-local shard lane from the WAL segment header.
+    ///
+    /// Dispatch MUST use this field for replay routing so that per-shard
+    /// `synced_not_inserted` and pending-FIFO dedup state rebuild exactly
+    /// where the original writes lived.
+    pub shard_id: u8,
     /// Ordered list of `AuditEvent`s staged for the seal transaction.
     pub audit_events: Vec<AuditEvent>,
     /// Ordered list of data record payloads (Arrow IPC bytes).
@@ -124,20 +135,28 @@ pub(crate) fn replay_wal_directory_stream_accounted(
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
     let reader = WalReader::open_directory_unfiltered(wal_dir)?;
-    let mut accumulators = HashMap::new();
+    // Key is (stream, shard_id) so that each shard's records accumulate
+    // independently with the correct shard_id threaded to ReplayedSealKey.
+    let mut accumulators: HashMap<(StreamIdentity, u8), ReplayAccumulator<'_>> = HashMap::new();
 
-    reader.for_each_stream_record(|stream, segment_path, record| {
+    reader.for_each_stream_record(|stream, shard_id, segment_path, record| {
         if recovery_stream.is_some_and(|current| {
             stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
         }) {
             return Ok(());
         }
         let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
-        if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(stream) {
-            entry.insert(ReplayAccumulator::new(stream, sealed_lsn_map, governor)?);
+        let key = (stream, shard_id);
+        if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
+            entry.insert(ReplayAccumulator::new(
+                stream,
+                shard_id,
+                sealed_lsn_map,
+                governor,
+            )?);
         }
         let accumulator = accumulators
-            .get_mut(&stream)
+            .get_mut(&key)
             .ok_or_else(|| ScribeError::Internal {
                 detail: "replay accumulator disappeared after insertion".to_owned(),
             })?;
@@ -182,20 +201,42 @@ fn sealed_lsn_map(wal_dir: &Path) -> Result<HashMap<String, WalLsn>, ScribeError
 
 /// Owns the dedupe index and one bounded replay batch while the WAL reader
 /// advances. The index survives batch boundaries; decoded state does not.
+///
+/// The `shard_id` field is the segment-header-recorded shard lane for this
+/// stream. It is threaded into every [`ReplayedSealKey`] so that replay
+/// dispatch can route back to the exact original lane without recomputing
+/// the routing key.
 struct ReplayAccumulator<'a> {
+    /// WAL stream identity for the records in this accumulator.
     stream: StreamIdentity,
+    /// Recorded pod-local shard lane from the WAL segment header.
+    shard_id: u8,
+    /// Per-seal-key manifest watermarks below which records are skipped.
     sealed_lsn_map: HashMap<String, WalLsn>,
+    /// Dedupe index that survives batch boundaries.
     seen_slices: HashSet<AppendSliceId>,
+    /// In-flight replay state keyed by seal-key path.
     states: HashMap<String, ReplayedSealKey>,
+    /// Optional memory governor supplied by the production WAL lane.
     governor: Option<&'a ScribeMemoryBudget>,
+    /// Current memory reservation for the in-flight batch.
     memory: Option<MemoryReservation>,
+    /// Accounted bytes for the in-flight batch.
     memory_bytes: usize,
 }
 
 impl<'a> ReplayAccumulator<'a> {
     /// Create an empty bounded replay batch with a zero-sized reservation.
+    ///
+    /// The `shard_id` is taken from the WAL segment header and threaded into
+    /// every [`ReplayedSealKey`] so that the caller can dispatch each replayed
+    /// append back to its recorded lane.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when the initial memory reservation fails.
     fn new(
         stream: StreamIdentity,
+        shard_id: u8,
         sealed_lsn_map: HashMap<String, WalLsn>,
         governor: Option<&'a ScribeMemoryBudget>,
     ) -> Result<Self, ScribeError> {
@@ -204,6 +245,7 @@ impl<'a> ReplayAccumulator<'a> {
             .transpose()?;
         Ok(Self {
             stream,
+            shard_id,
             sealed_lsn_map,
             seen_slices: HashSet::new(),
             states: HashMap::new(),
@@ -254,12 +296,14 @@ impl<'a> ReplayAccumulator<'a> {
             return Ok(false);
         }
         let audit_event = decode_audit_event(&decoded.audit)?;
+        let shard_id = self.shard_id;
         let state = self
             .states
             .entry(seal_key_path)
             .or_insert_with(|| ReplayedSealKey {
                 stream: self.stream,
                 seal_key: seal_key.clone(),
+                shard_id,
                 audit_events: Vec::new(),
                 data_records: Vec::new(),
                 append_metas: Vec::new(),
@@ -322,6 +366,18 @@ fn count_rows(data: &[u8]) -> usize {
         })
 }
 
+/// Merge an incoming per-shard replay state for the same seal key into the
+/// accumulated result map.
+///
+/// When the same seal key was written across multiple shards (as is normal
+/// under batch-spread routing), this function is called once per contributing
+/// shard. After merging, the three parallel append vectors (`audit_events`,
+/// `data_records`, `append_metas`) are sorted by [`WalLsn`] so that the
+/// caller always observes appends in their original temporal order. Pod-global
+/// LSNs are monotonic across shards, so this sort is always correct.
+///
+/// Records from a different stream identity are stored under a compound key
+/// rather than merged, preserving the per-stream dedup invariant.
 fn merge_replayed_state(
     replayed: &mut HashMap<String, ReplayedSealKey>,
     incoming: ReplayedSealKey,
@@ -343,6 +399,23 @@ fn merge_replayed_state(
             existing.wal_segments.push(segment);
         }
     }
+    // Re-sort the parallel append vectors by LSN so cross-shard merges produce
+    // a temporally ordered result. Build a sort key over append_metas indices,
+    // then permute all three parallel vectors together.
+    let n = existing.append_metas.len();
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by_key(|&i| existing.append_metas[i].wal_lsn);
+    let mut sorted_metas = Vec::with_capacity(n);
+    let mut sorted_audit = Vec::with_capacity(n);
+    let mut sorted_data = Vec::with_capacity(n);
+    for i in &indices {
+        sorted_metas.push(existing.append_metas[*i].clone());
+        sorted_audit.push(existing.audit_events[*i].clone());
+        sorted_data.push(existing.data_records[*i].clone());
+    }
+    existing.append_metas = sorted_metas;
+    existing.audit_events = sorted_audit;
+    existing.data_records = sorted_data;
 }
 
 #[cfg(test)]

@@ -1848,6 +1848,18 @@ pub(super) fn forge_transition_event(
 }
 
 /// Build the canonical audit detail for one compaction operation.
+///
+/// `writer_recipe_version` is read from [`BIFROST_WRITER_RECIPE_VERSION`]
+/// rather than a hard-coded literal so the durable audit stream's recorded
+/// recipe identity cannot silently desynchronize from the physical writer
+/// recipe on a future bump (mirrors the constant read at `compact.rs:937`).
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Group`] when the group storage path (built from
+/// `key.audit_resource()`) or any output file's storage path fails to
+/// validate, and [`ForgeError::Invariant`] when `outputs` is empty, since a
+/// compaction audit detail must record at least one output.
 fn forge_detail(
     key: &ForgeGroupKey,
     bin: &RewriteBin,
@@ -1893,7 +1905,7 @@ fn forge_detail(
         input_paths,
         output_paths,
         snapshot_id,
-        writer_recipe_version: "bifrost-writer-v1".to_owned(),
+        writer_recipe_version: BIFROST_WRITER_RECIPE_VERSION.to_owned(),
     })
 }
 

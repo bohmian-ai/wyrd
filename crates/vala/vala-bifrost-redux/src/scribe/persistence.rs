@@ -51,6 +51,22 @@ fn record_persist_stage(stage: &'static str, started: std::time::Instant) {
         .record(started.elapsed().as_secs_f64());
 }
 
+/// Emits the per-generation compression telemetry pair after a Parquet encode.
+///
+/// Sets `bifrost_scribe_persistence_compression_ratio` (raw Arrow bytes /
+/// encoded Parquet bytes; skipped when `file_size` is zero to avoid division
+/// by zero) and increments
+/// `bifrost_scribe_persistence_encoded_bytes_total` by `file_size`.
+fn emit_compression_telemetry(arrow_bytes: usize, file_size: usize) {
+    if file_size > 0 {
+        let arrow = arrow_bytes.to_f64().unwrap_or(f64::MAX);
+        let encoded = file_size.to_f64().unwrap_or(f64::MAX);
+        metrics::gauge!("bifrost_scribe_persistence_compression_ratio").set(arrow / encoded);
+    }
+    metrics::counter!("bifrost_scribe_persistence_encoded_bytes_total")
+        .increment(u64::try_from(file_size).unwrap_or(u64::MAX));
+}
+
 /// Test-tier one-shot failures for the concrete persistence seams.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Default)]
@@ -855,6 +871,7 @@ impl PersistenceWorker {
         let source_node_id = generation.stream.node_id.to_string();
         let path = object_path(binding, &generation.seal_key, &source_node_id)?;
         let file_size = encoded.bytes.len();
+        emit_compression_telemetry(generation.arrow_bytes, file_size);
         let row_encoded = ParquetEncoded {
             bytes: Vec::new(),
             row_group_stats: encoded.row_group_stats.clone(),
@@ -1449,6 +1466,95 @@ mod tests {
         assert_eq!(
             drained.gauges.get("bifrost_scribe_persistence_queue_bytes"),
             Some(&0.0)
+        );
+    }
+
+    /// Per-generation compression telemetry is recorded after a durable persist.
+    ///
+    /// Drives one complete `persist_once` through the real persistence runtime
+    /// using the [`IdlePersistenceFixture`] and asserts that:
+    /// - `bifrost_scribe_persistence_compression_ratio` gauge is set and
+    ///   positive (arrow bytes / encoded bytes > 0);
+    /// - `bifrost_scribe_persistence_encoded_bytes_total` counter is
+    ///   incremented by a positive amount (the Parquet-encoded size).
+    #[tokio::test(flavor = "current_thread")]
+    async fn persist_once_emits_compression_telemetry() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let fixture = IdlePersistenceFixture::start().await;
+        fixture.submit_and_drain().await;
+
+        let snapshot = recorder.snapshot();
+        let ratio = snapshot
+            .gauges
+            .get("bifrost_scribe_persistence_compression_ratio");
+        assert!(
+            ratio.is_some(),
+            "compression ratio gauge must be set after persist_once"
+        );
+        assert!(
+            *ratio.expect("ratio is present") > 0.0,
+            "compression ratio must be positive"
+        );
+        let encoded_bytes = snapshot
+            .counters
+            .get("bifrost_scribe_persistence_encoded_bytes_total");
+        assert!(
+            encoded_bytes.is_some(),
+            "encoded bytes counter must be set after persist_once"
+        );
+        assert!(
+            *encoded_bytes.expect("counter is present") > 0_u64,
+            "encoded bytes must be positive"
+        );
+    }
+
+    /// Compression telemetry pins the exact ratio orientation, the exact
+    /// counter increment, and the zero-byte gauge skip in isolation.
+    ///
+    /// [`persist_once_emits_compression_telemetry`] proves the pair is wired
+    /// into a real `persist_once`, but a fixed `arrow_bytes: 1` there cannot
+    /// distinguish a correct `arrow / encoded` orientation from an inverted
+    /// `encoded / arrow` one, nor a `file_size`-valued counter increment from
+    /// a constant one. This test calls [`emit_compression_telemetry`]
+    /// directly with values that make each of those regressions observable.
+    #[test]
+    fn emit_compression_telemetry_pins_formula_and_zero_edge() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        emit_compression_telemetry(400, 100);
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_scribe_persistence_compression_ratio"),
+            Some(&4.0),
+            "ratio must be arrow_bytes / file_size, not the inverse"
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_persistence_encoded_bytes_total"),
+            Some(&100_u64),
+            "counter must increment by file_size, not a constant amount"
+        );
+
+        emit_compression_telemetry(400, 0);
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_scribe_persistence_compression_ratio"),
+            Some(&4.0),
+            "gauge must be skipped (left unchanged) when file_size is zero"
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_persistence_encoded_bytes_total"),
+            Some(&100_u64),
+            "counter must still increment by zero, leaving the total unchanged"
         );
     }
 

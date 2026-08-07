@@ -690,7 +690,7 @@ async fn public_ack_restart_read_exact_once_journey() {
     replacement
         .bifrost_scribe()
         .expect("replacement Scribe")
-        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .retire_committed_for_test()
         .await
         .expect("retire source WAL segment");
     let source_wal_dir = roots

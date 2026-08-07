@@ -256,10 +256,13 @@ pub(crate) enum ShardCommand {
         now: std::time::Instant,
     },
     /// Retire committed generations and acknowledge completion for test control.
+    ///
+    /// Retirement is immediate: any [`ImmutableState::Committed`] generation is
+    /// retired on this pass. The `response` fires after the owner completes the
+    /// retirement and the test-support sweep, so the caller has a deterministic
+    /// observation point.
     #[cfg(any(test, feature = "test-support"))]
     RetireCommittedForTest {
-        /// Monotonic instant used for retention decisions.
-        now: std::time::Instant,
         /// Completes after the owner handles the retirement pass.
         response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
     },
@@ -400,12 +403,15 @@ pub(crate) struct ScribeShardRuntime {
     shutdown_flush_completions: AtomicUsize,
 }
 
+/// Configuration supplied to [`ScribeShardRuntime::start`].
+///
+/// All shard owners are started with this configuration. Committed generations
+/// retire immediately at the first lifecycle sweep after their SQL commit; there
+/// is no configurable grace period.
 pub(crate) struct ScribeShardStartConfig {
     /// Admission controller shared by all shard owners.
     pub(crate) admission: AdmissionController,
-    /// Grace period before committed generations may retire.
-    pub(crate) retention_grace: std::time::Duration,
-    /// Writable-byte threshold that triggers rotation.
+    /// Writable-byte threshold that triggers active-bucket rotation.
     pub(crate) rotation_bytes: usize,
     /// Shared WAL writer used to create shard handles.
     pub(crate) wal: Arc<WalWriter>,
@@ -511,7 +517,6 @@ impl ScribeShardRuntime {
     pub(crate) fn start(config: ScribeShardStartConfig, runtime: &Handle) -> Arc<Self> {
         let ScribeShardStartConfig {
             admission,
-            retention_grace,
             rotation_bytes,
             wal,
             persistence_cpu,
@@ -554,7 +559,7 @@ impl ScribeShardRuntime {
                 pending_generations: PendingGenerationsByKey::new(),
                 retained_generations: HashMap::new(),
                 admission: admission.clone(),
-                memtable: Memtable::new_with_limits(retention_grace, rotation_bytes),
+                memtable: Memtable::new_with_rotation(rotation_bytes),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
@@ -728,26 +733,26 @@ impl ScribeShardRuntime {
         }
     }
 
-    /// Run one acknowledged committed-generation retirement pass for every shard in tests.
+    /// Run one committed-generation retirement pass across every shard for tests.
     ///
     /// Unlike the production coalescing signal, this waits until every owner
-    /// has observed `now`. It lets integration journeys establish an exact
-    /// hot-tail retirement boundary without changing production scheduling.
+    /// has completed its retirement pass. It lets integration journeys establish
+    /// a deterministic observation point without changing production scheduling.
+    ///
+    /// Retirement is immediate: all [`ImmutableState::Committed`] generations are
+    /// retired on this call.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngressClosed`] when an owner has stopped or an
+    /// Returns [`ScribeError::IngressClosed`] when an owner has stopped, or an
     /// owner-reported retirement error when one shard cannot process the pass.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) async fn retire_committed_for_test(
-        &self,
-        now: std::time::Instant,
-    ) -> Result<(), ScribeError> {
+    pub(crate) async fn retire_committed_for_test(&self) -> Result<(), ScribeError> {
         for sender in &self.senders {
             let (response, result) = tokio::sync::oneshot::channel();
             sender
                 .sender
-                .send(ShardCommand::RetireCommittedForTest { now, response })
+                .send(ShardCommand::RetireCommittedForTest { response })
                 .await
                 .map_err(|_| ScribeError::IngressClosed)?;
             result.await.map_err(|_| ScribeError::Internal {
@@ -978,14 +983,14 @@ impl ShardOwner {
                 if let Err(error) = self.flush_expired(now) {
                     tracing::warn!(error = %error, shard = self.id, "age flush failed");
                 }
-                self.retire_committed(now).await;
+                self.retire_committed().await;
             }
             #[cfg(any(test, feature = "test-support"))]
-            ShardCommand::RetireCommittedForTest { now, response } => {
-                self.retire_committed(now).await;
+            ShardCommand::RetireCommittedForTest { response } => {
+                self.retire_committed().await;
                 let result = self
                     .memtable
-                    .sweep_once_for_test(now)
+                    .sweep_once_for_test()
                     .and_then(|retired_bytes| {
                         self.admission.release_immutable(retired_bytes);
                         self.memory_ledger.release_immutable(retired_bytes)?;
@@ -1339,23 +1344,30 @@ impl ShardOwner {
         Ok(())
     }
 
-    /// Retires committed generations after their retention grace period.
+    /// Retires all committed generations on the current lifecycle sweep.
     ///
-    /// Memory is released before WAL retirement is submitted. A failed WAL
-    /// retirement is logged and remains recoverable on a later lifecycle pass.
+    /// A generation is eligible the moment its state is
+    /// [`ImmutableState::Committed`], which is only reached after the fenced
+    /// `vala.file_list` + audit transaction commits. Retirement ordering is
+    /// preserved: `admission.release_immutable` and `memory_ledger.release_immutable`
+    /// are called before `ScribeWalIoOp::RetireWal` is submitted, so WAL
+    /// segment refcounts are released last.
+    ///
+    /// A failed WAL retirement is logged and remains recoverable on the next
+    /// lifecycle pass.
     ///
     /// # Cancellation
     ///
     /// Cancellation may leave a generation retained; its memory and WAL
     /// references remain owned until the next retirement pass.
-    async fn retire_committed(&mut self, now: std::time::Instant) {
+    async fn retire_committed(&mut self) {
         let generation_ids = self
             .retained_generations
             .keys()
             .copied()
             .collect::<Vec<_>>();
         for generation_id in generation_ids {
-            let retired = match self.memtable.retire_generation_at(generation_id, now) {
+            let retired = match self.memtable.retire_generation(generation_id) {
                 Ok(retired) => retired,
                 Err(error) => {
                     tracing::warn!(error = %error, generation_id, "shard generation retirement failed");
@@ -1993,7 +2005,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use chrono::NaiveDate;
     use std::sync::Arc;
-    use std::time::Duration;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
@@ -2252,7 +2263,7 @@ mod tests {
             .iter()
             .map(|column| column.get_array_memory_size())
             .sum();
-        let memtable = Memtable::new_with_limits(Duration::from_mins(1), rotation_bytes);
+        let memtable = Memtable::new_with_rotation(rotation_bytes);
         memtable
             .insert(&key, owner_event(), owner_meta(&key), first)
             .expect("seed full bucket");
@@ -2483,10 +2494,15 @@ mod tests {
         assert_eq!(stats.pending_generations, 0);
     }
 
+    /// Verifies that a committed generation retires on the first shard-level sweep
+    /// and that retirement does not enqueue additional generation tasks.
+    ///
+    /// The shard count is stable at 16, so FIFO queues indexed by shard ID cannot
+    /// grow beyond `SCRIBE_SHARD_COUNT`.
     #[test]
-    fn grace_expiry_does_not_add_generation_tasks() {
+    fn committed_generation_retires_at_first_shard_sweep() {
         let key = owner_key();
-        let owner = Memtable::new_with_retention(std::time::Duration::from_secs(1));
+        let owner = Memtable::new();
         owner
             .insert(&key, owner_event(), owner_meta(&key), owner_batch())
             .expect("owner insert");
@@ -2495,11 +2511,9 @@ mod tests {
             .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
             .expect("owner completion");
         assert_eq!(
-            owner
-                .sweep_once_at(std::time::Instant::now() + std::time::Duration::from_secs(2))
-                .expect("grace sweep")
-                .len(),
-            1
+            owner.sweep_once().expect("immediate sweep").len(),
+            1,
+            "committed generation retires at the first sweep"
         );
         assert_eq!(SCRIBE_SHARD_COUNT, 16);
     }

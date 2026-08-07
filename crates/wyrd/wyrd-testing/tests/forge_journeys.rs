@@ -1,7 +1,7 @@
 //! Distributed product journey for the real Scribe-to-Forge publication path.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use opendal::Buffer;
 use secrecy::SecretString;
@@ -769,7 +769,7 @@ async fn dedicated_forge_workers_journey() {
         .bifrost_scribe()
         .expect("server-role Scribe");
     scribe
-        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .retire_committed_for_test()
         .await
         .expect("retire committed Scribe generations");
     let oracle = scheduler_server
@@ -933,7 +933,7 @@ async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows()
     server
         .bifrost_scribe()
         .expect("server-role Scribe")
-        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .retire_committed_for_test()
         .await
         .expect("retire committed Scribe generations");
     let expected_rows =
@@ -1044,7 +1044,7 @@ async fn supervised_uncertain_commit_recovery_journey() {
     server
         .bifrost_scribe()
         .expect("server-role Scribe")
-        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .retire_committed_for_test()
         .await
         .expect("retire uncertain fixture Scribe generations");
     let tail_stats = server
@@ -1487,7 +1487,7 @@ async fn run_supervised_role_fixture(
     server
         .bifrost_scribe()
         .expect("server-role Scribe")
-        .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+        .retire_committed_for_test()
         .await
         .expect("retire Scribe generations");
 

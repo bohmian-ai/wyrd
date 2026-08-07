@@ -59,9 +59,6 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use num_traits::ToPrimitive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-#[cfg(any(test, feature = "test-support"))]
-use std::time::Instant;
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
 
@@ -85,6 +82,7 @@ async fn await_shutdown_phase<T>(
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+    use std::time::Duration;
 
     /// Proves a stalled Scribe phase returns exactly at the caller-owned deadline.
     #[tokio::test]
@@ -772,7 +770,6 @@ impl ScribeImpl {
         let shards = shards::ScribeShardRuntime::start(
             shards::ScribeShardStartConfig {
                 admission: admission.clone(),
-                retention_grace: Duration::from_mins(1),
                 rotation_bytes: memory.active_bucket_target_bytes(),
                 wal: Arc::clone(&wal),
                 persistence_cpu: persistence_cpu.clone(),
@@ -1102,20 +1099,23 @@ impl ScribeImpl {
         self.shards.flush_all().await
     }
 
-    /// Retire committed generations through an acknowledged test-only age pass.
+    /// Retire all committed generations through an acknowledged test-only retirement pass.
     ///
     /// Production lifecycle scheduling uses [`Self::check_age`] as a
-    /// coalescing best-effort signal. Tests use this control only when they
-    /// need to prove the public read path after every eligible hot generation
+    /// coalescing best-effort signal. Tests use this control when they need to
+    /// observe the public read path after every eligible committed generation
     /// has been retired.
+    ///
+    /// Retirement is immediate: all [`ImmutableState::Committed`] generations across
+    /// every shard are retired on this call with no grace period.
     ///
     /// # Errors
     ///
-    /// Returns the owner error when a shard cannot run the expiry or retirement
-    /// pass, including when a shard has stopped.
+    /// Returns the owner error when a shard cannot run the retirement pass,
+    /// including when a shard has stopped.
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn retire_committed_for_test(&self, now: Instant) -> Result<(), ScribeError> {
-        self.shards.retire_committed_for_test(now).await
+    pub async fn retire_committed_for_test(&self) -> Result<(), ScribeError> {
+        self.shards.retire_committed_for_test().await
     }
 
     /// Return the bounded persistence queue depth for test-tier drain checks.

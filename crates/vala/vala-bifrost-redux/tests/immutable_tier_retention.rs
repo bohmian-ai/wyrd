@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -47,7 +46,7 @@ fn pending_is_readable_and_only_committed_generation_retires() {
     )]));
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).expect("batch");
-    let memtable = Memtable::new_with_retention(Duration::from_secs(1));
+    let memtable = Memtable::new();
     memtable
         .insert(
             &key,
@@ -64,11 +63,10 @@ fn pending_is_readable_and_only_committed_generation_retires() {
         .expect("insert");
     let frozen = memtable.freeze(&key).expect("freeze");
     assert_eq!(memtable.pending_generation_count().expect("pending"), 1);
+    // A pending generation must not retire, even on the first sweep.
     assert!(
-        memtable
-            .sweep_once_at(Instant::now() + Duration::from_secs(10))
-            .expect("pending sweep")
-            .is_empty()
+        memtable.sweep_once().expect("pending sweep").is_empty(),
+        "PendingCommit generation must not retire before SQL commit"
     );
 
     memtable
@@ -85,11 +83,10 @@ fn pending_is_readable_and_only_committed_generation_retires() {
             },
         )
         .expect("complete");
+    // After commit, the generation is immediately retirement-eligible.
     assert_eq!(
-        memtable
-            .sweep_once_at(Instant::now() + Duration::from_secs(10))
-            .expect("committed sweep")
-            .len(),
-        1
+        memtable.sweep_once().expect("committed sweep").len(),
+        1,
+        "committed generation retires at the first sweep"
     );
 }

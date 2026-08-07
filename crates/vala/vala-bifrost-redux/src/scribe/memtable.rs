@@ -31,12 +31,17 @@ pub const ACTIVE_GENERATION_MAX_AGE: Duration = Duration::from_mins(10);
 ///
 /// Each seal-key holds an Arrow buffer, paired `AuditEvent` list, and
 /// `ScribeAppendMeta` list. Freezing a seal-key detaches an immutable snapshot.
+///
+/// Retirement is immediate: a generation is eligible the moment it enters
+/// [`ImmutableState::Committed`], which is only reached after the fenced
+/// `vala.file_list` + audit transaction commits. Retired Arrow memory is
+/// released before WAL segment retirement is submitted, preserving the
+/// ordering contract in `ShardOwner::retire_committed`.
 #[derive(Debug)]
 pub struct Memtable {
     pub(crate) writable: Arc<Mutex<HashMap<SealKey, MemtableBucket>>>,
     pub(crate) immutable: Arc<Mutex<HashMap<SealKey, Vec<ImmutableEntry>>>>,
     next_seal_id: Arc<AtomicU64>,
-    retention_grace: Duration,
     rotation_bytes: usize,
 }
 
@@ -88,26 +93,30 @@ pub(crate) struct PressureCandidate {
 }
 
 impl Memtable {
-    /// Construct a new empty memtable.
+    /// Construct a new empty memtable with the default active-bucket rotation threshold.
+    ///
+    /// Retirement is immediate: a [`ImmutableState::Committed`] generation is
+    /// eligible at the first lifecycle sweep after its SQL commit.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_retention(Duration::from_mins(1))
+        Self::new_with_rotation(MEMTABLE_ROTATION_BYTES)
     }
 
-    /// Construct a memtable with an explicit immutable-generation grace period.
+    /// Construct a memtable with an explicit active-bucket rotation byte threshold.
+    ///
+    /// The grace-period parameter that previously existed here has been removed.
+    /// Committed generations are immediately retirement-eligible; there is no
+    /// configurable delay.
+    ///
+    /// # Errors
+    ///
+    /// This constructor is infallible; it always returns a fresh, empty memtable.
     #[must_use]
-    pub fn new_with_retention(retention_grace: Duration) -> Self {
-        Self::new_with_limits(retention_grace, MEMTABLE_ROTATION_BYTES)
-    }
-
-    /// Construct a memtable with explicit retention and active-bucket limits.
-    #[must_use]
-    pub fn new_with_limits(retention_grace: Duration, rotation_bytes: usize) -> Self {
+    pub fn new_with_rotation(rotation_bytes: usize) -> Self {
         Self {
             writable: Arc::new(Mutex::new(HashMap::new())),
             immutable: Arc::new(Mutex::new(HashMap::new())),
             next_seal_id: Arc::new(AtomicU64::new(1)),
-            retention_grace,
             rotation_bytes,
         }
     }
@@ -657,28 +666,37 @@ impl Memtable {
         })
     }
 
-    /// Retire only committed immutable generations whose grace period elapsed.
-    /// The returned ranges are the only ranges eligible for WAL retirement.
-    pub fn sweep_once_at(&self, now: Instant) -> Result<Vec<(SealKey, WalRange)>, ScribeError> {
+    /// Retire all committed immutable generations at the current sweep.
+    ///
+    /// A generation is retirement-eligible the moment its state is
+    /// [`ImmutableState::Committed`]. `Committed` is only reached after the
+    /// fenced `vala.file_list` + audit transaction commits, so retired data is
+    /// always readable from published parquet. The returned WAL ranges are the
+    /// only ranges eligible for WAL retirement on this sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the immutable-generation lock is
+    /// poisoned.
+    pub fn sweep_once(&self) -> Result<Vec<(SealKey, WalRange)>, ScribeError> {
         Ok(self
-            .sweep_once_with_sizes_at(now)?
+            .sweep_once_with_sizes()?
             .into_iter()
             .map(|(seal_key, wal_range, _arrow_bytes)| (seal_key, wal_range))
             .collect())
     }
 
-    /// Retire committed immutable generations and retain their exact Arrow sizes.
+    /// Retire all committed immutable generations and return their exact Arrow sizes.
     ///
     /// This shared primitive keeps ordinary WAL retirement and test-only memory
     /// accounting aligned: both consume exactly the generations removed here.
+    /// Eligibility is immediate for any generation in [`ImmutableState::Committed`];
+    /// [`ImmutableState::PendingCommit`] generations are never retired.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
-    fn sweep_once_with_sizes_at(
-        &self,
-        now: Instant,
-    ) -> Result<Vec<(SealKey, WalRange, usize)>, ScribeError> {
+    fn sweep_once_with_sizes(&self) -> Result<Vec<(SealKey, WalRange, usize)>, ScribeError> {
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
@@ -686,12 +704,10 @@ impl Memtable {
         for (seal_key, entries) in immutable.iter_mut() {
             let mut kept = Vec::with_capacity(entries.len());
             for entry in entries.drain(..) {
-                let retire = matches!(
-                    entry.state,
-                    ImmutableState::Committed { observed_at, .. }
-                        if now.saturating_duration_since(observed_at) >= self.retention_grace
-                );
-                if retire {
+                // A committed generation is immediately retirement-eligible:
+                // `Committed` is only entered after the fenced file-list/audit
+                // transaction commits, so parquet is already readable.
+                if matches!(entry.state, ImmutableState::Committed { .. }) {
                     retired.push((
                         seal_key.clone(),
                         entry.wal_range(),
@@ -707,30 +723,42 @@ impl Memtable {
         Ok(retired)
     }
 
-    /// Retire eligible committed generations and return their exact Arrow bytes.
+    /// Retire eligible committed generations and return their total Arrow bytes.
     ///
-    /// This test-support control reports only bytes removed from the immutable
-    /// map, so callers cannot release memory for a still-pending generation.
+    /// This test-support helper reports only bytes removed from the immutable
+    /// map, so callers cannot double-release memory for a still-pending
+    /// generation. Eligibility is immediate: any [`ImmutableState::Committed`]
+    /// generation is retired on the first call after its commit completes.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn sweep_once_for_test(&self, now: Instant) -> Result<usize, ScribeError> {
+    pub(crate) fn sweep_once_for_test(&self) -> Result<usize, ScribeError> {
         Ok(self
-            .sweep_once_with_sizes_at(now)?
+            .sweep_once_with_sizes()?
             .into_iter()
             .fold(0_usize, |total, (_, _, arrow_bytes)| {
                 total.saturating_add(arrow_bytes)
             }))
     }
 
-    /// Retire one published generation after its grace period.
-    pub(crate) fn retire_generation_at(
-        &self,
-        seal_id: u64,
-        now: Instant,
-    ) -> Result<Option<WalRange>, ScribeError> {
+    /// Retire one durably published generation by seal ID.
+    ///
+    /// Eligibility invariant: a generation retires iff its state is
+    /// [`ImmutableState::Committed`], which is only entered after the fenced
+    /// `vala.file_list` + audit transaction commits. This guarantees parquet is
+    /// always readable before the in-memory accounting is released.
+    ///
+    /// The ordering contract with WAL retirement is owned by the caller
+    /// (`ShardOwner::retire_committed`): `admission.release_immutable` and
+    /// `memory_ledger.release_immutable` are called before
+    /// `ScribeWalIoOp::RetireWal` is submitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
+    pub(crate) fn retire_generation(&self, seal_id: u64) -> Result<Option<WalRange>, ScribeError> {
         let mut immutable = self
             .immutable
             .lock()
@@ -741,11 +769,7 @@ impl Memtable {
         for entries in immutable.values_mut() {
             let Some(index) = entries.iter().position(|entry| {
                 entry.seal_id() == seal_id
-                    && matches!(
-                        &entry.state,
-                        ImmutableState::Committed { observed_at, .. }
-                            if now.saturating_duration_since(*observed_at) >= self.retention_grace
-                    )
+                    && matches!(&entry.state, ImmutableState::Committed { .. })
             }) else {
                 continue;
             };
@@ -986,14 +1010,32 @@ impl MemtableBucket {
     }
 }
 
-/// The state of one immutable generation.
+/// The lifecycle state of one immutable generation.
+///
+/// The two variants govern retirement eligibility: only [`Committed`] generations
+/// are retirement-eligible, and they are eligible immediately — there is no
+/// timed grace period. [`PendingCommit`] generations are never retired until
+/// their SQL transaction durably commits.
+///
+/// [`Committed`]: ImmutableState::Committed
+/// [`PendingCommit`]: ImmutableState::PendingCommit
 #[derive(Debug)]
 pub enum ImmutableState {
-    /// The generation is readable but its SQL transaction is not durable yet.
+    /// The generation's SQL transaction is not yet durable.
+    ///
+    /// A generation in this state is never retirement-eligible, even if the
+    /// lifecycle sweep runs. Retirement would release accounting before parquet
+    /// is readable, violating the invariant that retired data is always
+    /// accessible from published parquet.
     PendingCommit,
-    /// The SQL row is durable and the generation is retained for the grace period.
+    /// The fenced `vala.file_list` + audit transaction has committed durably.
+    ///
+    /// A generation in this state is immediately retirement-eligible: parquet
+    /// is already readable from the published file list before this variant is
+    /// entered. The `observed_at` timestamp records when the commit was
+    /// acknowledged locally, for observability and tracing.
     Committed {
-        /// Local observation time used by deterministic sweeping.
+        /// Local time at which the SQL commit was acknowledged.
         observed_at: Instant,
         /// Exact durable file-list identity used for replay reconciliation.
         file_list_key: FileListCommitKey,
@@ -1181,7 +1223,6 @@ mod tests {
     use chrono::NaiveDate;
     use std::sync::Arc;
     use std::sync::Barrier;
-    use std::time::Duration;
 
     fn make_test_batch(num_rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1395,10 +1436,14 @@ mod tests {
         assert_eq!(lsns, vec![WalLsn::new(10), WalLsn::new(20)]);
     }
 
-    /// Verifies elapsed retention removes both a generation and its empty bucket.
+    /// Verifies that a committed generation retires on the first sweep after commit,
+    /// and that its empty bucket is also removed.
+    ///
+    /// Retirement is immediate: `Committed` implies durably published parquet,
+    /// so no grace period is required before the accounting releases.
     #[test]
-    fn committed_generations_retire_only_after_grace() {
-        let memtable = Memtable::new_with_retention(Duration::from_secs(1));
+    fn committed_generation_retires_at_first_sweep() {
+        let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
         memtable
             .insert(
@@ -1413,14 +1458,10 @@ mod tests {
             .complete_post_commit(frozen.seal_id, make_file_list_key(10, 10))
             .expect("complete");
 
-        let now = Instant::now();
-        assert!(memtable.sweep_once_at(now).expect("sweep").is_empty());
         assert_eq!(
-            memtable
-                .sweep_once_at(now + Duration::from_secs(2))
-                .expect("elapsed sweep")
-                .len(),
-            1
+            memtable.sweep_once().expect("first sweep").len(),
+            1,
+            "committed generation retires at the first sweep"
         );
         assert_eq!(memtable.immutable_generation_count().expect("immutable"), 0);
         assert_eq!(
@@ -1429,9 +1470,12 @@ mod tests {
         );
     }
 
+    /// Verifies that a frozen generation in `PendingCommit` state never retires,
+    /// even when a sweep runs. Retirement is gated on `Committed`, which requires
+    /// the SQL transaction to have committed durably.
     #[test]
     fn pending_generations_never_retire() {
-        let memtable = Memtable::new_with_retention(Duration::from_secs(1));
+        let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
         memtable
             .insert(
@@ -1443,10 +1487,8 @@ mod tests {
             .expect("insert");
         memtable.freeze(&seal_key).expect("freeze");
         assert!(
-            memtable
-                .sweep_once_at(Instant::now() + Duration::from_secs(10))
-                .expect("sweep")
-                .is_empty()
+            memtable.sweep_once().expect("sweep").is_empty(),
+            "PendingCommit generation must not retire before SQL commit"
         );
         assert_eq!(memtable.immutable_generation_count().expect("immutable"), 1);
     }
@@ -1473,7 +1515,7 @@ mod tests {
     fn would_cross_rotation_bounds_generation() {
         let incoming = make_test_batch(2);
         let incoming_bytes = estimate_batch_bytes(&incoming);
-        let memtable = Memtable::new_with_limits(Duration::from_mins(1), incoming_bytes + 1);
+        let memtable = Memtable::new_with_rotation(incoming_bytes + 1);
         let seal_key = make_test_seal_key();
 
         assert!(
@@ -1541,10 +1583,15 @@ mod tests {
     }
 
     /// Test-only retirement reports only bytes from generations it removed.
+    ///
+    /// A `PendingCommit` generation is ineligible and is excluded from the sweep.
+    /// Only the `Committed` generation's bytes are returned and released.
     #[test]
-    fn test_retirement_bytes_exclude_ineligible_immutable_generations() {
-        let memtable = Memtable::new_with_retention(Duration::from_secs(1));
+    fn retirement_bytes_exclude_pending_commit_generations() {
+        let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
+
+        // First generation: committed and immediately retirement-eligible.
         memtable
             .insert(
                 &seal_key,
@@ -1558,8 +1605,8 @@ mod tests {
             .complete_post_commit(first.seal_id, make_file_list_key(10, 10))
             .expect("first complete");
         let first_bytes = memtable.stats().expect("first stats").immutable_bytes;
-        std::thread::sleep(Duration::from_millis(1_100));
 
+        // Second generation: still in PendingCommit — must not be retired.
         memtable
             .insert(
                 &seal_key,
@@ -1568,22 +1615,27 @@ mod tests {
                 make_test_batch(1),
             )
             .expect("second insert");
-        let second = memtable.freeze(&seal_key).expect("second freeze");
-        memtable
-            .complete_post_commit(second.seal_id, make_file_list_key(20, 20))
-            .expect("second complete");
+        memtable.freeze(&seal_key).expect("second freeze");
         let total_bytes = memtable.stats().expect("combined stats").immutable_bytes;
 
-        let retired_bytes = memtable
-            .sweep_once_for_test(Instant::now())
-            .expect("test retirement");
-        assert_eq!(retired_bytes, first_bytes);
-        assert!(retired_bytes < total_bytes);
+        let retired_bytes = memtable.sweep_once_for_test().expect("test retirement");
+        assert_eq!(
+            retired_bytes, first_bytes,
+            "only the committed generation retires"
+        );
+        assert!(
+            retired_bytes < total_bytes,
+            "pending generation bytes excluded"
+        );
         assert_eq!(
             memtable.stats().expect("remaining stats").immutable_bytes,
             total_bytes.saturating_sub(retired_bytes)
         );
-        assert_eq!(memtable.immutable_generation_count().expect("remaining"), 1);
+        assert_eq!(
+            memtable.immutable_generation_count().expect("remaining"),
+            1,
+            "pending generation remains"
+        );
     }
 
     #[test]

@@ -453,8 +453,9 @@ async fn seal_and_rotation_preserve_fence() {
             },
         )
         .expect("sealed generation commits");
+    // Retirement is immediate: the committed generation retires on the first sweep.
     let retired = memtable
-        .sweep_once_at(Instant::now() + StdDuration::from_mins(2))
+        .sweep_once()
         .expect("committed generation retires from the memtable");
     assert_eq!(retired.len(), 1);
 

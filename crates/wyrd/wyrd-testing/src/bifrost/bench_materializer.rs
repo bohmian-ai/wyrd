@@ -1,5 +1,6 @@
 //! Production-path qualification dataset materialization.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +14,9 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, QueryClient};
+use wyrd_bench::{BenchmarkMetricSnapshot, BenchmarkRecorder};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -54,14 +57,168 @@ impl BackpressurePolicy {
     }
 }
 
+/// Closed set of D84 ceiling-labelled rejection reasons.
+///
+/// These are the exact `reason` label values the write path attaches to the
+/// `bifrost_scribe_rejections_total` counter when a memory ceiling trips
+/// (see `vala_bifrost_redux::scribe::ScribeRejectionCeiling::as_metric_label`).
+/// The bench harness consumes them by name to name the binding ceiling of a
+/// failing capacity run; it never defines or relabels them (T40 owns emission).
+pub const CEILING_REJECTION_REASONS: [&str; 5] = [
+    "cgroup_breaker",
+    "scribe_child",
+    "ingress_sublimit",
+    "bifrost_parent",
+    "cgroup_parent",
+];
+
+/// Governor memory high-water captured from a server inspection snapshot.
+///
+/// Records the parent Bifrost and Scribe-child occupancy against their ceilings
+/// plus retained WAL bytes at the instant a capacity run fails its deadline (or
+/// completes). When no ceiling-labelled rejection was observed, the ceiling
+/// closest to its limit here is what names the run's binding ceiling (D84).
+/// Additive server-side evidence only; it carries no tenant, table, or request
+/// identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GovernorHighWater {
+    /// Parent Bifrost bytes reserved across all roles.
+    pub parent_used_memory: usize,
+    /// Parent Bifrost memory ceiling.
+    pub parent_memory_limit: usize,
+    /// Scribe-child bytes reserved.
+    pub scribe_used_memory: usize,
+    /// Scribe-child memory ceiling.
+    pub scribe_memory_limit: usize,
+    /// WAL bytes retained on disk.
+    pub wal_disk_bytes: u64,
+}
+
+impl GovernorHighWater {
+    /// Read the governor high-water values from a server inspection snapshot.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &ScribeInspectionSnapshot) -> Self {
+        Self {
+            parent_used_memory: snapshot.parent_used_memory,
+            parent_memory_limit: snapshot.parent_memory_limit,
+            scribe_used_memory: snapshot.scribe_used_memory,
+            scribe_memory_limit: snapshot.scribe_memory_limit,
+            wal_disk_bytes: snapshot.wal_disk_bytes,
+        }
+    }
+
+    /// Return the ceiling label whose occupancy is closest to its own limit.
+    ///
+    /// Compares the Scribe-child and parent-Bifrost occupancy fractions and
+    /// returns the ceiling label of the larger fraction, ignoring a ceiling
+    /// whose limit is zero (unconfigured). Returns `None` when neither ceiling
+    /// has a positive limit. This is the fallback that names the binding
+    /// ceiling when no ceiling-labelled rejection was recorded (D84).
+    #[must_use]
+    fn nearest_ceiling(&self) -> Option<&'static str> {
+        let mut nearest: Option<(&'static str, f64)> = None;
+        for (label, used, limit) in [
+            (
+                "scribe_child",
+                self.scribe_used_memory,
+                self.scribe_memory_limit,
+            ),
+            (
+                "bifrost_parent",
+                self.parent_used_memory,
+                self.parent_memory_limit,
+            ),
+        ] {
+            if limit == 0 {
+                continue;
+            }
+            let fraction = used as f64 / limit as f64;
+            if nearest.is_none_or(|(_, best)| fraction > best) {
+                nearest = Some((label, fraction));
+            }
+        }
+        nearest.map(|(label, _)| label)
+    }
+}
+
+/// Extract the ceiling-labelled rejection counts from a benchmark metric snapshot.
+///
+/// Reads the `bifrost_scribe_rejections_total{reason="<ceiling>"}` series for
+/// each of the five [`CEILING_REJECTION_REASONS`], keyed by the closed ceiling
+/// label, and retains only ceilings that actually rejected work (count `> 0`).
+/// Returns an empty map when the recorder observed no ceiling-labelled
+/// rejection, which is the AC2 default that leaves `binding_ceilings` empty.
+#[must_use]
+pub fn ceiling_rejection_counts(snapshot: &BenchmarkMetricSnapshot) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for reason in CEILING_REJECTION_REASONS {
+        let key = format!("bifrost_scribe_rejections_total{{reason=\"{reason}\"}}");
+        if let Some(count) = snapshot.counters.get(&key).copied()
+            && count > 0
+        {
+            counts.insert(reason.to_owned(), count);
+        }
+    }
+    counts
+}
+
+/// Derive the binding ceiling name from captured ceiling rejections and governor high-water.
+///
+/// The binding ceiling is the ceiling-labelled rejection with the largest count
+/// in `binding_ceilings`; ties resolve to the lexicographically smallest ceiling
+/// label so the choice is deterministic. When `binding_ceilings` is empty, the
+/// binding ceiling falls back to the governor high-water ceiling closest to its
+/// limit. Returns `None` only when neither source is populated (D84).
+#[must_use]
+pub fn derive_binding_ceiling(
+    binding_ceilings: &BTreeMap<String, u64>,
+    governor: Option<&GovernorHighWater>,
+) -> Option<String> {
+    if let Some((ceiling, _)) = binding_ceilings
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+    {
+        return Some(ceiling.clone());
+    }
+    governor
+        .and_then(GovernorHighWater::nearest_ceiling)
+        .map(str::to_owned)
+}
+
 /// Admission pressure observed while materializing a dataset.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// The client-side counters `rejections` and `waited` are the unchanged D71
+/// contract. `binding_ceilings` and `governor_high_water` are the additive D84
+/// server-side evidence, populated from captured harness telemetry at the
+/// failure/completion instant and left empty/`None` when no telemetry source
+/// was injected.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PressureEvidence {
     /// Number of retryable capacity responses.
     pub rejections: u64,
     /// Total time spent waiting, including a final partial wait truncated by
     /// the absolute deadline.
     pub waited: Duration,
+    /// Which binding ceilings rejected work and how many times, keyed by the
+    /// ceiling-labelled T40 rejection `reason`. Empty when no ceiling-labelled
+    /// rejection was observed. (D84, additive)
+    pub binding_ceilings: BTreeMap<String, u64>,
+    /// Governor high-water at the failure/completion instant, from the server
+    /// inspection snapshot. `None` when no snapshot was taken. (D84, additive)
+    pub governor_high_water: Option<GovernorHighWater>,
+}
+
+impl PressureEvidence {
+    /// Name the binding ceiling from this run's own captured evidence.
+    ///
+    /// Delegates to [`derive_binding_ceiling`]: the max-count ceiling-labelled
+    /// rejection, or the governor high-water ceiling nearest its limit when no
+    /// ceiling-labelled rejection was recorded. `None` when no server-side
+    /// evidence was captured.
+    #[must_use]
+    pub fn binding_ceiling(&self) -> Option<String> {
+        derive_binding_ceiling(&self.binding_ceilings, self.governor_high_water.as_ref())
+    }
 }
 
 /// Progress retained when setup stops before the complete dataset is visible.
@@ -200,6 +357,18 @@ pub struct BifrostDatasetMaterializer<'a> {
     run_root: PathBuf,
     /// Cancellation observed between public operations.
     cancellation: CancellationToken,
+    /// Live server borrowed for pre-failure governor high-water capture.
+    ///
+    /// Set by [`Self::from_server`]; `None` under [`Self::with_backend`]. Read
+    /// through `scribe_inspection_snapshot` at the failure/completion instant to
+    /// populate [`PressureEvidence::governor_high_water`].
+    server: Option<&'a WyrdTestServer>,
+    /// Process recorder installed by the capacity entrypoint, if injected.
+    ///
+    /// Set by [`Self::with_recorder`]. Read at the failure/completion instant to
+    /// populate [`PressureEvidence::binding_ceilings`] with the ceiling-labelled
+    /// rejection counts. `None` leaves `binding_ceilings` empty (AC2).
+    recorder: Option<Arc<BenchmarkRecorder>>,
 }
 
 impl<'a> BifrostDatasetMaterializer<'a> {
@@ -222,7 +391,21 @@ impl<'a> BifrostDatasetMaterializer<'a> {
             policy,
             run_root: run_root.into(),
             cancellation,
+            server: None,
+            recorder: None,
         }
+    }
+
+    /// Attach the run's installed recorder so failure evidence can name
+    /// ceiling-labelled rejection counts.
+    ///
+    /// The recorder is the process-global handle installed by the capacity
+    /// entrypoint (this method never installs a second one). When absent,
+    /// [`PressureEvidence::binding_ceilings`] stays empty (AC2).
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<BenchmarkRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
     }
 
     /// Construct a real materializer from a bound test server and clients.
@@ -297,7 +480,29 @@ impl<'a> BifrostDatasetMaterializer<'a> {
             policy,
             run_root: run_root.into(),
             cancellation,
+            server: Some(server),
+            recorder: None,
         })
+    }
+
+    /// Populate the additive server-side pressure evidence from injected telemetry.
+    ///
+    /// Reads the ceiling-labelled rejection counts from the injected recorder and
+    /// the governor high-water from the injected server snapshot, writing both
+    /// into `pressure`. Each source is optional: an absent recorder leaves
+    /// `binding_ceilings` empty and an absent server (or a snapshot read error)
+    /// leaves `governor_high_water` `None` (AC2). Synchronous and infallible;
+    /// a snapshot error is treated as an absent snapshot and never panics.
+    fn capture_server_pressure(&self, pressure: &mut PressureEvidence) {
+        if let Some(recorder) = self.recorder.as_ref() {
+            pressure.binding_ceilings = ceiling_rejection_counts(&recorder.snapshot());
+        }
+        if let Some(server) = self.server {
+            pressure.governor_high_water = server
+                .scribe_inspection_snapshot()
+                .ok()
+                .map(|snapshot| GovernorHighWater::from_snapshot(&snapshot));
+        }
     }
 
     /// Materialize every tenant/day, retrying only public capacity responses.
@@ -390,6 +595,7 @@ impl<'a> BifrostDatasetMaterializer<'a> {
 
         match result {
             Ok(()) => {
+                self.capture_server_pressure(&mut pressure);
                 let elapsed = started.elapsed();
                 let seconds = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
                 Ok(MaterializedDataset {
@@ -522,8 +728,9 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                     };
                     pressure.waited = pressure.waited.saturating_add(evidence_wait);
                     if wait.is_zero() {
+                        self.capture_server_pressure(pressure);
                         return Err(MaterializationError::SetupDeadlineExceeded {
-                            pressure: *pressure,
+                            pressure: pressure.clone(),
                             progress: *progress,
                         });
                     }
@@ -534,8 +741,9 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                         _ = tokio::time::sleep(wait) => {}
                     }
                     if Instant::now() >= self.policy.setup_deadline {
+                        self.capture_server_pressure(pressure);
                         return Err(MaterializationError::SetupDeadlineExceeded {
-                            pressure: *pressure,
+                            pressure: pressure.clone(),
                             progress: *progress,
                         });
                     }
@@ -1062,5 +1270,62 @@ mod tests {
             .await
             .expect("visibility succeeds");
         assert_eq!(result.pressure.waited, Duration::ZERO);
+    }
+
+    /// Derive the binding ceiling as the max-count ceiling, then as the governor fallback.
+    ///
+    /// Proves both halves of [`derive_binding_ceiling`]: a populated
+    /// `binding_ceilings` map names its largest-count ceiling, and an empty map
+    /// falls back to the governor high-water ceiling nearest its limit. A
+    /// default (uncaptured) `PressureEvidence` names no ceiling.
+    #[test]
+    fn pressure_evidence_populates_binding_ceiling() {
+        let governor = GovernorHighWater {
+            parent_used_memory: 10,
+            parent_memory_limit: 100,
+            scribe_used_memory: 90,
+            scribe_memory_limit: 100,
+            wal_disk_bytes: 0,
+        };
+        let mut binding_ceilings = BTreeMap::new();
+        binding_ceilings.insert("scribe_child".to_owned(), 2);
+        binding_ceilings.insert("bifrost_parent".to_owned(), 5);
+        let evidence = PressureEvidence {
+            rejections: 7,
+            waited: Duration::from_millis(5),
+            binding_ceilings,
+            governor_high_water: Some(governor),
+        };
+        assert_eq!(
+            evidence.binding_ceiling().as_deref(),
+            Some("bifrost_parent")
+        );
+
+        let fallback = PressureEvidence {
+            binding_ceilings: BTreeMap::new(),
+            governor_high_water: Some(governor),
+            ..PressureEvidence::default()
+        };
+        assert_eq!(fallback.binding_ceiling().as_deref(), Some("scribe_child"));
+
+        assert_eq!(PressureEvidence::default().binding_ceiling(), None);
+    }
+
+    /// Keep the client-side `{ rejections, waited }` contract and default the new fields.
+    ///
+    /// Proves the D71 client-side counters are set exactly as before and the
+    /// additive D84 fields default empty/`None` when no telemetry was captured
+    /// (AC2).
+    #[test]
+    fn pressure_evidence_client_contract_unchanged() {
+        let evidence = PressureEvidence {
+            rejections: 3,
+            waited: Duration::from_millis(42),
+            ..PressureEvidence::default()
+        };
+        assert_eq!(evidence.rejections, 3);
+        assert_eq!(evidence.waited, Duration::from_millis(42));
+        assert!(evidence.binding_ceilings.is_empty());
+        assert!(evidence.governor_high_water.is_none());
     }
 }

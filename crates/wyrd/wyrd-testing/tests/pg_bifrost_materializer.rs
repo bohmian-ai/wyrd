@@ -12,6 +12,80 @@ mod pg_tests {
     };
     use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster};
 
+    /// Under injected WAL pressure the materializer names its own binding ceiling.
+    ///
+    /// Trips the server WAL breaker so public admission returns retryable
+    /// capacity rejections, then drives the locked two-tenant shape against a
+    /// short 20-second deadline. The run cannot complete, so it fails with
+    /// `SetupDeadlineExceeded`; the returned pressure evidence must carry the
+    /// governor high-water captured from the server inspection snapshot before
+    /// shutdown and, from that captured telemetry alone, name a binding ceiling
+    /// with no ad-hoc instrumentation. This is the write-path proof for audit
+    /// finding F5.
+    #[tokio::test]
+    #[ignore = "requires managed Postgres and the real public Gate cluster"]
+    async fn pg_bifrost_materializer_names_binding_ceiling_under_wal_pressure() {
+        let cluster = WyrdTestCluster::start(1, BifrostTopology::OnePod)
+            .await
+            .expect("cluster starts");
+        let tenant = cluster
+            .add_tenant("materializer-ceiling-tenant")
+            .await
+            .expect("second tenant starts");
+        let dataset = BifrostQualificationDataset::new(
+            DatasetShape::new(2, 160_000).expect("locked smoke shape"),
+        )
+        .expect("dataset builds");
+        let run_root = tempdir().expect("run root");
+        let server = cluster.server(0).expect("server exists");
+        server
+            .trip_bifrost_wal_disk_full_for_test()
+            .expect("WAL breaker trips");
+        let materializer = BifrostDatasetMaterializer::from_server(
+            server,
+            dataset,
+            vec![cluster.data_tenant_id(), tenant],
+            BackpressurePolicy::with_deadline(Instant::now() + Duration::from_secs(20)),
+            run_root.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("materializer setup");
+        let error = materializer
+            .materialize()
+            .await
+            .expect_err("WAL pressure exhausts the setup deadline");
+        drop(materializer);
+        let pressure = match &error {
+            MaterializationError::SetupDeadlineExceeded { pressure, .. } => pressure.clone(),
+            other => {
+                cluster
+                    .shutdown()
+                    .await
+                    .expect("cluster stops after unexpected error");
+                panic!("expected a setup-deadline failure under WAL pressure: {other:?}");
+            }
+        };
+        let binding_ceiling = pressure.binding_ceiling();
+        assert!(
+            pressure.rejections > 0,
+            "WAL pressure produced retryable capacity rejections"
+        );
+        assert!(
+            pressure.governor_high_water.is_some(),
+            "server governor high-water was captured before shutdown"
+        );
+        assert!(
+            binding_ceiling.is_some(),
+            "captured telemetry names the binding ceiling"
+        );
+        println!(
+            "materializer WAL pressure rejections={} binding_ceiling={binding_ceiling:?} governor_high_water={:?}",
+            pressure.rejections, pressure.governor_high_water,
+        );
+        cluster.shutdown().await.expect("cluster stops");
+    }
+
     /// Materialize the locked two-tenant smoke shape through public Gate and Oracle.
     ///
     /// The 180-second absolute deadline is intentionally part of this fixture's

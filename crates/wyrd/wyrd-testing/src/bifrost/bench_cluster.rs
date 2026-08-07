@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array};
@@ -14,19 +14,21 @@ use arrow::record_batch::RecordBatch;
 use hdrhistogram::Histogram;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport, QueryClient, ValaSdkError};
 use wyrd_bench::{
-    AttemptedProbe, BenchmarkEnvironment, BenchmarkOperation, BifrostDiagnosticReport,
-    BifrostReferenceProfile, BifrostRuntimeRole, BifrostSloEnvelope, CAPACITY_CONDITIONING_SECONDS,
-    CAPACITY_MEASURED_SECONDS, CAPACITY_TABLES_PER_TENANT, CLUSTER_REPORT_VERSION,
-    CLUSTER_WORKLOAD_VERSION, CapacityLimit, CapacityStage, CapacityStageIdentity,
-    CapacityStageOutcome, CapacityStagePlan, CapacityStateMachine, ClientTrialMetrics,
-    ClusterBenchmarkError, ClusterBenchmarkScenario, ClusterBenchmarkTrial, ClusterScenarioReport,
-    ClusterTopology, ClusterTrialReport, ClusterWorkloadIdentity, DependencyTelemetryEvidence,
-    DiagnosticStatus, EvidenceStatus, PillarTelemetryDelta, ProcessId, ProcessResourceEvidence,
-    ProductionTelemetryEvidence, QualificationProfileV2, ReviewedScenarioProfile, SpanDistribution,
-    TenantStageRows, TraceManifest, TrafficMix, TrialDistribution, derive_trial_median,
-    extract_linux_cpu_identity, extract_macos_cpu_identity, jain_fairness,
+    AttemptedProbe, BenchmarkEnvironment, BenchmarkMetricSnapshot, BenchmarkOperation,
+    BenchmarkRecorder, BifrostDiagnosticReport, BifrostReferenceProfile, BifrostRuntimeRole,
+    BifrostSloEnvelope, CAPACITY_CONDITIONING_SECONDS, CAPACITY_MEASURED_SECONDS,
+    CAPACITY_TABLES_PER_TENANT, CLUSTER_REPORT_VERSION, CLUSTER_WORKLOAD_VERSION, CapacityLimit,
+    CapacityStage, CapacityStageIdentity, CapacityStageOutcome, CapacityStagePlan,
+    CapacityStateMachine, ClientTrialMetrics, ClusterBenchmarkError, ClusterBenchmarkScenario,
+    ClusterBenchmarkTrial, ClusterScenarioReport, ClusterTopology, ClusterTrialReport,
+    ClusterWorkloadIdentity, DependencyTelemetryEvidence, DiagnosticStatus, EvidenceStatus,
+    PillarTelemetryDelta, ProcessId, ProcessResourceEvidence, ProductionTelemetryEvidence,
+    QualificationProfileV2, ReviewedScenarioProfile, SpanDistribution, TenantStageRows,
+    TraceManifest, TrafficMix, TrialDistribution, derive_trial_median, extract_linux_cpu_identity,
+    extract_macos_cpu_identity, jain_fairness,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -37,11 +39,15 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::Bootstrap;
+use crate::bifrost::bench_materializer::{
+    GovernorHighWater, ceiling_rejection_counts, derive_binding_ceiling,
+};
 use crate::bifrost::telemetry::{
     ClusterRuntimeRole, ClusterTelemetryEvidence, ClusterTelemetryExpectation,
     ClusterTelemetryProjection, ClusterTraceOperation, run_sampled_window,
 };
 use crate::bifrost::{BifrostClusterSpec, BifrostTopology, WyrdTestCluster};
+use crate::server::WyrdTestServer;
 
 /// Stable logical table used by the controlled workload.
 const REFERENCE_TABLE: &str = "cluster_reference_events";
@@ -315,6 +321,187 @@ fn qualification_execution_plan(
         .collect()
 }
 
+/// Process-global capacity benchmark recorder, installed at most once.
+///
+/// The `metrics` facade permits exactly one global recorder per process. This
+/// `OnceLock` makes [`install_or_existing_recorder`] idempotent across the
+/// capacity, smoke, and qualification entrypoints that may run in the same
+/// process: the first call installs and stores the recorder, every later call
+/// returns the same handle.
+static PROCESS_RECORDER: OnceLock<Arc<BenchmarkRecorder>> = OnceLock::new();
+
+/// T40 capacity metric families this harness consumes into its own artifact.
+///
+/// The bench harness reads these emitted-by-T40 families to reconstruct the
+/// server-side pressure picture; it never defines, renames, or relabels them.
+/// [`restrict_to_capacity_families`] keeps only series in these families so the
+/// persisted capture stays bounded to the capacity telemetry contract.
+const CAPACITY_METRIC_FAMILIES: [&str; 6] = [
+    "bifrost_scribe_rejections_total",
+    "bifrost_scribe_seal_total",
+    "bifrost_scribe_persist_stage_seconds",
+    "bifrost_memory_reserved_bytes",
+    "bifrost_memory_limit_bytes",
+    "bifrost_scribe_ingress_watermark_bytes",
+];
+
+/// Install the process-global benchmark recorder or return the existing one.
+///
+/// Installs a fresh [`BenchmarkRecorder`] as the `metrics` global recorder on
+/// the first call and stores it in [`PROCESS_RECORDER`]; every later call
+/// returns that same handle. When the `metrics` facade already holds a global
+/// recorder installed elsewhere, the install error is unwrapped back into the
+/// local handle rather than propagated, so a second capacity entrypoint in the
+/// same process never fails on `SetRecorderError`.
+fn install_or_existing_recorder() -> Arc<BenchmarkRecorder> {
+    Arc::clone(PROCESS_RECORDER.get_or_init(|| {
+        BenchmarkRecorder::new()
+            .install()
+            .unwrap_or_else(|error| error.into_inner())
+    }))
+}
+
+/// Restrict a metric snapshot to the [`CAPACITY_METRIC_FAMILIES`] series.
+///
+/// Retains only counters, gauges, gauge peaks, and histograms whose key names a
+/// T40 capacity family (either the bare family name or a `family{...}` labelled
+/// series), dropping every unrelated series so the persisted capture carries
+/// only the capacity telemetry contract. `series` and `series_limit_exceeded`
+/// are carried through unchanged as recorder-level diagnostics.
+#[must_use]
+fn restrict_to_capacity_families(snapshot: &BenchmarkMetricSnapshot) -> BenchmarkMetricSnapshot {
+    let retain = |key: &String| {
+        CAPACITY_METRIC_FAMILIES
+            .iter()
+            .any(|family| key == family || key.starts_with(&format!("{family}{{")))
+    };
+    BenchmarkMetricSnapshot {
+        counters: snapshot
+            .counters
+            .iter()
+            .filter(|(key, _)| retain(key))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect(),
+        gauges: snapshot
+            .gauges
+            .iter()
+            .filter(|(key, _)| retain(key))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect(),
+        gauge_peaks: snapshot
+            .gauge_peaks
+            .iter()
+            .filter(|(key, _)| retain(key))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect(),
+        histograms: snapshot
+            .histograms
+            .iter()
+            .filter(|(key, _)| retain(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        series: snapshot.series,
+        series_limit_exceeded: snapshot.series_limit_exceeded,
+    }
+}
+
+/// Server-side capacity telemetry the bench harness captures into its artifact.
+///
+/// Closes audit finding F5: the capacity lane installs its own
+/// [`BenchmarkRecorder`] and reads the server inspection snapshot, then persists
+/// this capture as a top-level artifact field. It carries the T40-restricted
+/// metric snapshot, the ceiling-labelled rejection counts, the governor
+/// high-water at the capture instant, and the derived binding ceiling that names
+/// the run's limiting resource. It holds no tenant, table, or request identity.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct CapacityTelemetryCapture {
+    /// Recorder snapshot restricted to [`CAPACITY_METRIC_FAMILIES`].
+    metrics: BenchmarkMetricSnapshot,
+    /// Ceiling-labelled rejection counts keyed by the closed ceiling reason.
+    binding_ceilings: BTreeMap<String, u64>,
+    /// Governor high-water captured before shutdown, or `None` when unavailable.
+    governor_high_water: Option<GovernorHighWater>,
+    /// Binding ceiling derived from the rejections and governor high-water.
+    binding_ceiling: Option<String>,
+}
+
+impl CapacityTelemetryCapture {
+    /// Assemble a capture from a recorder snapshot and an optional server snapshot.
+    ///
+    /// Restricts the metric snapshot to the T40 capacity families, extracts the
+    /// ceiling-labelled rejection counts, converts the server inspection
+    /// snapshot into governor high-water, and derives the binding ceiling from
+    /// both sources. The scribe snapshot is `None` when the server was already
+    /// gone at capture time.
+    #[must_use]
+    fn from_snapshot(
+        snapshot: &BenchmarkMetricSnapshot,
+        scribe: Option<&ScribeInspectionSnapshot>,
+    ) -> Self {
+        let metrics = restrict_to_capacity_families(snapshot);
+        let binding_ceilings = ceiling_rejection_counts(&metrics);
+        let governor_high_water = scribe.map(GovernorHighWater::from_snapshot);
+        let binding_ceiling =
+            derive_binding_ceiling(&binding_ceilings, governor_high_water.as_ref());
+        Self {
+            metrics,
+            binding_ceilings,
+            governor_high_water,
+            binding_ceiling,
+        }
+    }
+
+    /// Assemble a capture by snapshotting the installed recorder.
+    ///
+    /// Convenience wrapper over [`Self::from_snapshot`] for the entrypoints,
+    /// which hold the process-global recorder handle and the pre-shutdown server
+    /// snapshot.
+    #[must_use]
+    fn assemble(recorder: &BenchmarkRecorder, scribe: Option<&ScribeInspectionSnapshot>) -> Self {
+        Self::from_snapshot(&recorder.snapshot(), scribe)
+    }
+}
+
+/// Derive the capacity-telemetry sidecar path for a written artifact.
+///
+/// The main artifact keeps its own name and bytes; the capture is persisted in
+/// a companion file that shares the basename with a `.capacity-telemetry.json`
+/// extension (`cluster-capacity.json` yields
+/// `cluster-capacity.capacity-telemetry.json`).
+#[must_use]
+fn capacity_telemetry_sidecar_path(path: &Path) -> PathBuf {
+    path.with_extension("capacity-telemetry.json")
+}
+
+/// Write `report` to `path` and its capacity telemetry to the sidecar file.
+///
+/// The report structs are owned by `wyrd-bench`, seal their schema with
+/// `deny_unknown_fields`, and are re-read strictly by the qualification
+/// promotion path (`load_reviewed_qualification_profile_from_paths`). Injecting
+/// a new top-level field would break that strict round-trip and the artifact
+/// digest chain, so the capture is persisted byte-adjacently in the sidecar
+/// from [`capacity_telemetry_sidecar_path`] while the main artifact stays
+/// byte-identical to a plain serialization of `report`.
+///
+/// # Errors
+/// Returns an IO or JSON error when either the artifact or its sidecar cannot be
+/// serialized or written.
+fn write_capacity_artifact<T: serde::Serialize>(
+    path: &Path,
+    report: &T,
+    capture: &CapacityTelemetryCapture,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(report)?))?;
+    std::fs::write(
+        capacity_telemetry_sidecar_path(path),
+        format!("{}\n", serde_json::to_string_pretty(capture)?),
+    )?;
+    Ok(())
+}
+
 /// Run qualification with the parsed public selector.
 ///
 /// # Errors
@@ -331,6 +518,7 @@ async fn run_qualification_selected(
     selected_scenario: Option<&str>,
     matrix: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let recorder = install_or_existing_recorder();
     let path = report_path("cluster-candidate.json");
     let environment = detect_reference_environment_or_write(&path)?;
     let qualification = load_reviewed_qualification_profile(&environment)?;
@@ -338,6 +526,7 @@ async fn run_qualification_selected(
     let mut reports = Vec::new();
     let mut attempted_probes = Vec::new();
     let mut current_partial = None;
+    let mut scribe_snapshot = None;
     for item in execution_plan {
         let definition = item.definition;
         let rates = item.rates;
@@ -409,6 +598,14 @@ async fn run_qualification_selected(
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }
         .await;
+        // Capture the server inspection snapshot before shutdown consumes the
+        // cluster; the recorder snapshot is read later at report-write time.
+        if let Some(snapshot) = session
+            .server(0)
+            .and_then(|server| server.scribe_inspection_snapshot().ok())
+        {
+            scribe_snapshot = Some(snapshot);
+        }
         let shutdown = session.shutdown().await;
         if let Err(error) = result {
             let cleanup_error = shutdown.err().map(|cleanup| cleanup.to_string());
@@ -419,7 +616,15 @@ async fn run_qualification_selected(
             if let Some(partial) = current_partial {
                 reports.push(partial);
             }
-            write_partial_capture(&path, &environment, &combined, attempted_probes, reports)?;
+            let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
+            write_partial_capture(
+                &path,
+                &environment,
+                &combined,
+                attempted_probes,
+                reports,
+                &capture,
+            )?;
             return Err(error);
         }
         shutdown?;
@@ -438,13 +643,8 @@ async fn run_qualification_selected(
         scenarios: reviewed_scenario_profiles(reports, &environment_storage_identity(&environment)),
         slos: BifrostSloEnvelope::default(),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string_pretty(&profile)?),
-    )?;
+    let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
+    write_capacity_artifact(&path, &profile, &capture)?;
     let validation = selected_scenario.map_or_else(
         || profile.validate_reference(),
         |id| profile.validate_selected(id),
@@ -474,9 +674,11 @@ async fn run_capacity_selected(
     selected_scenario: Option<&str>,
     matrix: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let recorder = install_or_existing_recorder();
     let path = report_path("cluster-capacity.json");
     let environment = detect_reference_environment_or_write(&path)?;
     let mut reports = Vec::new();
+    let mut scribe_snapshot = None;
     for definition in reference_scenario_matrix() {
         if !matrix && selected_scenario != Some(definition.id) {
             continue;
@@ -516,6 +718,14 @@ async fn run_capacity_selected(
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }
         .await;
+        // Capture the server inspection snapshot before shutdown consumes the
+        // cluster; the recorder snapshot is read later at report-write time.
+        if let Some(snapshot) = session
+            .server(0)
+            .and_then(|server| server.scribe_inspection_snapshot().ok())
+        {
+            scribe_snapshot = Some(snapshot);
+        }
         let shutdown = session.shutdown().await;
         if let Err(error) = execution {
             let partial =
@@ -525,12 +735,14 @@ async fn run_capacity_selected(
                 || error.to_string(),
                 |cleanup| format!("{error}; cleanup failed: {cleanup}"),
             );
+            let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
             write_partial_capture(
                 &path,
                 &environment,
                 &combined,
                 attempted_probes,
                 partial.into_iter().collect(),
+                &capture,
             )?;
             return Err(error);
         }
@@ -543,13 +755,8 @@ async fn run_capacity_selected(
         scenarios: reviewed_scenario_profiles(reports, &environment_storage_identity(&environment)),
         slos: BifrostSloEnvelope::default(),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string_pretty(&profile)?),
-    )?;
+    let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
+    write_capacity_artifact(&path, &profile, &capture)?;
     write_qualification_profile_candidate(&path, &profile)?;
     Ok(path)
 }
@@ -994,6 +1201,11 @@ fn write_qualification_diagnostic(
 
 /// Persist completed reports and the current incomplete probe after a failure.
 ///
+/// The failing run's capacity telemetry capture is persisted to the companion
+/// sidecar via [`write_capacity_artifact`], so a deadline or lifecycle failure
+/// still names its own binding ceiling from captured server-side evidence
+/// without altering the strict diagnostic artifact.
+///
 /// # Errors
 /// Returns an IO or JSON error when the diagnostic cannot be written.
 fn write_partial_capture(
@@ -1002,10 +1214,8 @@ fn write_partial_capture(
     error: &str,
     attempted_probes: Vec<AttemptedProbe>,
     reports: Vec<ClusterScenarioReport>,
+    capture: &CapacityTelemetryCapture,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let report = BifrostDiagnosticReport::failure(
         DiagnosticStatus::NotReady,
         error.to_owned(),
@@ -1013,11 +1223,7 @@ fn write_partial_capture(
         attempted_probes,
         reviewed_scenario_profiles(reports, &environment_storage_identity(environment)),
     );
-    std::fs::write(
-        report_path,
-        format!("{}\n", serde_json::to_string_pretty(&report)?),
-    )?;
-    Ok(())
+    write_capacity_artifact(report_path, &report, capture)
 }
 
 /// Append the current probe before any fallible measurement work begins.
@@ -1567,6 +1773,19 @@ impl CapacityScenarioSession {
             published,
         )?;
         Ok((result, production, telemetry))
+    }
+
+    /// Borrow one running pod by stable order index before shutdown.
+    ///
+    /// The `cluster` field is private and [`Self::shutdown`] consumes it, so the
+    /// capacity entrypoints use this accessor to read the server inspection
+    /// snapshot immediately before shutting the session down. Returns `None`
+    /// when the session was already shut down or the index is out of range.
+    #[must_use]
+    pub(crate) fn server(&self, index: usize) -> Option<&WyrdTestServer> {
+        self.cluster
+            .as_ref()
+            .and_then(|cluster| cluster.server(index))
     }
 
     /// Shut the live cluster down exactly once and require complete cleanup.
@@ -2998,6 +3217,7 @@ fn is_retryable(error: &str) -> bool {
 /// Returns a cluster error when the real public Gate adapter fails its
 /// correctness, telemetry, tenant-isolation, audit, or cleanup assertions.
 pub async fn run_smoke() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let recorder = install_or_existing_recorder();
     let definition = reference_scenario_matrix()[2];
     let path = report_path("cluster-smoke.json");
     let environment = detect_reference_environment_or_write(&path)?;
@@ -3029,6 +3249,11 @@ pub async fn run_smoke() -> Result<PathBuf, Box<dyn std::error::Error + Send + S
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(stages)
     }
     .await;
+    // Capture the server inspection snapshot before shutdown consumes the
+    // cluster; the recorder snapshot is read later at report-write time.
+    let scribe_snapshot = session
+        .server(0)
+        .and_then(|server| server.scribe_inspection_snapshot().ok());
     let shutdown = session.shutdown().await;
     let stages = match result {
         Ok(stages) => stages,
@@ -3038,25 +3263,29 @@ pub async fn run_smoke() -> Result<PathBuf, Box<dyn std::error::Error + Send + S
                 || error.to_string(),
                 |cleanup| format!("{error}; cleanup failed: {cleanup}"),
             );
-            write_partial_capture(&path, &environment, &combined, attempted_probes, Vec::new())?;
+            let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
+            write_partial_capture(
+                &path,
+                &environment,
+                &combined,
+                attempted_probes,
+                Vec::new(),
+                &capture,
+            )?;
             return Err(error);
         }
     };
     shutdown?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
+    let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
+    write_capacity_artifact(
         &path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "evidence_class": "shortened-non-slo-smoke",
-                "schema_version": CLUSTER_REPORT_VERSION,
-                "scenario_id": definition.id,
-                "stages": stages,
-            }))?
-        ),
+        &serde_json::json!({
+            "evidence_class": "shortened-non-slo-smoke",
+            "schema_version": CLUSTER_REPORT_VERSION,
+            "scenario_id": definition.id,
+            "stages": stages,
+        }),
+        &capture,
     )?;
     Ok(path)
 }
@@ -3477,6 +3706,57 @@ fn lock_source_revision(lock: &str, package: &str) -> Result<String, ClusterBenc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capacity capture keeps only T40 families and names the binding ceiling.
+    ///
+    /// Proves [`restrict_to_capacity_families`] drops an unrelated series while
+    /// retaining the ceiling-labelled rejection and memory-reservation families,
+    /// and that the retained rejection still drives
+    /// [`derive_binding_ceiling`] to name the binding ceiling.
+    #[test]
+    fn capacity_capture_restricts_to_t40_families() {
+        let mut snapshot = BenchmarkMetricSnapshot::default();
+        snapshot.counters.insert(
+            "bifrost_scribe_rejections_total{reason=\"scribe_child\"}".to_owned(),
+            4,
+        );
+        snapshot.gauges.insert(
+            "bifrost_memory_reserved_bytes{role=\"scribe\"}".to_owned(),
+            2048.0,
+        );
+        snapshot
+            .counters
+            .insert("bifrost_unrelated_requests_total".to_owned(), 9);
+
+        let capture = CapacityTelemetryCapture::from_snapshot(&snapshot, None);
+
+        assert!(
+            capture
+                .metrics
+                .contains_family("bifrost_scribe_rejections_total")
+        );
+        assert!(
+            capture
+                .metrics
+                .contains_family("bifrost_memory_reserved_bytes")
+        );
+        assert!(
+            !capture
+                .metrics
+                .contains_family("bifrost_unrelated_requests_total")
+        );
+        assert!(
+            !capture
+                .metrics
+                .counters
+                .contains_key("bifrost_unrelated_requests_total")
+        );
+        assert_eq!(
+            capture.binding_ceilings.get("scribe_child").copied(),
+            Some(4)
+        );
+        assert_eq!(capture.binding_ceiling.as_deref(), Some("scribe_child"));
+    }
 
     /// Build a complete environment identity for diagnostic-assembly unit tests.
     fn diagnostic_environment_fixture() -> BenchmarkEnvironment {
@@ -3990,12 +4270,15 @@ mod tests {
         let environment = diagnostic_environment_fixture();
         let mut probes = Vec::new();
         begin_probe(&mut probes, "scenario-a".to_owned(), 500);
+        let capture =
+            CapacityTelemetryCapture::from_snapshot(&BenchmarkMetricSnapshot::default(), None);
         write_partial_capture(
             &path,
             &environment,
             "ordinary IO failure",
             probes,
             Vec::new(),
+            &capture,
         )
         .unwrap();
         let value: serde_json::Value =
@@ -4043,12 +4326,15 @@ mod tests {
             &transition,
             Err(ClusterBenchmarkError::NotReady(_))
         ));
+        let capture =
+            CapacityTelemetryCapture::from_snapshot(&BenchmarkMetricSnapshot::default(), None);
         write_partial_capture(
             &path,
             &environment,
             &transition.expect_err("invalid transition").to_string(),
             probes,
             vec![capacity_scenario_report(definition, stages)],
+            &capture,
         )
         .unwrap();
         let report: BifrostDiagnosticReport =

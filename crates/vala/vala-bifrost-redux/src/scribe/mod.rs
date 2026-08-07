@@ -43,6 +43,7 @@ use crate::scribe::admission::{AdmissionConfig, AdmissionController};
 pub use crate::scribe::execution_lanes::{
     ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
+pub use crate::scribe::memory::ScribeRejectionCeiling;
 pub use crate::scribe::memtable::SealTriggerReason;
 pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
@@ -1278,7 +1279,17 @@ impl ScribeImpl {
     /// [`Self::request_pressure_seal_toward_low_water`]: crossing the ingress
     /// high-water mark seals down toward low-water; below low-water it no-ops.
     /// The independent WAL-disk soft-pressure branch is unchanged.
+    ///
+    /// As the production steady-state tick, it first exports the governor and
+    /// memtable gauges (D84) so per-child occupancy, the D83 ingress watermarks,
+    /// and the memtable seal-decision inputs are observable every tick. Both
+    /// exports are emission-only and precede the flush requests; they never
+    /// change the seal, age, or pressure decisions the rest of the method makes.
     pub fn check_age(&self, now: std::time::Instant) {
+        self.pressure_snapshot().emit_governor_gauges();
+        if let Ok(stats) = self.aggregate_memtable_stats() {
+            emit_memtable_gauges(&stats);
+        }
         self.shards.request_expired_flush(now);
         self.request_pressure_seal_toward_low_water();
         if self.wal.disk_pressure().soft {
@@ -1463,6 +1474,38 @@ fn record_scribe_rejection(reason: &'static str) {
     metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(1);
 }
 
+/// Record one memory-ceiling rejection labelled by the ceiling that tripped (D84).
+///
+/// This shares the `bifrost_scribe_rejections_total` counter family with
+/// [`record_scribe_rejection`] but attaches the closed
+/// [`ScribeRejectionCeiling::as_metric_label`] value as the `reason`, so a
+/// dashboard can tell a Scribe-child overflow apart from an ingress-sublimit,
+/// parent-ceiling, or cgroup-breaker rejection instead of reading one collapsed
+/// `reason="memory"`. The label set is closed to the five ceiling values and
+/// carries no tenant, table, or request identity.
+fn record_scribe_ceiling_rejection(ceiling: ScribeRejectionCeiling) {
+    record_scribe_rejection(ceiling.as_metric_label());
+}
+
+/// Emit the three aggregate memtable gauges from a pod-level stats snapshot.
+///
+/// Emission-only: this sets the live gauges and never mutates admission state,
+/// so it is safe to call from the periodic age scanner ([`ScribeImpl::check_age`])
+/// as well as [`ScribeImpl::memtable_stats`]. The three gauges —
+/// `bifrost_scribe_active_memtable_bytes`, `bifrost_scribe_immutable_memtable_bytes`,
+/// and `bifrost_scribe_immutable_generation_count` — make the seal decision
+/// inputs (writable pressure, immutable backlog, generation depth) observable
+/// from production telemetry. The values are pod-global aggregates and carry no
+/// identity labels.
+fn emit_memtable_gauges(stats: &memtable::MemtableStats) {
+    metrics::gauge!("bifrost_scribe_active_memtable_bytes")
+        .set(stats.writable_bytes.to_f64().unwrap_or(f64::MAX));
+    metrics::gauge!("bifrost_scribe_immutable_memtable_bytes")
+        .set(stats.immutable_bytes.to_f64().unwrap_or(f64::MAX));
+    metrics::gauge!("bifrost_scribe_immutable_generation_count")
+        .set(stats.immutable_generations.to_f64().unwrap_or(f64::MAX));
+}
+
 /// Drop guard that drains the Scribe active-ingress gauge on every exit.
 struct ScribeIngressTelemetryGuard(metrics::Gauge);
 
@@ -1525,6 +1568,49 @@ mod telemetry_tests {
                 .any(|forbidden| key.contains(forbidden))
         }));
     }
+
+    /// Every ceiling rejection reason is a closed `snake_case` label with no identity.
+    ///
+    /// Emitting all five D84 ceilings through
+    /// [`super::record_scribe_ceiling_rejection`] proves the write-path rejection
+    /// counter labels the ceiling that tripped and never widens the label set
+    /// with tenant, table, path, request, node, error, or sql identity.
+    #[test]
+    fn write_path_metrics_carry_no_tenant_or_table_label() {
+        use super::ScribeRejectionCeiling;
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            for ceiling in [
+                ScribeRejectionCeiling::CgroupBreaker,
+                ScribeRejectionCeiling::ScribeChild,
+                ScribeRejectionCeiling::IngressSublimit,
+                ScribeRejectionCeiling::BifrostParent,
+                ScribeRejectionCeiling::CgroupParent,
+            ] {
+                super::record_scribe_ceiling_rejection(ceiling);
+            }
+        });
+        let snapshot = recorder.snapshot();
+        for reason in [
+            "cgroup_breaker",
+            "scribe_child",
+            "ingress_sublimit",
+            "bifrost_parent",
+            "cgroup_parent",
+        ] {
+            let key = format!("bifrost_scribe_rejections_total{{reason=\"{reason}\"}}");
+            assert_eq!(
+                snapshot.counters.get(&key).copied(),
+                Some(1),
+                "missing ceiling rejection {key}"
+            );
+        }
+        assert!(!snapshot.counters.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
+    }
 }
 
 impl ScribeImpl {
@@ -1555,8 +1641,18 @@ impl ScribeImpl {
         self.wal.bytes_on_disk()
     }
 
-    /// Return aggregate writable and immutable memtable state.
-    pub fn memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
+    /// Aggregate per-shard memtable state into one pod-level snapshot.
+    ///
+    /// Pure read: it sums every shard's writable and immutable counters without
+    /// touching admission or emitting telemetry, so both the admission-syncing
+    /// [`Self::memtable_stats`] and the emission-only age scanner
+    /// ([`Self::check_age`]) can share one aggregation without one path forcing
+    /// the other's side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a shard memtable snapshot cannot be read.
+    fn aggregate_memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
         let mut stats = memtable::MemtableStats::default();
         for owner in self.shards.memtable_snapshots()? {
             stats.writable_rows += owner.stats.writable_rows;
@@ -1568,14 +1664,19 @@ impl ScribeImpl {
             stats.writable_buckets += owner.stats.writable_buckets;
             stats.immutable_buckets += owner.stats.immutable_buckets;
         }
+        Ok(stats)
+    }
+
+    /// Return aggregate writable and immutable memtable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a shard memtable snapshot cannot be read.
+    pub fn memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
+        let stats = self.aggregate_memtable_stats()?;
         self.admission
             .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
-        metrics::gauge!("bifrost_scribe_active_memtable_bytes")
-            .set(stats.writable_bytes.to_f64().unwrap_or(f64::MAX));
-        metrics::gauge!("bifrost_scribe_immutable_memtable_bytes")
-            .set(stats.immutable_bytes.to_f64().unwrap_or(f64::MAX));
-        metrics::gauge!("bifrost_scribe_immutable_generation_count")
-            .set(stats.immutable_generations.to_f64().unwrap_or(f64::MAX));
+        emit_memtable_gauges(&stats);
         Ok(stats)
     }
 

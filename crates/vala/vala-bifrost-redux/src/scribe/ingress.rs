@@ -140,9 +140,12 @@ impl ScribeImpl {
     /// then retry the reservation exactly once. The cgroup 90% tripwire is left
     /// as an immediate `IngestBusy` — a container-level limit that a Scribe
     /// pressure seal cannot relieve — and is not retried. A retry that still
-    /// fails records the memory rejection and returns `IngestBusy`, deferring to
-    /// D71 client backoff for eventual admission. There is no busy-wait: freezing
-    /// and persistence proceed asynchronously between the seal request and retry.
+    /// fails records the rejection labelled by the ceiling that tripped (D84,
+    /// via [`super::record_scribe_ceiling_rejection`] — `cgroup_breaker`,
+    /// `ingress_sublimit`, or `bifrost_parent`) and returns `IngestBusy`,
+    /// deferring to D71 client backoff for eventual admission. There is no
+    /// busy-wait: freezing and persistence proceed asynchronously between the
+    /// seal request and retry.
     ///
     /// # Errors
     ///
@@ -154,13 +157,17 @@ impl ScribeImpl {
         bytes: usize,
         table: &str,
     ) -> Result<crate::scribe::memory::MemoryReservation, ScribeError> {
-        if !self.memory.cgroup_tripwire_engaged() {
+        if self.memory.cgroup_tripwire_engaged() {
+            super::record_scribe_ceiling_rejection(
+                crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
+            );
+        } else {
             self.request_pressure_seal_toward_low_water();
-            if let Ok(reservation) = self.memory.try_reserve_ingress(category, bytes) {
-                return Ok(reservation);
+            match self.memory.try_reserve_ingress_classified(category, bytes) {
+                Ok(reservation) => return Ok(reservation),
+                Err(ceiling) => super::record_scribe_ceiling_rejection(ceiling),
             }
         }
-        super::record_scribe_rejection("memory");
         Err(ScribeError::IngestBusy {
             table: table.to_owned(),
         })
@@ -175,8 +182,9 @@ impl ScribeImpl {
     /// shard-count-invariant pressure seal toward the low-water mark and retries
     /// the resize exactly once, while the cgroup 90% tripwire stays an immediate
     /// `IngestBusy` that a Scribe seal cannot relieve. A retry that still fails
-    /// records the memory rejection and returns `IngestBusy`, deferring to D71
-    /// client backoff.
+    /// records the rejection labelled by the ceiling that tripped (D84, via
+    /// [`super::record_scribe_ceiling_rejection`]) and returns `IngestBusy`,
+    /// deferring to D71 client backoff.
     ///
     /// # Errors
     ///
@@ -188,16 +196,20 @@ impl ScribeImpl {
         estimated_bytes: usize,
         table: &str,
     ) -> Result<(), ScribeError> {
-        if memory.resize_ingress(estimated_bytes).is_ok() {
+        if memory.resize_ingress_classified(estimated_bytes).is_ok() {
             return Ok(());
         }
-        if !self.memory.cgroup_tripwire_engaged() {
+        if self.memory.cgroup_tripwire_engaged() {
+            super::record_scribe_ceiling_rejection(
+                crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
+            );
+        } else {
             self.request_pressure_seal_toward_low_water();
-            if memory.resize_ingress(estimated_bytes).is_ok() {
-                return Ok(());
+            match memory.resize_ingress_classified(estimated_bytes) {
+                Ok(()) => return Ok(()),
+                Err(ceiling) => super::record_scribe_ceiling_rejection(ceiling),
             }
         }
-        super::record_scribe_rejection("memory");
         Err(ScribeError::IngestBusy {
             table: table.to_owned(),
         })

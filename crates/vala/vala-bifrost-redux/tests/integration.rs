@@ -8,6 +8,8 @@ mod mitari_rewrite_api;
 mod oracle_core;
 #[path = "pg_file_list_tenant_table.rs"]
 mod pg_file_list_tenant_table;
+#[path = "pg_scribe_governor_gauges.rs"]
+mod pg_scribe_governor_gauges;
 #[path = "pg_scribe_idempotent.rs"]
 mod pg_scribe_idempotent;
 #[path = "pg_scribe_persistence.rs"]

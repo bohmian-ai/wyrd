@@ -16,7 +16,9 @@ use crate::scribe::execution_lanes::{
     ScribePersistenceCpuPool, ScribeWalIoOp, ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::memory::{MemoryCategory, MemoryLedger};
-use crate::scribe::memtable::{BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate};
+use crate::scribe::memtable::{
+    BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, SealTriggerReason,
+};
 use crate::scribe::persistence::{
     ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
 };
@@ -1081,12 +1083,12 @@ impl ShardOwner {
     /// Applies one coalesced memory or WAL pressure signal.
     fn handle_pressure_signal(&mut self, signal: PressureSignal) {
         if !signal.keys.is_empty()
-            && let Err(error) = self.flush_keys(signal.keys)
+            && let Err(error) = self.flush_keys(signal.keys, Some(SealTriggerReason::Pressure))
         {
             tracing::warn!(error = %error, shard = self.id, "pressure flush failed");
         }
         if let Some(key) = signal.wal_key
-            && let Err(error) = self.flush_keys(vec![key])
+            && let Err(error) = self.flush_keys(vec![key], Some(SealTriggerReason::Pressure))
         {
             tracing::warn!(error = %error, shard = self.id, "WAL pressure flush failed");
         }
@@ -1314,7 +1316,7 @@ impl ShardOwner {
     /// construction fails; a full persistence queue remains pending for retry.
     fn flush_expired(&mut self, now: std::time::Instant) -> Result<(), ScribeError> {
         let keys = self.memtable.expired_seal_keys_for_shard(self.id, now)?;
-        self.flush_keys(keys)?;
+        self.flush_keys(keys, Some(SealTriggerReason::Age))?;
         self.retry_pending();
         Ok(())
     }
@@ -1327,10 +1329,19 @@ impl ShardOwner {
     /// preparation fails.
     fn flush_all(&mut self) -> Result<(), ScribeError> {
         let keys = self.memtable.active_seal_keys_for_shard(self.id)?;
-        self.flush_keys(keys)
+        self.flush_keys(keys, None)
     }
 
     /// Freezes selected writable buckets and queues immutable generations.
+    ///
+    /// `trigger` names the lifecycle reason these keys were selected so each
+    /// executed freeze counts one `bifrost_scribe_seal_total{trigger}` seal
+    /// (D84). Counting here — after the empty-bucket skip and a successful
+    /// freeze — is deliberate: the coordinated pressure path fans one request to
+    /// every shard, so counting at the request site would over-count by the
+    /// shard count, while counting at the actual freeze records exactly the
+    /// buckets that sealed. Callers with no lifecycle trigger (shutdown drain)
+    /// pass `None` and are not counted.
     ///
     /// # Errors
     ///
@@ -1340,12 +1351,16 @@ impl ShardOwner {
     fn flush_keys(
         &mut self,
         keys: Vec<crate::scribe::seal_key::SealKey>,
+        trigger: Option<SealTriggerReason>,
     ) -> Result<(), ScribeError> {
         for seal_key in keys {
             if self.memtable.row_count(&seal_key)? == 0 {
                 continue;
             }
             let frozen = self.memtable.freeze(&seal_key)?;
+            if let Some(trigger) = trigger {
+                record_seal(trigger);
+            }
             self.memory_ledger
                 .move_active_to_immutable(frozen.arrow_bytes)?;
             self.admission
@@ -1521,6 +1536,7 @@ impl ShardOwner {
             };
             self.admission.release_immutable(retained.arrow_bytes);
             let _ = self.memory_ledger.release_immutable(retained.arrow_bytes);
+            record_retirement(retained.arrow_bytes);
             if let Err(error) = self
                 .wal_io
                 .submit(ScribeWalIoOp::RetireWal {
@@ -2039,7 +2055,9 @@ impl ShardOwner {
                 .memtable
                 .would_cross_rotation(&slice.seal_key, &slice.rows);
             let pre_insert_result = match pre_insert_flush {
-                Ok(true) => self.flush_keys(vec![slice.seal_key.clone()]),
+                Ok(true) => {
+                    self.flush_keys(vec![slice.seal_key.clone()], Some(SealTriggerReason::Size))
+                }
                 Ok(false) => Ok(()),
                 Err(error) => Err(error),
             };
@@ -2108,6 +2126,12 @@ impl ShardOwner {
 
     /// Selects buckets crossing the rotation threshold and freezes them.
     ///
+    /// Each touched key is classified by [`Memtable::should_seal_reason`] so its
+    /// executed seal is counted under the true trigger — a size-crossing bucket
+    /// as `size`, an age-crossing bucket as `age` (D84). The two groups are
+    /// flushed separately purely so the seal counter is labelled correctly; the
+    /// freeze work and its ordering are unchanged from the single-group flush.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when rotation selection or generation preparation fails.
@@ -2115,13 +2139,17 @@ impl ShardOwner {
         &mut self,
         touched_keys: HashSet<crate::scribe::seal_key::SealKey>,
     ) -> Result<(), ScribeError> {
-        let mut keys = Vec::new();
+        let mut size_keys = Vec::new();
+        let mut age_keys = Vec::new();
         for seal_key in touched_keys {
-            if self.memtable.should_seal(&seal_key)? {
-                keys.push(seal_key);
+            match self.memtable.should_seal_reason(&seal_key)? {
+                Some(SealTriggerReason::Age) => age_keys.push(seal_key),
+                Some(_) => size_keys.push(seal_key),
+                None => {}
             }
         }
-        self.flush_keys(keys)
+        self.flush_keys(size_keys, Some(SealTriggerReason::Size))?;
+        self.flush_keys(age_keys, Some(SealTriggerReason::Age))
     }
 }
 
@@ -2131,6 +2159,34 @@ impl ShardOwner {
 /// classification. Every other group failure remains an unexpected error.
 fn is_expected_wal_capacity(error: &ScribeError) -> bool {
     matches!(error, ScribeError::WalDiskFull)
+}
+
+/// Count one executed seal, labelled by the trigger that caused it (D84).
+///
+/// Emitted at the moment a writable bucket is actually frozen, once per frozen
+/// bucket, so the `bifrost_scribe_seal_total{trigger}` counter reflects real
+/// seals rather than seal *requests* — the coordinated pressure path broadcasts
+/// one signal to every shard, but only the shards that hold a matching writable
+/// bucket freeze, and only those increments are counted here. The `trigger`
+/// label is closed to [`SealTriggerReason::as_label`]. Shutdown and
+/// tenant-administrative seals pass no trigger and are intentionally not
+/// counted, keeping the counter a pure size/age/pressure lifecycle signal.
+fn record_seal(trigger: SealTriggerReason) {
+    metrics::counter!("bifrost_scribe_seal_total", "trigger" => trigger.as_label()).increment(1);
+}
+
+/// Count one generation retirement and the immutable bytes it freed (D84).
+///
+/// Emitted once per generation that actually leaves retained state, so
+/// `bifrost_scribe_retirements_total` tracks completed retirements and
+/// `bifrost_scribe_retired_bytes_total` accumulates the immutable Arrow bytes
+/// returned to the memory budget. Together they make the tail of the write
+/// lifecycle — how fast committed generations are reclaimed — observable
+/// without a debugger. Neither counter carries identity labels.
+fn record_retirement(freed_bytes: usize) {
+    metrics::counter!("bifrost_scribe_retirements_total").increment(1);
+    metrics::counter!("bifrost_scribe_retired_bytes_total")
+        .increment(u64::try_from(freed_bytes).unwrap_or(u64::MAX));
 }
 
 #[cfg(test)]
@@ -2446,7 +2502,7 @@ mod tests {
             .expect("crossing insert");
         assert_eq!(touched, HashSet::from([key.clone()]));
         owner
-            .flush_keys(vec![key.clone()])
+            .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
             .expect("seal second generation");
 
         let immutable = owner.memtable.immutable.lock().expect("immutable lock");
@@ -3030,6 +3086,64 @@ mod tests {
             stats_a.writable_buckets + stats_b.writable_buckets,
             2,
             "pod-global snapshot fan-out must sum both shard contributions"
+        );
+    }
+
+    /// The seal counter is labelled by a closed size/age/pressure trigger set.
+    ///
+    /// Emitting one seal per trigger proves each [`SealTriggerReason`] increments
+    /// `bifrost_scribe_seal_total{trigger}` under its stable label and that no
+    /// trigger value leaks tenant, table, or request identity.
+    #[test]
+    fn seal_trigger_counter_labels_are_closed() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_seal(SealTriggerReason::Size);
+            record_seal(SealTriggerReason::Age);
+            record_seal(SealTriggerReason::Pressure);
+        });
+        let snapshot = recorder.snapshot();
+        for trigger in ["size", "age", "pressure"] {
+            let key = format!("bifrost_scribe_seal_total{{trigger=\"{trigger}\"}}");
+            assert_eq!(
+                snapshot.counters.get(&key).copied(),
+                Some(1),
+                "missing seal counter {key}"
+            );
+        }
+        assert!(!snapshot.counters.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
+    }
+
+    /// Retirement reports both a count and the immutable bytes it freed.
+    ///
+    /// Proves [`record_retirement`] advances `bifrost_scribe_retirements_total`
+    /// once and accumulates the freed bytes into
+    /// `bifrost_scribe_retired_bytes_total` under identity-free counter names.
+    #[test]
+    fn retirement_reports_freed_bytes() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_retirement(4096);
+            record_retirement(2048);
+        });
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_retirements_total")
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_retired_bytes_total")
+                .copied(),
+            Some(6144)
         );
     }
 }

@@ -230,6 +230,48 @@ impl MemorySnapshot {
         self
     }
 
+    /// Export the governor gauges that explain admission headroom (D84).
+    ///
+    /// Emitted from the production steady-state age scanner on every tick so a
+    /// dashboard can read live per-child occupancy and the D83 ingress
+    /// watermarks without a debugger. Two closed gauge families carry a
+    /// `consumer` label over the fixed set `{scribe, oracle, parent}`:
+    /// `bifrost_memory_reserved_bytes` (bytes currently charged) and
+    /// `bifrost_memory_limit_bytes` (the ceiling each is measured against). The
+    /// `scribe`/`oracle`/`parent` values share the `bifrost_memory_reserved_bytes`
+    /// family with the Forge consumer emitted by [`record_forge_memory`], keeping
+    /// one memory-occupancy family across every Bifrost role. A third family,
+    /// `bifrost_scribe_ingress_watermark_bytes`, carries the four D83 ingress
+    /// marks under a closed `mark` label `{occupancy, limit, high_water,
+    /// low_water}` — the exact numerator, denominator, and hysteresis band the
+    /// pressure-seal decision keys on. No label carries tenant, table, or
+    /// request identity. The snapshot should already be watermarked via
+    /// [`Self::with_ingress_watermarks`]; an unwatermarked snapshot reports the
+    /// two watermark marks as `0`.
+    pub fn emit_governor_gauges(self) {
+        let as_f64 = |bytes: usize| bytes.to_f64().unwrap_or(f64::MAX);
+        metrics::gauge!("bifrost_memory_reserved_bytes", "consumer" => "scribe")
+            .set(as_f64(self.scribe_total_bytes));
+        metrics::gauge!("bifrost_memory_reserved_bytes", "consumer" => "oracle")
+            .set(as_f64(self.oracle_total_bytes));
+        metrics::gauge!("bifrost_memory_reserved_bytes", "consumer" => "parent")
+            .set(as_f64(self.bifrost_total_bytes));
+        metrics::gauge!("bifrost_memory_limit_bytes", "consumer" => "scribe")
+            .set(as_f64(self.scribe_limit_bytes));
+        metrics::gauge!("bifrost_memory_limit_bytes", "consumer" => "oracle")
+            .set(as_f64(self.oracle_limit_bytes));
+        metrics::gauge!("bifrost_memory_limit_bytes", "consumer" => "parent")
+            .set(as_f64(self.bifrost_limit_bytes));
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "occupancy")
+            .set(as_f64(self.ingress_occupancy_bytes));
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "limit")
+            .set(as_f64(self.ingress_limit_bytes));
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "high_water")
+            .set(as_f64(self.ingress_high_water_bytes));
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "low_water")
+            .set(as_f64(self.ingress_low_water_bytes));
+    }
+
     /// Decide the pressure-seal release target from the ingress watermarks.
     ///
     /// This is the single, pure hysteresis decision shared by the admission
@@ -256,6 +298,78 @@ impl MemorySnapshot {
             .ingress_occupancy_bytes
             .saturating_sub(self.ingress_low_water_bytes);
         (to_release > 0).then_some(to_release)
+    }
+}
+
+/// Closed identity of the memory ceiling that rejected a reservation (D84).
+///
+/// Every distinct reservation ceiling maps to exactly one variant so that a
+/// user-visible ingress rejection can be labelled by the true limit that
+/// tripped, instead of collapsing five physically distinct ceilings under one
+/// constant `reason="memory"` label. The [`Self::as_metric_label`] values are
+/// the only accepted values of the ceiling-labelled rejection metric; the label
+/// set is closed and carries no tenant or table identity.
+///
+/// The ingress admission path constructs [`Self::CgroupBreaker`],
+/// [`Self::IngressSublimit`], and [`Self::BifrostParent`] (see
+/// [`ScribeMemoryBudget::try_reserve_ingress_classified`]); [`Self::ScribeChild`]
+/// is the child-limit form used by the non-ingress reservation paths, and
+/// [`Self::CgroupParent`] identifies the parent cgroup tripwire. All five are a
+/// normative D84 interface, not implementor latitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScribeRejectionCeiling {
+    /// The Scribe-child cgroup breaker tripped at or above 90% container usage.
+    CgroupBreaker,
+    /// A raw Scribe-child reservation exceeded the full child limit.
+    ScribeChild,
+    /// An ingress reservation exceeded the ingress sublimit (`limit - headroom`).
+    IngressSublimit,
+    /// A reservation exceeded the parent Bifrost ceiling (70% of pod memory).
+    BifrostParent,
+    /// The parent cgroup tripwire tripped at 100% container usage.
+    CgroupParent,
+}
+
+impl ScribeRejectionCeiling {
+    /// Return the stable `snake_case` label used by ceiling-rejection telemetry.
+    ///
+    /// The returned string is the value attached as the `reason` label on
+    /// `bifrost_scribe_rejections_total` for a ceiling-labelled rejection; the
+    /// five values form the closed label set and must stay stable across
+    /// changes.
+    #[must_use]
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::CgroupBreaker => "cgroup_breaker",
+            Self::ScribeChild => "scribe_child",
+            Self::IngressSublimit => "ingress_sublimit",
+            Self::BifrostParent => "bifrost_parent",
+            Self::CgroupParent => "cgroup_parent",
+        }
+    }
+
+    /// Map a tripped ceiling to the unchanged admission error.
+    ///
+    /// Every ceiling surfaces the same `IngestBusy { table: "memory" }` the
+    /// reservation path returned before D84 added ceiling identity, so the
+    /// returned [`ScribeError`] is byte-identical to prior behaviour; only the
+    /// telemetry label carries the ceiling. The ingress admission caller
+    /// reconstructs its own table-scoped `IngestBusy` and does not use this
+    /// mapping.
+    #[must_use]
+    fn into_ingest_busy(self) -> ScribeError {
+        // Every ceiling collapses to the same admission error; `self` names only
+        // the telemetry label the caller has already recorded, so the match is
+        // exhaustive-by-design rather than value-dependent.
+        match self {
+            Self::CgroupBreaker
+            | Self::ScribeChild
+            | Self::IngressSublimit
+            | Self::BifrostParent
+            | Self::CgroupParent => ScribeError::IngestBusy {
+                table: "memory".to_owned(),
+            },
+        }
     }
 }
 
@@ -694,7 +808,39 @@ impl ScribeMemoryBudget {
         category: MemoryCategory,
         bytes: usize,
     ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit(category, bytes, self.ingress_limit_bytes())
+        self.try_reserve_ingress_classified(category, bytes)
+            .map_err(ScribeRejectionCeiling::into_ingest_busy)
+    }
+
+    /// Reserve ingress bytes, naming the ceiling that rejects on failure.
+    ///
+    /// This is the ceiling-classified form of [`Self::try_reserve_ingress`]:
+    /// admission and byte accounting are identical, but a rejection returns the
+    /// closed [`ScribeRejectionCeiling`] that tripped instead of the collapsed
+    /// `IngestBusy`. Because ingress reservations charge against the ingress
+    /// sublimit, a Scribe-child overflow is reported as
+    /// [`ScribeRejectionCeiling::IngressSublimit`]; the cgroup breaker and the
+    /// parent ceiling report [`ScribeRejectionCeiling::CgroupBreaker`] and
+    /// [`ScribeRejectionCeiling::BifrostParent`]. The admission caller uses the
+    /// returned ceiling only to label rejection telemetry (D84) and then
+    /// surfaces its own table-scoped `IngestBusy`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ScribeRejectionCeiling`] that rejected the reservation when
+    /// the cgroup breaker is engaged, the ingress sublimit is exceeded, or the
+    /// parent Bifrost ceiling is exceeded.
+    pub(crate) fn try_reserve_ingress_classified(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+    ) -> Result<MemoryReservation, ScribeRejectionCeiling> {
+        self.try_reserve_with_limit_classified(
+            category,
+            bytes,
+            self.ingress_limit_bytes(),
+            ScribeRejectionCeiling::IngressSublimit,
+        )
     }
 
     /// Reserve bounded maintenance bytes up to the full parent and child caps.
@@ -712,25 +858,62 @@ impl ScribeMemoryBudget {
         bytes: usize,
         scribe_limit: usize,
     ) -> Result<MemoryReservation, ScribeError> {
+        self.try_reserve_with_limit_classified(
+            category,
+            bytes,
+            scribe_limit,
+            ScribeRejectionCeiling::ScribeChild,
+        )
+        .map_err(ScribeRejectionCeiling::into_ingest_busy)
+    }
+
+    /// Reserve bytes against a Scribe-child limit, naming the tripped ceiling.
+    ///
+    /// This is the single classified reservation core underneath every Scribe
+    /// reservation entry point. It performs the exact same three checks and
+    /// counter updates as before D84 — the cgroup breaker at 90%, the
+    /// Scribe-child total against `scribe_limit`, then the parent Bifrost total —
+    /// but on rejection returns the closed [`ScribeRejectionCeiling`] that
+    /// tripped rather than a collapsed `IngestBusy`. `child_ceiling` names the
+    /// ceiling to report when the Scribe-child total overflows `scribe_limit`
+    /// ([`ScribeRejectionCeiling::ScribeChild`] for full-limit callers,
+    /// [`ScribeRejectionCeiling::IngressSublimit`] for ingress). Byte accounting,
+    /// ordering, and the rollback of the Scribe-child charge on a parent
+    /// overflow are unchanged; only the error carries ceiling identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeRejectionCeiling::CgroupBreaker`] when the cgroup breaker
+    /// is engaged, `child_ceiling` when the Scribe-child limit is exceeded, and
+    /// [`ScribeRejectionCeiling::BifrostParent`] when the parent ceiling is
+    /// exceeded.
+    fn try_reserve_with_limit_classified(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+        scribe_limit: usize,
+        child_ceiling: ScribeRejectionCeiling,
+    ) -> Result<MemoryReservation, ScribeRejectionCeiling> {
         if bytes > 0
             && let Some((current, limit)) = self.parent.cgroup_pressure()
             && current.saturating_mul(100) >= limit.saturating_mul(90)
         {
-            return Err(ScribeError::IngestBusy {
-                table: "memory".to_owned(),
-            });
+            return Err(ScribeRejectionCeiling::CgroupBreaker);
         }
-        reserve_with_limit(&self.parent.inner.scribe_total_bytes, scribe_limit, bytes)?;
-        if let Err(error) = reserve_with_limit(
+        reserve_with_limit(&self.parent.inner.scribe_total_bytes, scribe_limit, bytes)
+            .map_err(|_| child_ceiling)?;
+        if reserve_with_limit(
             &self.parent.inner.bifrost_total_bytes,
             self.parent.bifrost_limit_bytes(),
             bytes,
-        ) {
+        )
+        .is_err()
+        {
             self.parent
                 .inner
                 .scribe_total_bytes
                 .fetch_sub(bytes, Ordering::AcqRel);
-            return Err(error);
+            return Err(ScribeRejectionCeiling::BifrostParent);
         }
         self.parent.inner.categories[category as usize].fetch_add(bytes, Ordering::AcqRel);
         Ok(MemoryReservation {
@@ -1232,15 +1415,64 @@ impl MemoryReservation {
 
     /// Resize an ingress reservation without consuming persistence headroom.
     pub fn resize_ingress(&mut self, bytes: usize) -> Result<(), ScribeError> {
-        self.resize_with_limit(bytes, self.governor.ingress_limit_bytes())
+        self.resize_ingress_classified(bytes)
+            .map_err(ScribeRejectionCeiling::into_ingest_busy)
+    }
+
+    /// Grow or shrink an ingress reservation, naming the ceiling on failure.
+    ///
+    /// This is the ceiling-classified form of [`Self::resize_ingress`]: the
+    /// grow path acquires the extra bytes against the ingress sublimit and the
+    /// shrink path releases, exactly as before, but a grow rejection returns the
+    /// closed [`ScribeRejectionCeiling`] that tripped so the admission caller can
+    /// label rejection telemetry (D84). A shrink never fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ScribeRejectionCeiling`] that rejected the additional
+    /// ingress bytes when the reservation must grow and cannot fit.
+    pub(crate) fn resize_ingress_classified(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), ScribeRejectionCeiling> {
+        self.resize_with_limit_classified(
+            bytes,
+            self.governor.ingress_limit_bytes(),
+            ScribeRejectionCeiling::IngressSublimit,
+        )
     }
 
     fn resize_with_limit(&mut self, bytes: usize, limit: usize) -> Result<(), ScribeError> {
+        self.resize_with_limit_classified(bytes, limit, ScribeRejectionCeiling::ScribeChild)
+            .map_err(ScribeRejectionCeiling::into_ingest_busy)
+    }
+
+    /// Resize against a Scribe-child limit, naming the tripped ceiling.
+    ///
+    /// The classified core underneath both [`Self::resize`] and
+    /// [`Self::resize_ingress`]. Growing acquires only the delta through the
+    /// classified reservation core and forgets the replacement so accounting is
+    /// unchanged; shrinking releases the delta and cannot fail. `child_ceiling`
+    /// names the ceiling to report on a Scribe-child overflow during a grow.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ScribeRejectionCeiling`] that rejected the additional bytes
+    /// when the reservation must grow and cannot fit under the limits.
+    fn resize_with_limit_classified(
+        &mut self,
+        bytes: usize,
+        limit: usize,
+        child_ceiling: ScribeRejectionCeiling,
+    ) -> Result<(), ScribeRejectionCeiling> {
         if bytes > self.bytes {
             let extra = bytes - self.bytes;
-            let replacement = self
-                .governor
-                .try_reserve_with_limit(self.category, extra, limit)?;
+            let replacement = self.governor.try_reserve_with_limit_classified(
+                self.category,
+                extra,
+                limit,
+                child_ceiling,
+            )?;
             self.bytes = bytes;
             std::mem::forget(replacement);
             self.adjust_shard_add(extra);
@@ -1727,6 +1959,120 @@ mod tests {
             .expect("derived ingress reservation");
         assert!(budget.try_reserve_ingress(MemoryCategory::Raw, 1).is_err());
         drop(reservation);
+    }
+
+    /// The five D84 ceilings map to their closed `snake_case` labels.
+    ///
+    /// Constructing every variant here also anchors the closed vocabulary: a
+    /// renamed or dropped variant fails this assertion, and the two ceilings
+    /// that only the non-ingress and parent paths produce
+    /// ([`ScribeRejectionCeiling::ScribeChild`] and
+    /// [`ScribeRejectionCeiling::CgroupParent`]) are exercised here so the label
+    /// contract is proven end to end.
+    #[test]
+    fn ceiling_labels_form_the_closed_d84_set() {
+        assert_eq!(
+            ScribeRejectionCeiling::CgroupBreaker.as_metric_label(),
+            "cgroup_breaker"
+        );
+        assert_eq!(
+            ScribeRejectionCeiling::ScribeChild.as_metric_label(),
+            "scribe_child"
+        );
+        assert_eq!(
+            ScribeRejectionCeiling::IngressSublimit.as_metric_label(),
+            "ingress_sublimit"
+        );
+        assert_eq!(
+            ScribeRejectionCeiling::BifrostParent.as_metric_label(),
+            "bifrost_parent"
+        );
+        assert_eq!(
+            ScribeRejectionCeiling::CgroupParent.as_metric_label(),
+            "cgroup_parent"
+        );
+    }
+
+    /// An ingress reservation pinned at its sublimit reports `IngressSublimit`.
+    ///
+    /// Pinning ingress at its ceiling and then classifying one more byte forces
+    /// the Scribe-child overflow branch of the classified core, which the ingress
+    /// entry point must label [`ScribeRejectionCeiling::IngressSublimit`] rather
+    /// than the parent or cgroup ceiling.
+    #[test]
+    fn ingress_ceiling_rejection_reports_ingress_sublimit() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let pinned = budget
+            .try_reserve_ingress(MemoryCategory::Raw, budget.ingress_limit_bytes())
+            .expect("pin ingress at the sublimit");
+        assert!(matches!(
+            budget.try_reserve_ingress_classified(MemoryCategory::Raw, 1),
+            Err(ScribeRejectionCeiling::IngressSublimit)
+        ));
+        drop(pinned);
+    }
+
+    /// An ingress reservation blocked by the parent ceiling reports `BifrostParent`.
+    ///
+    /// Filling the parent Bifrost ceiling through a parent-only reservation
+    /// leaves the ingress sublimit with room, so the classified core admits the
+    /// Scribe-child charge but then fails the parent charge and rolls back —
+    /// the branch that must be labelled
+    /// [`ScribeRejectionCeiling::BifrostParent`]. Uses a 4 GiB pod so the child
+    /// budget genuinely has ingress headroom while the parent is full.
+    #[test]
+    fn parent_ceiling_rejection_reports_bifrost_parent() {
+        let pod = 4 * 1024 * 1024 * 1024_usize;
+        let governor = BifrostMemoryGovernor::new(pod).expect("valid memory");
+        let parent = governor
+            .try_reserve_parent(governor.bifrost_limit_bytes())
+            .expect("fill the parent ceiling");
+        let budget = governor.scribe_budget();
+        assert!(matches!(
+            budget.try_reserve_ingress_classified(MemoryCategory::Raw, 1),
+            Err(ScribeRejectionCeiling::BifrostParent)
+        ));
+        assert_eq!(governor.snapshot().scribe_total_bytes, 0);
+        drop(parent);
+    }
+
+    /// The governor gauges carry only closed `consumer`/`mark` labels.
+    ///
+    /// Proves [`MemorySnapshot::emit_governor_gauges`] publishes both memory
+    /// families over the closed `consumer` set and the ingress watermark family
+    /// over the closed `mark` set, and that no gauge key carries tenant, table,
+    /// path, request, node, error, or sql identity.
+    #[test]
+    fn governor_gauges_emit_closed_consumer_and_mark_labels() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            governor
+                .snapshot()
+                .with_ingress_watermarks(75, 50)
+                .emit_governor_gauges();
+        });
+        let snapshot = recorder.snapshot();
+        for key in [
+            "bifrost_memory_reserved_bytes{consumer=\"scribe\"}",
+            "bifrost_memory_reserved_bytes{consumer=\"oracle\"}",
+            "bifrost_memory_reserved_bytes{consumer=\"parent\"}",
+            "bifrost_memory_limit_bytes{consumer=\"scribe\"}",
+            "bifrost_scribe_ingress_watermark_bytes{mark=\"occupancy\"}",
+            "bifrost_scribe_ingress_watermark_bytes{mark=\"high_water\"}",
+            "bifrost_scribe_ingress_watermark_bytes{mark=\"low_water\"}",
+        ] {
+            assert!(
+                snapshot.gauges.contains_key(key),
+                "missing governor gauge {key}"
+            );
+        }
+        assert!(!snapshot.gauges.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
     }
 
     /// Proves a parent-only (Forge) reservation charges neither Scribe nor Oracle.

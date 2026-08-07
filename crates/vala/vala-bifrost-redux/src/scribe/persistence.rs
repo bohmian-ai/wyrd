@@ -36,6 +36,21 @@ fn register_idle_persistence_queue() {
     metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(0.0);
 }
 
+/// Record the elapsed seconds for one persistence stage (D84).
+///
+/// The end-to-end `bifrost_scribe_persistence_publication_seconds` histogram
+/// measures closed-to-published latency but cannot say which stage dominates.
+/// This extends — never replaces — that histogram with a per-stage split under
+/// `bifrost_scribe_persist_stage_seconds{stage}`, where `stage` is closed to
+/// `{parquet, put, sql_commit}`: the Parquet encode, the object-store put, and
+/// the SQL file-list/audit commit. Each is recorded only after its stage
+/// completes successfully, so a stage that errors and returns early contributes
+/// no sample. The label carries no tenant, table, or object-path identity.
+fn record_persist_stage(stage: &'static str, started: std::time::Instant) {
+    metrics::histogram!("bifrost_scribe_persist_stage_seconds", "stage" => stage)
+        .record(started.elapsed().as_secs_f64());
+}
+
 /// Test-tier one-shot failures for the concrete persistence seams.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Default)]
@@ -769,29 +784,25 @@ impl PersistenceWorker {
         .await;
     }
 
-    /// Persists one generation through encode, object store, SQL, and manifest stages.
+    /// Encode one frozen generation to Parquet and time the encode stage (D84).
     ///
-    /// SQL commits the file-list and audit rows before the manifest advances. A
-    /// later manifest failure is intentionally recoverable through WAL replay;
-    /// object writes use the deterministic generation path and may already exist
-    /// when a retry begins.
+    /// Submits the encode to the persistence CPU lane, asserts the lane returned
+    /// a Parquet result, and records the elapsed time into the `parquet` stage of
+    /// `bifrost_scribe_persist_stage_seconds` on success. Extracted from
+    /// [`Self::persist_once`] so that method stays within its length budget while
+    /// the stage timing lives next to the work it measures.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when encoding, object storage, tenant SQL, SQL
-    /// commit, or manifest advancement fails.
-    ///
-    /// # Cancellation
-    ///
-    /// Cancellation may leave an object or committed file-list row behind. The
-    /// immutable generation remains retained by its shard for reconciliation.
-    async fn persist_once(
+    /// Returns [`ScribeError::Internal`] when the persistence lane returns a
+    /// non-Parquet result, and propagates any encode failure from the lane.
+    async fn encode_parquet_stage(
         &self,
-        generation: &ImmutableGeneration,
+        frozen: &FrozenMemtable,
         binding: &TenantTableBinding,
-    ) -> Result<FileListCommitKey, ScribeError> {
-        let frozen = generation.frozen_snapshot();
-        let mut encoded = match self
+    ) -> Result<ParquetEncoded, ScribeError> {
+        let parquet_started = std::time::Instant::now();
+        let encoded = match self
             .persistence_cpu
             .submit(ScribePersistenceCpuOp::EncodeParquet {
                 frozen: Box::new(frozen.clone()),
@@ -808,6 +819,39 @@ impl PersistenceWorker {
                 });
             }
         };
+        record_persist_stage("parquet", parquet_started);
+        Ok(encoded)
+    }
+
+    /// Persists one generation through encode, object store, SQL, and manifest stages.
+    ///
+    /// SQL commits the file-list and audit rows before the manifest advances. A
+    /// later manifest failure is intentionally recoverable through WAL replay;
+    /// object writes use the deterministic generation path and may already exist
+    /// when a retry begins.
+    ///
+    /// Each of the three costed stages — Parquet encode, object-store put, and
+    /// the SQL commit — records its elapsed time into
+    /// `bifrost_scribe_persist_stage_seconds{stage}` via [`record_persist_stage`]
+    /// (D84), splitting the end-to-end publication histogram without changing the
+    /// persistence work or its ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when encoding, object storage, tenant SQL, SQL
+    /// commit, or manifest advancement fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation may leave an object or committed file-list row behind. The
+    /// immutable generation remains retained by its shard for reconciliation.
+    async fn persist_once(
+        &self,
+        generation: &ImmutableGeneration,
+        binding: &TenantTableBinding,
+    ) -> Result<FileListCommitKey, ScribeError> {
+        let frozen = generation.frozen_snapshot();
+        let mut encoded = self.encode_parquet_stage(&frozen, binding).await?;
         let source_node_id = generation.stream.node_id.to_string();
         let path = object_path(binding, &generation.seal_key, &source_node_id)?;
         let file_size = encoded.bytes.len();
@@ -826,9 +870,11 @@ impl PersistenceWorker {
                 detail: "test object-store write failure".to_owned(),
             });
         }
+        let put_started = std::time::Instant::now();
         let path = self
             .put_object(&path, std::mem::take(&mut encoded.bytes))
             .await?;
+        record_persist_stage("put", put_started);
         let row = file_list_writer::build_insert(
             &frozen,
             &row_encoded,
@@ -842,6 +888,7 @@ impl PersistenceWorker {
         let fail_before_commit = self.faults.take_sql_commit();
         #[cfg(not(any(test, feature = "test-support")))]
         let fail_before_commit = false;
+        let commit_started = std::time::Instant::now();
         let outcome = self
             .publish_row(
                 binding.tenant,
@@ -850,6 +897,7 @@ impl PersistenceWorker {
                 fail_before_commit,
             )
             .await?;
+        record_persist_stage("sql_commit", commit_started);
         if let Some(publisher) = &self.staging_file_publisher {
             let event = crate::maintenance::StagingFileCommitted::new(
                 binding.clone(),
@@ -1468,5 +1516,38 @@ mod tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         assert!(tasks.is_empty());
+    }
+
+    /// The persistence stage split emits one histogram per closed stage label.
+    ///
+    /// Proves [`record_persist_stage`] records into
+    /// `bifrost_scribe_persist_stage_seconds{stage}` under the closed
+    /// `{parquet, put, sql_commit}` set and carries no identity labels, so the
+    /// split extends the end-to-end publication histogram without leaking tenant
+    /// or table dimensions.
+    #[test]
+    fn persist_stage_histograms_split_by_stage() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_persist_stage("parquet", std::time::Instant::now());
+            record_persist_stage("put", std::time::Instant::now());
+            record_persist_stage("sql_commit", std::time::Instant::now());
+        });
+        let snapshot = recorder.snapshot();
+        for stage in ["parquet", "put", "sql_commit"] {
+            let key = format!("bifrost_scribe_persist_stage_seconds{{stage=\"{stage}\"}}");
+            assert!(
+                snapshot.histograms.contains_key(&key),
+                "missing stage histogram {key}"
+            );
+        }
+        // Match forbidden label *keys* (`name="`), not value substrings: the
+        // legitimate `stage="sql_commit"` value contains "sql" but carries no
+        // sql identity label.
+        assert!(!snapshot.histograms.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(&format!("{forbidden}=\"")))
+        }));
     }
 }

@@ -380,16 +380,33 @@ impl Memtable {
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
     pub fn should_seal(&self, seal_key: &SealKey) -> Result<bool, ScribeError> {
+        Ok(self.should_seal_reason(seal_key)?.is_some())
+    }
+
+    /// Returns the size/age trigger that would seal this key, if any.
+    ///
+    /// This is the reason-carrying form of [`Self::should_seal`]: it applies the
+    /// same size-then-age precedence as [`MemtableBucket::should_seal_at`] and
+    /// returns the [`SealTriggerReason`] that fired so the caller (the shard
+    /// rotation sweep) can split keys by trigger and label the
+    /// `bifrost_scribe_seal_total{trigger}` counter (D84). Only `Size` and `Age`
+    /// are ever returned here; `Pressure` originates from the coordinated
+    /// ingress-pressure path, not this per-key rotation check.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
+    pub fn should_seal_reason(
+        &self,
+        seal_key: &SealKey,
+    ) -> Result<Option<SealTriggerReason>, ScribeError> {
         let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
         if let Some(bucket) = buckets.get(seal_key) {
-            Ok(bucket
-                .should_seal_at(Instant::now(), self.rotation_bytes, self.seal_max_age)
-                .is_some())
+            Ok(bucket.should_seal_at(Instant::now(), self.rotation_bytes, self.seal_max_age))
         } else {
-            Ok(false)
+            Ok(None)
         }
     }
 

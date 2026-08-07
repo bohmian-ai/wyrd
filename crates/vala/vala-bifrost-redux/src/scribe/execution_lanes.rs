@@ -58,6 +58,20 @@ fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Dura
         .record(elapsed.as_secs_f64());
 }
 
+/// Count one lane-saturation rejection, labelled by the lane that shed it (D84).
+///
+/// A saturated CPU lane rejects a job with `IngestBusy` when no application
+/// queue slot is free. The internal `saturation_events` counter already tracks
+/// this for the lane's own health snapshot, but the rejection was invisible in
+/// production telemetry; this makes it a first-class
+/// `bifrost_scribe_lane_saturation_total{lane}` counter so a lane shedding load
+/// is distinguishable from a memory-ceiling rejection. The `lane` label reuses
+/// the closed lane vocabulary shared with [`record_lane_state`] and
+/// [`record_lane_job`] and carries no tenant, table, or request identity.
+fn record_lane_saturation(lane: &'static str) {
+    metrics::counter!("bifrost_scribe_lane_saturation_total", "lane" => lane).increment(1);
+}
+
 /// The latency-sensitive native decode lane. Its queue is application-bounded;
 /// Rayon never becomes the source of untracked backpressure.
 #[derive(Debug, Clone)]
@@ -131,6 +145,7 @@ impl ScribeIngressCpuPool {
     ) -> Result<RecordBatch, ScribeError> {
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
+            record_lane_saturation("ingress");
             return Err(ScribeError::IngestBusy {
                 table: "ingress".to_owned(),
             });
@@ -202,6 +217,7 @@ impl ScribeIngressCpuPool {
     {
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
+            record_lane_saturation("ingress");
             return Err(ScribeError::IngestBusy {
                 table: "ingress".to_owned(),
             });
@@ -1292,7 +1308,7 @@ mod tests {
 
     use super::{
         ScribeIngressCpuPool, ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribeWalIoPool,
-        decode, source_schema_fingerprint, stamp_correlation_columns,
+        decode, record_lane_saturation, source_schema_fingerprint, stamp_correlation_columns,
     };
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::schema::SchemaFingerprint;
@@ -2130,5 +2146,33 @@ mod tests {
             .expect_err("server-owned managed columns are reserved");
             assert!(matches!(error, ScribeError::InvalidFrame), "{reserved}");
         }
+    }
+
+    /// Lane saturation emits a closed lane-labelled rejection counter.
+    ///
+    /// Proves [`record_lane_saturation`] advances
+    /// `bifrost_scribe_lane_saturation_total{lane}` under the closed lane
+    /// vocabulary and carries no tenant, table, or request identity, so a lane
+    /// shedding load is distinguishable in telemetry from a memory rejection.
+    #[test]
+    fn lane_saturation_emits_rejection_counter() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_lane_saturation("ingress");
+            record_lane_saturation("ingress");
+        });
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_lane_saturation_total{lane=\"ingress\"}")
+                .copied(),
+            Some(2)
+        );
+        assert!(!snapshot.counters.keys().any(|key| {
+            ["tenant", "table", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
     }
 }

@@ -506,23 +506,26 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                         });
                     }
                     let now = Instant::now();
-                    if now >= self.policy.setup_deadline {
+                    let remaining = self.policy.setup_deadline.saturating_duration_since(now);
+                    // Clamp the intended backoff to whatever time is left; a
+                    // zero remainder means the deadline is already at or past.
+                    let wait = backoff.min(remaining);
+                    // Record the truncated wait as pressure evidence even if the
+                    // deadline has already expired so that partial final sleeps
+                    // are always counted (task execution record requirement).
+                    pressure.waited = pressure.waited.saturating_add(wait);
+                    if wait.is_zero() {
                         return Err(MaterializationError::SetupDeadlineExceeded {
                             pressure: *pressure,
                             progress: *progress,
                         });
                     }
-                    let remaining = self.policy.setup_deadline.saturating_duration_since(now);
-                    let wait = backoff.min(remaining);
                     tokio::select! {
                         _ = self.cancellation.cancelled() => {
                             return Err(MaterializationError::Cancelled { progress: *progress });
                         }
                         _ = tokio::time::sleep(wait) => {}
                     }
-                    pressure.waited = pressure.waited.saturating_add(
-                        wait.min(self.policy.setup_deadline.saturating_duration_since(now)),
-                    );
                     if Instant::now() >= self.policy.setup_deadline {
                         return Err(MaterializationError::SetupDeadlineExceeded {
                             pressure: *pressure,

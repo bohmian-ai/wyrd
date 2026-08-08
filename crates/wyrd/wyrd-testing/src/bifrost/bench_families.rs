@@ -44,6 +44,7 @@ use super::bench_dataset::{
 use super::bench_materializer::{
     BackpressurePolicy, BifrostDatasetMaterializer, QUALIFICATION_TABLE,
 };
+use super::bench_qualification::{QualificationRunRecord, RunFingerprint};
 use super::bench_report::{
     AuditRelaySample, BifrostCapacityReport, BifrostCapacityStage, CapacityReportContext,
     CorrectnessVerdict, EnvironmentIdentity, IngestBody, LatencyPercentiles, MixedBody, QueryBody,
@@ -790,12 +791,45 @@ async fn acquire_query_dataset(
 ) -> Result<BifrostQualificationDataset, FamilyRunError> {
     match resolved.tier {
         RunnerTier::Smoke => materialize_smoke_dataset(cluster, invocation, workload_id).await,
-        RunnerTier::Qualification => Err(FamilyRunError::Cluster(
-            "qualification dataset acquisition (verified run scope opened by --run-id) is \
-             provided by T31; T30 runners implement the smoke tier"
-                .to_owned(),
-        )),
+        RunnerTier::Qualification => acquire_qualification_dataset(invocation),
     }
+}
+
+/// Open the verified qualification run scope named by `--run-id` and reuse it.
+///
+/// Opens the persisted run record under `<output_root>/<run_id>`, reconstructs
+/// the canonical-anchor dataset for the recorded shape, and refuses reuse unless
+/// the current qualified source commit, dataset digest, shape, and storage
+/// configuration all match what the run recorded. Reuse never crosses source
+/// commits and never fabricates qualification data: a mismatch fails before any
+/// cluster work with a field diagnostic. The returned dataset supplies the
+/// deterministic queries and expected results the family runner probes against
+/// the once-materialized run store.
+///
+/// # Errors
+/// Returns [`FamilyRunError::Cluster`] when the run record cannot be opened, the
+/// recorded shape is invalid, or the reuse fingerprint does not match the
+/// current environment.
+fn acquire_qualification_dataset(
+    invocation: &RunnerInvocation,
+) -> Result<BifrostQualificationDataset, FamilyRunError> {
+    let run_root = invocation.output_root.join(&invocation.run_id);
+    let record = QualificationRunRecord::open(&run_root)
+        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let shape = record.fingerprint.shape;
+    let dataset = BifrostQualificationDataset::new(shape)
+        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let current = RunFingerprint {
+        qualified_source_commit: git_head(),
+        dataset_digest: dataset.manifest().digest,
+        shape,
+        storage_config: environment_identity().storage_mode,
+    };
+    record
+        .fingerprint
+        .verify_reuse(&current)
+        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    Ok(dataset)
 }
 
 /// Materialize the fixture smoke shape into the cluster's data tenant.

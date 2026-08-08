@@ -1,0 +1,39 @@
+{
+  "schema_version": "wyrd.bifrost.capacity/v1",
+  "tier": "qualification",
+  "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "tree_clean": true,
+  "dataset_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "workload_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+  "topology": {
+    "topology_id": "topo-1",
+    "oracle_pods": 1
+  },
+  "stages": [
+    {
+      "ordinal": 0,
+      "correctness": "passed",
+      "audit": {
+        "backlog_records": 0,
+        "backlog_bytes": 0,
+        "lag_micros": 0
+      },
+      "recovery_replay": "passed",
+      "stage_execution": {
+        "run_id": "run-xyz",
+        "ordinal": 0,
+        "capture_window": {
+          "window_id": "w0",
+          "started_at_micros": 100,
+          "ended_at_micros": 200
+        },
+        "observation_digests": [
+          "3333333333333333333333333333333333333333333333333333333333333333"
+        ]
+      }
+    }
+  ],
+  "body": {
+    "saturation_reached": false
+  }
+}

@@ -188,10 +188,10 @@ echo "bifrost smoke suite completed in ${elapsed}s (budget ${budget}s)"
 '''
 
 [tasks."bench:bifrost:qualification"]
-description = "Run the full Bifrost qualification suite (verified-run orchestration supplied by T31)"
+description = "Run the full Bifrost qualification suite (live cluster driver supplied by T32)"
 run = '''
-echo "bench:bifrost:qualification requires the verified-run orchestration supplied by T31." >&2
-echo "Qualify one family against an existing verified run via bench:bifrost:qualification:{ingest,oracle,distributed,mixed} with WYRD_BIFROST_RUN_ID set." >&2
+echo "bench:bifrost:qualification runs the QualificationRun orchestration against a live cluster; the cluster provisioner/executor adapters and their driver entry are supplied by T32." >&2
+echo "The orchestration, shape selection, budgets, manifest writer, and validator are implemented (T31). Until the T32 driver lands, qualify one family against an existing verified run via bench:bifrost:qualification:{ingest,oracle,distributed,mixed} with WYRD_BIFROST_RUN_ID set." >&2
 exit 1
 '''
 

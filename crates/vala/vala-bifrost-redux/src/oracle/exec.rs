@@ -1314,6 +1314,39 @@ struct ReconciledRow {
     batch: RecordBatch,
 }
 
+/// Maps a full 16-byte batch id to one fixed reconciliation spill partition.
+///
+/// `ReconcileSpill::write_batch` fans retained rows across
+/// `RECONCILE_SPILL_PARTITIONS` files so each file reconciles under the
+/// per-partition byte bound applied in
+/// `FinishedReconcileSpill::reconcile_partition`. That bound only functions
+/// when rows spread uniformly, so partitioning MUST hash the entire batch id:
+/// every canonical batch id is a `UUIDv7` whose leading bytes are the top bits of
+/// the millisecond timestamp and are constant across the deployed timeframe, so
+/// hashing any fixed prefix collapses every row into one partition and defeats
+/// the bound. FNV-1a over all 16 bytes spreads rows on the random v7 tail while
+/// staying a pure deterministic function of the id, so identical identities (a
+/// `RowIdentity` shares its `batch_id`) always land in the same partition and
+/// exact-identity dedup is preserved.
+///
+/// # Panics
+///
+/// Never in practice: the result is a modulo of `RECONCILE_SPILL_PARTITIONS`
+/// and always fits `usize`; the invariant is named in the `expect` message.
+fn spill_partition(batch_id: &[u8]) -> usize {
+    /// FNV-1a 64-bit offset basis.
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    /// FNV-1a 64-bit prime.
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in batch_id {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    usize::try_from(hash % RECONCILE_SPILL_PARTITIONS as u64)
+        .expect("spill partition index is below RECONCILE_SPILL_PARTITIONS and fits usize")
+}
+
 /// Blocking-tempfile spill state partitioned by immutable row identity.
 struct ReconcileSpill {
     /// Tagged physical schema written to every partition.
@@ -1422,7 +1455,7 @@ impl ReconcileSpill {
                     ReconcileError::InvalidIdentity,
                 )));
             }
-            let partition = usize::from(batch_ids.value(row)[0]) % RECONCILE_SPILL_PARTITIONS;
+            let partition = spill_partition(batch_ids.value(row));
             indices[partition].push(u32::try_from(row).map_err(|_| {
                 DataFusionError::Execution("spill row ordinal exceeds u32".to_owned())
             })?);
@@ -2652,12 +2685,47 @@ mod tests {
         );
     }
 
-    /// Reconciliation spills at its query ceiling and still yields exact rows.
+    /// Reconciliation spills at its query ceiling across every fixed partition
+    /// and its union of winners equals the in-memory path's winner set exactly.
+    ///
+    /// The fixture mints canonical `UUIDv7`-shaped batch ids (shared timestamp
+    /// prefix, distinct random tails) — the only ids the system produces — so
+    /// the spill selector is exercised against its real input domain. Each
+    /// identity arrives in two source tiers with equal logical values, so exact
+    /// dedup runs across the spill boundary and the winner-set equality proves
+    /// the spilled reconciliation is identical to the in-memory reconciliation.
+    /// Before the D89 fix, every v7 id hashed on its constant first byte into a
+    /// single partition whose per-partition bound then rejected the read, so
+    /// this test fails closed against the defect.
     #[tokio::test]
     async fn reconciliation_spills_in_fixed_identity_partitions() {
-        let batches = (0_u8..128)
-            .map(|identity| tagged_batch([identity; 16], 0, i64::from(identity), SourceTier::Live))
-            .collect::<Vec<_>>();
+        // Two tiers per identity so dedup is exercised through the spill path.
+        let mut batches = Vec::new();
+        for tail in 0_u8..128 {
+            let id = v7_style_id(tail);
+            batches.push(tagged_batch(id, 0, i64::from(tail), SourceTier::Live));
+            batches.push(tagged_batch(id, 0, i64::from(tail), SourceTier::Iceberg));
+        }
+
+        // Reference winners from the in-memory reconciliation over the identical
+        // input, stripped of source-tier bookkeeping exactly as both output
+        // paths do before yielding.
+        let mut reference = BTreeMap::new();
+        for batch in &batches {
+            reconcile_batch(&mut reference, batch).expect("reference input reconciles");
+        }
+        let expected = reference
+            .into_values()
+            .map(|row| {
+                winner_key(&remove_column(&row.batch, SOURCE_TIER_COLUMN).expect("strip tier"))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            expected.len(),
+            128,
+            "dedup collapses each identity to one winner"
+        );
+
         let per_batch = batches[0].get_array_memory_size();
         let input = MemorySourceConfig::try_new_exec(
             std::slice::from_ref(&batches),
@@ -2667,11 +2735,16 @@ mod tests {
         .expect("test memory source");
         let governor = crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
             .expect("minimum test governor");
+        // The in-memory accumulator charges the compact source-batch size while
+        // each spilled row is re-charged at its larger IPC-decoded size, so the
+        // limit must sit above one partition's decoded rows yet below the total
+        // in-memory working set for a spill to trigger. 128x per_batch lands in
+        // that window for this fixture with comfortable margin on both sides.
         let plan = ReconcileExec::new(
             input,
             OracleMemoryResources {
                 governor,
-                reconciliation_limit_bytes: per_batch.saturating_mul(32),
+                reconciliation_limit_bytes: per_batch.saturating_mul(128),
             },
         )
         .expect("tagged input is valid");
@@ -2679,11 +2752,102 @@ mod tests {
         let mut stream = plan
             .execute(0, session.task_ctx())
             .expect("spill plan executes");
-        let mut rows = 0;
+        let mut actual = std::collections::BTreeSet::new();
         while let Some(batch) = stream.next().await {
-            rows += batch.expect("spill partition reconciles").num_rows();
+            let batch =
+                batch.expect("every spill partition reconciles under the per-partition bound");
+            for row in 0..batch.num_rows() {
+                assert!(
+                    actual.insert(winner_key(&batch.slice(row, 1))),
+                    "spill output must not repeat an identity"
+                );
+            }
         }
-        assert_eq!(rows, 128);
+        assert_eq!(
+            actual, expected,
+            "spill-path winner union must equal the in-memory winner set"
+        );
+    }
+
+    /// Builds a canonical UUIDv7-shaped batch id: a shared millisecond-timestamp
+    /// prefix with a distinct random-style tail, matching every id the system
+    /// mints via `Uuid::now_v7`.
+    fn v7_style_id(tail: u8) -> [u8; 16] {
+        // Shared 48-bit unix-ms timestamp prefix (bytes 0..6) and version nibble
+        // (byte 6 high nibble 0x7), constant across ids as in a real v7 burst.
+        let mut id = [
+            0x01, 0x93, 0x8a, 0x4c, 0x2f, 0x10, 0x70, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        // Vary only the random tail bytes the way v7 randomness does.
+        id[7] = tail.wrapping_mul(31).wrapping_add(7);
+        id[9] = tail.wrapping_mul(97);
+        id[15] = tail;
+        id
+    }
+
+    /// Extracts the exact identity and value of one reconciled output row.
+    fn winner_key(batch: &RecordBatch) -> (RowIdentity, i64) {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .expect("output batch id column");
+        let ordinals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("output ordinal column");
+        let values = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("output value column");
+        let batch_id: [u8; 16] = ids.value(0).try_into().expect("16-byte batch id");
+        (
+            RowIdentity {
+                batch_id,
+                ordinal: u32::try_from(ordinals.value(0)).expect("non-negative ordinal"),
+            },
+            values.value(0),
+        )
+    }
+
+    /// Canonical `UUIDv7` batch ids sharing a timestamp prefix spread across more
+    /// than one spill partition, while identical ids stay colocated.
+    #[test]
+    fn spill_partition_spreads_v7_prefix_collisions() {
+        let ids = (0_u8..64).map(v7_style_id).collect::<Vec<_>>();
+        let partitions = ids
+            .iter()
+            .map(|id| spill_partition(id))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            partitions
+                .iter()
+                .all(|partition| *partition < RECONCILE_SPILL_PARTITIONS),
+            "every partition index stays within the fixed count"
+        );
+        assert!(
+            partitions.len() > 1,
+            "shared-prefix v7 ids must spread across partitions, got {partitions:?}"
+        );
+        // The pre-fix first-byte selector would have collapsed all of these ids
+        // into a single partition; assert the whole-id hash does not.
+        let first_byte_partitions = ids
+            .iter()
+            .map(|id| usize::from(id[0]) % RECONCILE_SPILL_PARTITIONS)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            first_byte_partitions.len(),
+            1,
+            "v7 first byte is constant, confirming the defect the hash fixes"
+        );
+        // Identical batch ids always map to the same partition (dedup invariant).
+        let repeated = v7_style_id(11);
+        assert_eq!(
+            spill_partition(&repeated),
+            spill_partition(&v7_style_id(11))
+        );
     }
 
     /// In-memory sources remain unavailable while hot reads aggregate actual bytes.

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -33,6 +33,34 @@ use crate::server::WyrdTestServer;
 pub const QUALIFICATION_TABLE: &str = "bifrost_qualification_telemetry";
 /// Number of rows in every complete ingest batch.
 pub const MATERIALIZER_BATCH_ROWS: u64 = 4_096;
+/// Exact count of microseconds in one UTC day, used for run-anchor arithmetic.
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// Compute the D87(b) run-relative day-zero event-time anchor in UTC micros.
+///
+/// Returns the most recent UTC midnight at or before `now`, shifted back by
+/// `days - 1` whole days. This places the dataset's final day partition on the
+/// current UTC day so that every generated `wyrd_event_time` — spanning the
+/// anchor forward across `days` UTC days — lands inside the production D85
+/// admission window (30 days past, 24 hours future) and admission never rejects
+/// a qualification row as `EventTimeOutOfRange`. Computing the anchor from a
+/// live clock read is intentional: the materializer is bench/test code at an IO
+/// boundary, and the run anchor must track wall-clock time so the fixture stays
+/// admissible on any day it runs.
+///
+/// `now` is injected rather than read internally so the mapping is unit-testable
+/// against fixed instants. `days` is the validated dataset day count (always at
+/// least two), so `days - 1` never underflows.
+#[must_use]
+fn run_anchor_micros(days: u32, now: SystemTime) -> i64 {
+    let now_micros = now
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_micros()).ok())
+        .unwrap_or(0);
+    let most_recent_midnight = now_micros - now_micros.rem_euclid(MICROS_PER_DAY);
+    most_recent_midnight - i64::from(days.saturating_sub(1)) * MICROS_PER_DAY
+}
 
 /// Bounded retry policy for setup and visibility operations.
 #[derive(Debug, Clone, Copy)]
@@ -246,6 +274,15 @@ pub struct MaterializedPartition {
 /// Successful materialization result and measured production-path telemetry.
 #[derive(Debug, Clone)]
 pub struct MaterializedDataset {
+    /// Day-zero event-time anchor (UTC micros) the run materialized against.
+    ///
+    /// Recorded per D87 so a reader can reproduce the run's absolute event times
+    /// by evaluating the generator at this anchor (`with_anchor`). Anchor-invariant
+    /// facts stay comparable to the checked-in canonical manifest; anchor-dependent
+    /// facts (absolute `wyrd_event_time`, digests over rows carrying it) must be
+    /// compared against the generator evaluated at this recorded anchor, never
+    /// against checked-in absolute values.
+    pub run_anchor_micros: i64,
     /// Confirmed tenant/day layout.
     pub layout: Vec<MaterializedPartition>,
     /// Wall-clock duration from first setup operation to final visibility.
@@ -421,6 +458,14 @@ impl<'a> BifrostDatasetMaterializer<'a> {
         run_root: impl Into<PathBuf>,
         cancellation: CancellationToken,
     ) -> Result<Self, MaterializationError> {
+        // Re-anchor the caller's shape onto the D87(b) run-relative anchor so
+        // every generated event time falls inside the production D85 admission
+        // window; the incoming dataset supplies only the shape.
+        let dataset = BifrostQualificationDataset::with_anchor(
+            dataset.shape(),
+            run_anchor_micros(dataset.shape().days, SystemTime::now()),
+        )
+        .map_err(|error| MaterializationError::Backend(error.to_string()))?;
         let mut clients = Vec::with_capacity(tenants.len());
         let mut transports = Vec::with_capacity(tenants.len());
         let mut queries = Vec::with_capacity(tenants.len());
@@ -599,6 +644,7 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                 let elapsed = started.elapsed();
                 let seconds = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
                 Ok(MaterializedDataset {
+                    run_anchor_micros: self.dataset.day0_event_micros(),
                     layout,
                     duration: elapsed,
                     rows_per_second: progress.accepted_rows as f64 / seconds,
@@ -685,8 +731,10 @@ impl<'a> BifrostDatasetMaterializer<'a> {
         pressure: &mut PressureEvidence,
         progress: &mut PartialProgress,
     ) -> Result<(), MaterializationError> {
-        let batch_id =
-            deterministic_batch_id(request.tenant_index, request.row / MATERIALIZER_BATCH_ROWS);
+        let batch_id = deterministic_batch_id(
+            request.tenant_index,
+            day_unique_chunk_ordinal(request.row, self.dataset.shape().rows_per_day),
+        );
         let mut backoff = self.policy.initial_backoff;
         loop {
             let outcome = self
@@ -951,7 +999,7 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
             ),
             visibility: VisibilityMode::PublishedOnly,
             freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(5_000),
+            deadline_ms: Some(30_000),
         };
         let result = self.queries[index]
             .collect_bounded(
@@ -996,6 +1044,31 @@ fn is_retryable_capacity(error: &WyrdError) -> bool {
             .and_then(serde_json::Value::as_str),
         Some("WYRD_VALA_429_INGEST_BUSY" | "WYRD_VALA_507_WAL_DISK_FULL")
     )
+}
+
+/// Maps one global row position to a batch ordinal that is unique across days.
+///
+/// The send loop mints a client batch id per chunk from `(tenant_index,
+/// ordinal)`, and that id becomes the durable `wyrd_batch_id` the Oracle keys
+/// exact-identity reconciliation on. A naive global-floor ordinal
+/// (`row / MATERIALIZER_BATCH_ROWS`) collides across a day boundary whenever
+/// `rows_per_day` is not a multiple of `MATERIALIZER_BATCH_ROWS`: the day's
+/// final partial chunk and the next day's first chunk share the same floor,
+/// mint the same batch id for different rows, and each append stamps server
+/// ordinal 0 — a genuine `RowIdentity{batch_id, ordinal}` collision the Oracle
+/// correctly rejects with the reconciliation invariant.
+///
+/// Blocking the ordinal by day removes the collision: each day owns a
+/// contiguous, disjoint band of `rows_per_day.div_ceil(MATERIALIZER_BATCH_ROWS)`
+/// ordinals, so `(day, chunk-within-day)` maps to a globally unique ordinal. The
+/// result is a pure deterministic function of `row` and `rows_per_day`, so the
+/// same logical chunk always re-mints the same id (retry-stable) and repeats
+/// identically across runs.
+fn day_unique_chunk_ordinal(row: u64, rows_per_day: u64) -> u64 {
+    let day = row / rows_per_day;
+    let day_start = day * rows_per_day;
+    let chunks_per_day = rows_per_day.div_ceil(MATERIALIZER_BATCH_ROWS);
+    day * chunks_per_day + (row - day_start) / MATERIALIZER_BATCH_ROWS
 }
 
 /// Derive a stable UUID-shaped identity from tenant and batch ordinal.
@@ -1106,6 +1179,53 @@ mod tests {
             ),
             run_root,
         )
+    }
+
+    /// Day-block the batch ordinal so no two chunks mint the same identity.
+    ///
+    /// Guards the reconciliation-invariant defect: with a `rows_per_day` that is
+    /// not a multiple of `MATERIALIZER_BATCH_ROWS`, the naive global-floor
+    /// ordinal collides across the day boundary (day 0's partial tail chunk and
+    /// day 1's first chunk), while [`day_unique_chunk_ordinal`] keeps every
+    /// minted batch id distinct across days and tenants.
+    #[test]
+    fn day_unique_chunk_ordinal_avoids_cross_day_batch_id_collision() {
+        // Locked smoke shape: 160_000 % 4_096 == 256, a non-aligned boundary.
+        let rows_per_day = 160_000_u64;
+        let days = 2_u32;
+        let day0_last_start = 159_744_u64;
+        let day1_first_start = 160_000_u64;
+        // The naive global-floor ordinal collides across the day boundary.
+        assert_eq!(
+            day0_last_start / MATERIALIZER_BATCH_ROWS,
+            day1_first_start / MATERIALIZER_BATCH_ROWS,
+        );
+        // The day-unique ordinal does not.
+        assert_ne!(
+            day_unique_chunk_ordinal(day0_last_start, rows_per_day),
+            day_unique_chunk_ordinal(day1_first_start, rows_per_day),
+        );
+        // Every batch id the smoke send loop mints is pairwise distinct across
+        // both days and both tenants.
+        let mut seen = std::collections::HashSet::new();
+        for tenant_index in 0..2_usize {
+            for day in 0..days {
+                let start = u64::from(day) * rows_per_day;
+                let end = start + rows_per_day;
+                let mut row = start;
+                while row < end {
+                    let id = deterministic_batch_id(
+                        tenant_index,
+                        day_unique_chunk_ordinal(row, rows_per_day),
+                    );
+                    assert!(
+                        seen.insert(id),
+                        "batch id collision at tenant {tenant_index} row {row}"
+                    );
+                    row += (end - row).min(MATERIALIZER_BATCH_ROWS);
+                }
+            }
+        }
     }
 
     /// Retry capacity responses while retaining one immutable batch identity.
@@ -1309,6 +1429,51 @@ mod tests {
         assert_eq!(fallback.binding_ceiling().as_deref(), Some("scribe_child"));
 
         assert_eq!(PressureEvidence::default().binding_ceiling(), None);
+    }
+
+    /// Prove the run anchor keeps every smoke-shape event time inside the D85 window.
+    ///
+    /// The D87(b) anchor must be UTC-midnight aligned, place the final day
+    /// partition on the current UTC day, and keep the first and last generated
+    /// event times inside the production admission window (30 days past, 24 hours
+    /// future) so admission never rejects a qualification row as out of range.
+    #[test]
+    fn run_anchor_keeps_events_inside_admission_window() {
+        let days = 2_u32;
+        // A fixed non-midnight UTC instant so the flooring is exercised.
+        let now = UNIX_EPOCH + Duration::from_secs(1_754_582_400 + 58_137);
+        let anchor = run_anchor_micros(days, now);
+        assert_eq!(anchor.rem_euclid(MICROS_PER_DAY), 0);
+        let now_micros = i64::try_from(
+            now.duration_since(UNIX_EPOCH)
+                .expect("after epoch")
+                .as_micros(),
+        )
+        .expect("micros fit i64");
+        let today_midnight = now_micros - now_micros.rem_euclid(MICROS_PER_DAY);
+        assert_eq!(
+            anchor + i64::from(days - 1) * MICROS_PER_DAY,
+            today_midnight
+        );
+        let dataset = BifrostQualificationDataset::with_anchor(
+            DatasetShape::new(days, 160_000).expect("shape"),
+            anchor,
+        )
+        .expect("dataset");
+        let past_window = now_micros - 30 * MICROS_PER_DAY;
+        let future_window = now_micros + MICROS_PER_DAY;
+        let first = dataset.row(0).wyrd_event_time_micros;
+        let last = dataset
+            .row(i64::from(days) * 160_000 - 1)
+            .wyrd_event_time_micros;
+        assert!(
+            first >= past_window,
+            "first event predates the 30-day floor"
+        );
+        assert!(
+            last < future_window,
+            "last event exceeds the 24-hour future ceiling"
+        );
     }
 
     /// Keep the client-side `{ rejections, waited }` contract and default the new fields.

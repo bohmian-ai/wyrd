@@ -2,11 +2,13 @@
 
 #[cfg(feature = "bench")]
 mod pg_tests {
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
-    use wyrd_testing::bifrost::bench_dataset::{BifrostQualificationDataset, DatasetShape};
+    use wyrd_testing::bifrost::bench_dataset::{
+        BifrostQualificationDataset, DatasetManifestFixture, DatasetShape,
+    };
     use wyrd_testing::bifrost::bench_materializer::{
         BackpressurePolicy, BifrostDatasetMaterializer, MaterializationError,
     };
@@ -128,12 +130,45 @@ mod pg_tests {
                 panic!("smoke materialization completes: {error:?}");
             }
         };
-        assert_eq!(result.layout.len(), 4);
-        assert!(
-            result
-                .layout
+        // AC7 assertion split. Anchor-invariant facts (per-day row counts) are
+        // asserted against the checked-in canonical-anchor manifest; the
+        // anchor-dependent recorded run anchor is asserted against the live D85
+        // admission window, never against a checked-in absolute event time. The
+        // generator-at-run-anchor equivalence (uniform event-time shift, unchanged
+        // Q2/Q3/Q4 selections) is proven at the unit tier in `bench_dataset`.
+        let manifest: DatasetManifestFixture = serde_json::from_slice(include_bytes!(
+            "../fixtures/bifrost/qualification/dataset-manifest.json"
+        ))
+        .expect("checked-in dataset manifest");
+        let shape = manifest.smoke.shape;
+        assert_eq!(result.layout.len(), (shape.days as usize) * 2);
+        for partition in &result.layout {
+            let per_day = manifest
+                .smoke
+                .per_day
                 .iter()
-                .all(|partition| partition.rows == 160_000)
+                .find(|day| day.day == partition.day)
+                .expect("manifest per-day fact");
+            assert_eq!(partition.rows, per_day.row_count);
+        }
+        // The recorded run anchor is UTC-midnight aligned and slides the whole
+        // event-time axis into the live admission window (30 days past, 24 hours
+        // future), so admission accepts every qualification row; completion above
+        // with full per-day counts is the end-to-end zero-`EventTimeOutOfRange`
+        // proof (AC6). It is never the checked-in canonical 2026-01-01 anchor.
+        const MICROS_PER_DAY: i64 = 86_400_000_000;
+        assert_eq!(result.run_anchor_micros.rem_euclid(MICROS_PER_DAY), 0);
+        let now_micros = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("after epoch")
+                .as_micros(),
+        )
+        .expect("micros fit i64");
+        assert!(result.run_anchor_micros >= now_micros - 30 * MICROS_PER_DAY);
+        assert!(
+            result.run_anchor_micros + i64::from(shape.days) * MICROS_PER_DAY
+                <= now_micros + MICROS_PER_DAY
         );
         assert!(result.rows_per_second > 0.0);
         assert!(result.bytes_per_second > 0.0);

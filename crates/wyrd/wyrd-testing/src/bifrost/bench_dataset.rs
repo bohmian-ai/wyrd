@@ -255,22 +255,52 @@ pub struct DatasetScaleReference {
 }
 
 /// Deterministic Bifrost dataset owner.
+///
+/// The dataset binds a `day0_event_micros` anchor: the UTC-micros instant of
+/// the first row in day zero. Every row's `wyrd_event_time_micros` is derived
+/// relative to this anchor, so a caller (for example the run-relative
+/// materializer under D87) can slide the whole event-time axis to a live
+/// admission window while keeping all row-content facts — device, metric,
+/// value, payload, and every query's row selection — anchor-invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BifrostQualificationDataset {
     shape: DatasetShape,
     seed: u64,
+    day0_event_micros: i64,
 }
 
 impl BifrostQualificationDataset {
-    /// Construct a dataset using the locked splitmix64(18) seed.
+    /// Construct a dataset anchored at the canonical `2026-01-01T00:00:00Z`.
+    ///
+    /// Delegates to [`Self::with_anchor`] with the locked canonical anchor so
+    /// that every generated row, manifest byte, and digest is byte-identical to
+    /// the checked-in fixture.
     ///
     /// # Errors
     /// Returns [`DatasetShapeError`] when the shape is invalid.
     pub fn new(shape: DatasetShape) -> Result<Self, DatasetShapeError> {
+        Self::with_anchor(shape, UNIX_MICROS_2026_01_01)
+    }
+
+    /// Construct a dataset whose day-zero event time is `day0_event_micros`.
+    ///
+    /// Performs the same shape validation as [`Self::new`] and pins the locked
+    /// splitmix64(18) seed; only the absolute event-time anchor differs. All
+    /// non-event-time content (device, metric, value, payload) and every query
+    /// row selection are independent of the anchor, so shifting it slides the
+    /// event-time axis uniformly without changing any counted or grouped fact.
+    ///
+    /// # Errors
+    /// Returns [`DatasetShapeError`] when the shape is invalid.
+    pub(crate) fn with_anchor(
+        shape: DatasetShape,
+        day0_event_micros: i64,
+    ) -> Result<Self, DatasetShapeError> {
         DatasetShape::new(shape.days, shape.rows_per_day)?;
         Ok(Self {
             shape,
             seed: splitmix64(18),
+            day0_event_micros,
         })
     }
 
@@ -280,6 +310,15 @@ impl BifrostQualificationDataset {
         self.shape
     }
 
+    /// Return the day-zero event-time anchor in UTC microseconds.
+    ///
+    /// This is the absolute instant of the first row in day zero; day `d`'s
+    /// partition begins at `day0_event_micros + d * 86_400_000_000` micros.
+    #[must_use]
+    pub(crate) fn day0_event_micros(&self) -> i64 {
+        self.day0_event_micros
+    }
+
     /// Generate one deterministic row.
     #[must_use]
     pub fn row(&self, row_id: i64) -> QualificationDatasetRow {
@@ -287,7 +326,8 @@ impl BifrostQualificationDataset {
         let day = id / self.shape.rows_per_day;
         let ordinal = id % self.shape.rows_per_day;
         let spacing = MICROS_PER_DAY / self.shape.rows_per_day;
-        let event_time = UNIX_MICROS_2026_01_01
+        let event_time = self
+            .day0_event_micros
             .saturating_add(i64::try_from(day.saturating_mul(MICROS_PER_DAY)).unwrap_or(i64::MAX))
             .saturating_add(i64::try_from(ordinal.saturating_mul(spacing)).unwrap_or(i64::MAX));
         let metric = format!("metric_{:03}", splitmix(self, 0x02, id) % 100);
@@ -1058,6 +1098,64 @@ mod tests {
             schema_version: "wyrd.bifrost.workload/v1".to_owned(),
             workloads,
         }
+    }
+
+    /// Prove the canonical anchor default is byte-identical to `with_anchor`.
+    ///
+    /// `new(shape)` must equal `with_anchor(shape, UNIX_MICROS_2026_01_01)` for
+    /// every manifest byte and digest, guaranteeing the checked-in fixture and
+    /// `dataset_generator_is_repeatable` stay pinned at the canonical anchor.
+    #[test]
+    fn new_equals_with_anchor_at_canonical_anchor() {
+        for shape in [(2, 160_000), (10, 3_200_000)] {
+            let shape = DatasetShape::new(shape.0, shape.1).expect("locked shape");
+            let default = BifrostQualificationDataset::new(shape)
+                .expect("dataset")
+                .manifest();
+            let explicit = BifrostQualificationDataset::with_anchor(shape, UNIX_MICROS_2026_01_01)
+                .expect("dataset")
+                .manifest();
+            assert_eq!(default.canonical_json, explicit.canonical_json);
+            assert_eq!(default.digest, explicit.digest);
+            assert_eq!(default.expected_results, explicit.expected_results);
+        }
+    }
+
+    /// Prove a shifted anchor slides event times uniformly and selects the same rows.
+    ///
+    /// Every row's `wyrd_event_time_micros` shifts by exactly the anchor delta,
+    /// while all content facts and query row selections — Q2 count, Q3/Q4 group
+    /// aggregates, Q5 range length, Q1 row identity — remain anchor-invariant.
+    #[test]
+    fn shifted_anchor_shifts_event_times_but_not_selections() {
+        let shape = DatasetShape::new(2, 160_000).expect("locked smoke shape");
+        let delta: i64 = 7 * MICROS_PER_DAY as i64;
+        let canonical = BifrostQualificationDataset::new(shape).expect("dataset");
+        let shifted =
+            BifrostQualificationDataset::with_anchor(shape, UNIX_MICROS_2026_01_01 + delta)
+                .expect("dataset");
+
+        for row_id in [0_i64, 1, 159_999, 160_000, 319_999] {
+            let base = canonical.row(row_id);
+            let moved = shifted.row(row_id);
+            assert_eq!(
+                moved.wyrd_event_time_micros - base.wyrd_event_time_micros,
+                delta
+            );
+            assert_eq!(moved.device_id, base.device_id);
+            assert_eq!(moved.metric, base.metric);
+            assert_eq!(moved.value, base.value);
+            assert_eq!(moved.payload, base.payload);
+        }
+
+        let base = canonical.expected_results();
+        let moved = shifted.expected_results();
+        assert_eq!(moved.q1.row.row_id, base.q1.row.row_id);
+        assert_eq!(moved.q2.count, base.q2.count);
+        assert_eq!(moved.q3.groups, base.q3.groups);
+        assert_eq!(moved.q4.groups, base.q4.groups);
+        assert_eq!(moved.q5.row_count, base.q5.row_count);
+        assert_eq!(canonical.queries(), shifted.queries());
     }
 
     /// Proves a Q5 digest binds one selected row's all-column content.

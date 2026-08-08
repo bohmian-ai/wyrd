@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use arrow::array::{Array, UInt8Array, UInt32Array};
-use arrow::compute::{cast, take};
+use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -1347,6 +1347,83 @@ fn spill_partition(batch_id: &[u8]) -> usize {
         .expect("spill partition index is below RECONCILE_SPILL_PARTITIONS and fits usize")
 }
 
+/// Row bound for coalescing retained spill winners into one message.
+///
+/// Mirrors `DataFusion`'s default batch size so a coalesced spill message is the
+/// same shape the rest of the plan streams, keeping each partition file to a
+/// handful of large IPC messages instead of one message per retained winner.
+const RECONCILE_SPILL_COALESCE_ROWS: usize = 8192;
+
+/// Coalesces shallow one-row retained winners into bounded multi-row batches.
+///
+/// Retained reconciliation winners arrive as one-row slices of their source
+/// batches (see [`ReconciledRow`]), so spilling them verbatim would emit one
+/// Arrow IPC message per winner and keep each winner's full source array pinned
+/// behind its slice. Concatenating consecutive winners into batches of at most
+/// [`RECONCILE_SPILL_COALESCE_ROWS`] rows compacts those slices into fresh
+/// contiguous arrays — releasing the pinned source arrays — and lets
+/// [`ReconcileSpill::start`] write few large messages per partition. The result
+/// preserves winner order and never reorders across identities, so downstream
+/// hash partitioning and exact-identity dedup are unaffected.
+///
+/// # Errors
+///
+/// Returns a `DataFusion` execution error when Arrow rejects a concatenation,
+/// for example on a schema mismatch among the retained winners.
+fn coalesce_retained_winners(
+    schema: &SchemaRef,
+    retained: Vec<RecordBatch>,
+) -> DataFusionResult<Vec<RecordBatch>> {
+    let mut coalesced = Vec::new();
+    let mut pending: Vec<RecordBatch> = Vec::new();
+    let mut pending_rows = 0_usize;
+    for winner in retained {
+        pending_rows += winner.num_rows();
+        pending.push(winner);
+        if pending_rows >= RECONCILE_SPILL_COALESCE_ROWS {
+            coalesced.push(concat_batches(schema, &pending).map_err(DataFusionError::from)?);
+            pending.clear();
+            pending_rows = 0;
+        }
+    }
+    if !pending.is_empty() {
+        coalesced.push(concat_batches(schema, &pending).map_err(DataFusionError::from)?);
+    }
+    Ok(coalesced)
+}
+
+/// Sums the resident slice memory of one decoded spill batch across its columns.
+///
+/// A batch decoded from an Arrow IPC stream slices a single shared message arena
+/// whose full buffer capacity `RecordBatch::get_array_memory_size` counts once
+/// per buffer, so that measure scales with message and buffer count rather than
+/// the rows actually present. The per-partition read bound in
+/// [`FinishedReconcileSpill::reconcile_partition`] must instead reflect the
+/// resident partition contents, so it charges each column's
+/// `ArrayData::get_slice_memory_size` — the bytes the batch's own slice occupies
+/// — and sums them. This is the bound's measure only; the accumulate-side
+/// trigger charge and the parent-governor reservation are unchanged.
+///
+/// # Errors
+///
+/// Returns a `DataFusion` execution error when Arrow cannot compute a column's
+/// slice memory size, or when the per-column sum overflows `usize`.
+fn decoded_batch_slice_bytes(batch: &RecordBatch) -> DataFusionResult<usize> {
+    let mut total = 0_usize;
+    for column in batch.columns() {
+        let column_bytes = column
+            .to_data()
+            .get_slice_memory_size()
+            .map_err(DataFusionError::from)?;
+        total = total.checked_add(column_bytes).ok_or_else(|| {
+            DataFusionError::ResourcesExhausted(
+                "spill partition slice-byte accounting overflow".to_owned(),
+            )
+        })?;
+    }
+    Ok(total)
+}
+
 /// Blocking-tempfile spill state partitioned by immutable row identity.
 struct ReconcileSpill {
     /// Tagged physical schema written to every partition.
@@ -1360,14 +1437,27 @@ struct ReconcileSpill {
 impl ReconcileSpill {
     /// Creates a spill owner and writes the retained winners plus triggering batch off-thread.
     ///
+    /// The retained winners reach this owner as shallow one-row slices (one per
+    /// deduped identity), so writing them directly would emit one Arrow IPC
+    /// message per row and leave every winner's full source array pinned. They
+    /// are first coalesced into bounded multi-row batches via
+    /// [`coalesce_retained_winners`], which compacts the slices — releasing the
+    /// pinned source arrays — and keeps each partition file to a few large
+    /// messages so the per-partition read bound measures resident data rather
+    /// than per-message overhead. The post-trigger `append` path already carries
+    /// multi-row source batches and is left unchanged.
+    ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` error when the blocking task fails or spill IO rejects a batch.
+    /// Returns a `DataFusion` error when the blocking task fails, coalescing
+    /// rejects a batch, or spill IO rejects a batch.
     async fn start(retained: Vec<RecordBatch>, batch: RecordBatch) -> DataFusionResult<Self> {
         tokio::task::spawn_blocking(move || {
-            let mut spill = Self::new(batch.schema())?;
-            for retained_batch in retained {
-                spill.write_batch(&retained_batch)?;
+            let schema = batch.schema();
+            let coalesced = coalesce_retained_winners(&schema, retained)?;
+            let mut spill = Self::new(schema)?;
+            for coalesced_batch in coalesced {
+                spill.write_batch(&coalesced_batch)?;
             }
             spill.write_batch(&batch)?;
             Ok(spill)
@@ -1543,7 +1633,7 @@ impl FinishedReconcileSpill {
         while let Some(decoded) = batches.recv().await {
             let (batch, reservation) = decoded?;
             partition_bytes = partition_bytes
-                .checked_add(batch.get_array_memory_size())
+                .checked_add(decoded_batch_slice_bytes(&batch)?)
                 .ok_or_else(|| {
                     DataFusionError::ResourcesExhausted(
                         "spill partition byte accounting overflow".to_owned(),
@@ -2696,7 +2786,10 @@ mod tests {
     /// the spilled reconciliation is identical to the in-memory reconciliation.
     /// Before the D89 fix, every v7 id hashed on its constant first byte into a
     /// single partition whose per-partition bound then rejected the read, so
-    /// this test fails closed against the defect.
+    /// this test fails closed against the defect. Under D90 the retained winners
+    /// spill through [`coalesce_retained_winners`] and are re-charged by
+    /// [`decoded_batch_slice_bytes`], so this winner-set-equality proof now also
+    /// pins reconciliation correctness across the coalesced spill path.
     #[tokio::test]
     async fn reconciliation_spills_in_fixed_identity_partitions() {
         // Two tiers per identity so dedup is exercised through the spill path.
@@ -2847,6 +2940,196 @@ mod tests {
         assert_eq!(
             spill_partition(&repeated),
             spill_partition(&v7_style_id(11))
+        );
+    }
+
+    /// Builds one multi-row tagged batch sharing a single batch id.
+    ///
+    /// Every row carries `batch_id` with a distinct ordinal and value, so all
+    /// rows share one spill partition (dedup colocation) while remaining distinct
+    /// identities that reconcile without a duplicate-value conflict. Used to
+    /// drive multiple decoded messages into one spill partition.
+    fn tagged_rows(
+        batch_id: [u8; 16],
+        ordinals: std::ops::Range<i32>,
+        tier: SourceTier,
+    ) -> RecordBatch {
+        let count = usize::try_from(ordinals.end - ordinals.start).expect("non-negative range");
+        let mut ids = FixedSizeBinaryBuilder::with_capacity(count, 16);
+        let mut ord_values = Vec::with_capacity(count);
+        let mut int_values = Vec::with_capacity(count);
+        let mut tenants = Vec::with_capacity(count);
+        for ordinal in ordinals {
+            ids.append_value(batch_id)
+                .expect("test identity has fixed width");
+            ord_values.push(ordinal);
+            int_values.push(i64::from(ordinal));
+            tenants.push(uuid::Uuid::nil().to_string());
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
+            Field::new("wyrd_row_ordinal", DataType::Int32, false),
+            Field::new("data_tenant_id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new(SOURCE_TIER_COLUMN, DataType::UInt8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(ids.finish()) as ArrayRef,
+                Arc::new(Int32Array::from(ord_values)) as ArrayRef,
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(Int64Array::from(int_values)) as ArrayRef,
+                Arc::new(UInt8Array::from(vec![tier.as_u8(); count])) as ArrayRef,
+            ],
+        )
+        .expect("multi-row test batch matches its schema")
+    }
+
+    /// Decodes one spill partition file, returning its IPC message and row counts.
+    fn partition_message_stats(spill: &FinishedReconcileSpill, partition: usize) -> (usize, usize) {
+        let file = spill.files[partition]
+            .reopen()
+            .expect("reopen partition file");
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(file, None).expect("open partition reader");
+        let mut messages = 0_usize;
+        let mut rows = 0_usize;
+        for batch in reader {
+            let batch = batch.expect("decode partition batch");
+            messages += 1;
+            rows += batch.num_rows();
+        }
+        (messages, rows)
+    }
+
+    /// Coalescing collapses many one-row retained winners into a bounded number
+    /// of spill messages instead of one message per winner.
+    ///
+    /// The retained winners are shallow one-row slices sharing a single batch id,
+    /// so they colocate in one partition. Before the D90 fix each was written as
+    /// its own IPC message, so the partition file held one message per winner
+    /// (here 20,000). Coalescing to `RECONCILE_SPILL_COALESCE_ROWS`-row batches
+    /// must reduce that to `ceil(rows / RECONCILE_SPILL_COALESCE_ROWS)` messages
+    /// while preserving every row, which is what lets the per-partition read
+    /// bound measure resident data rather than per-message overhead.
+    #[tokio::test]
+    async fn spill_coalesces_one_row_winners_into_bounded_messages() {
+        const WINNERS: usize = 20_000;
+        let shared = v7_style_id(0);
+        let target = spill_partition(&shared);
+        // Route the triggering batch to a different partition so `target` holds
+        // only the coalesced retained winners.
+        let trigger_tail = (1_u8..=255)
+            .find(|tail| spill_partition(&v7_style_id(*tail)) != target)
+            .expect("a v7 tail maps to a different partition");
+        let trigger = tagged_batch(v7_style_id(trigger_tail), 0, -1, SourceTier::Live);
+
+        let retained = (0..WINNERS)
+            .map(|ordinal| {
+                let ordinal = i32::try_from(ordinal).expect("ordinal fits i32");
+                tagged_batch(shared, ordinal, i64::from(ordinal), SourceTier::Live)
+            })
+            .collect::<Vec<_>>();
+
+        let spill = ReconcileSpill::start(retained, trigger)
+            .await
+            .expect("spill start coalesces and writes");
+        let finished = spill.finish().expect("spill finishes");
+
+        let expected_messages = WINNERS.div_ceil(RECONCILE_SPILL_COALESCE_ROWS);
+        let (messages, rows) = partition_message_stats(&finished, target);
+        assert_eq!(
+            messages, expected_messages,
+            "coalescing must bound the target partition to ceil(rows/coalesce) messages, not one per winner"
+        );
+        assert_eq!(
+            rows, WINNERS,
+            "coalescing must preserve every retained winner row"
+        );
+        assert!(
+            messages < WINNERS,
+            "the pre-fix path wrote one message per winner ({WINNERS}); coalescing wrote {messages}"
+        );
+    }
+
+    /// The per-partition read bound charges resident slice bytes, so a partition
+    /// whose genuine contents fit the limit reconciles even though its
+    /// IPC-decoded `get_array_memory_size` total would exceed it.
+    ///
+    /// Several multi-row source batches sharing one batch id land in one
+    /// partition as separate messages. Each decoded message slices a shared IPC
+    /// arena counted once per buffer, so `get_array_memory_size` over the
+    /// partition inflates far beyond its resident data. Setting the limit just
+    /// below that inflated total proves the old accounting would fail closed
+    /// while the slice-accurate accounting reconciles the partition.
+    #[tokio::test]
+    async fn spill_partition_charges_slice_bytes_not_message_overhead() {
+        const BATCHES: i32 = 6;
+        const ROWS_PER_BATCH: i32 = 256;
+        let shared = v7_style_id(0);
+        let target = spill_partition(&shared);
+
+        let mut spill = ReconcileSpill::start(
+            Vec::new(),
+            tagged_rows(shared, 0..ROWS_PER_BATCH, SourceTier::Live),
+        )
+        .await
+        .expect("spill start");
+        for index in 1..BATCHES {
+            let start = index * ROWS_PER_BATCH;
+            spill = spill
+                .append(tagged_rows(
+                    shared,
+                    start..start + ROWS_PER_BATCH,
+                    SourceTier::Live,
+                ))
+                .await
+                .expect("append same-partition batch");
+        }
+        let finished = spill.finish().expect("spill finishes");
+
+        // Decode the target partition once to measure both accountings.
+        let file = finished.files[target].reopen().expect("reopen target");
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(file, None).expect("open target reader");
+        let decoded = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode target partition");
+        let slice_bytes = decoded
+            .iter()
+            .map(|batch| decoded_batch_slice_bytes(batch).expect("slice bytes"))
+            .sum::<usize>();
+        let array_bytes = decoded
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>();
+        assert!(
+            array_bytes > slice_bytes,
+            "IPC-decoded get_array_memory_size ({array_bytes}) must inflate beyond resident slice bytes ({slice_bytes})"
+        );
+
+        // A limit between the two measures: the old per-message accounting trips
+        // it, the slice-accurate accounting does not.
+        let limit = array_bytes - 1;
+        assert!(
+            slice_bytes <= limit,
+            "resident slice bytes must fit the limit the old accounting exceeds"
+        );
+        let memory = OracleMemoryResources {
+            governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                .expect("minimum test governor"),
+            reconciliation_limit_bytes: limit,
+        };
+        let winners = finished
+            .reconcile_partition(target, memory, None)
+            .await
+            .expect("slice-accurate accounting reconciles the partition");
+        let total_rows = winners.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(
+            total_rows,
+            usize::try_from(BATCHES * ROWS_PER_BATCH).expect("row count fits usize"),
+            "every distinct identity in the partition must reconcile to one winner"
         );
     }
 

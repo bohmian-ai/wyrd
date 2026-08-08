@@ -48,20 +48,41 @@ pub struct StageExecution {
 }
 
 /// Closed load-control shape for one stage.
+///
+/// The runner interprets each variant under one fixed rule: `value` is always a
+/// ladder rung the fixture selects, and the `unit` names the offer law plus the
+/// single controlling-throughput dimension the report attributes to the rung
+/// (and, for the distributed family, the `efficiency(n)` numerator). Two offer
+/// laws exist. Open-loop laws ([`Self::Qps`], [`Self::RequestsPerSec`]) offer
+/// `value` operations per second; the controlling dimension is operations per
+/// second. Closed-loop laws ([`Self::Concurrency`], [`Self::LogicalBytesPerSec`],
+/// [`Self::ReturnedBytesPerSec`], [`Self::Streams`]) hold `value` operations in
+/// flight for the measured window (a fixed-concurrency saturating loop); the
+/// unit selects only which throughput the measured completions are reported as —
+/// operations per second, logical scanned bytes per second, or terminal returned
+/// bytes per second respectively. The rung `value` is what the saturation and
+/// recommendation formulas compare across stages; the unit-selected throughput is
+/// what the distributed body records per pod count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "unit", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StageControl {
-    /// Open-loop requests per second.
+    /// Open-loop query rate: offer `value` queries per second, bounding driver
+    /// dispatch at `max_in_flight`. Controlling dimension: operations per second.
     Qps { value: u64, max_in_flight: u32 },
-    /// Concurrent operations.
+    /// Closed-loop concurrency: hold `value` operations in flight for the
+    /// measured window. Controlling dimension: operations per second.
     Concurrency { value: u64 },
-    /// Concurrent result streams.
+    /// Closed-loop result streams: hold `value` result streams in flight.
+    /// Controlling dimension: operations per second.
     Streams { value: u64 },
-    /// Logical scan bytes per second.
+    /// Closed-loop scan pressure: hold `value` queries in flight. Controlling
+    /// dimension: logical scanned bytes per second summed over completions.
     LogicalBytesPerSec { value: u64 },
-    /// Returned bytes per second.
+    /// Closed-loop return pressure: hold `value` queries in flight. Controlling
+    /// dimension: terminal returned bytes per second summed over completions.
     ReturnedBytesPerSec { value: u64 },
-    /// Generic requests per second used by ingest.
+    /// Open-loop write rate used by ingest: offer `value` writes per second.
+    /// Controlling dimension: operations per second.
     RequestsPerSec { value: u64 },
 }
 
@@ -541,6 +562,99 @@ where
             self.digest()?
         ))
     }
+
+    /// Persist this report as canonical JSON under the tier-scoped run layout.
+    ///
+    /// Writes [`canonical_json`](Self::canonical_json) to
+    /// `<output_root>/<run_id>/<family>-<tier>.json`, creating the run
+    /// directory as needed. This inherent operation is the only sanctioned path
+    /// from an in-memory report to a report file, so every downstream digest is
+    /// recomputable from the same bytes via [`digest`](Self::digest). Creation
+    /// uses `create_new`, so it is race-safe: an artifact already present for
+    /// the same `(run_id, family, tier)` is never overwritten and instead
+    /// yields [`ReportWriteError::AlreadyExists`].
+    ///
+    /// # Errors
+    /// Returns [`ReportWriteError::RunId`] for a run id that is not a nonempty
+    /// filesystem-safe token, [`ReportWriteError::Family`] for a family label
+    /// that is not a nonempty lowercase `[a-z0-9-]` token,
+    /// [`ReportWriteError::Serialize`] when canonical serialization fails,
+    /// [`ReportWriteError::AlreadyExists`] when the target artifact already
+    /// exists, and [`ReportWriteError::Io`] for a directory-creation or write
+    /// failure.
+    pub fn write_report(
+        &self,
+        output_root: &std::path::Path,
+        run_id: &str,
+        family: &str,
+    ) -> Result<std::path::PathBuf, ReportWriteError> {
+        use std::io::Write as _;
+        if !is_run_id_token(run_id) {
+            return Err(ReportWriteError::RunId(run_id.to_owned()));
+        }
+        if !is_family_token(family) {
+            return Err(ReportWriteError::Family(family.to_owned()));
+        }
+        let bytes = self
+            .canonical_json()
+            .map_err(|error| ReportWriteError::Serialize(error.to_string()))?;
+        let run_dir = output_root.join(run_id);
+        let path = run_dir.join(format!("{family}-{}.json", tier_slug(self.tier)));
+        std::fs::create_dir_all(&run_dir).map_err(|error| ReportWriteError::Io {
+            path: run_dir.clone(),
+            detail: error.to_string(),
+        })?;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ReportWriteError::AlreadyExists(path));
+            }
+            Err(error) => {
+                return Err(ReportWriteError::Io {
+                    path,
+                    detail: error.to_string(),
+                });
+            }
+        };
+        file.write_all(&bytes)
+            .map_err(|error| ReportWriteError::Io {
+                path: path.clone(),
+                detail: error.to_string(),
+            })?;
+        Ok(path)
+    }
+}
+
+/// Returns the stable on-disk slug for a report tier.
+#[must_use]
+fn tier_slug(tier: BenchmarkTier) -> &'static str {
+    match tier {
+        BenchmarkTier::Smoke => "smoke",
+        BenchmarkTier::Qualification => "qualification",
+        BenchmarkTier::Scale => "scale",
+    }
+}
+
+/// Returns whether a report family label is a nonempty lowercase `[a-z0-9-]` token.
+#[must_use]
+fn is_family_token(family: &str) -> bool {
+    !family.is_empty()
+        && family
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Returns whether a run id is a nonempty filesystem-safe `[A-Za-z0-9._-]` token.
+#[must_use]
+fn is_run_id_token(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// Returns whether an identity is exactly one lowercase hexadecimal SHA-256 digest.
@@ -744,6 +858,31 @@ pub enum CapacityReportError {
     Serialization(String),
 }
 
+/// Errors raised while persisting a capacity report to its on-disk artifact.
+#[derive(Debug, Error)]
+pub enum ReportWriteError {
+    /// The run id is not a nonempty filesystem-safe token.
+    #[error("run id must be a nonempty filesystem-safe token: {0:?}")]
+    RunId(String),
+    /// The report family label is not a nonempty lowercase `[a-z0-9-]` token.
+    #[error("report family must be a nonempty lowercase [a-z0-9-] token: {0:?}")]
+    Family(String),
+    /// Canonical serialization of the report failed.
+    #[error("capacity report serialization failed: {0}")]
+    Serialize(String),
+    /// An artifact already exists for the same run id, family, and tier.
+    #[error("refusing to overwrite existing report artifact at {0}")]
+    AlreadyExists(std::path::PathBuf),
+    /// A directory-creation or file-write operation failed.
+    #[error("report io failure at {path}: {detail}")]
+    Io {
+        /// Path whose creation or write failed.
+        path: std::path::PathBuf,
+        /// Rendered underlying IO error.
+        detail: String,
+    },
+}
+
 /// Recursively sorts report JSON object keys while preserving array order.
 fn sort_json(value: serde_json::Value) -> serde_json::Value {
     match value {
@@ -762,7 +901,11 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Computes a lowercase SHA-256 digest for canonical report bytes.
-fn sha256_hex(bytes: &[u8]) -> String {
+///
+/// Exposed at crate scope so the family runners can derive observation and
+/// workload digests from the same dependency-free implementation the report
+/// uses, keeping every digest recomputable from identical bytes.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut state = Sha256::new();
     state.update(bytes);
     state.finish()
@@ -1112,6 +1255,54 @@ mod tests {
                 .expect("markdown")
                 .contains("JSON SHA-256")
         );
+    }
+
+    /// Proves the disk writer honors the tier layout and never overwrites.
+    #[test]
+    fn write_report_persists_and_refuses_overwrite() {
+        let report = BifrostCapacityReport::new(
+            context(),
+            vec![stage(0, 100)],
+            IngestBody {
+                profile_id: "ingest-small".to_owned(),
+                saturation_reached: false,
+                recommended: None,
+            },
+        )
+        .expect("report");
+        let root = std::env::temp_dir().join(format!(
+            "wyrd-bench-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+
+        let path = report
+            .write_report(&root, "run-xyz", "ingest")
+            .expect("first write");
+        assert!(path.ends_with("run-xyz/ingest-smoke.json"));
+        assert_eq!(
+            std::fs::read(&path).expect("read artifact"),
+            report.canonical_json().expect("canonical json"),
+        );
+
+        match report.write_report(&root, "run-xyz", "ingest") {
+            Err(ReportWriteError::AlreadyExists(existing)) => assert_eq!(existing, path),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+
+        assert!(matches!(
+            report.write_report(&root, "run-xyz", "Ingest"),
+            Err(ReportWriteError::Family(_))
+        ));
+        assert!(matches!(
+            report.write_report(&root, "../evil", "ingest"),
+            Err(ReportWriteError::RunId(_))
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Proves recommendation presence and content are derived from saturation evidence.

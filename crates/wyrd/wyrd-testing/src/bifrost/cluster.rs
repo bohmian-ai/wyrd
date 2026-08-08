@@ -40,6 +40,8 @@ use crate::server::{
 pub enum BifrostTopology {
     /// Run one full Gate, Scribe, Forge, and Oracle pod.
     OnePod,
+    /// Run two full mixed pods for the distributed capacity ladder.
+    TwoPod,
     /// Run three full Gate, Scribe, Forge, and Oracle pods.
     ThreePod,
     /// Run one ingest pod and two query pods.
@@ -54,9 +56,15 @@ pub enum BifrostTopology {
 
 impl BifrostTopology {
     /// Return the concrete node descriptor for this named topology.
-    fn spec(self) -> BifrostClusterSpec {
+    ///
+    /// Exposed at crate scope so the fixture-driven family runners can boot the
+    /// exact mixed-pod topology their distributed ladder selects
+    /// ([`super::bench_runner::topology_for_pods`]) without re-deriving the
+    /// spec, while the enum's construction stays owned here.
+    pub(crate) fn spec(self) -> BifrostClusterSpec {
         match self {
             Self::OnePod => BifrostClusterSpec::one_mixed(),
+            Self::TwoPod => BifrostClusterSpec::two_mixed(),
             Self::ThreePod => BifrostClusterSpec::three_mixed(),
             Self::RoleSeparated => BifrostClusterSpec::role_separated(),
             Self::SixPod => BifrostClusterSpec::six_capacity(),
@@ -1981,6 +1989,7 @@ fn has_full_server_roles(roles: &BTreeSet<BifrostRuntimeRole>) -> bool {
 fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
     match spec.nodes.len() {
         1 => BifrostTopology::OnePod,
+        2 => BifrostTopology::TwoPod,
         6 if spec.nodes[..3]
             .iter()
             .all(|node| has_full_server_roles(&node.roles))

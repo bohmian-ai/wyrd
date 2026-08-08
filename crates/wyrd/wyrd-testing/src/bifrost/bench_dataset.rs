@@ -851,6 +851,206 @@ pub struct MixedFractions {
     pub oracle_percent: u8,
 }
 
+/// Locked topology fixture (`wyrd.bifrost.topology/v1`).
+///
+/// Enumerates the exact D70 distributed ladder topologies the runners and
+/// report `topology.topology_id` are validated against; the CLI rejects any
+/// `--topology` id not present here before starting a cluster. All
+/// `wyrd.bifrost.topology/v1` profiles are mixed pods (every pod runs server,
+/// oracle, and Forge); dedicated-role topologies are out of v1 scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologyProfiles {
+    /// Closed topology schema identifier.
+    pub schema_version: String,
+    /// Ordered topology entries.
+    pub topologies: Vec<TopologyProfile>,
+}
+
+/// One fixture-defined topology on the D70 distributed ladder.
+///
+/// Every v1 profile is a uniform mixed-pod cluster: each pod runs server,
+/// oracle, and Forge together, so `pods` is the only degree of freedom and
+/// runners map it straight onto `BifrostClusterSpec::mixed(pods)`. A
+/// dedicated-role topology, if one ever ships, is a `wyrd.bifrost.topology/v2`
+/// concern, not an added field here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologyProfile {
+    /// Stable topology identifier persisted in every report.
+    pub topology_id: String,
+    /// Number of mixed pods in this topology (server + oracle + Forge each).
+    pub pods: u16,
+}
+
+/// Locked tier-budget fixture (`wyrd.bifrost.tier-budgets/v1`).
+///
+/// Carries the D69 wall-clock envelopes the runners enforce so that budgets are
+/// fixture inputs read at runtime, never inferred in code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierBudgets {
+    /// Closed tier-budget schema identifier.
+    pub schema_version: String,
+    /// Preflight lane budget in seconds (D69: 120 s, no database).
+    pub preflight_seconds: u32,
+    /// Per-lane smoke budget in seconds (D69: 180 s).
+    pub smoke_lane_seconds: u32,
+    /// Full smoke-suite budget in seconds (D69: 600 s).
+    pub smoke_suite_seconds: u32,
+}
+
+/// Embedded workload fixture bytes shared by the loader and its round-trip test.
+const WORKLOAD_PROFILES_JSON: &[u8] =
+    include_bytes!("../../fixtures/bifrost/qualification/workload-profiles.json");
+/// Embedded topology fixture bytes shared by the loader and its round-trip test.
+const TOPOLOGY_PROFILES_JSON: &[u8] =
+    include_bytes!("../../fixtures/bifrost/qualification/topology-profiles.json");
+/// Embedded tier-budget fixture bytes shared by the loader and its round-trip test.
+const TIER_BUDGETS_JSON: &[u8] =
+    include_bytes!("../../fixtures/bifrost/qualification/tier-budgets.json");
+/// Embedded dataset-manifest fixture bytes shared by the digest accessor and tests.
+const DATASET_MANIFEST_JSON: &[u8] =
+    include_bytes!("../../fixtures/bifrost/qualification/dataset-manifest.json");
+
+/// Return the lowercase SHA-256 digest of the checked-in workload fixture.
+///
+/// The family runners stamp this into every report's `workload_digest` so the
+/// exact ladder and control fixture a run consumed is recomputable from the
+/// same embedded bytes the loader reads.
+#[must_use]
+pub(crate) fn workload_profiles_digest() -> String {
+    sha256_hex(WORKLOAD_PROFILES_JSON)
+}
+
+/// Return the lowercase SHA-256 digest of the checked-in dataset manifest fixture.
+///
+/// The family runners stamp this into every report's `dataset_digest`. It
+/// identifies the deterministic dataset contract (shape, seed, column formulas,
+/// per-day aggregates, and expected Q1-Q5 results) a run measured against, and
+/// is recomputable from the checked-in `dataset-manifest.json` bytes.
+#[must_use]
+pub(crate) fn dataset_manifest_digest() -> String {
+    sha256_hex(DATASET_MANIFEST_JSON)
+}
+
+/// Return the locked smoke dataset shape from the checked-in manifest fixture.
+///
+/// The smoke family runners materialize exactly this shape fresh per invocation
+/// (control-flow line 77), so the shape is a fixture input rather than a
+/// compiled-in constant. Qualification-tier shape selection is deliberately not
+/// provided here; it is T31's run-scope calibration.
+///
+/// # Panics
+/// Panics only if the embedded `dataset-manifest.json` bytes fail to parse,
+/// which the `dataset_fixture_agrees_with_generator` test proves cannot happen at
+/// runtime; a parse failure is a fixture-corruption invariant, not an input.
+#[must_use]
+pub(crate) fn smoke_dataset_shape() -> DatasetShape {
+    let fixture: DatasetManifestFixture = serde_json::from_slice(DATASET_MANIFEST_JSON)
+        .expect("dataset-manifest.json fixture parses");
+    fixture.smoke.shape
+}
+
+impl WorkloadProfiles {
+    /// Load the checked-in workload fixture embedded at compile time.
+    ///
+    /// This is the single runtime source of every ladder, control unit, and
+    /// stage timing the runners consume, so no ladder constant is compiled into
+    /// runner code. The `workload_fixture_equals_packet_constants` test proves
+    /// the embedded bytes round-trip through this contract, so a parse failure
+    /// here is a fixture-corruption invariant, not a runtime input.
+    ///
+    /// # Panics
+    /// Panics if the embedded fixture does not parse as [`WorkloadProfiles`],
+    /// which the fixture round-trip test prevents from reaching a build.
+    #[must_use]
+    pub fn load() -> Self {
+        serde_json::from_slice(WORKLOAD_PROFILES_JSON)
+            .expect("embedded workload-profiles.json parses as WorkloadProfiles")
+    }
+
+    /// Resolve one workload profile by its stable id before any cluster starts.
+    ///
+    /// The runner and CLI call this to fail closed on an unknown `--workload`
+    /// value ahead of every cluster and storage side effect.
+    ///
+    /// # Errors
+    /// Returns [`BenchmarkSelectionError::UnknownWorkload`] when no fixture
+    /// entry declares `workload_id`.
+    pub fn resolve(&self, workload_id: &str) -> Result<&WorkloadProfile, BenchmarkSelectionError> {
+        self.workloads
+            .iter()
+            .find(|profile| profile.workload_id == workload_id)
+            .ok_or_else(|| BenchmarkSelectionError::UnknownWorkload(workload_id.to_owned()))
+    }
+}
+
+impl TopologyProfiles {
+    /// Load the checked-in topology fixture embedded at compile time.
+    ///
+    /// This is the single runtime source of the locked distributed ladder, so
+    /// pod and server counts are never compiled into runner code. The
+    /// `topology_fixture_equals_packet_constants` test proves the embedded bytes
+    /// round-trip through this contract.
+    ///
+    /// # Panics
+    /// Panics if the embedded fixture does not parse as [`TopologyProfiles`],
+    /// which the fixture round-trip test prevents from reaching a build.
+    #[must_use]
+    pub fn load() -> Self {
+        serde_json::from_slice(TOPOLOGY_PROFILES_JSON)
+            .expect("embedded topology-profiles.json parses as TopologyProfiles")
+    }
+
+    /// Resolve one topology profile by its stable id before any cluster starts.
+    ///
+    /// The runner and CLI call this to fail closed on an unknown `--topology`
+    /// value ahead of every cluster and storage side effect.
+    ///
+    /// # Errors
+    /// Returns [`BenchmarkSelectionError::UnknownTopology`] when no fixture
+    /// entry declares `topology_id`.
+    pub fn resolve(&self, topology_id: &str) -> Result<&TopologyProfile, BenchmarkSelectionError> {
+        self.topologies
+            .iter()
+            .find(|profile| profile.topology_id == topology_id)
+            .ok_or_else(|| BenchmarkSelectionError::UnknownTopology(topology_id.to_owned()))
+    }
+}
+
+impl TierBudgets {
+    /// Load the checked-in tier-budget fixture embedded at compile time.
+    ///
+    /// This is the single runtime source of the D69 wall-clock envelopes the
+    /// runners enforce, so no budget is inferred in code. The
+    /// `tier_budget_fixture_equals_packet_constants` test proves the embedded
+    /// bytes round-trip through this contract.
+    ///
+    /// # Panics
+    /// Panics if the embedded fixture does not parse as [`TierBudgets`], which
+    /// the fixture round-trip test prevents from reaching a build.
+    #[must_use]
+    pub fn load() -> Self {
+        serde_json::from_slice(TIER_BUDGETS_JSON)
+            .expect("embedded tier-budgets.json parses as TierBudgets")
+    }
+}
+
+/// Failure raised when a `--workload` or `--topology` id is not in a locked fixture.
+///
+/// Runners surface this before starting a cluster so an unknown selection never
+/// consumes cluster, storage, or database resources.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BenchmarkSelectionError {
+    /// The requested workload id is absent from `workload-profiles.json`.
+    #[error("unknown Bifrost workload id: {0}")]
+    UnknownWorkload(String),
+    /// The requested topology id is absent from `topology-profiles.json`.
+    #[error("unknown Bifrost topology id: {0}")]
+    UnknownTopology(String),
+}
+
 /// Pure unit tests for deterministic data generation and locked fixture profiles.
 #[cfg(test)]
 mod tests {
@@ -962,6 +1162,131 @@ mod tests {
         .expect("fixture");
         value["unexpected"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<DatasetManifestFixture>(value).is_err());
+    }
+
+    /// Prove the topology fixture enumerates exactly the locked D70 ladder.
+    #[test]
+    fn topology_fixture_equals_packet_constants() {
+        let profiles: TopologyProfiles = serde_json::from_slice(include_bytes!(
+            "../../fixtures/bifrost/qualification/topology-profiles.json"
+        ))
+        .expect("topology fixture");
+        assert_eq!(
+            profiles,
+            TopologyProfiles {
+                schema_version: "wyrd.bifrost.topology/v1".to_owned(),
+                topologies: vec![
+                    TopologyProfile {
+                        topology_id: "one-pod".to_owned(),
+                        pods: 1,
+                    },
+                    TopologyProfile {
+                        topology_id: "two-pod".to_owned(),
+                        pods: 2,
+                    },
+                    TopologyProfile {
+                        topology_id: "three-pod".to_owned(),
+                        pods: 3,
+                    },
+                    TopologyProfile {
+                        topology_id: "six-pod".to_owned(),
+                        pods: 6,
+                    },
+                ],
+            }
+        );
+    }
+
+    /// Prove the topology fixture fails closed on unknown fields.
+    #[test]
+    fn topology_fixture_rejects_unknown_fields() {
+        let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../fixtures/bifrost/qualification/topology-profiles.json"
+        ))
+        .expect("fixture");
+        value["unexpected"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<TopologyProfiles>(value).is_err());
+    }
+
+    /// Prove the tier-budget fixture carries the locked D69 envelopes.
+    #[test]
+    fn tier_budget_fixture_equals_packet_constants() {
+        let budgets: TierBudgets = serde_json::from_slice(include_bytes!(
+            "../../fixtures/bifrost/qualification/tier-budgets.json"
+        ))
+        .expect("tier budget fixture");
+        assert_eq!(
+            budgets,
+            TierBudgets {
+                schema_version: "wyrd.bifrost.tier-budgets/v1".to_owned(),
+                preflight_seconds: 120,
+                smoke_lane_seconds: 180,
+                smoke_suite_seconds: 600,
+            }
+        );
+    }
+
+    /// Prove the tier-budget fixture fails closed on unknown fields.
+    #[test]
+    fn tier_budget_fixture_rejects_unknown_fields() {
+        let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../fixtures/bifrost/qualification/tier-budgets.json"
+        ))
+        .expect("fixture");
+        value["unexpected"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<TierBudgets>(value).is_err());
+    }
+
+    /// Prove the workload loader resolves every locked id and rejects unknowns.
+    #[test]
+    fn workload_profiles_resolve_known_and_reject_unknown() {
+        let profiles = WorkloadProfiles::load();
+        assert_eq!(
+            profiles
+                .resolve("ingest-small")
+                .expect("locked workload")
+                .workload_id,
+            "ingest-small"
+        );
+        assert_eq!(
+            profiles
+                .resolve("distributed-q1")
+                .expect("locked workload")
+                .query_id
+                .as_deref(),
+            Some("q1")
+        );
+        assert_eq!(
+            profiles.resolve("does-not-exist"),
+            Err(BenchmarkSelectionError::UnknownWorkload(
+                "does-not-exist".to_owned()
+            ))
+        );
+    }
+
+    /// Prove the topology loader resolves every locked id and rejects unknowns.
+    #[test]
+    fn topology_profiles_resolve_known_and_reject_unknown() {
+        let profiles = TopologyProfiles::load();
+        assert_eq!(
+            profiles.resolve("two-pod").expect("locked topology").pods,
+            2
+        );
+        assert_eq!(
+            profiles.resolve("four-pod"),
+            Err(BenchmarkSelectionError::UnknownTopology(
+                "four-pod".to_owned()
+            ))
+        );
+    }
+
+    /// Prove the tier-budget loader returns the locked D69 envelope.
+    #[test]
+    fn tier_budgets_load_matches_locked_envelope() {
+        let budgets = TierBudgets::load();
+        assert_eq!(budgets.preflight_seconds, 120);
+        assert_eq!(budgets.smoke_lane_seconds, 180);
+        assert_eq!(budgets.smoke_suite_seconds, 600);
     }
 
     /// Prove the workload fixture contains the locked profile constants.

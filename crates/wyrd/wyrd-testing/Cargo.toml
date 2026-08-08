@@ -80,11 +80,6 @@ wyrd-utils = { workspace = true, features = ["python"], optional = true }
 wyrd-tls = { workspace = true }
 
 [[bench]]
-name = "bench_bifrost_cluster"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
 name = "bench_bifrost_scribe"
 harness = false
 required-features = ["bench"]

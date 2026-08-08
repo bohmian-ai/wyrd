@@ -155,41 +155,65 @@ hide = true
 description = "Run only the named deterministic Rust cluster matrix journeys"
 run = "cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_three_server_three_worker_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- pressured_tenant_does_not_starve_peers --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_cancellation_and_shutdown_release_all_owners --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- three_server_cluster_reconciles_production_telemetry --ignored --test-threads=1"
 
-[tasks."bench:bifrost:capacity"]
-description = "Run the bounded absolute-rate Bifrost capacity characterization"
-env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-capacity.json", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run bench:bifrost:capacity:inner'"
-[tasks."bench:bifrost:capacity:inner"]
-hide = true
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster -- --mode capacity --matrix"
-
-[tasks."bench:bifrost:qualify"]
-description = "Run controlled three-trial Bifrost SLO qualification"
-env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-candidate.json", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run bench:bifrost:qualify:inner'"
-[tasks."bench:bifrost:qualify:inner"]
-hide = true
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_cluster -- --mode qualification --matrix"
+[tasks."bench:bifrost:preflight"]
+description = "Compile both Bifrost bench binaries and validate fixture digests and schemas (no database)"
+run = [
+  "cargo build --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe --bench bench_bifrost_oracle",
+  "cargo test --locked -p wyrd-testing --features bench --lib -- bifrost::bench_dataset bifrost::bench_report bifrost::bench_runner bifrost::bench_families --skip dataset_generator_is_repeatable --skip new_equals_with_anchor_at_canonical_anchor",
+]
 
 [tasks."bench:bifrost:smoke"]
-hide = true
-description = "Run the shortened real-cluster Bifrost diagnostic smoke"
-env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REPORT = "target/bifrost-benchmarks/cluster-smoke.json", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+description = "Run every Bifrost family at smoke tier through both binaries and assert the smoke-suite budget"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run bench:bifrost:smoke:inner'"
 [tasks."bench:bifrost:smoke:inner"]
 hide = true
-run = "cargo test --locked -p wyrd-testing --features bench --lib shortened_capacity_smoke_is_reachable -- --ignored --test-threads=1"
+run = '''
+set -euo pipefail
+run_id="smoke-$(date +%s)"
+out="target/bifrost-benchmarks/qualification"
+budget=$(python3 -c "import json;print(json.load(open('crates/wyrd/wyrd-testing/fixtures/bifrost/qualification/tier-budgets.json'))['smoke_suite_seconds'])")
+cargo build --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe --bench bench_bifrost_oracle
+start=$(date +%s)
+scribe() { cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --tier smoke --run-id "$run_id" --output-root "$out" "$@"; }
+oracle() { cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --tier smoke --run-id "$run_id" --output-root "$out" "$@"; }
+scribe --workload ingest-small --topology one-pod
+oracle --workload q1 --topology one-pod
+oracle --workload distributed-q1 --topology three-pod
+oracle --workload tenants-2 --topology one-pod
+oracle --workload mixed-25-25 --topology one-pod
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -gt "$budget" ]; then echo "bifrost smoke suite exceeded ${budget}s budget (${elapsed}s)" >&2; exit 1; fi
+echo "bifrost smoke suite completed in ${elapsed}s (budget ${budget}s)"
+'''
 
-[tasks."bench:bifrost:compare"]
-description = "Compare compatible Bifrost v2 reports at identical absolute rates"
-run = "cargo run --locked -p wyrd-bench --bin bifrost_compare --"
+[tasks."bench:bifrost:qualification"]
+description = "Run the full Bifrost qualification suite (verified-run orchestration supplied by T31)"
+run = '''
+echo "bench:bifrost:qualification requires the verified-run orchestration supplied by T31." >&2
+echo "Qualify one family against an existing verified run via bench:bifrost:qualification:{ingest,oracle,distributed,mixed} with WYRD_BIFROST_RUN_ID set." >&2
+exit 1
+'''
 
-[tasks."bench:bifrost:components"]
-description = "Run subordinate Bifrost component diagnostics"
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run bench:bifrost:components:inner'"
-[tasks."bench:bifrost:components:inner"]
-hide = true
-run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=1 --tenants=1 --measured-seconds=1 --items-per-request=1"
+[tasks."bench:bifrost:qualification:ingest"]
+description = "Qualify the ingest family at qualification tier against an existing verified run (WYRD_BIFROST_RUN_ID)"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --workload \"${WYRD_BIFROST_WORKLOAD:-ingest-typical}\" --topology \"${WYRD_BIFROST_TOPOLOGY:-one-pod}\" --tier qualification --run-id \"${WYRD_BIFROST_RUN_ID:?set WYRD_BIFROST_RUN_ID to the verified run}\"'"
+
+[tasks."bench:bifrost:qualification:oracle"]
+description = "Qualify the Oracle query family at qualification tier against an existing verified run (WYRD_BIFROST_RUN_ID)"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --workload \"${WYRD_BIFROST_WORKLOAD:-q1}\" --topology \"${WYRD_BIFROST_TOPOLOGY:-one-pod}\" --tier qualification --run-id \"${WYRD_BIFROST_RUN_ID:?set WYRD_BIFROST_RUN_ID to the verified run}\"'"
+
+[tasks."bench:bifrost:qualification:distributed"]
+description = "Qualify the distributed family at qualification tier against an existing verified run (WYRD_BIFROST_RUN_ID)"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --workload \"${WYRD_BIFROST_WORKLOAD:-distributed-q1}\" --topology \"${WYRD_BIFROST_TOPOLOGY:-six-pod}\" --tier qualification --run-id \"${WYRD_BIFROST_RUN_ID:?set WYRD_BIFROST_RUN_ID to the verified run}\"'"
+
+[tasks."bench:bifrost:qualification:mixed"]
+description = "Qualify the mixed family at qualification tier against an existing verified run (WYRD_BIFROST_RUN_ID)"
+env = { WYRD_POSTGRES_COMPOSE_FILE = "benches/bifrost/docker-compose.reference.yml", WYRD_BIFROST_REFERENCE_PROFILE = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --workload \"${WYRD_BIFROST_WORKLOAD:-mixed-50-50}\" --topology \"${WYRD_BIFROST_TOPOLOGY:-one-pod}\" --tier qualification --run-id \"${WYRD_BIFROST_RUN_ID:?set WYRD_BIFROST_RUN_ID to the verified run}\"'"
 
 [tasks."check:bifrost-oracle-deploy"]
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"

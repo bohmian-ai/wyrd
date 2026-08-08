@@ -1,9 +1,17 @@
-//! Canonical Scribe benchmark adapter.
+//! Scribe ingest benchmark binary.
+//!
+//! Parses the shared tiered-runner flag surface and dispatches the resolved
+//! workload through the ingest family runner. Only ingest workloads are served
+//! here; a workload that classifies as any Oracle family is rejected before a
+//! cluster starts so the Scribe and Oracle lanes stay disjoint.
 
-use wyrd_bench::{BifrostLane, BifrostScenario};
+use wyrd_testing::bifrost::bench_families::run_family;
+use wyrd_testing::bifrost::bench_runner::{RunnerFamily, RunnerInvocation};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let scenario = BifrostScenario::from_process(BifrostLane::Scribe)?;
-    wyrd_testing::bifrost::bench_scribe::run(scenario).await
+    let invocation = RunnerInvocation::parse(std::env::args().skip(1))?;
+    let report = run_family(&invocation, &[RunnerFamily::Ingest]).await?;
+    println!("{}", report.display());
+    Ok(())
 }

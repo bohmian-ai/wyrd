@@ -28,7 +28,7 @@ pre = {
     "test:bifrost:journey", "test:fuzz:bifrost",
     "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
-    "bench:bifrost:capacity", "bench:bifrost:qualify", "bench:bifrost:smoke", "bench:bifrost:components",
+    "bench:bifrost:smoke",
 }
 aggregates = {"test:unit", "pre-pr", "test:storage:matrix", "test:storage:cloud:matrix"}
 for name in empty | migrated | pre:
@@ -42,8 +42,21 @@ for name in empty | migrated | pre:
         raise SystemExit(f"{name} still has setup-only Postgres dependencies")
 
 def check_bifrost_benchmark_lifecycle(task_map):
-    """Require best-effort descriptor raise followed by Rust benchmark preflight."""
-    for name in ("bench:bifrost:capacity", "bench:bifrost:qualify", "bench:bifrost:smoke"):
+    """Require reference-profile parity on every database-backed Bifrost bench lane.
+
+    Under the tiered-runner taxonomy the database-backed lanes are the smoke
+    suite and the four per-family qualification lanes. Each must attempt the
+    canonical open-file raise, run under the reference profile and compose file,
+    and migrate before the benchmark binary starts.
+    """
+    lanes = (
+        "bench:bifrost:smoke",
+        "bench:bifrost:qualification:ingest",
+        "bench:bifrost:qualification:oracle",
+        "bench:bifrost:qualification:distributed",
+        "bench:bifrost:qualification:mixed",
+    )
+    for name in lanes:
         if task_map[name].get("env", {}).get("WYRD_BIFROST_REFERENCE_PROFILE") != "1":
             raise SystemExit(f"{name} must enable the canonical reference profile")
         expected_raise = "ulimit -n 8192 2>/dev/null || true;"
@@ -57,16 +70,18 @@ def check_bifrost_benchmark_lifecycle(task_map):
 
 check_bifrost_benchmark_lifecycle(tasks)
 
-smoke = tasks["bench:bifrost:smoke"]
 smoke_inner = tasks["bench:bifrost:smoke:inner"]
-if not smoke.get("hide") or not smoke_inner.get("hide"):
-    raise SystemExit("the Bifrost smoke outer and inner tasks must remain hidden")
-expected_smoke_selector = (
-    "cargo test --locked -p wyrd-testing --features bench --lib "
-    "shortened_capacity_smoke_is_reachable -- --ignored --test-threads=1"
-)
-if smoke_inner.get("run") != expected_smoke_selector:
-    raise SystemExit("the hidden Bifrost smoke inner selector drifted")
+if not smoke_inner.get("hide"):
+    raise SystemExit("the Bifrost smoke inner task must remain hidden")
+smoke_inner_run = str(smoke_inner.get("run", ""))
+for fragment in (
+    "--bench bench_bifrost_scribe",
+    "--bench bench_bifrost_oracle",
+    "--tier smoke",
+    "smoke_suite_seconds",
+):
+    if fragment not in smoke_inner_run:
+        raise SystemExit(f"the Bifrost smoke inner lane must drive both binaries under the smoke budget: missing {fragment}")
 
 def dependencies(task):
     raw = task.get("depends", [])

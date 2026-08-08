@@ -1,0 +1,21 @@
+{
+  "schema_version": "wyrd.bifrost.topology/v1",
+  "topologies": [
+    {
+      "topology_id": "one-pod",
+      "pods": 1
+    },
+    {
+      "topology_id": "two-pod",
+      "pods": 2
+    },
+    {
+      "topology_id": "three-pod",
+      "pods": 3
+    },
+    {
+      "topology_id": "six-pod",
+      "pods": 6
+    }
+  ]
+}

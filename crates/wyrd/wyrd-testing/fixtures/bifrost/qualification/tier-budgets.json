@@ -1,0 +1,6 @@
+{
+  "schema_version": "wyrd.bifrost.tier-budgets/v1",
+  "preflight_seconds": 120,
+  "smoke_lane_seconds": 180,
+  "smoke_suite_seconds": 600
+}

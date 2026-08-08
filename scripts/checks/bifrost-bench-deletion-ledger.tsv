@@ -1,0 +1,72 @@
+# T30 (task 18-E3) balanced-RPS deletion ledger; diff base: 9846077d9
+# The tiered runners (bench_families.rs) and the T28 report contracts replace the
+# capacity/qualification/report apparatus and the balanced-RPS runner machinery.
+# scripts/checks/bifrost-bench-registration.sh consumes this ledger and asserts
+# every name below is absent from the tree (excluding .dev/plan history, this
+# ledger, and the checker itself). Word-boundary fixed-string match, so retained
+# names such as BifrostCapacityStage never collide with deleted CapacityStage.
+# kind	name	file	replacement or none
+bin	bifrost_compare	crates/shared/wyrd-bench/src/bin/bifrost_compare.rs	none
+bench-target	bench_bifrost_cluster	crates/wyrd/wyrd-testing/benches/bench_bifrost_cluster.rs	bench_bifrost_scribe + bench_bifrost_oracle tiered runners
+fn	parse_cluster_benchmark_args	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	RunnerInvocation::parse (bench_runner.rs)
+type	ClusterBenchmarkCommand	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	RunnerInvocation (bench_runner.rs)
+fn	run_capacity	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	run_family qualification tier (bench_families.rs)
+fn	run_qualification	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	run_family qualification tier (bench_families.rs)
+fn	run_reference_trial	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	run_family family runners (bench_families.rs)
+fn	run_live_trial	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	run_three_server_live_trial (journey helper)
+fn	run_qualification_pair	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	none
+type	CapacityScenarioSession	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	none
+fn	reference_scenario_matrix	crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs	three_server_reference_trial (journey helper)
+type	ReviewedScenarioProfile	crates/shared/wyrd-bench/src/cluster.rs	none
+type	BifrostReferenceProfile	crates/shared/wyrd-bench/src/cluster.rs	none
+type	BifrostDiagnosticReport	crates/shared/wyrd-bench/src/cluster.rs	none
+type	DiagnosticStatus	crates/shared/wyrd-bench/src/cluster.rs	none
+type	AttemptedProbe	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	validate_report_matrix	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	fixed_scenarios	crates/shared/wyrd-bench/src/cluster.rs	workload-profiles.json fixture ladders
+fn	validate_fixed_scenario	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ProfileCompatibility	crates/shared/wyrd-bench/src/cluster.rs	none
+type	MetricRegression	crates/shared/wyrd-bench/src/cluster.rs	none
+type	BifrostBenchmarkComparison	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	compare_cluster_profiles	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	compare_scenario_metrics	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	evaluate_scaling	crates/shared/wyrd-bench/src/cluster.rs	DistributedBody::validate (bench_report.rs)
+const	QUALIFICATION_PROFILE_VERSION	crates/shared/wyrd-bench/src/cluster.rs	none
+const	CANONICAL_CAPACITY_RATES	crates/shared/wyrd-bench/src/cluster.rs	workload-profiles.json fixture ladders
+const	OPTIONAL_CAPACITY_RATES	crates/shared/wyrd-bench/src/cluster.rs	workload-profiles.json fixture ladders
+const	SMOKE_CAPACITY_RATES	crates/shared/wyrd-bench/src/cluster.rs	tier-budgets.json smoke shape
+const	MATRIX_DURATION_CAP	crates/shared/wyrd-bench/src/cluster.rs	tier-budgets.json budgets
+fn	capacity_rate_sequence	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	capacity_stage_rates	crates/shared/wyrd-bench/src/cluster.rs	none
+type	CapacityStageKind	crates/shared/wyrd-bench/src/cluster.rs	none
+type	CapacityStageOutcome	crates/shared/wyrd-bench/src/cluster.rs	none
+type	CapacityStagePlan	crates/shared/wyrd-bench/src/cluster.rs	none
+type	CapacityStateMachine	crates/shared/wyrd-bench/src/cluster.rs	none
+type	CapacityLimit	crates/shared/wyrd-bench/src/cluster.rs	none
+type	CapacityStageIdentity	crates/shared/wyrd-bench/src/cluster.rs	BifrostCapacityStage (bench_report.rs)
+type	QualificationRateRole	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ReviewedQualificationRate	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ReviewedStageRef	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ReviewedCapacitySource	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ReviewedScenarioQualification	crates/shared/wyrd-bench/src/cluster.rs	none
+type	QualificationProfileV2	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ClusterWorkloadIdentity	crates/shared/wyrd-bench/src/cluster.rs	none
+const	FLUSH_CADENCE_SECONDS	crates/shared/wyrd-bench/src/cluster.rs	none
+const	PLANNED_FLUSHES_PER_TRIAL	crates/shared/wyrd-bench/src/cluster.rs	none
+const	CLUSTER_REPORT_VERSION	crates/shared/wyrd-bench/src/cluster.rs	BifrostCapacityReport schema (bench_report.rs)
+type	BenchmarkOperation	crates/shared/wyrd-bench/src/cluster.rs	none
+type	SpanDistribution	crates/shared/wyrd-bench/src/cluster.rs	none
+type	TraceManifest	crates/shared/wyrd-bench/src/cluster.rs	none
+type	PillarTelemetryDelta	crates/shared/wyrd-bench/src/cluster.rs	none
+type	DependencyTelemetryEvidence	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ProcessResourceEvidence	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ClusterTrialReport	crates/shared/wyrd-bench/src/cluster.rs	none
+type	BenchmarkEnvironment	crates/shared/wyrd-bench/src/cluster.rs	StageExecution environment (bench_report.rs)
+type	MedianMetrics	crates/shared/wyrd-bench/src/cluster.rs	none
+type	ClusterScenarioReport	crates/shared/wyrd-bench/src/cluster.rs	BifrostCapacityReport (bench_report.rs)
+fn	derive_trial_median	crates/shared/wyrd-bench/src/cluster.rs	none
+type	BifrostSloEnvelope	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	normalize_cpu_model	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	classify_cpu_vendor	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	measured_flush_offsets_seconds	crates/shared/wyrd-bench/src/cluster.rs	none
+fn	qualification_preflight_seconds	crates/shared/wyrd-bench/src/cluster.rs	tier-budgets.json preflight_seconds

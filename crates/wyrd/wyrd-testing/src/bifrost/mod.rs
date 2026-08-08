@@ -5,6 +5,8 @@ pub mod bench_cluster;
 #[cfg(feature = "bench")]
 pub mod bench_dataset;
 #[cfg(feature = "bench")]
+pub mod bench_families;
+#[cfg(feature = "bench")]
 pub mod bench_forge;
 #[cfg(feature = "bench")]
 pub mod bench_materializer;
@@ -14,6 +16,8 @@ pub mod bench_oracle;
 pub mod bench_otlp;
 #[cfg(feature = "bench")]
 pub mod bench_report;
+#[cfg(feature = "bench")]
+pub mod bench_runner;
 #[cfg(feature = "bench")]
 pub mod bench_scribe;
 pub mod calibration;

@@ -8,37 +8,79 @@ require() {
   local pattern="$1"
   local file="$2"
   if ! rg -n -F -- "$pattern" "$file" >/dev/null; then
-    echo "missing Bifrost cluster benchmark contract: $pattern in $file" >&2
+    echo "missing Bifrost benchmark contract: $pattern in $file" >&2
     exit 1
   fi
 }
 
-for lane in capacity qualify compare components; do
-  require "[tasks.\"bench:bifrost:$lane\"]" mise.toml
+forbid() {
+  local pattern="$1"
+  local file="$2"
+  if rg -n -F -- "$pattern" "$file" >/dev/null; then
+    echo "deleted Bifrost benchmark contract still present: $pattern in $file" >&2
+    exit 1
+  fi
+}
+
+# Tiered-runner taxonomy: preflight (no database), smoke, and the qualification
+# suite plus its four per-family lanes.
+require '[tasks."bench:bifrost:preflight"]' mise.toml
+require '[tasks."bench:bifrost:smoke"]' mise.toml
+require '[tasks."bench:bifrost:qualification"]' mise.toml
+for family in ingest oracle distributed mixed; do
+  require "[tasks.\"bench:bifrost:qualification:$family\"]" mise.toml
 done
-require "--bench bench_bifrost_cluster" mise.toml
-require "--mode capacity" mise.toml
-require "--mode qualification" mise.toml
-require "--matrix" mise.toml
-require "bench_bifrost_cluster" crates/wyrd/wyrd-testing/Cargo.toml
-require "reference_scenario_matrix" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
-require "balanced-one-pod-one-tenant" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
-require "balanced-one-pod-eight-tenants" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
-require "balanced-three-server-three-worker-eight-tenants" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
-require "balanced-three-server-three-worker-thirty-two-tenants" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
-require "write-heavy-three-server-three-worker-eight-tenants" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
-require "read-heavy-three-server-three-worker-eight-tenants" crates/wyrd/wyrd-testing/src/bifrost/bench_cluster.rs
-require "CLUSTER_REPORT_VERSION" crates/shared/wyrd-bench/src/cluster.rs
-require "deny_unknown_fields" crates/shared/wyrd-bench/src/cluster.rs
-require "docker-compose.reference.yml" mise.toml
 
-if rg -n '^\[tasks\."bench(:workload|:check)?"\]' mise.toml >/dev/null; then
-  echo "legacy headline benchmark commands remain registered" >&2
+# Both binaries are launched as harness-free bench targets and registered as such.
+require '--bench bench_bifrost_scribe' mise.toml
+require '--bench bench_bifrost_oracle' mise.toml
+require 'name = "bench_bifrost_scribe"' crates/wyrd/wyrd-testing/Cargo.toml
+require 'name = "bench_bifrost_oracle"' crates/wyrd/wyrd-testing/Cargo.toml
+
+# Runner dispatch and family classification back the binaries.
+require 'pub async fn run_family' crates/wyrd/wyrd-testing/src/bifrost/bench_families.rs
+require 'pub enum RunnerFamily' crates/wyrd/wyrd-testing/src/bifrost/bench_runner.rs
+
+# Reference Postgres identity parity is preserved on the database-backed lanes.
+require 'docker-compose.reference.yml' mise.toml
+require 'WYRD_BIFROST_REFERENCE_PROFILE = "1"' mise.toml
+
+# The deleted legacy lane taxonomy is gone. `smoke` is reused by the new
+# taxonomy, so only the retired lanes are forbidden.
+for lane in capacity qualify compare components; do
+  forbid "[tasks.\"bench:bifrost:$lane\"]" mise.toml
+done
+forbid '--bench bench_bifrost_cluster' mise.toml
+
+# The deleted balanced-RPS cluster bench target is unregistered.
+forbid 'name = "bench_bifrost_cluster"' crates/wyrd/wyrd-testing/Cargo.toml
+
+# Every symbol, file, and target retired by the balanced-RPS deletion cone stays
+# absent from the tree. The checked-in ledger is the source of truth; assert each
+# ledgered name is gone (word-boundary fixed-string match, so retained names such
+# as BifrostCapacityStage never collide with deleted CapacityStage). Canonical
+# plan history, the ledger, and this checker are the only permitted mentions.
+ledger="scripts/checks/bifrost-bench-deletion-ledger.tsv"
+if [[ ! -f "$ledger" ]]; then
+  echo "missing Bifrost benchmark deletion ledger: $ledger" >&2
   exit 1
 fi
-if rg -n '^\[tasks\."bench:bifrost:(cluster|baseline|preflight|scribe|forge|oracle|otlp)' mise.toml >/dev/null; then
-  echo "legacy Bifrost benchmark aliases remain registered" >&2
-  exit 1
-fi
+while IFS=$'\t' read -r kind name _file _replacement; do
+  [[ "$kind" == \#* || -z "$kind" ]] && continue
+  if git grep -n -w -I -F -e "$name" -- \
+      ':(exclude).dev/plan/**' \
+      ":(exclude)$ledger" \
+      ':(exclude)scripts/checks/bifrost-bench-registration.sh' \
+      'crates/**' 'scripts/**' 'benches/**' 'benchmarks/**' 'mise.toml' \
+      >/dev/null 2>&1; then
+    echo "ledgered deleted Bifrost benchmark name still present in tree: $name (see $ledger)" >&2
+    git grep -n -w -I -F -e "$name" -- \
+      ':(exclude).dev/plan/**' \
+      ":(exclude)$ledger" \
+      ':(exclude)scripts/checks/bifrost-bench-registration.sh' \
+      'crates/**' 'scripts/**' 'benches/**' 'benchmarks/**' 'mise.toml' >&2 || true
+    exit 1
+  fi
+done < "$ledger"
 
-echo "Bifrost full-cluster benchmark registration passed"
+echo "Bifrost tiered-runner benchmark registration passed"

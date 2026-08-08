@@ -172,11 +172,9 @@ async fn three_server_cluster_reconciles_production_telemetry() {
 #[ignore = "requires managed Postgres and the real public Gate cluster"]
 #[cfg(feature = "bench")]
 async fn three_server_cluster_reconciles_production_telemetry() {
-    let definition = wyrd_testing::bifrost::bench_cluster::reference_scenario_matrix()[2];
-    let (scenario, trial) =
-        wyrd_testing::bifrost::bench_cluster::run_reference_trial(definition, 20, 1)
-            .await
-            .expect("canonical sampled production telemetry reconciles");
+    let (scenario, trial) = wyrd_testing::bifrost::bench_cluster::three_server_reference_trial()
+        .await
+        .expect("canonical sampled production telemetry reconciles");
     assert_eq!(scenario.tenants, 8);
     assert_eq!(
         trial.production.required_telemetry,

@@ -1930,6 +1930,7 @@ where
 fn topology_name(topology: BifrostTopology) -> &'static str {
     match topology {
         BifrostTopology::OnePod => "one_pod",
+        BifrostTopology::TwoPod => "two_pod",
         BifrostTopology::ThreePod => "three_pod",
         BifrostTopology::RoleSeparated => "role_separated",
         BifrostTopology::SixPod => "six_pod",
@@ -1960,6 +1961,7 @@ impl TopologySpec for BifrostTopology {
     fn spec_for_test(self) -> crate::bifrost::BifrostClusterSpec {
         match self {
             BifrostTopology::OnePod => crate::bifrost::BifrostClusterSpec::one_mixed(),
+            BifrostTopology::TwoPod => crate::bifrost::BifrostClusterSpec::two_mixed(),
             BifrostTopology::ThreePod => crate::bifrost::BifrostClusterSpec::three_mixed(),
             BifrostTopology::RoleSeparated => crate::bifrost::BifrostClusterSpec::role_separated(),
             BifrostTopology::SixPod => crate::bifrost::BifrostClusterSpec::six_capacity(),

@@ -1,10 +1,7 @@
 //! Controlled full-cluster benchmark adapter and versioned v2 diagnostics.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array};
@@ -14,21 +11,11 @@ use arrow::record_batch::RecordBatch;
 use hdrhistogram::Histogram;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport, QueryClient, ValaSdkError};
 use wyrd_bench::{
-    AttemptedProbe, BenchmarkEnvironment, BenchmarkMetricSnapshot, BenchmarkOperation,
-    BenchmarkRecorder, BifrostDiagnosticReport, BifrostReferenceProfile, BifrostRuntimeRole,
-    BifrostSloEnvelope, CAPACITY_CONDITIONING_SECONDS, CAPACITY_MEASURED_SECONDS,
-    CAPACITY_TABLES_PER_TENANT, CLUSTER_REPORT_VERSION, CLUSTER_WORKLOAD_VERSION, CapacityLimit,
-    CapacityStage, CapacityStageIdentity, CapacityStageOutcome, CapacityStagePlan,
-    CapacityStateMachine, ClientTrialMetrics, ClusterBenchmarkError, ClusterBenchmarkScenario,
-    ClusterBenchmarkTrial, ClusterScenarioReport, ClusterTopology, ClusterTrialReport,
-    ClusterWorkloadIdentity, DependencyTelemetryEvidence, DiagnosticStatus, EvidenceStatus,
-    PillarTelemetryDelta, ProcessId, ProcessResourceEvidence, ProductionTelemetryEvidence,
-    QualificationProfileV2, ReviewedScenarioProfile, SpanDistribution, TenantStageRows,
-    TraceManifest, TrafficMix, TrialDistribution, derive_trial_median, extract_linux_cpu_identity,
-    extract_macos_cpu_identity, jain_fairness,
+    CLUSTER_WORKLOAD_VERSION, ClientTrialMetrics, ClusterBenchmarkScenario, ClusterBenchmarkTrial,
+    ClusterTopology, EvidenceStatus, ProductionTelemetryEvidence, TenantStageRows, TrafficMix,
+    TrialDistribution, jain_fairness,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -39,32 +26,22 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::Bootstrap;
-use crate::bifrost::bench_materializer::{
-    GovernorHighWater, ceiling_rejection_counts, derive_binding_ceiling,
-};
 use crate::bifrost::telemetry::{
-    ClusterRuntimeRole, ClusterTelemetryEvidence, ClusterTelemetryExpectation,
-    ClusterTelemetryProjection, ClusterTraceOperation, run_sampled_window,
+    ClusterTelemetryEvidence, ClusterTelemetryExpectation, ClusterTelemetryProjection,
+    run_sampled_window,
 };
 use crate::bifrost::{BifrostClusterSpec, BifrostTopology, WyrdTestCluster};
-use crate::server::WyrdTestServer;
 
 /// Stable logical table used by the controlled workload.
-const REFERENCE_TABLE: &str = "cluster_reference_events";
-/// Shared warmup-table name used by one capacity scenario session.
-pub const CAPACITY_WARMUP_TABLE: &str = "cluster_capacity_warmup";
-/// Number of deterministic capacity measurement-table slots.
-pub const CAPACITY_STAGE_TABLE_COUNT: usize = 16;
+pub(crate) const REFERENCE_TABLE: &str = "cluster_reference_events";
 /// Rows preloaded through Gate for every tenant before measured traffic.
-const PRELOAD_ROWS: u64 = 8_192;
+pub(crate) const PRELOAD_ROWS: u64 = 8_192;
 /// Maximum acknowledged identities assigned to one public reconciliation query.
 const IDENTITY_RECONCILIATION_ROWS_PER_QUERY: usize = 1_024;
 /// Rows in one public durable write request.
-const ROWS_PER_WRITE: u32 = 64;
+pub(crate) const ROWS_PER_WRITE: u32 = 64;
 /// Default profile-driven concurrent public-operation cap.
 const DEFAULT_MAX_IN_FLIGHT: usize = 4_096;
-/// Minimum process soft open-file limit required by the reference benchmark.
-const MINIMUM_OPEN_FILE_LIMIT: u64 = 8_192;
 /// Disjoint logical row-id space reserved for each authenticated tenant.
 const TENANT_ROW_STRIDE: u64 = 1_000_000_000_000;
 
@@ -85,106 +62,6 @@ struct AncillaryQueryError {
     source: ValaSdkError,
 }
 
-/// Public benchmark execution mode selected by the canonical command grammar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClusterBenchmarkMode {
-    /// Run the bounded absolute-rate capacity sweep.
-    Capacity,
-    /// Replay reviewed absolute rates for controlled qualification.
-    Qualification,
-}
-
-/// Parsed selector for one canonical cluster invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClusterBenchmarkCommand {
-    /// Selected benchmark mode.
-    pub mode: ClusterBenchmarkMode,
-    /// One fixed scenario selector, when not running the matrix.
-    pub scenario: Option<String>,
-    /// Whether all six fixed scenarios run sequentially.
-    pub matrix: bool,
-}
-
-/// Parse the exact public `bench_bifrost_cluster` grammar before startup.
-///
-/// The parser intentionally ignores lifecycle/profile/output environment
-/// variables. They are consumed only after this grammar succeeds.
-///
-/// # Errors
-/// Returns a message when mode, selector cardinality, selector identity, or
-/// an unknown flag is invalid.
-pub fn parse_cluster_benchmark_args<I, S>(args: I) -> Result<ClusterBenchmarkCommand, String>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-    let mut mode = None;
-    let mut scenario = None;
-    let mut matrix = false;
-    let mut cargo_bench_sentinel = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--mode" => {
-                if mode.is_some() || index + 1 >= args.len() {
-                    return Err(
-                        "--mode must occur exactly once with capacity or qualification".to_owned(),
-                    );
-                }
-                mode = Some(match args[index + 1].as_str() {
-                    "capacity" => ClusterBenchmarkMode::Capacity,
-                    "qualification" => ClusterBenchmarkMode::Qualification,
-                    value => return Err(format!("unknown --mode value `{value}`")),
-                });
-                index += 2;
-            }
-            "--scenario" => {
-                if scenario.is_some() || matrix || index + 1 >= args.len() {
-                    return Err(
-                        "exactly one of --scenario <scenario-id> or --matrix is required"
-                            .to_owned(),
-                    );
-                }
-                let value = args[index + 1].clone();
-                if !reference_scenario_matrix()
-                    .iter()
-                    .any(|entry| entry.id == value)
-                {
-                    return Err(format!("unknown scenario `{value}`"));
-                }
-                scenario = Some(value);
-                index += 2;
-            }
-            "--matrix" => {
-                if matrix || scenario.is_some() {
-                    return Err(
-                        "exactly one of --scenario <scenario-id> or --matrix is required"
-                            .to_owned(),
-                    );
-                }
-                matrix = true;
-                index += 1;
-            }
-            "--bench" if !cargo_bench_sentinel => {
-                cargo_bench_sentinel = true;
-                index += 1;
-            }
-            "--bench" => return Err("Cargo benchmark sentinel may occur at most once".to_owned()),
-            value => return Err(format!("unknown benchmark argument `{value}`")),
-        }
-    }
-    let mode = mode.ok_or_else(|| "--mode capacity|qualification is required".to_owned())?;
-    if scenario.is_none() && !matrix {
-        return Err("exactly one of --scenario <scenario-id> or --matrix is required".to_owned());
-    }
-    Ok(ClusterBenchmarkCommand {
-        mode,
-        scenario,
-        matrix,
-    })
-}
-
 /// One fixed D22 scenario before calibration assigns absolute rates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReferenceScenarioDefinition {
@@ -200,773 +77,6 @@ pub struct ReferenceScenarioDefinition {
     pub write_percent: u8,
     /// Strict-query percentage of public operations.
     pub read_percent: u8,
-}
-
-/// Return D22's exact six scenarios in deterministic execution order.
-#[must_use]
-pub const fn reference_scenario_matrix() -> [ReferenceScenarioDefinition; 6] {
-    [
-        ReferenceScenarioDefinition {
-            id: "balanced-one-pod-one-tenant",
-            topology: ClusterTopology::OnePod,
-            tenants: 1,
-            traffic: TrafficMix::Balanced,
-            write_percent: 50,
-            read_percent: 50,
-        },
-        ReferenceScenarioDefinition {
-            id: "balanced-one-pod-eight-tenants",
-            topology: ClusterTopology::OnePod,
-            tenants: 8,
-            traffic: TrafficMix::Balanced,
-            write_percent: 50,
-            read_percent: 50,
-        },
-        ReferenceScenarioDefinition {
-            id: "balanced-three-server-three-worker-eight-tenants",
-            topology: ClusterTopology::ThreeServersThreeForgeWorkers,
-            tenants: 8,
-            traffic: TrafficMix::Balanced,
-            write_percent: 50,
-            read_percent: 50,
-        },
-        ReferenceScenarioDefinition {
-            id: "balanced-three-server-three-worker-thirty-two-tenants",
-            topology: ClusterTopology::ThreeServersThreeForgeWorkers,
-            tenants: 32,
-            traffic: TrafficMix::Balanced,
-            write_percent: 50,
-            read_percent: 50,
-        },
-        ReferenceScenarioDefinition {
-            id: "write-heavy-three-server-three-worker-eight-tenants",
-            topology: ClusterTopology::ThreeServersThreeForgeWorkers,
-            tenants: 8,
-            traffic: TrafficMix::WriteHeavy,
-            write_percent: 90,
-            read_percent: 10,
-        },
-        ReferenceScenarioDefinition {
-            id: "read-heavy-three-server-three-worker-eight-tenants",
-            topology: ClusterTopology::ThreeServersThreeForgeWorkers,
-            tenants: 8,
-            traffic: TrafficMix::ReadHeavy,
-            write_percent: 10,
-            read_percent: 90,
-        },
-    ]
-}
-
-/// One fully validated scenario-local qualification route.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct QualificationScenarioPlan {
-    /// Canonical scenario definition in repository execution order.
-    definition: ReferenceScenarioDefinition,
-    /// Exact reviewed rates owned by this scenario.
-    rates: Vec<u64>,
-}
-
-/// Resolve and validate the complete qualification selection before any IO.
-///
-/// # Errors
-/// Returns [`ClusterBenchmarkError::Incompatible`] when command authority is
-/// ambiguous or any selected entry differs from its exact canonical workload.
-fn qualification_execution_plan(
-    profile: &QualificationProfileV2,
-    selected_scenario: Option<&str>,
-    matrix: bool,
-) -> Result<Vec<QualificationScenarioPlan>, ClusterBenchmarkError> {
-    profile.validate()?;
-    if matrix {
-        if selected_scenario.is_some() {
-            return Err(ClusterBenchmarkError::Incompatible(
-                "qualification selection cannot combine matrix and scenario authority".to_owned(),
-            ));
-        }
-        profile.validate_matrix()?;
-    } else if selected_scenario.is_none() {
-        return Err(ClusterBenchmarkError::Incompatible(
-            "qualification selection requires one scenario or matrix authority".to_owned(),
-        ));
-    }
-    reference_scenario_matrix()
-        .into_iter()
-        .filter(|definition| matrix || selected_scenario == Some(definition.id))
-        .map(|definition| {
-            let reviewed = profile.scenario(definition.id)?;
-            let workload = &reviewed.qualification_workload;
-            if workload.scenario_id != definition.id
-                || workload.topology != definition.topology
-                || workload.tenants != definition.tenants
-                || workload.traffic != definition.traffic
-                || workload.rows_per_batch != 64
-                || workload.query_row_limit != 64
-                || workload.tables_per_tenant != 18
-                || workload.trial_count != 3
-            {
-                return Err(ClusterBenchmarkError::Incompatible(format!(
-                    "reviewed workload does not exactly match scenario {}",
-                    definition.id
-                )));
-            }
-            Ok(QualificationScenarioPlan {
-                definition,
-                rates: reviewed
-                    .rates
-                    .iter()
-                    .map(|rate| rate.requests_per_second)
-                    .collect(),
-            })
-        })
-        .collect()
-}
-
-/// Process-global capacity benchmark recorder, installed at most once.
-///
-/// The `metrics` facade permits exactly one global recorder per process. This
-/// `OnceLock` makes [`install_or_existing_recorder`] idempotent across the
-/// capacity, smoke, and qualification entrypoints that may run in the same
-/// process: the first call installs and stores the recorder, every later call
-/// returns the same handle.
-static PROCESS_RECORDER: OnceLock<Arc<BenchmarkRecorder>> = OnceLock::new();
-
-/// T40 capacity metric families this harness consumes into its own artifact.
-///
-/// The bench harness reads these emitted-by-T40 families to reconstruct the
-/// server-side pressure picture; it never defines, renames, or relabels them.
-/// [`restrict_to_capacity_families`] keeps only series in these families so the
-/// persisted capture stays bounded to the capacity telemetry contract.
-const CAPACITY_METRIC_FAMILIES: [&str; 6] = [
-    "bifrost_scribe_rejections_total",
-    "bifrost_scribe_seal_total",
-    "bifrost_scribe_persist_stage_seconds",
-    "bifrost_memory_reserved_bytes",
-    "bifrost_memory_limit_bytes",
-    "bifrost_scribe_ingress_watermark_bytes",
-];
-
-/// Install the process-global benchmark recorder or return the existing one.
-///
-/// Installs a fresh [`BenchmarkRecorder`] as the `metrics` global recorder on
-/// the first call and stores it in [`PROCESS_RECORDER`]; every later call
-/// returns that same handle. When the `metrics` facade already holds a global
-/// recorder installed elsewhere, the install error is unwrapped back into the
-/// local handle rather than propagated, so a second capacity entrypoint in the
-/// same process never fails on `SetRecorderError`.
-fn install_or_existing_recorder() -> Arc<BenchmarkRecorder> {
-    Arc::clone(PROCESS_RECORDER.get_or_init(|| {
-        BenchmarkRecorder::new()
-            .install()
-            .unwrap_or_else(|error| error.into_inner())
-    }))
-}
-
-/// Restrict a metric snapshot to the [`CAPACITY_METRIC_FAMILIES`] series.
-///
-/// Retains only counters, gauges, gauge peaks, and histograms whose key names a
-/// T40 capacity family (either the bare family name or a `family{...}` labelled
-/// series), dropping every unrelated series so the persisted capture carries
-/// only the capacity telemetry contract. `series` and `series_limit_exceeded`
-/// are carried through unchanged as recorder-level diagnostics.
-#[must_use]
-fn restrict_to_capacity_families(snapshot: &BenchmarkMetricSnapshot) -> BenchmarkMetricSnapshot {
-    let retain = |key: &String| {
-        CAPACITY_METRIC_FAMILIES
-            .iter()
-            .any(|family| key == family || key.starts_with(&format!("{family}{{")))
-    };
-    BenchmarkMetricSnapshot {
-        counters: snapshot
-            .counters
-            .iter()
-            .filter(|(key, _)| retain(key))
-            .map(|(key, value)| (key.clone(), *value))
-            .collect(),
-        gauges: snapshot
-            .gauges
-            .iter()
-            .filter(|(key, _)| retain(key))
-            .map(|(key, value)| (key.clone(), *value))
-            .collect(),
-        gauge_peaks: snapshot
-            .gauge_peaks
-            .iter()
-            .filter(|(key, _)| retain(key))
-            .map(|(key, value)| (key.clone(), *value))
-            .collect(),
-        histograms: snapshot
-            .histograms
-            .iter()
-            .filter(|(key, _)| retain(key))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        series: snapshot.series,
-        series_limit_exceeded: snapshot.series_limit_exceeded,
-    }
-}
-
-/// Server-side capacity telemetry the bench harness captures into its artifact.
-///
-/// Closes audit finding F5: the capacity lane installs its own
-/// [`BenchmarkRecorder`] and reads the server inspection snapshot, then persists
-/// this capture as a top-level artifact field. It carries the T40-restricted
-/// metric snapshot, the ceiling-labelled rejection counts, the governor
-/// high-water at the capture instant, and the derived binding ceiling that names
-/// the run's limiting resource. It holds no tenant, table, or request identity.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-struct CapacityTelemetryCapture {
-    /// Recorder snapshot restricted to [`CAPACITY_METRIC_FAMILIES`].
-    metrics: BenchmarkMetricSnapshot,
-    /// Ceiling-labelled rejection counts keyed by the closed ceiling reason.
-    binding_ceilings: BTreeMap<String, u64>,
-    /// Governor high-water captured before shutdown, or `None` when unavailable.
-    governor_high_water: Option<GovernorHighWater>,
-    /// Binding ceiling derived from the rejections and governor high-water.
-    binding_ceiling: Option<String>,
-}
-
-impl CapacityTelemetryCapture {
-    /// Assemble a capture from a recorder snapshot and an optional server snapshot.
-    ///
-    /// Restricts the metric snapshot to the T40 capacity families, extracts the
-    /// ceiling-labelled rejection counts, converts the server inspection
-    /// snapshot into governor high-water, and derives the binding ceiling from
-    /// both sources. The scribe snapshot is `None` when the server was already
-    /// gone at capture time.
-    #[must_use]
-    fn from_snapshot(
-        snapshot: &BenchmarkMetricSnapshot,
-        scribe: Option<&ScribeInspectionSnapshot>,
-    ) -> Self {
-        let metrics = restrict_to_capacity_families(snapshot);
-        let binding_ceilings = ceiling_rejection_counts(&metrics);
-        let governor_high_water = scribe.map(GovernorHighWater::from_snapshot);
-        let binding_ceiling =
-            derive_binding_ceiling(&binding_ceilings, governor_high_water.as_ref());
-        Self {
-            metrics,
-            binding_ceilings,
-            governor_high_water,
-            binding_ceiling,
-        }
-    }
-
-    /// Assemble a capture by snapshotting the installed recorder.
-    ///
-    /// Convenience wrapper over [`Self::from_snapshot`] for the entrypoints,
-    /// which hold the process-global recorder handle and the pre-shutdown server
-    /// snapshot.
-    #[must_use]
-    fn assemble(recorder: &BenchmarkRecorder, scribe: Option<&ScribeInspectionSnapshot>) -> Self {
-        Self::from_snapshot(&recorder.snapshot(), scribe)
-    }
-}
-
-/// Derive the capacity-telemetry sidecar path for a written artifact.
-///
-/// The main artifact keeps its own name and bytes; the capture is persisted in
-/// a companion file that shares the basename with a `.capacity-telemetry.json`
-/// extension (`cluster-capacity.json` yields
-/// `cluster-capacity.capacity-telemetry.json`).
-#[must_use]
-fn capacity_telemetry_sidecar_path(path: &Path) -> PathBuf {
-    path.with_extension("capacity-telemetry.json")
-}
-
-/// Write `report` to `path` and its capacity telemetry to the sidecar file.
-///
-/// The report structs are owned by `wyrd-bench`, seal their schema with
-/// `deny_unknown_fields`, and are re-read strictly by the qualification
-/// promotion path (`load_reviewed_qualification_profile_from_paths`). Injecting
-/// a new top-level field would break that strict round-trip and the artifact
-/// digest chain, so the capture is persisted byte-adjacently in the sidecar
-/// from [`capacity_telemetry_sidecar_path`] while the main artifact stays
-/// byte-identical to a plain serialization of `report`.
-///
-/// # Errors
-/// Returns an IO or JSON error when either the artifact or its sidecar cannot be
-/// serialized or written.
-fn write_capacity_artifact<T: serde::Serialize>(
-    path: &Path,
-    report: &T,
-    capture: &CapacityTelemetryCapture,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(report)?))?;
-    std::fs::write(
-        capacity_telemetry_sidecar_path(path),
-        format!("{}\n", serde_json::to_string_pretty(capture)?),
-    )?;
-    Ok(())
-}
-
-/// Run qualification with the parsed public selector.
-///
-/// # Errors
-/// Propagates the non-promotable diagnostic or lifecycle error emitted by the
-/// selected controlled run.
-pub async fn run_qualification(
-    command: ClusterBenchmarkCommand,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    run_qualification_selected(command.scenario.as_deref(), command.matrix).await
-}
-
-/// Execute qualification in one live cluster session per selected scenario.
-async fn run_qualification_selected(
-    selected_scenario: Option<&str>,
-    matrix: bool,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let recorder = install_or_existing_recorder();
-    let path = report_path("cluster-candidate.json");
-    let environment = detect_reference_environment_or_write(&path)?;
-    let qualification = load_reviewed_qualification_profile(&environment)?;
-    let execution_plan = qualification_execution_plan(&qualification, selected_scenario, matrix)?;
-    let mut reports = Vec::new();
-    let mut attempted_probes = Vec::new();
-    let mut current_partial = None;
-    let mut scribe_snapshot = None;
-    for item in execution_plan {
-        let definition = item.definition;
-        let rates = item.rates;
-        wyrd_bench::qualification_preflight_seconds(rates.len(), 20, 180, 1_200)?;
-        let session = CapacityScenarioSession::start_with_tables(
-            definition,
-            qualification_table_names(rates.len()),
-            PathBuf::from(&environment.storage_root),
-        )
-        .await?;
-        let result = async {
-            for (rate_index, rate) in rates.iter().copied().enumerate() {
-                let mut trials = Vec::with_capacity(3);
-                let mut trial_evidence = Vec::with_capacity(3);
-                for trial in 1..=3 {
-                    begin_probe(
-                        &mut attempted_probes,
-                        format!("{}:trial-{trial}", definition.id),
-                        rate,
-                    );
-                    let pair = rate_index * 3 + usize::from(trial - 1);
-                    let (window, production, telemetry) = tokio::time::timeout(
-                        Duration::from_secs(45),
-                        session.run_qualification_pair(pair, rate, Duration::from_secs(20)),
-                    )
-                    .await
-                    .map_err(|_| "qualification pair exceeded its 45-second bound")??;
-                    complete_current_probe(&mut attempted_probes, &[]);
-                    let metrics = window.metrics();
-                    trials.push(ClusterBenchmarkTrial {
-                        trial,
-                        client: metrics.clone(),
-                        production,
-                    });
-                    let projected = ClusterTelemetryProjection::from_delta(
-                        &telemetry,
-                        ClusterTelemetryExpectation::complete(canonical_topology(
-                            definition.topology,
-                        )),
-                    )?;
-                    let evidence = ClusterTrialReport {
-                        offered_requests_per_second: rate,
-                        trial_index: trial,
-                        metrics,
-                        telemetry: adapt_pillars(&projected),
-                        resources: adapt_process(&projected),
-                        dependencies: adapt_dependencies(&projected),
-                        traces: adapt_traces(&projected),
-                    };
-                    evidence.validate_evidence()?;
-                    trial_evidence.push(evidence);
-                    current_partial = Some(qualification_scenario_report(
-                        definition,
-                        rate,
-                        trials.clone(),
-                        trial_evidence.clone(),
-                        false,
-                    )?);
-                }
-                reports.push(qualification_scenario_report(
-                    definition,
-                    rate,
-                    trials,
-                    trial_evidence,
-                    true,
-                )?);
-                current_partial = None;
-            }
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        }
-        .await;
-        // Capture the server inspection snapshot before shutdown consumes the
-        // cluster; the recorder snapshot is read later at report-write time.
-        if let Some(snapshot) = session
-            .server(0)
-            .and_then(|server| server.scribe_inspection_snapshot().ok())
-        {
-            scribe_snapshot = Some(snapshot);
-        }
-        let shutdown = session.shutdown().await;
-        if let Err(error) = result {
-            let cleanup_error = shutdown.err().map(|cleanup| cleanup.to_string());
-            let combined = cleanup_error.as_ref().map_or_else(
-                || error.to_string(),
-                |cleanup| format!("{error}; cleanup failed: {cleanup}"),
-            );
-            if let Some(partial) = current_partial {
-                reports.push(partial);
-            }
-            let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
-            write_partial_capture(
-                &path,
-                &environment,
-                &combined,
-                attempted_probes,
-                reports,
-                &capture,
-            )?;
-            return Err(error);
-        }
-        shutdown?;
-        for report in reports
-            .iter_mut()
-            .filter(|report| report.scenario.scenario_id == definition.id)
-        {
-            for trial in &mut report.trials {
-                trial.production.cleanup = EvidenceStatus::Complete;
-            }
-        }
-    }
-    let profile = BifrostReferenceProfile {
-        schema_version: CLUSTER_REPORT_VERSION.to_owned(),
-        environment: environment.clone(),
-        scenarios: reviewed_scenario_profiles(reports, &environment_storage_identity(&environment)),
-        slos: BifrostSloEnvelope::default(),
-    };
-    let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
-    write_capacity_artifact(&path, &profile, &capture)?;
-    let validation = selected_scenario.map_or_else(
-        || profile.validate_reference(),
-        |id| profile.validate_selected(id),
-    );
-    if let Err(error) = validation {
-        write_qualification_diagnostic(&path, &profile, &error)?;
-        return Err(Box::new(error));
-    }
-    Ok(path)
-}
-
-/// Run the bounded absolute-rate capacity characterization.
-///
-/// Capacity reports are diagnostics only. They retain failed stages and never
-/// become a qualification baseline.
-///
-/// # Errors
-/// Propagates the selected cluster lifecycle or report-write error.
-pub async fn run_capacity(
-    command: ClusterBenchmarkCommand,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    run_capacity_selected(command.scenario.as_deref(), command.matrix).await
-}
-
-/// Execute the bounded curve in one live session per selected scenario.
-async fn run_capacity_selected(
-    selected_scenario: Option<&str>,
-    matrix: bool,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let recorder = install_or_existing_recorder();
-    let path = report_path("cluster-capacity.json");
-    let environment = detect_reference_environment_or_write(&path)?;
-    let mut reports = Vec::new();
-    let mut scribe_snapshot = None;
-    for definition in reference_scenario_matrix() {
-        if !matrix && selected_scenario != Some(definition.id) {
-            continue;
-        }
-        let mut session =
-            CapacityScenarioSession::start(definition, PathBuf::from(&environment.storage_root))
-                .await?;
-        let mut stages = Vec::new();
-        let mut attempted_probes = Vec::new();
-        let execution = async {
-            tokio::time::timeout(Duration::from_secs(15), session.run_initial_warmup())
-                .await
-                .map_err(|_| "capacity initial warmup exceeded its 15-second bound")??;
-            while let Some(plan) = session.next_stage() {
-                begin_probe(
-                    &mut attempted_probes,
-                    definition.id.to_owned(),
-                    plan.offered_requests_per_second,
-                );
-                let result = session
-                    .run_stage(
-                        plan,
-                        Duration::from_secs(u64::from(CAPACITY_MEASURED_SECONDS)),
-                    )
-                    .await?;
-                let stage = assemble_capacity_stage(
-                    definition,
-                    plan,
-                    result,
-                    u64::from(CAPACITY_MEASURED_SECONDS),
-                );
-                let outcome =
-                    retain_completed_capacity_stage(&mut stages, &mut attempted_probes, stage);
-                session.record_stage(plan, outcome)?;
-            }
-            session.reconcile_cumulative().await?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        }
-        .await;
-        // Capture the server inspection snapshot before shutdown consumes the
-        // cluster; the recorder snapshot is read later at report-write time.
-        if let Some(snapshot) = session
-            .server(0)
-            .and_then(|server| server.scribe_inspection_snapshot().ok())
-        {
-            scribe_snapshot = Some(snapshot);
-        }
-        let shutdown = session.shutdown().await;
-        if let Err(error) = execution {
-            let partial =
-                (!stages.is_empty()).then(|| capacity_scenario_report(definition, stages));
-            let cleanup_error = shutdown.err().map(|cleanup| cleanup.to_string());
-            let combined = cleanup_error.as_ref().map_or_else(
-                || error.to_string(),
-                |cleanup| format!("{error}; cleanup failed: {cleanup}"),
-            );
-            let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
-            write_partial_capture(
-                &path,
-                &environment,
-                &combined,
-                attempted_probes,
-                partial.into_iter().collect(),
-                &capture,
-            )?;
-            return Err(error);
-        }
-        shutdown?;
-        reports.push(capacity_scenario_report(definition, stages));
-    }
-    let profile = BifrostReferenceProfile {
-        schema_version: CLUSTER_REPORT_VERSION.to_owned(),
-        environment: environment.clone(),
-        scenarios: reviewed_scenario_profiles(reports, &environment_storage_identity(&environment)),
-        slos: BifrostSloEnvelope::default(),
-    };
-    let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
-    write_capacity_artifact(&path, &profile, &capture)?;
-    write_qualification_profile_candidate(&path, &profile)?;
-    Ok(path)
-}
-
-/// Assemble one capacity report while retaining every completed stage.
-#[must_use]
-fn capacity_scenario_report(
-    definition: ReferenceScenarioDefinition,
-    stages: Vec<CapacityStage>,
-) -> ClusterScenarioReport {
-    let rate = stages
-        .last()
-        .map_or(1, |stage| stage.offered_requests_per_second);
-    ClusterScenarioReport {
-        scenario: ClusterBenchmarkScenario {
-            scenario_id: definition.id.to_owned(),
-            workload_version: CLUSTER_WORKLOAD_VERSION.to_owned(),
-            topology: definition.topology,
-            tenants: definition.tenants,
-            traffic: definition.traffic,
-            rows_per_batch: ROWS_PER_WRITE,
-            query_row_limit: 64,
-            offered_requests_per_second: rate,
-            warmup_seconds: 10,
-            measured_seconds: 20,
-            trials: 3,
-            minimum_samples: 200,
-            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            seed: 0xB1_F057,
-        },
-        trials: Vec::new(),
-        trial_evidence: Vec::new(),
-        median: Default::default(),
-        capacity_stages: stages,
-    }
-}
-
-/// Assemble a complete or diagnostic partial qualification-rate report.
-fn qualification_scenario_report(
-    definition: ReferenceScenarioDefinition,
-    rate: u64,
-    trials: Vec<ClusterBenchmarkTrial>,
-    trial_evidence: Vec<ClusterTrialReport>,
-    complete: bool,
-) -> Result<ClusterScenarioReport, ClusterBenchmarkError> {
-    let median = if complete {
-        derive_trial_median(&trials)?
-    } else {
-        Default::default()
-    };
-    Ok(ClusterScenarioReport {
-        scenario: ClusterBenchmarkScenario {
-            scenario_id: definition.id.to_owned(),
-            workload_version: CLUSTER_WORKLOAD_VERSION.to_owned(),
-            topology: definition.topology,
-            tenants: definition.tenants,
-            traffic: definition.traffic,
-            rows_per_batch: ROWS_PER_WRITE,
-            query_row_limit: 64,
-            offered_requests_per_second: rate,
-            warmup_seconds: 10,
-            measured_seconds: 20,
-            trials: 3,
-            minimum_samples: 200,
-            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            seed: 0xB1_F057,
-        },
-        trials,
-        trial_evidence,
-        median,
-        capacity_stages: Vec::new(),
-    })
-}
-
-/// Convert a completed public workload window into one retained capacity stage.
-#[must_use]
-fn capacity_stage_report(
-    definition: ReferenceScenarioDefinition,
-    plan: CapacityStagePlan,
-    result: CapacityStageRun,
-    passed: bool,
-    measured_seconds: u64,
-) -> CapacityStage {
-    let projection = ClusterTelemetryProjection::from_delta(
-        &result.telemetry,
-        ClusterTelemetryExpectation::complete(canonical_topology(definition.topology)),
-    );
-    let mut stop_reasons = Vec::new();
-    if result.client.backpressure > 0 {
-        stop_reasons.push(CapacityLimit::Backpressure);
-    }
-    if result.client.in_flight_cap_exhaustions > 0 {
-        stop_reasons.push(CapacityLimit::InFlightCap);
-    }
-    if result.client.missed_operations > 0 {
-        stop_reasons.push(CapacityLimit::MissedDeadline);
-    }
-    let (telemetry, resources, dependencies, traces) = match projection {
-        Ok(projected) => (
-            adapt_pillars(&projected),
-            adapt_process(&projected),
-            adapt_dependencies(&projected),
-            adapt_traces(&projected),
-        ),
-        Err(error) => {
-            let invalid = vec![error.to_string()];
-            (
-                PillarTelemetryDelta {
-                    gate_accepted: 0,
-                    scribe_wal_bytes: 0,
-                    forge_publications: 0,
-                    oracle_decoded_rows: 0,
-                    status: EvidenceStatus::Failed,
-                    missing_required: Vec::new(),
-                    invalid: invalid.clone(),
-                },
-                Vec::new(),
-                DependencyTelemetryEvidence {
-                    postgres_pool_wait_us: 0,
-                    postgres_transactions: 0,
-                    storage_bytes: 0,
-                    storage_p99_us: 0,
-                    wal_fsync_p99_us: 0,
-                    status: EvidenceStatus::Failed,
-                    missing_required: Vec::new(),
-                    invalid,
-                },
-                Vec::new(),
-            )
-        }
-    };
-    CapacityStage {
-        identity: CapacityStageIdentity {
-            stage_id: format!("{}-{:02}", definition.id, plan.slot),
-            ordinal: plan.slot,
-            tenant_rows: result
-                .client
-                .tenant_write_ordinals
-                .iter()
-                .enumerate()
-                .map(|(tenant, ordinals)| stage_row_identity(tenant, ordinals))
-                .collect(),
-        },
-        kind: plan.kind,
-        offered_requests_per_second: plan.offered_requests_per_second,
-        completed_requests_per_second: result.client.accepted as f64
-            / measured_seconds.max(1) as f64,
-        duration: Duration::from_secs(measured_seconds),
-        passed,
-        in_flight_cap_exhaustions: result.client.in_flight_cap_exhaustions,
-        stop_reasons,
-        metrics: result.client.metrics(),
-        telemetry,
-        resources,
-        dependencies,
-        traces,
-    }
-}
-
-/// Assemble and validate one completed public workload stage for capacity or smoke.
-///
-/// The helper applies the single production outcome policy before validating
-/// the existing telemetry, dependency, resource, and trace evidence shape.
-#[must_use]
-fn assemble_capacity_stage(
-    definition: ReferenceScenarioDefinition,
-    plan: CapacityStagePlan,
-    result: CapacityStageRun,
-    measured_seconds: u64,
-) -> CapacityStage {
-    let passed = result.client.missed_operations == 0
-        && result.client.missed_flushes == 0
-        && result.client.in_flight_cap_exhaustions == 0
-        && result.client.backpressure == 0
-        && result.published_rows == result.client.tenant_write_rows.iter().sum::<u64>()
-        && result.audit_rows > 0;
-    let mut stage = capacity_stage_report(definition, plan, result, passed, measured_seconds);
-    if stage.validate_evidence().is_err() {
-        stage.passed = false;
-        stage.stop_reasons.push(CapacityLimit::InvalidEvidence);
-    }
-    stage
-}
-
-/// Classify a retained stage without converting arbitrary gate failures into saturation.
-#[must_use]
-fn capacity_stage_outcome(stage: &CapacityStage) -> CapacityStageOutcome {
-    if stage.passed {
-        CapacityStageOutcome::Passing
-    } else if stage.stop_reasons == [CapacityLimit::Backpressure] {
-        CapacityStageOutcome::ControlledBackpressure
-    } else {
-        CapacityStageOutcome::Invalid
-    }
-}
-
-/// Retain one fully assembled stage and its exact probe reasons before transition.
-///
-/// This ordering ensures a state-machine refusal cannot discard completed
-/// diagnostic evidence from the partial capacity artifact.
-#[must_use]
-fn retain_completed_capacity_stage(
-    stages: &mut Vec<CapacityStage>,
-    attempted_probes: &mut [AttemptedProbe],
-    stage: CapacityStage,
-) -> CapacityStageOutcome {
-    let outcome = capacity_stage_outcome(&stage);
-    complete_current_probe(attempted_probes, &stage.stop_reasons);
-    stages.push(stage);
-    outcome
 }
 
 /// Derive the report identity from the same ordinal used to write public frames.
@@ -994,99 +104,6 @@ fn stage_row_identity(tenant: usize, ordinals: &BTreeSet<u64>) -> TenantStageRow
     }
 }
 
-/// Copy canonical pillar evidence into the stable benchmark report shape.
-fn adapt_pillars(evidence: &ClusterTelemetryEvidence) -> PillarTelemetryDelta {
-    PillarTelemetryDelta {
-        gate_accepted: evidence.pillars.gate_accepted,
-        scribe_wal_bytes: evidence.pillars.scribe_wal_bytes,
-        forge_publications: evidence.pillars.forge_publications,
-        oracle_decoded_rows: evidence.pillars.oracle_decoded_rows,
-        status: EvidenceStatus::Complete,
-        missing_required: Vec::new(),
-        invalid: Vec::new(),
-    }
-}
-
-/// Copy required canonical dependencies into the stable benchmark report shape.
-fn adapt_dependencies(evidence: &ClusterTelemetryEvidence) -> DependencyTelemetryEvidence {
-    DependencyTelemetryEvidence {
-        postgres_pool_wait_us: evidence.dependencies.postgres_pool_wait_us.expect(
-            "invariant: complete benchmark projection requires PostgreSQL acquire evidence",
-        ),
-        postgres_transactions: evidence.dependencies.postgres_transactions.expect(
-            "invariant: complete benchmark projection requires PostgreSQL transaction evidence",
-        ),
-        storage_bytes: evidence
-            .dependencies
-            .storage_bytes
-            .expect("invariant: complete benchmark projection requires storage byte evidence"),
-        storage_p99_us: evidence
-            .dependencies
-            .storage_p99_us
-            .expect("invariant: complete benchmark projection requires storage duration evidence"),
-        wal_fsync_p99_us: evidence
-            .dependencies
-            .wal_fsync_p99_us
-            .expect("invariant: complete benchmark projection requires WAL fsync evidence"),
-        status: EvidenceStatus::Complete,
-        missing_required: Vec::new(),
-        invalid: Vec::new(),
-    }
-}
-
-/// Copy canonical process evidence into the stable benchmark report shape.
-fn adapt_process(evidence: &ClusterTelemetryEvidence) -> Vec<ProcessResourceEvidence> {
-    let process = &evidence.process;
-    vec![ProcessResourceEvidence {
-        process_id: ProcessId(process.identity.clone()),
-        epoch: process.epoch,
-        hosted_logical_nodes: process.hosted_logical_nodes.clone(),
-        roles: process
-            .roles
-            .iter()
-            .map(|role| match role {
-                ClusterRuntimeRole::Gate => BifrostRuntimeRole::Gate,
-                ClusterRuntimeRole::Scribe => BifrostRuntimeRole::Scribe,
-                ClusterRuntimeRole::Forge => BifrostRuntimeRole::Forge,
-                ClusterRuntimeRole::Oracle => BifrostRuntimeRole::Oracle,
-            })
-            .collect(),
-        cpu_seconds: process.cpu_seconds,
-        peak_rss_bytes: process.peak_rss_bytes,
-        current_rss_bytes: process.current_rss_bytes,
-        runtime_busy_seconds: process.runtime_busy_seconds,
-        runtime_queue_peak: process.runtime_queue_peak,
-    }]
-}
-
-/// Copy canonical trace evidence into the stable benchmark report shape.
-fn adapt_traces(evidence: &ClusterTelemetryEvidence) -> Vec<TraceManifest> {
-    evidence
-        .traces
-        .iter()
-        .map(|trace| {
-            let operation = match trace.operation {
-                ClusterTraceOperation::DurableWrite => BenchmarkOperation::DurableWrite,
-                ClusterTraceOperation::FlushToVisible => BenchmarkOperation::FlushToVisible,
-                ClusterTraceOperation::QueryTimeToFirstFrame => {
-                    BenchmarkOperation::QueryTimeToFirstFrame
-                }
-                ClusterTraceOperation::QueryTotal => BenchmarkOperation::QueryTotal,
-            };
-            TraceManifest {
-                operation,
-                representative_trace_ids: trace.representative_trace_ids.clone(),
-                critical_path_spans: vec![SpanDistribution {
-                    operation,
-                    samples: trace.samples,
-                    p95_us: trace.p95_us,
-                    p99_us: trace.p99_us,
-                }],
-            }
-        })
-        .collect()
-}
-
 /// Convert report topology into the dependency-neutral test-cluster topology.
 const fn canonical_topology(topology: ClusterTopology) -> BifrostTopology {
     match topology {
@@ -1097,772 +114,76 @@ const fn canonical_topology(topology: ClusterTopology) -> BifrostTopology {
     }
 }
 
-/// Group flat trial reports into the persisted reviewed-scenario contract.
-///
-/// Reports are sorted by absolute offered rate inside each fixed scenario so
-/// qualification replay and comparison consume one deterministic shape.
-#[must_use]
-fn reviewed_scenario_profiles(
-    reports: Vec<ClusterScenarioReport>,
-    storage_runtime_identity: &str,
-) -> Vec<ReviewedScenarioProfile> {
-    let mut grouped = BTreeMap::<String, Vec<ClusterScenarioReport>>::new();
-    for report in reports {
-        grouped
-            .entry(report.scenario.scenario_id.clone())
-            .or_default()
-            .push(report);
-    }
-    grouped
-        .into_iter()
-        .filter_map(|(scenario_id, mut reports)| {
-            reports.sort_by_key(|report| report.scenario.offered_requests_per_second);
-            let first = reports.first()?;
-            let capacity = !first.capacity_stages.is_empty();
-            let ordered_rates = if capacity {
-                first
-                    .capacity_stages
-                    .iter()
-                    .map(|stage| stage.offered_requests_per_second)
-                    .collect()
-            } else {
-                reports
-                    .iter()
-                    .map(|report| report.scenario.offered_requests_per_second)
-                    .collect()
-            };
-            Some(ReviewedScenarioProfile {
-                scenario_id: scenario_id.clone(),
-                workload: ClusterWorkloadIdentity {
-                    scenario_id,
-                    topology: first.scenario.topology,
-                    tenants: first.scenario.tenants,
-                    traffic: first.scenario.traffic,
-                    rows_per_batch: first.scenario.rows_per_batch,
-                    query_row_limit: first.scenario.query_row_limit,
-                    auth_cache_ttl_seconds: wyrd_bench::AUTH_CACHE_TTL_SECONDS,
-                    auth_invalidation_mode: wyrd_bench::AUTH_INVALIDATION_MODE.to_owned(),
-                    flush_policy: wyrd_bench::FLUSH_POLICY.to_owned(),
-                    routing_policy: wyrd_bench::ROUTING_POLICY.to_owned(),
-                    batching_policy: wyrd_bench::BATCHING_POLICY.to_owned(),
-                    storage_runtime_identity: storage_runtime_identity.to_owned(),
-                    allocation_policy: wyrd_bench::ALLOCATION_POLICY.to_owned(),
-                    tables_per_tenant: if capacity {
-                        CAPACITY_TABLES_PER_TENANT
-                    } else {
-                        u32::try_from(reports.len() * 3 * 2).unwrap_or(u32::MAX)
-                    },
-                    ordered_rates,
-                    trial_count: if capacity { 1 } else { 3 },
-                    warmup_seconds: 10,
-                    conditioning_seconds: 3,
-                    measured_seconds: 20,
-                },
-                offered_rates: reports
-                    .iter()
-                    .map(|report| report.scenario.offered_requests_per_second)
-                    .collect(),
-                reports,
-            })
-        })
-        .collect()
-}
-
-/// Derive the workload storage identity from inspected environment evidence.
-#[must_use]
-fn environment_storage_identity(environment: &BenchmarkEnvironment) -> String {
-    format!(
-        "{}:{}:{}",
-        environment.storage_backend_kind,
-        environment.storage_root,
-        environment.storage_device_class
-    )
-}
-
-/// Persist a machine-readable non-promotable qualification result beside a capture.
-///
-/// # Errors
-/// Returns an IO or JSON error when the diagnostic cannot be serialized or written.
-fn write_qualification_diagnostic(
-    report_path: &Path,
-    profile: &BifrostReferenceProfile,
-    error: &ClusterBenchmarkError,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let diagnostic_path = report_path.with_extension("qualification.json");
-    std::fs::write(
-        diagnostic_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&qualification_diagnostic(profile, error))?
-        ),
-    )?;
-    Ok(())
-}
-
-/// Persist completed reports and the current incomplete probe after a failure.
-///
-/// The failing run's capacity telemetry capture is persisted to the companion
-/// sidecar via [`write_capacity_artifact`], so a deadline or lifecycle failure
-/// still names its own binding ceiling from captured server-side evidence
-/// without altering the strict diagnostic artifact.
-///
-/// # Errors
-/// Returns an IO or JSON error when the diagnostic cannot be written.
-fn write_partial_capture(
-    report_path: &Path,
-    environment: &BenchmarkEnvironment,
-    error: &str,
-    attempted_probes: Vec<AttemptedProbe>,
-    reports: Vec<ClusterScenarioReport>,
-    capture: &CapacityTelemetryCapture,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let report = BifrostDiagnosticReport::failure(
-        DiagnosticStatus::NotReady,
-        error.to_owned(),
-        Some(environment.clone()),
-        attempted_probes,
-        reviewed_scenario_profiles(reports, &environment_storage_identity(environment)),
-    );
-    write_capacity_artifact(report_path, &report, capture)
-}
-
-/// Append the current probe before any fallible measurement work begins.
-fn begin_probe(probes: &mut Vec<AttemptedProbe>, scenario_id: String, rate: u64) {
-    probes.push(AttemptedProbe {
-        scenario_id: Some(scenario_id),
-        offered_requests_per_second: rate,
-        completed: false,
-        stop_reasons: Vec::new(),
-    });
-}
-
-/// Mark only the most recently attempted probe complete.
-fn complete_current_probe(probes: &mut [AttemptedProbe], stop_reasons: &[CapacityLimit]) {
-    if let Some(probe) = probes.last_mut() {
-        probe.completed = true;
-        probe.stop_reasons = stop_reasons.to_vec();
-    }
-}
-
-/// Persist a v2 diagnostic when environment discovery itself is unsupported.
-///
-/// # Errors
-/// Returns an IO or JSON error when the diagnostic cannot be written.
-fn write_unavailable_capture(
-    report_path: &Path,
-    error: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let report = BifrostDiagnosticReport::failure(
-        DiagnosticStatus::Unsupported,
-        error.to_owned(),
-        None,
-        Vec::new(),
-        Vec::new(),
-    );
-    std::fs::write(
-        report_path,
-        format!("{}\n", serde_json::to_string_pretty(&report)?),
-    )?;
-    Ok(())
-}
-
-/// Build exact deficient-trial evidence without changing the strict qualification gate.
-#[must_use]
-fn qualification_diagnostic(
-    profile: &BifrostReferenceProfile,
-    error: &ClusterBenchmarkError,
-) -> serde_json::Value {
-    let status = match error {
-        ClusterBenchmarkError::Invalid(_) => "invalid",
-        ClusterBenchmarkError::Unsupported(_) => "unsupported",
-        ClusterBenchmarkError::NotReady(_) => "not_ready",
-        ClusterBenchmarkError::Incompatible(_) => "incompatible",
-    };
-    let deficiencies = profile
-        .scenarios
-        .iter()
-        .flat_map(|reviewed| {
-            reviewed.reports.iter().flat_map(|report| {
-                report
-                    .trials
-                    .iter()
-                    .filter_map(|trial| trial_deficiency(report, trial))
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "schema_version": "wyrd.bifrost.qualification-diagnostic/v1",
-        "promotable": false,
-        "status": status,
-        "error": error.to_string(),
-        "report_schema_version": profile.schema_version,
-        "git_sha": profile.environment.git_sha,
-        "deficiencies": deficiencies,
-    })
-}
-
-/// Return exact machine-readable evidence when one trial misses its sample floor.
-#[must_use]
-fn trial_deficiency(
-    report: &ClusterScenarioReport,
-    trial: &ClusterBenchmarkTrial,
-) -> Option<serde_json::Value> {
-    let client = &trial.client;
-    let floor = report.scenario.minimum_samples;
-    if client.durable_write.samples >= floor
-        && client.query_time_to_first_frame.samples >= floor
-        && client.total_query.samples >= floor
-    {
-        return None;
-    }
-    Some(serde_json::json!({
-        "scenario_id": report.scenario.scenario_id,
-        "offered_requests_per_second": report.scenario.offered_requests_per_second,
-        "trial": trial.trial,
-        "minimum_samples": floor,
-        "planned_operations": client.planned_operations,
-        "attempted_operations": client.attempted_operations,
-        "accepted_operations": client.accepted_operations,
-        "successful_writes": client.durable_write.samples,
-        "successful_query_ttfb": client.query_time_to_first_frame.samples,
-        "successful_query_total": client.total_query.samples,
-        "retry_operations": client.retry_operations,
-        "backpressure_operations": client.backpressure_operations,
-        "in_flight_cap_exhaustions": client.in_flight_cap_exhaustions,
-        "max_in_flight": client.max_in_flight,
-        "missed_operations": client.missed_operations,
-    }))
-}
-
 /// Select one deterministic interleaved traffic class from the fixed seed.
 #[must_use]
 fn is_write_operation(ordinal: u64, write_percent: u8) -> bool {
     (ordinal.saturating_mul(37).saturating_add(0xB1_F057) % 100) < u64::from(write_percent)
 }
 
-/// Execute one real open-loop controlled trial through the public SDK/Gate path.
-///
-/// Every operation is scheduled from an immutable planned instant. Falling
-/// behind by more than one interval records a missed operation instead of
-/// shifting later work and hiding coordinated omission. A separate coordinator
-/// owns the ten fixed measured flush instants.
-///
-/// # Errors
-/// Returns a typed environment, cluster, public-client, protocol, telemetry,
-/// correctness, audit, or cleanup failure. Partial trials are never returned.
-pub async fn run_reference_trial(
-    definition: ReferenceScenarioDefinition,
-    offered_requests_per_second: u64,
-    trial: u8,
-) -> Result<
-    (ClusterBenchmarkScenario, ClusterBenchmarkTrial),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    run_trial_with_windows(ReferenceTrialSpec {
-        definition,
-        rate: offered_requests_per_second,
-        trial,
-        warmup: Duration::from_secs(10),
-        measured: Duration::from_secs(20),
-        max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-    })
-    .await
-}
-
-/// Immutable execution identity for one fresh calibration or reference trial.
-#[derive(Debug, Clone, Copy)]
-struct ReferenceTrialSpec {
-    /// Fixed D22 scenario.
-    definition: ReferenceScenarioDefinition,
-    /// Absolute offered public request rate.
-    rate: u64,
-    /// One-based independent trial number.
-    trial: u8,
-    /// Warmup window excluded from evidence.
-    warmup: Duration,
-    /// Measured evidence window.
-    measured: Duration,
-    /// Profile-driven concurrent public operation cap.
-    max_in_flight: usize,
-}
-
-/// One completed capacity table and its exact acknowledged identities.
-struct CompletedTableLedger {
-    /// Boot-provisioned table queried during cumulative reconciliation.
-    table: String,
-    /// Exact acknowledged identities for each tenant in roster order.
-    expected_rows_by_tenant: Vec<BTreeSet<u64>>,
-}
-
-/// One live, benchmark-only capacity scenario lifecycle.
-///
-/// The session owns the T15 cluster, tenant-bound public clients, exact
-/// seventeen-table allocation, stage allocator, cumulative identity ledger,
-/// and terminal shutdown. It deliberately cannot clone the cluster owner.
-pub struct CapacityScenarioSession {
-    /// Live T15 cluster, retained until the single terminal shutdown.
-    cluster: Option<WyrdTestCluster>,
-    /// Fixed scenario definition for every stage.
-    definition: ReferenceScenarioDefinition,
-    /// Tenant roster provisioned once during boot.
-    tenants: Vec<DataTenantId>,
-    /// Authenticated public Gate/Oracle clients provisioned once during boot.
-    clients: Vec<ReferenceClient>,
-    /// Closed discovery, confirmation, and recovery transition owner.
-    stages: CapacityStateMachine,
-    /// Exact boot-provisioned table names in allocation order.
-    tables: Vec<String>,
-    /// Cumulative expected row identities by tenant.
-    expected_rows: Vec<BTreeSet<u64>>,
-    /// Completed measurement tables and their exact per-tenant ledgers.
-    completed_tables: Vec<CompletedTableLedger>,
-}
-
-impl CapacityScenarioSession {
-    /// Boot one T15 cluster and provision the complete bounded stage allocation.
-    ///
-    /// # Errors
-    /// Returns a cluster, tenant, authentication, provisioning, or allocation
-    /// inspection error. The caller must still invoke [`Self::shutdown`]
-    /// whenever this constructor returns a session.
-    pub async fn start(
-        definition: ReferenceScenarioDefinition,
-        storage_root: PathBuf,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let tables = capacity_table_names();
-        if tables.len() != usize::try_from(CAPACITY_TABLES_PER_TENANT)? {
-            return Err(
-                "capacity allocation did not contain the complete bounded stage set".into(),
-            );
-        }
-        Self::start_with_tables(definition, tables, storage_root).await
-    }
-
-    /// Boot one live scenario with a formula-preflighted table allocation.
-    ///
-    /// # Errors
-    /// Returns the same lifecycle, tenant, authentication, and catalog errors
-    /// as [`Self::start`].
-    async fn start_with_tables(
-        definition: ReferenceScenarioDefinition,
-        tables: Vec<String>,
-        storage_root: PathBuf,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let cluster_spec = match definition.topology {
-            ClusterTopology::OnePod => BifrostClusterSpec::one_mixed(),
-            ClusterTopology::ThreeServersThreeForgeWorkers => {
-                BifrostClusterSpec::three_servers_three_forge_workers()
-            }
-        };
-        let storage_root = storage_root.canonicalize()?;
-        let cluster = WyrdTestCluster::start_spec_with_forge_observer_and_storage_root(
-            cluster_spec,
-            storage_root.clone(),
-        )
-        .await?;
-        if cluster.storage_root() != storage_root {
-            return Err("declared and live cluster storage roots differ".into());
-        }
-        let tenants = provision_reference_tenants(&cluster, definition.tenants as usize).await?;
-        provision_named_tables(&cluster, &tenants, &tables).await?;
-        provision_named_tables(&cluster, &tenants, &[REFERENCE_TABLE.to_owned()]).await?;
-        let clients = reference_clients(&cluster, &tenants).await?;
-        preload_reference_rows(&cluster, &tenants, &clients).await?;
-        await_forge_convergence(&cluster, &tenants).await?;
-        let expected_rows = vec![BTreeSet::new(); tenants.len()];
-        Ok(Self {
-            cluster: Some(cluster),
-            definition,
-            tenants,
-            clients,
-            stages: CapacityStateMachine::canonical(),
-            tables,
-            expected_rows,
-            completed_tables: Vec::new(),
+/// Build the exact deterministic preload ledger for every tenant.
+#[must_use]
+fn preload_identity_ledger(tenant_count: usize) -> Vec<BTreeSet<u64>> {
+    (0..tenant_count)
+        .map(|tenant| {
+            let start = tenant_row_base(tenant);
+            (start..start + PRELOAD_ROWS).collect()
         })
-    }
+        .collect()
+}
 
-    /// Return the next stage plan without creating runtime state or tables.
-    #[must_use]
-    pub fn next_stage(&mut self) -> Option<CapacityStagePlan> {
-        self.stages.next_plan()
-    }
-
-    /// Return stable session cardinalities used by runtime allocation checks.
-    #[must_use]
-    pub fn allocation_identity(&self) -> (&str, usize, usize, usize) {
-        (
-            self.definition.id,
-            self.tenants.len(),
-            self.clients.len(),
-            self.expected_rows.len(),
-        )
-    }
-
-    /// Run the exact ten-second scenario warmup against the shared warmup table.
-    ///
-    /// # Errors
-    /// Returns a public Gate workload error or a repeated-shutdown error.
-    async fn run_initial_warmup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let cluster = self
-            .cluster
-            .as_ref()
-            .ok_or("capacity session is shut down")?;
-        WindowRun {
-            cluster,
-            tenants: &self.tenants,
-            clients: &self.clients,
-            definition: self.definition,
-            rate: wyrd_bench::CANONICAL_CAPACITY_RATES[0],
-            duration: Duration::from_secs(10),
-            measured: false,
-            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            table: CAPACITY_WARMUP_TABLE,
-            phase_ordinal_base: 0,
-        }
-        .run()
-        .await?;
-        Ok(())
-    }
-
-    /// Return the deterministic measurement table assigned to a stage.
-    ///
-    /// # Errors
-    /// Returns an allocation error when the stage slot is outside the sixteen
-    /// measured slots provisioned at boot.
-    pub fn stage_table(
-        &self,
-        plan: CapacityStagePlan,
-    ) -> Result<&str, Box<dyn std::error::Error + Send + Sync>> {
-        self.tables
-            .get(usize::from(plan.slot) + 1)
-            .map(String::as_str)
-            .ok_or_else(|| "capacity stage exceeded its boot-provisioned table allocation".into())
-    }
-
-    /// Record one completed stage transition after the public workload owner
-    /// has retained its full evidence.
-    ///
-    /// # Errors
-    /// Returns the state-machine error for invalid terminal/recovery ordering.
-    pub fn record_stage(
-        &mut self,
-        plan: CapacityStagePlan,
-        outcome: CapacityStageOutcome,
-    ) -> Result<(), ClusterBenchmarkError> {
-        self.stages.record(plan, outcome)
-    }
-
-    /// Drive one conditioned measured stage through the public Gate workload.
-    ///
-    /// # Errors
-    /// Returns a public workload, allocation, telemetry, or lifecycle error.
-    async fn run_stage(
-        &mut self,
-        plan: CapacityStagePlan,
-        measured: Duration,
-    ) -> Result<CapacityStageRun, Box<dyn std::error::Error + Send + Sync>> {
-        let cluster = self
-            .cluster
-            .as_ref()
-            .ok_or("capacity session is shut down")?;
-        WindowRun {
-            cluster,
-            tenants: &self.tenants,
-            clients: &self.clients,
-            definition: self.definition,
-            rate: plan.offered_requests_per_second,
-            duration: Duration::from_secs(u64::from(CAPACITY_CONDITIONING_SECONDS)),
-            measured: false,
-            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            table: CAPACITY_WARMUP_TABLE,
-            phase_ordinal_base: 1_000_000 + u64::from(plan.slot) * 100_000,
-        }
-        .run()
-        .await?;
-        let checkpoint = cluster.telemetry().checkpoint()?;
-        let audit_before = audit_rows(cluster, &self.tenants).await?;
-        let result = WindowRun {
-            cluster,
-            tenants: &self.tenants,
-            clients: &self.clients,
-            definition: self.definition,
-            rate: plan.offered_requests_per_second,
-            duration: measured,
-            measured: true,
-            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            table: self.stage_table(plan)?,
-            phase_ordinal_base: 2_000_000 + u64::from(plan.slot) * 100_000,
-        }
-        .run()
-        .await?;
-        flush_tenant_writers(cluster, &self.tenants).await?;
-        await_forge_convergence(cluster, &self.tenants).await?;
-        let telemetry = cluster.telemetry().delta_since(&checkpoint)?;
-        let audit_after = audit_rows(cluster, &self.tenants).await?;
-        let expected_rows_by_tenant = result
-            .tenant_write_ordinals
-            .iter()
-            .enumerate()
-            .map(|(tenant, ordinals)| {
-                stage_row_identity(tenant, ordinals)
-                    .row_ids
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-            })
-            .collect::<Vec<_>>();
-        let published = final_published_identities(
-            cluster,
-            &self.tenants,
-            &self.clients,
-            self.stage_table(plan)?,
-            &expected_rows_by_tenant,
-        )
-        .await?;
-        for (tenant, expected) in expected_rows_by_tenant.iter().enumerate() {
-            self.expected_rows[tenant].extend(expected);
-        }
-        self.completed_tables.push(CompletedTableLedger {
-            table: self.stage_table(plan)?.to_owned(),
-            expected_rows_by_tenant,
-        });
-        Ok(CapacityStageRun {
-            client: result,
-            telemetry,
-            published_rows: published.iter().map(BTreeSet::len).sum::<usize>() as u64,
-            audit_rows: audit_after.saturating_sub(audit_before),
-        })
-    }
-
-    /// Re-read every assigned stage table and compare the exact cumulative union.
-    ///
-    /// # Errors
-    /// Returns an exact-identity error when any earlier stage is missing,
-    /// duplicated, corrupted, or visible under the wrong tenant.
-    async fn reconcile_cumulative(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let cluster = self
-            .cluster
-            .as_ref()
-            .ok_or("capacity session is shut down")?;
-        let mut observed = vec![BTreeSet::new(); self.tenants.len()];
-        for completed in &self.completed_tables {
-            let identities = final_published_identities(
-                cluster,
-                &self.tenants,
-                &self.clients,
-                &completed.table,
-                &completed.expected_rows_by_tenant,
-            )
-            .await?;
-            for (tenant, rows) in identities.into_iter().enumerate() {
-                observed[tenant].extend(rows);
-            }
-        }
-        if !exact_identity_ledger_matches(&self.expected_rows, &observed) {
-            return Err(
-                "final cumulative Oracle union differs from the exact expected identity ledger"
-                    .into(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Run one qualification rate/trial pair against its dedicated warmup and
-    /// untouched measurement tables.
-    ///
-    /// # Errors
-    /// Returns a table-allocation, public workload, telemetry, convergence,
-    /// correctness, or audit error.
-    async fn run_qualification_pair(
-        &self,
-        pair: usize,
-        rate: u64,
-        measured: Duration,
-    ) -> Result<
-        (
-            WindowResult,
-            ProductionTelemetryEvidence,
-            crate::bifrost::telemetry::BifrostTelemetryDelta,
-        ),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let cluster = self
-            .cluster
-            .as_ref()
-            .ok_or("qualification session is shut down")?;
-        let warmup_table = self
-            .tables
-            .get(pair * 2)
-            .ok_or("missing qualification warmup table")?;
-        let measurement_table = self
-            .tables
-            .get(pair * 2 + 1)
-            .ok_or("missing qualification measurement table")?;
-        for duration in [Duration::from_secs(10), Duration::from_secs(3)] {
-            WindowRun {
-                cluster,
-                tenants: &self.tenants,
-                clients: &self.clients,
-                definition: self.definition,
-                rate,
-                duration,
-                measured: false,
-                max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-                table: warmup_table,
-                phase_ordinal_base: 10_000_000 + pair as u64 * 100_000,
-            }
-            .run()
-            .await?;
-        }
-        let ((result, audit_before, audit_after), telemetry) =
-            run_sampled_window(cluster.telemetry(), || async {
-                let audit_before = audit_rows(cluster, &self.tenants).await?;
-                let result = WindowRun {
-                    cluster,
-                    tenants: &self.tenants,
-                    clients: &self.clients,
-                    definition: self.definition,
-                    rate,
-                    duration: measured,
-                    measured: true,
-                    max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-                    table: measurement_table,
-                    phase_ordinal_base: 20_000_000 + pair as u64 * 100_000,
-                }
-                .run()
-                .await?;
-                flush_tenant_writers(cluster, &self.tenants).await?;
-                await_forge_convergence(cluster, &self.tenants).await?;
-                let audit_after = audit_rows(cluster, &self.tenants).await?;
-                Ok((result, audit_before, audit_after))
-            })
-            .await?;
-        let expected_rows_by_tenant = result
-            .tenant_write_ordinals
-            .iter()
-            .enumerate()
-            .map(|(tenant, ordinals)| {
-                stage_row_identity(tenant, ordinals)
-                    .row_ids
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-            })
-            .collect::<Vec<_>>();
-        let published = final_published_identities(
-            cluster,
-            &self.tenants,
-            &self.clients,
-            measurement_table,
-            &expected_rows_by_tenant,
-        )
-        .await?
-        .iter()
-        .map(|identities| identities.len() as u64)
-        .sum();
-        let projected = ClusterTelemetryProjection::from_delta(
-            &telemetry,
-            ClusterTelemetryExpectation::complete(canonical_topology(self.definition.topology)),
-        )?;
-        let production = reconcile_production(
-            &projected,
-            &result,
-            audit_after.saturating_sub(audit_before),
-            published,
-        )?;
-        Ok((result, production, telemetry))
-    }
-
-    /// Borrow one running pod by stable order index before shutdown.
-    ///
-    /// The `cluster` field is private and [`Self::shutdown`] consumes it, so the
-    /// capacity entrypoints use this accessor to read the server inspection
-    /// snapshot immediately before shutting the session down. Returns `None`
-    /// when the session was already shut down or the index is out of range.
-    #[must_use]
-    pub(crate) fn server(&self, index: usize) -> Option<&WyrdTestServer> {
-        self.cluster
-            .as_ref()
-            .and_then(|cluster| cluster.server(index))
-    }
-
-    /// Shut the live cluster down exactly once and require complete cleanup.
-    ///
-    /// # Errors
-    /// Returns a lifecycle error for repeated shutdown or retained listeners,
-    /// queues, claims, attempts, or supervised tasks.
-    pub async fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let cluster = self
-            .cluster
-            .take()
-            .ok_or("capacity session already shut down")?;
-        let cleanup = cluster.shutdown_and_inspect().await?;
-        if !cleanup.listeners_stopped
-            || !cleanup.servers_stopped
-            || cleanup.scribe_queued != 0
-            || cleanup.scribe_inflight != 0
-            || cleanup.scribe_wal_streams != 0
-            || cleanup.forge_active_claims != 0
-            || cleanup.forge_active_attempts != 0
-            || cleanup.supervised_tasks != 0
-        {
-            return Err(format!("capacity session retained resources: {cleanup:?}").into());
-        }
-        Ok(())
+/// Extend a per-tenant identity ledger from acknowledged write ordinals.
+fn extend_identity_ledger(ledger: &mut [BTreeSet<u64>], acknowledged_ordinals: &[BTreeSet<u64>]) {
+    for (tenant, ordinals) in acknowledged_ordinals.iter().enumerate() {
+        ledger[tenant].extend(stage_row_identity(tenant, ordinals).row_ids);
     }
 }
 
 /// Compare an observed public-Oracle union with the acknowledged identity ledger.
+#[cfg(test)]
 #[must_use]
 fn exact_identity_ledger_matches(expected: &[BTreeSet<u64>], observed: &[BTreeSet<u64>]) -> bool {
     expected == observed
 }
 
-/// Build the exact one-warmup plus sixteen-stage capacity allocation.
-#[must_use]
-pub fn capacity_table_names() -> Vec<String> {
-    std::iter::once(CAPACITY_WARMUP_TABLE.to_owned())
-        .chain(
-            (0..CAPACITY_STAGE_TABLE_COUNT).map(|slot| format!("cluster_capacity_stage_{slot:02}")),
-        )
-        .collect()
-}
-
-/// Build dedicated qualification warmup/measurement table pairs in closed
-/// rate-major, trial-minor order.
-#[must_use]
-fn qualification_table_names(rate_count: usize) -> Vec<String> {
-    (0..rate_count * 3)
-        .flat_map(|pair| {
-            [
-                format!("cluster_qualification_{pair:02}_warmup"),
-                format!("cluster_qualification_{pair:02}_measurement"),
-            ]
-        })
-        .collect()
-}
-
-/// Execute one fresh-cluster trial with caller-selected calibration/reference windows.
-async fn run_trial_with_windows(
-    spec: ReferenceTrialSpec,
-) -> Result<
+/// Execute the canonical three-server, eight-tenant production-telemetry trial.
+///
+/// This is the journey-owned reproduction of the retired reference-trial path,
+/// specialized to the fixed `balanced-three-server-three-worker-eight-tenants`
+/// scenario. It boots a fresh three-server/three-forge-worker cluster, drives
+/// the retained open-loop [`WindowRun`] warmup and measured windows through the
+/// public SDK/Gate path, projects the canonical T17 sampled delta, reconciles it
+/// into [`ProductionTelemetryEvidence`], and requires complete terminal cleanup
+/// before returning. It exists solely so the
+/// `three_server_cluster_reconciles_production_telemetry` journey retains its
+/// exact production-telemetry assertions after the balanced reference-scenario
+/// matrix and its runner machinery were deleted in T30; the inline
+/// [`ReferenceScenarioDefinition`] here is that type's only remaining consumer.
+///
+/// # Errors
+/// Returns a typed environment, cluster, public-client, protocol, telemetry,
+/// correctness, audit, or cleanup failure. Partial trials are never returned;
+/// any cluster resource retained after shutdown is a hard error.
+pub async fn three_server_reference_trial() -> Result<
     (ClusterBenchmarkScenario, ClusterBenchmarkTrial),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let cluster_spec = match spec.definition.topology {
-        ClusterTopology::OnePod => BifrostClusterSpec::one_mixed(),
-        ClusterTopology::ThreeServersThreeForgeWorkers => {
-            BifrostClusterSpec::three_servers_three_forge_workers()
-        }
+    let definition = ReferenceScenarioDefinition {
+        id: "balanced-three-server-three-worker-eight-tenants",
+        topology: ClusterTopology::ThreeServersThreeForgeWorkers,
+        tenants: 8,
+        traffic: TrafficMix::Balanced,
+        write_percent: 50,
+        read_percent: 50,
     };
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(cluster_spec).await?;
-    let result = run_live_trial(&cluster, &spec).await;
+    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+        BifrostClusterSpec::three_servers_three_forge_workers(),
+    )
+    .await?;
+    let result = run_three_server_live_trial(&cluster, definition).await;
     let shutdown = cluster.shutdown_and_inspect().await;
     match (result, shutdown) {
-        (Ok((scenario, mut result)), Ok(cleanup)) => {
-            result.production.cleanup = if cleanup.listeners_stopped
+        (Ok((scenario, mut trial)), Ok(cleanup)) => {
+            trial.production.cleanup = if cleanup.listeners_stopped
                 && cleanup.servers_stopped
                 && cleanup.scribe_queued == 0
                 && cleanup.scribe_inflight == 0
@@ -1875,13 +196,13 @@ async fn run_trial_with_windows(
             } else {
                 EvidenceStatus::Failed
             };
-            if result.production.cleanup != EvidenceStatus::Complete {
+            if trial.production.cleanup != EvidenceStatus::Complete {
                 return Err(format!(
                     "reference trial retained cluster resources after shutdown: {cleanup:?}"
                 )
                 .into());
             }
-            Ok((scenario, result))
+            Ok((scenario, trial))
         }
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(error)) => Err(Box::new(error)),
@@ -1889,29 +210,44 @@ async fn run_trial_with_windows(
     }
 }
 
-/// Execute setup, warmup, measurement, fixed flushes, and reconciliation while
-/// the outer owner retains deterministic shutdown responsibility.
-async fn run_live_trial(
+/// Drive setup, warmup, one sampled measured window, and reconciliation while the
+/// caller retains deterministic shutdown responsibility.
+///
+/// Specialized to the fixed three-server reference scenario: an offered rate of
+/// twenty requests per second across a ten-second
+/// warmup and a twenty-second measured window bounded by the default in-flight
+/// cap. It preserves the exact post-warmup publication equality, wrong-tenant
+/// isolation probe, sampled measured window, cumulative identity ledger, and
+/// [`reconcile_production`] evidence assembly that the journey asserts.
+///
+/// # Errors
+/// Returns a provisioning, public-workload, telemetry-projection, correctness,
+/// audit, or reconciliation error. Cleanup evidence is finalized by the caller
+/// after shutdown.
+async fn run_three_server_live_trial(
     cluster: &WyrdTestCluster,
-    spec: &ReferenceTrialSpec,
+    definition: ReferenceScenarioDefinition,
 ) -> Result<
     (ClusterBenchmarkScenario, ClusterBenchmarkTrial),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let definition = spec.definition;
+    let rate = 20;
+    let warmup = Duration::from_secs(10);
+    let measured_window = Duration::from_secs(20);
+    let max_in_flight = DEFAULT_MAX_IN_FLIGHT;
     let tenants = provision_reference_tenants(cluster, definition.tenants as usize).await?;
     provision_reference_tables(cluster, &tenants).await?;
     let clients = reference_clients(cluster, &tenants).await?;
     preload_reference_rows(cluster, &tenants, &clients).await?;
-    let warmup = WindowRun {
+    let warmup_result = WindowRun {
         cluster,
         tenants: &tenants,
         clients: &clients,
         definition,
-        rate: spec.rate,
-        duration: spec.warmup,
+        rate,
+        duration: warmup,
         measured: false,
-        max_in_flight: spec.max_in_flight,
+        max_in_flight,
         table: REFERENCE_TABLE,
         phase_ordinal_base: 1_000_000,
     }
@@ -1920,7 +256,10 @@ async fn run_live_trial(
     flush_tenant_writers(cluster, &tenants).await?;
     await_forge_convergence(cluster, &tenants).await?;
     let mut expected_rows_by_tenant = preload_identity_ledger(tenants.len());
-    extend_identity_ledger(&mut expected_rows_by_tenant, &warmup.tenant_write_ordinals);
+    extend_identity_ledger(
+        &mut expected_rows_by_tenant,
+        &warmup_result.tenant_write_ordinals,
+    );
     let published_before_identities = final_published_identities(
         cluster,
         &tenants,
@@ -1952,10 +291,10 @@ async fn run_live_trial(
                 tenants: &tenants,
                 clients: &clients,
                 definition,
-                rate: spec.rate,
-                duration: spec.measured,
+                rate,
+                duration: measured_window,
                 measured: true,
-                max_in_flight: spec.max_in_flight,
+                max_in_flight,
                 table: REFERENCE_TABLE,
                 phase_ordinal_base: 2_000_000,
             }
@@ -2004,40 +343,22 @@ async fn run_live_trial(
         traffic: definition.traffic,
         rows_per_batch: ROWS_PER_WRITE,
         query_row_limit: 64,
-        offered_requests_per_second: spec.rate,
-        warmup_seconds: spec.warmup.as_secs().try_into()?,
-        measured_seconds: spec.measured.as_secs().try_into()?,
+        offered_requests_per_second: rate,
+        warmup_seconds: warmup.as_secs().try_into()?,
+        measured_seconds: measured_window.as_secs().try_into()?,
         trials: 3,
         minimum_samples: 200,
-        max_in_flight: spec.max_in_flight,
+        max_in_flight,
         seed: 0xB1_F057,
     };
     Ok((
         scenario,
         ClusterBenchmarkTrial {
-            trial: spec.trial,
+            trial: 1,
             client: measured.metrics(),
             production,
         },
     ))
-}
-
-/// Build the exact deterministic preload ledger for every tenant.
-#[must_use]
-fn preload_identity_ledger(tenant_count: usize) -> Vec<BTreeSet<u64>> {
-    (0..tenant_count)
-        .map(|tenant| {
-            let start = tenant_row_base(tenant);
-            (start..start + PRELOAD_ROWS).collect()
-        })
-        .collect()
-}
-
-/// Extend a per-tenant identity ledger from acknowledged write ordinals.
-fn extend_identity_ledger(ledger: &mut [BTreeSet<u64>], acknowledged_ordinals: &[BTreeSet<u64>]) {
-    for (tenant, ordinals) in acknowledged_ordinals.iter().enumerate() {
-        ledger[tenant].extend(stage_row_identity(tenant, ordinals).row_ids);
-    }
 }
 
 /// Client-side ledger accumulated by one open-loop window.
@@ -2089,18 +410,6 @@ pub struct WindowResult {
     measured_seconds: u64,
 }
 
-/// Live stage result retained until report evidence is reconciled.
-struct CapacityStageRun {
-    /// Complete client scheduler ledger.
-    client: WindowResult,
-    /// Production telemetry delta for only this stage.
-    telemetry: crate::bifrost::telemetry::BifrostTelemetryDelta,
-    /// Exact rows visible through public Oracle for this stage table.
-    published_rows: u64,
-    /// Durable audit rows committed during this stage.
-    audit_rows: u64,
-}
-
 impl WindowResult {
     /// Merge one measured flush cadence result into the existing client ledger.
     fn merge_flush_result(&mut self, flush_result: (Vec<u64>, u64, u64, u64)) {
@@ -2144,12 +453,16 @@ impl WindowResult {
 }
 
 /// Reused tenant-bound public SDK handles for one fresh trial.
+///
+/// Exposed at crate scope so the fixture-driven family runners can offer public
+/// writes and strict queries through the same tenant-bound identity the journey
+/// uses, without reconstructing SDK clients.
 #[derive(Clone)]
-struct ReferenceClient {
+pub(crate) struct ReferenceClient {
     /// Public gRPC Gate writer sharing the tenant-bound client identity.
-    writer: BifrostGrpcTransport,
+    pub(crate) writer: BifrostGrpcTransport,
     /// Public HTTP Oracle query handle sharing the tenant-bound client identity.
-    query: QueryClient,
+    pub(crate) query: QueryClient,
 }
 
 /// One finished scheduled public operation.
@@ -2614,7 +927,7 @@ impl WindowRun<'_> {
 }
 
 /// Create the isolated tenant roster for one fresh trial.
-async fn provision_reference_tenants(
+pub(crate) async fn provision_reference_tenants(
     cluster: &WyrdTestCluster,
     count: usize,
 ) -> Result<Vec<DataTenantId>, Box<dyn std::error::Error + Send + Sync>> {
@@ -2642,7 +955,7 @@ async fn provision_reference_tables(
 /// # Errors
 /// Returns a missing-catalog or catalog create error. No caller invokes this
 /// after warmup begins.
-async fn provision_named_tables(
+pub(crate) async fn provision_named_tables(
     cluster: &WyrdTestCluster,
     tenants: &[DataTenantId],
     tables: &[String],
@@ -2670,7 +983,7 @@ async fn provision_named_tables(
 }
 
 /// Build normal tenant-bound public writer and query clients.
-async fn reference_clients(
+pub(crate) async fn reference_clients(
     cluster: &WyrdTestCluster,
     tenants: &[DataTenantId],
 ) -> Result<Vec<ReferenceClient>, Box<dyn std::error::Error + Send + Sync>> {
@@ -2715,7 +1028,7 @@ async fn reference_clients(
 }
 
 /// Preload exactly 8,192 rows per tenant through Gate and publish them.
-async fn preload_reference_rows(
+pub(crate) async fn preload_reference_rows(
     cluster: &WyrdTestCluster,
     tenants: &[DataTenantId],
     clients: &[ReferenceClient],
@@ -2752,7 +1065,7 @@ async fn preload_reference_rows(
 ///
 /// # Errors
 /// Returns an error when an owning Server is absent or its Scribe flush fails.
-async fn flush_tenant_writers(
+pub(crate) async fn flush_tenant_writers(
     cluster: &WyrdTestCluster,
     tenants: &[DataTenantId],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2861,7 +1174,7 @@ async fn audit_rows(
 }
 
 /// Wait for every measured Forge task to reach durable completion.
-async fn await_forge_convergence(
+pub(crate) async fn await_forge_convergence(
     cluster: &WyrdTestCluster,
     tenants: &[DataTenantId],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -3115,7 +1428,7 @@ fn reconcile_production(
 }
 
 /// Encode one exact controlled 64-row Arrow request.
-fn reference_payload(
+pub(crate) fn reference_payload(
     first_row: u64,
     rows: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
@@ -3144,12 +1457,12 @@ fn reference_payload(
 
 /// Return the start of one tenant's deterministic disjoint row-id range.
 #[must_use]
-fn tenant_row_base(tenant_index: usize) -> u64 {
+pub(crate) fn tenant_row_base(tenant_index: usize) -> u64 {
     (tenant_index as u64).saturating_mul(TENANT_ROW_STRIDE)
 }
 
 /// Build a stable UUIDv7-shaped batch identity from seed, tenant, and ordinal.
-fn deterministic_batch_id(tenant_index: usize, ordinal: u64) -> [u8; 16] {
+pub(crate) fn deterministic_batch_id(tenant_index: usize, ordinal: u64) -> [u8; 16] {
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&(0xB1_F057_u64 ^ ordinal).to_be_bytes());
     bytes[8..].copy_from_slice(&(tenant_index as u64 ^ ordinal.rotate_left(17)).to_be_bytes());
@@ -3192,7 +1505,7 @@ fn elapsed_us(planned: tokio::time::Instant) -> u64 {
 }
 
 /// Classify only explicit stable admission/backpressure responses.
-fn is_backpressure(error: &str) -> bool {
+pub(crate) fn is_backpressure(error: &str) -> bool {
     error.contains("backpressure")
         || error.contains("busy")
         || error.contains("admission rejected")
@@ -3200,7 +1513,7 @@ fn is_backpressure(error: &str) -> bool {
 }
 
 /// Classify only bounded transient publication/admission responses.
-fn is_retryable(error: &str) -> bool {
+pub(crate) fn is_retryable(error: &str) -> bool {
     [
         "temporarily unavailable",
         "not published",
@@ -3211,841 +1524,9 @@ fn is_retryable(error: &str) -> bool {
     .any(|value| error.contains(value))
 }
 
-/// Run the shortened real public-cluster smoke without claiming wall-clock SLOs.
-///
-/// # Errors
-/// Returns a cluster error when the real public Gate adapter fails its
-/// correctness, telemetry, tenant-isolation, audit, or cleanup assertions.
-pub async fn run_smoke() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let recorder = install_or_existing_recorder();
-    let definition = reference_scenario_matrix()[2];
-    let path = report_path("cluster-smoke.json");
-    let environment = detect_reference_environment_or_write(&path)?;
-    let mut session =
-        CapacityScenarioSession::start(definition, PathBuf::from(&environment.storage_root))
-            .await?;
-    session.stages = CapacityStateMachine::for_rates(wyrd_bench::SMOKE_CAPACITY_RATES.to_vec());
-    let mut attempted_probes = Vec::new();
-    let result = async {
-        let mut stages = Vec::new();
-        while let Some(plan) = session.next_stage() {
-            begin_probe(
-                &mut attempted_probes,
-                definition.id.to_owned(),
-                plan.offered_requests_per_second,
-            );
-            let run = tokio::time::timeout(
-                Duration::from_secs(20),
-                session.run_stage(plan, Duration::from_secs(10)),
-            )
-            .await
-            .map_err(|_| "smoke stage exceeded 20 seconds")??;
-            let stage = assemble_capacity_stage(definition, plan, run, 10);
-            session.record_stage(plan, capacity_stage_outcome(&stage))?;
-            complete_current_probe(&mut attempted_probes, &stage.stop_reasons);
-            stages.push(stage);
-        }
-        session.reconcile_cumulative().await?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(stages)
-    }
-    .await;
-    // Capture the server inspection snapshot before shutdown consumes the
-    // cluster; the recorder snapshot is read later at report-write time.
-    let scribe_snapshot = session
-        .server(0)
-        .and_then(|server| server.scribe_inspection_snapshot().ok());
-    let shutdown = session.shutdown().await;
-    let stages = match result {
-        Ok(stages) => stages,
-        Err(error) => {
-            let cleanup_error = shutdown.err().map(|cleanup| cleanup.to_string());
-            let combined = cleanup_error.as_ref().map_or_else(
-                || error.to_string(),
-                |cleanup| format!("{error}; cleanup failed: {cleanup}"),
-            );
-            let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
-            write_partial_capture(
-                &path,
-                &environment,
-                &combined,
-                attempted_probes,
-                Vec::new(),
-                &capture,
-            )?;
-            return Err(error);
-        }
-    };
-    shutdown?;
-    let capture = CapacityTelemetryCapture::assemble(&recorder, scribe_snapshot.as_ref());
-    write_capacity_artifact(
-        &path,
-        &serde_json::json!({
-            "evidence_class": "shortened-non-slo-smoke",
-            "schema_version": CLUSTER_REPORT_VERSION,
-            "scenario_id": definition.id,
-            "stages": stages,
-        }),
-        &capture,
-    )?;
-    Ok(path)
-}
-
-/// Detect the reference environment and persist the existing unsupported diagnostic on failure.
-///
-/// # Errors
-/// Returns the original environment error after the diagnostic is written, or the diagnostic
-/// write error when the artifact cannot be persisted.
-fn detect_reference_environment_or_write(
-    report_path: &Path,
-) -> Result<BenchmarkEnvironment, Box<dyn std::error::Error + Send + Sync>> {
-    match detect_reference_environment() {
-        Ok(environment) => Ok(environment),
-        Err(error) => {
-            write_unavailable_capture(report_path, &error.to_string())?;
-            Err(Box::new(error))
-        }
-    }
-}
-
-/// Detect the complete controlled environment from host and wrapper evidence.
-///
-/// # Errors
-/// Returns `Unsupported` when CPU, memory, toolchain, lock, container, database,
-/// storage, Git, OS, or timestamp identity is absent or unclassifiable.
-pub fn detect_reference_environment() -> Result<BenchmarkEnvironment, ClusterBenchmarkError> {
-    validate_open_file_limit(&command_output("sh", &["-c", "ulimit -n"])?)?;
-    let os = std::env::consts::OS.to_owned();
-    let (cpu_vendor, cpu_model) = match os.as_str() {
-        "linux" => {
-            let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").map_err(|error| {
-                ClusterBenchmarkError::Unsupported(format!("cannot read /proc/cpuinfo: {error}"))
-            })?;
-            extract_linux_cpu_identity(&cpuinfo)?
-        }
-        "macos" => extract_macos_cpu_identity(&command_output(
-            "sysctl",
-            &["-n", "machdep.cpu.brand_string"],
-        )?)?,
-        other => {
-            return Err(ClusterBenchmarkError::Unsupported(format!(
-                "unsupported reference OS `{other}`"
-            )));
-        }
-    };
-    let logical_cores = std::thread::available_parallelism()
-        .map_err(|error| ClusterBenchmarkError::Unsupported(error.to_string()))?
-        .get()
-        .try_into()
-        .map_err(|_| ClusterBenchmarkError::Unsupported("logical core overflow".to_owned()))?;
-    let host_memory_bytes = match os.as_str() {
-        "macos" => command_output("sysctl", &["-n", "hw.memsize"])?,
-        "linux" => {
-            let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|error| {
-                ClusterBenchmarkError::Unsupported(format!("cannot read /proc/meminfo: {error}"))
-            })?;
-            let kib = meminfo
-                .lines()
-                .find_map(|line| line.strip_prefix("MemTotal:"))
-                .and_then(|value| value.split_ascii_whitespace().next())
-                .ok_or_else(|| {
-                    ClusterBenchmarkError::Unsupported("Linux MemTotal is absent".to_owned())
-                })?;
-            (kib.parse::<u64>().map_err(|error| {
-                ClusterBenchmarkError::Unsupported(format!("invalid Linux MemTotal: {error}"))
-            })? * 1024)
-                .to_string()
-        }
-        _ => unreachable!("OS was validated above"),
-    }
-    .parse::<u64>()
-    .map_err(|error| ClusterBenchmarkError::Unsupported(format!("invalid host memory: {error}")))?;
-    let container_cpu_nanos = required_environment_u64("WYRD_BENCH_CONTAINER_CPU_NANOS")?;
-    let container_cpu_millis = (container_cpu_nanos / 1_000_000)
-        .try_into()
-        .map_err(|_| ClusterBenchmarkError::Unsupported("container CPU overflow".to_owned()))?;
-    let container_memory_bytes = required_environment_u64("WYRD_BENCH_CONTAINER_MEMORY_BYTES")?;
-    let rust = command_output("rustc", &["--version"])?;
-    let rust_major_minor = rust
-        .split_ascii_whitespace()
-        .nth(1)
-        .and_then(|version| version.rsplit_once('.').map(|(major_minor, _)| major_minor))
-        .ok_or_else(|| {
-            ClusterBenchmarkError::Unsupported("rustc version is unclassifiable".to_owned())
-        })?
-        .to_owned();
-    let lock = include_str!("../../../../../Cargo.lock");
-    let storage_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("target/bifrost-benchmarks/storage");
-    std::fs::create_dir_all(&storage_root).map_err(|error| {
-        ClusterBenchmarkError::Unsupported(format!(
-            "cannot create dedicated benchmark storage root: {error}"
-        ))
-    })?;
-    let storage_root = storage_root.canonicalize().map_err(|error| {
-        ClusterBenchmarkError::Unsupported(format!(
-            "cannot inspect dedicated benchmark storage root: {error}"
-        ))
-    })?;
-    let storage_device_class = if os == "macos" {
-        command_output(
-            "stat",
-            &["-f", "%T", storage_root.to_string_lossy().as_ref()],
-        )?
-    } else {
-        command_output(
-            "stat",
-            &["-f", "-c", "%T", storage_root.to_string_lossy().as_ref()],
-        )?
-    };
-    let storage_root = storage_root.to_string_lossy().into_owned();
-    let environment = BenchmarkEnvironment {
-        architecture: std::env::consts::ARCH.to_owned(),
-        cpu_vendor,
-        cpu_model,
-        logical_cores,
-        host_memory_bytes,
-        container_cpu_millis,
-        container_memory_bytes,
-        postgres_image: "postgres:16".to_owned(),
-        postgres_version: postgres_version()?,
-        postgres_config: "wyrd-reference-v1:tmpfs:2cpu:4gib".to_owned(),
-        storage_image: "local-filesystem".to_owned(),
-        storage_version: env!("CARGO_PKG_VERSION").to_owned(),
-        storage_config: format!("local-filesystem:{storage_root}:dedicated-root"),
-        storage_backend_kind: "local-filesystem".to_owned(),
-        storage_root,
-        storage_device_class,
-        rust_major_minor,
-        arrow_version: lock_version(lock, "arrow")?,
-        datafusion_version: lock_version(lock, "datafusion")?,
-        iceberg_version: lock_source_revision(lock, "iceberg")?,
-        os,
-        kernel: command_output("uname", &["-srv"])?,
-        git_sha: command_output("git", &["rev-parse", "HEAD"])?,
-        dirty_worktree: !command_output("git", &["status", "--porcelain"])?.is_empty(),
-        captured_at: chrono::Utc::now().to_rfc3339(),
-    };
-    environment.validate()?;
-    Ok(environment)
-}
-
-/// Parse and validate the process soft open-file limit before cluster construction.
-///
-/// # Errors
-/// Returns `Unsupported` when the value is unreadable or below the benchmark minimum.
-fn validate_open_file_limit(rendered: &str) -> Result<u64, ClusterBenchmarkError> {
-    let limit = rendered.parse::<u64>().map_err(|error| {
-        ClusterBenchmarkError::Unsupported(format!("cannot parse process open-file limit: {error}"))
-    })?;
-    if limit < MINIMUM_OPEN_FILE_LIMIT {
-        return Err(ClusterBenchmarkError::Unsupported(format!(
-            "process open-file limit {limit} is below benchmark minimum {MINIMUM_OPEN_FILE_LIMIT}"
-        )));
-    }
-    Ok(limit)
-}
-
-/// Resolve a default or caller-selected target report path.
-fn report_path(file_name: &str) -> PathBuf {
-    let repository = repository_root();
-    std::env::var_os("WYRD_BIFROST_REPORT").map_or_else(
-        || repository.join("target/bifrost-benchmarks").join(file_name),
-        |configured| {
-            let configured = PathBuf::from(configured);
-            if configured.is_absolute() {
-                configured
-            } else {
-                repository.join(configured)
-            }
-        },
-    )
-}
-
-/// Return the repository root resolved from the owning crate manifest.
-fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
-}
-
-/// Load the explicitly reviewed qualification profile and verify its source digest when present.
-///
-/// # Errors
-/// Returns `Unsupported` when the checked-in profile is absent, malformed,
-/// incompatible with the live environment, or no longer matches the retained
-/// canonical capacity artifact.
-fn load_reviewed_qualification_profile(
-    environment: &BenchmarkEnvironment,
-) -> Result<QualificationProfileV2, Box<dyn std::error::Error + Send + Sync>> {
-    let profile_path = repository_root().join("benches/bifrost/qualification-profile-v2.json");
-    let capacity_path = repository_root().join("target/bifrost-benchmarks/cluster-capacity.json");
-    load_reviewed_qualification_profile_from_paths(environment, &profile_path, &capacity_path)
-}
-
-/// Load reviewed rates from explicit paths for deterministic source-binding tests.
-///
-/// # Errors
-/// Returns the same profile, environment, digest, report, and membership
-/// failures as [`load_reviewed_qualification_profile`].
-fn load_reviewed_qualification_profile_from_paths(
-    environment: &BenchmarkEnvironment,
-    profile_path: &Path,
-    capacity_path: &Path,
-) -> Result<QualificationProfileV2, Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = std::fs::read(profile_path).map_err(|error| {
-        ClusterBenchmarkError::Unsupported(format!(
-            "reviewed qualification profile {} is unavailable: {error}",
-            profile_path.display()
-        ))
-    })?;
-    let profile: QualificationProfileV2 = serde_json::from_slice(&bytes)?;
-    profile.validate()?;
-    if !profile.environment.compatible_with(environment) {
-        return Err(Box::new(ClusterBenchmarkError::Incompatible(
-            "reviewed qualification profile environment is incompatible with this capture"
-                .to_owned(),
-        )));
-    }
-    if capacity_path.exists() {
-        let capacity_bytes = std::fs::read(capacity_path)?;
-        if sha256_bytes(&capacity_bytes)? != profile.source_capacity.artifact_sha256 {
-            return Err(Box::new(ClusterBenchmarkError::Incompatible(
-                "reviewed qualification profile source digest does not match canonical capacity"
-                    .to_owned(),
-            )));
-        }
-        let capacity_report: BifrostReferenceProfile = serde_json::from_slice(&capacity_bytes)?;
-        profile.validate_capacity_source(&capacity_report)?;
-    }
-    Ok(profile)
-}
-
-/// Generate a non-authoritative candidate beside benchmark captures.
-///
-/// # Errors
-/// Returns the deterministic selection, serialization, digest, or IO error.
-fn write_qualification_profile_candidate(
-    capacity_path: &Path,
-    report: &BifrostReferenceProfile,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let candidate =
-        QualificationProfileV2::from_capacity_report(report, sha256_file(capacity_path)?)?;
-    let candidate_path =
-        repository_root().join("target/bifrost-benchmarks/qualification-profile-v2.candidate.json");
-    if let Some(parent) = candidate_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        candidate_path,
-        format!("{}\n", serde_json::to_string_pretty(&candidate)?),
-    )?;
-    Ok(())
-}
-
-/// Compute the lowercase SHA-256 emitted by the host's standard digest tool.
-///
-/// # Errors
-/// Returns `Unsupported` when neither supported digest command succeeds or
-/// when its output is not a lowercase 64-character SHA-256.
-fn sha256_file(path: &Path) -> Result<String, ClusterBenchmarkError> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        ClusterBenchmarkError::Unsupported(format!(
-            "cannot read capacity artifact {}: {error}",
-            path.display()
-        ))
-    })?;
-    sha256_bytes(&bytes)
-}
-
-/// Compute lowercase SHA-256 over exact already-read artifact bytes.
-///
-/// # Errors
-/// Returns `Unsupported` when the host digest command cannot be started,
-/// cannot consume the complete byte slice, fails, or emits an invalid digest.
-fn sha256_bytes(bytes: &[u8]) -> Result<String, ClusterBenchmarkError> {
-    let mut child = Command::new("shasum")
-        .args(["-a", "256"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .or_else(|_| {
-            Command::new("sha256sum")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-        })
-        .map_err(|error| {
-            ClusterBenchmarkError::Unsupported(format!(
-                "cannot start a SHA-256 digest command: {error}"
-            ))
-        })?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| {
-            ClusterBenchmarkError::Unsupported(
-                "SHA-256 digest command has no writable stdin".to_owned(),
-            )
-        })?
-        .write_all(bytes)
-        .map_err(|error| {
-            ClusterBenchmarkError::Unsupported(format!(
-                "cannot write capacity bytes to SHA-256 command: {error}"
-            ))
-        })?;
-    let result = child.wait_with_output().map_err(|error| {
-        ClusterBenchmarkError::Unsupported(format!(
-            "cannot collect SHA-256 digest command: {error}"
-        ))
-    })?;
-    if !result.status.success() {
-        return Err(ClusterBenchmarkError::Unsupported(format!(
-            "SHA-256 digest command exited with {}",
-            result.status
-        )));
-    }
-    let output = String::from_utf8(result.stdout).map_err(|error| {
-        ClusterBenchmarkError::Unsupported(format!("SHA-256 digest output is not UTF-8: {error}"))
-    })?;
-    let digest = output.split_whitespace().next().unwrap_or_default();
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(ClusterBenchmarkError::Unsupported(
-            "capacity digest command did not emit lowercase SHA-256".to_owned(),
-        ));
-    }
-    Ok(digest.to_owned())
-}
-
-/// Execute one local command and return trimmed UTF-8 output.
-fn command_output(program: &str, arguments: &[&str]) -> Result<String, ClusterBenchmarkError> {
-    let output = Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|error| {
-            ClusterBenchmarkError::Unsupported(format!("cannot execute {program}: {error}"))
-        })?;
-    if !output.status.success() {
-        return Err(ClusterBenchmarkError::Unsupported(format!(
-            "{program} exited with {}",
-            output.status
-        )));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_owned())
-        .map_err(|error| ClusterBenchmarkError::Unsupported(format!("invalid UTF-8: {error}")))
-}
-
-/// Read one mandatory positive integer from the reference wrapper.
-fn required_environment_u64(name: &str) -> Result<u64, ClusterBenchmarkError> {
-    let value = std::env::var(name).map_err(|_| {
-        ClusterBenchmarkError::Unsupported(format!("required environment {name} is absent"))
-    })?;
-    value
-        .parse::<u64>()
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            ClusterBenchmarkError::Unsupported(format!("required environment {name} is invalid"))
-        })
-}
-
-/// Query the exact server version through the wrapper-owned benchmark DSN.
-fn postgres_version() -> Result<String, ClusterBenchmarkError> {
-    let dsn = std::env::var("WYRD_BENCH_PG_URL").map_err(|_| {
-        ClusterBenchmarkError::Unsupported("WYRD_BENCH_PG_URL is absent".to_owned())
-    })?;
-    command_output("psql", &[&dsn, "-Atqc", "SHOW server_version"])
-}
-
-/// Extract one exact package version from the locked dependency graph.
-fn lock_version(lock: &str, package: &str) -> Result<String, ClusterBenchmarkError> {
-    lock.split("[[package]]")
-        .find(|entry| {
-            entry
-                .lines()
-                .any(|line| line == format!("name = \"{package}\""))
-        })
-        .and_then(|entry| {
-            entry.lines().find_map(|line| {
-                line.strip_prefix("version = \"")
-                    .and_then(|value| value.strip_suffix('"'))
-            })
-        })
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            ClusterBenchmarkError::Unsupported(format!("Cargo.lock has no {package} version"))
-        })
-}
-
-/// Extract one exact Git source revision from the locked dependency graph.
-fn lock_source_revision(lock: &str, package: &str) -> Result<String, ClusterBenchmarkError> {
-    lock.split("[[package]]")
-        .find(|entry| {
-            entry
-                .lines()
-                .any(|line| line == format!("name = \"{package}\""))
-        })
-        .and_then(|entry| {
-            entry.lines().find_map(|line| {
-                line.strip_prefix("source = \"")
-                    .and_then(|value| value.strip_suffix('"'))
-                    .and_then(|value| value.rsplit_once('#').map(|(_, revision)| revision))
-            })
-        })
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            ClusterBenchmarkError::Unsupported(format!(
-                "Cargo.lock has no Git revision for {package}"
-            ))
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The capacity capture keeps only T40 families and names the binding ceiling.
-    ///
-    /// Proves [`restrict_to_capacity_families`] drops an unrelated series while
-    /// retaining the ceiling-labelled rejection and memory-reservation families,
-    /// and that the retained rejection still drives
-    /// [`derive_binding_ceiling`] to name the binding ceiling.
-    #[test]
-    fn capacity_capture_restricts_to_t40_families() {
-        let mut snapshot = BenchmarkMetricSnapshot::default();
-        snapshot.counters.insert(
-            "bifrost_scribe_rejections_total{reason=\"scribe_child\"}".to_owned(),
-            4,
-        );
-        snapshot.gauges.insert(
-            "bifrost_memory_reserved_bytes{role=\"scribe\"}".to_owned(),
-            2048.0,
-        );
-        snapshot
-            .counters
-            .insert("bifrost_unrelated_requests_total".to_owned(), 9);
-
-        let capture = CapacityTelemetryCapture::from_snapshot(&snapshot, None);
-
-        assert!(
-            capture
-                .metrics
-                .contains_family("bifrost_scribe_rejections_total")
-        );
-        assert!(
-            capture
-                .metrics
-                .contains_family("bifrost_memory_reserved_bytes")
-        );
-        assert!(
-            !capture
-                .metrics
-                .contains_family("bifrost_unrelated_requests_total")
-        );
-        assert!(
-            !capture
-                .metrics
-                .counters
-                .contains_key("bifrost_unrelated_requests_total")
-        );
-        assert_eq!(
-            capture.binding_ceilings.get("scribe_child").copied(),
-            Some(4)
-        );
-        assert_eq!(capture.binding_ceiling.as_deref(), Some("scribe_child"));
-    }
-
-    /// Build a complete environment identity for diagnostic-assembly unit tests.
-    fn diagnostic_environment_fixture() -> BenchmarkEnvironment {
-        BenchmarkEnvironment {
-            architecture: "aarch64".to_owned(),
-            cpu_vendor: "apple".to_owned(),
-            cpu_model: "Apple M4".to_owned(),
-            logical_cores: 10,
-            host_memory_bytes: 16_000_000_000,
-            container_cpu_millis: 4_000,
-            container_memory_bytes: 4_000_000_000,
-            postgres_image: "postgres:16".to_owned(),
-            postgres_version: "16".to_owned(),
-            postgres_config: "reference".to_owned(),
-            storage_image: "local-filesystem".to_owned(),
-            storage_version: "1".to_owned(),
-            storage_config: "reference".to_owned(),
-            storage_backend_kind: "local-filesystem".to_owned(),
-            storage_root: "target/bifrost-benchmarks/storage".to_owned(),
-            storage_device_class: "apfs".to_owned(),
-            rust_major_minor: "1.90".to_owned(),
-            arrow_version: "1".to_owned(),
-            datafusion_version: "1".to_owned(),
-            iceberg_version: "1".to_owned(),
-            os: "macos".to_owned(),
-            kernel: "test".to_owned(),
-            git_sha: "deadbeef".to_owned(),
-            dirty_worktree: true,
-            captured_at: "2026-08-04T00:00:00Z".to_owned(),
-        }
-    }
-
-    /// Proves the public grammar requires one mode and one selector before
-    /// any cluster or database lifecycle starts.
-    #[test]
-    fn public_command_grammar_is_exact() {
-        let command = parse_cluster_benchmark_args([
-            "--mode",
-            "capacity",
-            "--scenario",
-            "balanced-one-pod-eight-tenants",
-        ])
-        .expect("canonical command parses");
-        assert_eq!(command.mode, ClusterBenchmarkMode::Capacity);
-        assert_eq!(
-            command.scenario.as_deref(),
-            Some("balanced-one-pod-eight-tenants")
-        );
-        let cargo_capacity = parse_cluster_benchmark_args([
-            "--mode",
-            "capacity",
-            "--scenario",
-            "balanced-one-pod-eight-tenants",
-            "--bench",
-        ])
-        .expect("Cargo capacity command parses");
-        assert_eq!(cargo_capacity, command);
-
-        let qualification = parse_cluster_benchmark_args(["--mode", "qualification", "--matrix"])
-            .expect("canonical qualification command parses");
-        let cargo_qualification =
-            parse_cluster_benchmark_args(["--mode", "qualification", "--matrix", "--bench"])
-                .expect("Cargo qualification command parses");
-        assert_eq!(cargo_qualification, qualification);
-
-        assert!(
-            parse_cluster_benchmark_args(["--mode", "capacity", "--matrix", "--bench", "--bench"])
-                .is_err()
-        );
-        assert!(parse_cluster_benchmark_args(["--mode", "capacity"]).is_err());
-        assert!(
-            parse_cluster_benchmark_args([
-                "--mode",
-                "capacity",
-                "--matrix",
-                "--scenario",
-                "balanced-one-pod-one-tenant"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_cluster_benchmark_args([
-                "--mode",
-                "qualification",
-                "--scenario",
-                "not-a-scenario"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_cluster_benchmark_args(["--mode", "qualification", "--matrix", "--unknown"])
-                .is_err()
-        );
-    }
-
-    /// Proves capacity boot owns one shared warmup table and sixteen unique
-    /// measurement slots without runtime provisioning.
-    #[test]
-    fn capacity_allocation_is_exact_and_deterministic() {
-        let tables = capacity_table_names();
-        assert_eq!(
-            tables.len(),
-            usize::try_from(CAPACITY_TABLES_PER_TENANT).unwrap()
-        );
-        assert_eq!(tables[0], CAPACITY_WARMUP_TABLE);
-        assert_eq!(tables[1], "cluster_capacity_stage_00");
-        assert_eq!(tables[13], "cluster_capacity_stage_12");
-        assert_eq!(tables.iter().collect::<BTreeSet<_>>().len(), tables.len());
-    }
-
-    /// Build six independently qualified scenario entries for routing tests.
-    fn qualification_profile_fixture() -> QualificationProfileV2 {
-        let environment = diagnostic_environment_fixture();
-        let reports = reference_scenario_matrix()
-            .into_iter()
-            .enumerate()
-            .map(|(index, definition)| {
-                let discovery = if index == 1 {
-                    vec![25, 50, 75]
-                } else {
-                    vec![25, 50, 75, 100, 200]
-                };
-                let recovery = *discovery.last().expect("fixture has discovery rates");
-                let mut stages = discovery
-                    .into_iter()
-                    .enumerate()
-                    .map(|(slot, rate)| {
-                        assemble_capacity_stage(
-                            definition,
-                            CapacityStagePlan {
-                                slot: u16::try_from(slot).expect("bounded fixture slot"),
-                                offered_requests_per_second: rate,
-                                kind: wyrd_bench::CapacityStageKind::Discovery,
-                            },
-                            completed_stage_fixture(0, true),
-                            20,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                stages.push(assemble_capacity_stage(
-                    definition,
-                    CapacityStagePlan {
-                        slot: u16::try_from(stages.len()).expect("bounded fixture slot"),
-                        offered_requests_per_second: recovery,
-                        kind: wyrd_bench::CapacityStageKind::Recovery,
-                    },
-                    completed_stage_fixture(0, true),
-                    20,
-                ));
-                capacity_scenario_report(definition, stages)
-            })
-            .collect();
-        let report = BifrostReferenceProfile {
-            schema_version: CLUSTER_REPORT_VERSION.to_owned(),
-            environment: environment.clone(),
-            scenarios: reviewed_scenario_profiles(
-                reports,
-                &environment_storage_identity(&environment),
-            ),
-            slos: BifrostSloEnvelope::default(),
-        };
-        QualificationProfileV2::from_capacity_report(&report, "a".repeat(64))
-            .expect("six-scenario fixture qualifies")
-    }
-
-    /// Proves all matrix routes validate before a startup loop can begin.
-    #[test]
-    fn qualification_preflight_rejects_final_workload_before_any_start() {
-        let mut profile = qualification_profile_fixture();
-        profile
-            .scenarios
-            .last_mut()
-            .expect("sixth scenario exists")
-            .qualification_workload
-            .query_row_limit = 65;
-        let mut starts = 0_u8;
-        match qualification_execution_plan(&profile, None, true) {
-            Ok(plan) => {
-                for _ in plan {
-                    starts = starts.saturating_add(1);
-                }
-                panic!("malformed final workload must fail preflight");
-            }
-            Err(ClusterBenchmarkError::Incompatible(_)) => {}
-            Err(error) => panic!("unexpected preflight error: {error}"),
-        }
-        assert_eq!(starts, 0);
-    }
-
-    /// Proves production preflight preserves distinct scenario-owned rates.
-    #[test]
-    fn qualification_preflight_routes_distinct_local_rates() {
-        let profile = qualification_profile_fixture();
-        let plan =
-            qualification_execution_plan(&profile, None, true).expect("complete matrix preflights");
-        assert_eq!(plan.len(), 6);
-        assert_eq!(plan[0].rates, vec![25, 100, 200]);
-        assert_eq!(plan[1].rates, vec![25, 50, 75]);
-        assert_eq!(plan[0].definition.id, "balanced-one-pod-one-tenant");
-        assert_eq!(plan[1].definition.id, "balanced-one-pod-eight-tenants");
-    }
-
-    /// Proves an existing digest-matched source is deserialized and every
-    /// reviewed rate is checked against retained stage membership.
-    #[test]
-    fn reviewed_rate_loader_enforces_capacity_source_membership() {
-        let environment = diagnostic_environment_fixture();
-        let definition = reference_scenario_matrix()[0];
-        let mut stages = [25, 50, 75, 100, 200]
-            .into_iter()
-            .enumerate()
-            .map(|(slot, rate)| {
-                assemble_capacity_stage(
-                    definition,
-                    CapacityStagePlan {
-                        slot: u16::try_from(slot).expect("bounded fixture slot"),
-                        offered_requests_per_second: rate,
-                        kind: wyrd_bench::CapacityStageKind::Discovery,
-                    },
-                    completed_stage_fixture(0, true),
-                    20,
-                )
-            })
-            .collect::<Vec<_>>();
-        stages.push(assemble_capacity_stage(
-            definition,
-            CapacityStagePlan {
-                slot: 5,
-                offered_requests_per_second: 200,
-                kind: wyrd_bench::CapacityStageKind::Recovery,
-            },
-            completed_stage_fixture(0, true),
-            20,
-        ));
-        let capacity_report = BifrostReferenceProfile {
-            schema_version: CLUSTER_REPORT_VERSION.to_owned(),
-            environment: environment.clone(),
-            scenarios: reviewed_scenario_profiles(
-                vec![capacity_scenario_report(definition, stages.clone())],
-                &environment_storage_identity(&environment),
-            ),
-            slos: BifrostSloEnvelope::default(),
-        };
-        let capacity_bytes = serde_json::to_vec(&capacity_report).expect("capacity fixture JSON");
-        let profile = QualificationProfileV2::from_capacity_report(
-            &capacity_report,
-            sha256_bytes(&capacity_bytes).expect("fixture digest"),
-        )
-        .expect("valid qualification fixture");
-        let directory = tempfile::tempdir().expect("temporary profile directory");
-        let profile_path = directory.path().join("qualification-profile-v2.json");
-        let capacity_path = directory.path().join("cluster-capacity.json");
-        std::fs::write(&capacity_path, &capacity_bytes).expect("write capacity fixture");
-        std::fs::write(
-            &profile_path,
-            serde_json::to_vec(&profile).expect("profile fixture JSON"),
-        )
-        .expect("write profile fixture");
-        assert_eq!(
-            load_reviewed_qualification_profile_from_paths(
-                &environment,
-                &profile_path,
-                &capacity_path,
-            )
-            .expect("exact source membership loads")
-            .scenarios[0]
-                .rates
-                .iter()
-                .map(|rate| rate.requests_per_second)
-                .collect::<Vec<_>>(),
-            vec![25, 100, 200],
-        );
-
-        let mut invented = profile;
-        invented.scenarios[0].selected_stages[0].stage_id = "invented-stage".to_owned();
-        std::fs::write(
-            &profile_path,
-            serde_json::to_vec(&invented).expect("tampered profile JSON"),
-        )
-        .expect("write tampered profile fixture");
-        assert!(
-            load_reviewed_qualification_profile_from_paths(
-                &environment,
-                &profile_path,
-                &capacity_path,
-            )
-            .is_err()
-        );
-    }
 
     /// Proves report metrics retain a non-default profile concurrency cap.
     #[test]
@@ -4093,85 +1574,6 @@ mod tests {
         assert_eq!(
             metrics.planned_operations,
             metrics.attempted_operations + metrics.missed_operations
-        );
-    }
-
-    /// Proves final reconciliation rejects corruption in an earlier completed stage.
-    #[test]
-    fn cumulative_identity_ledger_rejects_earlier_stage_corruption() {
-        let expected = vec![BTreeSet::from([10, 11, 20, 21])];
-        let exact = vec![BTreeSet::from([10, 11, 20, 21])];
-        let corrupted = vec![BTreeSet::from([10, 12, 20, 21])];
-        assert!(exact_identity_ledger_matches(&expected, &exact));
-        assert!(!exact_identity_ledger_matches(&expected, &corrupted));
-    }
-
-    /// Proves per-table capacity ledgers catch corruption that a cumulative
-    /// union alone would conceal.
-    #[test]
-    fn completed_table_ledgers_prevent_cross_table_substitution() {
-        let first = CompletedTableLedger {
-            table: "first".to_owned(),
-            expected_rows_by_tenant: vec![BTreeSet::from([10, 11])],
-        };
-        let second = CompletedTableLedger {
-            table: "second".to_owned(),
-            expected_rows_by_tenant: vec![BTreeSet::from([20, 21])],
-        };
-        let corrupted_first = vec![BTreeSet::from([10, 20])];
-        let corrupted_second = vec![BTreeSet::from([11, 21])];
-        let expected_union = first.expected_rows_by_tenant[0]
-            .union(&second.expected_rows_by_tenant[0])
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let corrupted_union = corrupted_first[0]
-            .union(&corrupted_second[0])
-            .copied()
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(expected_union, corrupted_union);
-        assert!(!exact_identity_ledger_matches(
-            &first.expected_rows_by_tenant,
-            &corrupted_first
-        ));
-        assert!(!exact_identity_ledger_matches(
-            &second.expected_rows_by_tenant,
-            &corrupted_second
-        ));
-    }
-
-    /// Proves trace report adapters copy the canonical operation and distribution.
-    #[test]
-    fn benchmark_trace_adapter_copies_canonical_evidence() {
-        let evidence = canonical_adapter_evidence();
-        let traces = adapt_traces(&evidence);
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0].operation, BenchmarkOperation::QueryTotal);
-        assert_eq!(traces[0].representative_trace_ids, vec!["trace-1"]);
-        assert_eq!(traces[0].critical_path_spans[0].samples, 7);
-        assert_eq!(traces[0].critical_path_spans[0].p95_us, 95);
-        assert_eq!(traces[0].critical_path_spans[0].p99_us, 99);
-    }
-
-    /// Proves serialized row and batch seeds describe the actual first frame.
-    #[test]
-    fn stage_report_identity_matches_written_frame_identity() {
-        let ordinals = BTreeSet::from([2_300_000, 2_300_002]);
-        let identity = stage_row_identity(2, &ordinals);
-        assert_eq!(identity.batch_id_seed, 2_300_000);
-        assert_eq!(
-            deterministic_batch_id(2, identity.batch_id_seed),
-            deterministic_batch_id(2, 2_300_000)
-        );
-        assert_eq!(
-            identity.row_id_start,
-            tenant_row_base(2) + PRELOAD_ROWS + 2_300_000 * 64
-        );
-        assert_eq!(identity.batch_ordinals, vec![2_300_000, 2_300_002]);
-        assert!(
-            !identity
-                .row_ids
-                .contains(&(tenant_row_base(2) + PRELOAD_ROWS + 2_300_001 * 64))
         );
     }
 
@@ -4232,908 +1634,6 @@ mod tests {
             .unwrap();
         }
         assert_eq!(ledger.lock().unwrap()[0], Some(12));
-    }
-
-    /// Proves the runtime open-file parser accepts the minimum and fails closed otherwise.
-    #[test]
-    fn runtime_open_file_limit_fails_closed_before_boot() {
-        assert_eq!(validate_open_file_limit("8192").unwrap(), 8_192);
-        assert!(matches!(
-            validate_open_file_limit("256"),
-            Err(ClusterBenchmarkError::Unsupported(_))
-        ));
-        assert!(matches!(
-            validate_open_file_limit("unlimited"),
-            Err(ClusterBenchmarkError::Unsupported(_))
-        ));
-    }
-
-    /// Proves a failed shell adjustment reaches the existing unsupported artifact shape.
-    #[test]
-    fn failed_limit_raise_reaches_unsupported_capture() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("unsupported.json");
-        let error = validate_open_file_limit("256").unwrap_err();
-        write_unavailable_capture(&path, &error.to_string()).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(value["status"], "unsupported");
-        assert_eq!(value["promotable"], false);
-        assert!(value["error"].as_str().unwrap().contains("256"));
-    }
-
-    /// Proves ordinary IO diagnostics retain an incomplete probe without capacity stages.
-    #[test]
-    fn infrastructure_error_retains_incomplete_attempt_without_capacity_classification() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("partial.json");
-        let environment = diagnostic_environment_fixture();
-        let mut probes = Vec::new();
-        begin_probe(&mut probes, "scenario-a".to_owned(), 500);
-        let capture =
-            CapacityTelemetryCapture::from_snapshot(&BenchmarkMetricSnapshot::default(), None);
-        write_partial_capture(
-            &path,
-            &environment,
-            "ordinary IO failure",
-            probes,
-            Vec::new(),
-            &capture,
-        )
-        .unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(value["attempted_probes"][0]["completed"], false);
-        assert!(
-            value["error"]
-                .as_str()
-                .unwrap()
-                .contains("ordinary IO failure")
-        );
-        assert_eq!(value["scenarios"].as_array().unwrap().len(), 0);
-        assert_eq!(
-            value["attempted_probes"][0]["stop_reasons"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
-    }
-
-    /// Proves a completed invalid stage reaches the partial artifact before
-    /// the state machine returns its non-saturation `NotReady` error.
-    #[test]
-    fn invalid_completed_stage_is_retained_before_transition_failure() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("partial-invalid-stage.json");
-        let environment = diagnostic_environment_fixture();
-        let definition = reference_scenario_matrix()[0];
-        let plan = CapacityStagePlan {
-            slot: 2,
-            offered_requests_per_second: 75,
-            kind: wyrd_bench::CapacityStageKind::Discovery,
-        };
-        let invalid =
-            assemble_capacity_stage(definition, plan, completed_stage_fixture(0, false), 20);
-        assert_eq!(invalid.stop_reasons, vec![CapacityLimit::InvalidEvidence]);
-        let mut probes = Vec::new();
-        begin_probe(&mut probes, definition.id.to_owned(), 75);
-        let mut stages = Vec::new();
-        let outcome = retain_completed_capacity_stage(&mut stages, &mut probes, invalid);
-        let mut machine = CapacityStateMachine::for_rates(vec![75]);
-        let transition = machine.record(plan, outcome);
-        assert!(matches!(
-            &transition,
-            Err(ClusterBenchmarkError::NotReady(_))
-        ));
-        let capture =
-            CapacityTelemetryCapture::from_snapshot(&BenchmarkMetricSnapshot::default(), None);
-        write_partial_capture(
-            &path,
-            &environment,
-            &transition.expect_err("invalid transition").to_string(),
-            probes,
-            vec![capacity_scenario_report(definition, stages)],
-            &capture,
-        )
-        .unwrap();
-        let report: BifrostDiagnosticReport =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert!(report.attempted_probes[0].completed);
-        assert_eq!(
-            report.attempted_probes[0].stop_reasons,
-            vec![CapacityLimit::InvalidEvidence]
-        );
-        assert_eq!(
-            report.scenarios[0].reports[0].capacity_stages[0].stop_reasons,
-            vec![CapacityLimit::InvalidEvidence]
-        );
-    }
-
-    /// Build one completed production-shaped stage input for classification tests.
-    fn completed_stage_fixture(backpressure: u64, complete_evidence: bool) -> CapacityStageRun {
-        let metric = |family: &str| {
-            let histogram = family.ends_with("_seconds");
-            let labels = match family {
-                "bifrost_gate_requests_total" => BTreeMap::from([
-                    ("operation".to_owned(), "write".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
-                "bifrost_gate_rows_total" => {
-                    BTreeMap::from([("status".to_owned(), "accepted".to_owned())])
-                }
-                "bifrost_gate_query_streams_total" => {
-                    BTreeMap::from([("outcome".to_owned(), "success".to_owned())])
-                }
-                "bifrost_scribe_seal_rows_total" => {
-                    BTreeMap::from([("stage".to_owned(), "file_list_transaction".to_owned())])
-                }
-                "bifrost_scribe_rows_total" => {
-                    BTreeMap::from([("status".to_owned(), "accepted".to_owned())])
-                }
-                "oracle_query_rows_total" => {
-                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())])
-                }
-                "vala_postgres_pool_acquire_seconds" => BTreeMap::from([
-                    ("le".to_owned(), "0.001".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                    ("pool".to_owned(), "runtime".to_owned()),
-                ]),
-                "wyrd_storage_operation_duration_seconds" => BTreeMap::from([
-                    ("backend".to_owned(), "local".to_owned()),
-                    ("le".to_owned(), "0.001".to_owned()),
-                    ("operation".to_owned(), "get".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
-                "bifrost_scribe_wal_fsync_seconds" => BTreeMap::from([
-                    ("le".to_owned(), "0.001".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
-                "bifrost_gate_request_duration_seconds" => BTreeMap::from([
-                    ("le".to_owned(), "0.001".to_owned()),
-                    ("operation".to_owned(), "write".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
-                "bifrost_gate_query_stream_duration_seconds" => BTreeMap::from([
-                    ("le".to_owned(), "0.001".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
-                "vala_postgres_pool_acquire_total" => {
-                    BTreeMap::from([("pool".to_owned(), "runtime".to_owned())])
-                }
-                "wyrd_storage_bytes_total" => BTreeMap::from([
-                    ("backend".to_owned(), "local".to_owned()),
-                    ("direction".to_owned(), "read".to_owned()),
-                    ("operation".to_owned(), "get".to_owned()),
-                ]),
-                _ => BTreeMap::new(),
-            };
-            crate::bifrost::telemetry::BifrostMetricSample {
-                family: family.to_owned(),
-                labels,
-                value: 1.0,
-                kind: if histogram {
-                    crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket
-                } else {
-                    crate::bifrost::telemetry::BifrostMetricKind::Counter
-                },
-            }
-        };
-        let metrics = [
-            "bifrost_gate_requests_total",
-            "bifrost_gate_rows_total",
-            "bifrost_gate_query_streams_total",
-            "bifrost_scribe_rows_total",
-            "bifrost_scribe_seal_rows_total",
-            "bifrost_scribe_wal_append_bytes_total",
-            "bifrost_forge_complete_gauge_publications_total",
-            "oracle_query_rows_total",
-            "vala_postgres_pool_acquire_total",
-            "wyrd_storage_bytes_total",
-        ]
-        .into_iter()
-        .map(metric)
-        .collect::<Vec<_>>();
-        let mut metrics = metrics;
-        metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-            family: "bifrost_gate_requests_total".to_owned(),
-            labels: BTreeMap::from([
-                ("operation".to_owned(), "query".to_owned()),
-                ("outcome".to_owned(), "success".to_owned()),
-            ]),
-            value: 1.0,
-            kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
-        });
-        for (operation, outcome) in [
-            ("query", "rejected"),
-            ("query", "failed"),
-            ("query", "cancelled"),
-            ("write", "cancelled"),
-        ] {
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: "bifrost_gate_requests_total".to_owned(),
-                labels: BTreeMap::from([
-                    ("operation".to_owned(), operation.to_owned()),
-                    ("outcome".to_owned(), outcome.to_owned()),
-                ]),
-                value: 0.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
-            });
-        }
-        metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-            family: "bifrost_gate_query_streams_total".to_owned(),
-            labels: BTreeMap::from([("outcome".to_owned(), "cancelled".to_owned())]),
-            value: 0.0,
-            kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
-        });
-        metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-            family: "oracle_admission_total".to_owned(),
-            labels: BTreeMap::from([
-                ("class".to_owned(), "interactive".to_owned()),
-                ("outcome".to_owned(), "admitted".to_owned()),
-                ("reason".to_owned(), "class_capacity".to_owned()),
-            ]),
-            value: 1.0,
-            kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
-        });
-        for (family, labels) in [
-            ("bifrost_gate_frame_bytes_total", BTreeMap::new()),
-            (
-                "bifrost_forge_rewrite_input_files_total",
-                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
-            ),
-            (
-                "bifrost_forge_rewrite_input_bytes_total",
-                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
-            ),
-            (
-                "bifrost_forge_rewrite_output_files_total",
-                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
-            ),
-            (
-                "bifrost_forge_rewrite_output_bytes_total",
-                BTreeMap::from([("source".to_owned(), "staging".to_owned())]),
-            ),
-            (
-                "oracle_query_rows_total",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-            (
-                "oracle_query_logical_bytes_selected_total",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-            (
-                "oracle_query_bytes_scanned_total",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-            (
-                "oracle_query_bytes_returned_total",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-            (
-                "oracle_query_files_scanned_total",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-            (
-                "oracle_query_partitions_scanned_total",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-            (
-                "oracle_query_spill_bytes_total",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-        ] {
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: family.to_owned(),
-                labels,
-                value: 1.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Counter,
-            });
-        }
-        for (family, labels) in [
-            (
-                "vala_postgres_pool_acquire_seconds",
-                BTreeMap::from([
-                    ("outcome".to_owned(), "success".to_owned()),
-                    ("pool".to_owned(), "runtime".to_owned()),
-                ]),
-            ),
-            (
-                "wyrd_storage_operation_duration_seconds",
-                BTreeMap::from([
-                    ("backend".to_owned(), "local".to_owned()),
-                    ("operation".to_owned(), "get".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
-            ),
-            (
-                "bifrost_scribe_wal_fsync_seconds",
-                BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
-            ),
-            (
-                "bifrost_gate_request_duration_seconds",
-                BTreeMap::from([
-                    ("operation".to_owned(), "write".to_owned()),
-                    ("outcome".to_owned(), "success".to_owned()),
-                ]),
-            ),
-            (
-                "bifrost_gate_query_stream_duration_seconds",
-                BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
-            ),
-            (
-                "oracle_admission_queue_duration_seconds",
-                BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-            ),
-        ] {
-            let mut finite = labels.clone();
-            finite.insert("le".to_owned(), "0.001".to_owned());
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: family.to_owned(),
-                labels: finite,
-                value: 1.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket,
-            });
-            let mut infinity = labels.clone();
-            infinity.insert("le".to_owned(), "+Inf".to_owned());
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: family.to_owned(),
-                labels: infinity,
-                value: 1.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramBucket,
-            });
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: family.to_owned(),
-                labels: labels.clone(),
-                value: 1.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramCount,
-            });
-            metrics.push(crate::bifrost::telemetry::BifrostMetricSample {
-                family: family.to_owned(),
-                labels,
-                value: 0.001,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::HistogramSum,
-            });
-        }
-        let gauge_maxima = vec![
-            crate::bifrost::telemetry::BifrostMetricSample {
-                family: "bifrost_forge_oldest_backlog_seconds".to_owned(),
-                labels: BTreeMap::new(),
-                value: 0.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
-            },
-            crate::bifrost::telemetry::BifrostMetricSample {
-                family: "oracle_queries_active".to_owned(),
-                labels: BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-                value: 4.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
-            },
-            crate::bifrost::telemetry::BifrostMetricSample {
-                family: "oracle_queries_queued".to_owned(),
-                labels: BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-                value: 2.0,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
-            },
-            crate::bifrost::telemetry::BifrostMetricSample {
-                family: "oracle_tenant_budget_pressure".to_owned(),
-                labels: BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-                value: 0.5,
-                kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
-            },
-        ];
-        let mut gauge_final = vec![crate::bifrost::telemetry::BifrostMetricSample {
-            family: "bifrost_gate_active_streams".to_owned(),
-            labels: BTreeMap::from([("operation".to_owned(), "query".to_owned())]),
-            value: 0.0,
-            kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
-        }];
-        gauge_final.extend(
-            [
-                ("bifrost_scribe_ingress_active", BTreeMap::new()),
-                (
-                    "bifrost_scribe_lane_active",
-                    BTreeMap::from([("lane".to_owned(), "ingress".to_owned())]),
-                ),
-                (
-                    "bifrost_scribe_lane_queued",
-                    BTreeMap::from([("lane".to_owned(), "ingress".to_owned())]),
-                ),
-                ("bifrost_scribe_persistence_queue_depth", BTreeMap::new()),
-                (
-                    "oracle_queries_active",
-                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-                ),
-                (
-                    "oracle_queries_queued",
-                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-                ),
-                (
-                    "oracle_tenant_budget_pressure",
-                    BTreeMap::from([("class".to_owned(), "analytical".to_owned())]),
-                ),
-                (
-                    "wyrd_storage_operations_active",
-                    BTreeMap::from([
-                        ("backend".to_owned(), "local".to_owned()),
-                        ("operation".to_owned(), "get".to_owned()),
-                    ]),
-                ),
-            ]
-            .into_iter()
-            .map(
-                |(family, labels)| crate::bifrost::telemetry::BifrostMetricSample {
-                    family: family.to_owned(),
-                    labels,
-                    value: 0.0,
-                    kind: crate::bifrost::telemetry::BifrostMetricKind::Gauge,
-                },
-            ),
-        );
-        let spans = if complete_evidence {
-            [
-                "bifrost.scribe.wal.append",
-                "bifrost.forge.catalog.commit",
-                "bifrost.oracle.source",
-                "bifrost.gate.query.stream",
-            ]
-            .into_iter()
-            .map(|name| wyrd_telemetry::CapturedSpan {
-                trace_id: format!("trace-{name}"),
-                name: name.to_owned(),
-                attributes: BTreeMap::new(),
-                duration_nanos: 1_000,
-                status: wyrd_telemetry::CapturedSpanStatus::Unset,
-            })
-            .collect()
-        } else {
-            Vec::new()
-        };
-        CapacityStageRun {
-            client: WindowResult {
-                max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-                write_us: vec![1],
-                flush_us: vec![1],
-                query_ttfb_us: vec![1],
-                query_total_us: vec![1],
-                tenant_write_rows: vec![64],
-                tenant_write_ordinals: vec![BTreeSet::from([0])],
-                tenant_queries: vec![1],
-                decoded_rows: 64,
-                telemetry_decoded_rows: 128,
-                telemetry_completed_queries: 2,
-                submitted: 2,
-                accepted: 2,
-                backpressure,
-                measured_seconds: 10,
-                ..WindowResult::default()
-            },
-            telemetry: crate::bifrost::telemetry::BifrostTelemetryDelta {
-                metrics,
-                gauge_maxima,
-                gauge_final,
-                spans,
-                interval_seconds: 10.0,
-                process: test_process_window(),
-            },
-            published_rows: 64,
-            audit_rows: 1,
-        }
-    }
-
-    /// Proves smoke classifies completed production outcomes through the capacity helper.
-    #[tokio::test]
-    async fn smoke_completed_stage_classification_confirms_and_recovers() {
-        let definition = reference_scenario_matrix()[0];
-        let mut machine = CapacityStateMachine::for_rates(vec![100, 200]);
-        let healthy = machine.next_plan().unwrap();
-        let healthy_stage =
-            assemble_capacity_stage(definition, healthy, completed_stage_fixture(0, true), 10);
-        assert!(
-            healthy_stage.passed,
-            "healthy fixture failed: {:?} {:?}",
-            healthy_stage.stop_reasons, healthy_stage.telemetry.invalid
-        );
-        machine
-            .record(healthy, capacity_stage_outcome(&healthy_stage))
-            .unwrap();
-
-        let failed = machine.next_plan().unwrap();
-        let mut admission = completed_stage_fixture(0, true);
-        admission.client.merge_flush_result((Vec::new(), 0, 0, 1));
-        assert_eq!(admission.client.backpressure, 1);
-        let backpressured = assemble_capacity_stage(definition, failed, admission, 10);
-        assert!(!backpressured.passed);
-        assert!(
-            backpressured
-                .stop_reasons
-                .contains(&CapacityLimit::Backpressure)
-        );
-        machine
-            .record(failed, capacity_stage_outcome(&backpressured))
-            .unwrap();
-
-        let confirmation = machine.next_plan().unwrap();
-        assert_eq!(
-            confirmation.kind,
-            wyrd_bench::CapacityStageKind::Confirmation
-        );
-        let incomplete_evidence = assemble_capacity_stage(
-            definition,
-            confirmation,
-            completed_stage_fixture(0, false),
-            10,
-        );
-        assert!(!incomplete_evidence.passed);
-        assert!(
-            incomplete_evidence
-                .stop_reasons
-                .contains(&CapacityLimit::InvalidEvidence)
-        );
-        assert!(matches!(
-            machine.record(confirmation, capacity_stage_outcome(&incomplete_evidence)),
-            Err(ClusterBenchmarkError::NotReady(_))
-        ));
-
-        let mut missed_flush = completed_stage_fixture(0, true);
-        missed_flush.client.missed_flushes = 1;
-        let missed_flush_stage = assemble_capacity_stage(
-            definition,
-            CapacityStagePlan {
-                slot: 0,
-                offered_requests_per_second: 100,
-                kind: wyrd_bench::CapacityStageKind::Discovery,
-            },
-            missed_flush,
-            10,
-        );
-        assert!(!missed_flush_stage.passed);
-    }
-
-    /// Proves all benchmark report adapters are pure copies of canonical evidence.
-    #[test]
-    fn benchmark_adapters_copy_canonical_fields() {
-        let evidence = canonical_adapter_evidence();
-        let pillars = adapt_pillars(&evidence);
-        let dependencies = adapt_dependencies(&evidence);
-        let resources = adapt_process(&evidence);
-        assert_eq!(pillars.gate_accepted, 11);
-        assert_eq!(pillars.scribe_wal_bytes, 12);
-        assert_eq!(pillars.forge_publications, 13);
-        assert_eq!(pillars.oracle_decoded_rows, 14);
-        assert_eq!(dependencies.postgres_pool_wait_us, 21);
-        assert_eq!(dependencies.postgres_transactions, 22);
-        assert_eq!(dependencies.storage_bytes, 23);
-        assert_eq!(dependencies.storage_p99_us, 24);
-        assert_eq!(dependencies.wal_fsync_p99_us, 25);
-        assert_eq!(resources[0].process_id.0, "pid-test");
-        assert_eq!(resources[0].epoch, 3);
-        assert_eq!(resources[0].hosted_logical_nodes, vec!["server-0"]);
-        assert_eq!(resources[0].roles.len(), 4);
-        assert_eq!(resources[0].runtime_queue_peak, 31);
-        assert!(evidence.cleanup.is_clean());
-    }
-
-    /// Build complete dependency-neutral evidence for pure adapter tests.
-    fn canonical_adapter_evidence() -> ClusterTelemetryEvidence {
-        ClusterTelemetryEvidence {
-            phase: crate::bifrost::telemetry::ClusterPhaseTelemetryEvidence {
-                gate_rows: 0,
-                gate_bytes: 0,
-                gate_success: 0,
-                gate_rejected: 0,
-                gate_failed: 0,
-                gate_cancelled: 0,
-                gate_query_request_success: 0,
-                gate_write_request_cancelled: 0,
-                gate_query_stream_cancelled: 0,
-                gate_query_stream_terminals: 0,
-                gate_active_streams: 0,
-                scribe_rows: 0,
-                oracle_stream_rows: 0,
-                oracle_stream_bytes: 0,
-                forge_input_files: 0,
-                forge_input_bytes: 0,
-                forge_output_files: 0,
-                forge_output_bytes: 0,
-            },
-            pillars: crate::bifrost::telemetry::ClusterPillarTelemetryEvidence {
-                gate_accepted: 11,
-                scribe_wal_bytes: 12,
-                forge_publications: 13,
-                oracle_decoded_rows: 14,
-            },
-            dependencies: crate::bifrost::telemetry::ClusterDependencyTelemetryEvidence {
-                postgres_pool_wait_us: Some(21),
-                postgres_transactions: Some(22),
-                storage_bytes: Some(23),
-                storage_p99_us: Some(24),
-                wal_fsync_p99_us: Some(25),
-            },
-            process: crate::bifrost::telemetry::ClusterProcessTelemetryEvidence {
-                identity: "pid-test".to_owned(),
-                epoch: 3,
-                hosted_logical_nodes: vec!["server-0".to_owned()],
-                roles: vec![
-                    ClusterRuntimeRole::Gate,
-                    ClusterRuntimeRole::Scribe,
-                    ClusterRuntimeRole::Forge,
-                    ClusterRuntimeRole::Oracle,
-                ],
-                cpu_seconds: 1.0,
-                peak_rss_bytes: 2,
-                current_rss_bytes: 1,
-                runtime_busy_seconds: 1.0,
-                runtime_queue_peak: 31,
-            },
-            traces: vec![crate::bifrost::telemetry::ClusterTraceTelemetryEvidence {
-                operation: ClusterTraceOperation::QueryTotal,
-                representative_trace_ids: vec!["trace-1".to_owned()],
-                samples: 7,
-                p95_us: 95,
-                p99_us: 99,
-            }],
-            reconciliation: crate::bifrost::telemetry::ClusterReconciliationTelemetryEvidence {
-                sealed_rows: 0,
-                successful_queries: 0,
-            },
-            cleanup: crate::bifrost::telemetry::ClusterCleanupTelemetryEvidence {
-                gate_active: Some(0),
-                scribe_ingress: Some(0),
-                scribe_lane_active: Some(0),
-                scribe_lane_queued: Some(0),
-                scribe_persistence_queue: Some(0),
-                oracle_in_flight: Some(0),
-                storage_active: Some(0),
-            },
-        }
-    }
-
-    /// Build deterministic checked process evidence for projection-only tests.
-    fn test_process_window() -> crate::bifrost::telemetry::ProcessWindow {
-        crate::bifrost::telemetry::ProcessWindow {
-            identity: "pid-test".to_owned(),
-            epoch: 0,
-            cpu_seconds: 1.0,
-            current_rss_bytes: 1,
-            peak_rss_bytes: 2,
-            tokio_busy_seconds: 1.0,
-            queue_peak: 2,
-        }
-    }
-
-    /// Proves primary and cleanup failures are retained together.
-    #[test]
-    fn dual_failure_text_preserves_both_causes() {
-        let primary = "measurement timed out";
-        let cleanup = "cluster shutdown timed out";
-        let combined = format!("{primary}; cleanup failed: {cleanup}");
-        assert!(combined.contains(primary));
-        assert!(combined.contains(cleanup));
-    }
-
-    /// Proves a first-stage timeout retains the attempted incomplete probe.
-    #[test]
-    fn first_stage_timeout_progress_is_retained() {
-        let mut probes = Vec::new();
-        begin_probe(&mut probes, "scenario-a".to_owned(), 8);
-        assert_eq!(probes.len(), 1);
-        assert!(!probes[0].completed);
-    }
-
-    /// Proves a mid-curve failure retains completed predecessors and current work.
-    #[test]
-    fn mid_curve_progress_is_retained() {
-        let mut probes = Vec::new();
-        begin_probe(&mut probes, "scenario-a".to_owned(), 8);
-        let reasons = [CapacityLimit::Backpressure, CapacityLimit::DependencySlo];
-        complete_current_probe(&mut probes, &reasons);
-        begin_probe(&mut probes, "scenario-a".to_owned(), 16);
-        assert!(probes[0].completed);
-        assert_eq!(probes[0].stop_reasons, reasons);
-        assert!(!probes[1].completed);
-    }
-
-    /// Proves qualification progress distinguishes trials and retains the failing trial.
-    #[test]
-    fn mid_qualification_progress_is_retained() {
-        let mut probes = Vec::new();
-        begin_probe(&mut probes, "scenario-a:trial-1".to_owned(), 32);
-        complete_current_probe(&mut probes, &[]);
-        begin_probe(&mut probes, "scenario-a:trial-2".to_owned(), 32);
-        assert_eq!(probes[0].scenario_id.as_deref(), Some("scenario-a:trial-1"));
-        assert_eq!(probes[1].scenario_id.as_deref(), Some("scenario-a:trial-2"));
-        assert!(!probes[1].completed);
-    }
-
-    /// Proves a partial rate report serializes trial-one client and production evidence.
-    #[test]
-    fn partial_qualification_report_serializes_completed_trial() {
-        let definition = reference_scenario_matrix()[0];
-        let trial = ClusterBenchmarkTrial {
-            trial: 1,
-            client: ClientTrialMetrics {
-                accepted_operations: 7,
-                ..Default::default()
-            },
-            production: ProductionTelemetryEvidence {
-                gate_accepted_rows: 7,
-                ..Default::default()
-            },
-        };
-        let report =
-            qualification_scenario_report(definition, 32, vec![trial], Vec::new(), false).unwrap();
-        let encoded = serde_json::to_value(&report).unwrap();
-        assert_eq!(encoded["trials"][0]["client"]["accepted_operations"], 7);
-        assert_eq!(encoded["trials"][0]["production"]["gate_accepted_rows"], 7);
-    }
-
-    /// Drives the representative distributed shortened curve through one live
-    /// public-Gate capacity session without making an SLO claim.
-    #[tokio::test]
-    #[ignore = "requires repository-managed Postgres and benchmark environment identity"]
-    async fn shortened_capacity_smoke_is_reachable() {
-        let path = run_smoke().await.expect("shortened smoke completes");
-        assert!(path.ends_with("cluster-smoke.json"));
-    }
-
-    /// Proves the public benchmark owns exactly D22's six scenario identities.
-    #[test]
-    fn reference_matrix_is_exact() {
-        let scenarios = reference_scenario_matrix();
-        assert_eq!(scenarios.len(), 6);
-        assert_eq!(scenarios[0].tenants, 1);
-        assert_eq!(scenarios[3].tenants, 32);
-        assert_eq!(
-            (scenarios[4].write_percent, scenarios[4].read_percent),
-            (90, 10)
-        );
-        assert_eq!(
-            (scenarios[5].write_percent, scenarios[5].read_percent),
-            (10, 90)
-        );
-        assert!(scenarios.iter().all(|scenario| {
-            scenario.write_percent + scenario.read_percent == 100 && !scenario.id.is_empty()
-        }));
-    }
-
-    /// Proves an unsupported capture preserves exact scheduler and outcome counts.
-    #[test]
-    fn qualification_diagnostic_preserves_deficient_trial_counts() {
-        let report = ClusterScenarioReport {
-            scenario: ClusterBenchmarkScenario {
-                scenario_id: "write-heavy-three-server-three-worker-eight-tenants".to_owned(),
-                workload_version: CLUSTER_WORKLOAD_VERSION.to_owned(),
-                topology: ClusterTopology::ThreeServersThreeForgeWorkers,
-                tenants: 8,
-                traffic: TrafficMix::WriteHeavy,
-                rows_per_batch: 64,
-                query_row_limit: 64,
-                offered_requests_per_second: 32,
-                warmup_seconds: 5,
-                measured_seconds: 20,
-                trials: 3,
-                minimum_samples: 200,
-                max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-                seed: 0xB1_F057,
-            },
-            trials: Vec::new(),
-            trial_evidence: Vec::new(),
-            median: Default::default(),
-            capacity_stages: Vec::new(),
-        };
-        let trial = ClusterBenchmarkTrial {
-            trial: 1,
-            client: ClientTrialMetrics {
-                planned_operations: 640,
-                attempted_operations: 640,
-                accepted_operations: 639,
-                backpressure_operations: 1,
-                durable_write: TrialDistribution {
-                    samples: 575,
-                    ..Default::default()
-                },
-                query_time_to_first_frame: TrialDistribution {
-                    samples: 64,
-                    ..Default::default()
-                },
-                total_query: TrialDistribution {
-                    samples: 64,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            production: Default::default(),
-        };
-
-        let diagnostic = trial_deficiency(&report, &trial).expect("trial is deficient");
-        assert_eq!(diagnostic["planned_operations"], 640);
-        assert_eq!(diagnostic["attempted_operations"], 640);
-        assert_eq!(diagnostic["successful_writes"], 575);
-        assert_eq!(diagnostic["successful_query_total"], 64);
-        assert_eq!(diagnostic["backpressure_operations"], 1);
-        assert_eq!(diagnostic["missed_operations"], 0);
-        assert_eq!(diagnostic["knee_requests_per_second"], 64);
-
-        let profile = BifrostReferenceProfile {
-            schema_version: CLUSTER_REPORT_VERSION.to_owned(),
-            environment: BenchmarkEnvironment {
-                architecture: "aarch64".to_owned(),
-                cpu_vendor: "apple".to_owned(),
-                cpu_model: "apple m1".to_owned(),
-                logical_cores: 8,
-                host_memory_bytes: 16 * 1024 * 1024 * 1024,
-                container_cpu_millis: 2_000,
-                container_memory_bytes: 4 * 1024 * 1024 * 1024,
-                postgres_image: "postgres:16".to_owned(),
-                postgres_version: "16".to_owned(),
-                postgres_config: "reference".to_owned(),
-                storage_image: "local-filesystem".to_owned(),
-                storage_version: "0.0.1".to_owned(),
-                storage_config: "loopback-memory-v1".to_owned(),
-                storage_backend_kind: "local-filesystem".to_owned(),
-                storage_root: "target/bifrost-benchmarks/storage".to_owned(),
-                storage_device_class: "local".to_owned(),
-                rust_major_minor: "1.88".to_owned(),
-                arrow_version: "58.4.0".to_owned(),
-                datafusion_version: "53.1.0".to_owned(),
-                iceberg_version: "revision".to_owned(),
-                os: "macos".to_owned(),
-                kernel: "test".to_owned(),
-                git_sha: "candidate".to_owned(),
-                dirty_worktree: false,
-                captured_at: "2026-08-03T00:00:00Z".to_owned(),
-            },
-            scenarios: vec![ReviewedScenarioProfile {
-                scenario_id: report.scenario.scenario_id.clone(),
-                workload: ClusterWorkloadIdentity {
-                    scenario_id: report.scenario.scenario_id.clone(),
-                    topology: report.scenario.topology,
-                    tenants: report.scenario.tenants,
-                    traffic: report.scenario.traffic,
-                    rows_per_batch: report.scenario.rows_per_batch,
-                    query_row_limit: report.scenario.query_row_limit,
-                    auth_cache_ttl_seconds: wyrd_bench::AUTH_CACHE_TTL_SECONDS,
-                    auth_invalidation_mode: wyrd_bench::AUTH_INVALIDATION_MODE.to_owned(),
-                    flush_policy: wyrd_bench::FLUSH_POLICY.to_owned(),
-                    routing_policy: wyrd_bench::ROUTING_POLICY.to_owned(),
-                    batching_policy: wyrd_bench::BATCHING_POLICY.to_owned(),
-                    storage_runtime_identity:
-                        "local-filesystem:target/bifrost-benchmarks/storage:local".to_owned(),
-                    allocation_policy: wyrd_bench::ALLOCATION_POLICY.to_owned(),
-                    tables_per_tenant: 6,
-                    ordered_rates: vec![report.scenario.offered_requests_per_second],
-                    trial_count: 3,
-                    warmup_seconds: 10,
-                    conditioning_seconds: 3,
-                    measured_seconds: 20,
-                },
-                offered_rates: vec![report.scenario.offered_requests_per_second],
-                reports: vec![ClusterScenarioReport {
-                    trials: vec![trial],
-                    ..report
-                }],
-            }],
-            slos: BifrostSloEnvelope::default(),
-        };
-        let directory = tempfile::tempdir().expect("temporary diagnostic directory");
-        let report_path = directory.path().join("cluster-candidate.json");
-        write_qualification_diagnostic(
-            &report_path,
-            &profile,
-            &ClusterBenchmarkError::Unsupported("insufficient samples".to_owned()),
-        )
-        .expect("unsupported diagnostic persists");
-        let persisted = std::fs::read_to_string(
-            directory
-                .path()
-                .join("cluster-candidate.qualification.json"),
-        )
-        .expect("persisted diagnostic is readable");
-        let persisted: serde_json::Value =
-            serde_json::from_str(&persisted).expect("persisted diagnostic is JSON");
-        assert_eq!(persisted["promotable"], false);
-        assert_eq!(persisted["status"], "unsupported");
-        assert_eq!(persisted["deficiencies"][0]["successful_query_total"], 64);
     }
 
     /// Proves tenant row identities occupy non-overlapping deterministic ranges.
@@ -5368,43 +1868,18 @@ mod tests {
         assert!(!function.contains("retry"));
     }
 
-    /// Proves capacity stages rely on their owned lifecycle bounds.
+    /// Proves the reference trial's measured correctness read occurs only after
+    /// its sampled telemetry and audit checkpoints have completed.
     #[test]
-    fn capacity_stage_lifecycle_has_no_outer_cancellation() {
+    fn correctness_reads_follow_sampled_window_and_audit_checkpoint() {
         let source = include_str!("bench_cluster.rs");
-        let capacity_start = source
-            .find("async fn run_capacity_selected(")
-            .expect("capacity runner exists");
-        let capacity_end = source[capacity_start..]
-            .find("fn capacity_scenario_report(")
-            .map(|offset| capacity_start + offset)
-            .expect("capacity runner has a stable end");
-        let capacity = &source[capacity_start..capacity_end];
-        let result_start = capacity
-            .find("let result = session")
-            .expect("capacity stage result begins");
-        let result_end = capacity[result_start..]
-            .find("let outcome =")
-            .map(|offset| result_start + offset)
-            .expect("capacity stage assembly ends");
-        let stage_result = &capacity[result_start..result_end];
-        assert_eq!(stage_result.matches(".run_stage(").count(), 1);
-        assert!(stage_result.contains(".await?"));
-        assert!(!stage_result.contains("timeout"));
-        // The sole runner timeout remains the separately owned initial warmup bound.
-        assert_eq!(capacity.matches("tokio::time::timeout").count(), 1);
-    }
-
-    /// Proves live and qualification correctness reads occur only after their
-    /// sampled telemetry and audit checkpoints have completed.
-    #[test]
-    fn correctness_reads_follow_sampled_windows_and_audit_checkpoints() {
-        let source = include_str!("bench_cluster.rs");
-        let live_start = source.find("async fn run_live_trial(").expect("live trial");
+        let live_start = source
+            .find("async fn run_three_server_live_trial(")
+            .expect("reference trial");
         let live_end = source[live_start..]
-            .find("fn preload_identity_ledger(")
+            .find("struct WindowResult")
             .map(|offset| live_start + offset)
-            .expect("live trial end");
+            .expect("reference trial end");
         let live = &source[live_start..live_end];
         assert!(
             live.find("let audit_after = audit_rows").unwrap()
@@ -5413,25 +1888,6 @@ mod tests {
         assert!(
             live.find(".await?;\n    extend_identity_ledger").unwrap()
                 < live.find("let published_after_identities").unwrap()
-        );
-
-        let qualification_start = source
-            .find("async fn run_qualification_pair(")
-            .expect("qualification pair");
-        let qualification_end = source[qualification_start..]
-            .find("pub async fn shutdown")
-            .map(|offset| qualification_start + offset)
-            .expect("qualification end");
-        let qualification = &source[qualification_start..qualification_end];
-        assert!(
-            qualification.find("let audit_after = audit_rows").unwrap()
-                < qualification.find("let expected_rows_by_tenant").unwrap()
-        );
-        assert!(
-            qualification.find("let expected_rows_by_tenant").unwrap()
-                < qualification
-                    .find("let published = final_published_identities")
-                    .unwrap()
         );
     }
 
@@ -5452,17 +1908,5 @@ mod tests {
         assert!(!is_backpressure(
             "server error: upstream failure; code=WYRD_VALA_502_UPSTREAM"
         ));
-    }
-
-    /// Proves locked package identities are extracted without invoking Cargo.
-    #[test]
-    fn locked_versions_are_exact() {
-        let lock = include_str!("../../../../../Cargo.lock");
-        assert_eq!(lock_version(lock, "arrow").unwrap(), "58.4.0");
-        assert_eq!(lock_version(lock, "datafusion").unwrap(), "53.1.0");
-        assert_eq!(
-            lock_source_revision(lock, "iceberg").unwrap(),
-            "1422e94ac570ed99abbf530403dd40de67d37dbf"
-        );
     }
 }

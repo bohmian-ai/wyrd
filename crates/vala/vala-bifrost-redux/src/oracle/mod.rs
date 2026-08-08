@@ -3081,10 +3081,26 @@ const fn terminal_error_label(code: QueryTerminalErrorCode) -> &'static str {
 }
 
 /// Applies the locked independent class ceilings and per-node slot demand.
+///
+/// Returns `(ceiling, demand)` for `class` on a node advertising `usable_slots`.
+/// The ceiling derivations are the locked D71 policy and are unchanged. The
+/// Analytical demand is clamped to `min(2, usable_slots.max(1))` so it upholds
+/// the schedulability invariant `demand <= running_capacity.max(1)` at the
+/// admission boundary: a node whose usable capacity is 1 must never advertise a
+/// per-node demand of 2, which would be structurally unschedulable against its
+/// own running semaphore. Interactive demand stays 1. Because every production
+/// producer calls this with `usable_slots = u32::MAX` (see the reserve-request
+/// builders in the dispatcher path), the transmitted Analytical wire demand is
+/// still 2; the clamp only takes effect for internal capacity-bounded callers,
+/// and the load-bearing peer-side clamp lives in
+/// [`ReservationRegistry::take_for_execute`].
 fn admission_limits(usable_slots: u32, class: QueryClass) -> (u32, u32) {
     match class {
         QueryClass::Interactive => ((usable_slots.saturating_mul(80) / 100).max(1), 1),
-        QueryClass::Analytical => ((usable_slots.saturating_mul(40) / 100).max(2), 2),
+        QueryClass::Analytical => (
+            (usable_slots.saturating_mul(40) / 100).max(2),
+            2.min(usable_slots.max(1)),
+        ),
     }
 }
 
@@ -3434,7 +3450,38 @@ mod tests {
     fn admission_class_ceiling_and_demand_are_locked() {
         assert_eq!(admission_limits(10, QueryClass::Interactive), (8, 1));
         assert_eq!(admission_limits(10, QueryClass::Analytical), (4, 2));
-        assert_eq!(admission_limits(1, QueryClass::Analytical), (2, 2));
+        assert_eq!(admission_limits(1, QueryClass::Analytical), (2, 1));
+    }
+
+    /// `admission_limits` clamps Analytical demand to the node's own capacity.
+    ///
+    /// Proves the schedulability invariant `demand <= running_capacity.max(1)`
+    /// holds at the derivation boundary for every small topology: a capacity-1
+    /// node derives demand 1 (never the structurally unschedulable 2), and no
+    /// node derives a demand exceeding its usable capacity. Interactive demand
+    /// stays fixed at 1. The test name carries the `admission_limits` substring
+    /// so the focused verification filter selects it.
+    #[test]
+    fn admission_limits_clamp_analytical_demand_to_capacity() {
+        assert_eq!(admission_limits(1, QueryClass::Analytical).1, 1);
+        for usable_slots in 1..=8u32 {
+            let (_, analytical_demand) = admission_limits(usable_slots, QueryClass::Analytical);
+            assert!(
+                analytical_demand <= usable_slots.max(1),
+                "analytical demand {analytical_demand} exceeds capacity {usable_slots}"
+            );
+            assert!(
+                analytical_demand >= 1,
+                "analytical demand must never be zero (would bypass the semaphore)"
+            );
+            assert_eq!(
+                admission_limits(usable_slots, QueryClass::Interactive).1,
+                1,
+                "interactive demand is unchanged"
+            );
+        }
+        // Producers pass u32::MAX, so the transmitted wire demand stays 2.
+        assert_eq!(admission_limits(u32::MAX, QueryClass::Analytical).1, 2);
     }
 
     /// Bounded local admission waits for an executing query instead of rejecting a transient race.

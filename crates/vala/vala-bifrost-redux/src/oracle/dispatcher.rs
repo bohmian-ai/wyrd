@@ -121,6 +121,18 @@ pub struct ReservationRegistry {
     capacity: usize,
     /// Role-scoped pending and running slot owner.
     slots: Arc<OracleSlotManager>,
+    /// Cumulative count of successful pending-to-running admissions on this peer.
+    ///
+    /// Incremented only in `take_for_execute`'s success arm — the remote-worker
+    /// admission site that charges this node's running semaphore — and never on
+    /// the leader-local path, which charges no peer running capacity. It exists
+    /// solely so a cross-pod integration test can assert that at least one query
+    /// fragment was admitted to run on a non-leader peer, which is otherwise
+    /// unobservable (the fragment span carries locality but no outcome, and the
+    /// outcome metric carries no locality). It is `test-support`-gated: no
+    /// field, cost, or behavior exists on the production path.
+    #[cfg(feature = "test-support")]
+    admitted_running_total: core::sync::atomic::AtomicU64,
 }
 
 impl ReservationRegistry {
@@ -131,7 +143,21 @@ impl ReservationRegistry {
             entries: Mutex::new(HashMap::new()),
             capacity,
             slots,
+            #[cfg(feature = "test-support")]
+            admitted_running_total: core::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Returns the cumulative count of successful running admissions on this peer.
+    ///
+    /// Integration-only observable for asserting that at least one fragment was
+    /// admitted to run on a non-leader peer. Reflects only `take_for_execute`
+    /// successes; the leader-local transition never contributes.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn admitted_running_total(&self) -> u64 {
+        self.admitted_running_total
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Atomically reserves one pending worker slot and returns its generated identity.
@@ -227,9 +253,20 @@ impl ReservationRegistry {
     /// The ownership tuple is checked before removal, so a forged execute cannot
     /// destroy another query's pending reservation.
     ///
+    /// The demand charged against this peer's running semaphore is the
+    /// load-bearing schedulability clamp: `slot_units` arrives leader-supplied
+    /// (every producer transmits `admission_limits(u32::MAX, class).1`, always 2
+    /// for Analytical) and would be structurally unschedulable on a peer whose
+    /// own running capacity is 1. Charging
+    /// `entry.slot_units.min(running_capacity.max(1))` upholds the invariant
+    /// `demand <= running_capacity.max(1)` at this admission site without ever
+    /// loosening the semaphore. A rejection after the clamp is a genuine
+    /// transient saturation (capacity in use by another query), which is why it
+    /// maps to a retryable outcome and emits an observable structured warning.
+    ///
     /// # Errors
     /// Returns terminal for missing/mismatched ownership and retryable for a
-    /// concurrent running-capacity change.
+    /// concurrent running-capacity change or transient saturation.
     #[tracing::instrument(name = "bifrost.oracle.slot_reservation", skip_all)]
     pub fn take_for_execute(
         &self,
@@ -250,8 +287,16 @@ impl ReservationRegistry {
         {
             return Err(DispatchError::Terminal);
         }
-        let demand = entry.slot_units;
         let query_class = entry.query_class;
+        let running_capacity = self.slots.running_capacity();
+        // Peer-side schedulability clamp: never charge more than this node's own
+        // usable running capacity, and never charge zero (which would bypass the
+        // semaphore). Leader-supplied demand above capacity is a fixed per-class
+        // constant, not a negotiation, so clamping here is safe and total. The
+        // capacity is a tiny slot count, so the saturating conversion never
+        // loses information in practice.
+        let capacity_slots = u32::try_from(running_capacity.max(1)).unwrap_or(u32::MAX);
+        let demand = entry.slot_units.min(capacity_slots);
         let entry = entries
             .remove(&reservation_id)
             .ok_or(DispatchError::Terminal)?;
@@ -264,6 +309,21 @@ impl ReservationRegistry {
                 permit: Some(permit),
             })
             .map_err(|_| DispatchError::Retryable);
+        if result.is_err() {
+            tracing::warn!(
+                stage = "slot_reservation",
+                query_class = ?query_class,
+                demand,
+                running_capacity,
+                running_in_use = self.slots.running_in_use(),
+                "oracle peer slot rejection"
+            );
+        }
+        #[cfg(feature = "test-support")]
+        if result.is_ok() {
+            self.admitted_running_total
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         record_slot(
             query_class,
             if result.is_ok() {
@@ -466,6 +526,17 @@ impl OraclePeerWorker {
     #[must_use]
     pub fn pending_reservations(&self) -> usize {
         self.reservations.cleanup_expired(Utc::now())
+    }
+
+    /// Returns cumulative successful running admissions for integration assertions.
+    ///
+    /// Counts only fragments this peer admitted to run via `take_for_execute`;
+    /// a non-zero value proves at least one fragment executed on this non-leader
+    /// peer rather than falling back to the leader.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn admitted_running_total(&self) -> u64 {
+        self.reservations.admitted_running_total()
     }
 
     /// Verifies and executes one ticket-bound fragment.
@@ -1652,6 +1723,13 @@ impl FragmentDispatcher {
         } {
             Ok(frames) => frames,
             Err(error) => {
+                tracing::warn!(
+                    stage = "remote_execute_open",
+                    query_class = ?context.query_class,
+                    candidate_node = %candidate.node_id.as_uuid(),
+                    ?error,
+                    "oracle peer remote execute open failed"
+                );
                 record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
                 telemetry.finish(FragmentOutcome::Failed, 0);
                 return Err(error);
@@ -2014,6 +2092,245 @@ mod tests {
             slot_units: 1,
             expires_at,
         }
+    }
+
+    /// Creates one leader-supplied Analytical reservation request.
+    ///
+    /// The `slot_units` value is the real production wire value
+    /// (`admission_limits(u32::MAX, Analytical).1 == 2`), never a hand-set 1.
+    /// This is the entry that exercises the peer-side schedulability clamp: on a
+    /// capacity-1 peer, demand 2 must clamp to 1 rather than reject permanently.
+    fn reserve_request_analytical(
+        query_id: QueryId,
+        leader: NodeId,
+        fence: FencingToken,
+        expires_at: DateTime<Utc>,
+    ) -> ReserveNodeSlotsRequest {
+        ReserveNodeSlotsRequest {
+            query_id,
+            leader_node_id: leader,
+            leader_fencing_token: fence,
+            query_class: QueryClass::Analytical,
+            slot_units: 2,
+            expires_at,
+        }
+    }
+
+    /// One captured `tracing` event: its rendered message and scalar fields.
+    type CapturedEvent = (String, HashMap<String, String>);
+
+    /// Minimal in-process subscriber retaining `tracing` events by message.
+    ///
+    /// The crate carries no `tracing-subscriber` dev-dependency, so this probe
+    /// captures the structured slot-rejection warning using only `tracing`
+    /// itself. It records each event's message and its scalar fields so the
+    /// AC3 assertion can prove the rejection path is observable in production.
+    #[derive(Clone, Default)]
+    struct RejectionWarnProbe {
+        /// Captured `(message, fields)` pairs for every observed event.
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl RejectionWarnProbe {
+        /// Returns the captured fields for the first event whose message matches.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the probe lock was poisoned by a prior failing test.
+        fn fields_for(&self, message: &str) -> Option<HashMap<String, String>> {
+            self.events
+                .lock()
+                .expect("rejection warn probe")
+                .iter()
+                .find(|(recorded, _)| recorded == message)
+                .map(|(_, fields)| fields.clone())
+        }
+    }
+
+    /// Captures the message and scalar fields of one `tracing` event.
+    struct RejectionFieldVisitor<'a> {
+        /// The message extracted from the reserved `message` field.
+        message: &'a mut String,
+        /// The remaining recorded scalar fields.
+        fields: &'a mut HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for RejectionFieldVisitor<'_> {
+        /// Records debug-only fields such as closed enums and the message.
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}");
+                // Strip the debug quotes the message value carries.
+                *self.message = self.message.trim_matches('"').to_owned();
+            } else {
+                self.fields
+                    .insert(field.name().to_owned(), format!("{value:?}"));
+            }
+        }
+
+        /// Records string fields without debug quoting.
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_owned();
+            } else {
+                self.fields
+                    .insert(field.name().to_owned(), value.to_owned());
+            }
+        }
+
+        /// Records unsigned count fields such as demand and capacity.
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_string());
+        }
+
+        /// Records signed count fields for completeness.
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for RejectionWarnProbe {
+        /// Enables every callsite so the focused rejection event is captured.
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        /// Spans are irrelevant to the event-field proof; assign a stub identity.
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        /// No span field updates are retained by this event-only probe.
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        /// Follows-from edges are irrelevant to the field-contract proof.
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        /// Captures one event's message and scalar fields.
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            let mut fields = HashMap::new();
+            event.record(&mut RejectionFieldVisitor {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.events
+                .lock()
+                .expect("rejection warn probe")
+                .push((message, fields));
+        }
+
+        /// Span entry carries no retained state for this probe.
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        /// Span exit carries no retained state for this probe.
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// `take_for_execute` clamps leader-supplied Analytical demand to peer capacity.
+    ///
+    /// AC2: a leader-supplied Analytical entry (`slot_units = 2`, the real
+    /// producer value) succeeds on a capacity-1 dispatcher because the peer
+    /// clamps demand to 1. This is the exact defect condition (256 MiB Oracle
+    /// child derives running capacity 1) that previously rejected permanently.
+    #[test]
+    fn take_for_execute_clamps_analytical_demand_to_capacity_one() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let pending = registry
+            .reserve(
+                &reserve_request_analytical(query, leader, 17, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("pending analytical reservation");
+        let running = registry
+            .take_for_execute(pending.reservation_id, query, leader, 17, now)
+            .expect("clamped analytical demand admits on a capacity-1 peer");
+        assert_eq!(running.query_class, QueryClass::Analytical);
+        // The clamp charged exactly one running unit; none remain.
+        assert!(slots.try_running(1).is_err());
+        drop(running);
+        assert!(slots.try_running(1).is_ok());
+    }
+
+    /// `take_for_execute` never over-clamps on a peer with capacity for full demand.
+    ///
+    /// Negative control for AC2: a capacity-2 peer charges the full leader
+    /// demand of 2, proving the clamp only lowers demand that exceeds capacity.
+    #[test]
+    fn take_for_execute_charges_full_analytical_demand_on_capacity_two() {
+        let slots = Arc::new(OracleSlotManager::new(2, 2));
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let pending = registry
+            .reserve(
+                &reserve_request_analytical(query, leader, 19, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("pending analytical reservation");
+        let running = registry
+            .take_for_execute(pending.reservation_id, query, leader, 19, now)
+            .expect("full analytical demand admits on a capacity-2 peer");
+        // Both units were charged; no running capacity remains.
+        assert!(slots.try_running(1).is_err());
+        drop(running);
+    }
+
+    /// `take_for_execute` emits a structured warning when the clamped demand is rejected.
+    ///
+    /// AC3: on a capacity-1 peer already saturated by an in-flight query, the
+    /// clamped Analytical demand of 1 still cannot be admitted, so the path
+    /// emits the observable structured warning (stage, class, demand, running
+    /// capacity, running in use) before the unchanged retryable mapping. The
+    /// warning is captured with a minimal `tracing`-only probe.
+    #[test]
+    fn take_for_execute_rejection_emits_structured_warning() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let held = slots.try_running(1).expect("saturating running unit");
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let pending = registry
+            .reserve(
+                &reserve_request_analytical(query, leader, 23, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("pending analytical reservation");
+
+        let probe = RejectionWarnProbe::default();
+        let result = tracing::subscriber::with_default(probe.clone(), || {
+            registry.take_for_execute(pending.reservation_id, query, leader, 23, now)
+        });
+
+        // The wire mapping is byte-unchanged: a saturated peer stays retryable.
+        assert!(matches!(result, Err(DispatchError::Retryable)));
+
+        let fields = probe
+            .fields_for("oracle peer slot rejection")
+            .expect("rejection path emits the structured warning");
+        assert_eq!(
+            fields.get("stage").map(String::as_str),
+            Some("slot_reservation")
+        );
+        assert_eq!(
+            fields.get("query_class").map(String::as_str),
+            Some("Analytical")
+        );
+        assert_eq!(fields.get("demand").map(String::as_str), Some("1"));
+        assert_eq!(
+            fields.get("running_capacity").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(fields.get("running_in_use").map(String::as_str), Some("1"));
+        drop(held);
     }
 
     /// A mismatched execute cannot remove another leader's pending reservation.

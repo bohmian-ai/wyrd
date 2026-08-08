@@ -1124,6 +1124,119 @@ async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
     cluster.shutdown().await.expect("topology replan shutdown");
 }
 
+/// AC4: a distributed Analytical query admits at least one fragment to run on a
+/// non-leader peer.
+///
+/// Proves the peer-side schedulability clamp end to end on the multi-pod
+/// harness. Every harness Oracle child derives running capacity 1 (a 1 GiB pod
+/// yields a 256 MiB child, one 256 MiB memory slot, `min(cpu, 1)`), while an
+/// Analytical query carries the fixed per-node slot demand 2. Without the clamp
+/// in `take_for_execute`, every peer rejects the demand-2 reservation, every
+/// fragment falls back to the leader's local path, and each non-leader peer's
+/// successful-admission count stays zero even though the aggregate still returns
+/// correctly (the leader absorbs the work). With the clamp, demand is charged as
+/// 1 and at least one non-leader peer admits a fragment to run. The final
+/// assertion therefore fails without the fix and passes with it, which is why it
+/// is a real gate rather than a fan-out-only proxy.
+///
+/// The successful-admission counter is a `test-support` observable because the
+/// production fragment span carries locality but no outcome and the outcome
+/// metric carries no locality, so "a fragment executed successfully on a peer"
+/// is otherwise unobservable without a new production telemetry contract.
+///
+/// # Panics
+///
+/// Panics if the cluster, table registration, seeding, query, or aggregate
+/// value does not match the expected distributed Analytical journey.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_analytical_query_admits_fragment_on_non_leader_peer() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
+        .await
+        .expect("start Analytical admission cluster");
+    let server = cluster.server(0).expect("query leader");
+    let table = unique_table("oracle_analytical_admission");
+    register_table(server, cluster.data_tenant_id(), &table)
+        .await
+        .expect("analytical table");
+    let client = client(server, "oracle-analytical-admission")
+        .await
+        .expect("analytical client");
+    // 64 independent sealed files force the production planner past the
+    // single-fragment leader-only fast path (at most 16 files per fragment) into
+    // the real portable assignment that fans fragments onto non-leader peers.
+    for ordinal in 0..64 {
+        seed_foreign_hot_row(
+            &cluster,
+            cluster.data_tenant_id(),
+            &table,
+            cluster.data_tenant_id(),
+            &format!("analytical-{ordinal}"),
+        )
+        .await
+        .expect("independent sealed file");
+    }
+    // Freeze each node's membership cut so the leader's portable assignment sees
+    // the worker nodes as eligible and fans fragments onto them; without this the
+    // assigner's eligible set is the leader alone and every fragment runs local.
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("membership includes remote workers");
+    // COUNT(*) with no GROUP BY is an Aggregate, which the classifier maps to
+    // QueryClass::Analytical (fixed per-node slot demand 2) — the exact class the
+    // materializer visibility poll issues and the one the clamp governs. A plain
+    // scan would classify Interactive (demand 1) and schedule on capacity-1 peers
+    // even without the fix, so it could not gate this behavior.
+    let mut stream = QueryClient::new(&client)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT COUNT(*) AS total FROM vala.bifrost.{table}"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(20_000),
+        })
+        .await
+        .expect("analytical query opens");
+    let mut total: Option<i64> = None;
+    while let Some(batch) = stream.next_batch().await.expect("analytical batch") {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column is Int64");
+        total = Some(counts.value(0));
+    }
+    let terminal = stream.terminal().cloned().expect("analytical terminal");
+    assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
+    assert_eq!(total, Some(64), "aggregate must observe every sealed row");
+    // Only take_for_execute's success arm increments this counter, and the leader
+    // runs its own fragments through take_for_local_leader_execute (which never
+    // touches it). A non-zero sum across every peer therefore proves at least one
+    // fragment was admitted to run on a non-leader peer rather than falling back
+    // to the leader.
+    let peer_admissions: u64 = cluster
+        .servers()
+        .filter_map(|server| {
+            server
+                .state()
+                .oracle_peer
+                .as_ref()
+                .map(|peer| peer.worker().admitted_running_total())
+        })
+        .sum();
+    assert!(
+        peer_admissions >= 1,
+        "expected at least one Analytical fragment admitted on a non-leader peer, got {peer_admissions}"
+    );
+    cluster
+        .shutdown()
+        .await
+        .expect("analytical admission shutdown");
+}
+
 /// J-typed proves Vala's typed route enters the same Oracle cut as SQL.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]

@@ -475,12 +475,17 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
 /// Event time is governed by presence, identically for both payload modes: when
 /// the admitted batch already carries `wyrd_event_time` the caller value is
 /// first validated against the managed physical type (native path only), then
-/// checked against the bounded acceptance `window`, and — if accepted — preserved
-/// verbatim (kept in the user projection so it is written exactly once, never
-/// duplicated and never re-stamped); when the column is absent the server stamps
-/// `wyrd_event_time` with the ingest receipt time. `wyrd_ingested_at` is always
-/// the server receipt time regardless of caller event time. Projected payloads
-/// retain their correlation values unchanged.
+/// checked against the bounded acceptance `window`, and — if accepted — the
+/// column is removed from the user projection and its array is reinserted
+/// verbatim (never re-stamped) in the canonical managed slot by
+/// [`append_managed_columns`]; when the column is absent the server stamps
+/// `wyrd_event_time` with the ingest receipt time in that same slot. Either way
+/// `wyrd_event_time` is written exactly once and lands between `wyrd_request_id`
+/// and `wyrd_ingested_at`, so the stamped batch's full field order equals
+/// [`with_managed_columns`](crate::schema::with_managed_columns) in every payload
+/// mode (D88). `wyrd_ingested_at` is always the server receipt time regardless of
+/// caller event time. Projected payloads retain their remaining correlation
+/// values unchanged.
 ///
 /// The `window` check uses a single `receipt_micros` computed once at the
 /// entry of this function so an in-flight clock tick cannot split a batch
@@ -524,7 +529,18 @@ fn stamp_correlation_columns(
     if rows.schema().index_of(WYRD_EVENT_TIME).is_ok() {
         enforce_event_time_window(rows, window, receipt_micros)?;
     }
-    let stamp_event_time = rows.schema().index_of(WYRD_EVENT_TIME).is_err();
+    // A present `wyrd_event_time` (validated above for native payloads and
+    // window-checked above for both modes) is always lifted out of the user
+    // projection here and reinserted verbatim in the canonical managed slot by
+    // `append_managed_columns`, never re-stamped. When absent, the server stamps
+    // the receipt time into that slot instead. Decoupling "exclude from the user
+    // block" from "stamp the receipt value" keeps the stamped field order equal
+    // to `with_managed_columns` in every payload mode (D88).
+    let caller_event_time = rows
+        .schema()
+        .index_of(WYRD_EVENT_TIME)
+        .ok()
+        .map(|index| Arc::clone(rows.column(index)));
     let native_run_id = if native_payload {
         let schema = rows.schema();
         let matches = schema
@@ -548,7 +564,7 @@ fn stamp_correlation_columns(
     } else {
         None
     };
-    let server_owned = server_owned_columns(native_payload, stamp_event_time);
+    let server_owned = server_owned_columns(native_payload);
     let card_uids = resolve_card_uids(rows, principal, row_count)?;
     let mut fields = user_fields(rows, &server_owned);
     let mut columns = user_columns(rows, &server_owned);
@@ -573,7 +589,7 @@ fn stamp_correlation_columns(
         principal,
         batch_id,
         row_count,
-        stamp_event_time,
+        caller_event_time,
     )?;
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|_| ScribeError::InvalidFrame)
@@ -667,12 +683,12 @@ fn enforce_event_time_window(
     let hi = receipt_micros.saturating_add(future_micros);
     for idx in 0..array.len() {
         if array.is_null(idx) {
-            // Null values are tolerated here; the native path already rejects
-            // nulls in validate_native_event_time. Projected paths may
-            // legitimately carry nulls in other columns; a null event time
-            // on the projected path falls through to server stamping because
-            // stamp_event_time is presence-governed (schema-level, not
-            // value-level).
+            // The window check is value-level and only range-checks non-null
+            // values, so it tolerates nulls here. The native path already
+            // rejects nulls upstream in validate_native_event_time. A present
+            // projected event-time column is later lifted verbatim into the
+            // non-nullable canonical managed slot (D88), so a null value there
+            // fails batch construction rather than being range-checked.
             continue;
         }
         let value = array.value(idx);
@@ -689,28 +705,29 @@ fn enforce_event_time_window(
 
 /// Return physical columns excluded from user projection for one payload mode.
 ///
-/// The two switches are independent. `native_payload` governs only the inbound
+/// Every managed column is unconditionally excluded from the user projection and
+/// materialized in its canonical slot by [`append_managed_columns`], regardless
+/// of whether the caller supplied it. In particular `wyrd_event_time` is always
+/// excluded: when the caller supplied a valid value it is reinserted verbatim in
+/// the canonical slot, and when it is absent the server stamps the receipt time
+/// there. Decoupling exclusion from the value source keeps the stamped field
+/// order equal to [`with_managed_columns`](crate::schema::with_managed_columns)
+/// in every payload mode (D88). `native_payload` additionally governs the inbound
 /// `run_id` field, which native payloads relinquish so the canonical nullable
-/// physical `run_id` can be stamped exactly once. `stamp_event_time` governs
-/// only `wyrd_event_time`: it is excluded (and re-stamped by
-/// [`append_managed_columns`]) when the server owns the value, and retained in
-/// the user projection when the caller supplied a valid event time in either
-/// payload mode. Every remaining managed column is unconditionally server-owned
-/// and therefore always excluded from the user projection.
-fn server_owned_columns(native_payload: bool, stamp_event_time: bool) -> Vec<&'static str> {
+/// physical `run_id` can be stamped exactly once; projected payloads keep their
+/// `run_id` as correlation data in the user projection.
+fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
     let mut columns = vec![
         CARD_REF,
         CARD_UID,
         PRINCIPAL_ID,
         WYRD_REQUEST_ID,
+        WYRD_EVENT_TIME,
         WYRD_INGESTED_AT,
         WYRD_BATCH_ID,
         WYRD_ROW_ORDINAL,
         DATA_TENANT_ID,
     ];
-    if stamp_event_time {
-        columns.push(WYRD_EVENT_TIME);
-    }
     if native_payload {
         columns.push("run_id");
     }
@@ -773,12 +790,15 @@ fn resolve_card_uids(
 ///
 /// The receipt timestamp, batch id, row ordinal, tenant, card uid, principal,
 /// and request id are unconditionally server-owned and always appended here.
-/// `wyrd_ingested_at` is always the server receipt time. `stamp_event_time`
-/// selects only whether this function also materializes the canonical
-/// server-stamped `wyrd_event_time` column (receipt time): it is `true` when the
-/// admitted batch did not carry a caller event time, and `false` when a valid
-/// caller-supplied `wyrd_event_time` was already retained in the user
-/// projection and must not be duplicated or overwritten.
+/// `wyrd_ingested_at` is always the server receipt time. `wyrd_event_time` is
+/// always materialized in the canonical slot (between `wyrd_request_id` and
+/// `wyrd_ingested_at`), so the stamped field order equals
+/// [`with_managed_columns`](crate::schema::with_managed_columns) in every payload
+/// mode (D88). Only the event-time *value* varies: `caller_event_time` carries a
+/// valid caller-supplied array (already validated and window-checked, lifted out
+/// of the user projection) that is written verbatim exactly once and never
+/// re-stamped; when it is `None` the server stamps the receipt time into the same
+/// slot.
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] when the system clock precedes the UNIX
@@ -790,21 +810,17 @@ fn append_managed_columns(
     principal: &Principal,
     batch_id: uuid::Uuid,
     row_count: usize,
-    stamp_event_time: bool,
+    caller_event_time: Option<ArrayRef>,
 ) -> Result<(), ScribeError> {
     fields.extend([
         Field::new(CARD_UID, DataType::Utf8, true),
         Field::new(PRINCIPAL_ID, DataType::Utf8, false),
         Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
-    ]);
-    if stamp_event_time {
-        fields.push(Field::new(
+        Field::new(
             WYRD_EVENT_TIME,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
-        ));
-    }
-    fields.extend([
+        ),
         Field::new(
             WYRD_INGESTED_AT,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -827,9 +843,9 @@ fn append_managed_columns(
     let timestamp_array =
         Arc::new(TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"))
             as ArrayRef;
-    if stamp_event_time {
-        columns.push(Arc::clone(&timestamp_array));
-    }
+    // Event time lands in the canonical slot exactly once: the caller's array
+    // verbatim when supplied, otherwise the server receipt instant.
+    columns.push(caller_event_time.unwrap_or_else(|| Arc::clone(&timestamp_array)));
     columns.push(timestamp_array);
     let mut batch_id_builder = FixedSizeBinaryBuilder::with_capacity(row_count, 16);
     for _ in 0..row_count {
@@ -2065,6 +2081,190 @@ mod tests {
         let array =
             Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
         (field, array)
+    }
+
+    /// Field names of a stamped batch, in physical order.
+    fn stamped_field_names(batch: &RecordBatch) -> Vec<String> {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    /// The canonical managed field-name order for a single `value` user column.
+    fn canonical_managed_order() -> Vec<String> {
+        Schema::new(crate::schema::with_managed_columns(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]))
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+    }
+
+    /// D88: a stamped native payload that carries a valid caller `wyrd_event_time`
+    /// has the full canonical field order, with `wyrd_event_time` lifted out of
+    /// the user block into the managed slot (between `wyrd_request_id` and
+    /// `wyrd_ingested_at`) — the order the Oracle's pinned sealed-fragment
+    /// fingerprint requires. Before D88 the caller column stayed in the user block
+    /// and diverged from [`with_managed_columns`], breaking every sealed read.
+    #[test]
+    fn native_caller_event_time_lands_in_canonical_managed_slot() {
+        let (principal, card) = scoped_service_principal();
+        let (event_field, event_array) =
+            managed_event_time(vec![now_micros_offset(-60), now_micros_offset(-120)]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
+                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
+                event_array,
+            ],
+        );
+        let decoded = decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect("native caller event time is accepted");
+        assert_eq!(
+            stamped_field_names(&decoded),
+            canonical_managed_order(),
+            "caller event time must yield the canonical managed field order",
+        );
+    }
+
+    /// D88: a stamped native payload WITHOUT a caller `wyrd_event_time` (server
+    /// stamps receipt time) has the identical canonical field order — the
+    /// event-time value source does not perturb the physical layout.
+    #[test]
+    fn native_server_stamped_event_time_lands_in_canonical_managed_slot() {
+        let (principal, card) = scoped_service_principal();
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+            ],
+        );
+        let decoded = decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect("native ingest without event time is server-stamped");
+        assert_eq!(
+            stamped_field_names(&decoded),
+            canonical_managed_order(),
+            "server-stamped event time must yield the canonical managed field order",
+        );
+    }
+
+    /// D88: a stamped projected payload with a preserved caller `wyrd_event_time`
+    /// also produces the canonical managed field order (`run_id` retained as
+    /// correlation data, event time lifted into the managed slot).
+    #[test]
+    fn projected_preserved_event_time_lands_in_canonical_managed_slot() {
+        let (event_field, event_array) = managed_event_time(vec![now_micros_offset(-3600)]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new("run_id", DataType::Utf8, true),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![Some("client-run")])),
+                event_array,
+            ],
+        );
+        let decoded = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect("projected preserved event time is accepted");
+        assert_eq!(
+            stamped_field_names(&decoded),
+            canonical_managed_order(),
+            "projected preserved event time must yield the canonical managed field order",
+        );
+    }
+
+    /// D88: a caller-supplied event time is preserved verbatim in the canonical
+    /// slot and is never re-stamped — it is distinct from the receipt-time
+    /// `wyrd_ingested_at`, proving the managed slot holds the caller value, not a
+    /// server-stamped one.
+    #[test]
+    fn caller_event_time_value_is_verbatim_not_receipt_time() {
+        let (principal, card) = scoped_service_principal();
+        // A distinctive in-window instant well clear of "now" so it cannot
+        // coincide with the receipt timestamp stamped into wyrd_ingested_at.
+        let caller = now_micros_offset(-6 * 60 * 60);
+        let (event_field, event_array) = managed_event_time(vec![caller]);
+        let rows = batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(CARD_REF, DataType::Utf8, false),
+                event_field,
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec![card.to_string()])),
+                event_array,
+            ],
+        );
+        let decoded = decode(
+            ipc_payload(&rows),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+        )
+        .expect("native caller event time is accepted");
+        let event = decoded
+            .column_by_name(WYRD_EVENT_TIME)
+            .expect("event time column present")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("event time is TimestampMicrosecond");
+        assert_eq!(
+            event.value(0),
+            caller,
+            "caller event time is preserved verbatim"
+        );
+        let ingested = decoded
+            .column_by_name(WYRD_INGESTED_AT)
+            .expect("ingested_at column present")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("ingested_at is TimestampMicrosecond");
+        assert_ne!(
+            event.value(0),
+            ingested.value(0),
+            "caller event time must not be re-stamped with the receipt time",
+        );
     }
 
     /// A native payload MAY carry a valid caller `wyrd_event_time`: its values

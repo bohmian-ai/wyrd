@@ -47,9 +47,29 @@ pub enum ForgeError {
     /// Prepared or terminal durable state could not be reconciled safely.
     #[error("Forge reconciliation failed: {detail}")]
     Reconciliation { detail: String },
-    /// Cancellation stopped work at a bounded stage or batch boundary.
+    /// Cancellation stopped work at a bounded stage or batch boundary *before*
+    /// any durable side effect, so the claim is safe to release.
+    ///
+    /// This is the pre-effect shutdown marker. `run_slot`'s error path drains
+    /// such a claim through `release_cancelled_claim`, whose SQL guard matches
+    /// only `claimed`/`running` rows for the owner and attempt; a claim that has
+    /// since advanced to `prepared` therefore no-matches and is retained anyway,
+    /// so routing every plain `Shutdown` through release is safe.
     #[error("Forge scheduler was shut down")]
     Shutdown,
+    /// Cancellation stopped work *after* a durable side effect committed
+    /// (a fresh catalog commit or a recovered committed snapshot), so the claim
+    /// is conservatively retained for evidence-based or lease-expiry recovery
+    /// rather than released.
+    ///
+    /// This is the post-effect shutdown marker. It exists so `run_slot` can
+    /// distinguish a committed-but-not-finalized claim, whose row is still
+    /// `running` and would otherwise be matched and wrongly released by
+    /// `release_cancelled_claim`, from the pre-effect [`ForgeError::Shutdown`]
+    /// case. It carries the same internal control-flow meaning as `Shutdown`
+    /// (never a public error) and only changes the retain-vs-release decision.
+    #[error("Forge scheduler was shut down after a durable effect")]
+    ShutdownRetained,
     /// A configured external-operation timeout elapsed.
     #[error("Forge {operation} timed out")]
     Timeout { operation: &'static str },

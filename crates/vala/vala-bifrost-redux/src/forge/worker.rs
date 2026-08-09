@@ -792,12 +792,17 @@ impl ForgeWorker {
 
     /// Claims and executes work serially for one bounded pool slot.
     ///
-    /// When cooperative shutdown is observed after a claim is taken but before
-    /// execution begins, the just-claimed task is released to `retryable` via
-    /// [`Self::release_cancelled_claim`] so a clean shutdown drains
-    /// `forge_active_claims` to zero, then the slot exits like the loop-top
-    /// shutdown check. No pre-effect durable work was performed, so a successor
-    /// reclaims the released task losslessly.
+    /// This slot owns the single in-execution release seam for cooperative
+    /// shutdown. Two windows drain a just-claimed task to `retryable` through
+    /// [`Self::release_cancelled_claim`] so a clean shutdown drives
+    /// `forge_active_claims` to zero: the pre-execution window, when shutdown is
+    /// observed after a claim is taken but before execution begins; and the
+    /// in-execution window, when [`Self::execute_claim`] returns
+    /// [`ForgeError::Shutdown`] because a pre-effect checkpoint fired before any
+    /// durable side effect. Both cases performed no durable work, so a successor
+    /// reclaims the released task losslessly. A post-effect cancellation instead
+    /// returns [`ForgeError::ShutdownRetained`] and is retained here for
+    /// evidence-based and lease-expiry recovery, never released.
     ///
     /// # Errors
     ///
@@ -854,6 +859,10 @@ impl ForgeWorker {
                 continue;
             };
             let task_id = claim.task_id;
+            // Capture the attempt generation before `execute_claim` consumes the
+            // claim, so the post-execution release arm below can address the
+            // exact owner+attempt row without re-fetching it.
+            let attempt_id = claim.attempt_id;
             if let Some(observer) = &self.completion_observer {
                 observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
                     task_id,
@@ -883,7 +892,8 @@ impl ForgeWorker {
             match result {
                 Ok(()) => self.record_completion(task_id, strategy),
                 Err(error) => {
-                    tracing::warn!(worker = %self.owner, error = %error, "Forge task execution stopped; durable state retained for recovery");
+                    self.settle_cancelled_claim(task_id, attempt_id, &error)
+                        .await;
                 }
             }
         }
@@ -1051,6 +1061,81 @@ impl ForgeWorker {
             Ok(()) | Err(vala_sql::SqlError::Conflict { .. }) => Ok(()),
             Err(error) => Err(ForgeError::Sql(error)),
         }
+    }
+
+    /// Applies the supervised slot's single in-execution cooperative-shutdown
+    /// settlement to a failed [`Self::execute_claim`] result.
+    ///
+    /// This is the one owner of the in-execution release decision for the whole
+    /// claim lifecycle (`run_slot` is its only production caller): the baseline
+    /// per-checkpoint release inside `execute_fenced` was migrated here so a
+    /// checkpoint only classifies the cancellation and the slot alone decides
+    /// retain-vs-release. A pre-effect [`ForgeError::Shutdown`] fired before any
+    /// durable side effect, so the claim drains through the single
+    /// [`Self::release_cancelled_claim`] seam; its SQL guard matches only
+    /// `claimed`/`running` rows for this owner and attempt, so a claim that has
+    /// since advanced to `prepared` no-matches and is conservatively retained
+    /// for lease-expiry recovery. Every other outcome — a post-effect
+    /// [`ForgeError::ShutdownRetained`] whose durable effect already committed,
+    /// or any genuine execution error — is retained here for evidence-based and
+    /// lease-expiry recovery, never released. A transiently failed release logs
+    /// and falls back to the same retention path.
+    ///
+    /// # Panics
+    ///
+    /// Never panics; a release failure is logged and the claim is retained.
+    async fn settle_cancelled_claim(
+        &self,
+        task_id: Uuid,
+        attempt_id: Option<Uuid>,
+        error: &ForgeError,
+    ) {
+        match error {
+            ForgeError::Shutdown => {
+                if let Some(attempt) = attempt_id
+                    && let Err(release_error) = self.release_cancelled_claim(task_id, attempt).await
+                {
+                    tracing::warn!(worker = %self.owner, task_id = %task_id, error = %release_error, "Forge claim shutdown release failed; durable state retained for lease recovery");
+                }
+            }
+            error => {
+                tracing::warn!(worker = %self.owner, error = %error, "Forge task execution stopped; durable state retained for recovery");
+            }
+        }
+    }
+
+    /// Executes one planted claim and applies the supervised slot's cooperative
+    /// shutdown settlement, exactly as [`Self::run_slot`] does after
+    /// [`Self::execute_claim`].
+    ///
+    /// This narrow seam lets an integration test drive the migrated single
+    /// release decision ([`Self::settle_cancelled_claim`]) directly against one
+    /// claim — proving pre-effect drain-to-`retryable` and post-effect retention
+    /// — without standing up the full supervised [`Self::run`] loop and its
+    /// claim-fair scheduling. It composes the same production methods in the
+    /// same order the slot uses, so it exercises the real seam rather than a
+    /// reimplementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`Self::execute_claim`] result unchanged: a
+    /// pre-effect cancellation still surfaces [`ForgeError::Shutdown`] after the
+    /// claim has been drained, and a post-effect cancellation surfaces
+    /// [`ForgeError::ShutdownRetained`] with the claim retained.
+    #[cfg(feature = "test-support")]
+    pub async fn execute_and_settle_claim_for_test(
+        &self,
+        claim: ForgeTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let task_id = claim.task_id;
+        let attempt_id = claim.attempt_id;
+        let result = self.execute_claim(claim, shutdown).await;
+        if let Err(error) = &result {
+            self.settle_cancelled_claim(task_id, attempt_id, error)
+                .await;
+        }
+        result
     }
 
     /// Executes one exact claimed task through validation, table fencing,
@@ -1572,11 +1657,14 @@ impl ForgeWorker {
     ///
     /// A cooperative cancellation observed before the durable effect (dispatch
     /// stopped mid-rewrite before its catalog commit, or a maintenance task
-    /// stopped before its `prepared()` boundary) releases the claim to
-    /// `retryable` via [`Self::release_cancelled_claim`] before returning
-    /// [`ForgeError::Shutdown`], draining the active-claim count for a clean
-    /// shutdown. A cancellation observed after the durable effect leaves the
-    /// claim retained for evidence-based recovery and is not released.
+    /// stopped before its `prepared()` boundary) propagates unchanged as
+    /// [`ForgeError::Shutdown`]; the caller [`Self::run_slot`] owns the single
+    /// release seam and drains the claim to `retryable` through
+    /// [`Self::release_cancelled_claim`] for a clean shutdown. A cancellation
+    /// observed after the durable effect — the fresh catalog commit or recovered
+    /// committed snapshot below, whose task row is still `running` — instead
+    /// returns [`ForgeError::ShutdownRetained`] so `run_slot` retains it for
+    /// evidence-based recovery rather than releasing it.
     ///
     /// # Errors
     ///
@@ -1679,15 +1767,18 @@ impl ForgeWorker {
         };
         // A pre-effect cancellation surfaces as `execution == Err(Shutdown)`
         // (dispatch stopped mid-rewrite before its catalog commit, or a
-        // maintenance task stopped before its `prepared()` boundary). The
-        // post-effect cancellation at the check below instead leaves `execution`
-        // `Ok` with the durable effect already committed, so it is excluded from
-        // release and stays retained for evidence-based recovery.
-        let pre_effect_shutdown = matches!(execution, Err(ForgeError::Shutdown));
+        // maintenance task stopped before its `prepared()` boundary) and
+        // propagates unchanged as `ForgeError::Shutdown`, which the single
+        // `run_slot` release seam drains through `release_cancelled_claim`. The
+        // post-effect cancellation at the check below instead has a durable
+        // effect already committed while its task row is still `running`, so it
+        // propagates as `ForgeError::ShutdownRetained` to keep `run_slot` from
+        // matching and releasing it; it stays retained for evidence-based and
+        // lease-expiry recovery.
         let completion = async {
             let evidence = execution?;
             if operation_stop.is_cancelled() {
-                return Err(ForgeError::Shutdown);
+                return Err(ForgeError::ShutdownRetained);
             }
             Ok(evidence)
         }
@@ -1697,9 +1788,6 @@ impl ForgeWorker {
             detail: format!("Forge claim heartbeat panicked: {error}"),
         })?;
         heartbeat_result?;
-        if pre_effect_shutdown {
-            self.release_cancelled_claim(claim.task_id, attempt).await?;
-        }
         let (evidence, state) = completion?;
         self.record_rewrite_evidence(claim, &evidence);
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)

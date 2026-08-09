@@ -3828,9 +3828,11 @@ mod pg_tests {
     /// a successor reclaims it immediately without waiting for lease expiry and
     /// completes it exactly once.
     ///
-    /// This is the in-flight (`execute_fenced`) pre-effect drain: the rewrite has
-    /// written a real output PUT but not committed to the catalog, so releasing
-    /// the claim is lossless.
+    /// This is the in-flight (`execute_fenced`) pre-effect drain, re-proven
+    /// through the migrated single release seam: the rewrite has written a real
+    /// output PUT but not committed to the catalog, so the supervised slot's
+    /// [`ForgeWorker::execute_and_settle_claim_for_test`] settlement — the same
+    /// `run_slot` release decision — drains the claim losslessly.
     ///
     /// # Panics
     ///
@@ -3848,7 +3850,7 @@ mod pg_tests {
         let execution = tokio::spawn({
             let worker = fixture.worker.clone();
             let stop = stop.clone();
-            async move { worker.execute_claim(claim, &stop).await }
+            async move { worker.execute_and_settle_claim_for_test(claim, &stop).await }
         });
         tokio::time::timeout(Duration::from_secs(30), fixture.reads.wait_for_output_put())
             .await
@@ -3895,6 +3897,77 @@ mod pg_tests {
         assert_eq!(
             succeeded, 1,
             "the pre-effect attempt must not commit a duplicate terminal"
+        );
+    }
+
+    /// A cooperative shutdown observed after a maintenance operation's durable
+    /// effect retains the claim through the migrated single release seam instead
+    /// of releasing it.
+    ///
+    /// The maintenance dispatch observes the authority token, not the
+    /// shutdown-sensitive `operation_stop`, so a graceful shutdown lets the
+    /// operation commit its durable effect and reach `prepared`; the post-effect
+    /// checkpoint then surfaces [`ForgeError::ShutdownRetained`]. The supervised
+    /// slot's settlement must NOT match the pre-effect release guard: the claim
+    /// stays `prepared` and counted as active for evidence-based and
+    /// lease-expiry recovery. This is the post-effect complement to
+    /// [`worker_active_shutdown_releases_retryable_then_successor_reclaims`],
+    /// driven through the same
+    /// [`ForgeWorker::execute_and_settle_claim_for_test`] seam.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the maintenance boundary is not reached, the post-effect
+    /// result is not [`ForgeError::ShutdownRetained`], the durable state is not
+    /// the retained `prepared`, or the active-claim count is not the retained
+    /// single claim.
+    #[tokio::test]
+    async fn worker_post_effect_shutdown_retains_claim_via_settlement() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let claim = prepare_maintenance_claim(&fixture).await;
+        let task_id = claim.task_id;
+        let controls = fixture.forge.maintenance_controls_for_test();
+        controls.arm_manifest_submission();
+        let stop = CancellationToken::new();
+        let execution = tokio::spawn({
+            let worker = fixture.worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_and_settle_claim_for_test(claim, &stop).await }
+        });
+        tokio::pin!(execution);
+        let arrival = async { controls.wait_manifest_submission().await };
+        tokio::pin!(arrival);
+        tokio::select! {
+            () = &mut arrival => {}
+            result = &mut execution => {
+                panic!("maintenance returned before catalog boundary: {result:?}")
+            }
+        }
+        stop.cancel();
+        controls.release_manifest_submission();
+        let result = (&mut execution).await.expect("post-effect worker join");
+        assert!(
+            matches!(result, Err(ForgeError::ShutdownRetained)),
+            "a post-effect shutdown must surface ShutdownRetained: {result:?}"
+        );
+        let (state, active) = task_state_and_active_claims(&fixture, task_id).await;
+        assert_eq!(
+            state, "prepared",
+            "a post-effect shutdown must retain the durable prepared state, never release it"
+        );
+        assert_eq!(
+            active, 1,
+            "retaining the post-effect claim must keep it counted as an active claim"
         );
     }
 

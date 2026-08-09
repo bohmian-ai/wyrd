@@ -64,6 +64,20 @@ VALA_MIXED_EXECUTOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/forge_tasks.rs",
 }
 
+# Cohesive owners that expose a narrow tenant-bound capability through a struct
+# that owns a verified `tenant: DataTenantId` and re-establishes the tenant RLS
+# boundary by executing `BIND_CURRENT_TENANT_SQL` before it writes, instead of
+# taking a `TenantConn`. This is the fenced-operator audit path: a Forge worker
+# appends audit evidence on the operator transaction it already holds, so the
+# capability binds the current tenant on that shared connection rather than
+# threading a separate TenantConn. Entries must still satisfy both shape rules:
+# every public async fn either takes a `TenantConn<'_>` or is a method of the
+# tenant-owning capability struct, and the module must execute
+# `BIND_CURRENT_TENANT_SQL`.
+VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/audit_outbox.rs",
+}
+
 # Vala tables that are intentionally cross-tenant control-plane surfaces with no
 # tenant column and NO RLS (accessed only via the OperatorPool). They are
 # exempt from the RLS-triple requirement because there is no `data_tenant_id`
@@ -292,24 +306,74 @@ def check_vala_query_modules(failures: list[str]) -> None:
                     )
             continue
 
+        if relative in VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST:
+            if "BIND_CURRENT_TENANT_SQL" not in code:
+                failures.append(
+                    f"{relative}: tenant-bound capability module must execute BIND_CURRENT_TENANT_SQL to re-establish the RLS boundary"
+                )
+            owns_tenant_field = re.search(
+                r"struct\s+\w+[^{]*\{[^}]*tenant:\s*DataTenantId", code, re.DOTALL
+            ) is not None
+            for fn_name, params in public_async_fns(code):
+                if (
+                    "TenantConn<'_" not in params
+                    and "TenantConn < '_" not in params
+                    and not (owns_tenant_field and "self" in params)
+                ):
+                    failures.append(
+                        f"{relative}: tenant-bound public async fn {fn_name} must take TenantConn or be a method of a struct owning tenant: DataTenantId"
+                    )
+            check_tenant_query_file(
+                relative,
+                body,
+                code,
+                failures,
+                allow_operator_transaction=True,
+                exempt_tenant_conn_param=True,
+            )
+            continue
+
         check_tenant_query_file(relative, body, code, failures)
 
 
 def check_tenant_query_file(
-    relative: str, body: str, code: str, failures: list[str]
+    relative: str,
+    body: str,
+    code: str,
+    failures: list[str],
+    *,
+    allow_operator_transaction: bool = False,
+    exempt_tenant_conn_param: bool = False,
 ) -> None:
-    if re.search(r"&\s*PgPool\b|\bPgPool\s*,|Transaction\s*<\s*'_", code):
+    """Run every tenant-query SQL rule against one module.
+
+    `allow_operator_transaction` and `exempt_tenant_conn_param` suppress only the
+    two rules a tenant-bound capability legitimately replaces with its own shape
+    guarantees (see `VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST`): a capability that
+    holds the caller's operator transaction is permitted a `Transaction<'_>`
+    parameter, and its public async fns are methods of a tenant-owning struct
+    rather than `TenantConn` takers. Every other rule — the raw-`PgPool`
+    prohibition, the self-opened-transaction prohibition, the tenant-predicate
+    requirement, and the raw-query justification — still runs unchanged.
+    """
+    pool_pattern = (
+        r"&\s*PgPool\b|\bPgPool\s*,"
+        if allow_operator_transaction
+        else r"&\s*PgPool\b|\bPgPool\s*,|Transaction\s*<\s*'_"
+    )
+    if re.search(pool_pattern, code):
         failures.append(
             f"{relative}: tenant query module must not take raw PgPool/Transaction"
         )
     if re.search(r"\.begin\s*\(", code):
         failures.append(f"{relative}: tenant query module must not open transactions")
 
-    for fn_name, params in public_async_fns(code):
-        if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
-            failures.append(
-                f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>"
-            )
+    if not exempt_tenant_conn_param:
+        for fn_name, params in public_async_fns(code):
+            if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
+                failures.append(
+                    f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>"
+                )
 
     if references_tenant_schema(code) and not (
         re.search(r"data_tenant_id\s*=\s*\$", code)

@@ -75,10 +75,13 @@ if [ -n "$forbidden_skald_prompt" ]; then
   exit 1
 fi
 
+# `wyrd-tls` joins the locked foundation set: it is a client-safe crypto crate
+# (rustls + thiserror only, no server, database, storage, cloud, or async-runtime
+# deps) that a Skald member may pull transitively via skald-providers.
 for crate in skald-agent skald-workflow skald-tool skald-runtime; do
   forbidden_skald_member=$(cargo tree -p "$crate" --all-features -e normal | \
     rg '(^|[ ─└├])(wyrd-|vala-)' | \
-    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-semver|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive)' || true)
+    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-semver|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive|wyrd-tls)' || true)
   if [ -n "$forbidden_skald_member" ]; then
     echo "FAIL: $crate pulls forbidden Wyrd/Vala deps outside the locked foundation set:"
     echo "$forbidden_skald_member"
@@ -92,6 +95,7 @@ if rg -n 'wyrd_spec|wyrd-' crates/skald \
   --glob '!crates/skald/skald-agent/**' \
   --glob '!crates/skald/skald-agent/Cargo.toml' \
   --glob '!crates/skald/skald-tool/Cargo.toml' \
+  --glob '!crates/skald/skald-providers/Cargo.toml' \
   --glob '!crates/skald/skald-workflow/**'; then
   echo 'Skald engine crates must remain free of Wyrd references outside locked boundary crates'
   exit 1

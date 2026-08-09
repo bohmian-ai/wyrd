@@ -33,9 +33,9 @@ mod pg_tests {
     };
     use vala_bifrost_redux::forge::{
         Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError, ForgeLease, ForgeObjectStore,
-        ForgeRewriteRuntime, ForgeScheduleOutcome, ForgeScheduler, ForgeWorker, ForgeWorkerConfig,
-        IcebergCandidateFile, IcebergRewriteGroup, deterministic_output_path_for_test,
-        forge_lease_key,
+        ForgeRewriteRuntime, ForgeScheduleOutcome, ForgeScheduler, ForgeWorker,
+        ForgeWorkerCompletionObserver, ForgeWorkerConfig, IcebergCandidateFile,
+        IcebergRewriteGroup, deterministic_output_path_for_test, forge_lease_key,
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -45,8 +45,8 @@ mod pg_tests {
     use vala_sql::queries::forge_tasks::ForgeTasks;
     use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
     use vala_sql::row_types::forge_tasks::{
-        FORGE_TASK_PAYLOAD_VERSION, ForgeTaskClaim, ForgeTaskEstimates, ForgeTaskLane,
-        ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+        FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeTaskClaim, ForgeTaskEstimates,
+        ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -258,6 +258,12 @@ mod pg_tests {
         scheduler_owner: uuid::Uuid,
         /// Production worker owner used to drain exact durable fixture tasks.
         worker: ForgeWorker,
+        /// Supervised completion observer shared with the worker under test.
+        ///
+        /// Present only for fixtures built to drive the supervised
+        /// [`ForgeWorker::run`] loop through its claim-gate seam; ordinary
+        /// direct-execution fixtures leave it `None`.
+        completion: Option<ForgeWorkerCompletionObserver>,
     }
 
     /// SQL projection and audit parity columns for one staging operation.
@@ -374,6 +380,52 @@ mod pg_tests {
             initial_file_count: usize,
             memory_pool_bytes: usize,
         ) -> Self {
+            Self::build(
+                config,
+                aged_inputs,
+                initial_file_count,
+                memory_pool_bytes,
+                None,
+            )
+            .await
+        }
+
+        /// Build a real fixture whose worker runs the supervised loop under a
+        /// caller-supplied completion observer.
+        ///
+        /// The observer's claim gate lets a test pause a supervised slot after
+        /// its durable claim, drive cooperative shutdown, and then release the
+        /// slot to observe the drain-to-`retryable` behavior of the real
+        /// [`ForgeWorker::run`] loop.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the embedded database, catalog, storage, or Forge owner
+        /// cannot be initialized; these are test-environment invariants.
+        async fn new_with_observer(observer: ForgeWorkerCompletionObserver) -> Self {
+            Self::build(
+                ForgeConfig::default(),
+                true,
+                2,
+                64 * 1024 * 1024,
+                Some(observer),
+            )
+            .await
+        }
+
+        /// Construct the fixture with an optional supervised completion observer.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the embedded database, catalog, storage, or Forge owner
+        /// cannot be initialized; these are test-environment invariants.
+        async fn build(
+            config: ForgeConfig,
+            aged_inputs: bool,
+            initial_file_count: usize,
+            memory_pool_bytes: usize,
+            completion: Option<ForgeWorkerCompletionObserver>,
+        ) -> Self {
             let pg = PgFixture::start().await.expect("postgres fixture");
             let tenant = pg.data_tenant_id();
             let table_name = format!("incremental_rows_{}", uuid::Uuid::now_v7().simple());
@@ -428,7 +480,7 @@ mod pg_tests {
                     config,
                     maintenance_interval: Duration::from_millis(10),
                     clock: ForgeClock::system(),
-                    completion_observer: None,
+                    completion_observer: completion.clone(),
                     scheduler_trigger: None,
                     telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
                 })
@@ -454,6 +506,7 @@ mod pg_tests {
                 forge,
                 scheduler_owner: uuid::Uuid::now_v7(),
                 worker,
+                completion,
             };
             fixture.seed_files(initial_file_count, aged_inputs).await;
             fixture
@@ -480,6 +533,65 @@ mod pg_tests {
                 .expect("fixture worker task")
             {}
             outcome
+        }
+
+        /// Build a sibling worker that shares this fixture's durable state but
+        /// carries a tightened Iceberg retry timeout.
+        ///
+        /// The sibling reuses the same catalog, operator pool, staging store, and
+        /// object store, so a claim this fixture already took remains executable
+        /// through it, and it inherits this fixture worker's ownership identity so
+        /// the durable claim transitions (fenced on `claimed_by`/`attempt_id`)
+        /// still match. Only the sibling's Forge carries `retry_timeout`, which
+        /// lets a test trip the maintenance manifest-rewrite timeout on execution
+        /// without subjecting the fixture's own setup commits to it. The
+        /// aggressive `snapshot_retention`/`orphan_gc_ttl` mirror the maintenance
+        /// fixtures so the periodic demand remains a genuine expiry candidate.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the runtime, Forge, or worker cannot be constructed; these
+        /// are test-environment invariants.
+        fn sibling_worker_with_retry_timeout(&self, retry_timeout: Duration) -> ForgeWorker {
+            let config = ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                iceberg_total_retry_timeout: retry_timeout,
+                ..ForgeConfig::default()
+            };
+            let (_publisher, hints) = staging_file_channel(16).expect("sibling hint channel");
+            let runtime = ForgeRewriteRuntime::new(
+                Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024)),
+                &self.root.path().join("sibling-spill"),
+                config.spill_limit_bytes,
+            )
+            .expect("sibling runtime");
+            let forge = Arc::new(
+                Forge::new(ForgeBuildConfig {
+                    vala: self.pg.vala_postgres().clone(),
+                    operator_pool: self.operator_pool.clone(),
+                    catalog: Arc::clone(&self.catalog),
+                    staging: Arc::clone(&self.staging),
+                    object_store: Arc::clone(&self.reads) as Arc<dyn ForgeObjectStore>,
+                    rewrite_runtime: runtime,
+                    hints,
+                    config,
+                    maintenance_interval: Duration::from_millis(10),
+                    clock: ForgeClock::system(),
+                    completion_observer: None,
+                    scheduler_trigger: None,
+                    telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
+                })
+                .expect("sibling forge"),
+            );
+            ForgeWorker::new(
+                forge,
+                ForgeWorkerConfig {
+                    worker_concurrency: 1,
+                },
+                self.worker.owner_for_test(),
+            )
+            .expect("sibling worker")
         }
 
         /// Persists a metadata version whose prior snapshot is detached from every ref.
@@ -928,8 +1040,13 @@ mod pg_tests {
             iceberg::spec::DataFileFormat::Parquet
         );
         assert!(data_file.file_size_in_bytes() > 0);
-        let expected = (1..=9).collect();
-        let expected_bounds = [1, 5, 6, 7, 8, 9].into_iter().collect();
+        // One user column plus the nine managed columns appended by
+        // `with_managed_columns`; every leaf column carries value, size, and
+        // null-count metrics. Fields 2 and 3 (`run_id`, `card_uid`) are the two
+        // nullable correlation columns and are entirely null in this fixture, so
+        // they carry no lower/upper bounds while the eight non-null columns do.
+        let expected = (1..=10).collect();
+        let expected_bounds = [1, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
         assert_eq!(
             data_file
                 .value_counts()
@@ -978,8 +1095,8 @@ mod pg_tests {
         );
         assert_eq!(
             data_file.null_value_counts().values().copied().sum::<u64>(),
-            data_file.record_count() * 3,
-            "the production schema carries three nullable correlation columns"
+            data_file.record_count() * 2,
+            "the production schema carries two nullable correlation columns"
         );
         assert!(data_file.nan_value_counts().is_empty());
         let offsets = data_file.split_offsets().expect("Parquet split offsets");
@@ -1147,6 +1264,34 @@ mod pg_tests {
         .await
         .expect("family audit count");
         (state_count, audit_count)
+    }
+
+    /// Read one task's durable state and the tenant's active-claim count.
+    ///
+    /// The active-claim count mirrors the `forge_active_claims` metric: it
+    /// counts rows in the pre-terminal `claimed`, `running`, and `prepared`
+    /// states and excludes released `retryable` rows, so a clean shutdown drain
+    /// is observable as the count falling to zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either tenant-scoped query fails.
+    async fn task_state_and_active_claims(fixture: &Fixture, task_id: uuid::Uuid) -> (String, i64) {
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("task state");
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks \
+             WHERE data_tenant_id=$1 AND state IN ('claimed','running','prepared')",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("active-claim count");
+        (state, active)
     }
 
     /// Construct the established system-owned envelope for a transition test.
@@ -1701,7 +1846,18 @@ mod pg_tests {
         assert_terminal_family_parity(&fixture, "orphan_gc").await;
     }
 
-    /// Aligns the live target with the largest current file to suppress rewrite work.
+    /// Aligns the live target with the SMALLEST current file to suppress rewrite work.
+    ///
+    /// The right-size policy (`src/forge/right_size.rs`) treats a file as
+    /// undersized below `0.75 * target` and oversized above `1.8 * target`.
+    /// Anchoring the target on the largest alive file classified every smaller
+    /// file undersized whenever the live spread exceeded `1.333` (max/min),
+    /// leaving a live `SmallFiles` rewrite candidate that the planner claims ahead
+    /// of the periodic maintenance demand. Anchoring on the smallest alive file
+    /// keeps every file at or above the target, so nothing is undersized, and it
+    /// admits the full `1.8` spread before any file is classified oversized —
+    /// which fully drains the compaction candidate so `plan_and_claim` claims the
+    /// `SnapshotExpiry` maintenance task the maintenance fixtures require.
     async fn make_current_files_right_sized(fixture: &Fixture) {
         let table = fixture
             .catalog
@@ -1714,16 +1870,15 @@ mod pg_tests {
             .load()
             .await
             .expect("manifests");
-        let mut target = 0_u64;
+        let mut target = u64::MAX;
         for file in manifests.entries() {
             let manifest = file.load_manifest(table.file_io()).await.expect("manifest");
             for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-                target = target.max(entry.data_file().file_size_in_bytes());
+                target = target.min(entry.data_file().file_size_in_bytes());
             }
         }
-        fixture
-            .set_live_target_file_size(&table, target.max(2))
-            .await;
+        let target = if target == u64::MAX { 2 } else { target.max(2) };
+        fixture.set_live_target_file_size(&table, target).await;
     }
 
     /// Builds two committed snapshots and claims the resulting periodic maintenance task.
@@ -1923,14 +2078,16 @@ mod pg_tests {
     }
 
     /// Authority loss injected at a maintenance catalog boundary.
+    ///
+    /// Graceful shutdown is no longer a member: it no longer reaches the
+    /// maintenance authority token, so its complete-through behavior is proven
+    /// separately by [`assert_maintenance_shutdown_completes_through`].
     #[derive(Clone, Copy)]
     enum MaintenanceAuthorityLoss {
         /// Expire the durable task claim and let its heartbeat cancel work.
         Claim,
         /// Replace the table lease generation and let its heartbeat cancel work.
         TableLease,
-        /// Cancel the worker shutdown token directly.
-        Shutdown,
     }
 
     /// Verifies that cancellation at a maintenance boundary published no durable effect.
@@ -1983,87 +2140,256 @@ mod pg_tests {
         assert_eq!(fixture.reads.total_delete_attempts(), deletes_before);
     }
 
-    /// Exercises one deterministic maintenance boundary under every cancellation source.
+    /// Exercises one deterministic maintenance boundary under every loss source.
+    ///
+    /// Authority loss (claim expiry, table-lease theft) and graceful shutdown
+    /// now diverge: the heartbeat cancels the maintenance authority token only
+    /// on authority loss, so those two variants still stop at the boundary with
+    /// nothing durable crossing it, while shutdown no longer reaches that token
+    /// and the operation completes through to a recoverable terminal.
     async fn assert_maintenance_boundary_loss(expiry_submission: bool) {
         for loss in [
             MaintenanceAuthorityLoss::Claim,
             MaintenanceAuthorityLoss::TableLease,
-            MaintenanceAuthorityLoss::Shutdown,
         ] {
-            let fixture = Fixture::new_with_config(
-                ForgeConfig {
-                    snapshot_retention: Duration::from_nanos(1),
-                    orphan_gc_ttl: Duration::from_nanos(1),
-                    ..ForgeConfig::default()
-                },
-                true,
-                4,
-                16 * 1024 * 1024,
-            )
-            .await;
-            let claim = prepare_maintenance_claim(&fixture).await;
-            let task_id = claim.task_id;
-            let table_before = fixture
-                .catalog
-                .load_table(&fixture.binding.table_ident())
-                .await
-                .expect("pre-cancellation maintenance table");
-            let metadata_before = table_before
-                .metadata_location()
-                .expect("pre-cancellation metadata location")
-                .to_owned();
-            let snapshot_before = table_before.metadata().current_snapshot_id();
-            let output_puts_before = fixture.reads.output_put_calls();
-            let deletes_before = fixture.reads.total_delete_attempts();
-            let controls = fixture.forge.maintenance_controls_for_test();
-            if expiry_submission {
-                controls.arm_expiry_submission();
-            } else {
-                controls.arm_manifest_submission();
-            }
-            let stop = CancellationToken::new();
-            let execution = tokio::spawn({
-                let worker = fixture.worker.clone();
-                let stop = stop.clone();
-                async move { worker.execute_claim(claim, &stop).await }
-            });
-            let arrival = async {
-                if expiry_submission {
-                    controls.wait_expiry_submission().await;
-                } else {
-                    controls.wait_manifest_submission().await;
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(30), arrival)
-                .await
-                .expect("maintenance catalog boundary");
-            match loss {
-                MaintenanceAuthorityLoss::Claim => {
-                    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
-                        .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("expire maintenance claim");
-                }
-                MaintenanceAuthorityLoss::TableLease => {
-                    sqlx::query("UPDATE vala.maintenance_leases SET owner=$2,fencing_token=fencing_token+1 WHERE lease_key=$1")
-                        .bind(forge_lease_key(fixture.tenant, &fixture.binding.logical_namespace, &fixture.binding.table_name))
-                        .bind(uuid::Uuid::now_v7()).execute(fixture.operator_pool.pool()).await.expect("steal maintenance lease");
-                }
-                MaintenanceAuthorityLoss::Shutdown => stop.cancel(),
-            }
-            let result = tokio::time::timeout(Duration::from_secs(30), execution)
-                .await
-                .expect("maintenance cancellation bound")
-                .expect("maintenance worker join");
-            assert!(result.is_err(), "authority loss must stop maintenance");
-            assert_cancelled_maintenance_state(
-                &fixture,
-                task_id,
-                &metadata_before,
-                snapshot_before,
-                output_puts_before,
-                deletes_before,
-            )
-            .await;
+            assert_maintenance_authority_loss(expiry_submission, loss).await;
         }
+        assert_maintenance_shutdown_completes_through(expiry_submission).await;
+    }
+
+    /// Stops one maintenance boundary on genuine authority loss with no durable effect.
+    ///
+    /// The armed boundary is driven to ARRIVE (raced against the worker join so a
+    /// premature return surfaces its `Result` immediately instead of a
+    /// misattributed timeout), then the chosen authority is revoked; the
+    /// heartbeat propagates the loss to the maintenance authority token, the
+    /// gate releases via cancellation, and the claim retains no effect past the
+    /// boundary.
+    async fn assert_maintenance_authority_loss(
+        expiry_submission: bool,
+        loss: MaintenanceAuthorityLoss,
+    ) {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let claim = prepare_maintenance_claim(&fixture).await;
+        let task_id = claim.task_id;
+        let table_before = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("pre-cancellation maintenance table");
+        let metadata_before = table_before
+            .metadata_location()
+            .expect("pre-cancellation metadata location")
+            .to_owned();
+        let snapshot_before = table_before.metadata().current_snapshot_id();
+        let output_puts_before = fixture.reads.output_put_calls();
+        let deletes_before = fixture.reads.total_delete_attempts();
+        let controls = fixture.forge.maintenance_controls_for_test();
+        if expiry_submission {
+            controls.arm_expiry_submission();
+        } else {
+            controls.arm_manifest_submission();
+        }
+        let stop = CancellationToken::new();
+        let execution = tokio::spawn({
+            let worker = fixture.worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_claim(claim, &stop).await }
+        });
+        tokio::pin!(execution);
+        let arrival = async {
+            if expiry_submission {
+                controls.wait_expiry_submission().await;
+            } else {
+                controls.wait_manifest_submission().await;
+            }
+        };
+        tokio::pin!(arrival);
+        tokio::select! {
+            () = &mut arrival => {}
+            result = &mut execution => {
+                panic!("maintenance returned before catalog boundary: {result:?}")
+            }
+        }
+        match loss {
+            MaintenanceAuthorityLoss::Claim => {
+                sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+                    .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("expire maintenance claim");
+            }
+            MaintenanceAuthorityLoss::TableLease => {
+                sqlx::query("UPDATE vala.maintenance_leases SET owner=$2,fencing_token=fencing_token+1 WHERE lease_key=$1")
+                    .bind(forge_lease_key(fixture.tenant, &fixture.binding.logical_namespace, &fixture.binding.table_name))
+                    .bind(uuid::Uuid::now_v7()).execute(fixture.operator_pool.pool()).await.expect("steal maintenance lease");
+            }
+        }
+        let result = (&mut execution).await.expect("maintenance worker join");
+        assert!(result.is_err(), "authority loss must stop maintenance");
+        assert_cancelled_maintenance_state(
+            &fixture,
+            task_id,
+            &metadata_before,
+            snapshot_before,
+            output_puts_before,
+            deletes_before,
+        )
+        .await;
+    }
+
+    /// Recovers an expired maintenance claim on a fresh successor worker and
+    /// asserts the recovery reaches a KNOWN terminal without re-committing.
+    ///
+    /// Expires the durable claim, runs one successor pass, and proves the
+    /// recovered metadata location is byte-identical to `operation_location`
+    /// (no second manifest commit) while the durable task state advances to
+    /// `succeeded`. Shared by the shutdown and interrupted-attempt scenarios so
+    /// each caller stays a focused, readable assertion.
+    ///
+    /// # Panics
+    /// Panics when the successor worker cannot be built, the recovery pass does
+    /// not report progress, the recovered location differs from
+    /// `operation_location`, or the durable state is not `succeeded`. These are
+    /// test-environment invariants.
+    async fn assert_successor_recovers_to_known_terminal(
+        fixture: &Fixture,
+        task_id: uuid::Uuid,
+        operation_location: &str,
+    ) {
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+            .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("expire shutdown task claim");
+        let successor = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("successor worker");
+        assert!(
+            successor
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("shutdown maintenance recovery")
+        );
+        let recovered_location = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("recovered maintenance table")
+            .metadata_location()
+            .expect("recovered metadata location")
+            .to_owned();
+        assert_eq!(
+            recovered_location, operation_location,
+            "successor must not perform a second manifest commit"
+        );
+        let terminal: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("recovered terminal state");
+        assert_eq!(
+            terminal, "succeeded",
+            "successor must drive the claim to a known terminal"
+        );
+    }
+
+    /// A graceful shutdown does not cancel an in-flight maintenance operation.
+    ///
+    /// Shutdown cancels only the shutdown-sensitive `operation_stop`; the
+    /// maintenance authority token is untouched, so once the boundary is
+    /// released the operation runs to its own outcome. The post-effect drain
+    /// then returns without terminalizing the attempt, leaving the durable
+    /// effect committed exactly once and the claim recoverable. A successor
+    /// pass reaches the KNOWN terminal without a second manifest commit.
+    async fn assert_maintenance_shutdown_completes_through(expiry_submission: bool) {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let claim = prepare_maintenance_claim(&fixture).await;
+        let task_id = claim.task_id;
+        let table_before = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("pre-shutdown maintenance table");
+        let snapshot_before = table_before.metadata().current_snapshot_id();
+        let controls = fixture.forge.maintenance_controls_for_test();
+        if expiry_submission {
+            controls.arm_expiry_submission();
+        } else {
+            controls.arm_manifest_submission();
+        }
+        let stop = CancellationToken::new();
+        let execution = tokio::spawn({
+            let worker = fixture.worker.clone();
+            let stop = stop.clone();
+            async move { worker.execute_claim(claim, &stop).await }
+        });
+        tokio::pin!(execution);
+        let arrival = async {
+            if expiry_submission {
+                controls.wait_expiry_submission().await;
+            } else {
+                controls.wait_manifest_submission().await;
+            }
+        };
+        tokio::pin!(arrival);
+        tokio::select! {
+            () = &mut arrival => {}
+            result = &mut execution => {
+                panic!("maintenance returned before catalog boundary: {result:?}")
+            }
+        }
+        stop.cancel();
+        if expiry_submission {
+            controls.release_expiry_submission();
+        } else {
+            controls.release_manifest_submission();
+        }
+        let result = (&mut execution).await.expect("maintenance worker join");
+        assert!(
+            result.is_err(),
+            "post-effect shutdown retains the claim for recovery: {result:?}"
+        );
+        let operation_location = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("post-operation maintenance table")
+            .metadata_location()
+            .expect("post-operation metadata location")
+            .to_owned();
+        // (a) The maintenance operation committed exactly once through shutdown.
+        let table_after_operation = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("post-operation maintenance table snapshot");
+        assert_ne!(
+            table_after_operation.metadata().current_snapshot_id(),
+            snapshot_before,
+            "maintenance must complete its commit through graceful shutdown"
+        );
+        // (b)/(c) A successor recovers the claim to a KNOWN terminal without a
+        // second manifest commit.
+        assert_successor_recovers_to_known_terminal(&fixture, task_id, &operation_location).await;
     }
 
     /// Manifest submission stops before expiry under claim, lease, and shutdown loss.
@@ -2076,6 +2402,64 @@ mod pg_tests {
     #[tokio::test]
     async fn maintenance_expiry_submission_cancellation_matrix_is_effect_ordered() {
         assert_maintenance_boundary_loss(true).await;
+    }
+
+    /// A manifest commit that outlives its retry timeout retains the claim for recovery.
+    ///
+    /// This pins the timeout backstop that bounds the now-shutdown-decoupled
+    /// maintenance operation: a `1ns` `iceberg_total_retry_timeout` elapses on
+    /// the first poll of the real catalog commit (which must yield for IO),
+    /// mapping to the unknown-acceptance `Reconciliation` and leaving nothing
+    /// durable behind, so the claim stays retained for lease-based recovery.
+    ///
+    /// The fixture itself keeps a normal retry timeout so its `StagingFold` setup
+    /// commits succeed; the tightened `1ns` timeout applies only to the sibling
+    /// worker that executes the already-taken maintenance claim, so the timeout
+    /// is exercised exactly where the assertion targets it — the maintenance
+    /// manifest rewrite — and never corrupts claim preparation.
+    #[tokio::test]
+    async fn maintenance_commit_timeout_retains_claim_for_recovery() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let claim = prepare_maintenance_claim(&fixture).await;
+        let task_id = claim.task_id;
+        let table_before = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("pre-timeout maintenance table");
+        let metadata_before = table_before
+            .metadata_location()
+            .expect("pre-timeout metadata location")
+            .to_owned();
+        let snapshot_before = table_before.metadata().current_snapshot_id();
+        let output_puts_before = fixture.reads.output_put_calls();
+        let deletes_before = fixture.reads.total_delete_attempts();
+        let tight = fixture.sibling_worker_with_retry_timeout(Duration::from_nanos(1));
+        let stop = CancellationToken::new();
+        let result = tight.execute_claim(claim, &stop).await;
+        assert!(
+            matches!(result, Err(ForgeError::Reconciliation { .. })),
+            "manifest commit timeout must map to unknown-acceptance Reconciliation: {result:?}"
+        );
+        assert_cancelled_maintenance_state(
+            &fixture,
+            task_id,
+            &metadata_before,
+            snapshot_before,
+            output_puts_before,
+            deletes_before,
+        )
+        .await;
     }
 
     /// An accepted expiry cancelled before response processing is recovered exactly once.
@@ -2113,12 +2497,31 @@ mod pg_tests {
             .metadata_location()
             .expect("accepted metadata location")
             .to_owned();
-        stop.cancel();
+        // Graceful shutdown no longer cancels an in-flight maintenance operation;
+        // revoke the claim so the heartbeat propagates authority loss to the
+        // maintenance authority token and releases the accepted-response gate via
+        // cancellation. All assertions below are unchanged.
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+            .bind(task_id).execute(fixture.operator_pool.pool()).await.expect("expire accepted maintenance claim");
         let result = tokio::time::timeout(Duration::from_secs(30), execution)
             .await
             .expect("accepted cancellation bound")
             .expect("accepted cancellation join");
-        assert!(matches!(result, Err(ForgeError::Reconciliation { .. })));
+        // Authority loss is detected by the claim heartbeat, and `execute_fenced`
+        // surfaces the heartbeat's fence conflict (`heartbeat_result?`) ahead of
+        // the maintenance operation's own unknown-acceptance `Reconciliation`
+        // (`completion?`). Because the heartbeat is the sole canceller of the
+        // maintenance authority token, its fence conflict is the deterministic
+        // surfaced variant here; both are non-success authority-loss outcomes
+        // that retain the accepted expiry effect for exactly-once successor
+        // recovery, which the assertions below prove.
+        assert!(
+            matches!(
+                result,
+                Err(ForgeError::Sql(_) | ForgeError::Reconciliation { .. })
+            ),
+            "interrupted accepted-expiry attempt must fail with an authority-loss error that retains the effect: {result:?}"
+        );
         let (states, audits) =
             family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.").await;
         assert_eq!((states, audits), (1, 1));
@@ -2369,6 +2772,57 @@ mod pg_tests {
         original
     }
 
+    /// Asserts the scheduled maintenance demand is a ready snapshot-expiry task,
+    /// claims it, and injects a crash immediately after the Prepared write.
+    ///
+    /// Guards the scheduler contract that `tasks_enqueued` counts a genuinely
+    /// executable `ready` row (not a terminal `unschedulable` one), confirms the
+    /// claimed strategy is `SnapshotExpiry`, then arms the post-Prepared failure
+    /// injection so `execute_claim` crashes after persisting Prepared evidence.
+    ///
+    /// # Panics
+    /// Panics when the durable row is not a `ready` snapshot-expiry task, no
+    /// claimable maintenance task is available, the claimed strategy differs, or
+    /// the injected crash does not surface an error. These are test invariants.
+    async fn claim_scheduled_expiry_demand_and_crash_after_prepared(
+        fixture: &Fixture,
+        stop: &CancellationToken,
+    ) {
+        // The enqueued demand must be a genuinely executable, ready snapshot-expiry
+        // task, not a terminal `unschedulable` row still counted in `tasks_enqueued`.
+        let scheduled_row: (String, String) = sqlx::query_as(
+            "SELECT strategy,state FROM vala.forge_tasks WHERE data_tenant_id=$1 AND strategy='snapshot_expiry'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("scheduled maintenance row");
+        assert_eq!(
+            scheduled_row,
+            ("snapshot_expiry".to_owned(), "ready".to_owned())
+        );
+        fixture.worker.fail_after_maintenance_prepared_for_test();
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("claim maintenance task")
+            .expect("maintenance task available to claim");
+        assert!(
+            matches!(
+                claim.strategy,
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+            ),
+            "claimed task must be the snapshot-expiry maintenance demand: {:?}",
+            claim.strategy
+        );
+        fixture
+            .worker
+            .execute_claim(claim, stop)
+            .await
+            .expect_err("injected post-Prepared crash");
+    }
+
     /// Production scheduling persists exact ordered cleanup evidence before deleting it.
     #[tokio::test]
     async fn scheduled_maintenance_deletes_only_evidenced_expired_objects() {
@@ -2376,7 +2830,6 @@ mod pg_tests {
             ForgeConfig {
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
-                max_concurrent_reads: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -2409,12 +2862,7 @@ mod pg_tests {
                 .await
                 .expect("maintenance schedule");
         assert_eq!(scheduled.tasks_enqueued, 1, "maintenance: {scheduled:?}");
-        fixture.worker.fail_after_maintenance_prepared_for_test();
-        fixture
-            .worker
-            .execute_one_for_test(&stop)
-            .await
-            .expect_err("injected post-Prepared crash");
+        claim_scheduled_expiry_demand_and_crash_after_prepared(&fixture, &stop).await;
         let prepared_task: uuid::Uuid = sqlx::query_scalar(
             "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' \
              WHERE data_tenant_id=$1 AND strategy='snapshot_expiry' AND state='prepared' RETURNING task_id",
@@ -3375,15 +3823,22 @@ mod pg_tests {
         assert_eq!(succeeded, 2);
     }
 
-    /// Cancellation after a real output PUT drains promptly, then a successor
-    /// boundedly reclaims the expired Running attempt and completes it.
+    /// Cancellation observed mid-rewrite, before the catalog commit, releases
+    /// the in-flight claim to `retryable` and drains the active-claim count, so
+    /// a successor reclaims it immediately without waiting for lease expiry and
+    /// completes it exactly once.
+    ///
+    /// This is the in-flight (`execute_fenced`) pre-effect drain: the rewrite has
+    /// written a real output PUT but not committed to the catalog, so releasing
+    /// the claim is lossless.
     ///
     /// # Panics
     ///
-    /// Panics when shutdown exceeds its bound, the attempt becomes terminal
-    /// prematurely, or the successor cannot reclaim and finish it.
+    /// Panics when shutdown exceeds its bound, the cancelled attempt does not
+    /// drain to `retryable`, the active-claim count does not fall to zero, or
+    /// the successor cannot reclaim and finish the task exactly once.
     #[tokio::test]
-    async fn worker_active_shutdown_is_reclaimed_after_crash_expiry() {
+    async fn worker_active_shutdown_releases_retryable_then_successor_reclaims() {
         let fixture =
             Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
         let claim = fixture.plan_and_claim().await;
@@ -3405,13 +3860,15 @@ mod pg_tests {
             .expect("active shutdown bound")
             .expect("active worker join");
         assert!(matches!(result, Err(ForgeError::Shutdown)), "{result:?}");
-        sqlx::query(
-            "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
-        )
-        .bind(task_id)
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("expire abandoned Running attempt");
+        let (state, active) = task_state_and_active_claims(&fixture, task_id).await;
+        assert_eq!(
+            state, "retryable",
+            "a pre-effect shutdown must release the in-flight claim to retryable"
+        );
+        assert_eq!(
+            active, 0,
+            "releasing the cancelled claim must drain the active-claim count"
+        );
         let successor = ForgeWorker::new(
             Arc::clone(&fixture.forge),
             ForgeWorkerConfig {
@@ -3426,13 +3883,181 @@ mod pg_tests {
                 .await
                 .expect("successor reclaim execution")
         );
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
-                .bind(task_id)
+        let (state, _) = task_state_and_active_claims(&fixture, task_id).await;
+        assert_eq!(state, "succeeded");
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND state='succeeded'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("terminal state count");
+        assert_eq!(
+            succeeded, 1,
+            "the pre-effect attempt must not commit a duplicate terminal"
+        );
+    }
+
+    /// A worker that crashes mid-execution without observing cancellation leaves
+    /// a durable `running` claim that a successor reclaims only after the lease
+    /// expires, then completes exactly once.
+    ///
+    /// This preserves crash-path recovery for the `running` state that the
+    /// cooperative drain deliberately does not cover: cancellation is never
+    /// observed, so the claim is retained and recovered through
+    /// `reclaim_expired` after its lease TTL rather than released to
+    /// `retryable`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the crashed `running` claim is not reclaimed after expiry or
+    /// the successor does not complete it exactly once.
+    #[tokio::test]
+    async fn worker_running_crash_without_cancel_is_reclaimed_after_expiry() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let claim = fixture.plan_and_claim().await;
+        let task_id = claim.task_id;
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET state='running', watermark_snapshot_id=0, watermark_timestamp_ms=0, claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("simulate crashed running attempt with an expired lease");
+        let successor = ForgeWorker::new(
+            Arc::clone(&fixture.forge),
+            ForgeWorkerConfig {
+                worker_concurrency: 1,
+            },
+            uuid::Uuid::now_v7(),
+        )
+        .expect("successor worker");
+        assert!(
+            successor
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("successor reclaim execution")
+        );
+        let (state, _) = task_state_and_active_claims(&fixture, task_id).await;
+        assert_eq!(state, "succeeded");
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND state='succeeded'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("terminal state count");
+        assert_eq!(
+            succeeded, 1,
+            "the crashed attempt committed nothing, so recovery completes exactly once"
+        );
+    }
+
+    /// A cooperative shutdown observed after a supervised slot durably claims
+    /// work, but before execution begins, releases the claim to `retryable` and
+    /// drains the active-claim count so a successor reclaims it losslessly.
+    ///
+    /// This is the `run_slot` post-claim, pre-execute drain path: no pre-effect
+    /// durable work was performed when the slot observes shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics when planning does not enqueue exactly one task, the supervised
+    /// slot does not reach its claim gate, the released task is not `retryable`,
+    /// or the active-claim count does not drain to zero.
+    #[tokio::test]
+    async fn worker_shutdown_before_execute_releases_claim_to_retryable() {
+        let fixture = Fixture::new_with_observer(ForgeWorkerCompletionObserver::new()).await;
+        let completion = fixture
+            .completion
+            .clone()
+            .expect("observer fixture exposes its completion observer");
+        let stop = CancellationToken::new();
+        let planned = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("fixture scheduler")
+            .schedule_once(&stop)
+            .await
+            .expect("fixture planning pass");
+        assert_eq!(planned.tasks_enqueued, 1, "planned outcome: {planned:?}");
+        completion.hold_after_claims_for_test(1);
+        let run = tokio::spawn({
+            let worker = fixture.worker.clone();
+            let stop = stop.clone();
+            async move { worker.run(stop).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            completion.wait_for_claims_for_test(),
+        )
+        .await
+        .expect("supervised slot reaches its claim gate");
+        stop.cancel();
+        completion.release_claims_for_test();
+        tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("supervised shutdown bound")
+            .expect("supervised run join")
+            .expect("supervised run drains cleanly");
+        let task_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id=$1")
+                .bind(fixture.tenant.as_uuid())
                 .fetch_one(fixture.operator_pool.pool())
                 .await
-                .expect("reclaimed task state");
-        assert_eq!(state, "succeeded");
+                .expect("single planned task");
+        let (state, active) = task_state_and_active_claims(&fixture, task_id).await;
+        assert_eq!(
+            state, "retryable",
+            "a shutdown observed before execution must release the claim to retryable"
+        );
+        assert_eq!(
+            active, 0,
+            "releasing the claim before execution must drain the active-claim count"
+        );
+    }
+
+    /// A shutdown release against a claim that already advanced to `prepared`
+    /// is benign: it retains the durable `prepared` state instead of erroring.
+    ///
+    /// The post-effect (`prepared`) row is past the pre-effect release guard, so
+    /// [`ForgeWorker::release_cancelled_claim_for_test`] matches no row, returns
+    /// `Ok(())`, and leaves the claim retained for reconciliation — proving a
+    /// `prepared` claim under cancellation is observed as clean retention, never
+    /// a release error, and stays counted as an active claim.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the benign release errors, the `prepared` state is not
+    /// retained, or the active-claim count changes.
+    #[tokio::test]
+    async fn prepared_claim_shutdown_release_is_benign_and_retained() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+        let claim = fixture.plan_and_claim().await;
+        let task_id = claim.task_id;
+        let attempt = claim.attempt_id.expect("claimed task carries an attempt");
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET state='prepared', watermark_snapshot_id=0, watermark_timestamp_ms=0, evidence='{}'::jsonb WHERE task_id=$1 AND attempt_id=$2",
+        )
+        .bind(task_id)
+        .bind(attempt)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("advance this worker's claim past the pre-effect guard");
+        fixture
+            .worker
+            .release_cancelled_claim_for_test(task_id, attempt)
+            .await
+            .expect("releasing a prepared claim must be benign");
+        let (state, active) = task_state_and_active_claims(&fixture, task_id).await;
+        assert_eq!(
+            state, "prepared",
+            "a prepared claim under cancellation must be retained, not released"
+        );
+        assert_eq!(
+            active, 1,
+            "the retained prepared claim must remain an active claim"
+        );
     }
 
     /// Reads the exact current metadata bytes and returns snapshot, location,

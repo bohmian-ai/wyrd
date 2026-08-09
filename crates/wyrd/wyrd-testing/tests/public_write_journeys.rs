@@ -956,7 +956,24 @@ async fn run_topology_public_journey(
                 }
             }
         }
-        let reconciled = cluster.oracle_inspection().await?;
+        // Wait for every pod's read-audit relay to drain before asserting on the
+        // durable read-audit row count. `audit_wal_records` is an exact pending
+        // counter, so this converges the outbox without masking a real shortfall.
+        let convergence_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let reconciled = loop {
+            let inspection = cluster.oracle_inspection().await?;
+            if inspection.audit_wal_records == 0 {
+                break inspection;
+            }
+            if std::time::Instant::now() >= convergence_deadline {
+                return Err(format!(
+                    "read-audit relay did not converge: {} WAL records pending (oldest {:?}) after 30s",
+                    inspection.audit_wal_records, inspection.audit_oldest_age,
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         let expected_reads = if topology == BifrostTopology::ThreeServersThreeForgeWorkers {
             6
         } else {

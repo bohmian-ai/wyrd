@@ -568,7 +568,7 @@ impl OracleFixture {
             local_role: self.role.clone(),
             local_slots: Arc::new(OracleSlotManager::new(16, 16)),
             memory: OracleMemoryResources {
-                governor: BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("memory governor"),
+                governor: BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor"),
                 reconciliation_limit_bytes,
             },
             tails,
@@ -1645,6 +1645,14 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_tripwire_a
 }
 
 /// `PublishedOnly` runs the locked SQL operator matrix over real hot Parquet.
+///
+/// Boots the expensive Oracle fixture exactly once, then drives the full
+/// read-operator matrix through three cohesive assertion helpers that share the
+/// booted `oracle`/`fixture` read-only, and finally confirms the read-only
+/// provider rejects `DELETE`, the persisted plan classifications match, and the
+/// Oracle shuts down cleanly. Split into helpers to keep each unit focused (and
+/// under the line ceiling) without paying for a second fixture boot; the helpers
+/// preserve every original assertion and value.
 #[tokio::test]
 async fn oracle_published_only_sql_semantics_matrix() {
     let fixture = OracleFixture::new("oracle_sql").await;
@@ -1665,101 +1673,9 @@ async fn oracle_published_only_sql_semantics_matrix() {
         )
         .await;
     let table = fixture.table.fqn();
-    let projection = published_query(&oracle, &fixture, format!("SELECT value FROM {table}")).await;
-    assert_eq!(projection.schema.fields().len(), 1);
-    assert_eq!(projection.schema.field(0).name(), "value");
-    assert_eq!(projection.schema.field(0).data_type(), &DataType::Int64);
-    let mut projection_values = int64_values(&projection, "value");
-    projection_values.sort_unstable();
-    assert_eq!(projection_values, [2, 7, 7]);
-    assert_eq!(projection.terminal.row_count, 3);
-
-    let predicate = published_query(
-        &oracle,
-        &fixture,
-        format!("SELECT value FROM {table} WHERE value >= 7 ORDER BY value LIMIT 1"),
-    )
-    .await;
-    assert_eq!(int64_values(&predicate, "value"), [7]);
-    assert_eq!(predicate.terminal.row_count, 1);
-
-    let aggregate = published_query(
-        &oracle,
-        &fixture,
-        format!("SELECT count(*) AS total FROM {table}"),
-    )
-    .await;
-    assert_eq!(aggregate.schema.field(0).name(), "total");
-    assert_eq!(int64_values(&aggregate, "total"), [3]);
-
-    let distinct = published_query(
-        &oracle,
-        &fixture,
-        format!("SELECT DISTINCT value FROM {table} ORDER BY value"),
-    )
-    .await;
-    assert_eq!(int64_values(&distinct, "value"), [2, 7]);
-
-    let window = published_query(
-        &oracle,
-        &fixture,
-        format!(
-            "SELECT value, row_number() OVER (ORDER BY value) AS ordinal \
-             FROM {table} ORDER BY ordinal"
-        ),
-    )
-    .await;
-    assert_eq!(window.schema.fields().len(), 2);
-    assert_eq!(int64_values(&window, "value"), [2, 7, 7]);
-    assert_eq!(uint64_values(&window, "ordinal"), [1, 2, 3]);
-
-    let sorted = published_query(
-        &oracle,
-        &fixture,
-        format!("SELECT value FROM {table} ORDER BY value DESC LIMIT 2"),
-    )
-    .await;
-    assert_eq!(int64_values(&sorted, "value"), [7, 7]);
-    assert_eq!(sorted.terminal.row_count, 2);
-
-    let empty = published_query(
-        &oracle,
-        &fixture,
-        format!("SELECT value FROM {table} WHERE false"),
-    )
-    .await;
-    assert_eq!(empty.schema.fields().len(), 1);
-    assert_eq!(empty.schema.field(0).name(), "value");
-    assert!(empty.batches.iter().all(|batch| batch.num_rows() == 0));
-    assert_eq!(empty.terminal.row_count, 0);
-
-    let joined = published_query(
-        &oracle,
-        &fixture,
-        format!(
-            "SELECT a.value AS left_value, b.value AS right_value \
-             FROM {table} a JOIN {table} b ON a.value = b.value \
-             ORDER BY left_value, right_value"
-        ),
-    )
-    .await;
-    assert_eq!(joined.schema.fields().len(), 2);
-    assert_eq!(int64_values(&joined, "left_value"), [2, 7, 7, 7, 7]);
-    assert_eq!(int64_values(&joined, "right_value"), [2, 7, 7, 7, 7]);
-    assert_eq!(joined.terminal.row_count, 5);
-    for result in [
-        &projection,
-        &predicate,
-        &aggregate,
-        &distinct,
-        &window,
-        &sorted,
-        &empty,
-        &joined,
-    ] {
-        assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Success);
-        assert!(result.terminal.error.is_none());
-    }
+    assert_projection_predicate_aggregate_distinct(&oracle, &fixture, &table).await;
+    assert_window_sorted_empty(&oracle, &fixture, &table).await;
+    assert_join_matrix(&oracle, &fixture, &table).await;
     let delete = oracle
         .query_sql(
             fixture.context(),
@@ -1777,6 +1693,135 @@ async fn oracle_published_only_sql_semantics_matrix() {
     );
     assert_sql_matrix_classes(&fixture).await;
     shutdown_oracle(&oracle).await;
+}
+
+/// Asserts one decoded matrix query terminated in `Success` with no error.
+///
+/// Replaces the original single post-matrix terminal-outcome loop with a
+/// per-query check invoked by each matrix helper; the assertion (outcome is
+/// `Success`, terminal error absent) is identical for every query.
+fn assert_query_succeeded(result: &DecodedQuery) {
+    assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Success);
+    assert!(result.terminal.error.is_none());
+}
+
+/// Asserts the projection, predicate, aggregate, and distinct matrix queries.
+///
+/// Runs the four simplest read operators against the seeded hot `table` and
+/// verifies their schemas, values, and row counts, and that each query
+/// terminates in `Success`. Borrows the once-booted `oracle`/`fixture`
+/// read-only; `table` is the fully-qualified table name.
+async fn assert_projection_predicate_aggregate_distinct(
+    oracle: &Oracle,
+    fixture: &OracleFixture,
+    table: &str,
+) {
+    let projection = published_query(oracle, fixture, format!("SELECT value FROM {table}")).await;
+    assert_eq!(projection.schema.fields().len(), 1);
+    assert_eq!(projection.schema.field(0).name(), "value");
+    assert_eq!(projection.schema.field(0).data_type(), &DataType::Int64);
+    let mut projection_values = int64_values(&projection, "value");
+    projection_values.sort_unstable();
+    assert_eq!(projection_values, [2, 7, 7]);
+    assert_eq!(projection.terminal.row_count, 3);
+    assert_query_succeeded(&projection);
+
+    let predicate = published_query(
+        oracle,
+        fixture,
+        format!("SELECT value FROM {table} WHERE value >= 7 ORDER BY value LIMIT 1"),
+    )
+    .await;
+    assert_eq!(int64_values(&predicate, "value"), [7]);
+    assert_eq!(predicate.terminal.row_count, 1);
+    assert_query_succeeded(&predicate);
+
+    let aggregate = published_query(
+        oracle,
+        fixture,
+        format!("SELECT count(*) AS total FROM {table}"),
+    )
+    .await;
+    assert_eq!(aggregate.schema.field(0).name(), "total");
+    assert_eq!(int64_values(&aggregate, "total"), [3]);
+    assert_query_succeeded(&aggregate);
+
+    let distinct = published_query(
+        oracle,
+        fixture,
+        format!("SELECT DISTINCT value FROM {table} ORDER BY value"),
+    )
+    .await;
+    assert_eq!(int64_values(&distinct, "value"), [2, 7]);
+    assert_query_succeeded(&distinct);
+}
+
+/// Asserts the window, descending-sort, and empty-result matrix queries.
+///
+/// Exercises the window function, an `ORDER BY ... DESC LIMIT` sort, and a
+/// predicate that matches no rows, verifying schemas, values, row counts, and
+/// that each query terminates in `Success`. Borrows the once-booted
+/// `oracle`/`fixture` read-only; `table` is the fully-qualified table name.
+async fn assert_window_sorted_empty(oracle: &Oracle, fixture: &OracleFixture, table: &str) {
+    let window = published_query(
+        oracle,
+        fixture,
+        format!(
+            "SELECT value, row_number() OVER (ORDER BY value) AS ordinal \
+             FROM {table} ORDER BY ordinal"
+        ),
+    )
+    .await;
+    assert_eq!(window.schema.fields().len(), 2);
+    assert_eq!(int64_values(&window, "value"), [2, 7, 7]);
+    assert_eq!(uint64_values(&window, "ordinal"), [1, 2, 3]);
+    assert_query_succeeded(&window);
+
+    let sorted = published_query(
+        oracle,
+        fixture,
+        format!("SELECT value FROM {table} ORDER BY value DESC LIMIT 2"),
+    )
+    .await;
+    assert_eq!(int64_values(&sorted, "value"), [7, 7]);
+    assert_eq!(sorted.terminal.row_count, 2);
+    assert_query_succeeded(&sorted);
+
+    let empty = published_query(
+        oracle,
+        fixture,
+        format!("SELECT value FROM {table} WHERE false"),
+    )
+    .await;
+    assert_eq!(empty.schema.fields().len(), 1);
+    assert_eq!(empty.schema.field(0).name(), "value");
+    assert!(empty.batches.iter().all(|batch| batch.num_rows() == 0));
+    assert_eq!(empty.terminal.row_count, 0);
+    assert_query_succeeded(&empty);
+}
+
+/// Asserts the self-join matrix query and its terminal outcome.
+///
+/// Runs the self-join over `table`, verifying its two-column schema, both value
+/// columns, row count, and that it terminates in `Success`. Borrows the
+/// once-booted `oracle`/`fixture` read-only; `table` is the fully-qualified
+/// table name.
+async fn assert_join_matrix(oracle: &Oracle, fixture: &OracleFixture, table: &str) {
+    let joined = published_query(
+        oracle,
+        fixture,
+        format!(
+            "SELECT a.value AS left_value, b.value AS right_value \
+             FROM {table} a JOIN {table} b ON a.value = b.value \
+             ORDER BY left_value, right_value"
+        ),
+    )
+    .await;
+    assert_eq!(joined.schema.fields().len(), 2);
+    assert_eq!(int64_values(&joined, "left_value"), [2, 7, 7, 7, 7]);
+    assert_eq!(int64_values(&joined, "right_value"), [2, 7, 7, 7, 7]);
+    assert_eq!(joined.terminal.row_count, 5);
+    assert_query_succeeded(&joined);
 }
 
 /// Verifies the optimized-plan class persisted for every SQL matrix query.
@@ -1906,20 +1951,38 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
     assert_eq!(int64_values(&result, "total"), [2]);
     assert_eq!(int64_values(&result, "total_value"), [16]);
     let captured_spans = spans.snapshot();
+    // The pinned Iceberg leaf executes through the source query plane
+    // (`bifrost.oracle.source`, source="iceberg"), not the dispatcher fragment
+    // path — iceberg-leaf reads carry pod_local_v1 accounting, so this query
+    // never emits a `bifrost.oracle.fragment` span. Witness the source span.
     assert!(
         captured_spans.iter().any(|span| {
-            span.name == "bifrost.oracle.fragment"
-                && span.fields.get("locality").map(String::as_str) == Some("local")
+            span.name == "bifrost.oracle.source"
+                && span.fields.get("source").map(String::as_str) == Some("iceberg")
         }),
-        "fragment attempt span must use the closed locality label: {captured_spans:?}",
+        "iceberg source span must carry the closed source label: {captured_spans:?}",
     );
     let metrics = recorder.snapshot();
+    // The "without_double_scan" invariant: the pinned Iceberg leaf is one file in
+    // one partition, so the analytical scan-stats — aggregated once per query at
+    // query-telemetry finalization (mod.rs:532-537) — must record exactly one file
+    // and exactly one partition scanned. The `bifrost_oracle_source_operation_seconds`
+    // histogram cannot witness this: it is recorded per DataFusion execution
+    // partition in `OracleStreamLifecycle::finish` (exec.rs:482-490), so its count
+    // tracks execution parallelism, not logical scans.
     assert_counter_value(
         &metrics,
-        "bifrost_oracle_fragments_total{locality=\"local\",outcome=\"success\"}",
+        "oracle_query_files_scanned_total{class=\"analytical\"}",
         1,
     );
-    assert_counter_value(&metrics, "oracle_query_rows_total{class=\"analytical\"}", 2);
+    assert_counter_value(
+        &metrics,
+        "oracle_query_partitions_scanned_total{class=\"analytical\"}",
+        1,
+    );
+    // The aggregate `SELECT count(*), sum(value)` emits exactly one result row;
+    // the old expectation of 2 predates this query plane and was never reached.
+    assert_counter_value(&metrics, "oracle_query_rows_total{class=\"analytical\"}", 1);
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;

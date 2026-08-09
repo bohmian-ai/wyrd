@@ -86,7 +86,7 @@ mod pg_tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
             Field::new("value", DataType::UInt64, false),
@@ -101,7 +101,7 @@ mod pg_tests {
         RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps).with_timezone("UTC")),
                 Arc::new(UInt64Array::from(values)),
             ],
         )
@@ -356,7 +356,7 @@ mod pg_tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
             Field::new("value", DataType::UInt64, false),
@@ -379,7 +379,7 @@ mod pg_tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps).with_timezone("UTC")),
                 Arc::new(UInt64Array::from(values)),
             ],
         )

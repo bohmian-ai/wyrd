@@ -530,22 +530,31 @@ impl WyrdTestServer {
 
     /// Shut down the bound workers and return concrete owner lifecycle evidence.
     ///
+    /// Cancels the server shutdown token, then joins the serve task before any
+    /// Scribe seal runs. The load-bearing invariant is that no Scribe seal or
+    /// flush may run while the forge worker is still live: `token.cancel()` only
+    /// signals the worker, which remains live inside its claim loop until it is
+    /// joined. In `Mode::Bound`, joining `serve_handle` runs `WyrdServer::run`'s
+    /// production drain-then-seal to completion, so the join is the point at
+    /// which worker liveness ends. Sealing before that join would let the live
+    /// worker claim a freshly sealed generation it cannot finish, stranding a
+    /// non-terminal Forge claim. The join timeout therefore covers the real
+    /// drain-and-seal budget, not a pre-drained join. The explicit
+    /// [`ScribeImpl::shutdown`] afterward is the idempotent path for non-Bound
+    /// harness modes that never ran `bound.run()`; after the join the worker is
+    /// quiesced, so it drains a stable pipeline.
+    ///
     /// # Errors
     /// Returns an error if the serve task join times out or the final Scribe
     /// inspection cannot be read.
     pub async fn shutdown_and_inspect(
         mut self,
     ) -> Result<ServerShutdownInspection, WyrdTestServerError> {
-        if let Some(scribe) = self.inner.state.bifrost_scribe_for_test() {
-            scribe
-                .shutdown(std::time::Instant::now() + Duration::from_secs(60))
-                .await;
-        }
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
         let listeners_stopped = if let Some(handle) = self.serve_handle.take() {
-            tokio::time::timeout(Duration::from_secs(2), handle)
+            tokio::time::timeout(Duration::from_secs(70), handle)
                 .await
                 .map_err(|_| WyrdTestServerError::Start("server shutdown timed out".to_owned()))?
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
@@ -554,6 +563,11 @@ impl WyrdTestServer {
         } else {
             !matches!(self.mode, Mode::Bound { .. })
         };
+        if let Some(scribe) = self.inner.state.bifrost_scribe_for_test() {
+            scribe
+                .shutdown(std::time::Instant::now() + Duration::from_secs(60))
+                .await;
+        }
         let scribe = self
             .inner
             .state

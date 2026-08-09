@@ -726,6 +726,7 @@ impl ClusterStorageRoot {
 /// clusters share one catalog namespace and one storage tree. It is a private
 /// value moved into the start path; [`SharedRunResources`] owns the durable
 /// originals across the whole run.
+#[cfg(any(test, feature = "bench"))]
 struct SharedClusterDeps {
     /// Shared embedded Postgres fixture both catalogs are constructed from.
     fixture: Arc<PgFixture>,
@@ -756,6 +757,7 @@ enum ClusterResourceSource {
     /// it clones the shared fixture, roots its storage at the shared root, and
     /// reuses the once-provisioned peer credentials. The cluster provisions and
     /// tears down none of them; the run owns their lifetime.
+    #[cfg(any(test, feature = "bench"))]
     Shared(SharedClusterDeps),
 }
 
@@ -1477,6 +1479,7 @@ impl WyrdTestCluster {
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
         let (fixture, shared_credentials, explicit_root) = match resource_source {
+            #[cfg(any(test, feature = "bench"))]
             ClusterResourceSource::Shared(deps) => (
                 deps.fixture,
                 Some(deps.oracle_peer_credentials),
@@ -2154,17 +2157,6 @@ impl WyrdTestCluster {
         let mut scribe_wal_streams = 0_u64;
         let mut listeners_stopped = true;
         let mut supervised_tasks = 0_u64;
-        for server in self.servers.values().filter_map(Option::as_ref) {
-            if server.bifrost_scribe().is_some() {
-                if let Err(error) = server.flush_bifrost().await {
-                    first_error.get_or_insert(error.to_string());
-                }
-                if let Some(scribe) = server.bifrost_scribe() {
-                    scribe_inflight =
-                        scribe_inflight.saturating_add(scribe.inflight_items_for_test() as u64);
-                }
-            }
-        }
         let node_ids = self.servers.keys().copied().collect::<Vec<_>>();
         let expected_servers = node_ids.len();
         let mut stopped_servers = 0_usize;
@@ -2172,6 +2164,20 @@ impl WyrdTestCluster {
             if let Some(slot) = self.servers.get_mut(&node_id)
                 && let Some(server) = slot.take()
             {
+                // No Scribe seal or flush may run while this node's forge worker
+                // is still live. Cancellation only signals the worker, which stays
+                // live inside its claim loop until it is joined, so a pre-shutdown
+                // flush would plant a fresh generation the live worker claims but
+                // cannot finish, stranding a non-terminal Forge claim. There is
+                // therefore no pre-shutdown flush here: `server.shutdown_and_inspect`
+                // cancels, joins the serve task (which runs the production
+                // drain-then-seal to completion, ending worker liveness), and only
+                // then drains the Scribe. The inflight read below is a pure
+                // observation of the admission owner and plants nothing.
+                if let Some(scribe) = server.bifrost_scribe() {
+                    scribe_inflight =
+                        scribe_inflight.saturating_add(scribe.inflight_items_for_test() as u64);
+                }
                 match server.shutdown_and_inspect().await {
                     Ok(server_inspection) => {
                         stopped_servers = stopped_servers.saturating_add(1);

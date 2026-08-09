@@ -34,9 +34,12 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
 
 /// Tenant-bound audit capability for a trusted operator transaction.
 ///
-/// This capability is intentionally crate-private and exposes only canonical
-/// audit append. It cannot be used as a general SQL executor or masquerade as
-/// a tenant connection.
+/// Exposes only canonical audit append bound to one already verified tenant.
+/// It owns the verified `tenant` and re-binds the current tenant via
+/// [`BIND_CURRENT_TENANT_SQL`](wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
+/// before every append, re-establishing on the shared operator transaction the
+/// RLS boundary a [`TenantConn`] would otherwise provide. It cannot be used as
+/// a general SQL executor or masquerade as a tenant connection.
 pub struct OperatorAudit<'transaction, 'connection> {
     /// Verified tenant on whose behalf Forge is appending audit evidence.
     tenant: DataTenantId,

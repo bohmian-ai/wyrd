@@ -321,7 +321,7 @@ fn batch(value: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
             "wyrd_event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
         Field::new("value", DataType::Int64, false),
@@ -329,9 +329,10 @@ fn batch(value: i64) -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![
-                chrono::Utc::now().timestamp_micros(),
-            ])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
+                    .with_timezone("UTC"),
+            ),
             Arc::new(Int64Array::from(vec![value])),
         ],
     )
@@ -430,6 +431,21 @@ fn managed_batch_bytes(
 }
 
 async fn append_one(fixture: &PersistenceFixture, table_name: &str, value: i64) {
+    append_with_batch_id(fixture, table_name, value, uuid::Uuid::now_v7()).await;
+}
+
+/// Append one generation carrying a caller-chosen `batch_id`.
+///
+/// [`append_one`] mints a fresh `now_v7` id per call, which spreads generations
+/// across shard lanes via `shard_for`. Tests that must place two generations
+/// on ONE shard lane instead choose their `batch_id`s explicitly through this
+/// helper so the routing key is deterministic.
+async fn append_with_batch_id(
+    fixture: &PersistenceFixture,
+    table_name: &str,
+    value: i64,
+    batch_id: uuid::Uuid,
+) {
     let rows = batch(value);
     fixture
         .scribe
@@ -438,12 +454,39 @@ async fn append_one(fixture: &PersistenceFixture, table_name: &str, value: i64) 
             table: table(table_name),
             schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
             request_id: RequestId::now_v7(),
-            batch_id: uuid::Uuid::now_v7(),
+            batch_id,
             measured_wire_bytes: 0,
             rows,
         })
         .await
         .expect("append to Scribe");
+}
+
+/// Deterministically choose a second, distinct `batch_id` that Scribe routes to
+/// the same shard lane as `first`.
+///
+/// Scribe selects a shard with `shard_for(tenant, table, batch_id)`
+/// (`scribe::routing`, mirrored in `scribe::shards::ShardSet::try_send`). With
+/// `(tenant, table)` fixed, the shard depends only on the `batch_id`, so a
+/// bounded counter walk finds a co-locating id with no runtime randomness
+/// (~1-in-16 candidates match across the 16 lanes). Co-location is what places
+/// both generations on ONE FIFO lane; keeping the ids DISTINCT (never a reused
+/// id) makes this a genuine same-`SealKey` ordering scenario rather than a
+/// `(batch_id, seal_key)` idempotency replay.
+fn colocated_distinct_batch_id(
+    tenant: DataTenantId,
+    table: &TableRef,
+    first: uuid::Uuid,
+) -> uuid::Uuid {
+    let target = vala_bifrost_redux::scribe::routing::shard_for(tenant, table, first);
+    (0_u128..1_000_000)
+        .map(uuid::Uuid::from_u128)
+        .find(|candidate| {
+            *candidate != first
+                && vala_bifrost_redux::scribe::routing::shard_for(tenant, table, *candidate)
+                    == target
+        })
+        .expect("a co-locating distinct batch id exists within the bounded search")
 }
 
 async fn wait_for_state(fixture: &PersistenceFixture, pending: usize) {
@@ -518,21 +561,35 @@ async fn rows_for_table(fixture: &PersistenceFixture, table_name: &str) -> Vec<(
     .expect("file-list rows")
 }
 
-async fn publication_order(fixture: &PersistenceFixture, table_name: &str) -> Vec<i64> {
-    let mut conn = fixture
-        .database
-        .tenant_conn_for(fixture.tenant)
-        .await
-        .expect("tenant connection");
-    sqlx::query_scalar(
-        "SELECT wal_lsn_min FROM vala.file_list
-          WHERE data_tenant_id = $1 AND table_name = $2 ORDER BY created_at",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .bind(table_name)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("publication order")
+/// Assert the published generations of one stream form a prefix-complete,
+/// strictly ordered chain of disjoint WAL-LSN ranges.
+///
+/// Durable FIFO order for a single seal key is carried by each published file's
+/// `[wal_lsn_min, wal_lsn_max]` range, NOT by the `created_at` publication
+/// timestamp: replayed same-key generations commit within one clock tick, so
+/// `ORDER BY created_at` breaks ties non-deterministically and cannot witness
+/// WAL order. Given `ranges` already sorted by `wal_lsn_min` (see
+/// [`rows_for_table`]), this checks (a) exactly `expected_len` generations
+/// published — the non-vacuity guard against an empty or short chain, (b) every
+/// range is well-formed (`min <= max`), and (c) each range ends strictly before
+/// the next begins (`max[i] < min[i+1]`), so the ranges are pairwise disjoint
+/// and chain in ascending WAL order. Disjointness is a real property that the
+/// `wal_lsn_min` sort alone does not imply (sorted ranges may still overlap), so
+/// the assertion is not a sort tautology.
+fn assert_wal_lsn_chain(ranges: &[(i64, i64, String)], expected_len: usize) {
+    assert_eq!(
+        ranges.len(),
+        expected_len,
+        "expected {expected_len} published generations, got {ranges:?}"
+    );
+    assert!(
+        ranges.iter().all(|range| range.0 <= range.1),
+        "each generation must carry a well-formed WAL-LSN range: {ranges:?}"
+    );
+    assert!(
+        ranges.windows(2).all(|pair| pair[0].1 < pair[1].0),
+        "generations must chain as disjoint, ascending WAL-LSN ranges: {ranges:?}"
+    );
 }
 
 async fn audit_count(fixture: &PersistenceFixture) -> i64 {
@@ -619,14 +676,27 @@ async fn different_seal_keys_persist_concurrently() {
 async fn failed_front_generation_blocks_later_same_key_generation() {
     let fixture = PersistenceFixture::start().await;
     fixture.faults.fail_next_object_write();
-    append_one(&fixture, "failed_front_events", 1).await;
+    // The failed front can only block its successor when BOTH generations occupy
+    // the same shard FIFO. `shard_for(tenant, table, batch_id)` keys on the
+    // `batch_id`, so `append_one`'s per-call `now_v7` ids would otherwise spread
+    // these two generations across lanes and let the successor publish
+    // independently. Pin both to one lane by choosing a second, distinct
+    // `batch_id` that routes to the same shard as the first. Distinct ids keep
+    // this a genuine FIFO-ordering scenario, not a `(batch_id, seal_key)` replay.
+    let front_batch_id = uuid::Uuid::from_u128(0x00FA_11ED);
+    let successor_batch_id = colocated_distinct_batch_id(
+        fixture.tenant,
+        &table("failed_front_events"),
+        front_batch_id,
+    );
+    append_with_batch_id(&fixture, "failed_front_events", 1, front_batch_id).await;
     fixture
         .scribe
         .flush_writable_for_test()
         .await
         .expect("failed front flush");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    append_one(&fixture, "failed_front_events", 2).await;
+    append_with_batch_id(&fixture, "failed_front_events", 2, successor_batch_id).await;
     fixture
         .scribe
         .flush_writable_for_test()
@@ -867,10 +937,10 @@ async fn replayed_generation_publishes_durably_after_restart() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(rows(&fixture).await.len(), 3);
-    assert_eq!(
-        publication_order(&fixture, "restart_publish_events").await,
-        vec![0, 1, 2]
-    );
+    // The three replayed same-key generations must publish as an ordered chain
+    // of disjoint WAL-LSN ranges (durable FIFO order lives in the WAL range, not
+    // in `created_at`, which ties across the batched replay commits).
+    assert_wal_lsn_chain(&rows_for_table(&fixture, "restart_publish_events").await, 3);
     assert_eq!(audit_count(&fixture).await, 3);
     assert_eq!(object_paths(&fixture).await.len(), 3);
     fixture.stop().await;
@@ -970,10 +1040,11 @@ async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(fixture.faults.max_concurrent_object_writes_for_test() >= 2);
+    // Distinct seal keys publish concurrently (asserted above), yet within each
+    // key the two generations must still form an ordered chain of disjoint
+    // WAL-LSN ranges — per-stream FIFO independent of cross-key publish timing.
     for table_name in ["restart_key_a", "restart_key_b"] {
-        assert_eq!(publication_order(&fixture, table_name).await.len(), 2);
-        let persisted = publication_order(&fixture, table_name).await;
-        assert!(persisted.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_wal_lsn_chain(&rows_for_table(&fixture, table_name).await, 2);
     }
     assert_eq!(audit_count(&fixture).await, 4);
     assert_eq!(object_paths(&fixture).await.len(), 4);

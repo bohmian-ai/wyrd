@@ -752,6 +752,20 @@ impl ForgeWorker {
             .store(true, Ordering::Release);
     }
 
+    /// Returns this worker's stable claim-ownership identity.
+    ///
+    /// A test constructs a sibling worker with this identity so it can execute a
+    /// claim this worker already took — the durable claim transitions fence on
+    /// `claimed_by`/`attempt_id`, so a differently-owned worker would be
+    /// rejected. It is the minimal seam that lets a boundary (for example a
+    /// tightened Iceberg retry timeout carried only by the sibling's Forge)
+    /// apply to execution without perturbing the setup that produced the claim.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn owner_for_test(&self) -> Uuid {
+        self.owner
+    }
+
     /// Runs the fixed worker set until shutdown stops claims and drains slots.
     ///
     /// Each slot claims at most one task at a time. Cancellation stops new
@@ -778,10 +792,19 @@ impl ForgeWorker {
 
     /// Claims and executes work serially for one bounded pool slot.
     ///
+    /// When cooperative shutdown is observed after a claim is taken but before
+    /// execution begins, the just-claimed task is released to `retryable` via
+    /// [`Self::release_cancelled_claim`] so a clean shutdown drains
+    /// `forge_active_claims` to zero, then the slot exits like the loop-top
+    /// shutdown check. No pre-effect durable work was performed, so a successor
+    /// reclaims the released task losslessly.
+    ///
     /// # Errors
     ///
     /// Returns only configuration errors that make further claims unsafe.
-    /// Individual task failures remain durable and are logged for takeover.
+    /// Individual task failures remain durable and are logged for takeover; a
+    /// shutdown-release database failure is likewise logged and the claim is
+    /// retained for lease-expiry recovery rather than failing the slot.
     async fn run_slot(&self, shutdown: CancellationToken) -> Result<(), ForgeError> {
         let claim_limits = self.claim_limits()?;
         loop {
@@ -843,6 +866,14 @@ impl ForgeWorker {
                 if observer.abandon_claim_for_test(&claim, self.owner) {
                     return Ok(());
                 }
+            }
+            if shutdown.is_cancelled() {
+                if let Some(attempt) = claim.attempt_id
+                    && let Err(error) = self.release_cancelled_claim(task_id, attempt).await
+                {
+                    tracing::warn!(worker = %self.owner, task_id = %task_id, error = %error, "Forge claim shutdown release failed; durable state retained for lease recovery");
+                }
+                return Ok(());
             }
             let strategy = claim.strategy.clone();
             let result = self.execute_claim(claim, &shutdown).await;
@@ -943,6 +974,83 @@ impl ForgeWorker {
             .claim_fair(self.owner, limits)
             .await
             .map_err(ForgeError::Sql)
+    }
+
+    /// Invokes the pre-effect shutdown release directly for one planted claim.
+    ///
+    /// This narrow seam lets an integration test assert the retain-on-advance
+    /// property of [`Self::release_cancelled_claim`] without reconstructing the
+    /// non-deterministic window between a maintenance `prepared()` commit and
+    /// the worker's next cancellation checkpoint. Releasing an already-advanced
+    /// claim — in particular a `prepared` row past the pre-effect guard, owned
+    /// by this worker and attempt — must be benign: the retry matches no row,
+    /// so the method returns `Ok(())` and the durable `prepared` state is
+    /// retained for reconciliation rather than surfacing a release error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] for a genuine database failure and
+    /// [`ForgeError::InvalidConfig`] when the release timestamp cannot be read.
+    /// A benign no-match against an already-advanced claim is not an error and
+    /// returns `Ok(())`.
+    #[cfg(feature = "test-support")]
+    pub async fn release_cancelled_claim_for_test(
+        &self,
+        task_id: Uuid,
+        attempt: Uuid,
+    ) -> Result<(), ForgeError> {
+        self.release_cancelled_claim(task_id, attempt).await
+    }
+
+    /// Releases a cooperatively cancelled claim to `retryable` before its
+    /// [`ForgeError::Shutdown`] surfaces, draining `forge_active_claims` to zero
+    /// at a clean shutdown instead of retaining the claim for lease-expiry
+    /// recovery.
+    ///
+    /// Cooperative cancellation is an event the worker observes with no
+    /// pre-effect durable work performed, so releasing the claim is lossless: a
+    /// successor reclaims the `retryable` task immediately. This is deliberately
+    /// distinct from crash recovery, where cancellation is never observed and
+    /// the claim is retained for `reclaim_expired` after its lease TTL.
+    ///
+    /// The release is guarded to pre-effect ownership. [`ForgeTasks::retry`]
+    /// matches only `state IN ('claimed','running')` for this attempt and owner,
+    /// so a claim that already advanced past that guard — expiry-reclaimed by
+    /// another worker, or transitioned to `prepared` between the caller's
+    /// shutdown observation and this call — does not match. That benign no-match
+    /// surfaces as [`vala_sql::SqlError::Conflict`] and is treated as
+    /// claim-already-advanced: the method returns `Ok(())` and the caller falls
+    /// through to its existing retain-for-recovery path, which is the correct
+    /// outcome for a post-effect (`prepared`) claim. This is why a `prepared`
+    /// claim under cancellation is observed as clean retention, never a release
+    /// error.
+    ///
+    /// Only the durable claim state changes; the caller still returns
+    /// [`ForgeError::Shutdown`], preserving the codebase-wide "shutdown stops
+    /// work" signal for both slot exit and in-flight cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] for a genuine database failure (connection,
+    /// pool, or statement error) and [`ForgeError::InvalidConfig`] when the
+    /// release timestamp cannot be read. A benign no-match is not an error and
+    /// returns `Ok(())`.
+    async fn release_cancelled_claim(
+        &self,
+        task_id: Uuid,
+        attempt: Uuid,
+    ) -> Result<(), ForgeError> {
+        let ready_at = self.forge.core.clock.now()?;
+        match self
+            .tasks
+            .retry(task_id, attempt, self.owner, ready_at)
+            .await
+        {
+            // Success releases the claim; a benign `Conflict` means the claim
+            // already advanced past the pre-effect guard and stays retained.
+            Ok(()) | Err(vala_sql::SqlError::Conflict { .. }) => Ok(()),
+            Err(error) => Err(ForgeError::Sql(error)),
+        }
     }
 
     /// Executes one exact claimed task through validation, table fencing,
@@ -1178,11 +1286,16 @@ impl ForgeWorker {
                 lease_key: format!("forge:table:{}:{}", task.data_tenant_id, binding.table_ref),
             });
         };
+        // Prepared-effect recovery runs post-commit idempotent cleanup behind a
+        // durable cursor; graceful shutdown cooperatively drains it, so both
+        // heartbeat tokens are the same shutdown-sensitive `operation_stop`
+        // (this path has no shutdown-decoupled in-flight commit to protect).
         let operation_stop = shutdown.child_token();
         let heartbeat = self.spawn_authority_heartbeat(
             task.task_id,
             attempt,
             lease.clone(),
+            operation_stop.clone(),
             operation_stop.clone(),
         )?;
         let reconciliation = self
@@ -1441,6 +1554,30 @@ impl ForgeWorker {
 
     /// Runs one supported task after acquiring the publication lease.
     ///
+    /// # Cancellation
+    ///
+    /// Two cancellation tokens scope this operation. `operation_stop` is a
+    /// child of the caller's shutdown token; non-maintenance strategies observe
+    /// it, so graceful shutdown cooperatively cancels them and they release
+    /// cleanly. `authority_stop` is a fresh token that shutdown never reaches;
+    /// the heartbeat cancels it (alongside `operation_stop`) only on genuine
+    /// authority loss — claim-heartbeat failure or lease-renew loss. Maintenance
+    /// strategies observe `authority_stop`, so a graceful shutdown does not
+    /// cancel an in-flight Iceberg maintenance operation: it completes through
+    /// to its own outcome, bounded by `iceberg_total_retry_timeout` and, past
+    /// the server drain window, by the supervisor `abort_all` plus lease-expiry
+    /// recovery (the accepted fallback, not asserted against). Maintenance
+    /// cancellation therefore means fence loss only, which conservatively
+    /// retains a possibly-committed effect for successor recovery.
+    ///
+    /// A cooperative cancellation observed before the durable effect (dispatch
+    /// stopped mid-rewrite before its catalog commit, or a maintenance task
+    /// stopped before its `prepared()` boundary) releases the claim to
+    /// `retryable` via [`Self::release_cancelled_claim`] before returning
+    /// [`ForgeError::Shutdown`], draining the active-claim count for a clean
+    /// shutdown. A cancellation observed after the durable effect leaves the
+    /// claim retained for evidence-based recovery and is not released.
+    ///
     /// # Errors
     ///
     /// Returns catalog, stale-snapshot, lifecycle, heartbeat, rewrite, evidence,
@@ -1489,18 +1626,36 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
+        // `operation_stop` is a shutdown-sensitive child token: graceful shutdown
+        // (or the post-effect drain below) cancels it, and non-maintenance
+        // strategies observe it so cooperative cancel with clean release stays
+        // their drain behavior. `authority_stop` is a fresh token that shutdown
+        // never reaches; only genuine authority loss (claim-heartbeat failure or
+        // lease-renew loss, propagated by the heartbeat) cancels it. Maintenance
+        // strategies observe `authority_stop` so an in-flight Iceberg maintenance
+        // operation completes through a graceful shutdown — bounded by
+        // `iceberg_total_retry_timeout` and, past the drain window, by the
+        // supervisor `abort_all` plus lease-expiry recovery — while still
+        // conservatively retaining a possibly-committed effect on fence loss.
         let operation_stop = shutdown.child_token();
+        let authority_stop = CancellationToken::new();
         let heartbeat = self.spawn_authority_heartbeat(
             claim.task_id,
             attempt,
             lease.clone(),
             operation_stop.clone(),
+            authority_stop.clone(),
         )?;
+        let dispatch_stop = if maintenance_recovery {
+            &authority_stop
+        } else {
+            &operation_stop
+        };
         let execution = match committed_recovery {
             Some(evidence) => Ok((evidence, ForgeExecutionEvidenceState::RecoveredCommit)),
             None => {
                 match self
-                    .dispatch_claim(claim, attempt, binding, lease, table, &operation_stop)
+                    .dispatch_claim(claim, attempt, binding, lease, table, dispatch_stop)
                     .await
                 {
                     Ok(ForgeDispatchResult::Committed(committed)) => self
@@ -1514,7 +1669,7 @@ impl ForgeWorker {
                             binding,
                             lease,
                             *result,
-                            &operation_stop,
+                            dispatch_stop,
                         )
                         .await
                         .map(|evidence| (evidence, ForgeExecutionEvidenceState::Prepared)),
@@ -1522,6 +1677,13 @@ impl ForgeWorker {
                 }
             }
         };
+        // A pre-effect cancellation surfaces as `execution == Err(Shutdown)`
+        // (dispatch stopped mid-rewrite before its catalog commit, or a
+        // maintenance task stopped before its `prepared()` boundary). The
+        // post-effect cancellation at the check below instead leaves `execution`
+        // `Ok` with the durable effect already committed, so it is excluded from
+        // release and stays retained for evidence-based recovery.
+        let pre_effect_shutdown = matches!(execution, Err(ForgeError::Shutdown));
         let completion = async {
             let evidence = execution?;
             if operation_stop.is_cancelled() {
@@ -1535,21 +1697,36 @@ impl ForgeWorker {
             detail: format!("Forge claim heartbeat panicked: {error}"),
         })?;
         heartbeat_result?;
-        let (evidence, state) = completion?;
-        if let Some(observer) = &self.completion_observer {
-            observer.record_lifecycle(ForgeLifecycleEvent::Rewritten {
-                task_id: claim.task_id,
-                input_count: claim.plan.inputs.len(),
-            });
-            if let Some(snapshot_id) = evidence.committed_snapshot_id {
-                observer.record_lifecycle(ForgeLifecycleEvent::CatalogCommitted {
-                    task_id: claim.task_id,
-                    snapshot_id,
-                });
-            }
+        if pre_effect_shutdown {
+            self.release_cancelled_claim(claim.task_id, attempt).await?;
         }
+        let (evidence, state) = completion?;
+        self.record_rewrite_evidence(claim, &evidence);
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await
+    }
+
+    /// Publishes the rewrite and catalog-commit observer events for a completed
+    /// execution.
+    ///
+    /// This runs only after the durable completion path produced evidence, so
+    /// test observation cannot acknowledge or alter a task before its effect is
+    /// committed. The catalog-committed event is emitted only when the evidence
+    /// carries a committed snapshot.
+    fn record_rewrite_evidence(&self, claim: &ForgeTaskClaim, evidence: &ForgeTaskEvidence) {
+        let Some(observer) = &self.completion_observer else {
+            return;
+        };
+        observer.record_lifecycle(ForgeLifecycleEvent::Rewritten {
+            task_id: claim.task_id,
+            input_count: claim.plan.inputs.len(),
+        });
+        if let Some(snapshot_id) = evidence.committed_snapshot_id {
+            observer.record_lifecycle(ForgeLifecycleEvent::CatalogCommitted {
+                task_id: claim.task_id,
+                snapshot_id,
+            });
+        }
     }
 
     /// Refreshes final authority and commits the appropriate success transition.
@@ -2085,9 +2262,14 @@ impl ForgeWorker {
 
     /// Starts coordinated task-claim and table-lease renewal for one operation.
     ///
-    /// Either authority loss cancels the shared operation token. The task
-    /// heartbeat also renews a large-lane reservation when the claim owns one,
-    /// while the cloned table lease retains the same publication fence token.
+    /// Either authority loss cancels BOTH the shutdown-sensitive
+    /// `operation_stop` and the authority-only `authority_stop` tokens, so a
+    /// maintenance strategy observing `authority_stop` still aborts on genuine
+    /// fence loss even though graceful shutdown never reaches that token. The
+    /// task heartbeat also renews a large-lane reservation when the claim owns
+    /// one, while the cloned table lease retains the same publication fence
+    /// token. The renewal loop exits cleanly when `operation_stop` is cancelled
+    /// (graceful shutdown or the caller's post-effect drain).
     ///
     /// # Errors
     ///
@@ -2097,7 +2279,8 @@ impl ForgeWorker {
         task_id: Uuid,
         attempt: Uuid,
         mut lease: ForgeLease,
-        stop: CancellationToken,
+        operation_stop: CancellationToken,
+        authority_stop: CancellationToken,
     ) -> Result<tokio::task::JoinHandle<Result<(), ForgeError>>, ForgeError> {
         let lease_seconds =
             u32::try_from(self.forge.core.config.lease_ttl.as_secs()).map_err(|_| {
@@ -2117,22 +2300,25 @@ impl ForgeWorker {
             loop {
                 tokio::select! {
                     biased;
-                    () = stop.cancelled() => return Ok(()),
+                    () = operation_stop.cancelled() => return Ok(()),
                     _ = ticker.tick() => {
                         if let Err(error) = tasks.heartbeat(task_id, attempt, owner, lease_seconds).await {
-                            stop.cancel();
+                            operation_stop.cancel();
+                            authority_stop.cancel();
                             return Err(ForgeError::Sql(error));
                         }
                         match lease.renew(&operator_pool).await {
                             Ok(true) => {}
                             Ok(false) => {
-                                stop.cancel();
+                                operation_stop.cancel();
+                                authority_stop.cancel();
                                 return Err(ForgeError::FenceLost {
                                     lease_key: lease.lease_key.clone(),
                                 });
                             }
                             Err(error) => {
-                                stop.cancel();
+                                operation_stop.cancel();
+                                authority_stop.cancel();
                                 return Err(error);
                             }
                         }

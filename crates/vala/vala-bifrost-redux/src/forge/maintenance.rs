@@ -58,9 +58,20 @@ impl MaintenanceTestGate {
     }
 
     /// Waits until the armed production future reaches this boundary.
+    ///
+    /// The `Notified` future is pinned and enabled (registered against the
+    /// `arrival` notify) BEFORE the final `arrived` re-check, so a `pause` that
+    /// stores `arrived` and calls `notify_waiters` in the window between the
+    /// check and the await cannot be a lost wakeup.
     async fn wait(&self) {
-        while !self.arrived.load(std::sync::atomic::Ordering::Acquire) {
-            self.arrival.notified().await;
+        loop {
+            let notified = self.arrival.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.arrived.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -177,6 +188,11 @@ impl ForgeMaintenance {
     ///
     /// # Cancellation
     ///
+    /// The `stop` token is the caller's authority-only token, not its shutdown
+    /// token: it is cancelled solely on genuine authority loss (claim-heartbeat
+    /// failure or lease-renew loss), so cancellation observed here means fence
+    /// loss and nothing else. A graceful shutdown does not cancel this operation
+    /// — it runs to its own outcome, bounded by `iceberg_total_retry_timeout`.
     /// Cancellation stops before the next stage. Cancellation or timeout racing
     /// manifest submission requires a successor to reload metadata before retry;
     /// expiry commit uncertainty remains represented by its Prepared operation.

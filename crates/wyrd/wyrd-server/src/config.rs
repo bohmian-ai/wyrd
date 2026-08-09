@@ -2358,8 +2358,10 @@ mod tests {
     /// Proves the closed public role derives the internal Bifrost topology.
     #[test]
     fn public_roles_derive_internal_bifrost_roles() {
-        let mut config = WyrdServerConfig::default();
-        config.role = ForgeProcessRole::Server;
+        let mut config = WyrdServerConfig {
+            role: ForgeProcessRole::Server,
+            ..Default::default()
+        };
         assert_eq!(config.bifrost_roles().len(), 3);
         config.role = ForgeProcessRole::ForgeWorker;
         assert_eq!(

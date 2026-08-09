@@ -196,6 +196,11 @@ struct RewriteBatchState {
     peak_spill_bytes: u64,
     /// Shared `DataFusion` pool reservation for encoded output capacity.
     output_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    /// Encoded writer-buffer bytes already charged against `output_reservation`
+    /// for the currently open output. Tracks the high-water mark so each batch
+    /// grows the reservation only by the delta it newly encodes, and resets to
+    /// zero when `record_output` frees the reservation for the next output.
+    charged: usize,
     /// Per-output NaN counts keyed by Iceberg field ID.
     nan_value_counts: NanValueCountVisitor,
 }
@@ -221,6 +226,7 @@ impl RewriteBatchState {
             output_rows: 0,
             peak_spill_bytes: 0,
             output_reservation: reservation,
+            charged: 0,
             nan_value_counts: NanValueCountVisitor::new(),
         }
     }
@@ -254,10 +260,23 @@ impl RewriteBatchState {
 
     /// Append one validated batch to the active bounded Parquet writer.
     ///
+    /// The shared-pool output reservation is grown to match the writer's real
+    /// encoded residency (`bytes_written() + in_progress_size()`) after the
+    /// write, not by the decoded Arrow batch size before it. That is the memory
+    /// forge actually holds: the source Arrow arrays are already charged by
+    /// `DataFusion`'s upstream operators, and the throwaway `batch.clone()`
+    /// forwarded into this call is a shallow `Arc` clone that allocates nothing.
+    /// Each batch charges only the positive delta above the high-water
+    /// `charged` mark (a row-group flush that shrinks residency does not shrink
+    /// the reservation), and `record_output` frees the reservation and resets
+    /// the mark for the next output.
+    ///
     /// # Errors
     ///
-    /// Returns a Parquet encoding failure or [`ForgeError::Invariant`] when
-    /// the batch row count cannot fit the rewrite's `u64` counters.
+    /// Returns a Parquet encoding failure, [`ForgeError::Invariant`] when the
+    /// batch row count cannot fit the rewrite's `u64` counters, or
+    /// [`ForgeError::Invariant`] when the shared pool cannot admit the writer's
+    /// grown encoded residency.
     fn write_batch(
         &mut self,
         schema: &SchemaRef,
@@ -269,13 +288,6 @@ impl RewriteBatchState {
             .map_err(|error| ForgeError::Invariant {
                 detail: format!("Forge NaN metric derivation failed: {error}"),
             })?;
-        if let Some(reservation) = &self.output_reservation {
-            reservation
-                .try_grow(batch.get_array_memory_size())
-                .map_err(|error| ForgeError::Invariant {
-                    detail: format!("Forge output reservation rejected batch: {error}"),
-                })?;
-        }
         if self.writer.is_none() {
             self.writer = Some(
                 ArrowWriter::try_new(
@@ -294,10 +306,19 @@ impl RewriteBatchState {
         writer.write(batch).map_err(|error| ForgeError::Parquet {
             detail: error.to_string(),
         })?;
+        let encoded = writer.bytes_written() + writer.in_progress_size();
         let rows = u64::try_from(batch.num_rows()).map_err(|error| ForgeError::Invariant {
             detail: format!("rewrite row count does not fit u64: {error}"),
         })?;
         self.writer_rows = self.writer_rows.saturating_add(rows);
+        if let Some(reservation) = &self.output_reservation {
+            reservation
+                .try_grow(encoded.saturating_sub(self.charged))
+                .map_err(|error| ForgeError::Invariant {
+                    detail: format!("Forge output reservation rejected batch: {error}"),
+                })?;
+            self.charged = self.charged.max(encoded);
+        }
         Ok(())
     }
 
@@ -324,6 +345,7 @@ impl RewriteBatchState {
         if let Some(reservation) = &self.output_reservation {
             reservation.free();
         }
+        self.charged = 0;
         self.output_rows = self.output_rows.saturating_add(self.writer_rows);
         self.writer_rows = 0;
         self.output_paths.push(path);
@@ -681,23 +703,16 @@ impl ForgeRewritePipeline {
             )
             .await?;
         }
-        let mut detached = std::mem::replace(
-            state,
-            RewriteBatchState::with_reservation(Some(
-                datafusion::execution::memory_pool::MemoryConsumer::new("forge-rewrite-output")
-                    .register(&self.runtime.runtime.memory_pool),
-            )),
-        );
+        // Detach the accounting state (which owns the real output reservation)
+        // to move it into the bounded blocking encode. The placeholder left in
+        // `state` holds no reservation: it is overwritten by `returned` below
+        // and never encodes, so registering a throwaway pool consumer for it
+        // would only churn the shared pool. `batch.clone()` is a shallow `Arc`
+        // clone that allocates nothing, so it needs no reservation of its own;
+        // the writer's real encoded residency is charged inside `write_batch`.
+        let mut detached = std::mem::replace(state, RewriteBatchState::with_reservation(None));
         let schema = Arc::clone(&request.schema);
         let iceberg_schema = Arc::clone(&request.iceberg_schema);
-        let clone_reservation =
-            datafusion::execution::memory_pool::MemoryConsumer::new("forge-rewrite-batch-clone")
-                .register(&self.runtime.runtime.memory_pool);
-        clone_reservation
-            .try_grow(batch.get_array_memory_size())
-            .map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge batch clone reservation rejected batch: {error}"),
-            })?;
         let batch = batch.clone();
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
@@ -707,7 +722,6 @@ impl ForgeRewritePipeline {
         };
         let join = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let _clone_reservation = clone_reservation;
             let result = detached.write_batch(&schema, &iceberg_schema, &batch);
             (detached, result)
         });

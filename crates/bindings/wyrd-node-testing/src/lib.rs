@@ -249,7 +249,7 @@ async fn start_test_server_async() -> napi::Result<NativeWyrdTestServer> {
     let grpc_url = server
         .grpc_url()
         .ok_or_else(|| napi::Error::from_reason("test server has no gRPC URL".to_owned()))?
-        .to_owned();
+        .clone();
     Ok(NativeWyrdTestServer {
         server: Arc::new(Mutex::new(Some(server))),
         base_url,

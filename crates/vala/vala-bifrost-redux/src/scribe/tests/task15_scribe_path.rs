@@ -36,13 +36,13 @@ fn batch(day: NaiveDate) -> RecordBatch {
         Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
             Field::new("value", DataType::Int64, false),
         ])),
         vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![timestamp])),
+            Arc::new(TimestampMicrosecondArray::from(vec![timestamp]).with_timezone("UTC")),
             Arc::new(Int64Array::from(vec![42])),
         ],
     )
@@ -246,18 +246,21 @@ fn cross_day_batch(schema: Arc<Schema>, day_one: NaiveDate, day_two: NaiveDate) 
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![
-                day_one
-                    .and_hms_opt(12, 0, 0)
-                    .expect("day one time")
-                    .and_utc()
-                    .timestamp_micros(),
-                day_two
-                    .and_hms_opt(12, 0, 0)
-                    .expect("day two time")
-                    .and_utc()
-                    .timestamp_micros(),
-            ])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![
+                    day_one
+                        .and_hms_opt(12, 0, 0)
+                        .expect("day one time")
+                        .and_utc()
+                        .timestamp_micros(),
+                    day_two
+                        .and_hms_opt(12, 0, 0)
+                        .expect("day two time")
+                        .and_utc()
+                        .timestamp_micros(),
+                ])
+                .with_timezone("UTC"),
+            ),
             Arc::new(Int64Array::from(vec![101_i64, 202_i64])),
         ],
     )

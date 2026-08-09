@@ -1523,11 +1523,12 @@ impl ScribeTailReader {
             detail: format!("tail fence registry lock poisoned: {error}"),
         })?;
         Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
-        let ownership_count = registry
-            .retained
-            .len()
-            .saturating_add(registry.released.len());
-        if ownership_count >= self.config.max_fences
+        // Live admission is bounded by retained (live) fences only. Release
+        // tombstones no longer consume ownership capacity: they exist solely to
+        // make a duplicate release idempotent for their original TTL, and are
+        // purged by `reclaim_expired`. Counting them against admission turned an
+        // acquire/release churn within one TTL into a self-inflicted capacity DoS.
+        if registry.retained.len() >= self.config.max_fences
             || registry.retained_bytes.saturating_add(retained_bytes)
                 > self.config.max_retained_bytes
         {
@@ -1729,6 +1730,25 @@ impl ScribeTailReader {
         registry.retained_bytes = registry
             .retained_bytes
             .saturating_sub(retained.retained_bytes);
+        // Tombstones no longer bound live admission, so cap the map purely as a
+        // memory backstop at `max_fences * 4`. At capacity, evict the entry with
+        // the earliest `expires_at` (the soonest to be purged anyway) via a linear
+        // scan under the already-held registry lock; the cap keeps the scan cheap.
+        // Reaching this cap requires release churn above 4x the live-fence budget
+        // within one TTL, whose only consequence — a later duplicate release of an
+        // evicted fence sees `released: false` — matches the post-TTL semantics
+        // every caller already tolerates.
+        let tombstone_cap = self.config.max_fences.saturating_mul(4);
+        if tombstone_cap > 0
+            && registry.released.len() >= tombstone_cap
+            && let Some(evict_id) = registry
+                .released
+                .iter()
+                .min_by_key(|(_, (expires_at, _))| *expires_at)
+                .map(|(fence_id, _)| *fence_id)
+        {
+            registry.released.remove(&evict_id);
+        }
         registry
             .released
             .insert(fence_id, (retained.expires_at, retained.fence));
@@ -2176,7 +2196,11 @@ mod tests {
         assert!(registry.retained.contains_key(&second.fence_id));
     }
 
-    /// Counts active fences and valid tombstones against one ownership budget.
+    /// Bounds the release-tombstone map by memory only, never by live admission.
+    ///
+    /// Tombstones no longer consume ownership capacity, so accumulating them never
+    /// blocks acquisition; the map is instead held at `max_fences * 4` by evicting
+    /// the earliest-expiry entry, and expired tombstones remain purged on reclaim.
     #[tokio::test]
     async fn release_tombstones_respect_configured_capacity() {
         let tenant = DataTenantId::new_v7();
@@ -2188,47 +2212,88 @@ mod tests {
                 ..TailFenceConfig::default()
             },
         );
-        let first = reader
+
+        // Fill the tombstone map to exactly its cap. Each acquire succeeds even as
+        // tombstones accumulate, proving live admission counts retained fences only.
+        let cap = 2 * 4;
+        let mut tombstones = Vec::new();
+        for _ in 0..cap {
+            let fence = reader
+                .acquire_fence(empty_fence_request(tenant))
+                .await
+                .expect("tombstones never block live admission");
+            assert!(
+                reader
+                    .release_fence(fence.fence_id)
+                    .expect("release creates tombstone")
+                    .released
+            );
+            tombstones.push(fence.fence_id);
+        }
+
+        // Impose a strict expiry order so eviction is deterministic: the target is
+        // the unique earliest-expiry tombstone, and every tombstone stays in the
+        // future so the opportunistic reclaim spares them.
+        let target = tombstones[3];
+        {
+            let mut registry = reader.fences.lock().expect("registry lock");
+            assert_eq!(registry.released.len(), cap);
+            let base = Instant::now();
+            for (offset, fence_id) in tombstones.iter().enumerate() {
+                let (expiry, _) = registry
+                    .released
+                    .get_mut(fence_id)
+                    .expect("tombstone present");
+                let secs = if *fence_id == target {
+                    1
+                } else {
+                    100 + offset as u64
+                };
+                *expiry = base + Duration::from_secs(secs);
+            }
+        }
+
+        // One more acquire/release overflows the cap; the earliest-expiry tombstone
+        // (the target) is evicted and the map stays at its cap.
+        let overflow = reader
             .acquire_fence(empty_fence_request(tenant))
             .await
-            .expect("first fence acquires");
-        let second = reader
-            .acquire_fence(empty_fence_request(tenant))
-            .await
-            .expect("second fence acquires");
-        reader
-            .release_fence(first.fence_id)
-            .expect("first release creates tombstone");
-        let second_release = reader
-            .release_fence(second.fence_id)
-            .expect("active release succeeds at ownership saturation");
-        assert!(second_release.released);
+            .expect("tombstone cap does not block live admission");
         assert!(
             reader
-                .release_fence(second.fence_id)
-                .expect("duplicate release remains idempotent")
+                .release_fence(overflow.fence_id)
+                .expect("overflow release")
                 .released
         );
         {
             let registry = reader.fences.lock().expect("registry lock");
-            assert!(!registry.retained.contains_key(&second.fence_id));
-            assert_eq!(registry.retained_bytes, 0);
-            assert_eq!(registry.released.len(), 2);
+            assert_eq!(registry.released.len(), cap, "tombstone map stays capped");
             assert!(
-                registry.released.contains_key(&first.fence_id),
-                "oldest valid tombstone remains idempotent"
+                !registry.released.contains_key(&target),
+                "earliest-expiry tombstone is evicted first"
             );
+            assert!(registry.released.contains_key(&overflow.fence_id));
+            assert!(registry.retained.is_empty());
+            assert_eq!(registry.retained_bytes, 0);
         }
+
+        // A duplicate release of a surviving tombstone stays idempotent; the evicted
+        // fence — now in neither map — reports released: false, matching the
+        // post-TTL semantics every caller already tolerates.
         assert!(
             reader
-                .release_fence(first.fence_id)
-                .expect("oldest tombstone duplicate release")
+                .release_fence(tombstones[4])
+                .expect("surviving tombstone duplicate release")
                 .released
         );
-        assert!(matches!(
-            reader.acquire_fence(empty_fence_request(tenant)).await,
-            Err(TailReadError::Capacity)
-        ));
+        assert!(
+            !reader
+                .release_fence(target)
+                .expect("evicted fence release")
+                .released
+        );
+
+        // Expired tombstones are still purged on the next opportunistic reclaim.
         {
             let mut registry = reader.fences.lock().expect("registry lock");
             for (expiry, _) in registry.released.values_mut() {
@@ -2241,6 +2306,11 @@ mod tests {
             .acquire_fence(empty_fence_request(tenant))
             .await
             .expect("expired tombstones permit a new fence");
+        {
+            let registry = reader.fences.lock().expect("registry lock");
+            assert!(registry.released.is_empty(), "expired tombstones purged");
+            assert_eq!(registry.retained.len(), 1);
+        }
     }
 
     /// Concurrent duplicate page reads observe the same immutable fence snapshot.

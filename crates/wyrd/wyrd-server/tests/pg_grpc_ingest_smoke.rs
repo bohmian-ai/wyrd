@@ -711,7 +711,10 @@ mod pg_tests {
             .expect_err("query mismatch cannot release retained rows");
         assert_eq!(wrong_query_release_status.code(), Code::PermissionDenied);
 
-        let security_rows: Vec<(
+        /// One `bifrost.scribe.tail_security` audit row projected from
+        /// `vala.audit_outbox`: `(data_tenant_id, principal_id, principal_kind,
+        /// auth_method, permission, decision, result, detail)`.
+        type SecurityAuditRow = (
             uuid::Uuid,
             uuid::Uuid,
             String,
@@ -720,7 +723,8 @@ mod pg_tests {
             String,
             String,
             Option<String>,
-        )> = sqlx::query_as(
+        );
+        let security_rows: Vec<SecurityAuditRow> = sqlx::query_as(
             "SELECT data_tenant_id, principal_id, principal_kind, auth_method, permission, \
                     decision, result, detail::text \
              FROM vala.audit_outbox \

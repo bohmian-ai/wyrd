@@ -172,6 +172,14 @@ pub struct OracleAuditPublisher {
     control: std::sync::Arc<RelayControl>,
     /// Sole retained relay task handle.
     relay: Mutex<Option<JoinHandle<()>>>,
+    /// Exact count of accepted-but-not-yet-relayed WAL records.
+    ///
+    /// Incremented when an append is durably acknowledged and decremented only
+    /// after the relay advances the durable checkpoint past a record, so it
+    /// mirrors the WAL residual without ever reporting a false zero on lock
+    /// contention (unlike the try-lock `wal.snapshot()`). It is the barriered
+    /// signal the test-support inspection chain asserts on.
+    pending: AtomicU64,
     /// Bounded retry, batch, and shutdown settings.
     config: OracleAuditWalConfig,
 }
@@ -210,6 +218,7 @@ impl OracleAuditPublisher {
                 notify: Notify::new(),
             }),
             relay: Mutex::new(None),
+            pending: AtomicU64::new(0),
             config,
         });
         for outcome in [
@@ -238,6 +247,7 @@ impl OracleAuditPublisher {
         metrics::gauge!("oracle_audit_relay_batch_size").set(0.0);
         if let Ok(wal) = publisher.wal.try_lock() {
             let (records, bytes, oldest) = wal.snapshot();
+            publisher.pending.store(records, Ordering::Release);
             metrics::gauge!("oracle_audit_wal_records").set(records as f64);
             metrics::gauge!("oracle_audit_wal_bytes").set(bytes as f64);
             metrics::gauge!("oracle_audit_oldest_record_age_seconds")
@@ -292,6 +302,9 @@ impl OracleAuditPublisher {
         ack_rx
             .await
             .map_err(|_| BifrostError::QueryAuditUnavailable)??;
+        // The record is durably accepted into the WAL; count it as pending until
+        // the relay checkpoints past it. This mirrors the WAL residual exactly.
+        self.pending.fetch_add(1, Ordering::AcqRel);
         metrics::histogram!("oracle_audit_append_duration_seconds")
             .record(started.elapsed().as_secs_f64());
         self.record_wal_metrics().await;
@@ -336,6 +349,11 @@ impl OracleAuditPublisher {
             }
         }
         let snapshot = self.wal.lock().await.snapshot();
+        // Reconcile the counter to the authoritative residual: an abort landing
+        // between a relay's checkpoint and its decrement could otherwise leave the
+        // counter one ahead of the WAL. After shutdown the counter equals the
+        // durable backlog exactly.
+        self.pending.store(snapshot.0, Ordering::Release);
         self.record_wal_metrics().await;
         AuditShutdownReport {
             relayed: before.0.saturating_sub(snapshot.0),
@@ -359,6 +377,10 @@ impl OracleAuditPublisher {
             task.abort();
             let _ = task.await;
         }
+        // Reconcile the pending counter to the durable residual after aborting the
+        // background tasks so a restart inspection observes the true backlog.
+        let residual = self.wal.lock().await.snapshot().0;
+        self.pending.store(residual, Ordering::Release);
     }
 
     /// Pauses the production relay before its next Postgres transaction.
@@ -400,11 +422,18 @@ impl OracleAuditPublisher {
     }
 
     /// Returns the pending record, byte, and age snapshot used by restart tests.
+    ///
+    /// The record count is the exact `pending` counter so the sync inspection
+    /// chain never observes a false zero under lock contention; the byte and age
+    /// values remain best-effort try-lock reads of the WAL snapshot.
     #[cfg(feature = "test-support")]
     pub fn wal_snapshot(&self) -> (u64, u64, Option<Duration>) {
-        self.wal
-            .try_lock()
-            .map_or((0, 0, None), |wal| wal.snapshot())
+        let pending = self.pending.load(Ordering::Acquire);
+        let (bytes, oldest) = self.wal.try_lock().map_or((0, None), |wal| {
+            let (_records, bytes, oldest) = wal.snapshot();
+            (bytes, oldest)
+        });
+        (pending, bytes, oldest)
     }
 
     /// Relays bounded snapshots and checkpoints only after SQL commit.
@@ -446,6 +475,11 @@ impl OracleAuditPublisher {
                             );
                             return;
                         }
+                        // The durable checkpoint now covers this record; drop it
+                        // from the pending count. Only reached after a committed
+                        // relay and an advanced checkpoint, so the counter never
+                        // undercounts a record that could still replay.
+                        self.pending.fetch_sub(1, Ordering::AcqRel);
                         record_relay_metric(AuditRelayOutcome::Committed, None);
                         metrics::gauge!("oracle_audit_relay_lag_seconds")
                             .set(record_age_seconds(&record).unwrap_or_default());
@@ -639,6 +673,24 @@ mod pg_tests {
         wyrd_runtime::runtime().block_on(future);
     }
 
+    /// Polls the publisher's exact pending counter until it drains to zero or the
+    /// bounded budget elapses, returning the final observed count.
+    ///
+    /// The relay checkpoints and decrements asynchronously in a background task,
+    /// so this converges on the real drained state rather than masking a race
+    /// with a fixed sleep: the caller asserts on the returned value, and a
+    /// nonzero return within budget is a genuine failure to drain.
+    async fn await_pending_drained(publisher: &OracleAuditPublisher, budget: Duration) -> u64 {
+        let deadline = Instant::now() + budget;
+        loop {
+            let pending = publisher.wal_snapshot().0;
+            if pending == 0 || Instant::now() >= deadline {
+                return pending;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[test]
     /// Proves a locally fsynced tenant event reaches the canonical outbox.
     fn oracle_audit_relay_appends_tenant_scoped_event() {
@@ -732,6 +784,173 @@ mod pg_tests {
             publisher
                 .shutdown(Instant::now() + Duration::from_secs(1))
                 .await;
+        });
+    }
+
+    #[test]
+    /// Proves the pending counter increments exactly once per accepted append and
+    /// decrements exactly once per relayed record, reaching zero on full relay.
+    ///
+    /// The relay is paused before its Postgres transaction so the increments are
+    /// observed with no concurrent decrement, then released so the counter drains
+    /// to zero. Correctness is measured as a committed-row delta around this
+    /// test's own appends, so it is independent of rows other tests leave in the
+    /// shared single-tenant outbox. The name sorts after
+    /// `oracle_audit_relay_appends_tenant_scoped_event` so that exact-count test
+    /// still observes a clean outbox.
+    fn oracle_audit_relay_pending_counter_drains_to_zero_pg() {
+        run(async {
+            let vala = crate::test_support::test_vala_postgres().await;
+            let tenant = crate::test_support::test_tenant().await;
+            let root = tempfile::tempdir().expect("WAL root");
+            let config = OracleAuditWalConfig {
+                audit_wal_root: Some(root.path().to_owned()),
+                ..OracleAuditWalConfig::default()
+            };
+            let count_before: i64 = {
+                let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
+                sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("baseline audit count")
+            };
+            let publisher = OracleAuditPublisher::new(vala.clone(), config).expect("publisher");
+            let pause = publisher.pause_relay_before_postgres();
+            assert_eq!(
+                publisher.wal_snapshot().0,
+                0,
+                "no records are pending before any append"
+            );
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("first acceptance");
+            assert_eq!(
+                publisher.wal_snapshot().0,
+                1,
+                "one accepted append increments pending exactly once"
+            );
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("second acceptance");
+            assert_eq!(
+                publisher.wal_snapshot().0,
+                2,
+                "the second accepted append increments pending exactly once"
+            );
+            drop(pause);
+            let drained = await_pending_drained(&publisher, Duration::from_secs(5)).await;
+            assert_eq!(
+                drained, 0,
+                "full relay decrements every relayed record to zero pending"
+            );
+            let count_after: i64 = {
+                let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
+                sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count")
+            };
+            assert_eq!(
+                count_after - count_before,
+                2,
+                "each of the two pending decrements committed exactly one outbox row"
+            );
+            publisher
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await;
+        });
+    }
+
+    #[test]
+    /// Proves `wal_snapshot` reports the exact pending record count from the
+    /// atomic counter even while another task holds the WAL lock.
+    ///
+    /// The test holds the WAL mutex across the synchronous `wal_snapshot` call so
+    /// its internal `try_lock` fails: the byte field falls back to zero, which is
+    /// the false-zero the replaced try-lock record path would also have reported,
+    /// while the record count must still be the true pending value. The byte-zero
+    /// versus record-two contrast is the deciding evidence for the counter.
+    fn oracle_audit_wal_snapshot_reports_exact_pending_under_lock_contention_pg() {
+        run(async {
+            let vala = crate::test_support::test_vala_postgres().await;
+            let tenant = crate::test_support::test_tenant().await;
+            let root = tempfile::tempdir().expect("WAL root");
+            let config = OracleAuditWalConfig {
+                audit_wal_root: Some(root.path().to_owned()),
+                ..OracleAuditWalConfig::default()
+            };
+            let publisher = OracleAuditPublisher::new(vala.clone(), config).expect("publisher");
+            // The relay stays paused for the whole test so it never checkpoints or
+            // commits a row: the two records remain pending, and the test tears the
+            // publisher down with `abort_for_test` rather than draining, keeping the
+            // shared single-tenant outbox unpolluted.
+            let _pause = publisher.pause_relay_before_postgres();
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("first acceptance");
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("second acceptance");
+            assert_eq!(
+                publisher.wal_snapshot().0,
+                2,
+                "the uncontended snapshot observes both pending records"
+            );
+            let held = publisher.wal.lock().await;
+            let contended = publisher.wal_snapshot();
+            assert_eq!(
+                contended.0, 2,
+                "the record count is the exact atomic pending even under WAL lock contention"
+            );
+            assert_eq!(
+                contended.1, 0,
+                "the byte fallback confirms the WAL lock was genuinely held; the replaced try-lock record path would have reported zero here"
+            );
+            drop(held);
+            publisher.abort_for_test().await;
+        });
+    }
+
+    #[test]
+    /// Proves `abort_for_test` reconciles the pending counter to the durable WAL
+    /// residual, leaving it consistent with the backlog rather than stranded.
+    ///
+    /// The relay stays paused so no record is checkpointed, the abort tears the
+    /// background tasks down, and the reconciled counter must equal the WAL's own
+    /// durable residual (both records, none drained).
+    fn oracle_audit_abort_for_test_reconciles_pending_to_durable_residual_pg() {
+        run(async {
+            let vala = crate::test_support::test_vala_postgres().await;
+            let tenant = crate::test_support::test_tenant().await;
+            let root = tempfile::tempdir().expect("WAL root");
+            let config = OracleAuditWalConfig {
+                audit_wal_root: Some(root.path().to_owned()),
+                ..OracleAuditWalConfig::default()
+            };
+            let publisher = OracleAuditPublisher::new(vala.clone(), config).expect("publisher");
+            let _pause = publisher.pause_relay_before_postgres();
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("first acceptance");
+            publisher
+                .publish_read_decision(&context(tenant), decision())
+                .await
+                .expect("second acceptance");
+            assert_eq!(
+                publisher.wal_snapshot().0,
+                2,
+                "both records are pending before the abort"
+            );
+            publisher.abort_for_test().await;
+            let durable_residual = publisher.wal.lock().await.snapshot().0;
+            assert_eq!(
+                publisher.wal_snapshot().0,
+                durable_residual,
+                "abort reconciles the pending counter to the durable WAL residual"
+            );
+            assert_eq!(
+                durable_residual, 2,
+                "aborting before any checkpoint retains both durable records"
+            );
         });
     }
 }

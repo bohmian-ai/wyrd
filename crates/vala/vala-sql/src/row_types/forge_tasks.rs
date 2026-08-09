@@ -588,7 +588,36 @@ pub enum ForgeTaskStrategy {
     OrphanCleanup,
 }
 
+/// The maintenance-family strategies a reserved worker slot claims first.
+///
+/// These lifecycle and garbage-collection strategies reclaim durable storage
+/// but produce no compaction throughput, so they are exactly the strategies a
+/// sustained compaction backlog would otherwise starve. Compaction and rewrite
+/// strategies are deliberately excluded. Passed to
+/// [`super::super::queries::forge_tasks::ForgeTasks::claim_fair`] as the
+/// reserved slot's strategy filter.
+pub const MAINTENANCE_STRATEGIES: &[ForgeTaskStrategy] = &[
+    ForgeTaskStrategy::SnapshotExpiry,
+    ForgeTaskStrategy::ExpiredCleanup,
+    ForgeTaskStrategy::OrphanCleanup,
+];
+
 impl ForgeTaskStrategy {
+    /// Returns whether this strategy is maintenance-family lifecycle work.
+    ///
+    /// Maintenance-family strategies reclaim durable storage (snapshot expiry
+    /// and orphan or expired cleanup) rather than producing compaction
+    /// throughput. The reserved worker slot uses this classification so a ready
+    /// maintenance task stays claimable regardless of compaction backlog. The
+    /// set is kept in sync with [`MAINTENANCE_STRATEGIES`].
+    #[must_use]
+    pub fn is_maintenance(self) -> bool {
+        matches!(
+            self,
+            Self::SnapshotExpiry | Self::ExpiredCleanup | Self::OrphanCleanup
+        )
+    }
+
     /// Returns the stable SQL representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {

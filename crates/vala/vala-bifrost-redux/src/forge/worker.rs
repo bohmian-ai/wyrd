@@ -23,7 +23,8 @@ use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ForgeClaimStrategy, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
     ForgePreparedTaskClaim, ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskState,
-    ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, SnapshotWatermark,
+    ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES,
+    SnapshotWatermark,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -777,10 +778,16 @@ impl ForgeWorker {
     /// Returns a slot panic or an unexpected slot-level configuration failure.
     pub async fn run(self, shutdown: CancellationToken) -> Result<(), ForgeError> {
         let mut slots = JoinSet::new();
-        for _ in 0..self.config.worker_concurrency {
+        for index in 0..self.config.worker_concurrency {
             let worker = self.clone();
             let stop = shutdown.clone();
-            slots.spawn(async move { worker.run_slot(stop).await });
+            // Slot zero is the reserved maintenance slot: it always attempts a
+            // maintenance-strategy claim before falling back to any strategy, so
+            // a ready maintenance task can never be starved by a compaction
+            // backlog occupying every other slot. With a single-slot worker that
+            // one slot carries the reservation.
+            let reserved_maintenance = index == 0;
+            slots.spawn(async move { worker.run_slot(stop, reserved_maintenance).await });
         }
         while let Some(result) = slots.join_next().await {
             result.map_err(|error| ForgeError::Invariant {
@@ -810,7 +817,15 @@ impl ForgeWorker {
     /// Individual task failures remain durable and are logged for takeover; a
     /// shutdown-release database failure is likewise logged and the claim is
     /// retained for lease-expiry recovery rather than failing the slot.
-    async fn run_slot(&self, shutdown: CancellationToken) -> Result<(), ForgeError> {
+    ///
+    /// When `reserved_maintenance` is set this slot attempts a maintenance-only
+    /// claim before any unfiltered claim on every iteration, reserving its
+    /// capacity for maintenance whenever such work is ready.
+    async fn run_slot(
+        &self,
+        shutdown: CancellationToken,
+        reserved_maintenance: bool,
+    ) -> Result<(), ForgeError> {
         let claim_limits = self.claim_limits()?;
         loop {
             if shutdown.is_cancelled() {
@@ -847,8 +862,7 @@ impl ForgeWorker {
                 continue;
             }
             let claim = self
-                .tasks
-                .claim_fair(self.owner, claim_limits)
+                .claim_next(claim_limits, reserved_maintenance)
                 .await
                 .map_err(ForgeError::Sql)?;
             let Some(claim) = claim else {
@@ -958,7 +972,7 @@ impl ForgeWorker {
         }
         let claim = self
             .tasks
-            .claim_fair(self.owner, limits)
+            .claim_fair(self.owner, limits, None)
             .await
             .map_err(ForgeError::Sql)?;
         let Some(claim) = claim else {
@@ -981,7 +995,28 @@ impl ForgeWorker {
     pub async fn claim_for_test(&self) -> Result<Option<ForgeTaskClaim>, ForgeError> {
         let limits = self.claim_limits()?;
         self.tasks
-            .claim_fair(self.owner, limits)
+            .claim_fair(self.owner, limits, None)
+            .await
+            .map_err(ForgeError::Sql)
+    }
+
+    /// Drives one reserved-slot claim attempt for deterministic fixtures.
+    ///
+    /// Mirrors [`Self::claim_next`] so an integration test can prove that a
+    /// reserved maintenance slot claims a ready maintenance task ahead of a
+    /// compaction backlog, then falls back to any strategy when no maintenance
+    /// work is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns configuration, SQL, or persisted-row decoding failures.
+    #[cfg(feature = "test-support")]
+    pub async fn claim_next_for_test(
+        &self,
+        reserved_maintenance: bool,
+    ) -> Result<Option<ForgeTaskClaim>, ForgeError> {
+        let limits = self.claim_limits()?;
+        self.claim_next(limits, reserved_maintenance)
             .await
             .map_err(ForgeError::Sql)
     }
@@ -2844,6 +2879,34 @@ impl ForgeWorker {
     fn base_snapshot_matches(table: &Table, base_snapshot_id: i64) -> bool {
         table.metadata().current_snapshot_id()
             == (base_snapshot_id != 0).then_some(base_snapshot_id)
+    }
+
+    /// Claims the next task for one slot, honoring its maintenance reservation.
+    ///
+    /// A reserved maintenance slot first attempts a claim restricted to
+    /// [`MAINTENANCE_STRATEGIES`]; when no maintenance task is ready it falls
+    /// back to an unfiltered claim so the slot still performs compaction rather
+    /// than idling. A non-reserved slot claims across every strategy directly.
+    /// Both paths share the same fair-claim transaction, so tenancy, lane, and
+    /// size admission are identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying fair-claim SQL errors.
+    async fn claim_next(
+        &self,
+        limits: ForgeClaimLimits,
+        reserved_maintenance: bool,
+    ) -> Result<Option<ForgeTaskClaim>, vala_sql::SqlError> {
+        if reserved_maintenance
+            && let Some(claim) = self
+                .tasks
+                .claim_fair(self.owner, limits, Some(MAINTENANCE_STRATEGIES))
+                .await?
+        {
+            return Ok(Some(claim));
+        }
+        self.tasks.claim_fair(self.owner, limits, None).await
     }
 
     /// Builds the positive atomic claim limits from Forge capacity.

@@ -51,6 +51,15 @@ const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
+/// Default commit count past `retain_last` that makes snapshot expiry due on
+/// its own. Chosen well above ordinary per-tick compaction commit counts so a
+/// table under steady ingest still accrues history before maintenance fires,
+/// but far below `max_retained_snapshots_per_table` so history never wedges.
+const DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT: usize = 32;
+/// Default oldest-snapshot age that makes snapshot expiry due when at least one
+/// commit exists past `retain_last`. Bounds retained-history age for a
+/// low-commit table that never reaches the count trigger.
+const DEFAULT_MAINTENANCE_TRIGGER_INTERVAL: Duration = Duration::from_hours(1);
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -100,6 +109,15 @@ pub struct ForgeConfig {
     pub max_open_operations_per_table: usize,
     /// Maximum retained snapshots traversed by one reconciliation observation.
     pub max_retained_snapshots_per_table: usize,
+    /// Count of accumulated commits past `retain_last` that makes snapshot
+    /// expiry due on its own, independent of compaction backlog. Evaluated
+    /// every planning tick so maintenance can never be starved by compaction
+    /// load; see [`super::planning_scheduler`].
+    pub maintenance_trigger_snapshot_count: usize,
+    /// Age of the oldest retained snapshot past which snapshot expiry becomes
+    /// due, provided at least one commit exists past `retain_last`. Paired with
+    /// `maintenance_trigger_snapshot_count` as a count-OR-interval trigger.
+    pub maintenance_trigger_interval: Duration,
 }
 
 impl Default for ForgeConfig {
@@ -128,6 +146,8 @@ impl Default for ForgeConfig {
             max_hints_per_wake: 256,
             max_open_operations_per_table: DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE,
             max_retained_snapshots_per_table: DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE,
+            maintenance_trigger_snapshot_count: DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT,
+            maintenance_trigger_interval: DEFAULT_MAINTENANCE_TRIGGER_INTERVAL,
         }
     }
 }
@@ -163,6 +183,8 @@ impl ForgeConfig {
             || self.max_hints_per_wake == 0
             || self.max_open_operations_per_table == 0
             || self.max_retained_snapshots_per_table == 0
+            || self.maintenance_trigger_snapshot_count == 0
+            || self.maintenance_trigger_interval.is_zero()
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge limits must be positive and min_files/max_files_per_bin must be at least two".to_owned(),

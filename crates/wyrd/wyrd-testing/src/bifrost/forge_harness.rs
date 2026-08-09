@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    FixedSizeBinaryBuilder, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -1477,7 +1478,7 @@ impl ForgeFixture {
                 Arc::new(Int64Array::from(values)),
                 Arc::new(StringArray::from(vec![None::<&str>; rows])),
                 Arc::new(StringArray::from(vec![None::<&str>; rows])),
-                Arc::new(StringArray::from(vec![None::<&str>; rows])),
+                Arc::new(StringArray::from(vec!["principal"; rows])),
                 Arc::new(StringArray::from(vec!["request"; rows])),
                 Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
                 Arc::new(
@@ -1489,6 +1490,11 @@ impl ForgeFixture {
                     .with_timezone("UTC"),
                 ),
                 Arc::new(batch_ids.finish()),
+                Arc::new(Int32Array::from(
+                    (0..rows)
+                        .map(|offset| i32::try_from(offset).expect("row ordinal"))
+                        .collect::<Vec<_>>(),
+                )),
                 Arc::new(StringArray::from(tenants)),
             ],
         )
@@ -1761,7 +1767,7 @@ async fn seed_forge_group_with_resources(
             columns.extend([
                 Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
                 Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
+                Arc::new(StringArray::from(vec!["principal"; 2])) as Arc<dyn arrow::array::Array>,
                 Arc::new(StringArray::from(vec!["request"; 2])) as Arc<dyn arrow::array::Array>,
                 Arc::new(
                     TimestampMicrosecondArray::from(vec![
@@ -1778,6 +1784,7 @@ async fn seed_forge_group_with_resources(
                     .with_timezone("UTC"),
                 ) as Arc<dyn arrow::array::Array>,
                 Arc::new(batch_ids.finish()) as Arc<dyn arrow::array::Array>,
+                Arc::new(Int32Array::from(vec![0_i32, 1_i32])) as Arc<dyn arrow::array::Array>,
                 Arc::new(StringArray::from(vec![tenant.to_string(); 2]))
                     as Arc<dyn arrow::array::Array>,
             ]);

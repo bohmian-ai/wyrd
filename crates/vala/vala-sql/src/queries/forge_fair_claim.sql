@@ -8,6 +8,7 @@ WITH cursor AS MATERIALIZED (
     FROM vala.forge_tasks t
     WHERE t.state IN ('ready', 'retryable')
       AND t.ready_at <= statement_timestamp()
+      AND ($11::text[] IS NULL OR t.strategy = ANY($11::text[]))
       AND NOT EXISTS (
           SELECT 1
           FROM vala.forge_tasks active

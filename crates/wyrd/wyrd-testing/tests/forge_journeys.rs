@@ -569,6 +569,121 @@ async fn forge_snapshot_expiry_journey() {
         .expect("journey expiry server shutdown");
 }
 
+/// Proves a sustained compaction backlog never starves Forge snapshot expiry.
+///
+/// The fixture builds real retained Iceberg history through two production
+/// staging-fold commits, then seeds an additional pool of uncompacted staging
+/// files so a staging-fold compaction candidate stays continuously available on
+redacted
+/// (`maintenance_trigger_snapshot_count` / `maintenance_trigger_interval`) making
+/// expiry due independently of that backlog, and the reserved maintenance worker
+/// slot claiming maintenance ahead of ready compaction, the journey asserts that
+/// the durable production scheduler and worker still complete `SnapshotExpiry`
+/// and persist its commit audit while the compaction backlog remains pending.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot build retained history, when no compaction
+/// candidate is present to contend with maintenance, when the bounded production
+/// maintenance loop never completes `SnapshotExpiry`, or when the authoritative
+/// expiry commit audit is absent.
+#[tokio::test]
+#[ignore = "gated journey: real Postgres, sustained compaction backlog, and Forge maintenance"]
+async fn sustained_ingest_does_not_starve_snapshot_expiry_journey() {
+    let server = start_maintenance_journey_server().await;
+    let fixture = seed_forge_group(&server, "journey_sustained_ingest_maintenance").await;
+    // Two production staging-fold commits create retained Iceberg history so the
+    // maintenance trigger has snapshots beyond `retain_last` to expire.
+    commit_journey_staging_snapshot(&fixture).await;
+    fixture.append_forge_file(2).await;
+    fixture.append_forge_file(3).await;
+    commit_journey_staging_snapshot(&fixture).await;
+    // Seed a sustained compaction backlog: uncompacted staging files keep a
+    // staging-fold candidate available on every subsequent planning tick, so
+    // maintenance must lead through real compaction contention rather than an
+    // idle table.
+    fixture.append_forge_file(4).await;
+    fixture.append_forge_file(5).await;
+    fixture.append_forge_file(6).await;
+    let pending_backlog: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
+         AND committed_snapshot_id IS NULL",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("sustained compaction backlog count");
+    assert!(
+        pending_backlog > 0,
+        "journey must hold a live staging-fold compaction candidate while maintenance runs"
+    );
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("journey sustained-ingest table");
+    let newest_snapshot_ms = table
+        .metadata()
+        .snapshots()
+        .map(|snapshot| snapshot.timestamp_ms())
+        .max()
+        .expect("journey sustained-ingest retained history");
+    server
+        .forge_clock()
+        .set(
+            chrono::DateTime::from_timestamp_millis(newest_snapshot_ms + 2)
+                .expect("journey snapshot timestamp is UTC-representable"),
+        )
+        .expect("advance journey expiry clock");
+    let mut config = fixture.config.clone();
+    config.snapshot_retention = Duration::from_millis(1);
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_millis(1);
+    let mut completed_expiry = false;
+    for _ in 0..3 {
+        let mut lifecycle = JourneyMaintenance::start(&fixture, config.clone());
+        let strategy = lifecycle.run_one_success().await;
+        lifecycle.shutdown().await;
+        if strategy == ForgeTaskStrategy::SnapshotExpiry {
+            completed_expiry = true;
+            break;
+        }
+    }
+    assert!(
+        completed_expiry,
+        "maintenance must complete snapshot_expiry despite a pending compaction backlog"
+    );
+    assert!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await
+            >= 1,
+        "sustained-backlog journey must persist an expiry commit audit"
+    );
+    let remaining_backlog: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
+         AND committed_snapshot_id IS NULL",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("residual compaction backlog count");
+    assert!(
+        remaining_backlog > 0,
+        "maintenance must lead ahead of the still-pending compaction backlog"
+    );
+    server
+        .shutdown()
+        .await
+        .expect("journey sustained-ingest server shutdown");
+}
+
 /// Runs real orphan collection and proves an aged, unreferenced object is deleted.
 ///
 /// # Panics

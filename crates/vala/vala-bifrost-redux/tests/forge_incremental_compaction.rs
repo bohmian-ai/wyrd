@@ -1901,6 +1901,280 @@ mod pg_tests {
         fixture.plan_and_claim().await
     }
 
+    /// A due maintenance trigger leads planning even while a live compaction
+    /// candidate is present, proving snapshot expiry is not starved by sustained
+    /// compaction load (AC1).
+    ///
+    /// Warm-up runs two ordinary compaction-and-execute cycles under a
+    /// one-nanosecond trigger interval: during each warm-up plan the table holds
+    /// at most `retain_last` snapshots, so `commits_since_last_maintenance` is
+    /// zero and the trigger does not fire mid-warm-up. Only after the second
+    /// commit does the interval arm become due. Fresh staging files are then
+    /// seeded and deliberately NOT right-sized away (the contrast with
+    /// [`prepare_maintenance_claim`], which drains compaction so expiry wins
+    /// through the both-empty fallback), so a live compaction candidate coexists
+    /// with the due maintenance candidate on the planned tick; the claimed
+    /// strategy proves maintenance took the tick's single slot ahead of it.
+    #[tokio::test]
+    async fn maintenance_leads_planning_amid_compaction_backlog() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+        fixture.schedule_and_execute().await;
+        fixture.seed_files_at(100, 4, true).await;
+        fixture.schedule_and_execute().await;
+        // Fresh, undrained staging files keep a live compaction candidate for
+        // this tick; the maintenance-family fixtures right-size to drain it, this
+        // one does not, so both candidate classes are present when planning runs.
+        fixture.seed_files_at(200, 4, true).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        )
+        .expect("maintenance identity");
+        ForgeTasks::new(fixture.operator_pool.clone())
+            .upsert_periodic(fixture.tenant, &identity)
+            .await
+            .expect("periodic maintenance demand");
+        let claim = fixture.plan_and_claim().await;
+        assert!(
+            matches!(
+                claim.strategy,
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+            ),
+            "a due maintenance trigger must lead planning ahead of a live compaction candidate: {:?}",
+            claim.strategy
+        );
+    }
+
+    /// A table whose manifest history exceeds `max_concurrent_reads` plans a
+    /// schedulable expiry on successive bounded ticks instead of wedging in the
+    /// terminal `Unschedulable` lane or pinning one idempotent plan (AC3).
+    ///
+    /// The regression is the deep-history wedge, which lives in the planning
+    /// layer: before the parallelism bound, `maintenance_candidate` set
+    /// `parallelism = manifest_count`, so a table with more retained manifests
+    /// than `max_concurrent_reads` (here `1`) planned a candidate whose
+    /// parallelism exceeded `max_parallelism` and whose input count was not one,
+    /// classifying it `Unschedulable` on every tick — a permanent stall. This
+    /// proof is deliberately plan-only (`schedule_once`, never executed): the
+    /// wedge is the capacity classification, and executing synthetic
+    /// fast-appended history would exercise unrelated expiry ancestry mechanics.
+    /// The first tick must plan a schedulable expiry (`unschedulable == 0`,
+    /// `tasks_enqueued == 1`); a second tick, after fresh manifest history moves
+    /// the current snapshot, must again plan schedulable and advance to a distinct
+    /// `plan_hash`, proving successive bounded ticks progress rather than pinning
+    /// the retired plan.
+    #[tokio::test]
+    async fn deep_manifest_history_progresses_without_wedging() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_concurrent_reads: 1,
+                maintenance_trigger_interval: Duration::from_nanos(1),
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            9,
+            16 * 1024 * 1024,
+        )
+        .await;
+        // Build a deep manifest history directly, one fast-append per seeded
+        // object, so the current snapshot's manifest list has six entries —
+        // strictly more than `max_concurrent_reads`.
+        for index in 0..6 {
+            let table = fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("historical table load");
+            fixture.append_seed_manifest(&table, index).await;
+        }
+        // Drop the staging file-list rows so only the manifest history drives
+        // planning; no compaction candidate competes with maintenance here.
+        fixture.delete_file_list_history().await;
+        let snapshots_before = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("deep-history table")
+            .metadata()
+            .snapshots()
+            .count();
+        // Deeper than the configured `max_concurrent_reads` of 1, so the
+        // pre-bound parallelism would have exceeded `max_parallelism`.
+        assert!(
+            snapshots_before > 1,
+            "fixture must build manifest history deeper than max_concurrent_reads: {snapshots_before}"
+        );
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        )
+        .expect("deep-history identity");
+        let tasks = ForgeTasks::new(fixture.operator_pool.clone());
+        let stop = CancellationToken::new();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tasks
+            .upsert_periodic(fixture.tenant, &identity)
+            .await
+            .expect("first periodic maintenance demand");
+        let first = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("first-tick scheduler")
+            .schedule_once(&stop)
+            .await
+            .expect("first bounded planning tick");
+        assert_eq!(
+            first.unschedulable, 0,
+            "deep manifest history must not wedge in the Unschedulable lane: {first:?}"
+        );
+        assert_eq!(
+            first.tasks_enqueued, 1,
+            "the first bounded tick must plan exactly one schedulable expiry: {first:?}"
+        );
+
+        // Append fresh manifest history so the second bounded tick plans from a
+        // new current snapshot rather than re-deriving the first plan.
+        for index in 6..9 {
+            let table = fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("second-round table load");
+            fixture.append_seed_manifest(&table, index).await;
+        }
+        fixture.delete_file_list_history().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tasks
+            .upsert_periodic(fixture.tenant, &identity)
+            .await
+            .expect("second periodic maintenance demand");
+        let second = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("second-tick scheduler")
+            .schedule_once(&stop)
+            .await
+            .expect("second bounded planning tick");
+        assert_eq!(
+            second.unschedulable, 0,
+            "the second bounded tick must also be schedulable: {second:?}"
+        );
+        assert_eq!(
+            second.tasks_enqueued, 1,
+            "the second bounded tick must plan exactly one schedulable expiry: {second:?}"
+        );
+        let distinct_plans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT plan_hash) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND strategy='snapshot_expiry'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("distinct maintenance plans");
+        assert_eq!(
+            distinct_plans, 2,
+            "successive bounded ticks must plan distinct expiries, not pin one idempotent plan"
+        );
+    }
+
+    /// A reserved maintenance slot claims a ready maintenance task ahead of an
+    /// older, ready compaction task, proving compaction backlog cannot starve
+    /// maintenance at the claim seam (AC2).
+    ///
+    /// The compaction task is enqueued first, so a strategy-blind FIFO claim
+    /// would take it; the reserved slot's maintenance-first claim call takes the
+    /// snapshot-expiry task instead.
+    #[tokio::test]
+    async fn reserved_slot_prefers_maintenance_over_ready_compaction() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+        let tasks = ForgeTasks::new(fixture.operator_pool.clone());
+        tasks
+            .enqueue(&fixture.durable_task(
+                ForgeTaskStrategy::SmallFiles,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["data/compaction.parquet".to_owned()],
+                    parameters: serde_json::json!({"kind":"small_files"}),
+                },
+                11,
+            ))
+            .await
+            .expect("compaction task enqueue");
+        tasks
+            .enqueue(&fixture.durable_task(
+                ForgeTaskStrategy::SnapshotExpiry,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["metadata/expiry.json".to_owned()],
+                    parameters: serde_json::json!({"kind":"maintenance"}),
+                },
+                22,
+            ))
+            .await
+            .expect("maintenance task enqueue");
+        let claim = fixture
+            .worker
+            .claim_next_for_test(true)
+            .await
+            .expect("reserved-slot claim query")
+            .expect("reserved-slot claimed task");
+        assert!(
+            matches!(
+                claim.strategy,
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+            ),
+            "the reserved slot must claim maintenance ahead of an older ready compaction task: {:?}",
+            claim.strategy
+        );
+    }
+
+    /// The reserved maintenance slot falls back to compaction when no maintenance
+    /// work is ready, so its capacity is reserved but never idled (AC2).
+    #[tokio::test]
+    async fn reserved_slot_falls_back_to_compaction_without_maintenance() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+        let tasks = ForgeTasks::new(fixture.operator_pool.clone());
+        tasks
+            .enqueue(&fixture.durable_task(
+                ForgeTaskStrategy::SmallFiles,
+                ForgeTaskPlan {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    inputs: vec!["data/compaction.parquet".to_owned()],
+                    parameters: serde_json::json!({"kind":"small_files"}),
+                },
+                33,
+            ))
+            .await
+            .expect("compaction task enqueue");
+        let claim = fixture
+            .worker
+            .claim_next_for_test(true)
+            .await
+            .expect("reserved-slot fallback claim query")
+            .expect("reserved-slot fallback claimed task");
+        assert!(
+            matches!(
+                claim.strategy,
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles)
+            ),
+            "the reserved slot must fall back to compaction when no maintenance is ready: {:?}",
+            claim.strategy
+        );
+    }
+
     /// A second scheduler remains a successful standby while the leader lease is live.
     #[tokio::test]
     async fn scheduler_contention_is_a_standby_outcome() {

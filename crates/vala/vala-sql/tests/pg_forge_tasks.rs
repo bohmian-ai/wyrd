@@ -8,10 +8,11 @@ mod pg_tests {
     use vala_sql::TenantConn;
     use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
     use vala_sql::row_types::forge_tasks::{
-        FORGE_TASK_PAYLOAD_VERSION, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
-        ForgeTaskEstimates, ForgeTaskEvidence, ForgeTaskLane, ForgeTaskPlan, ForgeTaskState,
-        ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome,
-        NewForgeTask, SnapshotWatermark,
+        FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate,
+        ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEstimates, ForgeTaskEvidence,
+        ForgeTaskLane, ForgeTaskPlan, ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity,
+        ForgeTaskTransition, ForgeTaskTransitionOutcome, MAINTENANCE_STRATEGIES, NewForgeTask,
+        SnapshotWatermark,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -56,6 +57,22 @@ mod pg_tests {
                 large_ceiling_bytes: 1000,
             },
             ready_at: Utc::now(),
+        }
+    }
+
+    /// Builds one ready snapshot-expiry maintenance task for a given table.
+    ///
+    /// # Panics
+    /// Panics when the fixed test identity is invalid.
+    fn maintenance_task(tenant: DataTenantId, table: &str, hash: u8) -> NewForgeTask {
+        NewForgeTask {
+            strategy: ForgeTaskStrategy::SnapshotExpiry,
+            plan: ForgeTaskPlan {
+                version: FORGE_TASK_PAYLOAD_VERSION,
+                inputs: vec![format!("metadata/{table}.avro")],
+                parameters: serde_json::json!({"kind": "maintenance"}),
+            },
+            ..task(tenant, table, ForgeTaskLane::Ordinary, hash)
         }
     }
 
@@ -112,7 +129,7 @@ mod pg_tests {
         assert_eq!(initial.0, None);
         assert!(
             tasks
-                .claim_fair(owner, limits(1))
+                .claim_fair(owner, limits(1), None)
                 .await
                 .expect("empty claim")
                 .is_none()
@@ -133,7 +150,7 @@ mod pg_tests {
         no_fit.max_bytes = 1;
         assert!(
             tasks
-                .claim_fair(owner, no_fit)
+                .claim_fair(owner, no_fit, None)
                 .await
                 .expect("no-fit claim")
                 .is_none()
@@ -147,7 +164,7 @@ mod pg_tests {
         assert_eq!(unchanged.0, None);
 
         let claim = tasks
-            .claim_fair(owner, limits(1))
+            .claim_fair(owner, limits(1), None)
             .await
             .expect("independent claim")
             .expect("worker claims without scheduler lease");
@@ -184,7 +201,7 @@ mod pg_tests {
             .await
             .expect("enqueue superseded task");
         let claim = tasks
-            .claim_fair(owner, limits(1))
+            .claim_fair(owner, limits(1), None)
             .await
             .expect("claim query")
             .expect("claimed task");
@@ -246,7 +263,7 @@ mod pg_tests {
         watermark: SnapshotWatermark,
     ) -> (Uuid, DataTenantId) {
         let claim = tasks
-            .claim_fair(owner, limits(4))
+            .claim_fair(owner, limits(4), None)
             .await
             .expect("claim")
             .expect("claimed task");
@@ -288,8 +305,8 @@ mod pg_tests {
             .expect("fence");
         let claim_limits = limits(1);
         let (left, right) = tokio::join!(
-            tasks.claim_fair(owner, claim_limits),
-            tasks.claim_fair(owner, claim_limits)
+            tasks.claim_fair(owner, claim_limits, None),
+            tasks.claim_fair(owner, claim_limits, None)
         );
         let claims = [left.expect("left"), right.expect("right")];
         assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
@@ -330,7 +347,7 @@ mod pg_tests {
         let oversized_id = tasks.enqueue(&oversized).await.expect("oversized enqueue");
         assert!(
             tasks
-                .claim_fair(owner, limits(2))
+                .claim_fair(owner, limits(2), None)
                 .await
                 .expect("capacity claim")
                 .is_none(),
@@ -388,7 +405,7 @@ mod pg_tests {
             ..limits(1)
         };
         let first = tasks
-            .claim_fair(leader, claim_limits)
+            .claim_fair(leader, claim_limits, None)
             .await
             .expect("first claim")
             .expect("first tenant");
@@ -424,7 +441,7 @@ mod pg_tests {
             .expect("successor")
             .expect("takeover fence");
         let second = tasks
-            .claim_fair(successor, claim_limits)
+            .claim_fair(successor, claim_limits, None)
             .await
             .expect("successor claim")
             .expect("next tenant");
@@ -464,8 +481,8 @@ mod pg_tests {
         let owner_a = Uuid::now_v7();
         let owner_b = Uuid::now_v7();
         let (left, right) = tokio::join!(
-            tasks.claim_fair(owner_a, limits(1)),
-            tasks.claim_fair(owner_b, limits(1))
+            tasks.claim_fair(owner_a, limits(1), None),
+            tasks.claim_fair(owner_b, limits(1), None)
         );
         let claims = [
             left.expect("left").expect("owner A claims a large task"),
@@ -498,7 +515,7 @@ mod pg_tests {
             .expect("second large for owner A tenant");
         assert!(
             tasks
-                .claim_fair(owner_a, limits(4))
+                .claim_fair(owner_a, limits(4), None)
                 .await
                 .expect("owner A second large claim")
                 .is_none(),
@@ -538,7 +555,7 @@ mod pg_tests {
             .await
             .expect("second large");
         let first = tasks
-            .claim_fair(owner, limits(4))
+            .claim_fair(owner, limits(4), None)
             .await
             .expect("first claim")
             .expect("owner claims first large");
@@ -546,7 +563,7 @@ mod pg_tests {
         let attempt = first.attempt_id.expect("attempt");
         assert!(
             tasks
-                .claim_fair(owner, limits(4))
+                .claim_fair(owner, limits(4), None)
                 .await
                 .expect("second claim")
                 .is_none(),
@@ -585,7 +602,7 @@ mod pg_tests {
             .expect("terminalize first large");
         conn.commit().await.expect("commit terminal");
         let second = tasks
-            .claim_fair(owner, limits(4))
+            .claim_fair(owner, limits(4), None)
             .await
             .expect("post-terminal claim")
             .expect("owner claims second large after first terminal");
@@ -623,13 +640,13 @@ mod pg_tests {
             .expect("scheduler")
             .expect("fence");
         let claimed_first = tasks
-            .claim_fair(owner, limits(4))
+            .claim_fair(owner, limits(4), None)
             .await
             .expect("first claim")
             .expect("first task");
         assert_eq!(claimed_first.task_id, first);
         let claimed_second = tasks
-            .claim_fair(owner, limits(4))
+            .claim_fair(owner, limits(4), None)
             .await
             .expect("second claim")
             .expect("independent task remains claimable");
@@ -672,7 +689,7 @@ mod pg_tests {
             .expect("fence");
         assert_eq!(
             tasks
-                .claim_fair(owner, limits(4))
+                .claim_fair(owner, limits(4), None)
                 .await
                 .expect("large claim")
                 .expect("large task")
@@ -681,7 +698,7 @@ mod pg_tests {
         );
         assert_eq!(
             tasks
-                .claim_fair(owner, limits(4))
+                .claim_fair(owner, limits(4), None)
                 .await
                 .expect("ordinary claim")
                 .expect("ordinary remains eligible")
@@ -701,7 +718,7 @@ mod pg_tests {
             .expect("second large task");
         assert!(
             tasks
-                .claim_fair(owner, limits(4))
+                .claim_fair(owner, limits(4), None)
                 .await
                 .expect("second large claim")
                 .is_none(),
@@ -752,7 +769,7 @@ mod pg_tests {
         .await
         .expect("scheduler before");
         assert!(
-            tasks.claim_fair(owner, limits(1)).await.is_err(),
+            tasks.claim_fair(owner, limits(1), None).await.is_err(),
             "unknown persisted plan fails claim conversion"
         );
         let task_after: (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
@@ -1042,7 +1059,7 @@ mod pg_tests {
             .await
             .expect("enqueue");
         let claimed = tasks
-            .claim_fair(original_owner, limits(1))
+            .claim_fair(original_owner, limits(1), None)
             .await
             .expect("claim")
             .expect("task");
@@ -1139,7 +1156,7 @@ mod pg_tests {
             .await
             .expect("enqueue");
         let claimed = tasks
-            .claim_fair(original_owner, limits(1))
+            .claim_fair(original_owner, limits(1), None)
             .await
             .expect("claim")
             .expect("task");
@@ -1237,7 +1254,7 @@ mod pg_tests {
             .expect("scheduler")
             .expect("fence");
         let first = tasks
-            .claim_fair(owner, limits(4))
+            .claim_fair(owner, limits(4), None)
             .await
             .expect("claim")
             .expect("claim");
@@ -1389,7 +1406,7 @@ mod pg_tests {
         .await
         .expect("cursor before malformed tenant claim");
         assert!(
-            tasks.claim_fair(owner, limits(4)).await.is_err(),
+            tasks.claim_fair(owner, limits(4), None).await.is_err(),
             "persisted invalid tenant fails before returning claim"
         );
         let rollback: (String, Option<Uuid>, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
@@ -2047,6 +2064,71 @@ mod pg_tests {
                 .await
                 .is_err(),
             "malformed persisted demand fails closed"
+        );
+    }
+
+    /// Proves a maintenance-filtered claim reaches a ready maintenance task past
+    /// a compaction backlog, and that an unfiltered claim still drains
+    /// compaction.
+    ///
+    /// This is the durable half of the reserved maintenance slot: even with
+    /// more ready compaction tasks than workers, the strategy-filtered claim a
+    /// reserved slot issues first always selects maintenance when it is ready,
+    /// so snapshot expiry cannot be starved by compaction load.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or claim assertions fail.
+    #[tokio::test]
+    async fn maintenance_strategy_filter_claims_past_compaction_backlog() {
+        let (fixture, _admin) = setup().await;
+        let op = fixture.operator_pool();
+        let tasks = ForgeTasks::new(op.clone());
+        let owner = Uuid::now_v7();
+        let tenant = fixture.data_tenant_id();
+
+        // A compaction backlog across distinct tables, each independently ready.
+        for index in 0..3_u8 {
+            tasks
+                .enqueue(&task(
+                    tenant,
+                    &format!("compaction_{index}"),
+                    ForgeTaskLane::Ordinary,
+                    index,
+                ))
+                .await
+                .expect("enqueue compaction backlog");
+        }
+        // One ready maintenance task on its own table.
+        tasks
+            .enqueue(&maintenance_task(tenant, "maintenance_table", 200))
+            .await
+            .expect("enqueue maintenance");
+
+        // The reserved slot's first attempt: restricted to maintenance
+        // strategies, it selects the maintenance task despite the larger,
+        // fair-ordered compaction backlog.
+        let maintenance = tasks
+            .claim_fair(owner, limits(8), Some(MAINTENANCE_STRATEGIES))
+            .await
+            .expect("maintenance-filtered claim")
+            .expect("maintenance task claimable past backlog");
+        assert_eq!(
+            maintenance.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry),
+            "filtered claim must select the maintenance strategy"
+        );
+
+        // The unfiltered fallback still claims a compaction task from the
+        // remaining backlog, so the reservation does not starve compaction.
+        let compaction = tasks
+            .claim_fair(owner, limits(8), None)
+            .await
+            .expect("unfiltered fallback claim")
+            .expect("compaction task remains claimable");
+        assert_eq!(
+            compaction.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles),
+            "unfiltered claim drains the compaction backlog"
         );
     }
 }

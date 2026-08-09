@@ -659,15 +659,66 @@ impl<'forge> ForgeScheduler<'forge> {
                 .map(live_candidate)
                 .collect::<Result<Vec<_>, ForgeError>>()?;
         }
-        if candidates.is_empty()
+        // Independent per-table maintenance trigger. Evaluated every tick from
+        // the current metadata, not from the presence of compaction work, so
+        // snapshot expiry can never be starved by sustained compaction load.
+        // When maintenance is due it leads the candidate list, taking this
+        // tick's single planned slot ahead of compaction; otherwise the
+        // both-empty fallback still materializes expiry when no compaction is
+        // ready, preserving staging-first compaction priority in the steady
+        // state.
+        let maintenance_due = self.maintenance_due(&table)?;
+        if (maintenance_due || candidates.is_empty())
             && let Some(candidate) = self.maintenance_candidate(&table).await?
         {
-            candidates.push(candidate);
+            if maintenance_due {
+                candidates.insert(0, candidate);
+            } else {
+                candidates.push(candidate);
+            }
         }
         Ok(ForgeTableSnapshot {
             snapshot_id: discovered.base_snapshot_id(),
             candidates,
         })
+    }
+
+    /// Evaluates the independent snapshot-expiry trigger for one table.
+    ///
+    /// Maintenance is due when accrued commits past `retain_last` reach
+    /// `maintenance_trigger_snapshot_count`, or when the oldest retained
+    /// snapshot is older than `maintenance_trigger_interval` and at least one
+    /// commit exists past `retain_last`. It reads only in-memory table metadata
+    /// plus the process clock, so it is cheap enough to evaluate on every
+    /// planning tick regardless of compaction backlog. Commit accrual is
+    /// derived from the retained snapshot count rather than a persisted marker
+    /// because each executed expiry shrinks that count, resetting the count arm
+    /// without additional durable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a clock error when the current time cannot be read.
+    fn maintenance_due(&self, table: &iceberg::table::Table) -> Result<bool, ForgeError> {
+        let retained = table.metadata().snapshots().count();
+        let commits = retained.saturating_sub(self.forge.core.config.retain_last);
+        if commits == 0 {
+            return Ok(false);
+        }
+        let now_ms = self.forge.core.clock.now()?.timestamp_millis();
+        let oldest_age = table
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.timestamp_ms())
+            .min()
+            .map(|oldest_ms| {
+                Duration::from_millis(u64::try_from(now_ms.saturating_sub(oldest_ms)).unwrap_or(0))
+            });
+        Ok(maintenance_trigger_due(
+            commits,
+            oldest_age,
+            self.forge.core.config.maintenance_trigger_snapshot_count,
+            self.forge.core.config.maintenance_trigger_interval,
+        ))
     }
 
     /// Builds one bounded lifecycle task from the current manifest list.
@@ -722,15 +773,27 @@ impl<'forge> ForgeScheduler<'forge> {
         if inputs.is_empty() {
             return Ok(None);
         }
-        let files = u16::try_from(inputs.len()).map_err(|_| ForgeError::Invariant {
-            detail: "manifest maintenance parallelism exceeds u16".to_owned(),
-        })?;
         let estimate = bytes.max(1);
+        // Parallelism is the concurrent-read width of the expiry, not the count
+        // of manifests to retire, so bound it by `max_concurrent_reads`. Leaving
+        // it equal to the manifest count would push any table whose retained
+        // history exceeds `max_concurrent_reads` into the Unschedulable lane
+        // (its input count is not one, so the large-singleton path never
+        // applies), wedging deep-history tables. The full manifest window still
+        // drives `inputs`, so successive expiries retire bounded slices and the
+        // plan hash advances as history shrinks.
+        let parallelism = u16::try_from(
+            inputs
+                .len()
+                .min(self.forge.core.config.max_concurrent_reads),
+        )
+        .unwrap_or(u16::MAX)
+        .max(1);
         Ok(Some(ForgePlanCandidate {
             strategy: ForgeTaskStrategy::SnapshotExpiry,
             inputs,
             bytes: estimate,
-            parallelism: files.max(1),
+            parallelism,
             memory_bytes: estimate,
             spill_bytes: estimate,
             parameters: serde_json::json!({"kind":"maintenance"}),
@@ -821,6 +884,31 @@ fn live_candidate(
     })
 }
 
+/// Pure count-OR-interval snapshot-expiry trigger predicate.
+///
+/// `commits` is the count of retained snapshots past `retain_last`, and
+/// `oldest_age` is the age of the oldest retained snapshot when the table has
+/// any. Maintenance is due when `commits >= count_threshold`, or when
+/// `oldest_age` has reached `interval` with at least one accrued commit. A
+/// table with zero accrued commits is never due, so the interval arm cannot
+/// fire on an empty or freshly maintained table. Extracted as a free function
+/// so the four trigger outcomes are exercised without catalog or clock IO.
+#[must_use]
+fn maintenance_trigger_due(
+    commits: usize,
+    oldest_age: Option<Duration>,
+    count_threshold: usize,
+    interval: Duration,
+) -> bool {
+    if commits == 0 {
+        return false;
+    }
+    if commits >= count_threshold {
+        return true;
+    }
+    oldest_age.is_some_and(|age| age >= interval)
+}
+
 /// Converts a durable backlog count into an exact, monotonic gauge value.
 #[must_use]
 fn exact_gauge(value: u64) -> f64 {
@@ -859,7 +947,56 @@ fn unschedulable_event(task_id: Uuid) -> AuditEvent {
 
 #[cfg(test)]
 mod source_tests {
-    use super::{ForgeScheduleOutcome, should_publish_gauges};
+    use std::time::Duration;
+
+    use super::{ForgeScheduleOutcome, maintenance_trigger_due, should_publish_gauges};
+
+    /// The count arm fires once accrued commits reach the threshold, even when
+    /// the oldest snapshot is younger than the interval.
+    #[test]
+    fn count_arm_fires_at_threshold() {
+        assert!(maintenance_trigger_due(
+            32,
+            Some(Duration::from_secs(1)),
+            32,
+            Duration::from_hours(1),
+        ));
+    }
+
+    /// The interval arm fires when the oldest snapshot ages past the interval
+    /// while at least one commit exists but the count arm has not tripped.
+    #[test]
+    fn interval_arm_fires_with_commits_below_count() {
+        assert!(maintenance_trigger_due(
+            1,
+            Some(Duration::from_hours(2)),
+            32,
+            Duration::from_hours(1),
+        ));
+    }
+
+    /// Neither arm fires for a below-threshold, recently committed table.
+    #[test]
+    fn not_due_below_count_and_interval() {
+        assert!(!maintenance_trigger_due(
+            5,
+            Some(Duration::from_mins(10)),
+            32,
+            Duration::from_hours(1),
+        ));
+    }
+
+    /// Zero accrued commits is never due, so the interval arm cannot fire on an
+    /// empty or freshly maintained table regardless of the reported age.
+    #[test]
+    fn not_due_without_commits() {
+        assert!(!maintenance_trigger_due(
+            0,
+            Some(Duration::from_hours(100)),
+            1,
+            Duration::from_hours(1),
+        ));
+    }
 
     /// The supervised scheduler path contains no direct execution or commit call.
     #[test]

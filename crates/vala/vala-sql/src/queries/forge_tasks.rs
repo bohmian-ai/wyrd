@@ -17,8 +17,9 @@ use crate::queries::audit_outbox::{OperatorAudit, append_audit};
 use crate::row_types::forge_tasks::{
     ForgePlanningDemand, ForgePlanningDemandSqlRow, ForgePreparedTaskClaim,
     ForgePreparedTaskClaimSqlRow, ForgeTask, ForgeTaskClaim, ForgeTaskClaimSqlRow,
-    ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow, ForgeTaskState, ForgeTaskTableIdentity,
-    ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask, SnapshotWatermark,
+    ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow, ForgeTaskState, ForgeTaskStrategy,
+    ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask,
+    SnapshotWatermark,
 };
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -425,12 +426,20 @@ impl ForgeTasks {
     /// Returns [`SqlError::Conflict`] for zero limits, invariant errors for
     /// malformed persisted rows, and query errors for transaction failures.
     ///
+    /// A non-empty `strategy_filter` restricts this claim to the listed
+    /// strategies, leaving fairness, tenancy, lane, and size selection
+    /// otherwise unchanged. A reserved maintenance worker slot uses it to try
+    /// maintenance strategies first and then falls back to an unfiltered claim,
+    /// so a ready maintenance task is always claimable regardless of compaction
+    /// backlog. `None` claims across every strategy, the ordinary worker path.
+    ///
     /// # Cancellation
     /// Cancellation rolls back both the claim and the cursor advance.
     pub async fn claim_fair(
         &self,
         owner: Uuid,
         limits: ForgeClaimLimits,
+        strategy_filter: Option<&[ForgeTaskStrategy]>,
     ) -> Result<Option<ForgeTaskClaim>, SqlError> {
         if limits.max_active_per_tenant == 0
             || limits.lease_seconds == 0
@@ -446,6 +455,17 @@ impl ForgeTasks {
             });
         }
         let attempt = Uuid::now_v7();
+        // A present-but-empty filter would make nothing claimable; treat it as
+        // an unfiltered claim so a misconfigured empty slice never wedges a
+        // worker slot.
+        let strategy_filter: Option<Vec<String>> = strategy_filter
+            .filter(|strategies| !strategies.is_empty())
+            .map(|strategies| {
+                strategies
+                    .iter()
+                    .map(|strategy| strategy.as_str().to_owned())
+                    .collect()
+            });
         let mut tx = self
             .operator_pool
             .pool()
@@ -479,6 +499,7 @@ impl ForgeTasks {
                     detail: "claim large limit overflow".to_owned(),
                 })?,
             )
+            .bind(strategy_filter)
             .fetch_optional(&mut *tx)
             .await
             .map_err(SqlError::from)?;

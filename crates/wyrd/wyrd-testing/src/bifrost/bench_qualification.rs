@@ -662,8 +662,13 @@ pub enum RunRecordError {
 /// One report artifact linked by the qualification manifest.
 ///
 /// Records the family label, the run-root-relative path of the canonical report
-/// file, and the SHA-256 digest of that file's bytes, so the validator can
-/// recompute the digest from the on-disk report and reject any drift.
+/// file, the SHA-256 digest of that file's bytes, and the topology the family
+/// actually executed under, so the validator can recompute the digest from the
+/// on-disk report and reject any drift, and confirm each report's topology
+/// matches its own manifest entry (per-entry, not against a single manifest
+/// topology, because the qualification suite is intentionally multi-topology:
+/// the distributed family runs six-pod weak scaling while the others run
+/// one-pod).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportDigestEntry {
@@ -673,6 +678,9 @@ pub struct ReportDigestEntry {
     pub path: String,
     /// SHA-256 digest of the report file bytes.
     pub digest: String,
+    /// Topology the family actually executed under, taken verbatim from the
+    /// written report so the per-entry validator check stays meaningful.
+    pub topology: super::bench_report::TopologyIdentity,
 }
 
 /// Measured wall-clock durations and disk usage recorded for the run.
@@ -737,7 +745,11 @@ pub struct QualificationManifest {
     pub dataset_digest: String,
     /// SHA-256 digest of the workload fixtures.
     pub workload_digest: String,
-    /// Topology identity captured with the run.
+    /// Base/environment topology of the run: the one-pod topology the single
+    /// dataset materialization ran under. It is not the per-family executed
+    /// topology and is deliberately not compared against the per-report
+    /// topologies, which vary by family (the distributed sweep is six-pod); the
+    /// validator checks each report against its own [`ReportDigestEntry::topology`].
     pub topology: super::bench_report::TopologyIdentity,
     /// Hardware/object-store environment identity captured with the run.
     pub environment: EnvironmentIdentity,
@@ -747,7 +759,8 @@ pub struct QualificationManifest {
     pub actual_durations: ActualDurations,
     /// The exact command lines that produced the run.
     pub command_lines: Vec<String>,
-    /// The four linked report digests.
+    /// The four linked report digests, each carrying its family's executed
+    /// topology for the per-entry validator check.
     pub reports: Vec<ReportDigestEntry>,
     /// Rolled-up correctness/saturation/recovery verdicts.
     pub verdicts: RunVerdicts,
@@ -899,7 +912,9 @@ pub struct ProvisionOutcome {
 ///
 /// Returned by [`FamilyExecutor::run_family`]: the written report's family
 /// label, its run-root-relative path and byte digest (linked by the manifest),
-/// and the correctness/saturation/recovery signals folded into the run verdicts.
+/// the topology the family actually executed under (stamped verbatim into the
+/// manifest's per-entry topology check), and the correctness/saturation/recovery
+/// signals folded into the run verdicts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FamilyOutcome {
     /// Report family label.
@@ -908,6 +923,9 @@ pub struct FamilyOutcome {
     pub report_path: String,
     /// SHA-256 digest of the written report file bytes.
     pub report_digest: String,
+    /// Topology the family actually executed under, read from the written
+    /// report so the manifest records the true executed topology.
+    pub topology: super::bench_report::TopologyIdentity,
     /// Whether every stage of this family passed correctness.
     pub correctness_passed: bool,
     /// Whether this family observed a saturation boundary.
@@ -921,7 +939,12 @@ pub struct FamilyOutcome {
 /// The real adapter wraps the T29 [`super::bench_materializer`] against a booted
 /// cluster; unit tests inject a double so the once-per-run guarantee and budget
 /// enforcement are proved without a server.
-#[async_trait]
+///
+/// The seam is `?Send`: [`QualificationRun::orchestrate`] awaits provisioning
+/// and every family serially on one task and never spawns, and the live cluster
+/// adapter's materialization future is not `Send` across all lifetimes, so a
+/// `Send` bound would reject the live adapter for no run-time benefit.
+#[async_trait(?Send)]
 pub trait RunDatasetProvisioner {
     /// Materialize `shape` into `run_root` and report the digest and elapsed.
     ///
@@ -940,7 +963,11 @@ pub trait RunDatasetProvisioner {
 ///
 /// The real adapter dispatches the T30 family runner; unit tests inject a double
 /// so serial dispatch order and verdict aggregation are proved without a server.
-#[async_trait]
+///
+/// The seam is `?Send` for the same reason as [`RunDatasetProvisioner`]: family
+/// dispatch is serial and un-spawned, and the live family-runner future is not
+/// `Send` across all lifetimes.
+#[async_trait(?Send)]
 pub trait FamilyExecutor {
     /// Run `family` against the dataset identified by `dataset_digest`.
     ///
@@ -964,7 +991,8 @@ pub struct OrchestrationConfig {
     pub source_tree_clean: bool,
     /// SHA-256 digest of the workload fixtures.
     pub workload_digest: String,
-    /// Topology identity captured with the run.
+    /// Base/materialization topology recorded as the manifest's top-level
+    /// topology; per-family executed topologies are carried on each report entry.
     pub topology: super::bench_report::TopologyIdentity,
     /// Environment identity captured with the run.
     pub environment: EnvironmentIdentity,
@@ -1071,6 +1099,7 @@ impl QualificationRun {
                 family: outcome.family,
                 path: outcome.report_path,
                 digest: outcome.report_digest,
+                topology: outcome.topology,
             });
         }
 
@@ -1362,6 +1391,23 @@ mod tests {
         }
     }
 
+    /// The topology a family executes under: six-pod for the distributed
+    /// weak-scaling sweep, one-pod for every other family, mirroring the
+    /// intentionally multi-topology qualification suite.
+    fn family_topology(family: &str) -> TopologyIdentity {
+        if family == "distributed" {
+            TopologyIdentity {
+                topology_id: "six-pod".to_owned(),
+                oracle_pods: 6,
+            }
+        } else {
+            TopologyIdentity {
+                topology_id: "one-pod".to_owned(),
+                oracle_pods: 1,
+            }
+        }
+    }
+
     /// Build the four report entries in a fixed order.
     fn report_entries() -> Vec<ReportDigestEntry> {
         ["ingest", "oracle", "distributed", "mixed"]
@@ -1370,6 +1416,7 @@ mod tests {
                 family: family.to_owned(),
                 path: format!("{family}-qualification.json"),
                 digest: TEST_DIGEST.to_owned(),
+                topology: family_topology(family),
             })
             .collect()
     }
@@ -1424,7 +1471,7 @@ mod tests {
         setup_elapsed: Duration,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl RunDatasetProvisioner for CountingProvisioner {
         async fn provision(
             &self,
@@ -1445,7 +1492,7 @@ mod tests {
         order: Mutex<Vec<String>>,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl FamilyExecutor for RecordingExecutor {
         async fn run_family(
             &self,
@@ -1460,6 +1507,7 @@ mod tests {
                 family: family.to_owned(),
                 report_path: format!("{family}-qualification.json"),
                 report_digest: TEST_DIGEST.to_owned(),
+                topology: family_topology(family),
                 correctness_passed: true,
                 saturation_reached: false,
                 recovery_recovered: true,

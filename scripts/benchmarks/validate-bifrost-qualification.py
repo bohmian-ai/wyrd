@@ -221,9 +221,11 @@ class Validator:
         if not isinstance(report, dict):
             self.fail(f"report.{label}", "report is not a JSON object")
             return
-        self._check_report_contents(manifest, label, report)
+        self._check_report_contents(manifest, entry, label, report)
 
-    def _check_report_contents(self, manifest: dict, label: str, report: dict) -> None:
+    def _check_report_contents(
+        self, manifest: dict, entry: dict, label: str, report: dict
+    ) -> None:
         """Cross-check one report's identity, tier, and every measured stage."""
         if report.get("schema_version") != REPORT_SCHEMA:
             self.fail(f"report.{label}.schema_version", "unexpected report schema")
@@ -240,8 +242,11 @@ class Validator:
             self.fail(f"dataset_digest.{label}", "report dataset digest differs from manifest")
         if report.get("workload_digest") != manifest.get("workload_digest"):
             self.fail(f"workload_digest.{label}", "report workload digest differs from manifest")
-        if report.get("topology") != manifest.get("topology"):
-            self.fail(f"topology.{label}", "report topology differs from manifest")
+        if report.get("topology") != entry.get("topology"):
+            self.fail(
+                f"topology.{label}",
+                "report topology differs from its manifest report entry",
+            )
 
         stages = report.get("stages")
         if not isinstance(stages, list) or not stages:

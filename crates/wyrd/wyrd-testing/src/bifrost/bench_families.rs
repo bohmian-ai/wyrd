@@ -1832,7 +1832,7 @@ fn report_context(
 /// CPU and memory probes are not implemented; their absence is explained by
 /// `unavailable_reason` so the report stays honest about what was measured.
 #[must_use]
-fn environment_identity() -> EnvironmentIdentity {
+pub(crate) fn environment_identity() -> EnvironmentIdentity {
     EnvironmentIdentity {
         cpu: None,
         memory_bytes: None,
@@ -1847,7 +1847,7 @@ fn environment_identity() -> EnvironmentIdentity {
 /// A non-hex sentinel makes report construction fail closed rather than emit an
 /// artifact with an unverifiable provenance.
 #[must_use]
-fn git_head() -> String {
+pub(crate) fn git_head() -> String {
     Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -1861,7 +1861,7 @@ fn git_head() -> String {
 
 /// Return whether the source tree has no tracked or untracked changes.
 #[must_use]
-fn git_tree_clean() -> bool {
+pub(crate) fn git_tree_clean() -> bool {
     Command::new("git")
         .args(["status", "--porcelain"])
         .output()

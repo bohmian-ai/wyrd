@@ -17,6 +17,8 @@ pub mod bench_otlp;
 #[cfg(feature = "bench")]
 pub mod bench_qualification;
 #[cfg(feature = "bench")]
+pub mod bench_qualification_driver;
+#[cfg(feature = "bench")]
 pub mod bench_report;
 #[cfg(feature = "bench")]
 pub mod bench_runner;

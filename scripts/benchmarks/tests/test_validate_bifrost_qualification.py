@@ -49,11 +49,13 @@ def _write_manifest(tmpdir, report_sources, *, sealed=False, mutate=None):
         data = Path(source).read_bytes()
         destination = root / f"{family}.json"
         destination.write_bytes(data)
+        report_topology = json.loads(data).get("topology")
         reports.append(
             {
                 "family": family,
                 "path": destination.name,
                 "digest": hashlib.sha256(data).hexdigest(),
+                "topology": report_topology,
             }
         )
     manifest = {
@@ -283,6 +285,18 @@ def test_rejects_digest_mismatch():
         code, stderr = _run(manifest, "pre-review")
         assert code == 1
         assert "FAIL report.family-a.digest:" in stderr
+
+
+def test_rejects_per_entry_topology_mismatch():
+    """A report entry whose topology differs from its report file is rejected."""
+    def mutate(manifest):
+        manifest["reports"][0]["topology"] = {"topology_id": "six-pod", "oracle_pods": 6}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = _write_manifest(tmp, _valid_sources(), mutate=mutate)
+        code, stderr = _run(manifest, "pre-review")
+        assert code == 1
+        assert "FAIL topology.family-a:" in stderr
 
 
 def test_rejects_non_qualification_tier_report():

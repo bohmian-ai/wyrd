@@ -98,3 +98,8 @@ required-features = ["bench"]
 name = "bench_bifrost_oracle"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "bench_bifrost_qualification"
+harness = false
+required-features = ["bench"]

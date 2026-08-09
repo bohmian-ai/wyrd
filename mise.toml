@@ -155,11 +155,20 @@ hide = true
 description = "Run only the named deterministic Rust cluster matrix journeys"
 run = "cargo test --locked -p wyrd-testing --test integration -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- multi_tenant_three_server_three_worker_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- pressured_tenant_does_not_starve_peers --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- cluster_load_cancellation_and_shutdown_release_all_owners --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test integration -- three_server_cluster_reconciles_production_telemetry --ignored --test-threads=1"
 
+[tasks."test:bifrost:bench-cluster"]
+description = "Run the Bifrost bench shared-resource cross-cluster visibility test against Postgres"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run test:bifrost:bench-cluster:inner'"
+
+[tasks."test:bifrost:bench-cluster:inner"]
+hide = true
+description = "Run only the AC1 cross-cluster shared-resource visibility test (bench feature)"
+run = "cargo test --locked -p wyrd-testing --features bench --lib bifrost::bench_families::tests::materialized_table_is_visible_across_shared_resource_clusters -- --test-threads=1 --nocapture"
+
 [tasks."bench:bifrost:preflight"]
 description = "Compile both Bifrost bench binaries and validate fixture digests and schemas (no database)"
 run = [
   "cargo build --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe --bench bench_bifrost_oracle",
-  "cargo test --locked -p wyrd-testing --features bench --lib -- bifrost::bench_dataset bifrost::bench_report bifrost::bench_runner bifrost::bench_families --skip dataset_generator_is_repeatable --skip new_equals_with_anchor_at_canonical_anchor",
+  "cargo test --locked -p wyrd-testing --features bench --lib -- bifrost::bench_dataset bifrost::bench_report bifrost::bench_runner bifrost::bench_families --skip dataset_generator_is_repeatable --skip new_equals_with_anchor_at_canonical_anchor --skip materialized_table_is_visible_across_shared_resource_clusters",
 ]
 
 [tasks."bench:bifrost:smoke"]

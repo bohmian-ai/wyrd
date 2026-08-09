@@ -30,11 +30,12 @@ use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryTerminalOutcome, VisibilityMode,
 };
 
+use super::BifrostClusterSpec;
 use super::bench_cluster::{
     REFERENCE_TABLE, ROWS_PER_WRITE, ReferenceClient, await_forge_convergence,
-    deterministic_batch_id, flush_tenant_writers, is_backpressure, is_retryable,
-    provision_named_tables, provision_reference_tenants, reference_clients, reference_payload,
-    tenant_row_base,
+    deterministic_batch_id, flush_tenant_writers, fresh_ingest_table, is_backpressure,
+    is_retryable, provision_named_tables, provision_reference_tenants, reference_clients,
+    reference_payload, tenant_row_base,
 };
 use super::bench_dataset::{
     BifrostQualificationDataset, DatasetShape, QualificationAggregate,
@@ -47,15 +48,15 @@ use super::bench_materializer::{
 use super::bench_qualification::{QualificationRunRecord, RunFingerprint};
 use super::bench_report::{
     AuditRelaySample, BifrostCapacityReport, BifrostCapacityStage, CapacityReportContext,
-    CorrectnessVerdict, EnvironmentIdentity, IngestBody, LatencyPercentiles, MixedBody, QueryBody,
-    RecommendedStage, ResourceSample, SaturationCause, StageControl, StageExecution,
-    TelemetryWindowRef, TopologyIdentity, WorkCounts, sha256_hex,
+    CorrectnessVerdict, DistributedBody, EnvironmentIdentity, IngestBody, LatencyPercentiles,
+    MixedBody, QueryBody, RecommendedStage, ResourceSample, SaturationCause, StageControl,
+    StageExecution, TelemetryWindowRef, TopologyIdentity, WorkCounts, sha256_hex,
 };
 use super::bench_runner::{
     ResolvedInvocation, RunnerFamily, RunnerInvocation, RunnerTier, StagePlan, enforce_budget,
-    plan_stages, stage_control,
+    plan_stages, stage_control, topology_for_pods,
 };
-use super::cluster::WyrdTestCluster;
+use super::cluster::{SharedRunResources, WyrdTestCluster};
 use super::telemetry::{BifrostTelemetryDelta, run_sampled_window};
 
 /// Logical bytes attributed to one reference row's single `Int64` `row_id`.
@@ -190,6 +191,48 @@ pub async fn run_family(
     invocation: &RunnerInvocation,
     allowed: &[RunnerFamily],
 ) -> Result<std::path::PathBuf, FamilyRunError> {
+    run_family_dispatch(invocation, allowed, None).await
+}
+
+/// Run a classified family over caller-supplied run-shared resources.
+///
+/// The qualification-tier sibling of [`run_family`]. It threads one run's
+/// [`SharedRunResources`] handle into the selected runner so every family
+/// cluster it boots observes the once-materialized qualification dataset over a
+/// single shared fixture and storage root, rather than materializing a private
+/// dataset per family. Smoke behavior is reached through [`run_family`] with a
+/// `None` handle and stays byte-identical; this entry is the seam the T32
+/// qualification orchestrator drives after it provisions the shared resources.
+///
+/// # Errors
+/// Returns [`FamilyRunError::Selection`] for an unresolved id or a family the
+/// caller does not serve, or any [`FamilyRunError`] raised by the selected runner.
+pub async fn run_family_with_resources(
+    invocation: &RunnerInvocation,
+    allowed: &[RunnerFamily],
+    resources: &SharedRunResources,
+) -> Result<std::path::PathBuf, FamilyRunError> {
+    run_family_dispatch(invocation, allowed, Some(resources)).await
+}
+
+/// Resolve the invocation and dispatch its family, optionally over shared resources.
+///
+/// The shared body behind [`run_family`] and [`run_family_with_resources`]. It
+/// loads the embedded workload, topology, and tier-budget fixtures, resolves the
+/// invocation against them (fail-closed on an unknown id before any cluster
+/// starts), classifies the family, rejects a workload routed to a binary that
+/// does not serve its family, and forwards the optional shared-resource handle to
+/// the selected runner. The lane wall-clock budget is measured from entry so
+/// every runner shares one budget origin.
+///
+/// # Errors
+/// Returns [`FamilyRunError::Selection`] for an unresolved id or unserved family,
+/// or any [`FamilyRunError`] raised by the selected runner.
+async fn run_family_dispatch(
+    invocation: &RunnerInvocation,
+    allowed: &[RunnerFamily],
+    resources: Option<&SharedRunResources>,
+) -> Result<std::path::PathBuf, FamilyRunError> {
     let lane_start = Instant::now();
     let workloads = WorkloadProfiles::load();
     let topologies = TopologyProfiles::load();
@@ -203,14 +246,44 @@ pub async fn run_family(
         });
     }
     match family {
-        RunnerFamily::Ingest => run_ingest(lane_start, invocation, resolved, &budgets).await,
-        RunnerFamily::Query => run_query(lane_start, invocation, resolved, &budgets).await,
-        RunnerFamily::Distributed => {
-            run_distributed(lane_start, invocation, resolved, &budgets).await
+        RunnerFamily::Ingest => {
+            run_ingest(lane_start, invocation, resolved, &budgets, resources).await
         }
-        RunnerFamily::Fairness => run_fairness(lane_start, invocation, resolved, &budgets).await,
-        RunnerFamily::Mixed => run_mixed(lane_start, invocation, resolved, &budgets).await,
+        RunnerFamily::Query => {
+            run_query(lane_start, invocation, resolved, &budgets, resources).await
+        }
+        RunnerFamily::Distributed => {
+            run_distributed(lane_start, invocation, resolved, &budgets, resources).await
+        }
+        RunnerFamily::Fairness => {
+            run_fairness(lane_start, invocation, resolved, &budgets, resources).await
+        }
+        RunnerFamily::Mixed => {
+            run_mixed(lane_start, invocation, resolved, &budgets, resources).await
+        }
     }
+}
+
+/// Boot a family cluster over run-shared resources when present, else standalone.
+///
+/// The single cluster-boot seam every runner uses. With `Some` shared resources
+/// (qualification tier) it starts the topology over the run's shared fixture,
+/// storage root, and once-provisioned oracle peer credentials so the cluster
+/// observes the run's already-materialized dataset. With `None` (smoke tier) it
+/// boots a byte-identical standalone cluster with a Forge worker-completion
+/// observer, exactly as every runner did before this seam existed.
+///
+/// # Errors
+/// Returns [`FamilyRunError::Cluster`] when the underlying cluster start fails.
+async fn start_family_cluster(
+    spec: BifrostClusterSpec,
+    resources: Option<&SharedRunResources>,
+) -> Result<WyrdTestCluster, FamilyRunError> {
+    let started = match resources {
+        Some(shared) => WyrdTestCluster::start_spec_with_shared_resources(spec, shared).await,
+        None => WyrdTestCluster::start_spec_with_forge_completion_observer(spec).await,
+    };
+    started.map_err(|error| FamilyRunError::Cluster(error.to_string()))
 }
 
 /// Run the ingest family: pure open-loop public writes at each ladder rung.
@@ -236,18 +309,33 @@ pub async fn run_ingest(
     invocation: &RunnerInvocation,
     resolved: ResolvedInvocation<'_>,
     budgets: &TierBudgets,
+    resources: Option<&SharedRunResources>,
 ) -> Result<std::path::PathBuf, FamilyRunError> {
     let family = "ingest";
     let workload_id = resolved.workload.workload_id.clone();
-    let topology = super::bench_runner::topology_for_pods(resolved.topology.pods)?;
+    let topology = topology_for_pods(resolved.topology.pods)?;
     let plan = plan_stages(resolved.workload, resolved.tier)?;
+    // The qualification sweep shares one catalog across every family cluster in
+    // the run, so it writes to a fresh per-run table to avoid colliding with the
+    // mixed family's use of the smoke-default reference table. Smoke keeps the
+    // reference table unchanged.
+    let table = match resolved.tier {
+        RunnerTier::Smoke => REFERENCE_TABLE.to_owned(),
+        RunnerTier::Qualification => fresh_ingest_table(&invocation.run_id),
+    };
 
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(topology.spec())
-        .await
-        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let cluster = start_family_cluster(topology.spec(), resources).await?;
 
-    let result =
-        run_ingest_stages(&cluster, invocation, resolved, &plan, family, &workload_id).await;
+    let result = run_ingest_stages(
+        &cluster,
+        invocation,
+        resolved,
+        &plan,
+        family,
+        &workload_id,
+        &table,
+    )
+    .await;
 
     // Always attempt shutdown; a shutdown failure only overrides a prior success.
     let shutdown = cluster
@@ -274,12 +362,15 @@ pub async fn run_ingest(
         .map_err(|error| FamilyRunError::Write(error.to_string()))
 }
 
-/// Provision the reference table and run every planned ingest stage.
+/// Provision `table` and run every planned ingest stage against it.
 ///
 /// Factored from [`run_ingest`] so cluster shutdown is guaranteed on both the
-/// success and failure paths. Returns the ordered measured stages plus the
-/// derived saturation outcome, stopping the ladder after the first controlled
-/// saturation boundary (D73 saturation-optional).
+/// success and failure paths. `table` is the logical write target: the
+/// smoke-default reference table at smoke tier, or a fresh per-run table at
+/// qualification tier so a run-shared catalog sees no collision. Returns the
+/// ordered measured stages plus the derived saturation outcome, stopping the
+/// ladder after the first controlled saturation boundary (D73
+/// saturation-optional).
 ///
 /// # Errors
 /// Returns [`FamilyRunError`] for a provisioning, capture, or unexpected-failure
@@ -291,11 +382,12 @@ async fn run_ingest_stages(
     plan: &[StagePlan],
     family: &str,
     workload_id: &str,
+    table: &str,
 ) -> Result<(Vec<BifrostCapacityStage>, bool, Option<RecommendedStage>), FamilyRunError> {
     let tenants = provision_reference_tenants(cluster, 1)
         .await
         .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
-    provision_named_tables(cluster, &tenants, &[REFERENCE_TABLE.to_owned()])
+    provision_named_tables(cluster, &tenants, &[table.to_owned()])
         .await
         .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
     let clients = reference_clients(cluster, &tenants)
@@ -323,6 +415,7 @@ async fn run_ingest_stages(
             step,
             max_in_flight,
             family,
+            table,
         )
         .await?;
         let saturated = stage.saturation == Some(SaturationCause::ControlledAdmission);
@@ -356,6 +449,7 @@ async fn measure_ingest_stage(
     step: &StagePlan,
     max_in_flight: u64,
     family: &str,
+    table: &str,
 ) -> Result<BifrostCapacityStage, FamilyRunError> {
     if step.warmup_seconds > 0 {
         offer_writes(
@@ -363,6 +457,7 @@ async fn measure_ingest_stage(
             step.control_value,
             step.warmup_seconds,
             max_in_flight,
+            table,
         )
         .await;
     }
@@ -374,6 +469,7 @@ async fn measure_ingest_stage(
             step.control_value,
             step.measure_seconds,
             max_in_flight,
+            table,
         )
         .await)
     })
@@ -387,6 +483,7 @@ async fn measure_ingest_stage(
             step.control_value,
             step.drain_seconds,
             max_in_flight,
+            table,
         )
         .await;
     }
@@ -433,12 +530,15 @@ async fn measure_ingest_stage(
 /// Dispatch is bounded by `max_in_flight` acquired-permit concurrency; a late
 /// wakeup still offers its planned operation, so `offered` always equals the
 /// planned operation count. Latencies are measured only across the admitted
-/// send, excluding any permit-acquisition wait.
+/// send, excluding any permit-acquisition wait. Every write targets `table`,
+/// which is the smoke-default reference table at smoke tier and a fresh per-run
+/// ingest table at qualification tier so a run-shared catalog sees no collision.
 async fn offer_writes(
     client: &ReferenceClient,
     rate: u64,
     seconds: u32,
     max_in_flight: u64,
+    table: &str,
 ) -> WriteWindow {
     let mut window = WriteWindow::default();
     let total_ops = rate.saturating_mul(u64::from(seconds));
@@ -458,9 +558,10 @@ async fn offer_writes(
             .await
             .expect("dispatch semaphore is never closed while offers are in flight");
         let client = client.clone();
+        let table = table.to_owned();
         tasks.spawn(async move {
             let _permit = permit;
-            send_one_write(client, ordinal).await
+            send_one_write(client, ordinal, table).await
         });
     }
     while let Some(joined) = tasks.join_next().await {
@@ -476,13 +577,15 @@ async fn offer_writes(
     window
 }
 
-/// Send one deterministic 64-row reference write and classify its outcome.
+/// Send one deterministic 64-row write to `table` and classify its outcome.
 ///
 /// Writes into the single reference tenant's disjoint row range above the
 /// preload window so successive stages never collide. A bounded retry mirrors
 /// the journey's transient-retry policy before classifying an exhausted retry as
-/// an unexpected failure.
-async fn send_one_write(client: ReferenceClient, ordinal: u64) -> WriteOutcome {
+/// an unexpected failure. `table` is the logical table name (without the
+/// `vala.bifrost.` namespace prefix this function applies) so an ingest sweep
+/// over run-shared resources can target a fresh per-run table.
+async fn send_one_write(client: ReferenceClient, ordinal: u64, table: String) -> WriteOutcome {
     let first_row = tenant_row_base(0)
         .saturating_add(super::bench_cluster::PRELOAD_ROWS)
         .saturating_add(ordinal.saturating_mul(u64::from(ROWS_PER_WRITE)));
@@ -491,7 +594,7 @@ async fn send_one_write(client: ReferenceClient, ordinal: u64) -> WriteOutcome {
         Err(_) => return WriteOutcome::Failed,
     };
     let frame = BifrostFrame {
-        table: format!("vala.bifrost.{REFERENCE_TABLE}"),
+        table: format!("vala.bifrost.{table}"),
         batch_id: deterministic_batch_id(0, ordinal),
         arrow_ipc: payload.into(),
     };
@@ -638,8 +741,9 @@ enum QueryOutcome {
 ///
 /// Boots the invocation's topology, acquires the qualification dataset for the
 /// tier (smoke materializes the fixture smoke shape into the cluster; the
-/// qualification tier opens a verified run scope, which is a T31 seam), probes
-/// the query's correctness once against the deterministic expected results, then
+/// qualification tier opens the verified run scope and reuses its once-
+/// materialized dataset after a digest check), probes the query's correctness
+/// once against the deterministic expected results, then
 /// offers the fixed query at each planned stage's measured window bound to a T17
 /// capture. Emits one `query`-family [`BifrostCapacityReport`] under the
 /// invocation's output root and returns the written artifact path. A smoke run
@@ -664,17 +768,16 @@ pub async fn run_query(
     invocation: &RunnerInvocation,
     resolved: ResolvedInvocation<'_>,
     budgets: &TierBudgets,
+    resources: Option<&SharedRunResources>,
 ) -> Result<std::path::PathBuf, FamilyRunError> {
     let workload_id = resolved.workload.workload_id.clone();
     let query_id = resolved.workload.query_id.clone().ok_or_else(|| {
         FamilyRunError::Cluster(format!("query workload {workload_id} declares no query_id"))
     })?;
-    let topology = super::bench_runner::topology_for_pods(resolved.topology.pods)?;
+    let topology = topology_for_pods(resolved.topology.pods)?;
     let plan = plan_stages(resolved.workload, resolved.tier)?;
 
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(topology.spec())
-        .await
-        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let cluster = start_family_cluster(topology.spec(), resources).await?;
 
     let result = run_query_stages(
         &cluster,
@@ -776,13 +879,17 @@ async fn run_query_stages(
 /// Acquire the qualification dataset appropriate to the run tier.
 ///
 /// The smoke tier materializes the fixture smoke shape into a fresh run scope on
-/// the booted cluster (T29 seam). The qualification tier opens a verified run
-/// scope by `--run-id` with a digest check; that acquisition is provided by T31,
-/// so this runner fails closed rather than fabricate qualification-tier data.
+/// the booted cluster (T29 seam). The qualification tier opens the verified run
+/// scope named by `--run-id` and reuses its once-materialized dataset, gated by
+/// a `verify_reuse` fingerprint check on the source commit, dataset digest,
+/// shape, and storage configuration; it refuses only when that fingerprint does
+/// not match, never fabricating qualification-tier data.
 ///
 /// # Errors
-/// Returns [`FamilyRunError::Cluster`] for a materialization failure or, on the
-/// qualification tier, the explicit T31-seam refusal.
+/// Returns [`FamilyRunError::Cluster`] for a smoke materialization failure or,
+/// on the qualification tier, when the run record cannot be opened, its recorded
+/// shape is invalid, or the reuse fingerprint does not match the current
+/// environment.
 async fn acquire_query_dataset(
     cluster: &WyrdTestCluster,
     invocation: &RunnerInvocation,
@@ -1787,25 +1894,48 @@ fn distributed_stage_control(pods: u16) -> StageControl {
     }
 }
 
+/// Compute the weak-scaling efficiency vector `X(n)/(n·X(1))` for each pod rung.
+///
+/// The single place the distributed sweep derives its efficiency values, kept as
+/// a pure helper so the formula is unit-testable against
+/// [`DistributedBody::validate`] without a cluster. `oracle_pods` and
+/// `throughput` are the per-rung pod counts and measured controlling throughputs
+/// `X(n)` in ladder order; the baseline `X(1)` is the first rung's throughput. A
+/// zero baseline yields non-finite ratios, which the report validator then
+/// rejects, so a degenerate run fails closed rather than reporting a fabricated
+/// efficiency. The returned vector has the same length and order as the inputs.
+#[must_use]
+fn distributed_efficiency(oracle_pods: &[u16], throughput: &[u64]) -> Vec<f64> {
+    let baseline = throughput.first().copied().unwrap_or_default() as f64;
+    oracle_pods
+        .iter()
+        .zip(throughput)
+        .map(|(pods, rung_throughput)| *rung_throughput as f64 / (f64::from(*pods) * baseline))
+        .collect()
+}
+
 /// Run the distributed family: weak-scaling reads under one query per pod.
 ///
 /// Ruling D-A/D-B: the smoke tier is a plumbing proof that boots the CLI
 /// `--topology`, materializes the smoke dataset, proves the fixture query's
 /// correctness once, and offers a closed-loop hold of one query in flight per pod
-/// for the single planned stage, emitting a single-stage [`QueryBody`]. The real
-/// four-pod `DistributedBody` weak-scaling sweep (`efficiency(n) = X(n)/(n·X(1))`)
-/// needs a verified run scope opened by `--run-id`, which T31 provides, so the
-/// qualification tier fails closed here rather than fabricate a sweep.
+/// for the single planned stage, emitting a single-stage [`QueryBody`]. The
+/// qualification tier runs the full `[1, 2, 3, 6]` pod ladder over the run's
+/// shared resources (one cluster per rung, no early break), measures the
+/// controlling throughput `X(n)` at each rung, and emits the four-pod
+/// `DistributedBody` weak-scaling sweep (`efficiency(n) = X(n)/(n·X(1))`); see
+/// [`run_distributed_qualification_sweep`].
 ///
 /// # Errors
 /// Returns [`FamilyRunError`] for an absent `query_id`, a cluster/capture/
-/// correctness failure, a rejected report, a budget breach, a disk-write failure,
-/// or the explicit qualification-tier T31-seam refusal.
+/// correctness failure, a rejected report, a budget breach, or a disk-write
+/// failure.
 pub async fn run_distributed(
     lane_start: Instant,
     invocation: &RunnerInvocation,
     resolved: ResolvedInvocation<'_>,
     budgets: &TierBudgets,
+    resources: Option<&SharedRunResources>,
 ) -> Result<std::path::PathBuf, FamilyRunError> {
     let workload_id = resolved.workload.workload_id.clone();
     let query_id = resolved.workload.query_id.clone().ok_or_else(|| {
@@ -1813,22 +1943,20 @@ pub async fn run_distributed(
             "distributed workload {workload_id} declares no query_id"
         ))
     })?;
-    match resolved.tier {
-        RunnerTier::Smoke => {}
-        RunnerTier::Qualification => {
-            return Err(FamilyRunError::Cluster(
-                "distributed four-pod weak-scaling sweep (verified run scope opened by --run-id) \
-                 is provided by T31; T30 runners implement the smoke tier"
-                    .to_owned(),
-            ));
-        }
+    if let RunnerTier::Qualification = resolved.tier {
+        return run_distributed_qualification_sweep(
+            invocation,
+            resolved,
+            &workload_id,
+            &query_id,
+            resources,
+        )
+        .await;
     }
-    let topology = super::bench_runner::topology_for_pods(resolved.topology.pods)?;
+    let topology = topology_for_pods(resolved.topology.pods)?;
     let plan = plan_stages(resolved.workload, resolved.tier)?;
 
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(topology.spec())
-        .await
-        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let cluster = start_family_cluster(topology.spec(), resources).await?;
 
     // A multi-pod distributed query dispatches sealed fragments to peer Oracles,
     // whose eligibility and fencing tokens are read from each pod's frozen
@@ -1866,7 +1994,9 @@ pub async fn run_distributed(
     let (stages, saturation_reached, recommended) = result?;
     shutdown?;
 
-    enforce_budget(lane_start.elapsed(), budgets.smoke_lane_seconds)?;
+    if let RunnerTier::Smoke = resolved.tier {
+        enforce_budget(lane_start.elapsed(), budgets.smoke_lane_seconds)?;
+    }
 
     let context = report_context(invocation, resolved);
     let body = QueryBody {
@@ -1879,6 +2009,158 @@ pub async fn run_distributed(
     report
         .write_report(&invocation.output_root, &invocation.run_id, &workload_id)
         .map_err(|error| FamilyRunError::Write(error.to_string()))
+}
+
+/// Run the distributed weak-scaling sweep across the full `[1, 2, 3, 6]` ladder.
+///
+/// The qualification-tier body of [`run_distributed`]. For each pod rung on the
+/// D70 ladder it boots one cluster over the run's shared resources (so every rung
+/// observes the once-materialized qualification dataset), converges peer-Oracle
+/// membership, proves the fixture query's correctness once, and measures one
+/// closed-loop stage holding one query in flight per pod
+/// ([`distributed_stage_control`] from the rung's pod count). It never breaks
+/// early on saturation: the `DistributedBody` requires all four rungs so the
+/// weak-scaling efficiency `X(n)/(n·X(1))` is defined at every pod count. The
+/// controlling throughput `X(n)` at a rung is that stage's completed-operation
+/// count over the identical measured window, so the per-rung efficiency ratio is
+/// window-duration invariant. Each rung's cluster is shut down before the next
+/// starts; the shared resources outlive the sweep and are torn down only by the
+/// run.
+///
+/// # Errors
+/// Returns [`FamilyRunError`] for a stage plan whose ladder is not the locked
+/// `[1, 2, 3, 6]`, a cluster/capture/correctness failure, a rejected report
+/// (including a zero baseline throughput), or a disk-write failure.
+async fn run_distributed_qualification_sweep(
+    invocation: &RunnerInvocation,
+    resolved: ResolvedInvocation<'_>,
+    workload_id: &str,
+    query_id: &str,
+    resources: Option<&SharedRunResources>,
+) -> Result<std::path::PathBuf, FamilyRunError> {
+    let plan = plan_stages(resolved.workload, resolved.tier)?;
+    let mut stages = Vec::with_capacity(plan.len());
+    let mut throughput = Vec::with_capacity(plan.len());
+    let mut oracle_pods = Vec::with_capacity(plan.len());
+    for step in &plan {
+        let pods = u16::try_from(step.control_value).map_err(|_| {
+            FamilyRunError::Cluster(format!(
+                "distributed rung control value {} exceeds the pod-count range",
+                step.control_value
+            ))
+        })?;
+        let topology = topology_for_pods(pods)?;
+        let cluster = start_family_cluster(topology.spec(), resources).await?;
+
+        // Converge every pod's frozen membership cut before the first cross-pod
+        // query, exactly as the smoke path does; membership is stable for the
+        // rung and pins node eligibility only, never the per-query file set.
+        let converged = cluster
+            .refresh_oracle_snapshots()
+            .await
+            .map_err(|error| FamilyRunError::Cluster(error.to_string()));
+        let measured = match converged {
+            Ok(()) => {
+                measure_distributed_rung(
+                    &cluster,
+                    invocation,
+                    resolved,
+                    step,
+                    workload_id,
+                    query_id,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+
+        // Always attempt shutdown; a shutdown failure only overrides a success.
+        let shutdown = cluster
+            .shutdown_and_inspect()
+            .await
+            .map_err(|error| FamilyRunError::Cluster(error.to_string()));
+        let stage = measured?;
+        shutdown?;
+
+        throughput.push(stage.completed.operations);
+        oracle_pods.push(pods);
+        stages.push(stage);
+    }
+
+    let efficiency = distributed_efficiency(&oracle_pods, &throughput);
+    let (saturation_reached, recommended) = derive_saturation_outcome(&mut stages);
+
+    let context = report_context(invocation, resolved);
+    let body = DistributedBody {
+        query_id: query_id.to_owned(),
+        oracle_pods,
+        throughput,
+        efficiency,
+        saturation_reached,
+        recommended,
+    };
+    let report = BifrostCapacityReport::new(context, stages, body)
+        .map_err(|error| FamilyRunError::Report(error.to_string()))?;
+    report
+        .write_report(&invocation.output_root, &invocation.run_id, workload_id)
+        .map_err(|error| FamilyRunError::Write(error.to_string()))
+}
+
+/// Acquire the shared dataset, prove correctness, and measure one distributed rung.
+///
+/// The per-rung body of [`run_distributed_qualification_sweep`]. It acquires the
+/// run's once-materialized qualification dataset (visible over the shared
+/// resources this rung's cluster booted from), proves the fixture query's
+/// correctness once against the deterministic expected results, then measures one
+/// closed-loop stage holding one query in flight per pod
+/// ([`distributed_stage_control`] from the rung's pod count). The stage ordinal is
+/// the rung's plan ordinal so the emitted report's stage indices stay contiguous.
+///
+/// # Errors
+/// Returns [`FamilyRunError`] for a dataset-acquisition, client, correctness, or
+/// capture failure encountered while measuring the rung.
+async fn measure_distributed_rung(
+    cluster: &WyrdTestCluster,
+    invocation: &RunnerInvocation,
+    resolved: ResolvedInvocation<'_>,
+    step: &StagePlan,
+    workload_id: &str,
+    query_id: &str,
+) -> Result<BifrostCapacityStage, FamilyRunError> {
+    let dataset = acquire_query_dataset(cluster, invocation, resolved, workload_id).await?;
+    let queries = dataset.queries();
+    let expected = dataset.expected_results();
+    let shape = dataset.shape();
+    let sql = query_sql(query_id, &queries, shape)?;
+    let scan_logical_bytes =
+        scan_range_rows(query_id, &queries, shape)?.saturating_mul(QUALIFICATION_LOGICAL_ROW_BYTES);
+
+    let clients = reference_clients(cluster, std::slice::from_ref(&cluster.data_tenant_id()))
+        .await
+        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let query = clients
+        .first()
+        .ok_or_else(|| {
+            FamilyRunError::Cluster("distributed runner has no reference client".to_owned())
+        })?
+        .query
+        .clone();
+
+    probe_query_correctness(&query, query_id, &sql, &expected).await?;
+
+    let pods = u16::try_from(step.control_value).unwrap_or(u16::MAX);
+    let control = distributed_stage_control(pods);
+    measure_query_stage(
+        cluster,
+        &query,
+        invocation,
+        workload_id,
+        control,
+        step,
+        &sql,
+        scan_logical_bytes,
+    )
+    .await
 }
 
 /// Materialize, prove correctness, and run the single distributed smoke stage.
@@ -1949,18 +2231,20 @@ async fn run_distributed_smoke_stages(
 /// completions. Because budget shares are equal, budget-normalization is an
 /// identity for the scale-invariant Jain index, so the raw per-tenant completion
 /// counts are the budget-normalized index. The smoke tier runs the single planned
-/// rung and emits a single-stage [`QueryBody`]; the qualification tier fails
-/// closed at the T31 verified-run-scope seam.
+/// rung and emits a single-stage [`QueryBody`]. Fairness is a smoke-tier-only
+/// family (D69): the qualification family set is ingest, oracle, distributed, and
+/// mixed, so a qualification-tier fairness invocation fails closed here.
 ///
 /// # Errors
 /// Returns [`FamilyRunError`] for an absent tenant matrix, a cluster/provisioning/
 /// capture/correctness failure, a rejected report, a budget breach, a disk-write
-/// failure, or the explicit qualification-tier T31-seam refusal.
+/// failure, or the qualification-tier refusal (fairness is smoke-tier only).
 pub async fn run_fairness(
     lane_start: Instant,
     invocation: &RunnerInvocation,
     resolved: ResolvedInvocation<'_>,
     budgets: &TierBudgets,
+    resources: Option<&SharedRunResources>,
 ) -> Result<std::path::PathBuf, FamilyRunError> {
     let workload_id = resolved.workload.workload_id.clone();
     let matrix = resolved.workload.tenant_matrix.clone().ok_or_else(|| {
@@ -1972,19 +2256,17 @@ pub async fn run_fairness(
         RunnerTier::Smoke => {}
         RunnerTier::Qualification => {
             return Err(FamilyRunError::Cluster(
-                "fairness tenant-matrix sweep (verified run scope opened by --run-id) is provided \
-                 by T31; T30 runners implement the smoke tier"
+                "fairness is a smoke-tier-only family (D69); the qualification family set is \
+                 ingest, oracle, distributed, and mixed, so fairness has no qualification sweep"
                     .to_owned(),
             ));
         }
     }
     let query_id = "q1";
-    let topology = super::bench_runner::topology_for_pods(resolved.topology.pods)?;
+    let topology = topology_for_pods(resolved.topology.pods)?;
     let plan = plan_stages(resolved.workload, resolved.tier)?;
 
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(topology.spec())
-        .await
-        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let cluster = start_family_cluster(topology.spec(), resources).await?;
 
     let tenant_count = usize::try_from(matrix.tenants).unwrap_or(1).max(1);
     let result = run_fairness_stages(
@@ -2006,7 +2288,9 @@ pub async fn run_fairness(
     let (stages, saturation_reached, recommended) = result?;
     shutdown?;
 
-    enforce_budget(lane_start.elapsed(), budgets.smoke_lane_seconds)?;
+    if let RunnerTier::Smoke = resolved.tier {
+        enforce_budget(lane_start.elapsed(), budgets.smoke_lane_seconds)?;
+    }
 
     let context = report_context(invocation, resolved);
     let body = QueryBody {
@@ -2233,32 +2517,26 @@ async fn offer_fairness_window(
 /// anchor is recoverable losslessly from the recorded offered count, the control
 /// percent, and the window duration, so no anchor field is added. Forge debt of
 /// `forge_debt_generations_per_tenant` is seeded before measurement and drained to
-/// convergence before the measured window opens (D71). The smoke tier runs the
-/// single planned diagonal rung and emits a single-stage [`MixedBody`]; the
-/// qualification tier fails closed at the T31 verified-run-scope seam.
+/// convergence before the measured window opens (D71). Each mixed workload runs
+/// its single planned diagonal rung and emits a single-stage [`MixedBody`]; the
+/// diagonal sweep is expressed as three separate single-rung workloads
+/// (`mixed-25-25`, `mixed-50-50`, `mixed-75-75`), not a multi-rung ladder within
+/// one invocation. At smoke tier the runner materializes the fixture smoke dataset
+/// into a fresh standalone cluster; at qualification tier it boots over the run's
+/// shared resources and reads the once-materialized qualification dataset.
 ///
 /// # Errors
 /// Returns [`FamilyRunError`] for an absent `mixed_fractions`/debt parameter, a
 /// cluster/provisioning/capture/correctness failure, an unexpected failure, a
-/// rejected report, a budget breach, a disk-write failure, or the explicit
-/// qualification-tier T31-seam refusal.
+/// rejected report, a budget breach, or a disk-write failure.
 pub async fn run_mixed(
     lane_start: Instant,
     invocation: &RunnerInvocation,
     resolved: ResolvedInvocation<'_>,
     budgets: &TierBudgets,
+    resources: Option<&SharedRunResources>,
 ) -> Result<std::path::PathBuf, FamilyRunError> {
     let workload_id = resolved.workload.workload_id.clone();
-    match resolved.tier {
-        RunnerTier::Smoke => {}
-        RunnerTier::Qualification => {
-            return Err(FamilyRunError::Cluster(
-                "mixed diagonal sweep (verified run scope opened by --run-id) is provided by T31; \
-                 T30 runners implement the smoke tier"
-                    .to_owned(),
-            ));
-        }
-    }
     let fractions = resolved.workload.mixed_fractions.clone().ok_or_else(|| {
         FamilyRunError::Cluster(format!(
             "mixed workload {workload_id} declares no mixed_fractions"
@@ -2272,14 +2550,22 @@ pub async fn run_mixed(
                 "mixed workload {workload_id} declares no forge_debt_generations_per_tenant"
             ))
         })?;
-    let topology = super::bench_runner::topology_for_pods(resolved.topology.pods)?;
+    let topology = topology_for_pods(resolved.topology.pods)?;
     let plan = plan_stages(resolved.workload, resolved.tier)?;
+    // Smoke boots a private cluster, so the smoke-default reference table never
+    // collides. Qualification shares one catalog across every family cluster in
+    // the run, so each mixed workload writes to a fresh table keyed by both the
+    // run and the workload id (three mixed workloads share the run's resources).
+    let table = match resolved.tier {
+        RunnerTier::Smoke => REFERENCE_TABLE.to_owned(),
+        RunnerTier::Qualification => {
+            fresh_ingest_table(&format!("{}-{}", invocation.run_id, workload_id))
+        }
+    };
 
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(topology.spec())
-        .await
-        .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
+    let cluster = start_family_cluster(topology.spec(), resources).await?;
 
-    let result = run_mixed_smoke_stage(
+    let result = run_mixed_stage(
         &cluster,
         invocation,
         resolved,
@@ -2287,6 +2573,7 @@ pub async fn run_mixed(
         &workload_id,
         &fractions,
         debt_generations,
+        &table,
     )
     .await;
 
@@ -2298,7 +2585,9 @@ pub async fn run_mixed(
     let (stages, saturation_reached, recommended) = result?;
     shutdown?;
 
-    enforce_budget(lane_start.elapsed(), budgets.smoke_lane_seconds)?;
+    if let RunnerTier::Smoke = resolved.tier {
+        enforce_budget(lane_start.elapsed(), budgets.smoke_lane_seconds)?;
+    }
 
     let context = report_context(invocation, resolved);
     let body = MixedBody {
@@ -2319,12 +2608,18 @@ pub async fn run_mixed(
 /// Factored from [`run_mixed`] so cluster shutdown is guaranteed on both paths.
 /// Every write phase draws a globally monotonic ordinal so no batch is deduplicated
 /// against an earlier phase, keeping the anchor and diagonal measurements honest.
+/// The Oracle read dataset is acquired tier-appropriately through
+/// [`acquire_query_dataset`]: the smoke tier materializes the fixture smoke shape
+/// into this cluster, the qualification tier reuses the run's once-materialized
+/// dataset visible over the shared resources. All Scribe writes target `table`,
+/// the run's mixed write target (the smoke reference table, or a fresh per-run,
+/// per-workload table at qualification).
 ///
 /// # Errors
-/// Returns [`FamilyRunError`] for a provisioning, materialization, client,
-/// correctness, capture, or unexpected-failure condition, or an empty smoke plan.
+/// Returns [`FamilyRunError`] for a provisioning, dataset-acquisition, client,
+/// correctness, capture, or unexpected-failure condition, or an empty plan.
 #[allow(clippy::too_many_arguments)]
-async fn run_mixed_smoke_stage(
+async fn run_mixed_stage(
     cluster: &WyrdTestCluster,
     invocation: &RunnerInvocation,
     resolved: ResolvedInvocation<'_>,
@@ -2332,18 +2627,19 @@ async fn run_mixed_smoke_stage(
     workload_id: &str,
     fractions: &super::bench_dataset::MixedFractions,
     debt_generations: u32,
+    table: &str,
 ) -> Result<(Vec<BifrostCapacityStage>, bool, Option<RecommendedStage>), FamilyRunError> {
     let step = plan
         .first()
-        .ok_or_else(|| FamilyRunError::Cluster("mixed smoke plan produced no stage".to_owned()))?;
+        .ok_or_else(|| FamilyRunError::Cluster("mixed plan produced no stage".to_owned()))?;
     let data_tenant = cluster.data_tenant_id();
     let tenant_slice = std::slice::from_ref(&data_tenant);
 
     // Scribe write path plus Oracle read dataset on the same tenant.
-    provision_named_tables(cluster, tenant_slice, &[REFERENCE_TABLE.to_owned()])
+    provision_named_tables(cluster, tenant_slice, &[table.to_owned()])
         .await
         .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
-    let dataset = materialize_smoke_dataset(cluster, invocation, workload_id).await?;
+    let dataset = acquire_query_dataset(cluster, invocation, resolved, workload_id).await?;
     let queries = dataset.queries();
     let expected = dataset.expected_results();
     let shape = dataset.shape();
@@ -2366,7 +2662,7 @@ async fn run_mixed_smoke_stage(
     let ordinals = Arc::new(AtomicU64::new(0));
 
     // Pre-measurement Forge debt, released to convergence before the window opens.
-    build_forge_debt(&client, debt_generations, &ordinals).await?;
+    build_forge_debt(&client, debt_generations, &ordinals, table).await?;
     flush_tenant_writers(cluster, tenant_slice)
         .await
         .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
@@ -2376,8 +2672,14 @@ async fn run_mixed_smoke_stage(
 
     // Standalone healthy-rate anchors measured in the same invocation (ruling D-D).
     let window_seconds = u64::from(step.measure_seconds.max(1));
-    let scribe_window =
-        offer_writes_saturating(&client, driver_in_flight, step.measure_seconds, &ordinals).await;
+    let scribe_window = offer_writes_saturating(
+        &client,
+        driver_in_flight,
+        step.measure_seconds,
+        &ordinals,
+        table,
+    )
+    .await;
     flush_tenant_writers(cluster, tenant_slice)
         .await
         .map_err(|error| FamilyRunError::Cluster(error.to_string()))?;
@@ -2401,6 +2703,7 @@ async fn run_mixed_smoke_stage(
                 step.measure_seconds,
                 driver_in_flight,
                 &ordinals,
+                table,
             ),
             offer_queries(&query, &query_control, &sql, step.measure_seconds),
         );
@@ -2462,11 +2765,12 @@ async fn run_mixed_smoke_stage(
     Ok((stages, saturation_reached, recommended))
 }
 
-/// Seed `generations` pre-measurement Forge-debt batches on one tenant.
+/// Seed `generations` pre-measurement Forge-debt batches into `table`.
 ///
 /// Each batch draws a monotonic ordinal so it is a real, non-deduplicated write.
 /// Controlled backpressure is tolerated (the debt is being applied under load);
-/// only an unexpected write failure aborts the seeding.
+/// only an unexpected write failure aborts the seeding. `table` is the mixed
+/// family's Scribe write target for the run.
 ///
 /// # Errors
 /// Returns [`FamilyRunError::Cluster`] when a debt-seeding write fails
@@ -2475,10 +2779,11 @@ async fn build_forge_debt(
     client: &ReferenceClient,
     generations: u32,
     ordinals: &Arc<AtomicU64>,
+    table: &str,
 ) -> Result<(), FamilyRunError> {
     for _ in 0..generations {
         let ordinal = ordinals.fetch_add(1, Ordering::Relaxed);
-        match send_one_write(client.clone(), ordinal).await {
+        match send_one_write(client.clone(), ordinal, table.to_owned()).await {
             WriteOutcome::Admitted(_) | WriteOutcome::Rejected => {}
             WriteOutcome::Failed => {
                 return Err(FamilyRunError::Cluster(
@@ -2506,12 +2811,14 @@ fn fold_write_outcome(window: &mut WriteWindow, outcome: WriteOutcome) {
 ///
 /// Used to measure a standalone Scribe healthy rate: each worker loops issuing
 /// monotonic-ordinal writes until the deadline, so `admitted` over the window is
-/// the achieved standalone write rate. `offered` is the total dispatched.
+/// the achieved standalone write rate. `offered` is the total dispatched. Every
+/// write targets `table`, the mixed family's Scribe write target for the run.
 async fn offer_writes_saturating(
     client: &ReferenceClient,
     workers: u64,
     seconds: u32,
     ordinals: &Arc<AtomicU64>,
+    table: &str,
 ) -> WriteWindow {
     let mut window = WriteWindow::default();
     let workers = workers.min(MAX_IN_FLIGHT_CAP);
@@ -2523,11 +2830,12 @@ async fn offer_writes_saturating(
     for _ in 0..workers {
         let client = client.clone();
         let ordinals = Arc::clone(ordinals);
+        let table = table.to_owned();
         tasks.spawn(async move {
             let mut outcomes = Vec::new();
             while tokio::time::Instant::now() < deadline {
                 let ordinal = ordinals.fetch_add(1, Ordering::Relaxed);
-                outcomes.push(send_one_write(client.clone(), ordinal).await);
+                outcomes.push(send_one_write(client.clone(), ordinal, table.clone()).await);
             }
             outcomes
         });
@@ -2553,13 +2861,15 @@ async fn offer_writes_saturating(
 ///
 /// Mirrors [`offer_writes`] but draws every batch ordinal from the shared
 /// monotonic allocator so a diagonal write never deduplicates against the anchor
-/// or debt phases of the same mixed run.
+/// or debt phases of the same mixed run. Every write targets `table`, the mixed
+/// family's Scribe write target for the run.
 async fn offer_writes_paced(
     client: &ReferenceClient,
     rate: u64,
     seconds: u32,
     max_in_flight: u64,
     ordinals: &Arc<AtomicU64>,
+    table: &str,
 ) -> WriteWindow {
     let mut window = WriteWindow::default();
     let total_ops = rate.saturating_mul(u64::from(seconds));
@@ -2580,9 +2890,10 @@ async fn offer_writes_paced(
             .expect("dispatch semaphore is never closed while offers are in flight");
         let client = client.clone();
         let ordinal = ordinals.fetch_add(1, Ordering::Relaxed);
+        let table = table.to_owned();
         tasks.spawn(async move {
             let _permit = permit;
-            send_one_write(client, ordinal).await
+            send_one_write(client, ordinal, table).await
         });
     }
     while let Some(joined) = tasks.join_next().await {
@@ -2862,5 +3173,144 @@ mod tests {
     fn fairness_jain_index_rewards_equal_service() {
         assert!((jain_fairness(&[5, 5, 5, 5]) - 1.0).abs() < 1e-9);
         assert!((jain_fairness(&[10, 0, 0, 0]) - 0.25).abs() < 1e-9);
+    }
+
+    /// Proves the distributed sweep's efficiency vector is exactly the ratio the
+    /// report validator recomputes, so a real sweep's body always validates.
+    #[test]
+    fn distributed_efficiency_matches_report_validator() {
+        use super::super::bench_report::{CapacityBody, DistributedBody};
+
+        let oracle_pods = [1_u16, 2, 3, 6];
+        let throughput = [1000_u64, 1900, 2700, 4800];
+        let efficiency = distributed_efficiency(&oracle_pods, &throughput);
+        assert_eq!(efficiency.len(), oracle_pods.len());
+        assert!((efficiency[0] - 1.0).abs() < 1e-9);
+
+        let body = DistributedBody {
+            query_id: "q1".to_owned(),
+            oracle_pods: oracle_pods.to_vec(),
+            throughput: throughput.to_vec(),
+            efficiency,
+            saturation_reached: false,
+            recommended: None,
+        };
+        assert!(body.validate().is_ok());
+    }
+
+    /// Proves a degenerate zero baseline throughput yields non-finite ratios that
+    /// the report validator rejects, so the sweep fails closed rather than
+    /// fabricating an efficiency figure.
+    #[test]
+    fn distributed_efficiency_zero_baseline_is_non_finite() {
+        let efficiency = distributed_efficiency(&[1, 2, 3, 6], &[0, 10, 20, 30]);
+        assert!(efficiency.iter().any(|value| !value.is_finite()));
+    }
+
+    /// Proves a qualification-tier fairness invocation fails closed with the D69
+    /// smoke-tier-only message and never attributes the sweep to T31, without
+    /// booting a cluster (the refusal returns before any cluster start).
+    #[tokio::test]
+    async fn fairness_qualification_fails_closed_with_d69_message() {
+        let workloads = WorkloadProfiles::load();
+        let topologies = TopologyProfiles::load();
+        let budgets = TierBudgets::load();
+        let invocation = RunnerInvocation {
+            workload_id: "tenants-2".to_owned(),
+            topology_id: "one-pod".to_owned(),
+            tier: RunnerTier::Qualification,
+            output_root: std::path::PathBuf::from(
+                "target/bifrost-benchmarks/test-fairness-refusal",
+            ),
+            run_id: "test-fairness-refusal".to_owned(),
+        };
+        let resolved = invocation
+            .resolve(&workloads, &topologies)
+            .expect("tenants-2 resolves against the locked fixtures");
+        assert_eq!(
+            RunnerFamily::classify(resolved.workload),
+            RunnerFamily::Fairness
+        );
+
+        let error = run_fairness(Instant::now(), &invocation, resolved, &budgets, None)
+            .await
+            .expect_err("fairness has no qualification sweep");
+        let message = error.to_string();
+        assert!(message.contains("smoke-tier"), "message: {message}");
+        assert!(message.contains("D69"), "message: {message}");
+        assert!(
+            !message.contains("T31"),
+            "message must not attribute to T31: {message}"
+        );
+    }
+
+    /// AC1: a table materialized by one family cluster is visible, with correct
+    /// results, to a differently-shaped cluster booted over the same
+    /// [`SharedRunResources`]. Cluster A (one pod) materializes the smoke dataset
+    /// and shuts down; the shared fixture, storage root, and peer credentials
+    /// survive that teardown; cluster B (two pods, a distinct topology) reboots
+    /// over the same resources and reads the materialized
+    /// `bifrost_qualification_telemetry` table with the expected results. This
+    /// proves the run-shared catalog and storage make one materialization
+    /// serviceable across every qualification-family cluster, and that cluster
+    /// shutdown never tears down the run-owned shared resources.
+    #[tokio::test]
+    async fn materialized_table_is_visible_across_shared_resource_clusters() {
+        let resources = SharedRunResources::provision()
+            .await
+            .expect("shared run resources provision");
+        let invocation = RunnerInvocation {
+            workload_id: "q2".to_owned(),
+            topology_id: "one-pod".to_owned(),
+            tier: RunnerTier::Smoke,
+            output_root: std::path::PathBuf::from(
+                "target/bifrost-benchmarks/test-cross-cluster-visibility",
+            ),
+            run_id: "test-cross-cluster-visibility".to_owned(),
+        };
+
+        // Cluster A (one pod) materializes the smoke dataset, then shuts down.
+        let cluster_a = WyrdTestCluster::start_spec_with_shared_resources(
+            topology_for_pods(1).expect("one-pod topology").spec(),
+            &resources,
+        )
+        .await
+        .expect("cluster A starts over shared resources");
+        let dataset = materialize_smoke_dataset(&cluster_a, &invocation, "q2")
+            .await
+            .expect("cluster A materializes the smoke dataset");
+        cluster_a
+            .shutdown()
+            .await
+            .expect("cluster A shuts down without tearing down shared resources");
+
+        // Cluster B (two pods, a distinct topology) reboots over the same
+        // resources and must read cluster A's materialized table correctly.
+        let cluster_b = WyrdTestCluster::start_spec_with_shared_resources(
+            topology_for_pods(2).expect("two-pod topology").spec(),
+            &resources,
+        )
+        .await
+        .expect("cluster B starts over the same shared resources");
+        let expected = dataset.expected_results();
+        let queries = dataset.queries();
+        let sql = query_sql("q2", &queries, dataset.shape()).expect("q2 sql renders");
+        let clients = reference_clients(
+            &cluster_b,
+            std::slice::from_ref(&cluster_b.data_tenant_id()),
+        )
+        .await
+        .expect("cluster B mints a reference client");
+        let query = clients
+            .first()
+            .expect("cluster B reference client")
+            .query
+            .clone();
+        probe_query_correctness(&query, "q2", &sql, &expected)
+            .await
+            .expect("cluster B reads cluster A's materialized table with correct results");
+
+        cluster_b.shutdown().await.expect("cluster B shuts down");
+        drop(resources);
     }
 }

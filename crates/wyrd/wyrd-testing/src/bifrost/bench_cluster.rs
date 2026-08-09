@@ -45,6 +45,32 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 4_096;
 /// Disjoint logical row-id space reserved for each authenticated tenant.
 const TENANT_ROW_STRIDE: u64 = 1_000_000_000_000;
 
+/// Derive a fresh, per-run ingest table name from a run identifier.
+///
+/// The qualification ingest sweep boots its cluster over run-shared resources
+/// whose Postgres catalog persists across every family cluster in the run. It
+/// therefore cannot reuse the smoke-default [`REFERENCE_TABLE`], because the
+/// mixed family registers that exact table over the same shared catalog and a
+/// second [`crate::bifrost::WyrdTestCluster`] creating it would collide. This
+/// seam yields a name that is unique to the run yet deterministic within it, so
+/// the ingest sweep owns a private write target while every other family keeps
+/// the smoke default. Each character outside `[a-z0-9_]` is folded to `_` so the
+/// result is a valid catalog identifier for any run-id token.
+#[must_use]
+pub(crate) fn fresh_ingest_table(run_id: &str) -> String {
+    let sanitized: String = run_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("bench_ingest_{sanitized}")
+}
+
 /// Typed first-attempt failure for an ancillary correctness query.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -1527,6 +1553,24 @@ pub(crate) fn is_retryable(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Proves the fresh ingest table name is namespaced, sanitized to a valid
+    /// catalog identifier, deterministic per run, and distinct across runs so the
+    /// qualification ingest sweep never collides on a run-shared catalog.
+    #[test]
+    fn fresh_ingest_table_is_sanitized_and_run_unique() {
+        let name = fresh_ingest_table("Run.42_alpha-1");
+        assert_eq!(name, "bench_ingest_run_42_alpha_1");
+        assert!(name.chars().all(|character| character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || character == '_'));
+        assert_eq!(name, fresh_ingest_table("Run.42_alpha-1"));
+        assert_ne!(
+            fresh_ingest_table("run-a"),
+            fresh_ingest_table("run-b"),
+            "distinct run ids must yield distinct tables"
+        );
+    }
 
     /// Proves report metrics retain a non-default profile concurrency cap.
     #[test]

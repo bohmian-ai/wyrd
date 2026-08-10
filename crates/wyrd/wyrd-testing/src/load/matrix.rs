@@ -411,7 +411,7 @@ impl BifrostClusterLoad {
                 profile.topology.spec_for_test(),
                 0,
                 AdmissionConfig {
-                    memory_limit_bytes: 512 * 1024 * 1024,
+                    memory_limit_bytes: 1024 * 1024 * 1024,
                     scribe_memory_limit_bytes: Some(256 * 1024),
                     event_time_window: EventTimeWindow::default(),
                 },

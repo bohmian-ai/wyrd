@@ -27,8 +27,27 @@ thread_local! {
     static CGROUP_CURRENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Minimum supported cgroup memory size.
-pub const MIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+/// Minimum supported pod memory size, enforced fail-closed at governor
+/// construction.
+///
+/// This floor is a derived consequence of the governor's two-level structure,
+/// not a magic number, and it is never a sizing mechanism: cgroup detection
+/// stays authoritative for actual budgets above the floor (D79). A
+/// combined-role pod must host two static children (Scribe and Oracle), each
+/// requiring [`MIN_CHILD_BYTES`] (256 MiB), under the parent ceiling fixed at
+/// the 70% fraction applied in
+/// [`BifrostMemoryGovernor::new_with_child_limits`]. The parent must therefore
+/// hold `2 * MIN_CHILD_BYTES = 512 MiB`, which demands a pod of at least
+/// `2 * MIN_CHILD_BYTES / 0.70 ≈ 732 MiB`. The floor is set to 768 MiB, the
+/// smallest conventional pod request above that measured bound, so the
+/// inequality holds with headroom:
+///
+/// `2 * MIN_CHILD_BYTES / 0.70 ≈ 732 MiB < 768 MiB = MIN_MEMORY_BYTES`.
+///
+/// The value is coupled to [`MIN_CHILD_BYTES`] and the 70% parent fraction: a
+/// future change to either invalidates the derivation above and must revisit
+/// this floor.
+pub const MIN_MEMORY_BYTES: usize = 768 * 1024 * 1024;
 /// Minimum byte budget for each static child (Scribe or Oracle).
 const MIN_CHILD_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum byte budget for each static child (Scribe or Oracle).
@@ -1912,6 +1931,62 @@ mod tests {
         assert!(BifrostMemoryGovernor::new(MIN_MEMORY_BYTES - 1).is_err());
     }
 
+    /// Pins the boot memory floor to 768 MiB and pins the inequality that
+    /// derives it, so a future change to `MIN_CHILD_BYTES` or the 70% parent
+    /// fraction that breaks the derivation fails here rather than silently
+    /// admitting pods that cannot construct both children.
+    #[test]
+    fn min_memory_floor_value_and_derivation() {
+        assert_eq!(
+            MIN_MEMORY_BYTES,
+            768 * 1024 * 1024,
+            "boot memory floor is 768 MiB"
+        );
+        // Parent ceiling at the floor must cover both children at their
+        // minimums. This uses the exact integer `pod * 70 / 100` arithmetic the
+        // constructor applies, so the pin matches real parent-ceiling behavior:
+        // MIN_MEMORY_BYTES * 70 / 100 >= 2 * MIN_CHILD_BYTES.
+        const {
+            assert!(
+                MIN_MEMORY_BYTES * 70 / 100 >= 2 * MIN_CHILD_BYTES,
+                "floor must admit two MIN_CHILD_BYTES children under the 70% parent fraction"
+            );
+        }
+    }
+
+    /// Proves a pod one byte below the floor (767 MiB) fails closed with the
+    /// existing typed construction error, confirming the raised floor stays a
+    /// fail-closed boot validation.
+    #[test]
+    fn pod_below_floor_fails_closed() {
+        let below_floor = MIN_MEMORY_BYTES - 1; // 767 MiB + (1 MiB - 1 byte) below the floor
+        let error = BifrostMemoryGovernor::new(below_floor)
+            .expect_err("pod below the memory floor must be rejected");
+        assert!(
+            matches!(error, ScribeError::Internal { .. }),
+            "below-floor rejection uses the existing typed construction error"
+        );
+    }
+
+    /// Proves a pod at exactly the floor (768 MiB) constructs with both children
+    /// resolved to their `MIN_CHILD_BYTES` minimums, the tightest viable
+    /// combined-role pod the floor is derived from.
+    #[test]
+    fn pod_at_floor_constructs_with_children_at_minimums() {
+        let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES)
+            .expect("pod at the memory floor must construct");
+        assert_eq!(
+            governor.scribe_limit_bytes(),
+            MIN_CHILD_BYTES,
+            "Scribe child clamps to its minimum at the floor"
+        );
+        assert_eq!(
+            governor.oracle_limit_bytes(),
+            MIN_CHILD_BYTES,
+            "Oracle child clamps to its minimum at the floor"
+        );
+    }
+
     #[test]
     fn transfers_reservations_between_lifecycle_categories() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
@@ -2477,14 +2552,23 @@ mod tests {
     }
 
     /// Proves that child limits whose sum exceeds the parent ceiling are rejected at construction.
+    ///
+    /// The requested children are enlarged to 300 MiB each because the premise
+    /// inverts at the 768 MiB floor: two `MIN_CHILD_BYTES` (256 MiB) children
+    /// sum to 512 MiB, which no longer exceeds the ~537.6 MiB parent, so the
+    /// case must use larger children to keep exercising child-sum rejection at
+    /// or above the floor.
     #[test]
     fn child_sum_exceeding_parent_rejected_at_construction() {
-        // pod = 512 MiB → bifrost = 358 MiB; two 256 MiB children sum to 512 MiB > bifrost.
-        let pod = MIN_MEMORY_BYTES; // 512 MiB
-        let bifrost = pod * 70 / 100; // 358 MiB
-        let each_child = MIN_CHILD_BYTES; // 256 MiB
+        // pod = 768 MiB → parent = 70% ≈ 537.6 MiB; two 300 MiB children sum to
+        // 600 MiB > parent.
+        let pod = MIN_MEMORY_BYTES; // 768 MiB
+        let parent = pod * 70 / 100; // ≈ 537.6 MiB
+        // 300 MiB stays within [MIN_CHILD_BYTES, MAX_CHILD_BYTES] so each child
+        // passes its own bound and the sum reaches the parent-ceiling check.
+        let each_child = 300 * 1024 * 1024; // 300 MiB
         assert!(
-            each_child * 2 > bifrost,
+            each_child * 2 > parent,
             "test invariant: sum exceeds parent"
         );
         assert!(

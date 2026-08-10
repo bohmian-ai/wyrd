@@ -1115,9 +1115,32 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
 /// the full terminal frame. Transport errors with the documented
 /// `WYRD_VALA_429_INGEST_BUSY` capacity code are retryable for the same
 /// reason; protocol, decode, and bound violations stay fatal.
+///
+/// The same governor refusal also fires during query admission, before any
+/// stream frame exists: the HTTP response carries
+/// `WYRD_VALA_500_QUERY_EXECUTION_FAILED`, which the shared client cannot
+/// reconstruct into a typed variant and therefore folds into
+/// [`WyrdError::UpstreamFailure`] with the code preserved in
+/// `details.original_code` (wyrd-client error.rs `code_to_wyrd_error`). That
+/// transport shape is the pre-stream twin of the failed terminal and is
+/// retryable on the same grounds, alongside the documented capacity codes
+/// already covered by [`is_retryable_capacity`].
 fn is_retryable_query_capacity(error: &vala_sdk::ValaSdkError) -> bool {
-    matches!(error, vala_sdk::ValaSdkError::FailedTerminal { .. })
-        || error.code() == "WYRD_VALA_429_INGEST_BUSY"
+    match error {
+        vala_sdk::ValaSdkError::FailedTerminal { .. } => true,
+        vala_sdk::ValaSdkError::Transport(transport) => {
+            is_retryable_capacity(transport)
+                || matches!(
+                    transport,
+                    WyrdError::UpstreamFailure { details, .. }
+                        if details
+                            .get("original_code")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("WYRD_VALA_500_QUERY_EXECUTION_FAILED")
+                )
+        }
+        _ => false,
+    }
 }
 
 /// Return whether an error is one of the documented capacity responses.

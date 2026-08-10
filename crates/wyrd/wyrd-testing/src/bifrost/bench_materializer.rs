@@ -1099,28 +1099,25 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
     }
 }
 
-/// Return whether a public Oracle query failure is a transient capacity
-/// refusal the visibility poll loop should absorb.
+/// Return whether a public Oracle query failure is worth re-polling inside
+/// the deadline-bounded visibility loop.
 ///
-/// The Oracle currently flattens a shared-governor memory refusal
+/// The Oracle flattens a shared-governor memory refusal
 /// (`ScribeError::IngestBusy { table: "memory" }` stringified through
 /// `DataFusionError::ResourcesExhausted`) into the generic
-/// `WYRD_VALA_500_QUERY_EXECUTION_FAILED` terminal, so the only wire-visible
-/// handle is the terminal detail text. The substrings below are pinned to the
-/// `ScribeError::IngestBusy` display ("ingest busy for table") and the
-/// DataFusion `ResourcesExhausted` prefix ("Resources exhausted"). A transport
-/// error carrying the documented `WYRD_VALA_429_INGEST_BUSY` capacity code is
-/// also retryable so the classifier keeps working if the server ever
-/// classifies the refusal properly.
+/// `WYRD_VALA_500_QUERY_EXECUTION_FAILED` terminal and scrubs the detail off
+/// the wire (`query_stream.rs` emits only the bare
+/// `QueryTerminalErrorCode`), so a client cannot distinguish a transient
+/// capacity refusal from a genuine query defect. Inside a poll loop already
+/// bounded by `setup_deadline` the safe classification is therefore: every
+/// failed terminal is retryable — a capacity refusal clears once ingest
+/// drains, and a deterministic defect still fails at the deadline carrying
+/// the full terminal frame. Transport errors with the documented
+/// `WYRD_VALA_429_INGEST_BUSY` capacity code are retryable for the same
+/// reason; protocol, decode, and bound violations stay fatal.
 fn is_retryable_query_capacity(error: &vala_sdk::ValaSdkError) -> bool {
-    if error.code() == "WYRD_VALA_429_INGEST_BUSY" {
-        return true;
-    }
-    if !matches!(error, vala_sdk::ValaSdkError::FailedTerminal { .. }) {
-        return false;
-    }
-    let detail = error.detail();
-    detail.contains("ingest busy for table") || detail.contains("Resources exhausted")
+    matches!(error, vala_sdk::ValaSdkError::FailedTerminal { .. })
+        || error.code() == "WYRD_VALA_429_INGEST_BUSY"
 }
 
 /// Return whether an error is one of the documented capacity responses.

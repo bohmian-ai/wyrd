@@ -771,10 +771,16 @@ impl PersistenceWorker {
             }
             "failed"
         };
-        if let Err(error) = &result
-            && let Ok(mut failures) = self.failures.lock()
-        {
-            failures.push(error.to_string());
+        if let Err(error) = &result {
+            tracing::warn!(
+                error = %error,
+                generation_id = generation.generation_id.0,
+                seal_key = %generation.seal_key,
+                "persistence job failed"
+            );
+            if let Ok(mut failures) = self.failures.lock() {
+                failures.push(error.to_string());
+            }
         }
         metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => status).increment(1);
         let published_at = std::time::Instant::now();
@@ -802,7 +808,32 @@ impl PersistenceWorker {
                 error: Some(error.to_string()),
             },
         };
+        self.deliver_completion(job, completion, visibility, publication_succeeded)
+            .await;
+    }
+
+    /// Delivers one completion to the owning shard and resolves its visibility span.
+    ///
+    /// Emits `completion_send` and `visibility_ack` stage events around the two
+    /// awaits so a worker parked in mailbox delivery or in the shard
+    /// acknowledgment is identifiable from logs. A failed delivery increments
+    /// the dropped-completion counter and warns, because the owning shard can no
+    /// longer retire the generation; the visibility span is then failed or
+    /// cancelled by [`finish_visibility_publication`].
+    async fn deliver_completion(
+        &self,
+        job: PersistenceJob,
+        completion: PersistenceCompletion,
+        visibility: super::seal::VisibilityPublishGuard,
+        publication_succeeded: bool,
+    ) {
+        let generation_id = job.generation.generation_id.0;
         let (visibility_result_tx, visibility_result_rx) = oneshot::channel();
+        tracing::debug!(
+            generation_id,
+            stage = "completion_send",
+            "persist stage start"
+        );
         let completion_delivered = job
             .completion_tx
             .send(crate::scribe::shards::ShardCommand::PersistenceComplete {
@@ -814,7 +845,17 @@ impl PersistenceWorker {
             .is_ok();
         if !completion_delivered {
             metrics::counter!("bifrost_scribe_persistence_completion_dropped_total").increment(1);
+            tracing::warn!(
+                generation_id,
+                seal_key = %job.generation.seal_key,
+                "persistence completion dropped: shard owner is gone"
+            );
         }
+        tracing::debug!(
+            generation_id,
+            stage = "visibility_ack",
+            "persist stage start"
+        );
         finish_visibility_publication(
             visibility,
             publication_succeeded,
@@ -822,6 +863,7 @@ impl PersistenceWorker {
             visibility_result_rx,
         )
         .await;
+        tracing::debug!(generation_id, "persistence job finished");
     }
 
     /// Encode one frozen generation to Parquet and time the encode stage (D84).
@@ -874,7 +916,10 @@ impl PersistenceWorker {
     /// the SQL commit — records its elapsed time into
     /// `bifrost_scribe_persist_stage_seconds{stage}` via [`record_persist_stage`]
     /// (D84), splitting the end-to-end publication histogram without changing the
-    /// persistence work or its ordering.
+    /// persistence work or its ordering. Every stage additionally emits a
+    /// `persist stage start` debug event before it begins so a worker parked
+    /// mid-stage is identifiable from logs: the last emitted stage for a
+    /// generation is the stage that never completed.
     ///
     /// # Errors
     ///
@@ -890,7 +935,9 @@ impl PersistenceWorker {
         generation: &ImmutableGeneration,
         binding: &TenantTableBinding,
     ) -> Result<FileListCommitKey, ScribeError> {
+        let generation_id = generation.generation_id.0;
         let frozen = generation.frozen_snapshot();
+        tracing::debug!(generation_id, stage = "encode", "persist stage start");
         let mut encoded = self.encode_parquet_stage(&frozen, binding).await?;
         let source_node_id = generation.stream.node_id.to_string();
         let path = object_path(binding, &generation.seal_key, &source_node_id)?;
@@ -911,6 +958,7 @@ impl PersistenceWorker {
                 detail: "test object-store write failure".to_owned(),
             });
         }
+        tracing::debug!(generation_id, stage = "object_put", "persist stage start");
         let put_started = std::time::Instant::now();
         let path = self
             .put_object(&path, std::mem::take(&mut encoded.bytes))
@@ -929,6 +977,7 @@ impl PersistenceWorker {
         let fail_before_commit = self.faults.take_sql_commit();
         #[cfg(not(any(test, feature = "test-support")))]
         let fail_before_commit = false;
+        tracing::debug!(generation_id, stage = "sql_commit", "persist stage start");
         let commit_started = std::time::Instant::now();
         let outcome = self
             .publish_row(
@@ -957,7 +1006,17 @@ impl PersistenceWorker {
                 detail: "test manifest publication failure".to_owned(),
             });
         }
+        tracing::debug!(
+            generation_id,
+            stage = "manifest_lock",
+            "persist stage start"
+        );
         let _manifest_guard = self.manifest_guard.lock().await;
+        tracing::debug!(
+            generation_id,
+            stage = "manifest_advance",
+            "persist stage start"
+        );
         let result = self
             .wal_io
             .submit(ScribeWalIoOp::AdvanceManifest {
@@ -972,6 +1031,7 @@ impl PersistenceWorker {
                 detail: "WAL IO lane returned the wrong manifest result".to_owned(),
             });
         }
+        tracing::debug!(generation_id, "persist stages complete");
         Ok(outcome.commit_key)
     }
 

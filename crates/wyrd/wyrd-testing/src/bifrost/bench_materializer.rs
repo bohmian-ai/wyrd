@@ -898,6 +898,11 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                 _ = tokio::time::sleep(wait) => {}
             }
             if Instant::now() >= self.policy.setup_deadline {
+                if let Some(message) = capacity_refusal {
+                    return Err(MaterializationError::Backend(format!(
+                        "visibility polling exhausted setup deadline on a retryable capacity refusal: {message}"
+                    )));
+                }
                 return Err(MaterializationError::Visibility {
                     tenant,
                     day,

@@ -13,9 +13,29 @@ default = []
 bench = ["dep:wyrd-bench"]
 python = ["dep:pyo3", "dep:wyrd-utils"]
 
+# Surface-scoped Bifrost test binaries (T54): the former monolithic
+# `integration` target was split so a single test edit relinks only its surface
+# instead of every Bifrost test. `autotests = false` keeps the individual test
+# files (referenced via `#[path]` from these roots) from also becoming targets.
 [[test]]
-name = "integration"
-path = "tests/integration.rs"
+name = "journeys"
+path = "tests/journeys.rs"
+
+[[test]]
+name = "oracle"
+path = "tests/oracle.rs"
+
+[[test]]
+name = "otlp"
+path = "tests/otlp.rs"
+
+[[test]]
+name = "fuzz"
+path = "tests/fuzz.rs"
+
+[[test]]
+name = "cluster"
+path = "tests/cluster.rs"
 
 [[test]]
 name = "oracle_peer"

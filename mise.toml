@@ -217,7 +217,7 @@ set -euo pipefail
 run_id="${WYRD_BIFROST_RUN_ID:-qualification-$(date +%s)}"
 out="target/bifrost-benchmarks/qualification"
 cargo build --locked -p wyrd-testing --features bench --bench bench_bifrost_qualification
-manifest=$(cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_qualification -- --run-id "$run_id" --output-root "$out" | tail -n1)
+manifest=$(cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_qualification -- --run-id "$run_id" --output-root "$out" | tee /dev/stderr | tail -n1)
 echo "bifrost qualification manifest written to ${manifest}"
 '''
 

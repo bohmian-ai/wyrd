@@ -355,6 +355,24 @@ pub enum MaterializationError {
     Backend(String),
 }
 
+/// Failure surfaced by one public Oracle visibility COUNT poll.
+///
+/// `retryable` separates transient capacity refusals — the Oracle's shared
+/// memory governor refusing a query reservation while ingest holds the budget
+/// surfaces as an `IngestBusy { table: "memory" }` flattened into the
+/// `WYRD_VALA_500_QUERY_EXECUTION_FAILED` terminal detail — from genuine query
+/// defects. [`BifrostDatasetMaterializer::wait_for_visibility`] re-polls
+/// retryable failures with backoff until the setup deadline, exactly like an
+/// under-count, and fails fast on everything else.
+#[derive(Debug, Clone)]
+pub(crate) struct VisibleCountError {
+    /// Human-readable failure detail carried into
+    /// [`MaterializationError::Backend`] when the poll cannot continue.
+    pub message: String,
+    /// Whether the failure is a transient capacity refusal worth re-polling.
+    pub retryable: bool,
+}
+
 /// Private public-surface adapter used by the orchestration owner and tests.
 #[async_trait]
 pub(crate) trait MaterializerBackend: Send + Sync {
@@ -370,12 +388,18 @@ pub(crate) trait MaterializerBackend: Send + Sync {
     /// Trigger the documented tenant flush surface.
     async fn flush(&self, tenant: DataTenantId) -> Result<(), String>;
     /// Return the public Oracle count for one logical day range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VisibleCountError`] with `retryable = true` for transient
+    /// capacity refusals the visibility loop should absorb, and
+    /// `retryable = false` for structural query failures.
     async fn visible_count(
         &self,
         tenant: DataTenantId,
         day: u32,
         rows_per_day: u64,
-    ) -> Result<u64, String>;
+    ) -> Result<u64, VisibleCountError>;
 }
 
 /// One cohesive owner for deterministic qualification materialization.
@@ -810,6 +834,19 @@ impl<'a> BifrostDatasetMaterializer<'a> {
     }
 
     /// Poll public Oracle until one logical day reaches its expected count.
+    ///
+    /// A retryable COUNT failure (a transient capacity refusal per
+    /// [`VisibleCountError::retryable`]) is absorbed exactly like an
+    /// under-count: back off and re-poll until `policy.setup_deadline`. A
+    /// non-retryable failure aborts immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaterializationError::Backend`] for a non-retryable COUNT
+    /// failure or a retryable one that outlives the setup deadline,
+    /// [`MaterializationError::Visibility`] when the deadline passes with the
+    /// day still under-counted, and [`MaterializationError::Cancelled`] on
+    /// cooperative cancellation.
     async fn wait_for_visibility(
         &self,
         tenant: DataTenantId,
@@ -819,22 +856,32 @@ impl<'a> BifrostDatasetMaterializer<'a> {
         progress: &mut PartialProgress,
     ) -> Result<u64, MaterializationError> {
         let mut backoff = self.policy.initial_backoff;
+        let mut observed = 0_u64;
         loop {
-            let observed = self
-                .backend
-                .visible_count(tenant, day, rows_per_day)
-                .await
-                .map_err(MaterializationError::Backend)?;
+            let poll = self.backend.visible_count(tenant, day, rows_per_day).await;
             if self.cancellation.is_cancelled() {
                 return Err(MaterializationError::Cancelled {
                     progress: *progress,
                 });
             }
-            if observed >= expected {
-                return Ok(observed);
-            }
+            let capacity_refusal = match poll {
+                Ok(count) => {
+                    observed = count;
+                    if observed >= expected {
+                        return Ok(observed);
+                    }
+                    None
+                }
+                Err(error) if error.retryable => Some(error.message),
+                Err(error) => return Err(MaterializationError::Backend(error.message)),
+            };
             let now = Instant::now();
             if now >= self.policy.setup_deadline {
+                if let Some(message) = capacity_refusal {
+                    return Err(MaterializationError::Backend(format!(
+                        "visibility polling exhausted setup deadline on a retryable capacity refusal: {message}"
+                    )));
+                }
                 return Err(MaterializationError::Visibility {
                     tenant,
                     day,
@@ -985,12 +1032,15 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
         tenant: DataTenantId,
         day: u32,
         rows_per_day: u64,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, VisibleCountError> {
         let index = self
             .tenants
             .iter()
             .position(|candidate| *candidate == tenant)
-            .ok_or_else(|| "materializer tenant is not provisioned".to_owned())?;
+            .ok_or_else(|| VisibleCountError {
+                message: "materializer tenant is not provisioned".to_owned(),
+                retryable: false,
+            })?;
         let start = u64::from(day).saturating_mul(rows_per_day);
         let end = start.saturating_add(rows_per_day);
         let request = BifrostQueryRequest {
@@ -1010,18 +1060,67 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
                 },
             )
             .await
-            .map_err(|error| error.to_string())?;
-        let batch = result
-            .batches
-            .first()
-            .ok_or_else(|| "Oracle count returned no batch".to_owned())?;
+            .map_err(|error| {
+                let message = match &error {
+                    vala_sdk::ValaSdkError::FailedTerminal { terminal } => format!(
+                        "oracle failed terminal: public_code={} terminal_code={:?} detail={:?} outcome={:?} freshness={:?} row_count={} warnings={:?} source_completion={:?}",
+                        error.code(),
+                        terminal.error.as_ref().map(|inner| inner.code),
+                        error.detail(),
+                        terminal.outcome,
+                        terminal.freshness,
+                        terminal.row_count,
+                        terminal.warnings,
+                        terminal.source_completion,
+                    ),
+                    other => format!("{other} (public_code={})", other.code()),
+                };
+                VisibleCountError {
+                    retryable: is_retryable_query_capacity(&error),
+                    message,
+                }
+            })?;
+        let batch = result.batches.first().ok_or_else(|| VisibleCountError {
+            message: "Oracle count returned no batch".to_owned(),
+            retryable: false,
+        })?;
         let count = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| "Oracle count was not Int64".to_owned())?;
-        u64::try_from(count.value(0)).map_err(|error| error.to_string())
+            .ok_or_else(|| VisibleCountError {
+                message: "Oracle count was not Int64".to_owned(),
+                retryable: false,
+            })?;
+        u64::try_from(count.value(0)).map_err(|error| VisibleCountError {
+            message: error.to_string(),
+            retryable: false,
+        })
     }
+}
+
+/// Return whether a public Oracle query failure is a transient capacity
+/// refusal the visibility poll loop should absorb.
+///
+/// The Oracle currently flattens a shared-governor memory refusal
+/// (`ScribeError::IngestBusy { table: "memory" }` stringified through
+/// `DataFusionError::ResourcesExhausted`) into the generic
+/// `WYRD_VALA_500_QUERY_EXECUTION_FAILED` terminal, so the only wire-visible
+/// handle is the terminal detail text. The substrings below are pinned to the
+/// `ScribeError::IngestBusy` display ("ingest busy for table") and the
+/// DataFusion `ResourcesExhausted` prefix ("Resources exhausted"). A transport
+/// error carrying the documented `WYRD_VALA_429_INGEST_BUSY` capacity code is
+/// also retryable so the classifier keeps working if the server ever
+/// classifies the refusal properly.
+fn is_retryable_query_capacity(error: &vala_sdk::ValaSdkError) -> bool {
+    if error.code() == "WYRD_VALA_429_INGEST_BUSY" {
+        return true;
+    }
+    if !matches!(error, vala_sdk::ValaSdkError::FailedTerminal { .. }) {
+        return false;
+    }
+    let detail = error.detail();
+    detail.contains("ingest busy for table") || detail.contains("Resources exhausted")
 }
 
 /// Return whether an error is one of the documented capacity responses.
@@ -1097,7 +1196,7 @@ mod tests {
     struct MockBackend {
         outcomes: Mutex<VecDeque<Result<(), WyrdError>>>,
         ids: Mutex<Vec<[u8; 16]>>,
-        counts: Mutex<VecDeque<u64>>,
+        counts: Mutex<VecDeque<Result<u64, VisibleCountError>>>,
         retry_signal: Mutex<Option<Arc<Notify>>>,
     }
 
@@ -1141,13 +1240,12 @@ mod tests {
             _tenant: DataTenantId,
             _day: u32,
             rows_per_day: u64,
-        ) -> Result<u64, String> {
-            Ok(self
-                .counts
+        ) -> Result<u64, VisibleCountError> {
+            self.counts
                 .lock()
                 .expect("mock count lock")
                 .pop_front()
-                .unwrap_or(rows_per_day))
+                .unwrap_or(Ok(rows_per_day))
         }
     }
 
@@ -1382,7 +1480,7 @@ mod tests {
             .counts
             .lock()
             .expect("counts")
-            .extend([0, 4_096, 4_096]);
+            .extend([Ok(0), Ok(4_096), Ok(4_096)]);
         let (materializer, _run_root) =
             materializer(backend, Instant::now() + Duration::from_secs(5));
         let result = materializer
@@ -1390,6 +1488,87 @@ mod tests {
             .await
             .expect("visibility succeeds");
         assert_eq!(result.pressure.waited, Duration::ZERO);
+    }
+
+    /// Build one retryable capacity-refusal COUNT failure for the mock queue.
+    fn capacity_refusal() -> VisibleCountError {
+        VisibleCountError {
+            message: "oracle failed terminal: detail=\"Resources exhausted: ingest busy for table: memory\"".to_owned(),
+            retryable: true,
+        }
+    }
+
+    /// A retryable COUNT capacity refusal re-polls and then succeeds.
+    ///
+    /// Guards the gate-4 root cause: a transient Oracle memory-governor
+    /// refusal during the visibility poll must behave like an under-count
+    /// (backoff and retry) instead of aborting materialization.
+    #[tokio::test]
+    async fn retryable_count_failure_repolls_until_visible() {
+        let backend = Arc::new(MockBackend::default());
+        backend.counts.lock().expect("counts").extend([
+            Err(capacity_refusal()),
+            Ok(4_096),
+            Ok(4_096),
+        ]);
+        let (materializer, _run_root) =
+            materializer(backend, Instant::now() + Duration::from_secs(5));
+        materializer
+            .materialize()
+            .await
+            .expect("materialization succeeds after a retryable count refusal");
+    }
+
+    /// A retryable COUNT refusal that outlives the deadline fails with evidence.
+    ///
+    /// The terminal error must carry the last refusal message so an exhausted
+    /// run is diagnosable, rather than reporting a misleading under-count.
+    #[tokio::test]
+    async fn retryable_count_failure_exhausting_deadline_reports_refusal() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .counts
+            .lock()
+            .expect("counts")
+            .push_back(Err(capacity_refusal()));
+        let (materializer, _run_root) = materializer(backend, Instant::now());
+        let error = materializer
+            .materialize()
+            .await
+            .expect_err("deadline-exhausted refusal fails");
+        match error {
+            MaterializationError::Backend(message) => {
+                assert!(message.contains("retryable capacity refusal"), "{message}");
+                assert!(message.contains("ingest busy for table"), "{message}");
+            }
+            other => panic!("expected Backend error, got: {other}"),
+        }
+    }
+
+    /// A non-retryable COUNT failure aborts materialization immediately.
+    #[tokio::test]
+    async fn fatal_count_failure_aborts_immediately() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .counts
+            .lock()
+            .expect("counts")
+            .push_back(Err(VisibleCountError {
+                message: "Oracle count was not Int64".to_owned(),
+                retryable: false,
+            }));
+        let (materializer, _run_root) =
+            materializer(backend, Instant::now() + Duration::from_secs(5));
+        let error = materializer
+            .materialize()
+            .await
+            .expect_err("fatal count failure aborts");
+        match error {
+            MaterializationError::Backend(message) => {
+                assert!(message.contains("not Int64"), "{message}");
+            }
+            other => panic!("expected Backend error, got: {other}"),
+        }
     }
 
     /// Derive the binding ceiling as the max-count ceiling, then as the governor fallback.

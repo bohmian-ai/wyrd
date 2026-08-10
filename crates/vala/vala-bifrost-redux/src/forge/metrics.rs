@@ -12,6 +12,7 @@ use wyrd_spec::vala::api::StoragePath;
 use crate::catalog::TenantTableBinding;
 
 use super::error::ForgeError;
+use super::orphan_gc::OrphanGcOutcome;
 use super::path::catalog_path_to_object_key;
 use super::{Forge, ForgeScheduleOutcome};
 
@@ -344,20 +345,17 @@ pub(super) enum ForgeCleanupKind {
     Expired,
     /// Cleanup proved one never-published object can be removed.
     Orphan,
-    /// Cleanup accounted for one temporary spill artifact.
-    Spill,
 }
 
 impl ForgeCleanupKind {
     /// Every provenance label eagerly registered for cleanup-duration series.
-    const ALL: [Self; 3] = [Self::Expired, Self::Orphan, Self::Spill];
+    const ALL: [Self; 2] = [Self::Expired, Self::Orphan];
 
     /// Returns the stable cleanup metric label for this provenance.
     const fn as_str(self) -> &'static str {
         match self {
             Self::Expired => "expired",
             Self::Orphan => "orphan",
-            Self::Spill => "spill",
         }
     }
 }
@@ -468,6 +466,33 @@ impl ForgeTelemetry {
     /// Record completion of one durable cleanup obligation.
     pub(super) fn record_cleanup(&self, kind: ForgeCleanupKind, elapsed: Duration) {
         self.cleanup_duration[&kind].record(elapsed.as_secs_f64());
+    }
+
+    /// Records one completed orphan-GC run through its closed label inventory.
+    ///
+    /// Emits the run's wall-clock duration into
+    /// `bifrost_forge_cleanup_duration_seconds{kind="orphan"}`, its deleted and
+    /// retained counts into the staging operation counters, and — when a per-run
+    /// bound ended the run before its candidate set was exhausted — one `Budget`
+    /// staging operation so a Partial run is observable. Counts route through the
+    /// existing operation surface with no per-tenant, per-table, or per-path
+    /// label. The duration is recorded unconditionally so an empty run still
+    /// advances the cleanup series; the count increments are no-ops when zero.
+    pub(super) fn record_orphan_gc(&self, outcome: &OrphanGcOutcome, elapsed: Duration) {
+        self.record_cleanup(ForgeCleanupKind::Orphan, elapsed);
+        self.record_operation(
+            ForgeMetricSource::Staging,
+            ForgeOperationResult::Committed,
+            outcome.deleted,
+        );
+        self.record_operation(
+            ForgeMetricSource::Staging,
+            ForgeOperationResult::Noop,
+            outcome.skipped,
+        );
+        if outcome.partial {
+            self.record_operation(ForgeMetricSource::Staging, ForgeOperationResult::Budget, 1);
+        }
     }
 
     /// Publish the complete scheduler-owned backlog and fairness state.
@@ -690,7 +715,7 @@ mod tests {
     #[cfg(test)]
     use super::{
         ForgeCleanupKind, ForgeConflictKind, ForgeMetricSource, ForgeTaskMetricStrategy,
-        ForgeTaskTerminalResult, ForgeTelemetry,
+        ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
     };
     #[cfg(test)]
     use crate::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
@@ -767,6 +792,91 @@ mod tests {
             .filter(|family| family_changed(&before, &after, family))
             .collect::<Vec<_>>();
         assert_eq!(changed, vec![expected]);
+    }
+
+    /// Proves an orphan-GC outcome routes its counts and cleanup duration through metrics.
+    ///
+    /// A Complete outcome moves its deleted count onto the `committed` staging
+    /// operation series, its retained count onto `noop`, no `budget` movement,
+    /// and advances the orphan cleanup-duration family. A Partial outcome moves
+    /// its deleted count onto `committed` and emits exactly one `budget` staging
+    /// operation, so a bounded stop is observable without any per-path label.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any staging-operation delta or the cleanup-duration family
+    /// movement does not match the outcome the telemetry owner was handed.
+    #[cfg(test)]
+    fn assert_orphan_gc_operation_emission(
+        recorder: &BenchmarkRecorder,
+        telemetry: &ForgeTelemetry,
+    ) {
+        let staging_operations = |snapshot: &BenchmarkMetricSnapshot, result_label: &str| {
+            snapshot
+                .counters
+                .iter()
+                .filter(|(name, _)| {
+                    name.starts_with("bifrost_forge_operations{")
+                        && name.contains("source=\"staging\"")
+                        && name.contains(&format!("result=\"{result_label}\""))
+                })
+                .map(|(_, value)| *value)
+                .sum::<u64>()
+        };
+
+        let before_complete = recorder.snapshot();
+        telemetry.record_orphan_gc(
+            &OrphanGcOutcome {
+                deleted: 3,
+                skipped: 2,
+                partial: false,
+                ..OrphanGcOutcome::default()
+            },
+            Duration::from_millis(5),
+        );
+        let after_complete = recorder.snapshot();
+        assert_eq!(
+            staging_operations(&after_complete, "committed")
+                - staging_operations(&before_complete, "committed"),
+            3
+        );
+        assert_eq!(
+            staging_operations(&after_complete, "noop")
+                - staging_operations(&before_complete, "noop"),
+            2
+        );
+        assert_eq!(
+            staging_operations(&after_complete, "budget")
+                - staging_operations(&before_complete, "budget"),
+            0
+        );
+        assert!(family_changed(
+            &before_complete,
+            &after_complete,
+            "bifrost_forge_cleanup_duration_seconds"
+        ));
+
+        let before_partial = recorder.snapshot();
+        telemetry.record_orphan_gc(
+            &OrphanGcOutcome {
+                deleted: 1,
+                skipped: 0,
+                partial: true,
+                ..OrphanGcOutcome::default()
+            },
+            Duration::from_millis(5),
+        );
+        let after_partial = recorder.snapshot();
+        assert_eq!(
+            staging_operations(&after_partial, "committed")
+                - staging_operations(&before_partial, "committed"),
+            1
+        );
+        assert_eq!(
+            staging_operations(&after_partial, "budget")
+                - staging_operations(&before_partial, "budget"),
+            1
+        );
     }
 
     /// Drive each real telemetry owner boundary and pin independent report sensitivity.
@@ -853,6 +963,8 @@ mod tests {
         assert_owner_transition(&recorder, "bifrost_forge_cleanup_duration_seconds", || {
             telemetry.record_cleanup(ForgeCleanupKind::Expired, Duration::from_millis(3));
         });
+
+        assert_orphan_gc_operation_emission(&recorder, &telemetry);
 
         assert_owner_transition(&recorder, "bifrost_memory_reserved_bytes", || {
             reservation.try_grow(4096).expect("Forge memory reserve");

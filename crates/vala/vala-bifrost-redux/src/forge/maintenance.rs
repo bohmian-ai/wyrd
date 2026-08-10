@@ -1,7 +1,7 @@
 //! Ordered Iceberg metadata maintenance for one claimed Forge task.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use iceberg::table::Table;
 use iceberg::transaction::{
@@ -15,7 +15,7 @@ use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::PendingExpiryTerminal;
 use super::lease::ForgeLease;
-use super::orphan_gc::{GcProtectedPaths, OrphanGcOutcome};
+use super::metrics::ForgeMetricStage;
 use crate::catalog::TenantTableBinding;
 
 /// Deterministic one-shot catalog boundaries for Forge integration tests.
@@ -290,6 +290,13 @@ impl ForgeMaintenance {
 
     /// Runs the disjoint never-published generation collector after expired cleanup.
     ///
+    /// The bounded orphan-GC run's outcome is consumed for telemetry: the run's
+    /// wall-clock duration and success/failure are recorded against the
+    /// `OrphanGc` maintenance stage, and its deleted, retained, and Partial
+    /// accounting is recorded through the orphan cleanup surface. Recording
+    /// happens on both the success and error paths so a failed run still moves
+    /// its stage-failure series before the error propagates.
+    ///
     /// # Errors
     ///
     /// Returns lease, catalog, SQL, audit, object-store, or cancellation failures.
@@ -297,6 +304,7 @@ impl ForgeMaintenance {
     /// # Cancellation
     ///
     /// Cancellation before collection starts no new scan or deletion effect.
+    #[tracing::instrument(skip_all, fields(tenant = %key.tenant))]
     pub(super) async fn collect_never_published(
         &self,
         lease: &mut ForgeLease,
@@ -306,22 +314,23 @@ impl ForgeMaintenance {
     ) -> Result<(), ForgeError> {
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        let staging = BTreeSet::new();
-        let live = BTreeSet::new();
-        let _: OrphanGcOutcome = self
+        let now = self.forge.core.clock.now()?;
+        let started = Instant::now();
+        let result = self
             .forge
-            .run_orphan_gc_for_table(
-                lease,
-                key,
-                binding,
-                self.forge.core.clock.now()?,
-                stop,
-                GcProtectedPaths {
-                    staging: &staging,
-                    live: &live,
-                },
-            )
-            .await?;
+            .run_orphan_gc_for_table(lease, key, binding, now, stop)
+            .await;
+        let elapsed = started.elapsed();
+        self.forge.core.telemetry.record_stage(
+            ForgeMetricStage::OrphanGc,
+            elapsed,
+            result.is_err(),
+        );
+        let outcome = result?;
+        self.forge
+            .core
+            .telemetry
+            .record_orphan_gc(&outcome, elapsed);
         Ok(())
     }
 }

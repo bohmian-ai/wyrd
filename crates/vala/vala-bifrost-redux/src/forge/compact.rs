@@ -16,6 +16,8 @@ use arrow::compute::cast;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::NaiveDate;
+use futures_util::future::ready;
+use futures_util::stream::{self, BoxStream};
 use iceberg::spec::DataFile;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::{Buffer, Entry, Metadata};
@@ -60,6 +62,16 @@ const DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT: usize = 32;
 /// commit exists past `retain_last`. Bounds retained-history age for a
 /// low-commit table that never reaches the count trigger.
 const DEFAULT_MAINTENANCE_TRIGGER_INTERVAL: Duration = Duration::from_hours(1);
+/// Default cap on listing pages walked by one orphan-GC candidate scan. Sized
+/// well above an ordinary table's orphan-prefix page count so steady-state runs
+/// complete in one pass, while still bounding a pathological prefix so one run
+/// cannot walk unboundedly before yielding to a successor.
+const DEFAULT_ORPHAN_GC_MAX_LIST_PAGES: usize = 1_024;
+/// Default wall-clock budget for one orphan-GC run. Bounds the time a single run
+/// spends listing and deleting before it yields cleanly as Partial, leaving the
+/// remainder to a successor run that resumes from the committed-deletion
+/// frontier.
+const DEFAULT_ORPHAN_GC_RUN_BUDGET: Duration = Duration::from_mins(2);
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -118,6 +130,19 @@ pub struct ForgeConfig {
     /// due, provided at least one commit exists past `retain_last`. Paired with
     /// `maintenance_trigger_snapshot_count` as a count-OR-interval trigger.
     pub maintenance_trigger_interval: Duration,
+    /// Maximum object-store listing pages an orphan-GC candidate scan consumes
+    /// in one run. Bounds a single run's listing work on a table whose orphan
+    /// prefix holds more pages than one run should walk; a run that hits the cap
+    /// ends cleanly as Partial and a successor run resumes after the durable
+    /// deletions this run committed. Not yet wired to the user-facing config or
+    /// environment surface; defaulted at construction.
+    pub orphan_gc_max_list_pages: usize,
+    /// Wall-clock budget for one orphan-GC run, checked at listing-page and
+    /// per-candidate-deletion boundaries. Exhausting the budget ends the run
+    /// cleanly as Partial with no deletion attempted past the boundary; a
+    /// successor run resumes from the durable frontier. Not yet wired to the
+    /// user-facing config or environment surface; defaulted at construction.
+    pub orphan_gc_run_budget: Duration,
 }
 
 impl Default for ForgeConfig {
@@ -148,6 +173,8 @@ impl Default for ForgeConfig {
             max_retained_snapshots_per_table: DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE,
             maintenance_trigger_snapshot_count: DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT,
             maintenance_trigger_interval: DEFAULT_MAINTENANCE_TRIGGER_INTERVAL,
+            orphan_gc_max_list_pages: DEFAULT_ORPHAN_GC_MAX_LIST_PAGES,
+            orphan_gc_run_budget: DEFAULT_ORPHAN_GC_RUN_BUDGET,
         }
     }
 }
@@ -185,6 +212,8 @@ impl ForgeConfig {
             || self.max_retained_snapshots_per_table == 0
             || self.maintenance_trigger_snapshot_count == 0
             || self.maintenance_trigger_interval.is_zero()
+            || self.orphan_gc_max_list_pages == 0
+            || self.orphan_gc_run_budget.is_zero()
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge limits must be positive and min_files/max_files_per_bin must be at least two".to_owned(),
@@ -216,6 +245,15 @@ impl ForgeConfig {
             .saturating_add(self.uncertainty_margin)
     }
 }
+
+/// A stream of object-listing pages under one prefix.
+///
+/// Each item is one bounded page of entries or the backend error that ended
+/// the walk. The stream owns its listing state, so it is `'static` and does not
+/// borrow the object store that produced it. Orphan GC pulls pages one at a
+/// time so it can stop at a page boundary once its page cap or run budget is
+/// reached without having materialized the whole prefix.
+pub type ForgeObjectPages = BoxStream<'static, opendal::Result<Vec<Entry>>>;
 
 /// The object-store operations Forge performs after Scribe has staged a file.
 ///
@@ -270,6 +308,25 @@ pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
     ///
     /// Returns the backend error when recursive listing cannot complete.
     async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>>;
+
+    /// List objects below a table-owned prefix as a stream of bounded pages.
+    ///
+    /// This is the listing path orphan GC uses so it can consume the prefix
+    /// incrementally and stop at a page boundary once its per-run page cap or
+    /// time budget is reached. The default body adapts [`Self::list`] into a
+    /// single page, which preserves behavior for every non-production
+    /// implementation. The production adapter overrides this with true
+    /// incremental pagination so a large prefix never materializes at once;
+    /// riding this default in production would defeat the scan bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when recursive listing cannot begin. Errors
+    /// encountered mid-walk surface as a failed item in the returned stream.
+    async fn list_pages(&self, prefix: &str) -> opendal::Result<ForgeObjectPages> {
+        let entries = self.list(prefix).await?;
+        Ok(Box::pin(stream::once(ready(Ok(entries)))))
+    }
 
     /// Read object metadata before a destructive decision.
     ///
@@ -2001,6 +2058,99 @@ mod tests {
             .await;
     }
 
+    /// Object store whose `list` delegates to a real filesystem operator.
+    ///
+    /// Backs the default `list_pages` adaptation test with genuine
+    /// [`opendal::Entry`] values, which cannot be constructed directly, while
+    /// leaving `list_pages` unimplemented so the trait default is exercised.
+    #[derive(Debug)]
+    struct FsListObjectStore {
+        /// Filesystem operator rooted at a temporary directory.
+        operator: opendal::Operator,
+    }
+
+    #[async_trait]
+    impl ForgeObjectStore for FsListObjectStore {
+        /// Reject reads because this unit exercises only listing adaptation.
+        async fn read(&self, _path: &str) -> opendal::Result<Buffer> {
+            unreachable!("listing unit does not read objects")
+        }
+
+        /// Reject ranged reads because this unit exercises only listing adaptation.
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> opendal::Result<Buffer> {
+            unreachable!("listing unit does not read object ranges")
+        }
+
+        /// Delegate the flat recursive listing to the backing filesystem operator.
+        async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
+            self.operator.list_with(prefix).recursive(true).await
+        }
+
+        /// Reject metadata reads because this unit exercises only listing adaptation.
+        async fn stat(&self, _path: &str) -> opendal::Result<Metadata> {
+            unreachable!("listing unit does not inspect objects")
+        }
+
+        /// Reject deletes because this unit exercises only listing adaptation.
+        async fn delete(&self, _path: &str) -> opendal::Result<()> {
+            unreachable!("listing unit does not delete objects")
+        }
+    }
+
+    /// The default `list_pages` body adapts `list` into exactly one page.
+    #[tokio::test]
+    async fn list_pages_default_yields_single_page() {
+        use futures_util::StreamExt;
+
+        let dir = tempfile::tempdir().expect("temporary listing root");
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default().root(dir.path().to_str().expect("root path")),
+        )
+        .expect("filesystem operator")
+        .finish();
+        for name in ["a.parquet", "b.parquet", "c.parquet"] {
+            operator
+                .write(name, vec![0_u8])
+                .await
+                .expect("seed listing object");
+        }
+        let store = FsListObjectStore { operator };
+
+        let mut direct = store
+            .list("")
+            .await
+            .expect("direct listing")
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<Vec<_>>();
+        direct.sort();
+
+        let mut pages = store.list_pages("").await.expect("paged listing");
+        let first = pages
+            .next()
+            .await
+            .expect("default body yields one page")
+            .expect("page listing succeeds");
+        assert!(
+            pages.next().await.is_none(),
+            "the default adaptation yields exactly one page"
+        );
+        let mut page_paths = first
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<Vec<_>>();
+        page_paths.sort();
+
+        assert_eq!(
+            page_paths, direct,
+            "the single page equals the flat listing"
+        );
+    }
+
     /// Forge output encoding uses the shared Bifrost Parquet recipe.
     #[test]
     fn compacted_output_uses_shared_writer_properties() {
@@ -2041,6 +2191,28 @@ mod tests {
             ..ForgeConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    /// Both orphan-GC scan bounds default to positive values and reject zero.
+    #[test]
+    fn forge_config_rejects_zero_orphan_gc_bounds() {
+        let config = ForgeConfig::default();
+        assert_eq!(
+            config.orphan_gc_max_list_pages,
+            DEFAULT_ORPHAN_GC_MAX_LIST_PAGES
+        );
+        assert_eq!(config.orphan_gc_run_budget, DEFAULT_ORPHAN_GC_RUN_BUDGET);
+        assert!(config.validate().is_ok());
+        let zero_pages = ForgeConfig {
+            orphan_gc_max_list_pages: 0,
+            ..ForgeConfig::default()
+        };
+        assert!(zero_pages.validate().is_err());
+        let zero_budget = ForgeConfig {
+            orphan_gc_run_budget: Duration::ZERO,
+            ..ForgeConfig::default()
+        };
+        assert!(zero_budget.validate().is_err());
     }
 
     /// The staging seam consumes the right-size policy's selected groups.

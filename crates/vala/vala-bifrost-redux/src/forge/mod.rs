@@ -35,7 +35,7 @@ mod worker;
 pub use clock::ForgeClock;
 #[cfg(feature = "test-support")]
 pub use clock::ForgeClockControl;
-pub use compact::{ForgeConfig, ForgeObjectStore, ForgeTickOutcome};
+pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore, ForgeTickOutcome};
 pub use error::ForgeError;
 pub use metrics::ForgeTelemetry;
 pub use planner::{
@@ -60,7 +60,7 @@ pub use live_replace::IcebergRewriteDisposition;
 #[cfg(feature = "test-support")]
 pub use maintenance::MaintenanceTestControls;
 #[cfg(feature = "test-support")]
-pub use orphan_gc::current_gc_gate_for_test;
+pub use orphan_gc::{OrphanGcReport, current_gc_gate_for_test};
 #[cfg(feature = "test-support")]
 pub use right_size::{IcebergCandidateFile, IcebergRewriteGroup, IcebergTablePlan};
 

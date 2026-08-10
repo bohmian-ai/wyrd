@@ -21,7 +21,8 @@ pub struct ForgeCapacity {
     pub max_memory_bytes: u64,
     /// Maximum spill estimate.
     pub max_spill_bytes: u64,
-    /// Maximum bytes for one cluster-fenced singleton.
+    /// Maximum bytes for one large-lane singleton admitted under a worker's own
+    /// per-worker capacity budget.
     pub max_large_task_bytes: u64,
 }
 
@@ -113,7 +114,7 @@ pub struct ForgeTableSnapshot {
 pub enum ForgePlanCapacity {
     /// The plan fits every ordinary ceiling.
     Ordinary,
-    /// One task fits every non-byte ceiling and requires the cluster-fenced large lane.
+    /// One task fits every non-byte ceiling and requires the per-worker large lane.
     LargeSingleton,
     /// The plan exceeds at least one non-relaxable ceiling.
     Unschedulable,

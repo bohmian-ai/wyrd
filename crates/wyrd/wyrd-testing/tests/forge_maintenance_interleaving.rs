@@ -643,6 +643,118 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
 
 #[tokio::test]
 #[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Extends the maintenance journey with the orphan-GC evidence negative flow.
+///
+/// Steps:
+/// 1. Seed a real table and one never-published Reset generation, giving an
+///    evidenced orphan object aged past the GC TTL floor.
+/// 2. Write a second object in the same prefix with no Reset evidence, aged the
+///    same amount, so only the positive-evidence gate distinguishes the two.
+/// 3. Run one clean production maintenance tick (compaction disabled) whose
+///    snapshot-expiry tail performs orphan GC through the real object store.
+/// 4. Assert the evidenced orphan is durably deleted, the unevidenced object
+///    survives, and exactly one terminal `forge.orphan_gc.committed` audit is
+///    recorded.
+///
+/// This proves the user-observable GC contract end to end through the real
+/// maintenance path: positive Reset evidence plus the TTL floor is required to
+/// delete, and an equally aged object lacking that evidence is preserved.
+///
+/// # Errors
+///
+/// The test panics when the server, seeding, durable maintenance tick, or
+/// object-store assertions diverge from the expected durable state. No detached
+/// maintenance task is permitted to outlive the test.
+async fn forge_gc_deletes_evidenced_orphan_and_preserves_unevidenced() {
+    let server = start_maintenance_server().await;
+    let fixture = seed_forge_group(&server, "maintenance_gc_evidence_flow_rows").await;
+    commit_staging_snapshot(&fixture).await;
+    let reset_outputs = seed_reset_generations(&fixture, 1).await;
+    commit_staging_snapshot(&fixture).await;
+    commit_live_rewrite(&fixture).await;
+    let evidenced = reset_outputs[0].clone();
+    let unevidenced = format!(
+        "{}/data/forge/bifrost-writer-v1/{}-unevidenced.parquet",
+        fixture.binding.object_prefix,
+        uuid::Uuid::now_v7(),
+    );
+    fixture
+        .staging
+        .write(&unevidenced, Buffer::from(vec![7_u8]))
+        .await
+        .expect("unevidenced survivor object");
+    let mut config = fixture.config.clone();
+    config.min_files = 3;
+    config.orphan_gc_ttl = Duration::from_millis(1);
+    let evidenced_modified = fixture
+        .staging
+        .stat(&evidenced)
+        .await
+        .expect("evidenced orphan metadata")
+        .last_modified()
+        .expect("object age evidence")
+        .into_inner()
+        .as_millisecond();
+    let unevidenced_modified = fixture
+        .staging
+        .stat(&unevidenced)
+        .await
+        .expect("unevidenced object metadata")
+        .last_modified()
+        .expect("object age evidence")
+        .into_inner()
+        .as_millisecond();
+    let latest_modified = evidenced_modified.max(unevidenced_modified);
+    server
+        .forge_clock()
+        .set(
+            chrono::DateTime::from_timestamp_millis(latest_modified + 100)
+                .expect("object timestamp is UTC-representable"),
+        )
+        .expect("advance Forge object age");
+    let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
+    let diagnostic = fixture.context_with_object_store(config.clone(), control.clone());
+    assert_eq!(
+        diagnostic
+            .gc_eligibility_for_test(&fixture.binding, &evidenced)
+            .await
+            .expect("evidenced orphan eligibility"),
+        "Eligible",
+    );
+    assert_ne!(
+        diagnostic
+            .gc_eligibility_for_test(&fixture.binding, &unevidenced)
+            .await
+            .expect("unevidenced object eligibility"),
+        "Eligible",
+        "an object without positive Reset evidence is never GC-eligible",
+    );
+    let mut rig = SupervisedMaintenance::start(
+        &fixture,
+        config,
+        Arc::clone(&fixture.catalog),
+        control.clone(),
+    );
+    rig.run_one_success().await;
+    assert!(rig.worker_observer.returned_errors().is_empty());
+    rig.shutdown().await;
+    assert!(
+        control.stat(&evidenced).await.is_err(),
+        "the evidenced orphan past the TTL floor is durably deleted",
+    );
+    assert!(
+        control.stat(&unevidenced).await.is_ok(),
+        "the unevidenced object survives the evidence gate",
+    );
+    assert_eq!(
+        fixture.operation_count("forge.orphan_gc.committed").await,
+        1
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Proves that only one exact prepared GC operation may pass its final gate.
 ///
 /// # Panics

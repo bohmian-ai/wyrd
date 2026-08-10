@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
-    ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
+    Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectPages, ForgeObjectStore,
+    ForgeRewriteRuntime, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
@@ -67,6 +68,13 @@ use crate::state::{
 const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
 const ORACLE_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Number of listing entries the production Forge object store groups into one
+/// orphan-GC page. The producer owns page granularity: this bounds how much of
+/// an OpenDAL recursive walk materializes before orphan GC can check its page
+/// cap and run budget at a page boundary. Sized so a steady-state prefix scans
+/// in a handful of pages while a pathological prefix still yields control
+/// promptly.
+const FORGE_OBJECT_LIST_PAGE_ENTRIES: usize = 1_000;
 
 /// Production Forge object-store capability backed by the server's OpenDAL operator.
 #[derive(Debug, Clone)]
@@ -113,6 +121,31 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
     /// Returns the underlying OpenDAL error when listing cannot complete.
     async fn list(&self, prefix: &str) -> opendal::Result<Vec<opendal::Entry>> {
         self.operator.list_with(prefix).recursive(true).await
+    }
+
+    /// Recursively list objects below a Forge-owned prefix as bounded pages.
+    ///
+    /// Overrides the trait default with a true incremental OpenDAL lister so a
+    /// large orphan prefix never materializes at once. The returned stream owns
+    /// its lister and groups entries into fixed-size pages; orphan GC pulls one
+    /// page at a time and stops at a page boundary once its per-run page cap or
+    /// time budget is reached. Each page collects the lister's per-entry results
+    /// so a mid-walk backend error surfaces as a failed page rather than being
+    /// silently truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying OpenDAL error when the lister cannot be opened.
+    /// Errors encountered after the walk begins surface as a failed page in the
+    /// returned stream.
+    async fn list_pages(&self, prefix: &str) -> opendal::Result<ForgeObjectPages> {
+        let lister = self.operator.lister_with(prefix).recursive(true).await?;
+        let pages = lister.chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES).map(|chunk| {
+            chunk
+                .into_iter()
+                .collect::<opendal::Result<Vec<opendal::Entry>>>()
+        });
+        Ok(Box::pin(pages))
     }
 
     /// Read object metadata before Forge makes a destructive decision.

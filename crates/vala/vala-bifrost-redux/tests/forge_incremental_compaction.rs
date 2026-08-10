@@ -19,8 +19,12 @@ mod pg_tests {
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, NullOrder,
         PrimitiveType, SortDirection, StatisticsFile, Struct, TableMetadata, Transform, Type,
     };
+    use iceberg::table::Table;
     use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
-    use iceberg::{Catalog, MetadataLocation};
+    use iceberg::{
+        Catalog, MetadataLocation, Namespace, NamespaceIdent, TableCommit, TableCreation,
+        TableIdent,
+    };
     use opendal::services::Fs;
     use opendal::{Buffer, Operator};
     use parquet::arrow::ArrowWriter;
@@ -32,8 +36,8 @@ mod pg_tests {
         BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
     };
     use vala_bifrost_redux::forge::{
-        Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError, ForgeLease, ForgeObjectStore,
-        ForgeRewriteRuntime, ForgeScheduleOutcome, ForgeScheduler, ForgeWorker,
+        Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError, ForgeLease, ForgeObjectPages,
+        ForgeObjectStore, ForgeRewriteRuntime, ForgeScheduleOutcome, ForgeScheduler, ForgeWorker,
         ForgeWorkerCompletionObserver, ForgeWorkerConfig, IcebergCandidateFile,
         IcebergRewriteGroup, deterministic_output_path_for_test, forge_lease_key,
     };
@@ -88,6 +92,13 @@ mod pg_tests {
         output_put_calls: AtomicUsize,
         /// Per-path cleanup delete attempts observed through the production store seam.
         delete_attempts: Mutex<HashMap<String, usize>>,
+        /// Entries per orphan-listing page, or `0` to keep the single-page default.
+        ///
+        /// A positive value makes [`ForgeObjectStore::list_pages`] paginate the
+        /// sorted listing into fixed-size pages, modeling a lexicographically
+        /// ordered object backend so bounded-scan tests can exercise the page cap
+        /// and cross-run drainage deterministically.
+        list_page_entries: AtomicUsize,
     }
 
     impl InstrumentedStore {
@@ -149,6 +160,15 @@ mod pg_tests {
                 .expect("delete-attempt ledger lock")
                 .values()
                 .sum()
+        }
+
+        /// Sets the entries-per-page cap for the paginated orphan listing seam.
+        ///
+        /// A positive `entries` makes [`ForgeObjectStore::list_pages`] emit fixed
+        /// pages over the sorted listing so a test can drive the per-run page cap;
+        /// `0` restores the default single-page adaptation.
+        fn set_list_page_entries(&self, entries: usize) {
+            self.list_page_entries.store(entries, Ordering::Release);
         }
     }
 
@@ -216,6 +236,34 @@ mod pg_tests {
             self.operator.list_with(prefix).recursive(true).await
         }
 
+        /// Paginate the sorted listing when a page size is armed, else one page.
+        ///
+        /// With `list_page_entries == 0` this reproduces the trait default's
+        /// single-page adaptation. With a positive page size it retains only
+        /// file entries, sorts the listing by path, and slices it into fixed
+        /// pages, modeling a flat, lexicographically ordered object store (S3,
+        /// GCS, Azure) whose recursive listing yields objects and no directory
+        /// markers, so the orphan-GC page cap and cross-run drainage are
+        /// deterministic rather than perturbed by the local filesystem
+        /// backend's synthetic directory entries.
+        async fn list_pages(&self, prefix: &str) -> opendal::Result<ForgeObjectPages> {
+            let page_entries = self.list_page_entries.load(Ordering::Acquire);
+            if page_entries == 0 {
+                let entries = self.list(prefix).await?;
+                return Ok(Box::pin(futures_util::stream::once(
+                    futures_util::future::ready(Ok(entries)),
+                )));
+            }
+            let mut entries = self.list(prefix).await?;
+            entries.retain(|entry| entry.metadata().mode() == opendal::EntryMode::FILE);
+            entries.sort_by(|left, right| left.path().cmp(right.path()));
+            let pages = entries
+                .chunks(page_entries)
+                .map(|chunk| Ok(chunk.to_vec()))
+                .collect::<Vec<opendal::Result<Vec<opendal::Entry>>>>();
+            Ok(Box::pin(futures_util::stream::iter(pages)))
+        }
+
         /// Stat one fixture object.
         async fn stat(&self, path: &str) -> opendal::Result<opendal::Metadata> {
             self.operator.stat(path).await
@@ -268,6 +316,13 @@ mod pg_tests {
 
     /// SQL projection and audit parity columns for one staging operation.
     type StagingParityRow = (String, i64, Option<i64>, bool, Option<bool>);
+
+    /// One-shot wrapper applied to the registered catalog before Forge composition.
+    ///
+    /// Lets a fixture interpose an observing or fault-injecting [`Catalog`] over
+    /// the production catalog Forge holds, without altering table registration,
+    /// which runs against the raw catalog first.
+    type CatalogDecorator = Box<dyn FnOnce(Arc<dyn Catalog>) -> Arc<dyn Catalog> + Send>;
 
     impl Fixture {
         /// Register the Forge table through the production Bifrost catalog.
@@ -386,6 +441,7 @@ mod pg_tests {
                 initial_file_count,
                 memory_pool_bytes,
                 None,
+                None,
             )
             .await
         }
@@ -409,6 +465,7 @@ mod pg_tests {
                 2,
                 64 * 1024 * 1024,
                 Some(observer),
+                None,
             )
             .await
         }
@@ -425,6 +482,7 @@ mod pg_tests {
             initial_file_count: usize,
             memory_pool_bytes: usize,
             completion: Option<ForgeWorkerCompletionObserver>,
+            catalog_decorator: Option<CatalogDecorator>,
         ) -> Self {
             let pg = PgFixture::start().await.expect("postgres fixture");
             let tenant = pg.data_tenant_id();
@@ -441,6 +499,10 @@ mod pg_tests {
                     .finish(),
             );
             let catalog = Self::build_catalog(&pg, &root, &binding).await;
+            let catalog = match catalog_decorator {
+                Some(decorate) => decorate(catalog),
+                None => catalog,
+            };
             let operator_pool = pg.operator_pool().clone();
             let whole_reads = Arc::new(AtomicUsize::new(0));
             let reads = Arc::new(InstrumentedStore {
@@ -457,6 +519,7 @@ mod pg_tests {
                 output_put_released: AtomicBool::new(false),
                 output_put_calls: AtomicUsize::new(0),
                 delete_attempts: Mutex::new(HashMap::new()),
+                list_page_entries: AtomicUsize::new(0),
             });
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
             let runtime = ForgeRewriteRuntime::new(
@@ -1592,6 +1655,445 @@ mod pg_tests {
             .expect("proven Forge GC pass");
         assert_eq!(deleted, 1);
         assert!(fixture.staging.stat(&path).await.is_err());
+    }
+
+    /// Delegating catalog that counts `load_table` and can fail it on demand.
+    ///
+    /// Interposed over the production catalog through the fixture's catalog
+    /// decorator. `load_table_calls` counts every table load Forge performs
+    /// during a bounded orphan-GC run so a test can prove the maintenance
+    /// protection set is loaded a bounded number of times per batch rather than
+    /// once per candidate; `fail_load` makes the same seam fail so a test can
+    /// prove the run fails closed and deletes nothing when protection cannot be
+    /// established.
+    #[derive(Debug)]
+    struct ProbeCatalog {
+        /// Production catalog receiving every delegated operation.
+        inner: Arc<dyn Catalog>,
+        /// Count of `load_table` calls observed since construction.
+        load_table_calls: Arc<AtomicUsize>,
+        /// When set, `load_table` fails instead of delegating.
+        fail_load: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for ProbeCatalog {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+
+        async fn create_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<Namespace> {
+            self.inner.create_namespace(namespace, properties).await
+        }
+
+        async fn get_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<Namespace> {
+            self.inner.get_namespace(namespace).await
+        }
+
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+
+        async fn update_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            self.inner.update_namespace(namespace, properties).await
+        }
+
+        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            self.inner.drop_namespace(namespace).await
+        }
+
+        async fn list_tables(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<TableIdent>> {
+            self.inner.list_tables(namespace).await
+        }
+
+        async fn create_table(
+            &self,
+            namespace: &NamespaceIdent,
+            creation: TableCreation,
+        ) -> iceberg::Result<Table> {
+            self.inner.create_table(namespace, creation).await
+        }
+
+        async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+            self.load_table_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_load.load(Ordering::Acquire) {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "injected orphan-GC protection load failure",
+                ));
+            }
+            self.inner.load_table(table).await
+        }
+
+        async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.inner.drop_table(table).await
+        }
+
+        async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.inner.purge_table(table).await
+        }
+
+        async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+            self.inner.table_exists(table).await
+        }
+
+        async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+            self.inner.rename_table(src, dest).await
+        }
+
+        async fn register_table(
+            &self,
+            table: &TableIdent,
+            metadata_location: String,
+        ) -> iceberg::Result<Table> {
+            self.inner.register_table(table, metadata_location).await
+        }
+
+        async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+            self.inner.update_table(commit).await
+        }
+    }
+
+    /// Writes one aged, Reset-evidenced orphan object and returns its object path.
+    ///
+    /// Mirrors the single-orphan seeding used by
+    /// [`terminal_file_list_history_does_not_protect_expired_object`]: a fresh
+    /// staging object plus a prepared/reset staging-fold operation pair under a
+    /// distinct operation id, which is the positive never-published evidence the
+    /// GC owner requires before deleting the object. `ordinal` keeps each seeded
+    /// path distinct within one table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the staging write or either operation transition fails,
+    /// because successful seeding is a fixture invariant.
+    async fn seed_evidenced_orphan(fixture: &Fixture, ordinal: usize) -> String {
+        let path = deterministic_output_path_for_test(
+            &fixture.binding.object_prefix,
+            uuid::Uuid::now_v7(),
+            ordinal,
+        );
+        fixture
+            .staging
+            .write(&path, Buffer::from(vec![1_u8]))
+            .await
+            .expect("seed orphan object");
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
+        );
+        let operation_id = uuid::Uuid::now_v7();
+        let prepared = operation_event(
+            "forge.file_compact.prepared",
+            &resource,
+            reset_detail_for_output(
+                operation_id,
+                &resource,
+                ForgeCompactionPhase::Prepared,
+                &path,
+            ),
+        );
+        append_operation(fixture, ForgeOperationFamily::StagingFold, &prepared, true).await;
+        let reset = operation_event(
+            "forge.file_compact.reset",
+            &resource,
+            reset_detail_for_output(operation_id, &resource, ForgeCompactionPhase::Reset, &path),
+        );
+        append_operation(fixture, ForgeOperationFamily::StagingFold, &reset, false).await;
+        path
+    }
+
+    /// A per-run page cap defers the unscanned tail as Partial and drains across runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup, seeding, or any bounded GC pass fails.
+    #[tokio::test]
+    async fn orphan_gc_page_cap_defers_remainder_and_drains_across_runs() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                orphan_gc_ttl: Duration::from_millis(1),
+                orphan_gc_max_list_pages: 1,
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            16 * 1024 * 1024,
+        )
+        .await;
+        // One entry per page against a single-page cap means each run may only
+        // scan the lexicographically first object; data-prefixed orphans sort
+        // ahead of the table's metadata objects.
+        fixture.reads.set_list_page_entries(1);
+        let mut orphans = Vec::new();
+        for ordinal in 0..3 {
+            orphans.push(seed_evidenced_orphan(&fixture, ordinal).await);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let first = fixture
+            .forge
+            .run_orphan_gc_report_for_test(&fixture.binding)
+            .await
+            .expect("first bounded orphan pass");
+        assert!(first.partial, "page cap must defer the unscanned tail");
+        assert_eq!(first.deleted, 1, "one page yields exactly one deletion");
+
+        let mut deleted = first.deleted;
+        for _ in 0..8 {
+            if deleted == orphans.len() {
+                break;
+            }
+            let report = fixture
+                .forge
+                .run_orphan_gc_report_for_test(&fixture.binding)
+                .await
+                .expect("successor bounded orphan pass");
+            deleted += report.deleted;
+        }
+        assert_eq!(
+            deleted,
+            orphans.len(),
+            "committed-deletion progress must drain the full set across runs"
+        );
+        assert_eq!(
+            fixture.reads.total_delete_attempts(),
+            orphans.len(),
+            "each orphan is deleted exactly once across the bounded runs"
+        );
+        for orphan in &orphans {
+            assert!(
+                fixture.staging.stat(orphan).await.is_err(),
+                "every drained orphan is durably removed"
+            );
+        }
+    }
+
+    /// An exhausted per-run wall-clock budget defers cleanly without any deletion.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup, seeding, or either GC pass fails.
+    #[tokio::test]
+    async fn orphan_gc_run_budget_defers_without_deletion() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                orphan_gc_ttl: Duration::from_millis(1),
+                orphan_gc_run_budget: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let orphan = seed_evidenced_orphan(&fixture, 0).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let budgeted = fixture
+            .forge
+            .run_orphan_gc_report_for_test(&fixture.binding)
+            .await
+            .expect("budget-bounded orphan pass");
+        assert!(
+            budgeted.partial,
+            "an exhausted budget marks the run Partial"
+        );
+        assert_eq!(budgeted.deleted, 0, "no deletion happens past the budget");
+        assert_eq!(
+            fixture.reads.total_delete_attempts(),
+            0,
+            "no delete is even attempted once the budget is exhausted"
+        );
+        assert!(
+            fixture.staging.stat(&orphan).await.is_ok(),
+            "the deferred orphan survives the budgeted run intact for a successor"
+        );
+    }
+
+    /// One batch loads maintenance protection a bounded number of times, not per candidate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup, seeding, or the batched GC pass fails.
+    #[tokio::test]
+    async fn orphan_gc_loads_protection_once_per_batch() {
+        const CANDIDATES: usize = 5;
+        let load_table_calls = Arc::new(AtomicUsize::new(0));
+        let fail_load = Arc::new(AtomicBool::new(false));
+        let decorator_calls = Arc::clone(&load_table_calls);
+        let decorator_fail = Arc::clone(&fail_load);
+        let fixture = Fixture::build(
+            ForgeConfig {
+                orphan_gc_ttl: Duration::from_millis(1),
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            16 * 1024 * 1024,
+            None,
+            Some(Box::new(move |inner| {
+                Arc::new(ProbeCatalog {
+                    inner,
+                    load_table_calls: decorator_calls,
+                    fail_load: decorator_fail,
+                }) as Arc<dyn Catalog>
+            })),
+        )
+        .await;
+        for ordinal in 0..CANDIDATES {
+            seed_evidenced_orphan(&fixture, ordinal).await;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        load_table_calls.store(0, Ordering::Release);
+        let report = fixture
+            .forge
+            .run_orphan_gc_report_for_test(&fixture.binding)
+            .await
+            .expect("batched orphan pass");
+        assert_eq!(report.deleted, CANDIDATES, "the full batch is deleted");
+        assert!(!report.partial, "the batch completes in one run");
+        let loads = load_table_calls.load(Ordering::Acquire);
+        assert!(
+            loads < CANDIDATES,
+            "protection loads ({loads}) must be independent of the candidate count ({CANDIDATES})"
+        );
+    }
+
+    /// A protection-load failure fails the run closed and attempts no deletion.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup or seeding fails.
+    #[tokio::test]
+    async fn orphan_gc_fails_closed_when_protection_load_fails() {
+        let load_table_calls = Arc::new(AtomicUsize::new(0));
+        let fail_load = Arc::new(AtomicBool::new(false));
+        let decorator_calls = Arc::clone(&load_table_calls);
+        let decorator_fail = Arc::clone(&fail_load);
+        let fixture = Fixture::build(
+            ForgeConfig {
+                orphan_gc_ttl: Duration::from_millis(1),
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            16 * 1024 * 1024,
+            None,
+            Some(Box::new(move |inner| {
+                Arc::new(ProbeCatalog {
+                    inner,
+                    load_table_calls: decorator_calls,
+                    fail_load: decorator_fail,
+                }) as Arc<dyn Catalog>
+            })),
+        )
+        .await;
+        let orphan = seed_evidenced_orphan(&fixture, 0).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        fail_load.store(true, Ordering::Release);
+        let error = fixture
+            .forge
+            .run_orphan_gc_report_for_test(&fixture.binding)
+            .await
+            .expect_err("protection load failure must fail the run closed");
+        assert!(matches!(error, ForgeError::Catalog(_)), "error: {error:?}");
+        assert_eq!(
+            fixture.reads.total_delete_attempts(),
+            0,
+            "a fail-closed run attempts no deletion"
+        );
+        assert!(
+            fixture.staging.stat(&orphan).await.is_ok(),
+            "the orphan survives a fail-closed run"
+        );
+    }
+
+    /// Journey: an evidenced, aged orphan is deleted while young and unevidenced
+    /// objects survive one bounded orphan-GC run.
+    ///
+    /// Gated out of the fast lane because it sleeps past a real TTL boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup, seeding, or the GC pass fails.
+    #[tokio::test]
+    #[ignore = "journey: real-time TTL boundary, run in the gated lane"]
+    async fn orphan_gc_deletes_evidenced_past_ttl_and_preserves_young() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                orphan_gc_ttl: Duration::from_secs(1),
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            16 * 1024 * 1024,
+        )
+        .await;
+        // Evidenced and aged past the TTL: eligible for deletion.
+        let evidenced = seed_evidenced_orphan(&fixture, 0).await;
+        // Aged past the TTL but carries no Reset evidence: the evidence gate
+        // must keep it.
+        let unevidenced = deterministic_output_path_for_test(
+            &fixture.binding.object_prefix,
+            uuid::Uuid::now_v7(),
+            1,
+        );
+        fixture
+            .staging
+            .write(&unevidenced, Buffer::from(vec![2_u8]))
+            .await
+            .expect("aged unevidenced object");
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // Written after the sleep: within the TTL floor and must survive.
+        let young = deterministic_output_path_for_test(
+            &fixture.binding.object_prefix,
+            uuid::Uuid::now_v7(),
+            2,
+        );
+        fixture
+            .staging
+            .write(&young, Buffer::from(vec![3_u8]))
+            .await
+            .expect("young object");
+
+        let report = fixture
+            .forge
+            .run_orphan_gc_report_for_test(&fixture.binding)
+            .await
+            .expect("journey orphan pass");
+        assert_eq!(
+            report.deleted, 1,
+            "only the evidenced aged orphan is deleted"
+        );
+        assert!(
+            fixture.staging.stat(&evidenced).await.is_err(),
+            "the evidenced aged orphan is removed"
+        );
+        assert!(
+            fixture.staging.stat(&unevidenced).await.is_ok(),
+            "the unevidenced object survives the evidence gate"
+        );
+        assert!(
+            fixture.staging.stat(&young).await.is_ok(),
+            "the young object survives the TTL floor"
+        );
     }
 
     /// Proves retained-snapshot traversal fails closed above its configured cap.

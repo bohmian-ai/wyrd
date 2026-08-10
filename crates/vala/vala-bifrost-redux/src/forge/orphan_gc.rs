@@ -1,8 +1,10 @@
 //! Reference-aware orphan garbage collection for Forge objects.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use iceberg::spec::{DataContentType, ManifestContentType, TableMetadata};
 use opendal::raw::Timestamp;
 use opendal::{EntryMode, ErrorKind};
@@ -250,10 +252,6 @@ struct GcTableContext<'context> {
     now: DateTime<Utc>,
     /// Cancellation boundary checked before every destructive transition.
     stop: &'context CancellationToken,
-    /// Outputs protected by open staging reconciliation.
-    staging_protected_paths: &'context BTreeSet<String>,
-    /// Outputs protected by open live-rewrite reconciliation.
-    live_protected_paths: &'context BTreeSet<String>,
 }
 
 /// Inputs that distinguish a fresh protection load from a GC self-reload.
@@ -272,6 +270,11 @@ struct GcBatchRequest<'context> {
     detail: &'context AuditDetail,
     /// Whether terminal evidence records recovery rather than first commit.
     recovered: bool,
+    /// Optional wall-clock budget for the deletion loop. `Some` bounds a fresh
+    /// batch so it defers remaining candidates once the run budget is reached;
+    /// `None` lets a reconciled recovery batch complete its prepared candidate
+    /// set in full.
+    deadline: Option<Instant>,
 }
 
 /// Catalog-derived live paths and the validated table metadata location.
@@ -280,14 +283,6 @@ struct CatalogProtection {
     live: ProtectedLiveSet,
     /// Catalog location used to normalize SQL and audit paths.
     table_location: String,
-}
-
-/// Reconciliation-owned output paths protected during one GC stage.
-pub(super) struct GcProtectedPaths<'paths> {
-    /// Outputs protected by open staging reconciliation.
-    pub(super) staging: &'paths BTreeSet<String>,
-    /// Outputs protected by open live-rewrite reconciliation.
-    pub(super) live: &'paths BTreeSet<String>,
 }
 
 /// Returns output objects that nonterminal operations must retain.
@@ -422,9 +417,16 @@ pub fn current_gc_gate_for_test(
 impl Forge {
     /// Run reconciled orphan deletion for one fenced physical table.
     ///
+    /// The run is bounded: its candidate scan honors a per-run listing-page cap
+    /// and wall-clock budget, and its deletion loop yields at the same budget.
+    /// A run that hits either bound returns a Partial [`OrphanGcOutcome`] with
+    /// no deletion attempted past the boundary; a successor run resumes from the
+    /// durable committed-deletion frontier rather than a stored cursor.
+    ///
     /// # Errors
     ///
     /// Returns lease, catalog, object-store, SQL, audit, or live-set failures.
+    #[tracing::instrument(skip_all, fields(tenant = %key.tenant))]
     pub(super) async fn run_orphan_gc_for_table(
         &self,
         lease: &mut ForgeLease,
@@ -432,15 +434,12 @@ impl Forge {
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
         stop: &CancellationToken,
-        protected_paths: GcProtectedPaths<'_>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
         let table = GcTableContext {
             key,
             binding,
             now,
             stop,
-            staging_protected_paths: protected_paths.staging,
-            live_protected_paths: protected_paths.live,
         };
         self.run_orphan_gc_for_table_inner(lease, &table).await
     }
@@ -473,15 +472,11 @@ impl Forge {
             table_ref: binding.table_ref.clone(),
         };
         let stop = CancellationToken::new();
-        let staging = BTreeSet::new();
-        let live = BTreeSet::new();
         let table = GcTableContext {
             key: &key,
             binding,
             now: self.core.clock.now()?,
             stop: &stop,
-            staging_protected_paths: &staging,
-            live_protected_paths: &live,
         };
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
@@ -508,15 +503,11 @@ impl Forge {
             table_ref: binding.table_ref.clone(),
         };
         let stop = CancellationToken::new();
-        let staging = BTreeSet::new();
-        let live = BTreeSet::new();
         let table = GcTableContext {
             key: &key,
             binding,
             now: self.core.clock.now()?,
             stop: &stop,
-            staging_protected_paths: &staging,
-            live_protected_paths: &live,
         };
         let protection = self
             .load_maintenance_protection(ProtectionRequest {
@@ -547,6 +538,26 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
+        Ok(self.run_orphan_gc_report_for_test(binding).await?.deleted)
+    }
+
+    /// Runs one bounded orphan collection pass and reports its full outcome.
+    ///
+    /// Mirrors [`Self::run_orphan_gc_for_test`] but surfaces the bounded-run
+    /// accounting an integration test asserts on — deleted, skipped, candidate,
+    /// and pending counts plus whether a per-run bound made the run Partial — so
+    /// tests can prove the page cap and run budget without reaching into the
+    /// crate-private [`OrphanGcOutcome`].
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, catalog, object-store, SQL, audit, or live-set failures
+    /// from the unchanged production GC owner.
+    #[cfg(feature = "test-support")]
+    pub async fn run_orphan_gc_report_for_test(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<OrphanGcReport, ForgeError> {
         let key = ForgeTableKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
@@ -566,8 +577,6 @@ impl Forge {
         .ok_or_else(|| ForgeError::FenceLost {
             lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
         })?;
-        let staging = BTreeSet::new();
-        let live = BTreeSet::new();
         let outcome = self
             .run_orphan_gc_for_table(
                 &mut lease,
@@ -575,15 +584,37 @@ impl Forge {
                 binding,
                 self.core.clock.now()?,
                 &CancellationToken::new(),
-                GcProtectedPaths {
-                    staging: &staging,
-                    live: &live,
-                },
             )
             .await?;
         lease.release(&self.core.operator_pool).await?;
-        Ok(outcome.deleted)
+        Ok(OrphanGcReport {
+            candidates: outcome.candidates,
+            deleted: outcome.deleted,
+            skipped: outcome.skipped,
+            pending: outcome.pending,
+            partial: outcome.partial,
+        })
     }
+}
+
+/// Public projection of one orphan-GC run for integration assertions.
+///
+/// Exposes the bounded-run counters and the Partial flag across the crate
+/// boundary so `test-support` consumers can assert that a page cap or run budget
+/// yielded a Partial outcome and that successive runs drain the candidate set.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy)]
+pub struct OrphanGcReport {
+    /// Candidate paths considered across new and reconciled batches.
+    pub candidates: usize,
+    /// Candidate paths deleted or already absent at deletion time.
+    pub deleted: usize,
+    /// Candidate paths retained or deferred past the run budget.
+    pub skipped: usize,
+    /// Open prepared operations left pending after bounded reconciliation.
+    pub pending: usize,
+    /// Whether a per-run bound ended the run before its candidates were drained.
+    pub partial: bool,
 }
 
 impl Forge {
@@ -592,6 +623,10 @@ impl Forge {
         lease: &mut ForgeLease,
         table: &GcTableContext<'_>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
+        let deadline = Instant::now()
+            .checked_add(self.core.config.orphan_gc_run_budget)
+            .expect("orphan-GC run budget must fit the monotonic clock horizon");
+        let page_cap = self.core.config.orphan_gc_max_list_pages;
         let mut outcome = self.reconcile_gc(lease, table).await?;
         let protection = self
             .load_maintenance_protection(ProtectionRequest {
@@ -603,27 +638,32 @@ impl Forge {
             outcome.pending = outcome.pending.saturating_add(1);
             return Ok(outcome);
         }
-        let candidates = self.list_gc_candidates(table.binding, &protection).await?;
-        outcome.candidates = outcome.candidates.saturating_add(candidates.len());
-        if candidates.is_empty() {
+        let scan = self
+            .list_gc_candidates(table.binding, &protection, page_cap, deadline)
+            .await?;
+        outcome.partial |= scan.partial;
+        outcome.candidates = outcome.candidates.saturating_add(scan.candidates.len());
+        if scan.candidates.is_empty() {
             return Ok(outcome);
         }
-        let detail = Self::gc_detail(table.key, candidates)?;
+        let detail = Self::gc_detail(table.key, scan.candidates)?;
         self.append_gc_audit(lease, table.key.tenant, &detail, "forge.orphan_gc.prepared")
             .await?;
-        let (deleted, skipped) = self
+        let batch = self
             .delete_gc_batch(
                 lease,
                 GcBatchRequest {
                     table,
                     detail: &detail,
                     recovered: false,
+                    deadline: Some(deadline),
                 },
             )
             .await?;
         outcome.recovered = outcome.recovered.saturating_add(1);
-        outcome.deleted = outcome.deleted.saturating_add(deleted);
-        outcome.skipped = outcome.skipped.saturating_add(skipped);
+        outcome.deleted = outcome.deleted.saturating_add(batch.deleted);
+        outcome.skipped = outcome.skipped.saturating_add(batch.skipped);
+        outcome.partial |= batch.deferred;
         Ok(outcome)
     }
 }
@@ -640,6 +680,53 @@ pub(crate) struct OrphanGcOutcome {
     pub(crate) skipped: usize,
     /// Open prepared operations left pending after bounded reconciliation.
     pub(crate) pending: usize,
+    /// Whether a per-run bound (listing-page cap or wall-clock budget) ended the
+    /// run before its candidate set was exhausted. A partial run committed only
+    /// durable deletions and leaves the remainder for a successor run; it is not
+    /// an error and does not weaken deletion safety.
+    pub(crate) partial: bool,
+}
+
+/// Result of one bounded orphan-candidate scan.
+///
+/// Produced by [`Forge::list_gc_candidates`]. `partial` is set when the scan
+/// stopped at a listing-page boundary because the per-run page cap or wall-clock
+/// budget was reached rather than because the prefix was exhausted.
+struct GcCandidateScan {
+    /// Sorted, batch-capped eligible candidate object keys.
+    candidates: Vec<String>,
+    /// Whether a per-run bound stopped the scan before the prefix was exhausted.
+    partial: bool,
+}
+
+/// Result of completing one prepared GC batch under an optional run budget.
+///
+/// Produced by [`Forge::delete_gc_batch`]. `deferred` is set when the run's
+/// wall-clock budget stopped the deletion loop before every candidate was
+/// evaluated; the remaining candidates are recorded as skipped so the terminal
+/// audit's deleted-plus-skipped partition still covers the full candidate set.
+struct GcBatchResult {
+    /// Candidates deleted or already absent at deletion time.
+    deleted: usize,
+    /// Candidates retained or deferred past the run budget.
+    skipped: usize,
+    /// Whether the run budget deferred remaining candidates to a successor run.
+    deferred: bool,
+}
+
+/// Per-candidate partition produced by one bounded deletion loop.
+///
+/// Owns the deleted and skipped path lists that the terminal audit records, and
+/// tracks whether the run budget deferred the unscanned remainder. The two lists
+/// together always cover the full candidate set the loop was given.
+#[derive(Default)]
+struct GcDeletionTally {
+    /// Paths deleted, or already absent, under the held fence.
+    deleted: Vec<String>,
+    /// Paths retained by protection or deferred past the run budget.
+    skipped: Vec<String>,
+    /// Whether the run budget deferred remaining candidates to a successor run.
+    deferred: bool,
 }
 
 /// Build protection from every retained Iceberg object and every open workflow.
@@ -673,14 +760,6 @@ impl Forge {
         .map_err(ForgeError::Sql)?;
         for path in rows {
             add(&path)?;
-        }
-
-        for path in table_context
-            .staging_protected_paths
-            .iter()
-            .chain(table_context.live_protected_paths.iter())
-        {
-            add(path)?;
         }
 
         let resource = table_resource_for_key(key);
@@ -886,43 +965,161 @@ impl Forge {
 impl Forge {
     /// Lists aged table-owned objects absent from the caller's protected live set.
     ///
+    /// The scan is bounded per run: it pulls listing pages one at a time and, at
+    /// each page boundary, stops once `page_cap` pages have been consumed or the
+    /// `deadline` has passed, marking the returned scan `partial`. Bounds are
+    /// checked before pulling each page so a run never begins work it cannot
+    /// finish within budget; a run that stops early leaves the unscanned tail to
+    /// a successor run. Eligibility classification and the batch cap are
+    /// unchanged, so a partial scan cannot admit a candidate a full scan would
+    /// have rejected.
+    ///
     /// # Errors
     /// Returns object-store listing failures. Cancellation leaves objects untouched.
     async fn list_gc_candidates(
         &self,
         binding: &TenantTableBinding,
         protection: &MaintenanceProtection,
-    ) -> Result<Vec<String>, ForgeError> {
+        page_cap: usize,
+        deadline: Instant,
+    ) -> Result<GcCandidateScan, ForgeError> {
         tracing::debug!(
             captured_now = %protection.now,
             prefix = %binding.object_prefix,
+            page_cap,
             "enumerating bounded orphan-GC candidates"
         );
         let prefix = format!("{}/", binding.object_prefix.trim_end_matches('/'));
-        let entries = self
+        let mut pages = self
             .core
             .object_store
-            .list(&prefix)
+            .list_pages(&prefix)
             .await
             .map_err(ForgeError::ObjectList)?;
-        let mut candidates = entries
-            .into_iter()
-            .filter_map(|entry| {
+        let mut candidates = Vec::new();
+        let mut scanned_pages = 0_usize;
+        let mut partial = false;
+        loop {
+            if scanned_pages >= page_cap || Instant::now() >= deadline {
+                partial = true;
+                break;
+            }
+            let Some(page) = pages.next().await else {
+                break;
+            };
+            let entries = page.map_err(ForgeError::ObjectList)?;
+            scanned_pages = scanned_pages.saturating_add(1);
+            for entry in entries {
                 let path = entry.path().to_owned();
-                (protection.gc_eligibility(
+                if protection.gc_eligibility(
                     binding,
                     &path,
                     ObjectEvidence::Present(entry.metadata()),
-                ) == GcEligibility::Eligible)
-                    .then_some(path)
-            })
-            .collect::<Vec<_>>();
+                ) == GcEligibility::Eligible
+                {
+                    candidates.push(path);
+                }
+            }
+        }
         candidates.sort_unstable();
         candidates.truncate(self.core.config.max_gc_candidates_per_batch);
-        Ok(candidates)
+        Ok(GcCandidateScan {
+            candidates,
+            partial,
+        })
+    }
+
+    /// Fences, rechecks, and deletes each candidate under a single protection snapshot.
+    ///
+    /// The `protection` snapshot is loaded once by the caller and shared across
+    /// every candidate; this method re-fences the lease and re-stats each object
+    /// immediately before deletion so the once-per-batch snapshot is still gated
+    /// by a per-candidate truth-table check. When `deadline` is `Some` the loop
+    /// yields at a candidate boundary once the run budget is reached, recording
+    /// the unscanned remainder as skipped and setting `deferred`, so the returned
+    /// deleted-plus-skipped partition always covers the full candidate set and no
+    /// deletion is attempted past the budget.
+    ///
+    /// # Errors
+    /// Returns cancellation, lease-fence, or object-store failures. A candidate
+    /// whose path escapes the table binding fails closed as a reconciliation
+    /// error before any deletion.
+    async fn apply_gc_deletions(
+        &self,
+        lease: &mut ForgeLease,
+        table: &GcTableContext<'_>,
+        protection: &MaintenanceProtection,
+        candidate_paths: &[StoragePath],
+        deadline: Option<Instant>,
+    ) -> Result<GcDeletionTally, ForgeError> {
+        let mut tally = GcDeletionTally::default();
+        for path in candidate_paths {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                tally.skipped.push(path.as_str().to_owned());
+                tally.deferred = true;
+                continue;
+            }
+            require_running(table.stop)?;
+            lease.require_fence(&self.core.operator_pool).await?;
+            let normalized = table
+                .binding
+                .validate_object_path(path.as_str())
+                .ok_or_else(|| ForgeError::Reconciliation {
+                    detail: format!("orphan-GC candidate escaped table binding: {path:?}"),
+                })?;
+            let metadata = match self.core.object_store.stat(&normalized).await {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(error) => return Err(ForgeError::ObjectDelete(error)),
+            };
+            let eligibility = protection.gc_eligibility(
+                table.binding,
+                &normalized,
+                metadata
+                    .as_ref()
+                    .map_or(ObjectEvidence::Missing, ObjectEvidence::Present),
+            );
+            if eligibility == GcEligibility::Missing {
+                tally.deleted.push(path.as_str().to_owned());
+                continue;
+            }
+            if eligibility != GcEligibility::Eligible {
+                tally.skipped.push(path.as_str().to_owned());
+                continue;
+            }
+            require_running(table.stop)?;
+            lease.require_fence(&self.core.operator_pool).await?;
+            match self.core.object_store.delete(&normalized).await {
+                Ok(()) => tally.deleted.push(path.as_str().to_owned()),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    tally.deleted.push(path.as_str().to_owned());
+                }
+                Err(error) => return Err(ForgeError::ObjectDelete(error)),
+            }
+        }
+        Ok(tally)
     }
 
     /// Deletes a prepared candidate batch with a final fence and reference check.
+    ///
+    /// The maintenance-protection proof is loaded once, before the deletion
+    /// loop, rather than per candidate. This batch holds the table's exclusive
+    /// lease fence for its whole duration, so no other writer can add a
+    /// protection to this table's catalog or open-operation state mid-batch; the
+    /// orphan TTL floor means a candidate cannot become live-referenced without
+    /// a lease-holding catalog commit that this fence excludes; and any file
+    /// staged after the candidate set was listed is not in that set. The only
+    /// admissible drift is therefore in the safe direction — a path this batch
+    /// treats as an orphan being newly protected — and the per-candidate fence
+    /// and metadata rechecks below still gate every deletion. A once-per-batch
+    /// snapshot under the held fence is thus equivalent in safety to a
+    /// per-candidate reload.
+    ///
+    /// When `request.deadline` is `Some`, the loop yields at a candidate
+    /// boundary once the run budget is reached: remaining candidates are
+    /// recorded as skipped and `deferred` is set, so the terminal audit's
+    /// deleted-plus-skipped partition still covers the full candidate set and no
+    /// deletion is attempted past the budget.
     ///
     /// # Errors
     /// Returns lease, catalog, object-store, SQL, or audit failures.
@@ -930,7 +1127,7 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         request: GcBatchRequest<'_>,
-    ) -> Result<(usize, usize), ForgeError> {
+    ) -> Result<GcBatchResult, ForgeError> {
         let table = request.table;
         let detail = request.detail;
         let AuditDetail::ForgeOrphanGc {
@@ -953,53 +1150,19 @@ impl Forge {
                 detail: "orphan-GC audit detail is not canonical".to_owned(),
             });
         }
-        let mut deleted = Vec::new();
-        let mut skipped = Vec::new();
-        for path in candidate_paths {
-            require_running(table.stop)?;
-            lease.require_fence(&self.core.operator_pool).await?;
-            let normalized = table
-                .binding
-                .validate_object_path(path.as_str())
-                .ok_or_else(|| ForgeError::Reconciliation {
-                    detail: format!("orphan-GC candidate escaped table binding: {path:?}"),
-                })?;
-            let protection = self
-                .load_maintenance_protection(ProtectionRequest {
-                    table,
-                    current_gc_detail: Some(detail),
-                })
-                .await?;
-            let metadata = match self.core.object_store.stat(&normalized).await {
-                Ok(metadata) => Some(metadata),
-                Err(error) if error.kind() == ErrorKind::NotFound => None,
-                Err(error) => return Err(ForgeError::ObjectDelete(error)),
-            };
-            let eligibility = protection.gc_eligibility(
-                table.binding,
-                &normalized,
-                metadata
-                    .as_ref()
-                    .map_or(ObjectEvidence::Missing, ObjectEvidence::Present),
-            );
-            if eligibility == GcEligibility::Missing {
-                deleted.push(path.as_str().to_owned());
-                continue;
-            }
-            if eligibility != GcEligibility::Eligible {
-                skipped.push(path.as_str().to_owned());
-                continue;
-            }
-            require_running(table.stop)?;
-            lease.require_fence(&self.core.operator_pool).await?;
-            match self.core.object_store.delete(&normalized).await {
-                Ok(()) => deleted.push(path.as_str().to_owned()),
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    deleted.push(path.as_str().to_owned());
-                }
-                Err(error) => return Err(ForgeError::ObjectDelete(error)),
-            }
-        }
+        let protection = self
+            .load_maintenance_protection(ProtectionRequest {
+                table,
+                current_gc_detail: Some(detail),
+            })
+            .await?;
+        let GcDeletionTally {
+            deleted,
+            skipped,
+            deferred,
+        } = self
+            .apply_gc_deletions(lease, table, &protection, candidate_paths, request.deadline)
+            .await?;
         require_running(table.stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let deleted_count = deleted.len();
@@ -1025,7 +1188,11 @@ impl Forge {
             },
         )
         .await?;
-        Ok((deleted_count, skipped_count))
+        Ok(GcBatchResult {
+            deleted: deleted_count,
+            skipped: skipped_count,
+            deferred,
+        })
     }
 
     /// Replays the cap-bounded, parity-proven open orphan-GC projection.
@@ -1071,20 +1238,21 @@ impl Forge {
                     detail: "orphan-GC prepared audit has the wrong kind".to_owned(),
                 });
             };
-            let (deleted, skipped) = self
+            let batch = self
                 .delete_gc_batch(
                     lease,
                     GcBatchRequest {
                         table,
                         detail: &detail,
                         recovered: true,
+                        deadline: None,
                     },
                 )
                 .await?;
             outcome.candidates = outcome.candidates.saturating_add(candidate_paths.len());
             outcome.recovered = outcome.recovered.saturating_add(1);
-            outcome.deleted = outcome.deleted.saturating_add(deleted);
-            outcome.skipped = outcome.skipped.saturating_add(skipped);
+            outcome.deleted = outcome.deleted.saturating_add(batch.deleted);
+            outcome.skipped = outcome.skipped.saturating_add(batch.skipped);
         }
         Ok(outcome)
     }

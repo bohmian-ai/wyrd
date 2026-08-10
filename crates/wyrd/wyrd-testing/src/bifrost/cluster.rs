@@ -376,6 +376,11 @@ pub struct OracleInspection {
     pub forge_active_claims: u64,
     /// Distinct Forge attempts still in a non-terminal claimed execution state.
     pub forge_active_attempts: u64,
+    /// Forge tasks eligible for claim (`ready` or `retryable`, with `ready_at`
+    /// reached) that no worker has claimed yet. These are excluded from
+    /// `forge_active_claims`, so a quiesce check that ignores them can still
+    /// race a task claimed between the observation and shutdown.
+    pub forge_claimable_tasks: u64,
     /// Forge tasks retaining historical attempt identifiers for diagnostics.
     pub forge_historical_attempts: u64,
     /// Forge tasks in a terminal state with durable evidence.
@@ -1821,13 +1826,15 @@ impl WyrdTestCluster {
         let (
             forge_active_claims,
             forge_active_attempts,
+            forge_claimable_tasks,
             forge_historical_attempts,
             forge_terminal_tasks,
-        ): (i64, i64, i64, i64) =
+        ): (i64, i64, i64, i64, i64) =
             sqlx::query_as(
                 "SELECT
                     COUNT(*) FILTER (WHERE state IN ('claimed', 'running', 'prepared'))::bigint,
                     COUNT(DISTINCT attempt_id) FILTER (WHERE state IN ('claimed', 'running', 'prepared'))::bigint,
+                    COUNT(*) FILTER (WHERE state IN ('ready', 'retryable') AND ready_at <= statement_timestamp())::bigint,
                     COUNT(*) FILTER (WHERE attempt_id IS NOT NULL)::bigint,
                     COUNT(*) FILTER (WHERE state IN ('succeeded', 'failed', 'cancelled', 'unschedulable') AND evidence IS NOT NULL)::bigint
                  FROM vala.forge_tasks",
@@ -1896,6 +1903,8 @@ impl WyrdTestCluster {
             forge_active_claims: u64::try_from(forge_active_claims)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
             forge_active_attempts: u64::try_from(forge_active_attempts)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            forge_claimable_tasks: u64::try_from(forge_claimable_tasks)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
             forge_historical_attempts: u64::try_from(forge_historical_attempts)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,

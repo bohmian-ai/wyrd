@@ -882,92 +882,92 @@ mod tests {
     /// Drive each real telemetry owner boundary and pin independent report sensitivity.
     #[test]
     fn forge_production_telemetry_contract() {
-        let recorder = BenchmarkRecorder::new()
-            .install()
-            .expect("production metrics recorder installs once");
-        let telemetry = ForgeTelemetry::new();
-        telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 0, 0, 0, 0);
-        for strategy in ForgeTaskMetricStrategy::ALL {
-            for result in ForgeTaskTerminalResult::ALL {
-                telemetry.record_task_terminal(strategy, result, Duration::ZERO);
+        let recorder = BenchmarkRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let telemetry = ForgeTelemetry::new();
+            telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 0, 0, 0, 0);
+            for strategy in ForgeTaskMetricStrategy::ALL {
+                for result in ForgeTaskTerminalResult::ALL {
+                    telemetry.record_task_terminal(strategy, result, Duration::ZERO);
+                }
+                telemetry.record_task_spill(strategy, 0);
             }
-            telemetry.record_task_spill(strategy, 0);
-        }
-        for kind in ForgeConflictKind::ALL {
-            telemetry.record_conflict(kind);
-        }
-        for kind in ForgeCleanupKind::ALL {
-            telemetry.record_cleanup(kind, Duration::ZERO);
-        }
-        telemetry.record_planning_status(Duration::from_secs(1), 1);
-        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
-        let pool: Arc<dyn MemoryPool> = Arc::new(BifrostDataFusionMemoryPool::new(governor));
-        let reservation = MemoryConsumer::new("forge-owner-proof").register(&pool);
-        reservation.try_grow(0).expect("zero-sized Forge reserve");
-
-        let snapshot = recorder.snapshot();
-        let task_durations = snapshot
-            .histograms
-            .keys()
-            .filter(|name| name.starts_with("bifrost_forge_task_duration_seconds{"))
-            .count();
-        let spills = snapshot
-            .histograms
-            .keys()
-            .filter(|name| name.starts_with("bifrost_forge_task_spill_bytes{"))
-            .count();
-        let cleanups = snapshot
-            .histograms
-            .keys()
-            .filter(|name| name.starts_with("bifrost_forge_cleanup_duration_seconds{"))
-            .count();
-        let conflicts = snapshot
-            .counters
-            .keys()
-            .filter(|name| name.starts_with("bifrost_forge_conflicts_total{"))
-            .count();
-        assert_eq!(
-            task_durations,
-            ForgeTaskMetricStrategy::ALL.len() * ForgeTaskTerminalResult::ALL.len()
-        );
-        assert_eq!(spills, ForgeTaskMetricStrategy::ALL.len());
-        assert_eq!(cleanups, ForgeCleanupKind::ALL.len());
-        assert_eq!(conflicts, ForgeConflictKind::ALL.len());
-
-        assert_owner_transition(
-            &recorder,
-            "bifrost_forge_rewrite_output_bytes_total",
-            || telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 1, 64, 1, 32),
-        );
-        assert_owner_transition(&recorder, "bifrost_forge_task_duration_seconds", || {
-            telemetry.record_task_terminal(
-                ForgeTaskMetricStrategy::StagingFold,
-                ForgeTaskTerminalResult::Succeeded,
-                Duration::from_millis(2),
-            );
-        });
-        assert_owner_transition(&recorder, "bifrost_forge_oldest_backlog_seconds", || {
-            telemetry.record_planning_status(Duration::from_secs(2), 1);
-        });
-        assert_owner_transition(&recorder, "bifrost_forge_fairness_lag_tasks", || {
-            telemetry.record_planning_status(Duration::from_secs(2), 2);
-        });
-        assert_owner_transition(&recorder, "bifrost_forge_task_spill_bytes", || {
-            telemetry.record_task_spill(ForgeTaskMetricStrategy::StagingFold, 4096);
-        });
-        for kind in ForgeConflictKind::ALL {
-            assert_owner_transition(&recorder, "bifrost_forge_conflicts_total", || {
+            for kind in ForgeConflictKind::ALL {
                 telemetry.record_conflict(kind);
+            }
+            for kind in ForgeCleanupKind::ALL {
+                telemetry.record_cleanup(kind, Duration::ZERO);
+            }
+            telemetry.record_planning_status(Duration::from_secs(1), 1);
+            let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+            let pool: Arc<dyn MemoryPool> = Arc::new(BifrostDataFusionMemoryPool::new(governor));
+            let reservation = MemoryConsumer::new("forge-owner-proof").register(&pool);
+            reservation.try_grow(0).expect("zero-sized Forge reserve");
+
+            let snapshot = recorder.snapshot();
+            let task_durations = snapshot
+                .histograms
+                .keys()
+                .filter(|name| name.starts_with("bifrost_forge_task_duration_seconds{"))
+                .count();
+            let spills = snapshot
+                .histograms
+                .keys()
+                .filter(|name| name.starts_with("bifrost_forge_task_spill_bytes{"))
+                .count();
+            let cleanups = snapshot
+                .histograms
+                .keys()
+                .filter(|name| name.starts_with("bifrost_forge_cleanup_duration_seconds{"))
+                .count();
+            let conflicts = snapshot
+                .counters
+                .keys()
+                .filter(|name| name.starts_with("bifrost_forge_conflicts_total{"))
+                .count();
+            assert_eq!(
+                task_durations,
+                ForgeTaskMetricStrategy::ALL.len() * ForgeTaskTerminalResult::ALL.len()
+            );
+            assert_eq!(spills, ForgeTaskMetricStrategy::ALL.len());
+            assert_eq!(cleanups, ForgeCleanupKind::ALL.len());
+            assert_eq!(conflicts, ForgeConflictKind::ALL.len());
+
+            assert_owner_transition(
+                &recorder,
+                "bifrost_forge_rewrite_output_bytes_total",
+                || telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 1, 64, 1, 32),
+            );
+            assert_owner_transition(&recorder, "bifrost_forge_task_duration_seconds", || {
+                telemetry.record_task_terminal(
+                    ForgeTaskMetricStrategy::StagingFold,
+                    ForgeTaskTerminalResult::Succeeded,
+                    Duration::from_millis(2),
+                );
             });
-        }
-        assert_owner_transition(&recorder, "bifrost_forge_cleanup_duration_seconds", || {
-            telemetry.record_cleanup(ForgeCleanupKind::Expired, Duration::from_millis(3));
-        });
+            assert_owner_transition(&recorder, "bifrost_forge_oldest_backlog_seconds", || {
+                telemetry.record_planning_status(Duration::from_secs(2), 1);
+            });
+            assert_owner_transition(&recorder, "bifrost_forge_fairness_lag_tasks", || {
+                telemetry.record_planning_status(Duration::from_secs(2), 2);
+            });
+            assert_owner_transition(&recorder, "bifrost_forge_task_spill_bytes", || {
+                telemetry.record_task_spill(ForgeTaskMetricStrategy::StagingFold, 4096);
+            });
+            for kind in ForgeConflictKind::ALL {
+                assert_owner_transition(&recorder, "bifrost_forge_conflicts_total", || {
+                    telemetry.record_conflict(kind);
+                });
+            }
+            assert_owner_transition(&recorder, "bifrost_forge_cleanup_duration_seconds", || {
+                telemetry.record_cleanup(ForgeCleanupKind::Expired, Duration::from_millis(3));
+            });
 
-        assert_orphan_gc_operation_emission(&recorder, &telemetry);
+            assert_orphan_gc_operation_emission(&recorder, &telemetry);
 
-        assert_owner_transition(&recorder, "bifrost_memory_reserved_bytes", || {
-            reservation.try_grow(4096).expect("Forge memory reserve");
+            assert_owner_transition(&recorder, "bifrost_memory_reserved_bytes", || {
+                reservation.try_grow(4096).expect("Forge memory reserve");
+            });
         });
     }
 

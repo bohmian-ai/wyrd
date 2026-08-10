@@ -703,6 +703,9 @@ async fn public_ack_restart_read_exact_once_journey() {
         wal_file_sizes(&source_wal_dir).is_empty(),
         "durably published source WAL epoch must retire"
     );
+    wait_forge_quiesce(&cluster)
+        .await
+        .expect("restart journey Forge quiesce");
     assert_drained_shutdown(
         cluster
             .shutdown_and_inspect()
@@ -992,6 +995,7 @@ async fn run_topology_public_journey(
             );
         }
     }
+    wait_forge_quiesce(&cluster).await?;
     assert_drained_shutdown(cluster.shutdown_and_inspect().await?);
     result
 }
@@ -1188,8 +1192,67 @@ async fn run_multitenant_public_journey() -> Result<(), Box<dyn std::error::Erro
             .iter()
             .any(|family| family.contains("forge"))
     );
+    wait_forge_quiesce(&cluster).await?;
     assert_drained_shutdown(cluster.shutdown_and_inspect().await?);
     Ok(())
+}
+
+/// Wait until Forge holds no active or claimable work before a drain assertion.
+///
+/// `assert_drained_shutdown` requires zero Forge claims and attempts at
+/// shutdown. A worker cancelled by shutdown *after* a durable effect correctly
+/// retains its claim for lease recovery, so a scheduler-produced maintenance
+/// task that is in flight or newly claimable at cancel time trips that
+/// assertion even though production behavior is correct. This poll establishes
+/// the assertion's stated precondition — a fully quiesced Forge — by waiting,
+/// under a generous liveness deadline, until no task is active
+/// (`forge_active_claims`, `forge_active_attempts`) and none is claimable
+/// (`forge_claimable_tasks`), confirmed stable across one immediate re-poll so a
+/// transient trough observed mid scheduler tick is not mistaken for quiescence.
+///
+/// It masks no defect: every drain assertion stays unmodified, and Forge
+/// generates no further work once the journey's writes have stopped and its
+/// tables have reached their compaction fixpoint. The scheduler is
+/// state-triggered — a tick plans only from live small-file groups, staging
+/// folds, or a clock-eligible maintenance candidate — and the Forge clock is
+/// test-controlled, never advanced during this wait, so no time-based
+/// maintenance becomes newly eligible while it runs. A tick over the drained
+/// tenant therefore enqueues nothing, and the confirmed all-zero state holds.
+///
+/// # Errors
+///
+/// Returns an inspection error, or a diagnostic naming the surviving active and
+/// claimable counts when the Forge does not quiesce before the deadline.
+async fn wait_forge_quiesce(
+    cluster: &WyrdTestCluster,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let inspection = cluster.oracle_inspection().await?;
+        let quiesced = inspection.forge_active_claims == 0
+            && inspection.forge_active_attempts == 0
+            && inspection.forge_claimable_tasks == 0;
+        if quiesced {
+            let confirm = cluster.oracle_inspection().await?;
+            if confirm.forge_active_claims == 0
+                && confirm.forge_active_attempts == 0
+                && confirm.forge_claimable_tasks == 0
+            {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let surviving = cluster.oracle_inspection().await?;
+            return Err(format!(
+                "Forge did not quiesce before shutdown: {} active claims, {} active attempts, {} claimable tasks after 60s",
+                surviving.forge_active_claims,
+                surviving.forge_active_attempts,
+                surviving.forge_claimable_tasks,
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Assert every server, listener, and retained runtime owner drained at shutdown.

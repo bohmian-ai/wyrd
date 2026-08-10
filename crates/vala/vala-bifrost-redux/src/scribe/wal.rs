@@ -59,9 +59,28 @@ thread_local! {
     static WAL_WALK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WAL_RECOVERY_SYNC_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// One-shot injection that forces the next `retain_segments` call on this
+    /// thread to fail before it mutates any retention refcount. Self-consuming
+    /// (`replace(false)`), mirroring `WAL_PARTIAL_WRITE`, so a retried retain
+    /// after the forced failure succeeds. Lets a seal-path test drive the
+    /// state-A retention-failure branch without a poisoned mutex.
+    static WAL_FAIL_RETAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 #[cfg(test)]
 static WAL_FAULT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Arm a one-shot forced failure of the next `retain_segments` call on the
+/// calling thread.
+///
+/// Consumed on the next `retain_segments`, which then fails before mutating any
+/// retention refcount; subsequent calls (a retry) succeed. Seal-path tests in
+/// sibling modules use this to drive the retention-failure branch that
+/// otherwise fires only on a poisoned `retirement_refs` mutex. The flag is
+/// thread-local, so arm it on the same thread that invokes the retention.
+#[cfg(test)]
+pub(crate) fn arm_retain_failure_for_test() {
+    WAL_FAIL_RETAIN.with(|flag| flag.set(true));
+}
 
 /// WAL log sequence number — monotonic per `(node_id, writer_epoch)` stream.
 ///
@@ -1904,6 +1923,14 @@ impl WalWriter {
 
     /// Retain segment references for one pending immutable generation.
     pub(crate) fn retain_segments(&self, segments: &[WalSegmentRef]) -> Result<(), ScribeError> {
+        #[cfg(test)]
+        if WAL_FAIL_RETAIN.with(|flag| flag.replace(false)) {
+            // Fail before touching any refcount so the caller observes state A
+            // with the segment map fully intact for an identical retry.
+            return Err(ScribeError::Internal {
+                detail: "forced WAL retention failure (test seam)".to_owned(),
+            });
+        }
         let mut references = self
             .retirement_refs
             .lock()

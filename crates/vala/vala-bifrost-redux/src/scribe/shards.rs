@@ -348,6 +348,18 @@ struct ShardOwner {
     synced_not_inserted: HashMap<AppendSliceId, WalSliceState>,
     /// Per-key immutable generations waiting for ordered persistence.
     pending_generations: PendingGenerationsByKey,
+    /// Seal keys whose `flush_keys` attempt failed after the freeze but before
+    /// the accounting move, leaving a stranded pending frozen generation
+    /// (state A).
+    ///
+    /// Such a key is invisible to every writable-bucket enumeration (its bucket
+    /// is gone) and to `pending_generations` (it was never queued), so a guard
+    /// change alone could never re-drive it. `flush_keys` unions this set into
+    /// its worked key list on entry, so every lifecycle signal that reaches
+    /// `flush_keys` — age tick, pressure, explicit flush — retries the stranded
+    /// seal even when the signal's own selection is empty. A key is removed on
+    /// the attempt that completes it (or that finds nothing left to complete).
+    seal_retry: HashSet<crate::scribe::seal_key::SealKey>,
     /// Published generations retained until grace-ordered WAL retirement.
     retained_generations: HashMap<u64, RetainedGeneration>,
     /// Admission controller shared by all shard owners.
@@ -575,6 +587,7 @@ impl ScribeShardRuntime {
                 wal_segments: WalSegmentsByKey::new(),
                 synced_not_inserted: HashMap::new(),
                 pending_generations: PendingGenerationsByKey::new(),
+                seal_retry: HashSet::new(),
                 retained_generations: HashMap::new(),
                 admission: admission.clone(),
                 memtable: Memtable::new_with_config(rotation_bytes, seal_max_age),
@@ -1081,10 +1094,14 @@ impl ShardOwner {
     }
 
     /// Applies one coalesced memory or WAL pressure signal.
+    ///
+    /// The primary `flush_keys` call is unconditional — the previous
+    /// empty-`keys` short-circuit is removed — so a pressure signal that
+    /// selects no victims of its own still reaches `flush_keys` and re-drives
+    /// any stranded state-A seals through the entry drain (change 3). An empty
+    /// worked set is a cheap no-op.
     fn handle_pressure_signal(&mut self, signal: PressureSignal) {
-        if !signal.keys.is_empty()
-            && let Err(error) = self.flush_keys(signal.keys, Some(SealTriggerReason::Pressure))
-        {
+        if let Err(error) = self.flush_keys(signal.keys, Some(SealTriggerReason::Pressure)) {
             record_seal_failure();
             tracing::warn!(error = %error, shard = self.id, "pressure flush failed");
         }
@@ -1345,64 +1362,172 @@ impl ShardOwner {
     /// buckets that sealed. Callers with no lifecycle trigger (shutdown drain)
     /// pass `None` and are not counted.
     ///
+    /// On entry the shard's `seal_retry` set is unioned into the worked keys so
+    /// a stranded state-A seal (freeze succeeded but a persistence-prep step
+    /// failed before the accounting move) is re-driven by every lifecycle
+    /// signal, including one whose own selection is empty. Per-key work is
+    /// delegated to [`Self::prepare_and_queue_generation`], which guarantees the
+    /// two-legal-states invariant; a failing key is recorded in `seal_retry`
+    /// before the error propagates.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a bucket, memory transfer, table binding,
     /// or WAL retention operation fails. A full persistence queue leaves the
-    /// generation unsubmitted for the next retry signal.
+    /// generation unsubmitted for the next retry signal. On any failure the
+    /// bytes remain Active-accounted and the key stays retry-reachable.
     fn flush_keys(
         &mut self,
         keys: Vec<crate::scribe::seal_key::SealKey>,
         trigger: Option<SealTriggerReason>,
     ) -> Result<(), ScribeError> {
+        // Re-drive site: every lifecycle signal that reaches `flush_keys`
+        // retries the shard's stranded state-A seals, even when its own `keys`
+        // selection is empty. The retry set is snapshotted (not drained) so a
+        // mid-loop `?` early return leaves any not-yet-reached retry key
+        // recorded for the next signal; a key leaves the set only on the
+        // attempt that resolves it (completed, or nothing left to complete).
+        let mut seen = HashSet::with_capacity(keys.len() + self.seal_retry.len());
+        let mut worked = Vec::with_capacity(keys.len() + self.seal_retry.len());
         for seal_key in keys {
-            if self.memtable.row_count(&seal_key)? == 0 {
-                continue;
+            if seen.insert(seal_key.clone()) {
+                worked.push(seal_key);
             }
+        }
+        for seal_key in self.seal_retry.iter().cloned().collect::<Vec<_>>() {
+            if seen.insert(seal_key.clone()) {
+                worked.push(seal_key);
+            }
+        }
+
+        for seal_key in worked {
+            // A writable bucket is the fresh-seal path. With no writable bucket
+            // the key is only worth touching when a stranded pending frozen
+            // generation exists AND was never queued; otherwise it is a stale
+            // retry mark or an already-completed seal, so dropping the mark and
+            // skipping is the safe no-op (no double freeze, move, or queue).
+            let has_rows = self.memtable.row_count(&seal_key)? > 0;
+            if !has_rows {
+                let strandable = !self.pending_generations.contains_key(&seal_key)
+                    && self.memtable.has_pending_frozen(&seal_key)?;
+                if !strandable {
+                    self.seal_retry.remove(&seal_key);
+                    continue;
+                }
+            }
+
+            // freeze is retry-safe: with a writable bucket it produces a new
+            // pending entry; with none it returns the existing stranded one.
+            // The seal is counted only for a newly created pending entry so a
+            // retried freeze never double-counts `bifrost_scribe_seal_total`.
             let frozen = self.memtable.freeze(&seal_key)?;
-            if let Some(trigger) = trigger {
+            if has_rows && let Some(trigger) = trigger {
                 record_seal(trigger);
             }
-            self.memory_ledger
-                .move_active_to_immutable(frozen.arrow_bytes)?;
-            self.admission
-                .transfer_active_to_immutable(frozen.arrow_bytes);
+
             if self.persistence.is_none() {
+                // No persistence target: the accounting move is the terminal
+                // legal state for this path (semantics unchanged by this task).
+                self.memory_ledger
+                    .move_active_to_immutable(frozen.arrow_bytes)?;
+                self.admission
+                    .transfer_active_to_immutable(frozen.arrow_bytes);
+                self.seal_retry.remove(&seal_key);
                 continue;
             }
-            let binding = crate::catalog::TenantTableBinding::resolve((
-                seal_key.tenant,
-                seal_key.table.clone(),
-            ))
-            .map_err(|error| ScribeError::Internal {
-                detail: error.to_string(),
-            })?;
-            let segment_map = self.wal_segments.remove(&seal_key).unwrap_or_default();
-            let segment_refs = segment_map
-                .values()
-                .map(|segment| segment.reference())
-                .collect::<Vec<_>>();
-            self.wal_handle.retain_segments(&segment_refs)?;
-            let generation = Arc::new(ImmutableGeneration::from_frozen(
-                &frozen,
-                (seal_key.tenant, seal_key.table.clone()),
-                self.stream,
-                segment_refs,
-                self.wal_handle.clone(),
-            ));
-            let queue = self
-                .pending_generations
-                .entry(seal_key.clone())
-                .or_default();
-            let should_submit = queue.is_empty();
-            queue.push_back(PendingGeneration {
-                generation,
-                binding,
-                submitted: false,
-            });
-            if should_submit {
-                self.submit_front(&seal_key);
+
+            // All fallible persistence-prep completes BEFORE the accounting
+            // move, so a failure here leaves bytes Active-accounted and the
+            // segment map intact (state A). Record the key for retry before
+            // propagating so a later lifecycle signal re-drives it.
+            match self.prepare_and_queue_generation(&seal_key, &frozen) {
+                Ok(()) => {
+                    self.seal_retry.remove(&seal_key);
+                }
+                Err(error) => {
+                    self.seal_retry.insert(seal_key.clone());
+                    return Err(error);
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Runs every fallible persistence-prep step for one frozen generation
+    /// before the accounting move, then queues it through the infallible tail.
+    ///
+    /// This is the transactional pivot of the seal path. Table-binding
+    /// resolution and WAL segment retention — the two fallible prep steps —
+    /// execute BEFORE `move_active_to_immutable`, and the ledger move (T52
+    /// net-zero, poison-only failure) is the last fallible step, run
+    /// immediately before the infallible queue push. As a result a single-step
+    /// failure leaves exactly one of two states: (A) prep failed, bytes remain
+    /// Active-accounted, admission Active-accounted, and the `wal_segments`
+    /// entry is intact for an identical retry; or (B) the generation is queued,
+    /// bytes are Immutable-accounted, and its segments are retained. There is
+    /// no state in which bytes are Immutable-accounted with no queued
+    /// generation. The `wal_segments` entry is removed only after retention
+    /// succeeds, and `segment_refs` is derived non-destructively so a retention
+    /// failure re-derives identical references.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when the table binding cannot be
+    /// resolved, or propagates [`ScribeError`] from `retain_segments` or the
+    /// ledger move (poison only). Every such failure occurs at or before the
+    /// accounting move, so no partial queue or Immutable accounting is left
+    /// behind.
+    fn prepare_and_queue_generation(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        frozen: &crate::scribe::memtable::FrozenMemtable,
+    ) -> Result<(), ScribeError> {
+        let binding =
+            crate::catalog::TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+        // Non-destructive: the segment map entry is removed only after
+        // retention succeeds (below), so a retention failure leaves identical
+        // references for a retry to re-derive.
+        let segment_refs = self
+            .wal_segments
+            .get(seal_key)
+            .map(|segments| {
+                segments
+                    .values()
+                    .map(|segment| segment.reference())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.wal_handle.retain_segments(&segment_refs)?;
+
+        // Accounting move is the last fallible step; everything below is
+        // infallible, so no fallible step runs between the move and the queue
+        // push (AC1).
+        self.memory_ledger
+            .move_active_to_immutable(frozen.arrow_bytes)?;
+        self.admission
+            .transfer_active_to_immutable(frozen.arrow_bytes);
+        self.wal_segments.remove(seal_key);
+        let generation = Arc::new(ImmutableGeneration::from_frozen(
+            frozen,
+            (seal_key.tenant, seal_key.table.clone()),
+            self.stream,
+            segment_refs,
+            self.wal_handle.clone(),
+        ));
+        let queue = self
+            .pending_generations
+            .entry(seal_key.clone())
+            .or_default();
+        let should_submit = queue.is_empty();
+        queue.push_back(PendingGeneration {
+            generation,
+            binding,
+            submitted: false,
+        });
+        if should_submit {
+            self.submit_front(seal_key);
         }
         Ok(())
     }
@@ -2447,6 +2572,7 @@ mod tests {
             wal_segments: WalSegmentsByKey::new(),
             synced_not_inserted: HashMap::new(),
             pending_generations: PendingGenerationsByKey::new(),
+            seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
             admission: AdmissionController::new(),
             memtable,
@@ -2527,6 +2653,250 @@ mod tests {
             generations
                 .iter()
                 .all(|entry| entry.frozen.arrow_bytes <= rotation_bytes)
+        );
+    }
+
+    /// A seal key whose table name is unsafe, so `TenantTableBinding::resolve`
+    /// fails deterministically — the forced binding-failure fixture.
+    fn owner_bad_binding_key() -> SealKey {
+        SealKey::new(
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Bifrost, "bad/name"),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("valid date")),
+        )
+    }
+
+    /// Builds a `persistence: Some` owner seeded for seal-path atomicity tests.
+    ///
+    /// The memtable holds one writable bucket for `key`; the ledger and
+    /// admission are pre-charged with `active_seed` Active bytes so the
+    /// accounting move is observable via [`MemoryLedger::active_bytes`] /
+    /// [`MemoryLedger::immutable_bytes`] and the admission snapshot; and
+    /// `wal_segments` holds an entry for `key` so the segment-map lifecycle
+    /// (removed only after retention success) is assertable. Returns the WAL
+    /// writer and temp directory so the caller keeps them alive.
+    fn owner_for_seal_atomicity_test(
+        key: &SealKey,
+        active_seed: usize,
+    ) -> (ShardOwner, Arc<WalWriter>, tempfile::TempDir) {
+        let memtable = Memtable::new();
+        memtable
+            .insert(key, owner_event(), owner_meta(key), owner_batch())
+            .expect("seed writable bucket");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
+        owner.persistence = Some(Arc::new(
+            crate::scribe::persistence::PersistenceRuntime::empty_for_test(),
+        ));
+        owner.wal_segments.insert(key.clone(), HashMap::new());
+        owner
+            .memory_ledger
+            .reserve_active(active_seed)
+            .expect("seed active ledger");
+        owner
+            .admission
+            .try_reserve_active("owner-test", active_seed)
+            .expect("seed active admission");
+        (owner, wal, wal_root)
+    }
+
+    /// A forced binding failure strands the seal in state A and keeps it
+    /// retry-reachable; a later age tick re-drives it (and, being a
+    /// deterministic failure, re-fails) without a second seal count or any
+    /// accounting move.
+    ///
+    /// Proves AC2's state-A half for the binding-resolve prep step: bytes stay
+    /// Active-accounted, admission stays Active-accounted, the WAL segment map
+    /// is intact, the key is recorded for retry, and exactly one seal is
+    /// counted across the original attempt and the age-tick re-drive.
+    #[test]
+    fn binding_failure_strands_state_a_and_stays_retry_reachable() {
+        let key = owner_bad_binding_key();
+        let seed = 1_usize << 20;
+        let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
+
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let error = owner
+                .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
+                .expect_err("binding resolve must fail on an unsafe table name");
+            assert!(matches!(error, ScribeError::Internal { .. }));
+
+            // State A: nothing moved, segment map intact, key retry-reachable.
+            assert_eq!(owner.memory_ledger.active_bytes(), seed);
+            assert_eq!(owner.memory_ledger.immutable_bytes(), 0);
+            let admission = owner.admission.snapshot();
+            assert_eq!(admission.active_bytes, seed);
+            assert_eq!(admission.immutable_bytes, 0);
+            assert!(owner.wal_segments.contains_key(&key));
+            assert!(!owner.pending_generations.contains_key(&key));
+            assert!(owner.seal_retry.contains(&key));
+            assert!(
+                owner
+                    .memtable
+                    .has_pending_frozen(&key)
+                    .expect("pending probe")
+            );
+
+            // Age tick: its own selection is empty (the bucket is frozen), so
+            // only the entry drain re-drives the key; the binding still fails.
+            let retry = owner.flush_expired(std::time::Instant::now());
+            assert!(retry.is_err(), "deterministic binding failure re-fails");
+
+            // Still state A, still retry-reachable, no accounting change.
+            assert_eq!(owner.memory_ledger.active_bytes(), seed);
+            assert_eq!(owner.memory_ledger.immutable_bytes(), 0);
+            assert!(owner.wal_segments.contains_key(&key));
+            assert!(owner.seal_retry.contains(&key));
+        });
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_seal_total{trigger=\"size\"}")
+                .copied(),
+            Some(1),
+            "the freeze is counted once; the retry returns the pending entry"
+        );
+        assert!(
+            !snapshot
+                .counters
+                .contains_key("bifrost_scribe_seal_total{trigger=\"age\"}"),
+            "the age-tick re-drive must not count a second seal"
+        );
+    }
+
+    /// A forced WAL retention failure strands the seal in state A with the
+    /// segment map intact; a subsequent age tick whose own selection does not
+    /// name the key re-drives it through the production entry drain to state B
+    /// with exact net-zero accounting and exactly one seal count.
+    ///
+    /// Proves AC2 (state A/B accounting + admission + segment-map + retry),
+    /// AC3 (recovery through a production re-drive site that does not name the
+    /// key), and AC4 (`wal_segments` removed only after retention succeeds).
+    #[test]
+    fn retention_failure_recovers_to_state_b_through_age_tick() {
+        let key = owner_key();
+        let seed = 1_usize << 20;
+        let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
+
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            crate::scribe::wal::arm_retain_failure_for_test();
+            let error = owner
+                .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
+                .expect_err("armed retention failure must fail the seal");
+            assert!(matches!(error, ScribeError::Internal { .. }));
+
+            // State A: no move, admission unchanged, segment map intact (AC4),
+            // key retry-reachable.
+            assert_eq!(owner.memory_ledger.active_bytes(), seed);
+            assert_eq!(owner.memory_ledger.immutable_bytes(), 0);
+            let admission = owner.admission.snapshot();
+            assert_eq!(admission.active_bytes, seed);
+            assert_eq!(admission.immutable_bytes, 0);
+            assert!(
+                owner.wal_segments.contains_key(&key),
+                "retention failure must not drop the segment map entry (AC4)"
+            );
+            assert!(!owner.pending_generations.contains_key(&key));
+            assert!(owner.seal_retry.contains(&key));
+
+            // Age tick: expired selection is empty (bucket already frozen), so
+            // the key is re-driven only by the entry drain (AC3). Retention now
+            // succeeds (the fault self-consumed).
+            owner
+                .flush_expired(std::time::Instant::now())
+                .expect("age-tick re-drive completes the seal");
+
+            // State B: net-zero move landed, admission moved, segment map entry
+            // removed after success (AC4), generation queued, mark cleared.
+            let active = owner.memory_ledger.active_bytes();
+            let immutable = owner.memory_ledger.immutable_bytes();
+            assert!(immutable > 0, "bytes moved to Immutable accounting");
+            assert_eq!(active + immutable, seed, "net-zero category move");
+            let admission = owner.admission.snapshot();
+            assert!(admission.immutable_bytes > 0);
+            assert_eq!(admission.active_bytes + admission.immutable_bytes, seed);
+            assert!(
+                !owner.wal_segments.contains_key(&key),
+                "segment map entry removed only after retention succeeds (AC4)"
+            );
+            assert!(owner.pending_generations.contains_key(&key));
+            assert!(!owner.seal_retry.contains(&key));
+        });
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_seal_total{trigger=\"size\"}")
+                .copied(),
+            Some(1),
+            "the bucket seals exactly once across failure and retry"
+        );
+        assert!(
+            !snapshot
+                .counters
+                .contains_key("bifrost_scribe_seal_total{trigger=\"age\"}"),
+            "the age-tick re-drive returns the pending entry and counts no seal"
+        );
+    }
+
+    /// A stale retry mark — one whose key is already queued, and one whose key
+    /// was never seen — is a safe no-op: the marks are dropped, nothing is
+    /// re-sealed, and accounting is unchanged.
+    ///
+    /// Proves the packet's stale-retry edge case: `has_pending_frozen` and the
+    /// `pending_generations` guard keep a stranded-state completion from
+    /// double-accounting or double-queueing an already-sealed or absent key.
+    #[test]
+    fn stale_seal_retry_marks_are_safe_no_ops() {
+        let key = owner_key();
+        let seed = 1_usize << 20;
+        let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
+
+        owner
+            .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
+            .expect("initial seal reaches state B");
+        let active_after = owner.memory_ledger.active_bytes();
+        let immutable_after = owner.memory_ledger.immutable_bytes();
+        assert!(owner.pending_generations.contains_key(&key));
+
+        // Stale mark 1: the key is already queued (state B). Stale mark 2: a
+        // key that was never sealed and has nothing pending.
+        owner.seal_retry.insert(key.clone());
+        let ghost = SealKey::new(
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Bifrost, "ghost"),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 25).expect("valid date")),
+        );
+        owner.seal_retry.insert(ghost);
+
+        owner
+            .flush_keys(Vec::new(), Some(SealTriggerReason::Age))
+            .expect("stale marks drain as a no-op");
+
+        assert!(owner.seal_retry.is_empty(), "stale marks dropped");
+        assert_eq!(owner.memory_ledger.active_bytes(), active_after);
+        assert_eq!(owner.memory_ledger.immutable_bytes(), immutable_after);
+        assert_eq!(
+            owner.pending_generations.get(&key).map(VecDeque::len),
+            Some(1),
+            "no double queueing of the already-sealed key"
         );
     }
 

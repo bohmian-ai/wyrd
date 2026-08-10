@@ -421,6 +421,30 @@ impl std::fmt::Debug for PersistenceRuntime {
 }
 
 impl PersistenceRuntime {
+    /// Build a persistence runtime with empty queues and no workers for tests.
+    ///
+    /// Mirrors the finalizer-only `tests::test_runtime` but is reachable from
+    /// sibling scribe modules, so a seal-path test can construct a shard owner
+    /// with `persistence: Some(..)` — required to exercise the binding-resolve
+    /// and WAL retention prep steps — without a Postgres or object-store
+    /// dependency. The receiver is dropped immediately, so `try_submit` finds a
+    /// closed queue and `submit_front` leaves the generation queued under the
+    /// existing full-queue retry semantics, which is exactly the state-B
+    /// condition these tests assert.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        let (sender, _receiver) = mpsc::channel(1);
+        Self {
+            sender: Arc::new(Mutex::new(Some(sender))),
+            queued: Arc::new(AtomicUsize::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            drained: Arc::new(Notify::new()),
+            failures: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+            abort_handles: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     /// Start bounded persistence workers on the Scribe coordination runtime.
     #[must_use]
     pub(crate) fn start(

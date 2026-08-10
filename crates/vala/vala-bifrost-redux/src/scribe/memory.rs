@@ -1425,6 +1425,41 @@ impl MemoryLedger {
         let target = immutable.bytes().saturating_add(bytes);
         immutable.resize(target)
     }
+
+    /// Read the active-category byte total for accounting assertions in tests.
+    ///
+    /// Exposes the ledger's active reservation size so seal-path tests can pin
+    /// the two-legal-states invariant (Active-accounted before a successful
+    /// move, transferred out after). Test-only; no production caller reads a
+    /// category total directly.
+    ///
+    /// # Panics
+    /// Panics if the active ledger lock is poisoned; a poisoned ledger is a
+    /// broken invariant that a test should surface loudly.
+    #[cfg(test)]
+    pub(crate) fn active_bytes(&self) -> usize {
+        self.active
+            .lock()
+            .expect("active memory ledger lock poisoned")
+            .bytes()
+    }
+
+    /// Read the immutable-category byte total for accounting assertions in
+    /// tests.
+    ///
+    /// Counterpart to [`Self::active_bytes`]; together they let a seal-path
+    /// test assert the net-zero category move (state A has zero immutable
+    /// bytes; state B has the frozen bytes). Test-only.
+    ///
+    /// # Panics
+    /// Panics if the immutable ledger lock is poisoned.
+    #[cfg(test)]
+    pub(crate) fn immutable_bytes(&self) -> usize {
+        self.immutable
+            .lock()
+            .expect("immutable memory ledger lock poisoned")
+            .bytes()
+    }
 }
 
 /// RAII category reservation.

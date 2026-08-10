@@ -494,6 +494,30 @@ impl Memtable {
         Ok(buckets.get(seal_key).map_or(0, |b| b.row_count))
     }
 
+    /// Report whether a stranded pending frozen generation exists for a key.
+    ///
+    /// The shard seal-retry path uses this to tell a genuinely stranded
+    /// state-A generation — one [`Self::freeze`] produced but a downstream
+    /// persistence-prep step failed to queue — apart from a stale retry mark
+    /// whose generation was already completed and discarded. Returning `false`
+    /// lets the caller drop the stale mark as a safe no-op instead of calling
+    /// [`Self::freeze`], which would fail with "seal-key not found" when no
+    /// writable bucket and no pending entry remain. Only entries still in the
+    /// pending state are counted; committing or aborting a generation clears
+    /// its pending flag, so a completed seal reports `false`.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the immutable-entry lock is
+    /// poisoned.
+    pub(crate) fn has_pending_frozen(&self, seal_key: &SealKey) -> Result<bool, ScribeError> {
+        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable immutable lock poisoned: {e}"),
+        })?;
+        Ok(immutable
+            .get(seal_key)
+            .is_some_and(|entries| entries.iter().any(ImmutableEntry::is_pending)))
+    }
+
     /// Snapshot every active seal-key currently held by the memtable whose
     /// tenant equals `tenant`. Used by `ScribeImpl::force_seal` to drive a
     /// per-tenant seal loop without exposing the private `MemtableBucket` type.

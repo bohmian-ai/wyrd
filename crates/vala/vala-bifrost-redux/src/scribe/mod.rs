@@ -1282,11 +1282,36 @@ impl ScribeImpl {
     ///
     /// As the production steady-state tick, it first exports the governor and
     /// memtable gauges (D84) so per-child occupancy, the D83 ingress watermarks,
-    /// and the memtable seal-decision inputs are observable every tick. Both
-    /// exports are emission-only and precede the flush requests; they never
-    /// change the seal, age, or pressure decisions the rest of the method makes.
+    /// and the memtable seal-decision inputs are observable every tick. It also
+    /// emits one debug-level governor snapshot line per tick — child totals,
+    /// the derived parent-only remainder, and every per-category total — so a
+    /// saturated ceiling can be attributed to its holder from logs alone
+    /// (ceiling refusals collapse to one `IngestBusy` message and cannot name
+    /// the holder themselves). All exports are emission-only and precede the
+    /// flush requests; they never change the seal, age, or pressure decisions
+    /// the rest of the method makes.
     pub fn check_age(&self, now: std::time::Instant) {
-        self.pressure_snapshot().emit_governor_gauges();
+        let snapshot = self.pressure_snapshot();
+        snapshot.emit_governor_gauges();
+        tracing::debug!(
+            scribe_total = snapshot.scribe_total_bytes,
+            oracle_total = snapshot.oracle_total_bytes,
+            bifrost_total = snapshot.bifrost_total_bytes,
+            parent_only = snapshot.bifrost_total_bytes.saturating_sub(
+                snapshot
+                    .scribe_total_bytes
+                    .saturating_add(snapshot.oracle_total_bytes)
+            ),
+            raw = snapshot.categories[memory::MemoryCategory::Raw as usize],
+            decode = snapshot.categories[memory::MemoryCategory::Decode as usize],
+            prepared = snapshot.categories[memory::MemoryCategory::Prepared as usize],
+            queued = snapshot.categories[memory::MemoryCategory::Queued as usize],
+            active = snapshot.categories[memory::MemoryCategory::Active as usize],
+            immutable = snapshot.categories[memory::MemoryCategory::Immutable as usize],
+            persistence = snapshot.categories[memory::MemoryCategory::Persistence as usize],
+            metadata = snapshot.categories[memory::MemoryCategory::Metadata as usize],
+            "governor tick snapshot"
+        );
         if let Ok(stats) = self.aggregate_memtable_stats() {
             emit_memtable_gauges(&stats);
         }

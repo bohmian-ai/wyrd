@@ -74,8 +74,16 @@ const DEFAULT_ORPHAN_GC_MAX_LIST_PAGES: usize = 1_024;
 const DEFAULT_ORPHAN_GC_RUN_BUDGET: Duration = Duration::from_mins(2);
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Limits and durability windows for one Forge maintenance loop.
+///
+/// A subset of these limits is operator-tunable through the server's `forge`
+/// config section (see `wyrd-server`'s `ForgeRuntimeConfig`); the rest stay
+/// internal. Whether supplied by an operator or left at the compiled default,
+/// every instance passes through [`ForgeConfig::validate`] at Forge
+/// construction, so the invariants below hold regardless of the source of the
+/// numbers. `PartialEq`/`Eq` let boot-time resolution pin that an empty config
+/// reproduces [`ForgeConfig::default`] exactly.
 pub struct ForgeConfig {
     /// Minimum number of staged files that makes a group eligible.
     pub min_files: i64,
@@ -134,14 +142,14 @@ pub struct ForgeConfig {
     /// in one run. Bounds a single run's listing work on a table whose orphan
     /// prefix holds more pages than one run should walk; a run that hits the cap
     /// ends cleanly as Partial and a successor run resumes after the durable
-    /// deletions this run committed. Not yet wired to the user-facing config or
-    /// environment surface; defaulted at construction.
+    /// deletions this run committed. Operator-tunable via
+    /// `forge.orphan_gc_max_list_pages`; defaults to the compiled value.
     pub orphan_gc_max_list_pages: usize,
     /// Wall-clock budget for one orphan-GC run, checked at listing-page and
     /// per-candidate-deletion boundaries. Exhausting the budget ends the run
     /// cleanly as Partial with no deletion attempted past the boundary; a
-    /// successor run resumes from the durable frontier. Not yet wired to the
-    /// user-facing config or environment surface; defaulted at construction.
+    /// successor run resumes from the durable frontier. Operator-tunable via
+    /// `forge.orphan_gc_run_budget_secs`; defaults to the compiled value.
     pub orphan_gc_run_budget: Duration,
 }
 
@@ -185,8 +193,10 @@ impl ForgeConfig {
     /// # Errors
     ///
     /// Returns [`ForgeError::InvalidConfig`] when a limit is zero, a bin cannot
-    /// contain two files, or the lease cannot cover the configured commit
-    /// window.
+    /// contain two files, the lease cannot cover the configured commit window,
+    /// or `retain_last` exceeds the retained-snapshot traversal cap
+    /// (`max_retained_snapshots_per_table`), which would make reconciliation
+    /// unable to see every snapshot the expiry policy is asked to retain.
     pub fn validate(&self) -> Result<(), ForgeError> {
         if self.min_files < 2
             || self.max_files_per_bin < 2
@@ -224,6 +234,11 @@ impl ForgeConfig {
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "max_files_per_bin must not exceed max_files_per_tick and max_large_task_bytes must cover the ordinary byte limit".to_owned(),
+            });
+        }
+        if self.retain_last > self.max_retained_snapshots_per_table {
+            return Err(ForgeError::InvalidConfig {
+                detail: "retain_last must not exceed max_retained_snapshots_per_table".to_owned(),
             });
         }
         let required = self
@@ -2213,6 +2228,27 @@ mod tests {
             ..ForgeConfig::default()
         };
         assert!(zero_budget.validate().is_err());
+    }
+
+    /// `retain_last` may not exceed the retained-snapshot traversal cap.
+    ///
+    /// The default (`retain_last` 1, cap 256) is well within bound, and equal
+    /// values are accepted; only a `retain_last` above the traversal cap fails,
+    /// because reconciliation could then never observe every retained snapshot.
+    #[test]
+    fn forge_config_rejects_retain_last_above_traversal_cap() {
+        let at_bound = ForgeConfig {
+            retain_last: 4,
+            max_retained_snapshots_per_table: 4,
+            ..ForgeConfig::default()
+        };
+        assert!(at_bound.validate().is_ok());
+        let over_bound = ForgeConfig {
+            retain_last: 5,
+            max_retained_snapshots_per_table: 4,
+            ..ForgeConfig::default()
+        };
+        assert!(over_bound.validate().is_err());
     }
 
     /// The staging seam consumes the right-size policy's selected groups.

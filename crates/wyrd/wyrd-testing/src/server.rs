@@ -1843,8 +1843,9 @@ impl WyrdTestServer {
             .with_shutdown_token(shutdown_token.clone());
 
         if self.forge_process_role() == ForgeProcessRole::ForgeWorker {
-            let worker = wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1)
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let worker =
+                wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1, 1)
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             let serve_handle = wyrd_runtime::runtime().spawn(async move {
                 worker
                     .await

@@ -553,6 +553,7 @@ mod pg_tests {
                 Arc::clone(&forge),
                 ForgeWorkerConfig {
                     worker_concurrency: 1,
+                    per_tenant_active_cap: 1,
                 },
                 uuid::Uuid::now_v7(),
             )
@@ -651,6 +652,7 @@ mod pg_tests {
                 forge,
                 ForgeWorkerConfig {
                     worker_concurrency: 1,
+                    per_tenant_active_cap: 1,
                 },
                 self.worker.owner_for_test(),
             )
@@ -4547,6 +4549,7 @@ mod pg_tests {
             Arc::clone(&fixture.forge),
             ForgeWorkerConfig {
                 worker_concurrency: 2,
+                per_tenant_active_cap: 2,
             },
             uuid::Uuid::now_v7(),
         )
@@ -4651,6 +4654,7 @@ mod pg_tests {
             Arc::clone(&fixture.forge),
             ForgeWorkerConfig {
                 worker_concurrency: 1,
+                per_tenant_active_cap: 1,
             },
             uuid::Uuid::now_v7(),
         )
@@ -4778,6 +4782,7 @@ mod pg_tests {
             Arc::clone(&fixture.forge),
             ForgeWorkerConfig {
                 worker_concurrency: 1,
+                per_tenant_active_cap: 1,
             },
             uuid::Uuid::now_v7(),
         )
@@ -5020,6 +5025,7 @@ mod pg_tests {
             Arc::clone(&fixture.forge),
             ForgeWorkerConfig {
                 worker_concurrency: 1,
+                per_tenant_active_cap: 1,
             },
             uuid::Uuid::now_v7(),
         )

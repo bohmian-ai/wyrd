@@ -530,6 +530,7 @@ impl BoundServer {
                 &self.state,
                 shutdown.clone(),
                 self.config.forge.worker_concurrency,
+                self.config.forge.resolved_per_tenant_active_cap(),
             )
             .map_err(|e| BootExit::Other(Box::new(e)))?;
             set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));

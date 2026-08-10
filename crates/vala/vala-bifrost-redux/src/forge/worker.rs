@@ -134,7 +134,21 @@ fn cleanup_candidates(
 #[derive(Debug, Clone, Copy)]
 pub struct ForgeWorkerConfig {
     /// Number of task executors spawned by this process.
+    ///
+    /// Controls parallelism only: how many claim executors this worker runs
+    /// (see the executor spawn loop in [`ForgeWorker::run`]). It no longer
+    /// determines the per-tenant admission cap; that value now lives in
+    /// [`Self::per_tenant_active_cap`] so parallelism can scale without
+    /// silently widening what one tenant may consume.
     pub worker_concurrency: usize,
+    /// Maximum active tasks one tenant may hold concurrently (the D78 fairness
+    /// bound, `max_active_per_tenant` in the fair claim).
+    ///
+    /// Previously aliased to `worker_concurrency`; it is now an independent
+    /// value. The server resolves it to `worker_concurrency` when an operator
+    /// leaves it unset, preserving today's behavior, but it may be set higher
+    /// or lower to tune tenant fairness separately from executor parallelism.
+    pub per_tenant_active_cap: usize,
 }
 
 /// Observes successful durable task completion from supervised worker roles.
@@ -675,10 +689,12 @@ impl ForgeWorkerCompletionObserver {
 }
 
 impl Default for ForgeWorkerConfig {
-    /// Uses one executor so embedded deployments share dedicated semantics.
+    /// Uses one executor and a matching single-task per-tenant cap so embedded
+    /// deployments share dedicated semantics.
     fn default() -> Self {
         Self {
             worker_concurrency: 1,
+            per_tenant_active_cap: 1,
         }
     }
 }
@@ -688,11 +704,17 @@ impl ForgeWorkerConfig {
     ///
     /// # Errors
     ///
-    /// Returns invalid configuration when concurrency is zero.
+    /// Returns invalid configuration when the executor count or the per-tenant
+    /// active cap is zero; a zero cap would admit no task for any tenant.
     pub fn validate(self) -> Result<Self, ForgeError> {
         if self.worker_concurrency == 0 {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge worker concurrency must be positive".to_owned(),
+            });
+        }
+        if self.per_tenant_active_cap == 0 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge per-tenant active cap must be positive".to_owned(),
             });
         }
         Ok(self)
@@ -2916,7 +2938,7 @@ impl ForgeWorker {
     /// Returns invalid configuration when the claim TTL exceeds `u32`.
     fn claim_limits(&self) -> Result<ForgeClaimLimits, ForgeError> {
         Ok(ForgeClaimLimits {
-            max_active_per_tenant: u32::try_from(self.config.worker_concurrency)
+            max_active_per_tenant: u32::try_from(self.config.per_tenant_active_cap)
                 .unwrap_or(u32::MAX),
             lease_seconds: u32::try_from(self.forge.core.config.lease_ttl.as_secs()).map_err(
                 |_| ForgeError::InvalidConfig {
@@ -2978,17 +3000,54 @@ mod tests {
         );
     }
 
-    /// Worker concurrency is a hard positive construction invariant.
+    /// Worker concurrency and the per-tenant cap are hard positive invariants.
     #[test]
     fn worker_concurrency_must_be_positive() {
         assert!(
             ForgeWorkerConfig {
-                worker_concurrency: 0
+                worker_concurrency: 0,
+                per_tenant_active_cap: 1,
             }
             .validate()
             .is_err()
         );
-        assert_eq!(ForgeWorkerConfig::default().worker_concurrency, 1);
+        assert!(
+            ForgeWorkerConfig {
+                worker_concurrency: 1,
+                per_tenant_active_cap: 0,
+            }
+            .validate()
+            .is_err()
+        );
+        let defaults = ForgeWorkerConfig::default();
+        assert_eq!(defaults.worker_concurrency, 1);
+        assert_eq!(defaults.per_tenant_active_cap, 1);
+    }
+
+    /// The per-tenant cap is stored and read independently of executor count.
+    ///
+    /// Proves the fields are decoupled at the config layer: a config may carry
+    /// a per-tenant cap that differs from `worker_concurrency` in either
+    /// direction and still validate, which is the whole point of separating the
+    /// D78 fairness bound from parallelism.
+    #[test]
+    fn per_tenant_active_cap_is_independent_of_worker_concurrency() {
+        let wider = ForgeWorkerConfig {
+            worker_concurrency: 2,
+            per_tenant_active_cap: 8,
+        }
+        .validate()
+        .expect("a per-tenant cap above the executor count is legal");
+        assert_eq!(wider.per_tenant_active_cap, 8);
+        assert_eq!(wider.worker_concurrency, 2);
+
+        let narrower = ForgeWorkerConfig {
+            worker_concurrency: 8,
+            per_tenant_active_cap: 1,
+        }
+        .validate()
+        .expect("a per-tenant cap below the executor count is legal");
+        assert_eq!(narrower.per_tenant_active_cap, 1);
     }
 
     /// Completion observation retains an event recorded before the waiter starts.

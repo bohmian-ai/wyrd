@@ -375,9 +375,69 @@ pub async fn build_app_state_from_boot_with_config(
     let roles = [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Forge]
         .into_iter()
         .collect();
-    Ok(build_bifrost_parts_from_boot(boot, &bifrost_config, &roles)
-        .await?
-        .state)
+    Ok(build_bifrost_parts_from_boot(
+        boot,
+        &bifrost_config,
+        &crate::config::ForgeRuntimeConfig::default(),
+        &roles,
+    )
+    .await?
+    .state)
+}
+
+/// Resolve the operator `forge` config section into a `ForgeConfig` plus the
+/// scheduler maintenance interval.
+///
+/// This is the single seam where the promoted operational knobs move from
+/// server config into the compiled Forge limit set. Every field starts from
+/// [`ForgeConfig::default`] (or [`DEFAULT_MAINTENANCE_INTERVAL`]) and is
+/// overridden only when the operator supplied a value, so an empty `[forge]`
+/// section yields a `ForgeConfig` byte-identical to the compiled default. The
+/// resolved `ForgeConfig` is validated fail-closed downstream by
+/// [`Forge::new`], which runs [`ForgeConfig::validate`] and the maintenance
+/// interval check; this function performs no validation itself and never
+/// panics.
+fn resolve_forge_config(
+    forge_runtime: &crate::config::ForgeRuntimeConfig,
+) -> (ForgeConfig, std::time::Duration) {
+    let base = ForgeConfig::default();
+    let config = ForgeConfig {
+        max_files_per_tick: forge_runtime
+            .max_files_per_tick
+            .unwrap_or(base.max_files_per_tick),
+        max_bytes_per_tick: forge_runtime
+            .max_bytes_per_tick
+            .unwrap_or(base.max_bytes_per_tick),
+        snapshot_retention: forge_runtime
+            .snapshot_retention_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(base.snapshot_retention),
+        retain_last: forge_runtime.retain_last.unwrap_or(base.retain_last),
+        orphan_gc_ttl: forge_runtime
+            .orphan_gc_ttl_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(base.orphan_gc_ttl),
+        maintenance_trigger_snapshot_count: forge_runtime
+            .maintenance_trigger_snapshot_count
+            .unwrap_or(base.maintenance_trigger_snapshot_count),
+        maintenance_trigger_interval: forge_runtime
+            .maintenance_trigger_interval_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(base.maintenance_trigger_interval),
+        orphan_gc_max_list_pages: forge_runtime
+            .orphan_gc_max_list_pages
+            .unwrap_or(base.orphan_gc_max_list_pages),
+        orphan_gc_run_budget: forge_runtime
+            .orphan_gc_run_budget_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(base.orphan_gc_run_budget),
+        ..base
+    };
+    let maintenance_interval = forge_runtime
+        .maintenance_interval_secs
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL);
+    (config, maintenance_interval)
 }
 
 /// Builds state plus unmounted Scribe dependencies for the authenticated boot path.
@@ -389,6 +449,7 @@ pub async fn build_app_state_from_boot_with_config(
 async fn build_bifrost_parts_from_boot(
     boot: &PostgresBoot,
     bifrost_config: &crate::config::BifrostRuntimeConfig,
+    forge_runtime: &crate::config::ForgeRuntimeConfig,
     roles: &std::collections::BTreeSet<BifrostRuntimeRole>,
 ) -> Result<BifrostBootParts, ServerBootError> {
     if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -598,7 +659,7 @@ async fn build_bifrost_parts_from_boot(
     };
 
     let forge = if roles.contains(&BifrostRuntimeRole::Forge) {
-        let forge_config = ForgeConfig::default();
+        let (forge_config, maintenance_interval) = resolve_forge_config(forge_runtime);
         let forge_datafusion_memory_pool = Arc::new(BifrostDataFusionMemoryPool::for_parent(
             bifrost_memory.clone(),
         ));
@@ -619,7 +680,7 @@ async fn build_bifrost_parts_from_boot(
             rewrite_runtime,
             hints: staging_file_inbox,
             config: forge_config,
-            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            maintenance_interval,
             clock: ForgeClock::system(),
             completion_observer: None,
             scheduler_trigger: None,
@@ -646,13 +707,20 @@ async fn build_bifrost_parts_from_boot(
 
 /// Build the bounded Forge worker future shared by embedded and worker roles.
 ///
+/// `worker_concurrency` sizes the executor pool; `per_tenant_active_cap` is the
+/// resolved D78 per-tenant admission bound (see
+/// [`crate::config::ForgeRuntimeConfig::resolved_per_tenant_active_cap`]).
+/// Passing them separately keeps tenant fairness decoupled from parallelism.
+///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge is absent or
-/// [`ServerBootError::Forge`] when the requested worker bound is invalid.
+/// [`ServerBootError::Forge`] when the requested worker bound or per-tenant cap
+/// is invalid.
 pub fn spawn_forge_worker(
     state: &AppState,
     shutdown: CancellationToken,
     worker_concurrency: usize,
+    per_tenant_active_cap: usize,
 ) -> Result<
     impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
     + Send
@@ -674,7 +742,10 @@ pub fn spawn_forge_worker(
             })?;
     let worker = ForgeWorker::new(
         forge,
-        ForgeWorkerConfig { worker_concurrency },
+        ForgeWorkerConfig {
+            worker_concurrency,
+            per_tenant_active_cap,
+        },
         node_id.as_uuid(),
     )
     .map_err(ServerBootError::Forge)?;
@@ -720,7 +791,8 @@ pub async fn build_state(
 
     let boot = PostgresBoot::from_env().await?;
     let roles = config.bifrost_roles();
-    let mut bifrost_parts = build_bifrost_parts_from_boot(&boot, &config.bifrost, &roles).await?;
+    let mut bifrost_parts =
+        build_bifrost_parts_from_boot(&boot, &config.bifrost, &config.forge, &roles).await?;
     #[cfg(feature = "test-support")]
     if overrides.fail_after_scribe_activation {
         bifrost_parts.rollback().await;
@@ -1859,6 +1931,74 @@ pub fn spawn_maintenance_scheduler(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// An empty `forge` config resolves to the compiled `ForgeConfig` default
+    /// and the default maintenance interval, pinning byte-identical no-config
+    /// behavior (AC1).
+    #[test]
+    fn resolve_forge_config_defaults_match_compiled_defaults() {
+        let (config, maintenance_interval) =
+            resolve_forge_config(&crate::config::ForgeRuntimeConfig::default());
+        assert_eq!(config, ForgeConfig::default());
+        assert_eq!(maintenance_interval, DEFAULT_MAINTENANCE_INTERVAL);
+    }
+
+    /// Supplied `forge` values override the compiled defaults on exactly the
+    /// promoted fields, and the resolved config still validates fail-closed.
+    #[test]
+    fn resolve_forge_config_applies_supplied_overrides() {
+        let runtime = crate::config::ForgeRuntimeConfig {
+            snapshot_retention_secs: Some(7_200),
+            retain_last: Some(3),
+            orphan_gc_ttl_secs: Some(3_600),
+            maintenance_trigger_snapshot_count: Some(8),
+            maintenance_trigger_interval_secs: Some(900),
+            orphan_gc_max_list_pages: Some(64),
+            orphan_gc_run_budget_secs: Some(30),
+            maintenance_interval_secs: Some(45),
+            max_files_per_tick: Some(512),
+            max_bytes_per_tick: Some(256 * 1024 * 1024),
+            ..crate::config::ForgeRuntimeConfig::default()
+        };
+        let (config, maintenance_interval) = resolve_forge_config(&runtime);
+        assert_eq!(
+            config.snapshot_retention,
+            std::time::Duration::from_secs(7_200)
+        );
+        assert_eq!(config.retain_last, 3);
+        assert_eq!(config.orphan_gc_ttl, std::time::Duration::from_secs(3_600));
+        assert_eq!(config.maintenance_trigger_snapshot_count, 8);
+        assert_eq!(
+            config.maintenance_trigger_interval,
+            std::time::Duration::from_secs(900)
+        );
+        assert_eq!(config.orphan_gc_max_list_pages, 64);
+        assert_eq!(
+            config.orphan_gc_run_budget,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(config.max_files_per_tick, 512);
+        assert_eq!(config.max_bytes_per_tick, 256 * 1024 * 1024);
+        assert_eq!(maintenance_interval, std::time::Duration::from_secs(45));
+        config
+            .validate()
+            .expect("resolved override config must validate");
+        // Fields outside the promoted set retain their compiled defaults.
+        assert_eq!(config.min_files, ForgeConfig::default().min_files);
+        assert_eq!(config.lease_ttl, ForgeConfig::default().lease_ttl);
+    }
+
+    /// A zeroed promoted duration resolves through and is rejected by the
+    /// downstream `ForgeConfig::validate` fail-closed check.
+    #[test]
+    fn resolve_forge_config_zero_value_is_rejected_by_validate() {
+        let runtime = crate::config::ForgeRuntimeConfig {
+            snapshot_retention_secs: Some(0),
+            ..crate::config::ForgeRuntimeConfig::default()
+        };
+        let (config, _) = resolve_forge_config(&runtime);
+        assert!(config.validate().is_err());
+    }
 
     /// Production boot rejects a plaintext address discovered from live membership.
     #[test]

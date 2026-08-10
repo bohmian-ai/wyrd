@@ -102,8 +102,13 @@ async fn run_forge_worker_process(
     let _role_telemetry = metrics::ForgeRoleTelemetryGuard::started(config.role, node_id.as_uuid());
     let shutdown = state.shutdown_token.clone();
     let mut set: JoinSet<TaskExit> = JoinSet::new();
-    let worker = spawn_forge_worker(&state, shutdown.clone(), config.forge.worker_concurrency)
-        .map_err(|error| BootExit::Other(Box::new(error)))?;
+    let worker = spawn_forge_worker(
+        &state,
+        shutdown.clone(),
+        config.forge.worker_concurrency,
+        config.forge.resolved_per_tenant_active_cap(),
+    )
+    .map_err(|error| BootExit::Other(Box::new(error)))?;
     set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
 
     if config.metrics.enabled {
@@ -253,6 +258,7 @@ mod pg_tests {
             },
             forge: crate::config::ForgeRuntimeConfig {
                 worker_concurrency: 1,
+                ..crate::config::ForgeRuntimeConfig::default()
             },
             metrics: crate::config::MetricsConfig {
                 enabled: true,

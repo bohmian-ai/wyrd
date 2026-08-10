@@ -1272,6 +1272,7 @@ async fn dedicated_unschedulable_admission_journey() {
         bootstrap,
         ForgeWorkerConfig {
             worker_concurrency: 1,
+            per_tenant_active_cap: 1,
         },
         uuid::Uuid::now_v7(),
     )

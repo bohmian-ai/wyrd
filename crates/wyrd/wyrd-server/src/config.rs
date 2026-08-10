@@ -166,13 +166,79 @@ impl ForgeProcessRole {
     }
 }
 
-/// Forge worker capacity selected for the current process role.
+/// Forge worker capacity and operational tuning for the current process role.
+///
+/// Every field except `worker_concurrency` is optional and defaults to the
+/// value compiled into `vala_bifrost_redux::forge::ForgeConfig::default()` (or,
+/// for `maintenance_interval_secs`, the boot maintenance-interval default). A
+/// `[forge]` section that sets nothing therefore reproduces today's compiled
+/// behavior byte-for-byte; the resolved values are assembled and validated once
+/// at boot in `crate::boot`. Durations are expressed in whole seconds. Unknown
+/// keys are rejected at parse time by `deny_unknown_fields`.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgeRuntimeConfig {
-    /// Number of bounded Forge worker executors.
+    /// Number of bounded Forge worker executors this process spawns.
+    ///
+    /// Controls parallelism only. Must be positive (rejected in
+    /// [`WyrdServerConfig::validate`]). Default 1.
     #[serde(default = "default_forge_worker_concurrency")]
     pub worker_concurrency: usize,
+    /// Maximum active tasks one tenant may hold concurrently (the D78 fairness
+    /// bound). When unset it resolves to `worker_concurrency`, preserving
+    /// today's coupled behavior; set it to tune per-tenant admission
+    /// independently of executor parallelism. May be above or below
+    /// `worker_concurrency`. Must be positive when set. Default: tracks
+    /// `worker_concurrency`.
+    #[serde(default)]
+    pub per_tenant_active_cap: Option<usize>,
+    /// Age (seconds) after which old Iceberg snapshots become eligible for
+    /// expiry. Must be positive when set. Default 432000 (120 hours).
+    #[serde(default)]
+    pub snapshot_retention_secs: Option<u64>,
+    /// Number of snapshots retained along each current/ref ancestry. Must be
+    /// positive and must not exceed the internal retained-snapshot traversal
+    /// cap. Default 1.
+    #[serde(default)]
+    pub retain_last: Option<usize>,
+    /// Age (seconds) after which an unreferenced object may be deleted by
+    /// orphan GC. Must be positive when set. Default 86400 (24 hours).
+    #[serde(default)]
+    pub orphan_gc_ttl_secs: Option<u64>,
+    /// Count of accumulated commits past `retain_last` that makes snapshot
+    /// expiry due on its own, independent of compaction backlog. Must be at
+    /// least 1 when set. Default 32.
+    #[serde(default)]
+    pub maintenance_trigger_snapshot_count: Option<usize>,
+    /// Oldest-retained-snapshot age (seconds) past which snapshot expiry
+    /// becomes due when at least one commit exists past `retain_last`. Paired
+    /// with `maintenance_trigger_snapshot_count` as a count-OR-interval
+    /// trigger. Must be positive when set. Default 3600 (1 hour).
+    #[serde(default)]
+    pub maintenance_trigger_interval_secs: Option<u64>,
+    /// Maximum object-store listing pages one orphan-GC candidate scan walks
+    /// before yielding cleanly to a successor run. Must be at least 1 when set.
+    /// Default 1024.
+    #[serde(default)]
+    pub orphan_gc_max_list_pages: Option<usize>,
+    /// Wall-clock budget (seconds) for one orphan-GC run before it yields as
+    /// Partial. Must be positive when set. Default 120 (2 minutes).
+    #[serde(default)]
+    pub orphan_gc_run_budget_secs: Option<u64>,
+    /// Interval (seconds) between Forge maintenance scheduler ticks. Must be
+    /// positive when set. Default 60.
+    #[serde(default)]
+    pub maintenance_interval_secs: Option<u64>,
+    /// Maximum number of input files a single compaction tick processes. Must
+    /// be positive and at least `max_files_per_bin` (an internal limit). Default
+    /// 1024.
+    #[serde(default)]
+    pub max_files_per_tick: Option<usize>,
+    /// Maximum input bytes a single compaction tick processes. Must be positive
+    /// and within the internal oversized-singleton ceiling. Default 1073741824
+    /// (1 GiB).
+    #[serde(default)]
+    pub max_bytes_per_tick: Option<u64>,
 }
 
 const fn default_forge_worker_concurrency() -> usize {
@@ -183,7 +249,33 @@ impl Default for ForgeRuntimeConfig {
     fn default() -> Self {
         Self {
             worker_concurrency: default_forge_worker_concurrency(),
+            per_tenant_active_cap: None,
+            snapshot_retention_secs: None,
+            retain_last: None,
+            orphan_gc_ttl_secs: None,
+            maintenance_trigger_snapshot_count: None,
+            maintenance_trigger_interval_secs: None,
+            orphan_gc_max_list_pages: None,
+            orphan_gc_run_budget_secs: None,
+            maintenance_interval_secs: None,
+            max_files_per_tick: None,
+            max_bytes_per_tick: None,
         }
+    }
+}
+
+impl ForgeRuntimeConfig {
+    /// Resolve the per-tenant active cap, falling back to `worker_concurrency`.
+    ///
+    /// This is the single place the D78 per-tenant fairness bound is derived
+    /// from operator config: an unset `per_tenant_active_cap` tracks
+    /// `worker_concurrency` so existing deployments keep today's behavior, while
+    /// an explicit value decouples the bound from executor parallelism. The
+    /// result feeds `ForgeWorkerConfig::per_tenant_active_cap` at worker spawn.
+    #[must_use]
+    pub fn resolved_per_tenant_active_cap(&self) -> usize {
+        self.per_tenant_active_cap
+            .unwrap_or(self.worker_concurrency)
     }
 }
 
@@ -1806,6 +1898,11 @@ impl WyrdServerConfig {
                 message: "forge.worker_concurrency must be positive".to_owned(),
             });
         }
+        if self.forge.per_tenant_active_cap == Some(0) {
+            return Err(ConfigError::Invalid {
+                message: "forge.per_tenant_active_cap must be positive".to_owned(),
+            });
+        }
         if serves_api {
             if self.bifrost.oracle.max_workers_per_query > 63 {
                 return Err(ConfigError::Invalid {
@@ -2423,6 +2520,92 @@ mod tests {
                 "{role:?} must reject malformed API-owned settings"
             );
         }
+    }
+
+    /// Every promoted `[forge]` operational field is optional; an omitted
+    /// section leaves them all `None`, which the boot resolver maps to the
+    /// compiled `ForgeConfig` defaults.
+    #[test]
+    fn forge_operational_fields_default_to_none_when_absent() {
+        let config = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
+        let forge = &config.forge;
+        assert_eq!(forge.worker_concurrency, 1);
+        assert_eq!(forge.per_tenant_active_cap, None);
+        assert_eq!(forge.snapshot_retention_secs, None);
+        assert_eq!(forge.retain_last, None);
+        assert_eq!(forge.orphan_gc_ttl_secs, None);
+        assert_eq!(forge.maintenance_trigger_snapshot_count, None);
+        assert_eq!(forge.maintenance_trigger_interval_secs, None);
+        assert_eq!(forge.orphan_gc_max_list_pages, None);
+        assert_eq!(forge.orphan_gc_run_budget_secs, None);
+        assert_eq!(forge.maintenance_interval_secs, None);
+        assert_eq!(forge.max_files_per_tick, None);
+        assert_eq!(forge.max_bytes_per_tick, None);
+    }
+
+    /// A `[forge]` section parses every promoted operational field onto
+    /// `config.forge`.
+    #[test]
+    fn forge_operational_fields_parse_from_toml() {
+        let toml = r#"
+[forge]
+worker_concurrency = 4
+per_tenant_active_cap = 2
+snapshot_retention_secs = 7200
+retain_last = 3
+orphan_gc_ttl_secs = 3600
+maintenance_trigger_snapshot_count = 8
+maintenance_trigger_interval_secs = 900
+orphan_gc_max_list_pages = 64
+orphan_gc_run_budget_secs = 30
+maintenance_interval_secs = 45
+max_files_per_tick = 512
+max_bytes_per_tick = 268435456
+"#;
+        let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
+        let forge = &config.forge;
+        assert_eq!(forge.worker_concurrency, 4);
+        assert_eq!(forge.per_tenant_active_cap, Some(2));
+        assert_eq!(forge.snapshot_retention_secs, Some(7200));
+        assert_eq!(forge.retain_last, Some(3));
+        assert_eq!(forge.orphan_gc_ttl_secs, Some(3600));
+        assert_eq!(forge.maintenance_trigger_snapshot_count, Some(8));
+        assert_eq!(forge.maintenance_trigger_interval_secs, Some(900));
+        assert_eq!(forge.orphan_gc_max_list_pages, Some(64));
+        assert_eq!(forge.orphan_gc_run_budget_secs, Some(30));
+        assert_eq!(forge.maintenance_interval_secs, Some(45));
+        assert_eq!(forge.max_files_per_tick, Some(512));
+        assert_eq!(forge.max_bytes_per_tick, Some(268_435_456));
+    }
+
+    /// An unknown key under `[forge]` is rejected at parse time by
+    /// `deny_unknown_fields`.
+    #[test]
+    fn forge_rejects_unknown_field() {
+        let toml = "[forge]\nnot_a_real_forge_field = 1\n";
+        assert!(from_toml_str_with_dev_oracle_opt_in(toml).is_err());
+    }
+
+    /// `resolved_per_tenant_active_cap` falls back to `worker_concurrency` when
+    /// unset and honors an explicit override otherwise.
+    #[test]
+    fn forge_resolved_per_tenant_active_cap_fallback_and_override() {
+        let mut forge = ForgeRuntimeConfig {
+            worker_concurrency: 6,
+            ..ForgeRuntimeConfig::default()
+        };
+        assert_eq!(forge.resolved_per_tenant_active_cap(), 6);
+        forge.per_tenant_active_cap = Some(2);
+        assert_eq!(forge.resolved_per_tenant_active_cap(), 2);
+    }
+
+    /// A zero `forge.per_tenant_active_cap` fails boot validation fail-closed.
+    #[test]
+    fn forge_zero_per_tenant_active_cap_is_rejected() {
+        let mut config = WyrdServerConfig::default();
+        config.bifrost.oracle.allow_unapproved_profile = true;
+        config.forge.per_tenant_active_cap = Some(0);
+        assert!(config.validate().is_err());
     }
 
     /// Proves the removed independent role environment is rejected.

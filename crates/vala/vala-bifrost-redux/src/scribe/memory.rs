@@ -1334,6 +1334,25 @@ impl MemoryLedger {
     }
 
     /// Move Arrow ownership from writable buckets to immutable generations.
+    ///
+    /// The transfer is a net-zero category move: the bytes stay charged against
+    /// the shared Scribe and Bifrost pools throughout, so nothing is released to
+    /// the pool and nothing is re-reserved. This closes the shrink-then-grow
+    /// race a concurrent reservation could otherwise win at the ceiling — the
+    /// pre-D97 form shrank Active (releasing the bytes to the pool) and then
+    /// grew Immutable (re-reserving them), and an ingress `try_reserve` racing
+    /// into the transiently freed headroom made the grow fail exactly when the
+    /// pod sat at ceiling and pressure seals ran. Because the category move
+    /// never touches the pool totals it can no longer fail on a ceiling, only on
+    /// a poisoned ledger lock, and it therefore needs no rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the active or immutable ledger
+    /// lock is poisoned. Poisoning indicates a prior panic inside a ledger
+    /// critical section — a broken invariant, not a recoverable accounting
+    /// failure — and no partial category move can have occurred because the
+    /// method mutates nothing before both locks are held.
     pub fn move_active_to_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
         let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
             detail: "active memory ledger lock poisoned".to_owned(),
@@ -1341,19 +1360,24 @@ impl MemoryLedger {
         let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?;
-        let moved = bytes.min(active.bytes());
-        let active_target = active.bytes() - moved;
-        active.resize(active_target)?;
-        let immutable_target = immutable.bytes().saturating_add(moved);
-        if let Err(error) = immutable.resize(immutable_target) {
-            let rollback_target = active.bytes().saturating_add(moved);
-            let _ = active.resize(rollback_target);
-            return Err(error);
-        }
+        active.transfer_bytes_to(&mut immutable, bytes);
         Ok(())
     }
 
     /// Move Arrow ownership back to writable buckets after rollback.
+    ///
+    /// Symmetric net-zero counterpart to [`Self::move_active_to_immutable`]: the
+    /// bytes stay charged against the shared pools while their category flips
+    /// from immutable back to active, so a post-commit abort's accounting
+    /// rollback cannot fail on a ceiling and needs no compensating resize. The
+    /// lock order (active before immutable) matches the forward move so the two
+    /// methods share one lock ordering and add no deadlock surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the active or immutable ledger
+    /// lock is poisoned; no partial category move can have occurred because the
+    /// method mutates nothing before both locks are held.
     pub fn move_immutable_to_active(&self, bytes: usize) -> Result<(), ScribeError> {
         let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
             detail: "active memory ledger lock poisoned".to_owned(),
@@ -1361,15 +1385,7 @@ impl MemoryLedger {
         let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?;
-        let moved = bytes.min(immutable.bytes());
-        let immutable_target = immutable.bytes() - moved;
-        immutable.resize(immutable_target)?;
-        let active_target = active.bytes().saturating_add(moved);
-        if let Err(error) = active.resize(active_target) {
-            let rollback_target = immutable.bytes().saturating_add(moved);
-            let _ = immutable.resize(rollback_target);
-            return Err(error);
-        }
+        immutable.transfer_bytes_to(&mut active, bytes);
         Ok(())
     }
 
@@ -1543,6 +1559,39 @@ impl MemoryReservation {
         other.detach_shard();
         std::mem::forget(other);
         Ok(())
+    }
+
+    /// Move `bytes` of already-held reservation from this reservation's category
+    /// into `other`, adjusting only the per-category totals.
+    ///
+    /// This is the net-zero primitive behind
+    /// [`MemoryLedger::move_active_to_immutable`] and
+    /// [`MemoryLedger::move_immutable_to_active`]: the moved bytes stay charged
+    /// against the shared Scribe and Bifrost pool totals the entire time, so no
+    /// headroom is ever released and no re-reservation is ever attempted. A
+    /// concurrent reservation therefore cannot claim transiently freed bytes
+    /// between a shrink and a grow, which closes the shrink-then-grow seal race
+    /// by construction rather than by ordering. The amount moved is clamped to
+    /// the bytes this reservation currently owns, so an over-large request moves
+    /// only what is held and never underflows.
+    ///
+    /// Both reservations' optional shard counters are adjusted symmetrically so
+    /// per-shard accounting stays consistent. When the categories are equal the
+    /// category total is left untouched (the sub and add would cancel); the
+    /// ledger reservations are shard-unattached, so their shard adjustments are
+    /// no-ops. This operation is infallible and performs no pool interaction.
+    fn transfer_bytes_to(&mut self, other: &mut MemoryReservation, bytes: usize) {
+        let moved = bytes.min(self.bytes);
+        if self.category != other.category {
+            self.governor.parent.inner.categories[self.category as usize]
+                .fetch_sub(moved, Ordering::AcqRel);
+            self.governor.parent.inner.categories[other.category as usize]
+                .fetch_add(moved, Ordering::AcqRel);
+        }
+        self.bytes -= moved;
+        other.bytes += moved;
+        self.adjust_shard_sub(moved);
+        other.adjust_shard_add(moved);
     }
 
     /// Move accounting to another lifecycle category without changing totals.
@@ -1932,6 +1981,119 @@ mod tests {
         assert_eq!(governor.snapshot().total_bytes(), 256);
         ledger.release_active(256).expect("release active");
         assert_eq!(governor.snapshot().total_bytes(), 0);
+    }
+
+    /// The seal move relabels bytes Active->Immutable without touching pool totals.
+    ///
+    /// Pins the D97 net-zero invariant: after `move_active_to_immutable` the
+    /// per-category totals shift by the moved amount while `scribe_total_bytes`
+    /// and `bifrost_total_bytes` are byte-for-byte unchanged, proving no release
+    /// to or re-reservation from the shared pool occurred. The rollback move
+    /// restores the original category split, so freeze/persist/retire accounting
+    /// is exactly conserved.
+    #[test]
+    fn seal_move_is_net_zero_category_transfer() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let ledger = MemoryLedger::new(&budget).expect("ledger");
+        ledger.reserve_active(8192).expect("reserve active");
+        let before = governor.snapshot();
+        assert_eq!(before.categories[MemoryCategory::Active as usize], 8192);
+
+        ledger
+            .move_active_to_immutable(3072)
+            .expect("move to immutable");
+        let mid = governor.snapshot();
+        assert_eq!(mid.categories[MemoryCategory::Active as usize], 5120);
+        assert_eq!(mid.categories[MemoryCategory::Immutable as usize], 3072);
+        assert_eq!(mid.scribe_total_bytes, before.scribe_total_bytes);
+        assert_eq!(mid.bifrost_total_bytes, before.bifrost_total_bytes);
+
+        ledger.move_immutable_to_active(3072).expect("move back");
+        let after = governor.snapshot();
+        assert_eq!(after.categories[MemoryCategory::Active as usize], 8192);
+        assert_eq!(after.categories[MemoryCategory::Immutable as usize], 0);
+        assert_eq!(after.scribe_total_bytes, before.scribe_total_bytes);
+    }
+
+    /// An over-large move clamps to owned bytes and never fails.
+    ///
+    /// The net-zero move can only fail on a poisoned lock, never on inputs:
+    /// requesting more than the reservation owns moves exactly the owned bytes
+    /// and returns `Ok`. This is the reachable-failure half of the D97
+    /// two-legal-states proof — after any single move the bucket is either fully
+    /// Active-accounted (retryable) or fully Immutable-accounted (queued), never
+    /// a stranded partial state.
+    #[test]
+    fn seal_move_clamps_to_owned_bytes_without_failing() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let ledger = MemoryLedger::new(&budget).expect("ledger");
+        ledger.reserve_active(2048).expect("reserve active");
+        ledger
+            .move_active_to_immutable(1_000_000)
+            .expect("clamped move");
+        let snapshot = governor.snapshot();
+        assert_eq!(snapshot.categories[MemoryCategory::Active as usize], 0);
+        assert_eq!(
+            snapshot.categories[MemoryCategory::Immutable as usize],
+            2048
+        );
+        assert_eq!(snapshot.scribe_total_bytes, 2048);
+    }
+
+    /// The seal move never fails while concurrent reservations hammer the ceiling.
+    ///
+    /// Regression guard for the D97 shrink-then-grow race (window 2). The ledger
+    /// holds Active pinned at the Scribe ceiling, leaving zero free headroom,
+    /// while a contender thread spins on `try_reserve` against the shared pool.
+    /// The pre-D97 move released the moved bytes to the pool before re-reserving
+    /// them, so the contender could win the transient headroom and make the grow
+    /// fail; the net-zero move never touches the pool, so every one of the many
+    /// forward/rollback moves returns `Ok` regardless of contention, and the
+    /// ceiling accounting is exactly restored at the end.
+    #[test]
+    fn seal_move_never_fails_under_concurrent_reservations_at_ceiling() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
+        let scribe_limit = governor.scribe_limit_bytes();
+        let ledger = MemoryLedger::new(&budget).expect("ledger");
+        ledger
+            .reserve_active(scribe_limit)
+            .expect("reserve at ceiling");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let contender_budget = budget.clone();
+        let contender_stop = Arc::clone(&stop);
+        let contender = std::thread::spawn(move || {
+            while !contender_stop.load(Ordering::Relaxed) {
+                if let Ok(reservation) =
+                    contender_budget.try_reserve(MemoryCategory::Metadata, 4096)
+                {
+                    drop(reservation);
+                }
+            }
+        });
+
+        let moved = 4096;
+        for _ in 0..50_000 {
+            ledger
+                .move_active_to_immutable(moved)
+                .expect("net-zero seal move must not fail at the ceiling");
+            ledger
+                .move_immutable_to_active(moved)
+                .expect("net-zero rollback move must not fail at the ceiling");
+        }
+        stop.store(true, Ordering::Relaxed);
+        contender.join().expect("contender thread");
+
+        let snapshot = governor.snapshot();
+        assert_eq!(
+            snapshot.categories[MemoryCategory::Active as usize],
+            scribe_limit
+        );
+        assert_eq!(snapshot.categories[MemoryCategory::Immutable as usize], 0);
+        assert_eq!(snapshot.scribe_total_bytes, scribe_limit);
     }
 
     /// Proves the parent ceiling is a hard limit even when child budgets have room.

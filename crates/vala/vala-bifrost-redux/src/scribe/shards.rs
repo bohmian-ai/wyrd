@@ -1085,11 +1085,13 @@ impl ShardOwner {
         if !signal.keys.is_empty()
             && let Err(error) = self.flush_keys(signal.keys, Some(SealTriggerReason::Pressure))
         {
+            record_seal_failure();
             tracing::warn!(error = %error, shard = self.id, "pressure flush failed");
         }
         if let Some(key) = signal.wal_key
             && let Err(error) = self.flush_keys(vec![key], Some(SealTriggerReason::Pressure))
         {
+            record_seal_failure();
             tracing::warn!(error = %error, shard = self.id, "WAL pressure flush failed");
         }
     }
@@ -2175,6 +2177,19 @@ fn record_seal(trigger: SealTriggerReason) {
     metrics::counter!("bifrost_scribe_seal_total", "trigger" => trigger.as_label()).increment(1);
 }
 
+/// Count one seal-accounting failure so a stranded seal cannot be silent (D84).
+///
+/// [`ShardOwner::handle_pressure_signal`] keeps a failed pressure flush
+/// non-fatal to the shard owner loop and still logs its WARN, but a swallowed
+/// seal failure would otherwise be invisible to operators. This counter makes
+/// the condition observable without a debugger — a stranded frozen generation
+/// (D97) or any other seal-path failure increments it exactly once per failed
+/// flush. It carries no tenant, table, or request identity: it records only
+/// that a seal flush failed.
+fn record_seal_failure() {
+    metrics::counter!("bifrost_scribe_seal_failed_total").increment(1);
+}
+
 /// Count one generation retirement and the immutable bytes it freed (D84).
 ///
 /// Emitted once per generation that actually leaves retained state, so
@@ -3145,5 +3160,34 @@ mod tests {
                 .copied(),
             Some(6144)
         );
+    }
+
+    /// A swallowed seal failure increments an identity-free failure counter.
+    ///
+    /// Proves [`record_seal_failure`] advances `bifrost_scribe_seal_failed_total`
+    /// once per call under its stable, identity-free name so a stranded-seal
+    /// condition (D97) surfaced only as a WARN cannot be silent, and that the
+    /// counter leaks no tenant, table, or request identity.
+    #[test]
+    fn seal_failure_counter_is_identity_free() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_seal_failure();
+            record_seal_failure();
+        });
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_scribe_seal_failed_total")
+                .copied(),
+            Some(2),
+            "seal-failure counter must advance once per failed flush"
+        );
+        assert!(!snapshot.counters.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
     }
 }

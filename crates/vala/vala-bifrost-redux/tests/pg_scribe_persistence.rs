@@ -44,6 +44,8 @@ struct PersistenceFixture {
     database: PgFixture,
     operator: Arc<opendal::Operator>,
     scribe: Arc<ScribeImpl>,
+    /// Shared production governor used to overlap Oracle range ownership.
+    memory: BifrostMemoryGovernor,
     faults: PersistenceFaults,
     /// Receiver retained so post-commit hints remain observable until assertions finish.
     hint_inbox: vala_bifrost_redux::maintenance::StagingFileInbox,
@@ -53,7 +55,29 @@ struct PersistenceFixture {
 }
 
 impl PersistenceFixture {
+    /// Starts the standard persistence fixture with the production-derived governor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the governor or any Postgres, object-store, WAL, execution-lane,
+    /// persistence, or Scribe fixture dependency cannot be constructed.
     async fn start() -> Self {
+        Self::start_with_memory(
+            BifrostMemoryGovernor::new(8 * 1024 * 1024 * 1024).expect("memory governor"),
+        )
+        .await
+    }
+
+    /// Starts a persistence fixture with one caller-selected shared governor.
+    ///
+    /// The supplied governor is shared by Scribe and any test-owned overlapping
+    /// Oracle reservation so the fixture exercises the production accounting tree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any Postgres, object-store, WAL, execution-lane, persistence,
+    /// channel, or Scribe fixture dependency cannot be constructed.
+    async fn start_with_memory(memory: BifrostMemoryGovernor) -> Self {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
         let operator = Arc::new(
@@ -77,7 +101,6 @@ impl PersistenceFixture {
         let persistence =
             ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 16, 2)
                 .with_test_faults(faults.clone());
-        let memory = BifrostMemoryGovernor::new(8 * 1024 * 1024 * 1024).expect("memory governor");
         let admission = vala_bifrost_redux::scribe::admission::AdmissionConfig::default();
         let lane_config = ScribeLaneConfig {
             ingress_cpu_threads: 1,
@@ -105,12 +128,62 @@ impl PersistenceFixture {
             database,
             operator,
             scribe,
+            memory,
             faults,
             hint_inbox,
             wal_root,
             _warehouse: None,
             tenant,
         }
+    }
+
+    /// Derives the measured-wire remainder that places a projected append at `target`.
+    ///
+    /// The calibration traverses the production projection path because managed
+    /// columns make admitted Arrow ownership larger than the source batch. Its
+    /// expected oversize rejection occurs before WAL or memtable mutation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the source batch is already at the target, calibration does
+    /// not return the decoded-size ceiling, or projected ownership reaches the
+    /// target without room for a measured-wire remainder.
+    async fn calibrate_exact_wire_bytes(
+        &self,
+        rows: &RecordBatch,
+        schema: &Schema,
+        table_name: &str,
+        target: usize,
+    ) -> usize {
+        let source_bytes = rows.get_array_memory_size();
+        assert!(source_bytes < target);
+        let calibration_wire_bytes = target - source_bytes;
+        let calibration = self
+            .scribe
+            .append(ScribeAppend {
+                principal: principal(self.tenant),
+                table: table(table_name),
+                schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema),
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: calibration_wire_bytes,
+                rows: rows.clone(),
+            })
+            .await
+            .expect_err("managed projection makes the source-sized calibration oversized");
+        let ScribeError::DecodedPayloadTooLarge {
+            bytes: calibrated_bytes,
+            limit,
+        } = calibration
+        else {
+            panic!("calibration must return the decoded-size ceiling");
+        };
+        assert_eq!(limit, target);
+        let decoded_bytes = calibrated_bytes - calibration_wire_bytes;
+        assert!(decoded_bytes < target);
+        let measured_wire_bytes = target - decoded_bytes;
+        assert_eq!(decoded_bytes + measured_wire_bytes, target);
+        measured_wire_bytes
     }
 
     async fn stop(self) {
@@ -223,6 +296,7 @@ impl PersistenceFixture {
             database,
             operator,
             scribe,
+            memory,
             faults,
             hint_inbox,
             wal_root,
@@ -1099,6 +1173,97 @@ fn native_event_time_frame(
         measured_wire_bytes: bytes.len(),
         payload: IngressPayload::ArrowIpc(bytes.into()),
     }
+}
+
+/// Persistence workspace admission remains available while a governed Oracle
+/// range overlaps, and both role counters return to their exact baseline.
+#[tokio::test]
+async fn persistence_headroom_survives_oracle_range_overlap() {
+    let memory =
+        BifrostMemoryGovernor::new_with_test_scribe_limit(1024 * 1024 * 1024, 256 * 1024 * 1024)
+            .expect("bounded production-formula governor");
+    let fixture = PersistenceFixture::start_with_memory(memory).await;
+    let baseline = fixture.memory.snapshot();
+    let oracle = fixture.memory.oracle_budget();
+    let range = oracle
+        .try_reserve(oracle.limit_bytes())
+        .expect("worst-case Oracle child range occupancy");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(arrow::array::StringArray::from(vec![
+                "x".repeat(59 * 1024 * 1024),
+            ])),
+        ],
+    )
+    .expect("near-target persistence batch");
+    let target_bytes = fixture.memory.scribe_budget().active_bucket_target_bytes();
+    let request_id = RequestId::now_v7();
+    let measured_wire_bytes = fixture
+        .calibrate_exact_wire_bytes(
+            &rows,
+            schema.as_ref(),
+            "persistence_range_overlap",
+            target_bytes,
+        )
+        .await;
+    fixture
+        .scribe
+        .append(ScribeAppend {
+            principal: principal(fixture.tenant),
+            table: table("persistence_range_overlap"),
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema.as_ref()),
+            request_id,
+            batch_id: uuid::Uuid::now_v7(),
+            measured_wire_bytes,
+            rows,
+        })
+        .await
+        .expect("near-target generation admits under Oracle overlap");
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("flush while Oracle range is retained");
+    wait_for_state(&fixture, 0).await;
+    assert_eq!(
+        rows_for_table(&fixture, "persistence_range_overlap")
+            .await
+            .len(),
+        1
+    );
+    fixture
+        .scribe
+        .retire_committed_for_test()
+        .await
+        .expect("retire committed generation while Oracle range is retained");
+    let overlapped = fixture.memory.snapshot();
+    assert_eq!(overlapped.oracle_total_bytes, oracle.limit_bytes());
+    assert!(overlapped.bifrost_total_bytes >= overlapped.oracle_total_bytes);
+    drop(range);
+    let restored = fixture.memory.snapshot();
+    assert_eq!(restored.oracle_total_bytes, baseline.oracle_total_bytes);
+    assert_eq!(
+        restored.scribe_total_bytes, baseline.scribe_total_bytes,
+        "scribe ownership did not restore: {restored:?}"
+    );
+    assert_eq!(
+        restored.bifrost_total_bytes, baseline.bifrost_total_bytes,
+        "parent ownership did not restore: {restored:?}"
+    );
+    fixture.stop().await;
 }
 
 /// End-to-end proof that native ingest honours a caller-supplied event time:

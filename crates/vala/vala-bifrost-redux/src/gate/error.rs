@@ -238,6 +238,12 @@ impl IngestError {
                 limit: u64::try_from(crate::scribe::admission::MAX_REQUEST_BYTES)
                     .unwrap_or(u64::MAX),
             },
+            crate::contracts::ScribeError::DecodedPayloadTooLarge { bytes, limit } => {
+                Self::PayloadTooLarge {
+                    bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                }
+            }
             crate::contracts::ScribeError::FingerprintMismatch { table } => {
                 Self::SchemaMismatch { table }
             }

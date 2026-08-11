@@ -121,6 +121,16 @@ pub enum ScribeError {
     #[error("ingest payload too large: {bytes} bytes")]
     PayloadTooLarge { bytes: usize },
 
+    /// The decoded Arrow ownership plus its measured wire frame cannot fit in
+    /// one active persistence bucket, so no WAL or memtable work was started.
+    #[error("decoded ingest payload too large: {bytes} > {limit} bytes")]
+    DecodedPayloadTooLarge {
+        /// Combined decoded Arrow and measured wire bytes.
+        bytes: usize,
+        /// Active-bucket ceiling applied to this request.
+        limit: usize,
+    },
+
     #[error("schema fingerprint mismatch for table: {table}")]
     FingerprintMismatch { table: String },
 
@@ -185,6 +195,10 @@ impl ScribeError {
                 Self::UnsupportedWalVersion { version: *version }
             }
             Self::PayloadTooLarge { bytes } => Self::PayloadTooLarge { bytes: *bytes },
+            Self::DecodedPayloadTooLarge { bytes, limit } => Self::DecodedPayloadTooLarge {
+                bytes: *bytes,
+                limit: *limit,
+            },
             Self::FingerprintMismatch { table } => Self::FingerprintMismatch {
                 table: table.clone(),
             },

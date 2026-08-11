@@ -24,7 +24,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
-use vala_bifrost_redux::cluster::ClusterRegistry;
+use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
@@ -308,6 +308,8 @@ pub struct WyrdTestServerBuilder {
     forge_max_files_per_bin: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
+    /// Optional accelerated role cadence for heartbeat-specific journeys.
+    role_timing: Option<RoleTiming>,
     /// Stable node identity retained when a cluster restarts this builder.
     node_id: Option<NodeId>,
     /// Closed role set constructed for this server instance.
@@ -369,6 +371,7 @@ impl Default for WyrdTestServerBuilder {
             forge_max_files_per_bin: 3,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
+            role_timing: None,
             node_id: None,
             bifrost_roles: [
                 BifrostRuntimeRole::Scribe,
@@ -1957,6 +1960,13 @@ impl Drop for WyrdTestServer {
 }
 
 impl WyrdTestServerBuilder {
+    /// Selects an explicit role heartbeat cadence for this test server only.
+    #[must_use]
+    pub fn with_role_timing_for_test(mut self, timing: RoleTiming) -> Self {
+        self.role_timing = Some(timing);
+        self
+    }
+
     /// Attach the process-installed production telemetry guard.
     #[must_use]
     pub fn with_telemetry_for_test(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
@@ -2458,7 +2468,11 @@ impl WyrdTestServerBuilder {
             self.scribe_wal_root
         };
         let scribe_registration = if scribe_wal_root.is_some() {
-            let registry = Arc::new(ClusterRegistry::new(postgres.vala().clone(), node_id));
+            let registry = Arc::new(if let Some(timing) = self.role_timing {
+                ClusterRegistry::new_with_role_timing(postgres.vala().clone(), node_id, timing)
+            } else {
+                ClusterRegistry::new(postgres.vala().clone(), node_id)
+            });
             let advertise_addr = self.bind_addrs.map_or_else(
                 || "http://127.0.0.1:0".to_owned(),
                 |(_, grpc)| format!("http://{grpc}"),
@@ -2659,6 +2673,7 @@ impl WyrdTestServerBuilder {
                             .as_ref()
                             .map(|root| root.path().to_owned()),
                     },
+                    self.role_timing,
                 )
                 .await
             } else {
@@ -2671,6 +2686,7 @@ impl WyrdTestServerBuilder {
                     self.oracle_audit_wal_root
                         .as_ref()
                         .map(|root| root.path().to_owned()),
+                    self.role_timing,
                 )
                 .await
             }

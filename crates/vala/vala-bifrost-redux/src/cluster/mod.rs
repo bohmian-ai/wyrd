@@ -25,6 +25,33 @@ pub const ROLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum age of a heartbeat included in a live cluster snapshot.
 pub const ROLE_LIVENESS_CUTOFF: Duration = Duration::from_secs(15);
 
+/// Test-support cadence for independently fenced role heartbeats and snapshots.
+///
+/// Production registry construction does not accept timing configuration and
+/// retains the fixed five-second heartbeat and fifteen-second cutoff. This seam
+/// does not alter Oracle dispatcher peer candidacy, which intentionally keeps
+/// the production fifteen-second [`ROLE_LIVENESS_CUTOFF`].
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleTiming {
+    /// Interval between durable readiness heartbeats.
+    pub heartbeat_interval: Duration,
+    /// Maximum heartbeat age included in live membership snapshots.
+    pub liveness_cutoff: Duration,
+}
+
+#[cfg(feature = "test-support")]
+impl RoleTiming {
+    /// Returns the locked deterministic cadence used by heartbeat journeys.
+    #[must_use]
+    pub const fn deterministic_test() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_millis(50),
+            liveness_cutoff: Duration::from_millis(500),
+        }
+    }
+}
+
 /// Cluster membership operation failure.
 #[derive(Debug, Error)]
 pub enum ClusterError {
@@ -154,6 +181,9 @@ pub struct ClusterRegistry {
     node_id: NodeId,
     /// Atomically published immutable live-role snapshot.
     snapshot: ArcSwap<ClusterSnapshot>,
+    /// Optional accelerated heartbeat timing compiled only for test support.
+    #[cfg(feature = "test-support")]
+    role_timing: Option<RoleTiming>,
 }
 
 impl ClusterRegistry {
@@ -164,7 +194,58 @@ impl ClusterRegistry {
             nodes: ClusterNodes::new(postgres),
             node_id,
             snapshot: ArcSwap::from_pointee(ClusterSnapshot::default()),
+            #[cfg(feature = "test-support")]
+            role_timing: None,
         }
+    }
+
+    /// Creates a test-support registry with an explicit heartbeat cadence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either duration is zero or the liveness cutoff is not
+    /// greater than the heartbeat interval.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn new_with_role_timing(
+        postgres: ValaPostgres,
+        node_id: NodeId,
+        timing: RoleTiming,
+    ) -> Self {
+        assert!(
+            !timing.heartbeat_interval.is_zero(),
+            "role heartbeat interval must be nonzero"
+        );
+        assert!(
+            timing.liveness_cutoff > timing.heartbeat_interval,
+            "role liveness cutoff must exceed its heartbeat interval"
+        );
+        Self {
+            nodes: ClusterNodes::new(postgres),
+            node_id,
+            snapshot: ArcSwap::from_pointee(ClusterSnapshot::default()),
+            role_timing: Some(timing),
+        }
+    }
+
+    /// Returns the heartbeat interval selected by this registry owner.
+    #[must_use]
+    fn heartbeat_interval(&self) -> Duration {
+        #[cfg(feature = "test-support")]
+        if let Some(timing) = self.role_timing {
+            return timing.heartbeat_interval;
+        }
+        ROLE_HEARTBEAT_INTERVAL
+    }
+
+    /// Returns the liveness cutoff selected by this registry owner.
+    #[must_use]
+    fn liveness_cutoff(&self) -> Duration {
+        #[cfg(feature = "test-support")]
+        if let Some(timing) = self.role_timing {
+            return timing.liveness_cutoff;
+        }
+        ROLE_LIVENESS_CUTOFF
     }
 
     /// Validates a peer's exact durable Oracle role fence before mutation.
@@ -188,7 +269,7 @@ impl ClusterRegistry {
                 node_id,
                 fencing_token,
                 Utc::now()
-                    - ChronoDuration::from_std(ROLE_LIVENESS_CUTOFF).map_err(|_| {
+                    - ChronoDuration::from_std(self.liveness_cutoff()).map_err(|_| {
                         SqlError::InvariantViolation {
                             detail: "invalid liveness cutoff".to_owned(),
                         }
@@ -286,7 +367,7 @@ impl ClusterRegistry {
     /// or read from membership.
     pub async fn refresh_snapshot(&self) -> Result<(), ClusterError> {
         let cutoff = Utc::now()
-            - chrono::Duration::from_std(ROLE_LIVENESS_CUTOFF).map_err(|error| {
+            - chrono::Duration::from_std(self.liveness_cutoff()).map_err(|error| {
                 ClusterError::Sql(SqlError::InvariantViolation {
                     detail: error.to_string(),
                 })
@@ -351,7 +432,7 @@ impl ClusterRegistry {
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ROLE_HEARTBEAT_INTERVAL);
+            let mut interval = tokio::time::interval(self.heartbeat_interval());
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
@@ -380,7 +461,7 @@ impl ClusterRegistry {
     #[must_use]
     pub fn start_snapshot_poller(self: Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ROLE_HEARTBEAT_INTERVAL);
+            let mut interval = tokio::time::interval(self.heartbeat_interval());
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {

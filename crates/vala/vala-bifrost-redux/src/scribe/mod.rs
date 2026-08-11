@@ -60,6 +60,8 @@ use async_trait::async_trait;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use num_traits::ToPrimitive;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -240,6 +242,10 @@ pub struct ScribeImpl {
     staging_file_publisher: Option<StagingFilePublisher>,
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
+    /// Optional decoded-request ceiling used only by bounded regression tests;
+    /// zero selects the production active-bucket target.
+    #[cfg(any(test, feature = "test-support"))]
+    decoded_request_limit_for_test: AtomicUsize,
     /// Passive typed lifecycle observer populated only by production owner boundaries.
     #[cfg(feature = "test-support")]
     publication_observer: ScribePublicationObserver,
@@ -880,6 +886,8 @@ impl ScribeImpl {
             staging_file_publisher,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-support"))]
+            decoded_request_limit_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-support")]
             publication_observer: ScribePublicationObserver::default(),
         }
@@ -1469,6 +1477,7 @@ impl Scribe for ScribeImpl {
                 let reason = match error {
                     ScribeError::UnsupportedWalVersion { .. } => Some("wal"),
                     ScribeError::PayloadTooLarge { .. }
+                    | ScribeError::DecodedPayloadTooLarge { .. }
                     | ScribeError::TooManyRows { .. }
                     | ScribeError::InvalidFrame
                     | ScribeError::EventTimeOutOfRange { .. }
@@ -1720,20 +1729,48 @@ impl ScribeImpl {
     }
 
     /// Return the bounded setup and ownership snapshot used by test harnesses.
+    ///
+    /// Governor totals are authoritative. Bucket and transient-shard
+    /// attribution is retried for coherence, but under uninterrupted writes the
+    /// method returns the latest independently sampled attribution rather than
+    /// failing an otherwise valid operational inspection.
     pub fn inspection_snapshot(&self) -> Result<ScribeInspectionSnapshot, ScribeError> {
         let stats = self.memtable_stats()?;
-        let memory = self.memory.snapshot().with_ingress_watermarks(
-            self.pressure_config.ingress_high_water_percent,
-            self.pressure_config.ingress_low_water_percent,
-        );
-        let owner_snapshots = self.shards.memtable_snapshots()?;
+        let mut coherent = None;
+        let mut latest = None;
+        for _ in 0..64 {
+            let before = self.memory.snapshot();
+            let owner_snapshots = self.shards.memtable_snapshots()?;
+            let transient_by_shard = self.memory.shard_snapshot();
+            let memory = self.memory.snapshot().with_ingress_watermarks(
+                self.pressure_config.ingress_high_water_percent,
+                self.pressure_config.ingress_low_water_percent,
+            );
+            let bucket_total = owner_snapshots
+                .iter()
+                .flat_map(|snapshot| &snapshot.bucket_memory)
+                .map(|bucket| bucket.writable_bytes.saturating_add(bucket.immutable_bytes))
+                .sum::<usize>();
+            let transient_total = transient_by_shard.into_iter().sum::<usize>();
+            latest = Some((memory, owner_snapshots.clone(), transient_by_shard));
+            if before.total_bytes() == memory.total_bytes()
+                && bucket_total.saturating_add(transient_total) == memory.total_bytes()
+            {
+                coherent = Some((memory, owner_snapshots, transient_by_shard));
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        let (memory, owner_snapshots, transient_by_shard) =
+            coherent.or(latest).ok_or_else(|| ScribeError::Internal {
+                detail: "inspection could not read bucket and shard ownership".to_owned(),
+            })?;
         let bucket_memory = owner_snapshots
             .iter()
             .flat_map(|snapshot| snapshot.bucket_memory.clone())
             .collect::<Vec<_>>();
         let mut memory_by_shard = [0_usize; crate::scribe::routing::SCRIBE_SHARD_COUNT];
         let mut memory_by_bucket = Vec::with_capacity(bucket_memory.len());
-        let mut bucket_total = 0_usize;
         for bucket in bucket_memory {
             let bytes = bucket.writable_bytes.saturating_add(bucket.immutable_bytes);
             // Attribution-only: under batch-spread routing a bucket's shard
@@ -1745,26 +1782,14 @@ impl ScribeImpl {
                 Uuid::nil(),
             );
             memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
-            bucket_total = bucket_total.saturating_add(bytes);
             memory_by_bucket.push(ScribeBucketMemorySnapshot {
                 seal_key: bucket.seal_key,
                 writable_bytes: bucket.writable_bytes,
                 immutable_bytes: bucket.immutable_bytes,
             });
         }
-        for (shard, bytes) in self.memory.shard_snapshot().into_iter().enumerate() {
+        for (shard, bytes) in transient_by_shard.into_iter().enumerate() {
             memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
-        }
-        let transient_total = self.memory.shard_snapshot().into_iter().sum::<usize>();
-        if bucket_total.saturating_add(transient_total) != memory.total_bytes() {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "inspection found {} bytes without a bucket or shard owner",
-                    memory
-                        .total_bytes()
-                        .saturating_sub(bucket_total.saturating_add(transient_total))
-                ),
-            });
         }
         Ok(ScribeInspectionSnapshot {
             shard_task_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,

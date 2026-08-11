@@ -1162,7 +1162,17 @@ impl BifrostMemoryGovernor {
         Ok(())
     }
 
-    /// Release bytes from the Oracle child counter and the parent ceiling.
+    /// Releases bytes from the Oracle child counter and the parent ceiling.
+    ///
+    /// Both counters are checked before either is changed. Each checked release
+    /// then retries ordinary concurrent counter movement, so unrelated query
+    /// completion cannot be mistaken for corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns a counter-overflow rejection and poisons the shared governor when
+    /// either counter lacks the owned bytes or a checked release detects an
+    /// accounting invariant violation after preflight.
     fn release_oracle_bytes_checked(&self, bytes: usize) -> Result<(), MemoryRejection> {
         let oracle = self.inner.oracle_total_bytes.load(Ordering::Acquire);
         let parent = self.inner.bifrost_total_bytes.load(Ordering::Acquire);
@@ -1177,36 +1187,16 @@ impl BifrostMemoryGovernor {
                 self.oracle_limit_bytes(),
             ));
         }
-        self.inner
-            .oracle_total_bytes
-            .compare_exchange(oracle, oracle - bytes, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|current| {
-                self.poison();
-                MemoryRejection::new(
-                    MemoryRejectionKind::CounterOverflow,
-                    MemoryPurpose::OracleQuery,
-                    MemoryCeiling::NotApplicable,
-                    bytes,
-                    current,
-                    self.oracle_limit_bytes(),
-                )
-            })?;
-        if self
-            .inner
-            .bifrost_total_bytes
-            .compare_exchange(parent, parent - bytes, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            self.poison();
-            return Err(MemoryRejection::new(
-                MemoryRejectionKind::CounterOverflow,
-                MemoryPurpose::OracleQuery,
-                MemoryCeiling::NotApplicable,
-                bytes,
-                parent,
-                self.bifrost_limit_bytes(),
-            ));
-        }
+        self.release_counter_checked(
+            &self.inner.oracle_total_bytes,
+            bytes,
+            MemoryPurpose::OracleQuery,
+        )?;
+        self.release_counter_checked(
+            &self.inner.bifrost_total_bytes,
+            bytes,
+            MemoryPurpose::OracleQuery,
+        )?;
         Ok(())
     }
 
@@ -2658,15 +2648,21 @@ impl MemoryReservation {
     /// headroom is ever released and no re-reservation is ever attempted. A
     /// concurrent reservation therefore cannot claim transiently freed bytes
     /// between a shrink and a grow, which closes the shrink-then-grow seal race
-    /// by construction rather than by ordering. The amount moved is clamped to
-    /// the bytes this reservation currently owns, so an over-large request moves
-    /// only what is held and never underflows.
+    /// by construction rather than by ordering. Ordinary concurrent category
+    /// changes are retried; ownership corruption remains fail-closed.
     ///
     /// Both reservations' optional shard counters are adjusted symmetrically so
     /// per-shard accounting stays consistent. When the categories are equal the
     /// category total is left untouched (the sub and add would cancel); the
     /// ledger reservations are shard-unattached, so their shard adjustments are
-    /// no-ops. This operation is infallible and performs no pool interaction.
+    /// no-ops. The operation performs no pool acquisition or release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the source does not own `bytes`,
+    /// an owned/category/shard counter would overflow or underflow, or an
+    /// attached shard changes after preflight. Accounting corruption poisons
+    /// the shared governor.
     fn transfer_bytes_to(
         &mut self,
         other: &mut MemoryReservation,
@@ -2706,48 +2702,44 @@ impl MemoryReservation {
         if self.category != other.category {
             let source = &self.governor.parent.inner.categories[self.category as usize];
             let target = &self.governor.parent.inner.categories[other.category as usize];
-            let source_current = source.load(Ordering::Acquire);
-            if source_current < moved {
-                self.governor.parent.poison();
-                return Err(ScribeError::Internal {
-                    detail: "memory reservation category accounting underflow during transfer"
-                        .to_owned(),
-                });
-            }
-            let target_current = target.load(Ordering::Acquire);
-            let target_next = target_current.checked_add(moved).ok_or_else(|| {
-                self.governor.parent.poison();
-                ScribeError::Internal {
-                    detail: "memory reservation category accounting overflow during transfer"
-                        .to_owned(),
+            let mut source_current = source.load(Ordering::Acquire);
+            loop {
+                if source_current < moved {
+                    self.governor.parent.poison();
+                    return Err(ScribeError::Internal {
+                        detail: "memory reservation category accounting underflow during transfer"
+                            .to_owned(),
+                    });
                 }
-            })?;
-            source
-                .compare_exchange(
+                match source.compare_exchange(
                     source_current,
                     source_current - moved,
                     Ordering::AcqRel,
                     Ordering::Acquire,
-                )
-                .map_err(|_| {
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => source_current = observed,
+                }
+            }
+            let mut target_current = target.load(Ordering::Acquire);
+            loop {
+                let target_next = target_current.checked_add(moved).ok_or_else(|| {
                     self.governor.parent.poison();
                     ScribeError::Internal {
-                        detail: "memory reservation category changed during transfer".to_owned(),
+                        detail: "memory reservation category accounting overflow during transfer"
+                            .to_owned(),
                     }
                 })?;
-            target
-                .compare_exchange(
+                match target.compare_exchange(
                     target_current,
                     target_next,
                     Ordering::AcqRel,
                     Ordering::Acquire,
-                )
-                .map_err(|_| {
-                    self.governor.parent.poison();
-                    ScribeError::Internal {
-                        detail: "memory reservation category changed during transfer".to_owned(),
-                    }
-                })?;
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => target_current = observed,
+                }
+            }
         }
         let other_shard_plan = other.preflight_shard_add(moved)?;
         self.bytes -= moved;
@@ -2757,54 +2749,57 @@ impl MemoryReservation {
         Ok(())
     }
 
-    /// Move accounting to another lifecycle category without changing totals.
+    /// Moves this reservation to another lifecycle category without changing totals.
+    ///
+    /// Ordinary concurrent changes to either aggregate category counter are
+    /// retried while the reservation retains exclusive ownership of its bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the shared governor when
+    /// the source category lacks the reservation's bytes or the target category
+    /// would overflow.
     pub fn transfer_category(&mut self, category: MemoryCategory) -> Result<(), ScribeError> {
         if self.category != category {
-            let current = self.governor.parent.inner.categories[self.category as usize]
-                .load(Ordering::Acquire);
-            if current < self.bytes {
-                self.governor.parent.poison();
-                return Err(ScribeError::Internal {
-                    detail: "memory reservation category accounting underflow".to_owned(),
-                });
-            }
+            let source = &self.governor.parent.inner.categories[self.category as usize];
             let target = &self.governor.parent.inner.categories[category as usize];
-            let target_current = target.load(Ordering::Acquire);
-            let target_next = target_current.checked_add(self.bytes).ok_or_else(|| {
-                self.governor.parent.poison();
-                ScribeError::Internal {
-                    detail: "memory reservation category accounting overflow during transfer"
-                        .to_owned(),
+            let mut current = source.load(Ordering::Acquire);
+            loop {
+                if current < self.bytes {
+                    self.governor.parent.poison();
+                    return Err(ScribeError::Internal {
+                        detail: "memory reservation category accounting underflow".to_owned(),
+                    });
                 }
-            })?;
-            self.governor.parent.inner.categories[self.category as usize]
-                .compare_exchange(
+                match source.compare_exchange(
                     current,
                     current - self.bytes,
                     Ordering::AcqRel,
                     Ordering::Acquire,
-                )
-                .map_err(|_| {
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+            let mut target_current = target.load(Ordering::Acquire);
+            loop {
+                let target_next = target_current.checked_add(self.bytes).ok_or_else(|| {
                     self.governor.parent.poison();
                     ScribeError::Internal {
-                        detail: "memory reservation category accounting changed during transfer"
+                        detail: "memory reservation category accounting overflow during transfer"
                             .to_owned(),
                     }
                 })?;
-            target
-                .compare_exchange(
+                match target.compare_exchange(
                     target_current,
                     target_next,
                     Ordering::AcqRel,
                     Ordering::Acquire,
-                )
-                .map_err(|_| {
-                    self.governor.parent.poison();
-                    ScribeError::Internal {
-                        detail: "memory reservation category accounting changed during transfer"
-                            .to_owned(),
-                    }
-                })?;
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => target_current = observed,
+                }
+            }
         }
         self.category = category;
         Ok(())

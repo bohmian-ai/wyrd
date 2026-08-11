@@ -9,6 +9,34 @@ use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::routing::shard_for;
 use std::time::Instant;
 
+/// Validates that one decoded request fits the persistence bucket that must own it.
+///
+/// The bound covers decoded Arrow ownership plus the measured transport frame.
+/// Checked addition makes an unrepresentable request fail as oversized before
+/// reservation growth, preprocessing, shard dispatch, or WAL work.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::DecodedPayloadTooLarge`] when the combined byte count
+/// overflows `usize` or exceeds `limit`.
+fn validate_decoded_request_size(
+    decoded_arrow_bytes: usize,
+    wire_bytes: usize,
+    limit: usize,
+) -> Result<usize, ScribeError> {
+    let bytes =
+        decoded_arrow_bytes
+            .checked_add(wire_bytes)
+            .ok_or(ScribeError::DecodedPayloadTooLarge {
+                bytes: usize::MAX,
+                limit,
+            })?;
+    if bytes > limit {
+        return Err(ScribeError::DecodedPayloadTooLarge { bytes, limit });
+    }
+    Ok(bytes)
+}
+
 impl ScribeImpl {
     /// Prepares one request and dispatches its owned packet to its fixed shard.
     ///
@@ -78,11 +106,13 @@ impl ScribeImpl {
                 self.admission.config().event_time_window,
             )
             .await?;
+        let decoded_request_bytes = validate_decoded_request_size(
+            rows.get_array_memory_size(),
+            frame.measured_wire_bytes,
+            self.decoded_request_limit(),
+        )?;
         memory.transfer_category(MemoryCategory::Decode)?;
-        let estimated_bytes = rows
-            .get_array_memory_size()
-            .saturating_add(frame.measured_wire_bytes)
-            .saturating_add(REQUEST_OVERHEAD_BYTES);
+        let estimated_bytes = decoded_request_bytes.saturating_add(REQUEST_OVERHEAD_BYTES);
         reservation.resize(estimated_bytes)?;
         self.resize_ingress_after_pressure_seal(&mut memory, estimated_bytes, &table)?;
         memory.transfer_category(MemoryCategory::Prepared)?;
@@ -126,6 +156,38 @@ impl ScribeImpl {
             batch_id: frame.batch_id,
             rows_accepted,
         })
+    }
+
+    /// Returns the decoded-request ceiling for the current production or test owner.
+    #[must_use]
+    fn decoded_request_limit(&self) -> usize {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let override_bytes = self
+                .decoded_request_limit_for_test
+                .load(std::sync::atomic::Ordering::Acquire);
+            if override_bytes != 0 {
+                return override_bytes;
+            }
+        }
+        self.memory.active_bucket_target_bytes()
+    }
+
+    /// Overrides the decoded-request ceiling for one bounded test owner.
+    ///
+    /// Production construction always leaves the atomic at zero and therefore
+    /// uses the active-bucket target. The override affects subsequent requests
+    /// only and does not mutate reservations already in flight.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bytes` is zero because zero is reserved to select the
+    /// production ceiling.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_decoded_request_limit_for_test(&self, bytes: usize) {
+        assert!(bytes != 0, "decoded request test limit must be nonzero");
+        self.decoded_request_limit_for_test
+            .store(bytes, std::sync::atomic::Ordering::Release);
     }
 
     /// Reserve ingress bytes after one coordinated pressure seal and single retry.
@@ -240,10 +302,21 @@ fn record_accepted_frame(rows_accepted: u64, elapsed: std::time::Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::ScribeImpl;
-    use crate::contracts::ScribeError;
+    use super::{ScribeImpl, validate_decoded_request_size};
+    use crate::catalog::TableRef;
+    use crate::contracts::{Scribe, ScribeAppend, ScribeError};
+    use crate::namespaces::BifrostNamespace;
+    use crate::schema::SchemaFingerprint;
     use crate::scribe::memory::MemoryCategory;
+    use arrow::array::{StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::request_id::RequestId;
 
     /// The admission memory path rejects with `IngestBusy` **only** when the
     /// coordinated pressure seal cannot free ingress capacity (the D83
@@ -282,6 +355,108 @@ mod tests {
             .expect("admits once ingress capacity is available");
         drop(admitted);
 
+        scribe
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+    }
+
+    /// An oversized decoded request is refused at the pre-WAL size gate while
+    /// the exact ceiling remains available to a subsequent bounded request.
+    #[tokio::test]
+    async fn oversized_decoded_request_is_rejected_before_wal_append() {
+        let limit = 64 * 1024;
+        assert!(matches!(
+            validate_decoded_request_size(limit, 1, limit),
+            Err(ScribeError::DecodedPayloadTooLarge {
+                bytes,
+                limit: actual_limit,
+            }) if bytes == limit + 1 && actual_limit == limit
+        ));
+        assert_eq!(
+            validate_decoded_request_size(48 * 1024, 16 * 1024, limit)
+                .expect("request at the exact decoded ceiling is valid"),
+            limit
+        );
+        assert!(matches!(
+            validate_decoded_request_size(usize::MAX, 1, limit),
+            Err(ScribeError::DecodedPayloadTooLarge {
+                bytes: usize::MAX,
+                limit: actual_limit,
+            }) if actual_limit == limit
+        ));
+        let scribe = ScribeImpl::new();
+        scribe.set_decoded_request_limit_for_test(limit);
+        let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::new(),
+        };
+        let make_append = |value: String| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(
+                    "wyrd_event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+            let rows = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![
+                            chrono::Utc::now().timestamp_micros(),
+                        ])
+                        .with_timezone("UTC"),
+                    ),
+                    Arc::new(StringArray::from(vec![value])),
+                ],
+            )
+            .expect("decoded-size fixture batch");
+            ScribeAppend {
+                principal: principal.clone(),
+                table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
+                schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema.as_ref()),
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: 0,
+                rows,
+            }
+        };
+        let admission_before = scribe.admission_snapshot();
+        let memory_before = scribe.memory_snapshot();
+        let wal_before = scribe.wal_bytes_on_disk();
+        let stats_before = scribe
+            .memtable_stats()
+            .expect("pre-rejection memtable stats");
+        let error = scribe
+            .append_durable(make_append("x".repeat(limit)))
+            .await
+            .expect_err("decoded request above 64 KiB must fail");
+        assert!(matches!(
+            error,
+            ScribeError::DecodedPayloadTooLarge {
+                bytes,
+                limit: actual_limit,
+            } if bytes > limit && actual_limit == limit
+        ));
+        assert_eq!(scribe.admission_snapshot(), admission_before);
+        assert_eq!(scribe.memory_snapshot(), memory_before);
+        assert_eq!(scribe.wal_bytes_on_disk(), wal_before);
+        assert_eq!(
+            scribe
+                .memtable_stats()
+                .expect("post-rejection memtable stats"),
+            stats_before
+        );
+        scribe
+            .append_durable(make_append("small".to_owned()))
+            .await
+            .expect("sub-limit request remains durably admissible");
+        assert!(scribe.wal_bytes_on_disk() > wal_before);
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await;

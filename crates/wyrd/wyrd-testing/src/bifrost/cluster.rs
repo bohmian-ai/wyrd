@@ -11,6 +11,7 @@ use sqlx::Row;
 use thiserror::Error;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::{
     OraclePeerCredentials, OraclePeerTls, TonicOraclePeerTransport,
@@ -116,6 +117,8 @@ pub struct BifrostNodeSpec {
     pub roles: BTreeSet<BifrostRuntimeRole>,
     /// Optional Oracle-local resource placement.
     pub oracle: Option<TestOracleResources>,
+    /// Optional accelerated role cadence applied only by test-support builders.
+    pub role_timing: Option<RoleTiming>,
 }
 
 /// Non-empty concrete topology descriptor used by journeys and calibration.
@@ -226,6 +229,7 @@ impl BifrostClusterSpec {
             node_id: NodeId::new(uuid::Uuid::from_u128(id)),
             roles: roles.into_iter().collect(),
             oracle: None,
+            role_timing: None,
         }
     }
 
@@ -1686,6 +1690,9 @@ impl WyrdTestCluster {
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
             .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
             .with_telemetry(Arc::clone(&process_telemetry()?.guard));
+        if let Some(timing) = resources.spec.role_timing {
+            builder = builder.with_role_timing_for_test(timing);
+        }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);
         if let Some(observer) = &self.forge_completion_observer {

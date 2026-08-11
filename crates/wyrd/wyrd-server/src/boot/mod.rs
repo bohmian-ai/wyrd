@@ -13,6 +13,8 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+#[cfg(feature = "test-support")]
+use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectPages, ForgeObjectStore,
@@ -1597,6 +1599,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
         advertise_addr,
         peer_credentials,
         None,
+        None,
     )
     .await
 }
@@ -1610,9 +1613,14 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
     advertise_addr: String,
     peer_credentials: Arc<dyn OraclePeerCredentials>,
     audit_wal_root: Option<std::path::PathBuf>,
+    role_timing: Option<RoleTiming>,
 ) -> Result<AppState, ServerBootError> {
     let node_id = ClusterNodeId::new(node_id.as_uuid());
-    let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
+    let cluster = Arc::new(if let Some(timing) = role_timing {
+        ClusterRegistry::new_with_role_timing(state.postgres.vala().clone(), node_id, timing)
+    } else {
+        ClusterRegistry::new(state.postgres.vala().clone(), node_id)
+    });
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
     config.bifrost.oracle.audit_wal_root =
@@ -1656,6 +1664,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
             server_name,
             audit_wal_root: None,
         },
+        None,
     )
     .await
 }
@@ -1680,9 +1689,14 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
     advertise_addr: String,
     peer_credentials: Arc<dyn OraclePeerCredentials>,
     tls: TestOracleTlsAttachment,
+    role_timing: Option<RoleTiming>,
 ) -> Result<AppState, ServerBootError> {
     let node_id = ClusterNodeId::new(node_id.as_uuid());
-    let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
+    let cluster = Arc::new(if let Some(timing) = role_timing {
+        ClusterRegistry::new_with_role_timing(state.postgres.vala().clone(), node_id, timing)
+    } else {
+        ClusterRegistry::new(state.postgres.vala().clone(), node_id)
+    });
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
     config.bifrost.oracle.audit_wal_root = Some(

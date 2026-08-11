@@ -1246,9 +1246,13 @@ impl ExecutionPlan for ReconcileExec {
                     spill = Some(ReconcileSpill::start(prior, batch).await?);
                     continue;
                 }
-                let reservation = memory.governor.try_reserve_parent(batch_bytes).map_err(|error| {
-                    DataFusionError::ResourcesExhausted(error.to_string())
-                })?;
+                let reservation = memory
+                    .governor
+                    .try_reserve_parent_classified(
+                        batch_bytes,
+                        MemoryPurpose::OracleReconciliation,
+                    )
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 reservations.push(match &telemetry {
                     Some((telemetry, query_class)) => ReconcileMemoryReservation::Accounted(
                         telemetry.account_memory(
@@ -1711,8 +1715,11 @@ impl FinishedReconcileSpill {
                 let decoded = batch.map_err(DataFusionError::from).and_then(|batch| {
                     let reservation = memory
                         .governor
-                        .try_reserve_parent(batch.get_array_memory_size())
-                        .map_err(|error| DataFusionError::ResourcesExhausted(error.to_string()))?;
+                        .try_reserve_parent_classified(
+                            batch.get_array_memory_size(),
+                            MemoryPurpose::OracleReconciliation,
+                        )
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
                     Ok((batch, reservation))
                 });
                 if sender.blocking_send(decoded).is_err() {
@@ -2111,7 +2118,7 @@ fn hot_stream(
                         batch.get_array_memory_size(),
                         MemoryPurpose::OracleHotDecodedBatch,
                     )
-                    .map_err(|error| DataFusionError::ResourcesExhausted(error.to_string()))?;
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 let decoded_reservation = telemetry.account_oracle_memory(
                     decoded_reservation,
                     query_class,

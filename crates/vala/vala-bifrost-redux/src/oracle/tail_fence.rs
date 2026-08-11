@@ -766,11 +766,10 @@ impl TailFenceDrainer<'_> {
                 }
             };
             for batch in page.batches {
-                let Ok(reservation) = self
-                    .memory
-                    .governor
-                    .try_reserve_parent(batch.get_array_memory_size())
-                else {
+                let Ok(reservation) = self.memory.governor.try_reserve_parent_classified(
+                    batch.get_array_memory_size(),
+                    MemoryPurpose::OracleQuery,
+                ) else {
                     self.release_one(&mut acquired).await;
                     return Err((table, BifrostError::QueryVisibilityUnavailable));
                 };

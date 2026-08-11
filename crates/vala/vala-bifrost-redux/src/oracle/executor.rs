@@ -34,7 +34,7 @@ use super::fragment::{
     ClosedLeafPredicate, LeafComparison, LeafScalar, SealedScanFile, SealedScanFragment,
 };
 use super::query_class_label;
-use crate::scribe::memory::BifrostMemoryGovernor;
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryPurpose};
 
 /// Worker-owned physical demand collected for one sealed fragment attempt.
 #[derive(Debug)]
@@ -535,7 +535,7 @@ impl SealedFragmentExecutor {
                 let estimate = usize::try_from(fragment.estimated_bytes)
                     .map_err(|_| ExecutorError::Capacity)?;
                 governor
-                    .try_reserve_parent(estimate)
+                    .try_reserve_parent_classified(estimate, MemoryPurpose::OracleQuery)
                     .map_err(|_| ExecutorError::Capacity)
             })
             .transpose()?;

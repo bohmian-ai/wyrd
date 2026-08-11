@@ -1076,13 +1076,36 @@ impl BifrostMemoryGovernor {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngestBusy`] when the cgroup is saturated or
-    /// when the reservation would exceed the parent ceiling.
+    /// Returns [`ScribeError::IngestBusy`] when the cgroup is saturated or the
+    /// reservation would exceed the parent ceiling. Returns
+    /// [`ScribeError::Internal`] when arithmetic overflow or prior governor
+    /// poison makes accounting unsafe.
     pub fn try_reserve_parent(&self, bytes: usize) -> Result<ParentMemoryReservation, ScribeError> {
-        self.try_reserve_parent_bytes(bytes)?;
+        self.try_reserve_parent_classified(bytes, MemoryPurpose::ForgeWorkspace)
+            .map_err(MemoryRejection::into_scribe_error)
+    }
+
+    /// Reserves parent-only bytes while retaining the requesting role in failures.
+    ///
+    /// Oracle reconciliation uses this path so a parent-capacity refusal remains
+    /// typed through `DataFusion`; Forge callers retain the public compatibility
+    /// projection through [`Self::try_reserve_parent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed rejection when cgroup pressure, parent occupancy, an
+    /// indivisible request, arithmetic corruption, or governor poison prevents
+    /// the reservation.
+    pub(crate) fn try_reserve_parent_classified(
+        &self,
+        bytes: usize,
+        purpose: MemoryPurpose,
+    ) -> Result<ParentMemoryReservation, MemoryRejection> {
+        self.try_reserve_parent_bytes_classified(bytes, purpose)?;
         Ok(ParentMemoryReservation {
             governor: self.clone(),
             bytes,
+            purpose,
         })
     }
 
@@ -1091,31 +1114,47 @@ impl BifrostMemoryGovernor {
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] when cgroup pressure is at 100% or
-    /// when the parent ceiling would be exceeded.
+    /// the parent ceiling would be exceeded. Returns [`ScribeError::Internal`]
+    /// for counter overflow or a previously poisoned governor.
     fn try_reserve_parent_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
+        self.try_reserve_parent_bytes_classified(bytes, MemoryPurpose::ForgeWorkspace)
+            .map_err(MemoryRejection::into_scribe_error)
+    }
+
+    /// Reserves bytes against only the parent while preserving typed diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed rejection for cgroup pressure, parent ceiling refusal,
+    /// counter overflow, or a poisoned governor.
+    fn try_reserve_parent_bytes_classified(
+        &self,
+        bytes: usize,
+        purpose: MemoryPurpose,
+    ) -> Result<(), MemoryRejection> {
         if bytes > 0 && self.is_poisoned() {
-            return Err(ScribeError::Internal {
-                detail: self
-                    .poisoned_rejection(MemoryPurpose::ForgeWorkspace, bytes)
-                    .to_string(),
-            });
+            return Err(self.poisoned_rejection(purpose, bytes));
         }
         if bytes > 0
             && let Some((current, limit)) = self.cgroup_pressure()
             && current.saturating_mul(100) >= limit.saturating_mul(100)
         {
-            return Err(ScribeError::IngestBusy {
-                table: "bifrost-parent".to_owned(),
-            });
+            return Err(MemoryRejection::new(
+                MemoryRejectionKind::Occupied,
+                purpose,
+                MemoryCeiling::CgroupParent,
+                bytes,
+                current,
+                limit,
+            ));
         }
         reserve_with_limit_diagnostic(
             &self.inner.bifrost_total_bytes,
             self.bifrost_limit_bytes(),
             bytes,
-            MemoryPurpose::ForgeWorkspace,
+            purpose,
             MemoryCeiling::BifrostParent,
         )
-        .map_err(MemoryRejection::into_scribe_error)
     }
 
     /// Reserve bytes against the Oracle child limit and the parent ceiling.
@@ -1732,12 +1771,17 @@ impl Drop for OracleMemoryReservation {
 
 /// RAII reservation against the Bifrost parent that is not owned by any child.
 ///
-/// Forge rewrite workspaces use this type. Dropping it releases only the
-/// parent counter, leaving both child totals untouched.
+/// Forge rewrite workspaces and Oracle parent-only query or reconciliation
+/// ownership use this type. Dropping it releases only the parent counter,
+/// leaving both child totals untouched.
 #[derive(Debug)]
 pub struct ParentMemoryReservation {
+    /// Shared governor whose parent counter owns these bytes.
     governor: BifrostMemoryGovernor,
+    /// Exact parent-only bytes released on drop.
     bytes: usize,
+    /// Role retained for typed cleanup diagnostics and poison reporting.
+    purpose: MemoryPurpose,
 }
 
 impl ParentMemoryReservation {
@@ -1758,7 +1802,7 @@ impl Drop for ParentMemoryReservation {
         if let Err(rejection) = self.governor.release_counter_only(
             &self.governor.inner.bifrost_total_bytes,
             self.bytes,
-            MemoryPurpose::ForgeWorkspace,
+            self.purpose,
         ) {
             tracing::error!(error = %rejection, "parent memory cleanup poisoned accounting");
         }

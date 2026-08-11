@@ -8,7 +8,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use wyrd_spec::vala::api::{WorkerAttemptFrame, WorkerFooter};
 
-use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryPurpose, ParentMemoryReservation};
 
 /// Validated whole attempt returned to the leader.
 #[derive(Debug)]
@@ -173,7 +173,7 @@ impl AttemptBuffer {
         let mut buffer = Self::with_spill_limit(limit, memory_limit);
         buffer.memory_reservation = Some(
             governor
-                .try_reserve_parent(buffer.memory_limit)
+                .try_reserve_parent_classified(buffer.memory_limit, MemoryPurpose::OracleQuery)
                 .map_err(|_| AttemptError::ParentCapacity)?,
         );
         Ok(buffer)

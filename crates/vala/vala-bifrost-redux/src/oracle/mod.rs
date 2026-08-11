@@ -3375,6 +3375,25 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::atomic::AtomicUsize;
 
+    /// Parent contention in reconciliation remains a typed retryable query refusal.
+    #[test]
+    fn reconciliation_parent_refusal_survives_datafusion_source_chain() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let retained = governor
+            .try_reserve_parent(governor.bifrost_limit_bytes())
+            .expect("fill parent ceiling");
+        let rejection = governor
+            .try_reserve_parent_classified(1, MemoryPurpose::OracleReconciliation)
+            .expect_err("occupied parent rejects reconciliation");
+        let error = datafusion::error::DataFusionError::External(Box::new(rejection));
+        assert_eq!(
+            map_datafusion_error(&error),
+            BifrostError::QueryAdmissionRejected
+        );
+        drop(retained);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
+    }
+
     /// Synthetic first-batch owner exposing cleanup and final-drop observations.
     struct FirstBatchOwner {
         /// Stable identity proving the ready path returns the same owner.

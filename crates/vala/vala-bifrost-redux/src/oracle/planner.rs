@@ -13,8 +13,6 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::default_table_source::DefaultTableSource;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use wyrd_spec::vala::api::ClusterCapabilities;
 
@@ -232,33 +230,20 @@ impl OraclePlanner {
         .map_err(|error| map_datafusion_error(&error))
     }
 
-    /// Creates one physical plan over the shared Oracle-child memory governor.
+    /// Creates one physical plan in the admitted query's governed session.
     ///
-    /// The fresh session owns a `for_oracle` pool backed by the process-wide
-    /// governor, so typed-plan execution shares the same child and parent
-    /// ceilings as SQL execution. Cancellation drops the `DataFusion` planning
-    /// future and returns no session or executable plan, so no partially
-    /// prepared execution escapes.
+    /// The caller supplies the same query-owned memory and disk runtime used by
+    /// SQL execution. Cancellation drops the `DataFusion` planning future and
+    /// returns no session or executable plan, so no partially prepared
+    /// execution escapes.
     ///
     /// # Errors
-    /// Returns query execution failure when `DataFusion` cannot construct the
-    /// governed runtime or lower the plan.
+    /// Returns query execution failure when `DataFusion` cannot lower the plan
+    /// in the supplied governed session.
     pub(super) async fn create_physical_plan(
         plan: &datafusion::logical_expr::LogicalPlan,
-        memory: &OracleMemoryResources,
+        session: SessionContext,
     ) -> Result<(SessionContext, Arc<dyn ExecutionPlan>), BifrostError> {
-        let pool = Arc::new(
-            crate::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(memory.governor.clone()),
-        );
-        let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(pool)
-            .build()
-            .map_err(|error| map_datafusion_error(&error))?;
-        let state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_runtime_env(Arc::new(runtime))
-            .build();
-        let session = SessionContext::new_with_state(state);
         let physical = session
             .state()
             .create_physical_plan(plan)

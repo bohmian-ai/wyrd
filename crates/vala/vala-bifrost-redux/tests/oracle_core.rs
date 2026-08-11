@@ -344,6 +344,8 @@ struct OracleFixture {
     role: RegisteredRole,
     /// Warehouse lifetime.
     _warehouse: tempfile::TempDir,
+    /// Pod-local Oracle spill root lifetime.
+    spill_root: tempfile::TempDir,
 }
 
 /// One persisted hot fixture and the exact physical batch written to Parquet.
@@ -359,6 +361,43 @@ struct SeededHotRows {
 }
 
 impl OracleFixture {
+    /// Counts every owned process/query scratch descendant beneath this fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a scratch directory cannot be inspected during a lifecycle assertion.
+    #[cfg(feature = "test-support")]
+    fn spill_descendant_count(&self) -> usize {
+        /// Recursively counts descendants without following symlinks.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the test-owned directory cannot be read or classified.
+        fn count(path: &std::path::Path) -> usize {
+            if !path.exists() {
+                return 0;
+            }
+            std::fs::read_dir(path)
+                .expect("test spill directory must remain readable")
+                .map(|entry| {
+                    let entry = entry.expect("test spill entry must be readable");
+                    let nested = if entry
+                        .file_type()
+                        .expect("test spill entry type must be readable")
+                        .is_dir()
+                    {
+                        count(&entry.path())
+                    } else {
+                        0
+                    };
+                    1 + nested
+                })
+                .sum()
+        }
+
+        count(&self.spill_root.path().join("oracle-spill"))
+    }
+
     /// Creates a real tenant-qualified empty Iceberg table and Oracle role.
     ///
     /// # Panics
@@ -368,6 +407,7 @@ impl OracleFixture {
         let pg = PgFixture::start().await.expect("managed Postgres fixture");
         let tenant = pg.data_tenant_id();
         let warehouse = tempfile::tempdir().expect("warehouse");
+        let spill_root = tempfile::tempdir().expect("Oracle spill root");
         let storage = StorageHandle::from_settings(StorageSettings {
             backend: BackendConfig::Local {
                 root: warehouse.path().to_path_buf(),
@@ -435,6 +475,7 @@ impl OracleFixture {
             cluster,
             role,
             _warehouse: warehouse,
+            spill_root,
         }
     }
 
@@ -571,6 +612,11 @@ impl OracleFixture {
                 governor: BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor"),
                 reconciliation_limit_bytes,
             },
+            spill_runtime: vala_bifrost_redux::oracle::OracleSpillRuntime::new(
+                &self.spill_root.path().join("oracle-spill"),
+                config.spill_bytes,
+            )
+            .expect("Oracle spill runtime"),
             tails,
             audit,
             peer_ticket_minter: Arc::new(
@@ -1518,7 +1564,7 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_audit_fail
         .query_sql(
             fixture.context(),
             BifrostQueryRequest {
-                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
+                sql: format!("SELECT value FROM {} ORDER BY value", fixture.table.fqn()),
                 visibility: VisibilityMode::PublishedOnly,
                 freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(5_000),
@@ -2779,6 +2825,187 @@ async fn typed_fused_success_commits_one_decision_and_output() {
         QueryTerminalOutcome::Success
     );
     assert_eq!(decisions.load(Ordering::SeqCst), 1);
+    shutdown_oracle(&oracle).await;
+}
+
+/// Typed first-lookahead failure releases its admitted query and disk runtime.
+///
+/// # Panics
+///
+/// Panics when the real typed provider/session path does not fail on the
+/// tenant tripwire or does not restore exact admission and scratch baselines.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn typed_first_batch_error_releases_admission_and_query_scratch() {
+    let fixture = OracleFixture::new("oracle_typed_runtime_cleanup").await;
+    let foreign = DataTenantId::new_v7();
+    let _ = fixture.seed_hot_rows(&[(1, foreign)]).await;
+    let config = OracleConfig {
+        interactive_slots: 1,
+        analytical_slots: 1,
+        single_tenant_ceiling: 1,
+        multi_tenant_ceiling: 1,
+        ..OracleConfig::default()
+    };
+    let exact_share = config.spill_bytes;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            config,
+        )
+        .await;
+    let baseline = oracle.runtime_inspection();
+    let scratch_baseline = fixture.spill_descendant_count();
+    assert_eq!(baseline.active_queries, 0);
+    assert_eq!(baseline.reserved_spill_bytes, 0);
+
+    let plan = oracle
+        .typed_dataframe(fixture.tenant, &fixture.table.fqn())
+        .await
+        .expect("typed dataframe")
+        .into_optimized_plan()
+        .expect("typed plan");
+    let error = oracle
+        .query_plan(
+            fixture.context(),
+            plan,
+            QueryOptions {
+                visibility: VisibilityMode::PublishedOnly,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .await
+        .expect_err("typed first lookahead must reject the foreign row");
+    assert_eq!(error, BifrostError::QueryTenantInvariant);
+    let restored = oracle.runtime_inspection();
+    assert_eq!(restored.active_queries, baseline.active_queries);
+    assert_eq!(restored.reserved_spill_bytes, baseline.reserved_spill_bytes);
+    assert_eq!(fixture.spill_descendant_count(), scratch_baseline);
+    assert!(exact_share > 0, "configured spill share must be nonzero");
+    shutdown_oracle(&oracle).await;
+}
+
+/// Dropping a real interactive SQL stream releases its zero-share runtime.
+///
+/// # Panics
+///
+/// Panics when SQL does not retain the admitted owner through stream lifetime or
+/// when stream drop fails to restore exact admission and scratch baselines.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn sql_stream_drop_releases_admission_and_query_scratch() {
+    let fixture = OracleFixture::new("oracle_sql_runtime_cleanup").await;
+    let _ = fixture.seed_hot_rows(&[(1, fixture.tenant)]).await;
+    let config = OracleConfig {
+        interactive_slots: 1,
+        analytical_slots: 1,
+        single_tenant_ceiling: 1,
+        multi_tenant_ceiling: 1,
+        ..OracleConfig::default()
+    };
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            config,
+        )
+        .await;
+    let baseline = oracle.runtime_inspection();
+    let scratch_baseline = fixture.spill_descendant_count();
+    assert_eq!(baseline.active_queries, 0);
+    assert_eq!(baseline.reserved_spill_bytes, 0);
+
+    let stream = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT * FROM {}", fixture.table.fqn()),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect("real SQL stream must start");
+    let active = oracle.runtime_inspection();
+    assert_eq!(active.active_queries, 1);
+    assert_eq!(active.reserved_spill_bytes, 0);
+    assert_eq!(fixture.spill_descendant_count(), scratch_baseline);
+
+    drop(stream);
+    let restored = oracle.runtime_inspection();
+    assert_eq!(restored.active_queries, baseline.active_queries);
+    assert_eq!(restored.reserved_spill_bytes, baseline.reserved_spill_bytes);
+    assert_eq!(fixture.spill_descendant_count(), scratch_baseline);
+    shutdown_oracle(&oracle).await;
+}
+
+/// Dropping a real typed stream releases its exact spill grant and query scratch.
+///
+/// # Panics
+///
+/// Panics when typed execution bypasses the admitted spill share or when stream
+/// drop fails to restore exact admission and scratch baselines.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn typed_stream_drop_releases_admission_and_query_scratch() {
+    let fixture = OracleFixture::new("oracle_typed_stream_cleanup").await;
+    let _ = fixture.seed_hot_rows(&[(1, fixture.tenant)]).await;
+    let config = OracleConfig {
+        interactive_slots: 1,
+        analytical_slots: 1,
+        single_tenant_ceiling: 1,
+        multi_tenant_ceiling: 1,
+        ..OracleConfig::default()
+    };
+    let exact_share = config.spill_bytes;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            config,
+        )
+        .await;
+    let baseline = oracle.runtime_inspection();
+    let scratch_baseline = fixture.spill_descendant_count();
+    let plan = oracle
+        .typed_dataframe(fixture.tenant, &fixture.table.fqn())
+        .await
+        .expect("typed dataframe")
+        .into_optimized_plan()
+        .expect("typed plan");
+    let stream = oracle
+        .query_plan(
+            fixture.context(),
+            plan,
+            QueryOptions {
+                visibility: VisibilityMode::PublishedOnly,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .await
+        .expect("real typed stream must start");
+    let active = oracle.runtime_inspection();
+    assert_eq!(active.active_queries, 1);
+    assert_eq!(active.reserved_spill_bytes, exact_share);
+    assert_eq!(
+        fixture.spill_descendant_count(),
+        scratch_baseline,
+        "a fully materialized first batch must not retain idle query scratch"
+    );
+
+    drop(stream);
+    let restored = oracle.runtime_inspection();
+    assert_eq!(restored.active_queries, baseline.active_queries);
+    assert_eq!(restored.reserved_spill_bytes, baseline.reserved_spill_bytes);
+    assert_eq!(fixture.spill_descendant_count(), scratch_baseline);
     shutdown_oracle(&oracle).await;
 }
 

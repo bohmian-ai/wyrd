@@ -989,6 +989,12 @@ impl Drop for AdmittedQueryGuard {
 }
 
 impl AdmittedQueryGuard {
+    /// Returns the immutable spill share retained by this admitted query.
+    #[must_use]
+    pub(super) fn spill_limit_bytes(&self) -> u64 {
+        self.local_permit.as_ref().map_or(0, |permit| permit.spill)
+    }
+
     /// Attaches exact query-keyed ownership after live-tail drain completes.
     #[cfg(feature = "test-support")]
     pub(super) fn attach_resource_probe(&mut self) -> Arc<QueryResourceProbe> {

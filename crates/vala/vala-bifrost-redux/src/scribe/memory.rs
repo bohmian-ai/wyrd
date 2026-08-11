@@ -289,6 +289,22 @@ impl MemoryRejection {
         rejection
     }
 
+    /// Constructs one exact rejection kind for sibling-module mapping tests.
+    ///
+    /// The production path always derives these operands from governed counters;
+    /// this test-only seam isolates boundary projection without mutating them.
+    #[cfg(test)]
+    pub(crate) fn for_mapping_test(kind: MemoryRejectionKind) -> Self {
+        Self::new(
+            kind,
+            MemoryPurpose::OracleQuery,
+            MemoryCeiling::OracleChild,
+            3,
+            5,
+            7,
+        )
+    }
+
     /// Return the refusal category.
     pub(crate) const fn kind(self) -> MemoryRejectionKind {
         self.kind

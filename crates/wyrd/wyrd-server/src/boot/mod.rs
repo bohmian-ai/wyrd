@@ -28,7 +28,7 @@ use vala_bifrost_redux::oracle::dispatcher::{
 use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
 use vala_bifrost_redux::oracle::{
     Oracle, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-    TailTransportDirectory,
+    OracleSpillRuntime, TailTransportDirectory,
 };
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
@@ -1334,6 +1334,19 @@ impl<'a> OracleRoleBuilder<'a> {
         let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
         let peer_transports =
             OraclePeerTransportDirectory::new(node_id, local_transport, remote_transport);
+        let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
+        let spill_runtime = match OracleSpillRuntime::new(
+            &wal_dir.join("oracle-spill"),
+            config.bifrost.oracle.spill_limit_bytes,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                release_failed_oracle_role(&cluster, &role, "spill runtime construction").await;
+                return Err(ServerBootError::OraclePeer(error.to_string()));
+            }
+        };
         let oracle = match Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(catalog),
             vala: state.postgres.vala().clone(),
@@ -1344,6 +1357,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 governor: memory,
                 reconciliation_limit_bytes,
             },
+            spill_runtime,
             tails: Arc::new(TailTransportDirectory::default()),
             audit: audit.clone(),
             peer_ticket_minter,

@@ -64,6 +64,8 @@ pub mod fragment;
 pub mod peer;
 mod planner;
 mod query_stream;
+mod spill;
+pub use spill::OracleSpillRuntime;
 
 /// Return the process-local query lifecycle observer used by test journeys.
 #[cfg(feature = "test-support")]
@@ -1202,6 +1204,8 @@ pub struct OracleBuildConfig {
     pub local_slots: Arc<OracleSlotManager>,
     /// Parent memory and spill resources.
     pub memory: OracleMemoryResources,
+    /// Process-lifetime owner of pod-local Oracle query scratch.
+    pub spill_runtime: OracleSpillRuntime,
     /// Table-local tail transports.
     pub tails: Arc<TailTransportDirectory>,
     /// Read/security audit collaborator.
@@ -1436,6 +1440,8 @@ pub struct Oracle {
     vala: ValaPostgres,
     /// Parent-governed query memory and spill configuration.
     memory: OracleMemoryResources,
+    /// Process-lifetime owner used to construct bounded query disk managers.
+    spill_runtime: OracleSpillRuntime,
     /// Table-local Scribe tail transport directory.
     tails: Arc<TailTransportDirectory>,
     /// Query-scoped Scribe-tail ticket signer, when the server has a Scribe role.
@@ -1635,6 +1641,7 @@ impl Oracle {
             catalog: config.catalog,
             vala: config.vala,
             memory: config.memory,
+            spill_runtime: config.spill_runtime,
             tails: config.tails,
             tail_ticket_minter: config.tail_ticket_minter,
             tail_discovery: config.tail_discovery,
@@ -2172,8 +2179,8 @@ impl Oracle {
             })
             .await?;
         let rewritten = OraclePlanner::replace_typed_sources(plan, &providers)?;
-        let (session, physical) =
-            OraclePlanner::create_physical_plan(&rewritten, &self.memory).await?;
+        let session = self.execution_session(&admitted)?;
+        let (session, physical) = OraclePlanner::create_physical_plan(&rewritten, session).await?;
         let scan_stats = OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();
         let mut batches = execute_stream(physical, session.task_ctx())
@@ -2386,7 +2393,7 @@ impl Oracle {
         mut input: SqlCutInput<'_>,
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
-        let session = self.execution_session()?;
+        let session = self.execution_session(input.admitted)?;
         for cut in input.cuts {
             let table_name = cut.binding.table_ref.fqn();
             let mut hot_files = self.local_hot_sources(&cut)?;
@@ -2503,28 +2510,31 @@ impl Oracle {
         Ok(())
     }
 
-    /// Builds one Oracle execution session over the process-wide governed pool.
+    /// Builds one Oracle execution session over governed memory and query spill.
     ///
-    /// Every SQL attempt receives a fresh `DataFusion` session while all attempts
-    /// share the same Oracle-child and parent counters through the cloned governor.
+    /// Every attempt receives a fresh `DataFusion` session. All attempts share
+    /// Oracle-child and parent memory counters, while the admitted guard's
+    /// immutable spill share becomes this session's exact disk ceiling.
     ///
     /// # Errors
     ///
     /// Returns a stable execution error when `DataFusion` cannot construct the
     /// runtime environment.
-    fn execution_session(&self) -> Result<SessionContext, BifrostError> {
+    fn execution_session(
+        &self,
+        admitted: &AdmittedQueryGuard,
+    ) -> Result<SessionContext, BifrostError> {
         let pool = Arc::new(
             crate::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(
                 self.memory.governor.clone(),
             ),
         );
-        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
-            .with_memory_pool(pool)
-            .build()
-            .map_err(|error| map_datafusion_error(&error))?;
+        let runtime = self
+            .spill_runtime
+            .build_query_runtime(pool, admitted.spill_limit_bytes())?;
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
-            .with_runtime_env(Arc::new(runtime))
+            .with_runtime_env(runtime)
             .build();
         Ok(SessionContext::new_with_state(state))
     }
@@ -3250,6 +3260,12 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     if let Some(rejection) = MemoryRejection::from_source_chain(error) {
         return map_memory_rejection(rejection);
     }
+    if matches!(
+        error,
+        datafusion::error::DataFusionError::ResourcesExhausted(_)
+    ) {
+        return BifrostError::QueryAdmissionRejected;
+    }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("tenant invariant") {
         BifrostError::QueryTenantInvariant
@@ -3375,23 +3391,43 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::atomic::AtomicUsize;
 
-    /// Parent contention in reconciliation remains a typed retryable query refusal.
+    /// Every typed governor kind wins over generic DataFusion capacity mapping.
     #[test]
-    fn reconciliation_parent_refusal_survives_datafusion_source_chain() {
-        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
-        let retained = governor
-            .try_reserve_parent(governor.bifrost_limit_bytes())
-            .expect("fill parent ceiling");
-        let rejection = governor
-            .try_reserve_parent_classified(1, MemoryPurpose::OracleReconciliation)
-            .expect_err("occupied parent rejects reconciliation");
-        let error = datafusion::error::DataFusionError::External(Box::new(rejection));
+    fn datafusion_capacity_mapping_preserves_all_typed_memory_kinds() {
+        for (kind, expected) in [
+            (
+                MemoryRejectionKind::Occupied,
+                BifrostError::QueryAdmissionRejected,
+            ),
+            (
+                MemoryRejectionKind::RequestTooLarge,
+                BifrostError::QueryMemoryRequestTooLarge,
+            ),
+            (
+                MemoryRejectionKind::CounterOverflow,
+                BifrostError::QueryMemoryRequestTooLarge,
+            ),
+            (
+                MemoryRejectionKind::AccountingPoisoned,
+                BifrostError::QueryExecutionFailed,
+            ),
+        ] {
+            let rejection = MemoryRejection::for_mapping_test(kind);
+            let error = datafusion::error::DataFusionError::External(Box::new(rejection));
+            assert_eq!(map_datafusion_error(&error), expected, "kind={kind:?}");
+        }
+    }
+
+    /// Generic DataFusion resource exhaustion is classified structurally as capacity.
+    #[test]
+    fn datafusion_resource_exhaustion_maps_to_query_admission_rejected() {
+        let error = datafusion::error::DataFusionError::ResourcesExhausted(
+            "message intentionally contains no capacity keyword".to_owned(),
+        );
         assert_eq!(
             map_datafusion_error(&error),
             BifrostError::QueryAdmissionRejected
         );
-        drop(retained);
-        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
     }
 
     /// Synthetic first-batch owner exposing cleanup and final-drop observations.

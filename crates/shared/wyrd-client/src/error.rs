@@ -186,6 +186,8 @@ fn bifrost_error_from_code(
                 .to_owned(),
         },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
+        "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE" => BifrostError::QueryMemoryRequestTooLarge,
+        "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => BifrostError::QueryExecutionFailed,
         "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE" => {
             let (value, past_bound, future_bound) = event_time_window_bounds_from_message(message);
             BifrostError::EventTimeOutOfRange {
@@ -302,6 +304,17 @@ mod tests {
         }));
         assert_eq!(admission.status(), 429);
         assert_eq!(admission.code(), "WYRD_VALA_429_QUERY_ADMISSION_REJECTED");
+
+        let oversized = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
+            "detail": "query memory request too large",
+            "details": {},
+        }));
+        assert_eq!(oversized.status(), 422);
+        assert_eq!(
+            oversized.code(),
+            "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE"
+        );
     }
 
     /// Proves the stable `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE` code
@@ -404,6 +417,42 @@ mod tests {
         use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
         use crate::error::{from_grpc_status, from_problem_json};
+
+        /// Capacity and poison codes reconstruct identically across both transports.
+        #[test]
+        fn capacity_http_and_grpc_reconstruct_retryability_identically() {
+            for (code, status, grpc_code) in [
+                (
+                    "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+                    429,
+                    Code::ResourceExhausted,
+                ),
+                (
+                    "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
+                    422,
+                    Code::InvalidArgument,
+                ),
+                ("WYRD_VALA_500_QUERY_EXECUTION_FAILED", 500, Code::Internal),
+            ] {
+                let details = ErrorDetails::with_error_info(code, "wyrd.dev", HashMap::new());
+                let grpc = wyrd_tonic::tonic::Status::with_error_details(
+                    grpc_code,
+                    "capacity result",
+                    details,
+                );
+                let http = serde_json::json!({
+                    "code": code,
+                    "status": status,
+                    "detail": "capacity result",
+                    "details": {},
+                });
+                let from_grpc = from_grpc_status(&grpc);
+                let from_http = from_problem_json(&http);
+                assert_eq!(from_grpc.code(), code);
+                assert_eq!(from_grpc.status(), status);
+                assert_eq!(from_grpc.as_problem_json(), from_http.as_problem_json());
+            }
+        }
 
         #[test]
         fn grpc_and_http_same_code_produce_equal_wyrd_error() {

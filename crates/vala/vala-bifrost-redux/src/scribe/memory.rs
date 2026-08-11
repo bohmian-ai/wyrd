@@ -1942,8 +1942,9 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
     ///
     /// # Errors
     ///
-    /// Returns `DataFusionError::ResourcesExhausted` when the relevant limit
-    /// would be exceeded.
+    /// Returns `DataFusionError::External` with the typed Oracle rejection as
+    /// its source when an Oracle or parent ceiling refuses the request. Parent-
+    /// only Forge refusals retain their existing resources-exhausted projection.
     fn try_grow(
         &self,
         reservation: &datafusion::execution::memory_pool::MemoryReservation,
@@ -1953,13 +1954,7 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
             DataFusionPoolTarget::Oracle => self
                 .governor
                 .try_reserve_oracle_bytes_classified(additional, MemoryPurpose::OracleQuery)
-                .map_err(|error| {
-                    DataFusionError::ResourcesExhausted(format!(
-                        "Bifrost Oracle memory limit rejected {} bytes for `{}`: {error}",
-                        additional,
-                        reservation.consumer().name()
-                    ))
-                }),
+                .map_err(|error| DataFusionError::External(Box::new(error))),
             DataFusionPoolTarget::Parent => self
                 .governor
                 .try_reserve_parent_bytes(additional)

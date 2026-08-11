@@ -2394,7 +2394,12 @@ impl WyrdTestServerBuilder {
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_memory = Arc::new(
-            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(
+            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(
+                bifrost_memory.clone(),
+            ),
+        );
+        let forge_memory = Arc::new(
+            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::for_parent(
                 bifrost_memory.clone(),
             ),
         );
@@ -2412,12 +2417,9 @@ impl WyrdTestServerBuilder {
             let root = spill_root.as_ref().ok_or_else(|| {
                 WyrdTestServerError::Start("Forge spill root is unavailable".to_owned())
             })?;
-            let forge_runtime = ForgeRewriteRuntime::new(
-                query_memory.clone(),
-                root.path(),
-                forge_config.spill_limit_bytes,
-            )
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let forge_runtime =
+                ForgeRewriteRuntime::new(forge_memory, root.path(), forge_config.spill_limit_bytes)
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             let staging = Arc::new(storage.operator().clone());
             let object_store: Arc<dyn ForgeObjectStore> =
                 Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));

@@ -74,6 +74,13 @@ pub fn wyrd_error_response_from_parts(
     request_id: Option<&wyrd_spec::request_id::RequestId>,
 ) -> Response {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let retry_after = matches!(
+        &error,
+        WyrdError::AuthVerifyUnavailable { .. }
+            | WyrdError::Vala {
+                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
+            }
+    );
     let mut body = error.as_problem_json();
     if let (serde_json::Value::Object(map), Some(id)) = (&mut body, request_id) {
         map.insert(
@@ -81,7 +88,6 @@ pub fn wyrd_error_response_from_parts(
             serde_json::Value::String(format!("urn:wyrd:request:{}", id.as_str())),
         );
     }
-    let retry_after = matches!(error, WyrdError::AuthVerifyUnavailable { .. });
     match serde_json::to_vec(&body) {
         Ok(bytes) => {
             let mut response = response_with_body(status, bytes);
@@ -372,7 +378,7 @@ mod error_mapper_tests {
     }
 
     #[tokio::test]
-    async fn retry_after_only_on_verify_unavailable() {
+    async fn http_retry_after_only_for_retryable_capacity() {
         let retryable = WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
             message: "resolver unavailable".to_owned(),
             details: serde_json::json!({}),
@@ -380,6 +386,17 @@ mod error_mapper_tests {
         .into_response();
         assert_eq!(
             retryable
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let capacity = WyrdErrorResponse::from(WyrdError::from(
+            wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
+        ))
+        .into_response();
+        assert_eq!(
+            capacity
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
@@ -395,6 +412,8 @@ mod error_mapper_tests {
                 message: "audit unavailable".to_owned(),
                 details: serde_json::json!({}),
             },
+            wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge.into(),
+            wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
         ] {
             let response = WyrdErrorResponse::from(error).into_response();
             assert!(

@@ -3959,6 +3959,10 @@ mod tests {
         assert_eq!(rejection.requested(), 9);
         assert_eq!(rejection.current(), 0);
         assert_eq!(rejection.limit(), 8);
+        assert_eq!(
+            crate::oracle::map_first_batch_failure(Some(&Err(error))),
+            Some(BifrostError::QueryMemoryRequestTooLarge)
+        );
         assert!(ranges.lock().expect("recorded ranges").is_empty());
         assert_eq!(governor.snapshot().oracle_total_bytes, 0);
     }

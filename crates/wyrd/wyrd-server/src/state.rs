@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(feature = "test-support")]
+use std::time::Duration;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use datafusion::execution::memory_pool::MemoryPool;

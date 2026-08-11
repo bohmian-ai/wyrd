@@ -49,6 +49,16 @@ pub enum BifrostError {
     )]
     QueryAdmissionRejected,
 
+    /// One indivisible query memory request exceeds its governing ceiling.
+    #[error("query memory request too large")]
+    #[wyrd_error(
+        code = "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
+        status = 422,
+        title = "Query memory request too large",
+        remediation = "Reduce the requested range or query memory footprint; retrying unchanged will not succeed."
+    )]
+    QueryMemoryRequestTooLarge,
+
     /// The requested sealed or live visibility cut could not be acquired.
     #[error("query visibility unavailable")]
     #[wyrd_error(

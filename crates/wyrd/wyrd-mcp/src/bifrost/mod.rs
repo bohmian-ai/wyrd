@@ -629,6 +629,7 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::OracleRoleUnavailable,
         BifrostError::ScribeRoleUnavailable,
         BifrostError::QueryAdmissionRejected,
+        BifrostError::QueryMemoryRequestTooLarge,
         BifrostError::QueryVisibilityUnavailable,
         BifrostError::QueryTenantInvariant,
         BifrostError::QueryReconciliationInvariant,
@@ -637,6 +638,11 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::QueryStreamIncomplete,
         BifrostError::QueryAuditUnavailable,
         BifrostError::QueryExecutionFailed,
+        BifrostError::EventTimeOutOfRange {
+            value: String::new(),
+            past_bound: String::new(),
+            future_bound: String::new(),
+        },
         BifrostError::IngestAuthentication {
             message: String::new(),
         },
@@ -941,6 +947,22 @@ mod bifrost_tools {
         );
     }
 
+    /// A pre-stream permanent capacity refusal retains its 422 descriptor.
+    #[test]
+    fn bifrost_query_tool_preserves_pre_stream_422_descriptor() {
+        assert_structured_error(
+            ValaSdkError::Transport(BifrostError::QueryMemoryRequestTooLarge.into()),
+            "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
+            422,
+            "Query memory request too large",
+            "query memory request too large",
+            "Reduce the requested range or query memory footprint; retrying unchanged will not succeed.",
+            Some(json!({
+                "variant": "query_memory_request_too_large"
+            })),
+        );
+    }
+
     /// Failed terminals retain scrubbed terminal details without flattening them.
     #[test]
     fn bifrost_query_error_mapping_preserves_failed_terminal_details() {
@@ -1108,6 +1130,17 @@ mod bifrost_tools {
             codes.contains(&"WYRD_VALA_507_WAL_DISK_FULL"),
             "WAL disk full code missing from error catalog"
         );
+    }
+
+    /// The public catalog includes the permanent query-memory descriptor.
+    #[test]
+    fn bifrost_tools_list_errors_includes_query_memory_request_too_large() {
+        let descriptor = bifrost_error_catalog()
+            .into_iter()
+            .find(|entry| entry.code == "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE")
+            .expect("query memory descriptor");
+        assert_eq!(descriptor.status, 422);
+        assert!(!descriptor.remediation.contains("Retry after"));
     }
 
     #[test]

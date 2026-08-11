@@ -3761,6 +3761,11 @@ mod error_vala_tests {
                 413,
             ),
             (
+                BifrostError::QueryMemoryRequestTooLarge,
+                "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
+                422,
+            ),
+            (
                 BifrostError::QueryTimeout,
                 "WYRD_VALA_504_QUERY_TIMEOUT",
                 504,

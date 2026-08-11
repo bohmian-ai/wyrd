@@ -1,10 +1,12 @@
 //! Authenticated public Bifrost query gRPC adapter.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use futures_util::Stream;
 use wyrd_spec::error::WyrdError;
 use wyrd_tonic::tonic::{Request, Response, Status};
+use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt as _};
 use wyrd_tonic::wyrd::v1::bifrost_query_service_server::{
     BifrostQueryService, BifrostQueryServiceServer,
 };
@@ -148,18 +150,21 @@ pub(crate) fn query_stream_response(
 
 /// Converts a public Wyrd error to its closest tonic status class.
 pub(crate) fn query_status(error: WyrdError) -> Status {
-    let mut status = match error.status() {
-        400 | 422 => Status::invalid_argument(error.to_string()),
-        401 => Status::unauthenticated(error.to_string()),
-        403 => Status::permission_denied(error.to_string()),
-        404 => Status::not_found(error.to_string()),
-        409 => Status::aborted(error.to_string()),
-        429 => Status::resource_exhausted(error.to_string()),
-        503 => Status::unavailable(error.to_string()),
-        504 => Status::deadline_exceeded(error.to_string()),
-        _ => Status::internal(error.to_string()),
+    let status_code = error.status();
+    let code = match status_code {
+        400 | 422 => wyrd_tonic::tonic::Code::InvalidArgument,
+        401 => wyrd_tonic::tonic::Code::Unauthenticated,
+        403 => wyrd_tonic::tonic::Code::PermissionDenied,
+        404 => wyrd_tonic::tonic::Code::NotFound,
+        409 => wyrd_tonic::tonic::Code::Aborted,
+        429 => wyrd_tonic::tonic::Code::ResourceExhausted,
+        503 => wyrd_tonic::tonic::Code::Unavailable,
+        504 => wyrd_tonic::tonic::Code::DeadlineExceeded,
+        _ => wyrd_tonic::tonic::Code::Internal,
     };
-    if matches!(error.status(), 429 | 503) {
+    let details = ErrorDetails::with_error_info(error.code(), "wyrd.dev", HashMap::new());
+    let mut status = Status::with_error_details(code, error.to_string(), details);
+    if matches!(status_code, 429 | 503) {
         status.metadata_mut().insert(
             "retry-after-ms",
             "1000".parse().expect("static metadata is valid"),
@@ -181,6 +186,7 @@ mod tests {
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
     use wyrd_tonic::tonic::Code;
+    use wyrd_tonic::tonic_types::StatusExt as _;
 
     use super::{proto, query_status, query_stream_response};
 
@@ -270,6 +276,39 @@ mod tests {
             status.metadata().get("retry-after-ms"),
             Some(&"1000".parse().expect("static retry metadata"))
         );
+    }
+
+    /// Retry metadata is emitted only for transient query capacity.
+    #[test]
+    fn grpc_retry_metadata_only_for_retryable_capacity() {
+        let retryable = query_status(BifrostError::QueryAdmissionRejected.into());
+        assert_eq!(retryable.metadata().get("retry-after-ms").unwrap(), "1000");
+        for error in [
+            BifrostError::QueryMemoryRequestTooLarge,
+            BifrostError::QueryExecutionFailed,
+        ] {
+            assert!(
+                query_status(error.into())
+                    .metadata()
+                    .get("retry-after-ms")
+                    .is_none()
+            );
+        }
+    }
+
+    /// ErrorInfo retains stable capacity and poison codes without message parsing.
+    #[test]
+    fn grpc_error_info_preserves_capacity_and_poison_codes() {
+        for error in [
+            BifrostError::QueryAdmissionRejected,
+            BifrostError::QueryMemoryRequestTooLarge,
+            BifrostError::QueryExecutionFailed,
+        ] {
+            let expected = error.code().to_owned();
+            let status = query_status(error.into());
+            let info = status.get_details_error_info().expect("query ErrorInfo");
+            assert_eq!(info.reason, expected);
+        }
     }
 
     /// Proves an empty success stream and schema metadata cross gRPC unchanged.

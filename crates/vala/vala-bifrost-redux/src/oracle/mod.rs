@@ -49,7 +49,8 @@ use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, Tab
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
 use crate::scribe::memory::{
-    BifrostMemoryGovernor, OracleMemoryReservation, ParentMemoryReservation,
+    BifrostMemoryGovernor, MemoryPurpose, MemoryRejection, MemoryRejectionKind,
+    OracleMemoryReservation, ParentMemoryReservation,
 };
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
@@ -1771,6 +1772,7 @@ impl Oracle {
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
+        self.preflight_query_capacity()?;
         let deadline = request
             .deadline_ms
             .map_or(self.planner.config.default_deadline, Duration::from_millis);
@@ -1887,6 +1889,9 @@ impl Oracle {
             admitted.release();
             record_stale_replan();
             return Ok(None);
+        }
+        if let Some(error) = map_first_batch_failure(first.as_ref()) {
+            return release_error(deadline, admitted, error, "first-batch rejection");
         }
         let Some(query_telemetry) = query_telemetry.take() else {
             let error = BifrostError::QueryExecutionFailed;
@@ -2096,8 +2101,10 @@ impl Oracle {
     /// Installs immutable-cut providers and executes one typed plan.
     ///
     /// # Errors
-    /// Returns typed timeout, audit, visibility, reconciliation, or execution
-    /// failures and releases admission state through the returned stream owner.
+    /// Returns typed capacity, timeout, audit, visibility, reconciliation, or
+    /// execution failures and releases admission state through the returned
+    /// stream owner. Before catalog or storage work, a one-byte reversible
+    /// probe rejects a fully occupied or poisoned shared Oracle budget.
     async fn execute_typed_plan(
         &self,
         context: &AuthorizedQueryContext,
@@ -2107,6 +2114,7 @@ impl Oracle {
         query_telemetry: QueryTelemetryGuard,
         mut admitted: AdmittedQueryGuard,
     ) -> Result<OracleQueryStream, BifrostError> {
+        self.preflight_query_capacity()?;
         let cuts = self
             .planner
             .prepare_typed_cuts(
@@ -2164,7 +2172,8 @@ impl Oracle {
             })
             .await?;
         let rewritten = OraclePlanner::replace_typed_sources(plan, &providers)?;
-        let (session, physical) = OraclePlanner::create_physical_plan(&rewritten).await?;
+        let (session, physical) =
+            OraclePlanner::create_physical_plan(&rewritten, &self.memory).await?;
         let scan_stats = OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();
         let mut batches = execute_stream(physical, session.task_ctx())
@@ -2176,6 +2185,14 @@ impl Oracle {
         let first = tokio::time::timeout(remaining, batches.next())
             .await
             .map_err(|_| BifrostError::QueryTimeout)?;
+        if let Some(error) = map_first_batch_failure(first.as_ref()) {
+            return release_error(
+                options.deadline,
+                admitted,
+                error,
+                "typed first-batch rejection",
+            );
+        }
         let schema_frame = encode_schema_frame(&schema)?;
         Ok(OracleQueryStream::new(QueryStreamInput {
             schema_frame,
@@ -2369,7 +2386,7 @@ impl Oracle {
         mut input: SqlCutInput<'_>,
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
-        let session = SessionContext::new();
+        let session = self.execution_session()?;
         for cut in input.cuts {
             let table_name = cut.binding.table_ref.fqn();
             let mut hot_files = self.local_hot_sources(&cut)?;
@@ -2463,6 +2480,53 @@ impl Oracle {
         }
         self.execute_session(&session, input.sql, input.logical_bytes_selected)
             .await
+    }
+
+    /// Rejects a query before IO when the shared Oracle child cannot accept any work.
+    ///
+    /// The reversible one-byte reservation observes the same atomic child and
+    /// parent ceilings as range and `DataFusion` allocations, then releases
+    /// immediately so it does not become query-lifetime accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable public capacity, oversized, or poisoned projection
+    /// for the governor's typed refusal.
+    fn preflight_query_capacity(&self) -> Result<(), BifrostError> {
+        let probe = self
+            .memory
+            .governor
+            .oracle_budget()
+            .try_reserve_classified(1, MemoryPurpose::OracleQuery)
+            .map_err(map_memory_rejection)?;
+        drop(probe);
+        Ok(())
+    }
+
+    /// Builds one Oracle execution session over the process-wide governed pool.
+    ///
+    /// Every SQL attempt receives a fresh `DataFusion` session while all attempts
+    /// share the same Oracle-child and parent counters through the cloned governor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable execution error when `DataFusion` cannot construct the
+    /// runtime environment.
+    fn execution_session(&self) -> Result<SessionContext, BifrostError> {
+        let pool = Arc::new(
+            crate::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(
+                self.memory.governor.clone(),
+            ),
+        );
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build()
+            .map_err(|error| map_datafusion_error(&error))?;
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_runtime_env(Arc::new(runtime))
+            .build();
+        Ok(SessionContext::new_with_state(state))
     }
 
     /// Resolves leader-local hot file locations for one pinned cut.
@@ -3183,6 +3247,9 @@ fn admission_limits(usable_slots: u32, class: QueryClass) -> (u32, u32) {
 /// Maps a pre-stream `DataFusion` failure into the stable public catalog.
 fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostError {
     tracing::error!(error = %error, "Oracle DataFusion operation failed");
+    if let Some(rejection) = MemoryRejection::from_source_chain(error) {
+        return map_memory_rejection(rejection);
+    }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("tenant invariant") {
         BifrostError::QueryTenantInvariant
@@ -3193,6 +3260,27 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     } else {
         BifrostError::QueryExecutionFailed
     }
+}
+
+/// Projects one structured governor refusal into the stable public query catalog.
+fn map_memory_rejection(rejection: MemoryRejection) -> BifrostError {
+    match rejection.kind() {
+        MemoryRejectionKind::Occupied => BifrostError::QueryAdmissionRejected,
+        MemoryRejectionKind::RequestTooLarge | MemoryRejectionKind::CounterOverflow => {
+            BifrostError::QueryMemoryRequestTooLarge
+        }
+        MemoryRejectionKind::AccountingPoisoned => BifrostError::QueryExecutionFailed,
+    }
+}
+
+/// Projects a failed first lookahead before any schema frame can be emitted.
+fn map_first_batch_failure(
+    first: Option<&Result<RecordBatch, datafusion::error::DataFusionError>>,
+) -> Option<BifrostError> {
+    first
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(map_datafusion_error)
 }
 
 /// Recursively rejects logical-plan variants that can write or bypass bound sources.

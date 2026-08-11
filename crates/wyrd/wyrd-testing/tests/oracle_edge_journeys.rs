@@ -17,6 +17,7 @@ use chrono::{NaiveDate, Utc};
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
 use secrecy::SecretString;
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::with_managed_columns;
@@ -30,12 +31,18 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, EventDay,
     FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning, VisibilityMode,
 };
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::Bootstrap;
+use wyrd_testing::bifrost::bench_dataset::{BifrostQualificationDataset, DatasetShape};
+use wyrd_testing::bifrost::bench_materializer::{
+    BackpressurePolicy, BifrostDatasetMaterializer, QUALIFICATION_TABLE,
+};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
@@ -114,6 +121,129 @@ async fn pg_bifrost_oracle_published_journey() {
     )
     .await
     .expect("J1 PublishedOnly journey");
+}
+
+/// A retained production Oracle reservation produces the public typed 429,
+/// drives the real fast-capacity visibility policy within its bounded window,
+/// and allows queries to complete after the same reservation is released.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_capacity_contract_journey() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("capacity contract cluster");
+    let server = cluster.server(0).expect("mixed server");
+    let table = unique_table("oracle_capacity_contract");
+    register_table(server, cluster.data_tenant_id(), &table)
+        .await
+        .expect("capacity contract table");
+    let writer = client(server, "oracle-capacity-writer")
+        .await
+        .expect("writer client");
+    ingest(&writer, &format!("vala.bifrost.{table}"), &[1, 2])
+        .await
+        .expect("capacity fixture ingest");
+    server
+        .flush_bifrost()
+        .await
+        .expect("capacity fixture flush");
+    let reader = client(server, "oracle-capacity-reader")
+        .await
+        .expect("reader client");
+    let governor = server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .expect("shared production memory governor");
+    let oracle = governor.oracle_budget();
+    let retained = oracle
+        .try_reserve(oracle.limit_bytes())
+        .expect("retain the complete Oracle child budget");
+
+    let refusal = match QueryClient::new(&reader)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id, value FROM vala.bifrost.{table} ORDER BY id"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(10_000),
+        })
+        .await
+    {
+        Ok(_) => panic!("occupied Oracle budget must reject before opening a response stream"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        refusal,
+        ValaSdkError::Transport(WyrdError::Vala {
+            error: BifrostError::QueryAdmissionRejected
+        })
+    ));
+
+    drop(retained);
+    assert_eq!(
+        query_rows(&reader, &table, VisibilityMode::PublishedOnly)
+            .await
+            .expect("query succeeds after retained capacity drains"),
+        2
+    );
+
+    let retained = oracle
+        .try_reserve(oracle.limit_bytes())
+        .expect("retain Oracle capacity for the fast-policy journey");
+    let dataset = BifrostQualificationDataset::new(
+        DatasetShape::new(2, 2).expect("capacity dataset shape is valid"),
+    )
+    .expect("capacity dataset is valid");
+    let run_root = tempfile::tempdir().expect("capacity materializer root");
+    let fast_started = std::time::Instant::now();
+    let materializer = BifrostDatasetMaterializer::from_server(
+        server,
+        dataset,
+        vec![cluster.data_tenant_id()],
+        BackpressurePolicy::for_fast_capacity(
+            std::time::Instant::now() + std::time::Duration::from_secs(35),
+        ),
+        run_root.path().join("fast-capacity"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("fast-capacity materializer");
+    let capacity_error = materializer
+        .materialize()
+        .await
+        .expect_err("retained Oracle capacity must exhaust the fast policy");
+    let scheduler_jitter = std::time::Duration::from_secs(2);
+    assert!(
+        fast_started.elapsed() <= std::time::Duration::from_secs(30) + scheduler_jitter,
+        "fast-capacity feedback exceeded its thirty-second budget plus scheduler jitter"
+    );
+    assert!(
+        capacity_error
+            .to_string()
+            .contains("fast visibility exhausted typed retryable capacity refusal"),
+        "capacity journey must exhaust only the typed fast-capacity path: {capacity_error}"
+    );
+    drop(retained);
+    let mut recovered = QueryClient::new(&reader)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT row_id FROM vala.bifrost.{QUALIFICATION_TABLE} ORDER BY row_id"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        })
+        .await
+        .expect("qualification query succeeds after retained capacity drains");
+    let mut recovered_rows = 0_usize;
+    while let Some(batch) = recovered
+        .next_batch()
+        .await
+        .expect("qualification recovery stream remains valid")
+    {
+        recovered_rows = recovered_rows.saturating_add(batch.num_rows());
+    }
+    assert_eq!(recovered_rows, 2);
+    drop(materializer);
+    cluster.shutdown().await.expect("capacity cluster shutdown");
 }
 
 /// J2 proves a Fused query drains a live tonic tail without a Scribe flush.

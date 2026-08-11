@@ -128,6 +128,11 @@ impl AdmissionController {
     }
 
     /// Construct an admission controller with explicit limits.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed one-gibibyte test governor violates the
+    /// governor constructor invariant.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_config(config: AdmissionConfig) -> Self {

@@ -869,7 +869,7 @@ impl Memtable {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn sweep_once_for_test(&self) -> Result<usize, ScribeError> {
         Ok(self
             .sweep_once_with_sizes()?

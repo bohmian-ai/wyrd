@@ -71,6 +71,17 @@ pub struct BackpressurePolicy {
     pub max_backoff: Duration,
     /// Absolute deadline for the complete setup operation.
     pub setup_deadline: Instant,
+    /// Visibility retry mode selected for the first post-flush poll.
+    visibility: VisibilityPolicy,
+}
+
+/// Closed visibility policies separating bulk setup from capacity feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibilityPolicy {
+    /// Preserve the existing under-count exponential backoff.
+    BulkSetup,
+    /// Use three absolute capacity slots within a fresh thirty-second budget.
+    FastCapacity,
 }
 
 impl BackpressurePolicy {
@@ -81,6 +92,18 @@ impl BackpressurePolicy {
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(5),
             setup_deadline,
+            visibility: VisibilityPolicy::BulkSetup,
+        }
+    }
+
+    /// Construct a direct fast-capacity visibility policy for capacity journeys.
+    #[must_use]
+    pub fn for_fast_capacity(setup_deadline: Instant) -> Self {
+        Self {
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_secs(5),
+            setup_deadline,
+            visibility: VisibilityPolicy::FastCapacity,
         }
     }
 }
@@ -357,13 +380,10 @@ pub enum MaterializationError {
 
 /// Failure surfaced by one public Oracle visibility COUNT poll.
 ///
-/// `retryable` separates transient capacity refusals — the Oracle's shared
-/// memory governor refusing a query reservation while ingest holds the budget
-/// surfaces as an `IngestBusy { table: "memory" }` flattened into the
-/// `WYRD_VALA_500_QUERY_EXECUTION_FAILED` terminal detail — from genuine query
-/// defects. [`BifrostDatasetMaterializer::wait_for_visibility`] re-polls
-/// retryable failures with backoff until the setup deadline, exactly like an
-/// under-count, and fails fast on everything else.
+/// `retryable` retains the broad legacy predicate used by bulk setup, while
+/// `typed_capacity` identifies only the reconstructed public query-admission
+/// 429 that switches qualification into bounded fast feedback. Permanent 422
+/// oversized requests and 500 accounting poison remain terminal.
 #[derive(Debug, Clone)]
 pub(crate) struct VisibleCountError {
     /// Human-readable failure detail carried into
@@ -371,6 +391,8 @@ pub(crate) struct VisibleCountError {
     pub message: String,
     /// Whether the failure is a transient capacity refusal worth re-polling.
     pub retryable: bool,
+    /// Whether this is the exact typed query-admission 429 that enters fast mode.
+    pub typed_capacity: bool,
 }
 
 /// Private public-surface adapter used by the orchestration owner and tests.
@@ -391,14 +413,14 @@ pub(crate) trait MaterializerBackend: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`VisibleCountError`] with `retryable = true` for transient
-    /// capacity refusals the visibility loop should absorb, and
-    /// `retryable = false` for structural query failures.
+    /// Returns [`VisibleCountError`] with the broad bulk retry classification
+    /// and the independent typed-429 classification used to enter fast mode.
     async fn visible_count(
         &self,
         tenant: DataTenantId,
         day: u32,
         rows_per_day: u64,
+        deadline_ms: u64,
     ) -> Result<u64, VisibleCountError>;
 }
 
@@ -855,10 +877,18 @@ impl<'a> BifrostDatasetMaterializer<'a> {
         rows_per_day: u64,
         progress: &mut PartialProgress,
     ) -> Result<u64, MaterializationError> {
+        if self.policy.visibility == VisibilityPolicy::FastCapacity {
+            return self
+                .wait_for_fast_capacity(tenant, day, expected, rows_per_day, progress, None)
+                .await;
+        }
         let mut backoff = self.policy.initial_backoff;
         let mut observed = 0_u64;
         loop {
-            let poll = self.backend.visible_count(tenant, day, rows_per_day).await;
+            let poll = self
+                .backend
+                .visible_count(tenant, day, rows_per_day, 30_000)
+                .await;
             if self.cancellation.is_cancelled() {
                 return Err(MaterializationError::Cancelled {
                     progress: *progress,
@@ -871,6 +901,18 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                         return Ok(observed);
                     }
                     None
+                }
+                Err(error) if error.typed_capacity => {
+                    return self
+                        .wait_for_fast_capacity(
+                            tenant,
+                            day,
+                            expected,
+                            rows_per_day,
+                            progress,
+                            Some(error.message),
+                        )
+                        .await;
                 }
                 Err(error) if error.retryable => Some(error.message),
                 Err(error) => return Err(MaterializationError::Backend(error.message)),
@@ -911,6 +953,77 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                 });
             }
             backoff = backoff.saturating_mul(2).min(self.policy.max_backoff);
+        }
+    }
+
+    /// Polls visibility at three absolute capacity slots within thirty seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns immediately for permanent capacity or unrelated failures,
+    /// returns visibility failure after three under-counts, and returns backend
+    /// failure after three typed 429 refusals or when setup time expires.
+    async fn wait_for_fast_capacity(
+        &self,
+        tenant: DataTenantId,
+        day: u32,
+        expected: u64,
+        rows_per_day: u64,
+        progress: &PartialProgress,
+        initial_capacity: Option<String>,
+    ) -> Result<u64, MaterializationError> {
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(Duration::from_secs(30))
+            .unwrap_or(self.policy.setup_deadline)
+            .min(self.policy.setup_deadline);
+        let mut observed = 0;
+        let mut last_capacity = initial_capacity;
+        for ordinal in 0..3_u32 {
+            let slot = started + Duration::from_secs(u64::from(ordinal) * 10);
+            if slot >= deadline {
+                break;
+            }
+            if Instant::now() < slot {
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => {
+                        return Err(MaterializationError::Cancelled { progress: *progress });
+                    }
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(slot)) => {}
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let deadline_ms = u64::try_from(remaining.as_millis())
+                .unwrap_or(u64::MAX)
+                .clamp(1, 10_000);
+            match self
+                .backend
+                .visible_count(tenant, day, rows_per_day, deadline_ms)
+                .await
+            {
+                Ok(count) if count >= expected => return Ok(count),
+                Ok(count) => {
+                    observed = count;
+                    last_capacity = None;
+                }
+                Err(error) if error.typed_capacity => last_capacity = Some(error.message),
+                Err(error) => return Err(MaterializationError::Backend(error.message)),
+            }
+        }
+        if let Some(message) = last_capacity {
+            Err(MaterializationError::Backend(format!(
+                "fast visibility exhausted typed retryable capacity refusal attempts: {message}"
+            )))
+        } else {
+            Err(MaterializationError::Visibility {
+                tenant,
+                day,
+                expected,
+                observed,
+            })
         }
     }
 
@@ -1037,6 +1150,7 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
         tenant: DataTenantId,
         day: u32,
         rows_per_day: u64,
+        deadline_ms: u64,
     ) -> Result<u64, VisibleCountError> {
         let index = self
             .tenants
@@ -1045,6 +1159,7 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
             .ok_or_else(|| VisibleCountError {
                 message: "materializer tenant is not provisioned".to_owned(),
                 retryable: false,
+                typed_capacity: false,
             })?;
         let start = u64::from(day).saturating_mul(rows_per_day);
         let end = start.saturating_add(rows_per_day);
@@ -1054,7 +1169,7 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
             ),
             visibility: VisibilityMode::PublishedOnly,
             freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(30_000),
+            deadline_ms: Some(deadline_ms),
         };
         let result = self.queries[index]
             .collect_bounded(
@@ -1082,12 +1197,14 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
                 };
                 VisibleCountError {
                     retryable: is_retryable_query_capacity(&error),
+                    typed_capacity: is_typed_query_capacity(&error),
                     message,
                 }
             })?;
         let batch = result.batches.first().ok_or_else(|| VisibleCountError {
             message: "Oracle count returned no batch".to_owned(),
             retryable: false,
+            typed_capacity: false,
         })?;
         let count = batch
             .column(0)
@@ -1096,10 +1213,12 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
             .ok_or_else(|| VisibleCountError {
                 message: "Oracle count was not Int64".to_owned(),
                 retryable: false,
+                typed_capacity: false,
             })?;
         u64::try_from(count.value(0)).map_err(|error| VisibleCountError {
             message: error.to_string(),
             retryable: false,
+            typed_capacity: false,
         })
     }
 }
@@ -1133,19 +1252,19 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
 fn is_retryable_query_capacity(error: &vala_sdk::ValaSdkError) -> bool {
     match error {
         vala_sdk::ValaSdkError::FailedTerminal { .. } => true,
-        vala_sdk::ValaSdkError::Transport(transport) => {
-            is_retryable_capacity(transport)
-                || matches!(
-                    transport,
-                    WyrdError::UpstreamFailure { details, .. }
-                        if details
-                            .get("original_code")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("WYRD_VALA_500_QUERY_EXECUTION_FAILED")
-                )
-        }
+        vala_sdk::ValaSdkError::Transport(transport) => is_retryable_capacity(transport),
         _ => false,
     }
+}
+
+/// Return whether a query failure is the exact typed retryable capacity variant.
+fn is_typed_query_capacity(error: &vala_sdk::ValaSdkError) -> bool {
+    matches!(
+        error,
+        vala_sdk::ValaSdkError::Transport(WyrdError::Vala {
+            error: BifrostError::QueryAdmissionRejected,
+        })
+    )
 }
 
 /// Return whether an error is one of the documented capacity responses.
@@ -1222,6 +1341,9 @@ mod tests {
         outcomes: Mutex<VecDeque<Result<(), WyrdError>>>,
         ids: Mutex<Vec<[u8; 16]>>,
         counts: Mutex<VecDeque<Result<u64, VisibleCountError>>>,
+        query_deadlines: Mutex<Vec<u64>>,
+        query_started: Mutex<Vec<Instant>>,
+        flush_completed: Mutex<Vec<Instant>>,
         retry_signal: Mutex<Option<Arc<Notify>>>,
     }
 
@@ -1257,6 +1379,10 @@ mod tests {
         }
 
         async fn flush(&self, _tenant: DataTenantId) -> Result<(), String> {
+            self.flush_completed
+                .lock()
+                .expect("flush completion")
+                .push(Instant::now());
             Ok(())
         }
 
@@ -1265,7 +1391,16 @@ mod tests {
             _tenant: DataTenantId,
             _day: u32,
             rows_per_day: u64,
+            deadline_ms: u64,
         ) -> Result<u64, VisibleCountError> {
+            self.query_deadlines
+                .lock()
+                .expect("query deadlines")
+                .push(deadline_ms);
+            self.query_started
+                .lock()
+                .expect("query starts")
+                .push(Instant::now());
             self.counts
                 .lock()
                 .expect("mock count lock")
@@ -1520,7 +1655,198 @@ mod tests {
         VisibleCountError {
             message: "oracle failed terminal: detail=\"Resources exhausted: ingest busy for table: memory\"".to_owned(),
             retryable: true,
+            typed_capacity: true,
         }
+    }
+
+    /// Build one permanent oversized-memory visibility refusal.
+    fn oversized_refusal() -> VisibleCountError {
+        VisibleCountError {
+            message: "query memory request too large".to_owned(),
+            retryable: false,
+            typed_capacity: false,
+        }
+    }
+
+    /// Permanent oversized capacity stops after one fast-policy request.
+    #[tokio::test]
+    async fn visibility_oversized_capacity_fails_without_retry() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .counts
+            .lock()
+            .expect("counts")
+            .push_back(Err(oversized_refusal()));
+        let run_root = tempfile::tempdir().expect("run root").keep();
+        let materializer = BifrostDatasetMaterializer::with_backend(
+            backend.clone(),
+            dataset(),
+            vec![DataTenantId::SYSTEM_OWNER],
+            BackpressurePolicy::for_fast_capacity(Instant::now() + Duration::from_secs(30)),
+            run_root,
+            CancellationToken::new(),
+        );
+        let error = materializer
+            .wait_for_visibility(
+                DataTenantId::SYSTEM_OWNER,
+                0,
+                4_096,
+                4_096,
+                &mut PartialProgress::default(),
+            )
+            .await
+            .expect_err("oversized request is permanent");
+        assert!(
+            matches!(error, MaterializationError::Backend(message) if message.contains("too large"))
+        );
+        assert_eq!(backend.query_deadlines.lock().expect("deadlines").len(), 1);
+    }
+
+    /// Drainable capacity uses no more than the three absolute fast slots.
+    #[tokio::test(start_paused = true)]
+    async fn visibility_drainable_capacity_retries_at_most_three_times() {
+        let backend = Arc::new(MockBackend::default());
+        backend.counts.lock().expect("counts").extend([
+            Err(capacity_refusal()),
+            Err(capacity_refusal()),
+            Ok(4_096),
+        ]);
+        let run_root = tempfile::tempdir().expect("run root").keep();
+        let materializer = BifrostDatasetMaterializer::with_backend(
+            backend.clone(),
+            dataset(),
+            vec![DataTenantId::SYSTEM_OWNER],
+            BackpressurePolicy::for_fast_capacity(Instant::now() + Duration::from_secs(30)),
+            run_root,
+            CancellationToken::new(),
+        );
+        let count = materializer
+            .wait_for_visibility(
+                DataTenantId::SYSTEM_OWNER,
+                0,
+                4_096,
+                4_096,
+                &mut PartialProgress::default(),
+            )
+            .await
+            .expect("capacity drains");
+        assert_eq!(count, 4_096);
+        assert_eq!(backend.query_deadlines.lock().expect("deadlines").len(), 3);
+    }
+
+    /// Every fast-capacity query receives at most a ten-second deadline.
+    #[tokio::test(start_paused = true)]
+    async fn visibility_query_uses_ten_second_deadline() {
+        let backend = Arc::new(MockBackend::default());
+        backend.counts.lock().expect("counts").extend([
+            Err(capacity_refusal()),
+            Err(capacity_refusal()),
+            Err(capacity_refusal()),
+        ]);
+        let run_root = tempfile::tempdir().expect("run root").keep();
+        let materializer = BifrostDatasetMaterializer::with_backend(
+            backend.clone(),
+            dataset(),
+            vec![DataTenantId::SYSTEM_OWNER],
+            BackpressurePolicy::for_fast_capacity(Instant::now() + Duration::from_secs(30)),
+            run_root,
+            CancellationToken::new(),
+        );
+        let _ = materializer
+            .wait_for_visibility(
+                DataTenantId::SYSTEM_OWNER,
+                0,
+                4_096,
+                4_096,
+                &mut PartialProgress::default(),
+            )
+            .await;
+        let deadlines = backend.query_deadlines.lock().expect("deadlines");
+        assert_eq!(deadlines.len(), 3);
+        assert!(deadlines.iter().all(|deadline| *deadline <= 10_000));
+    }
+
+    /// Bulk under-count polling retains the existing 30-second query deadline.
+    #[tokio::test]
+    async fn bulk_visibility_undercount_retains_existing_backoff() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .counts
+            .lock()
+            .expect("counts")
+            .extend([Ok(0), Ok(4_096)]);
+        let (materializer, _run_root) =
+            materializer(backend.clone(), Instant::now() + Duration::from_secs(5));
+        materializer
+            .wait_for_visibility(
+                DataTenantId::SYSTEM_OWNER,
+                0,
+                4_096,
+                4_096,
+                &mut PartialProgress::default(),
+            )
+            .await
+            .expect("bulk under-count clears");
+        assert_eq!(
+            *backend.query_deadlines.lock().expect("deadlines"),
+            vec![30_000, 30_000]
+        );
+    }
+
+    /// The first typed bulk 429 switches subsequent polls to fast capacity.
+    #[tokio::test]
+    async fn bulk_visibility_first_capacity_refusal_switches_to_fast_policy() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .counts
+            .lock()
+            .expect("counts")
+            .extend([Err(capacity_refusal()), Ok(4_096)]);
+        let (materializer, _run_root) =
+            materializer(backend.clone(), Instant::now() + Duration::from_secs(5));
+        materializer
+            .wait_for_visibility(
+                DataTenantId::SYSTEM_OWNER,
+                0,
+                4_096,
+                4_096,
+                &mut PartialProgress::default(),
+            )
+            .await
+            .expect("fast capacity clears");
+        let deadlines = backend.query_deadlines.lock().expect("deadlines");
+        assert_eq!(deadlines[0], 30_000);
+        assert!(deadlines[1] > 0 && deadlines[1] <= 5_000);
+    }
+
+    /// Fast visibility budget is constructed after flush, not at bulk setup start.
+    #[tokio::test]
+    async fn visibility_budget_starts_after_flush() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .counts
+            .lock()
+            .expect("counts")
+            .extend([Ok(4_096), Ok(4_096)]);
+        let run_root = tempfile::tempdir().expect("run root").keep();
+        let materializer = BifrostDatasetMaterializer::with_backend(
+            backend.clone(),
+            dataset(),
+            vec![DataTenantId::SYSTEM_OWNER],
+            BackpressurePolicy::for_fast_capacity(Instant::now() + Duration::from_secs(30)),
+            run_root,
+            CancellationToken::new(),
+        );
+        materializer.materialize().await.expect("materialization");
+        let flushes = backend.flush_completed.lock().expect("flush completion");
+        let queries = backend.query_started.lock().expect("query starts");
+        assert_eq!(flushes.len(), queries.len());
+        assert!(
+            flushes
+                .iter()
+                .zip(queries.iter())
+                .all(|(flushed, queried)| queried >= flushed)
+        );
     }
 
     /// A retryable COUNT capacity refusal re-polls and then succeeds.
@@ -1581,6 +1907,7 @@ mod tests {
             .push_back(Err(VisibleCountError {
                 message: "Oracle count was not Int64".to_owned(),
                 retryable: false,
+                typed_capacity: false,
             }));
         let (materializer, _run_root) =
             materializer(backend, Instant::now() + Duration::from_secs(5));

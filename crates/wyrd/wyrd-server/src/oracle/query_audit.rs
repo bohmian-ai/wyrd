@@ -16,9 +16,10 @@ use vala_sql::ValaPostgres;
 use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult};
 use wyrd_spec::vala::error::BifrostError;
 
+#[cfg(feature = "test-support")]
+use super::audit_wal::AuditWalWriterControl;
 use super::audit_wal::{
-    AuditWal, AuditWalAppendCommand, AuditWalRecord, AuditWalWriter, AuditWalWriterControl,
-    OracleAuditWalConfig,
+    AuditWal, AuditWalAppendCommand, AuditWalRecord, AuditWalWriter, OracleAuditWalConfig,
 };
 
 static TEMP_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -159,8 +160,10 @@ pub struct OracleAuditPublisher {
     /// Retained writer task joined during shutdown.
     writer: Mutex<Option<JoinHandle<()>>>,
     /// One-shot grouped-write failure seam.
+    #[cfg(feature = "test-support")]
     writer_fail_next_group: std::sync::Arc<AtomicBool>,
     /// Writer pause and sync-count controls used by deterministic test seams.
+    #[cfg(feature = "test-support")]
     writer_control: std::sync::Arc<AuditWalWriterControl>,
     /// Shared SQL handle used only by the background relay.
     vala: ValaPostgres,
@@ -202,12 +205,19 @@ impl OracleAuditPublisher {
         let writer_capacity = config.audit_wal_max_records.clamp(1, 1024);
         let (writer_tx, writer_fail_next_group, writer_control, writer) =
             AuditWalWriter::spawn(std::sync::Arc::clone(&wal), writer_capacity);
+        #[cfg(not(feature = "test-support"))]
+        {
+            drop(writer_fail_next_group);
+            drop(writer_control);
+        }
         let cancel = CancellationToken::new();
         let publisher = std::sync::Arc::new(Self {
             wal,
             writer_tx: Mutex::new(Some(writer_tx)),
             writer: Mutex::new(Some(writer)),
+            #[cfg(feature = "test-support")]
             writer_fail_next_group,
+            #[cfg(feature = "test-support")]
             writer_control,
             vala,
             cancel: cancel.clone(),

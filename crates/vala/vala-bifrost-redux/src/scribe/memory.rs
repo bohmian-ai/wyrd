@@ -707,6 +707,31 @@ struct MemoryGovernorInner {
 }
 
 impl BifrostMemoryGovernor {
+    /// Constructs a test governor with deliberately small child limits.
+    ///
+    /// This keeps the production parent derivation while allowing focused
+    /// ranged-reader tests to prove that a file larger than one child budget
+    /// succeeds when each live range and batch fits independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the pod limit is invalid or the
+    /// governor becomes shared before its test-only limits are installed.
+    #[cfg(test)]
+    pub(crate) fn new_with_test_child_limits(
+        pod_limit_bytes: usize,
+        scribe_limit_bytes: usize,
+        oracle_limit_bytes: usize,
+    ) -> Result<Self, ScribeError> {
+        let mut governor = Self::new(pod_limit_bytes)?;
+        let inner = Arc::get_mut(&mut governor.inner).ok_or_else(|| ScribeError::Internal {
+            detail: "test memory governor unexpectedly shared during construction".to_owned(),
+        })?;
+        inner.scribe_limit_bytes = scribe_limit_bytes;
+        inner.oracle_limit_bytes = oracle_limit_bytes;
+        Ok(governor)
+    }
+
     /// Construct a test-tier governor with a deliberately small Scribe child limit.
     ///
     /// This bypasses production minimums only for deterministic admission tests;
@@ -1102,35 +1127,37 @@ impl BifrostMemoryGovernor {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngestBusy`] when the Oracle child limit or
-    /// the parent ceiling would be exceeded.
-    fn try_reserve_oracle_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
+    /// Returns a typed rejection when the Oracle child or parent ceiling is
+    /// occupied, the request is indivisibly too large, arithmetic overflows,
+    /// or prior accounting corruption poisoned the governor.
+    fn try_reserve_oracle_bytes_classified(
+        &self,
+        bytes: usize,
+        purpose: MemoryPurpose,
+    ) -> Result<(), MemoryRejection> {
         if bytes > 0 && self.is_poisoned() {
-            return Err(ScribeError::Internal {
-                detail: self
-                    .poisoned_rejection(MemoryPurpose::OracleQuery, bytes)
-                    .to_string(),
-            });
+            return Err(self.poisoned_rejection(purpose, bytes));
         }
         reserve_with_limit_diagnostic(
             &self.inner.oracle_total_bytes,
             self.inner.oracle_limit_bytes,
             bytes,
-            MemoryPurpose::OracleQuery,
+            purpose,
             MemoryCeiling::OracleChild,
-        )
-        .map_err(MemoryRejection::into_scribe_error)?;
+        )?;
         if let Err(error) = reserve_with_limit_diagnostic(
             &self.inner.bifrost_total_bytes,
             self.bifrost_limit_bytes(),
             bytes,
-            MemoryPurpose::OracleQuery,
+            purpose,
             MemoryCeiling::BifrostParent,
         ) {
-            if let Err(cleanup) = self.release_oracle_bytes_checked(bytes) {
+            if let Err(cleanup) =
+                self.release_counter_only(&self.inner.oracle_total_bytes, bytes, purpose)
+            {
                 tracing::error!(error = %cleanup, primary = %error, "Oracle child rollback failed after parent refusal");
             }
-            return Err(error.into_scribe_error());
+            return Err(error);
         }
         Ok(())
     }
@@ -1653,7 +1680,28 @@ impl OracleMemoryBudget {
     /// Returns [`ScribeError::IngestBusy`] when the Oracle child limit or
     /// the parent ceiling would be exceeded.
     pub fn try_reserve(&self, bytes: usize) -> Result<OracleMemoryReservation, ScribeError> {
-        self.parent.try_reserve_oracle_bytes(bytes)?;
+        self.try_reserve_classified(bytes, MemoryPurpose::OracleQuery)
+            .map_err(MemoryRejection::into_scribe_error)
+    }
+
+    /// Reserve bytes for one classified Oracle memory owner.
+    ///
+    /// The returned rejection retains the exact purpose, ceiling, request,
+    /// occupancy, and limit operands so Oracle can distinguish an indivisible
+    /// request from aggregate contention before issuing storage IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed rejection when the request exceeds a child or parent
+    /// ceiling, current occupancy leaves insufficient capacity, arithmetic
+    /// overflows, or the shared governor is poisoned.
+    pub(crate) fn try_reserve_classified(
+        &self,
+        bytes: usize,
+        purpose: MemoryPurpose,
+    ) -> Result<OracleMemoryReservation, MemoryRejection> {
+        self.parent
+            .try_reserve_oracle_bytes_classified(bytes, purpose)?;
         Ok(OracleMemoryReservation {
             governor: self.parent.clone(),
             bytes,
@@ -1676,6 +1724,11 @@ impl OracleMemoryReservation {
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Poison the shared governor when a coupled outer owner detects corruption.
+    pub(crate) fn poison(&self) {
+        self.governor.poison();
     }
 }
 
@@ -1899,7 +1952,7 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
         match self.target {
             DataFusionPoolTarget::Oracle => self
                 .governor
-                .try_reserve_oracle_bytes(additional)
+                .try_reserve_oracle_bytes_classified(additional, MemoryPurpose::OracleQuery)
                 .map_err(|error| {
                     DataFusionError::ResourcesExhausted(format!(
                         "Bifrost Oracle memory limit rejected {} bytes for `{}`: {error}",
@@ -3431,6 +3484,26 @@ mod tests {
         ));
         assert_eq!(governor.snapshot().scribe_total_bytes, 0);
         drop(parent);
+    }
+
+    /// Oracle parent refusal rolls back only the newly charged child counter.
+    #[test]
+    fn oracle_parent_refusal_preserves_existing_parent_ownership() {
+        let governor = BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024).expect("valid memory");
+        let parent = governor
+            .try_reserve_parent(governor.bifrost_limit_bytes())
+            .expect("fill parent ceiling");
+        let before = governor.snapshot();
+        let rejection = governor
+            .oracle_budget()
+            .try_reserve_classified(1, MemoryPurpose::OracleHotRange)
+            .expect_err("parent ceiling refuses Oracle range");
+        assert_eq!(rejection.ceiling(), MemoryCeiling::BifrostParent);
+        let after = governor.snapshot();
+        assert_eq!(after.oracle_total_bytes, 0);
+        assert_eq!(after.bifrost_total_bytes, before.bifrost_total_bytes);
+        drop(parent);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
     }
 
     /// The governor gauges carry only closed `consumer`/`mark` labels.

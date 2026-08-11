@@ -48,7 +48,9 @@ use wyrd_spec::vala::api::{
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
-use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
+use crate::scribe::memory::{
+    BifrostMemoryGovernor, OracleMemoryReservation, ParentMemoryReservation,
+};
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
 mod admission;
@@ -284,6 +286,15 @@ struct OracleTelemetry {
 }
 
 impl OracleTelemetry {
+    /// Adds one live Oracle memory owner to the canonical gauge accounting.
+    fn charge_memory(&self, bytes: usize, query_class: QueryClass, memory_kind: OracleMemoryKind) {
+        let total = self
+            .memory_bytes
+            .fetch_add(bytes as u64, Ordering::AcqRel)
+            .saturating_add(bytes as u64);
+        let _ = (total, query_class, memory_kind);
+    }
+
     /// Creates telemetry around the same slot owner used by admission.
     #[must_use]
     fn new(slots: Arc<OracleSlotManager>) -> Self {
@@ -412,13 +423,28 @@ impl OracleTelemetry {
         memory_kind: OracleMemoryKind,
     ) -> AccountedMemoryReservation {
         let bytes = reservation.bytes();
-        let total = self
-            .memory_bytes
-            .fetch_add(bytes as u64, Ordering::AcqRel)
-            .saturating_add(bytes as u64);
-        let _ = (total, query_class, memory_kind);
+        self.charge_memory(bytes, query_class, memory_kind);
         AccountedMemoryReservation {
-            reservation: Some(reservation),
+            reservation: Some(OracleGovernorReservation::Parent(reservation)),
+            owner: Arc::clone(self),
+            query_class,
+            memory_kind,
+            bytes,
+        }
+    }
+
+    /// Couples one Oracle-child reservation to canonical Oracle memory gauges.
+    #[must_use]
+    fn account_oracle_memory(
+        self: &Arc<Self>,
+        reservation: OracleMemoryReservation,
+        query_class: QueryClass,
+        memory_kind: OracleMemoryKind,
+    ) -> AccountedMemoryReservation {
+        let bytes = reservation.bytes();
+        self.charge_memory(bytes, query_class, memory_kind);
+        AccountedMemoryReservation {
+            reservation: Some(OracleGovernorReservation::Oracle(reservation)),
             owner: Arc::clone(self),
             query_class,
             memory_kind,
@@ -644,10 +670,28 @@ impl Drop for AdmissionWaitTelemetryGuard {
     }
 }
 
-/// Parent reservation coupled to canonical Oracle memory gauges.
+/// Governor reservation coupled to canonical Oracle memory gauges.
+enum OracleGovernorReservation {
+    /// Parent-only ownership used by reconciliation and live-source state.
+    Parent(ParentMemoryReservation),
+    /// Oracle-child plus parent ownership used by hot source buffers.
+    Oracle(OracleMemoryReservation),
+}
+
+impl OracleGovernorReservation {
+    /// Poison the shared governor after wrapper-accounting corruption.
+    fn poison(&self) {
+        match self {
+            Self::Parent(reservation) => reservation.poison(),
+            Self::Oracle(reservation) => reservation.poison(),
+        }
+    }
+}
+
+/// Governor reservation coupled to canonical Oracle memory gauges.
 struct AccountedMemoryReservation {
     /// Governor reservation released before the gauges are decremented.
-    reservation: Option<ParentMemoryReservation>,
+    reservation: Option<OracleGovernorReservation>,
     /// Retained process-local telemetry owner.
     owner: Arc<OracleTelemetry>,
     /// Query class charged for the reservation.

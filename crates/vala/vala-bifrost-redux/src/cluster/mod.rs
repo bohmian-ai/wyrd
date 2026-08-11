@@ -52,6 +52,15 @@ impl RoleTiming {
     }
 }
 
+/// Runtime-selected heartbeat and snapshot cadence owned by one registry.
+#[derive(Debug, Clone, Copy)]
+struct RegistryRoleTiming {
+    /// Interval between durable readiness heartbeats.
+    heartbeat_interval: Duration,
+    /// Maximum heartbeat age included in live membership snapshots.
+    liveness_cutoff: Duration,
+}
+
 /// Cluster membership operation failure.
 #[derive(Debug, Error)]
 pub enum ClusterError {
@@ -181,9 +190,8 @@ pub struct ClusterRegistry {
     node_id: NodeId,
     /// Atomically published immutable live-role snapshot.
     snapshot: ArcSwap<ClusterSnapshot>,
-    /// Optional accelerated heartbeat timing compiled only for test support.
-    #[cfg(feature = "test-support")]
-    role_timing: Option<RoleTiming>,
+    /// Selected production or test-support heartbeat and snapshot cadence.
+    role_timing: RegistryRoleTiming,
 }
 
 impl ClusterRegistry {
@@ -194,8 +202,10 @@ impl ClusterRegistry {
             nodes: ClusterNodes::new(postgres),
             node_id,
             snapshot: ArcSwap::from_pointee(ClusterSnapshot::default()),
-            #[cfg(feature = "test-support")]
-            role_timing: None,
+            role_timing: RegistryRoleTiming {
+                heartbeat_interval: ROLE_HEARTBEAT_INTERVAL,
+                liveness_cutoff: ROLE_LIVENESS_CUTOFF,
+            },
         }
     }
 
@@ -224,28 +234,23 @@ impl ClusterRegistry {
             nodes: ClusterNodes::new(postgres),
             node_id,
             snapshot: ArcSwap::from_pointee(ClusterSnapshot::default()),
-            role_timing: Some(timing),
+            role_timing: RegistryRoleTiming {
+                heartbeat_interval: timing.heartbeat_interval,
+                liveness_cutoff: timing.liveness_cutoff,
+            },
         }
     }
 
     /// Returns the heartbeat interval selected by this registry owner.
     #[must_use]
     fn heartbeat_interval(&self) -> Duration {
-        #[cfg(feature = "test-support")]
-        if let Some(timing) = self.role_timing {
-            return timing.heartbeat_interval;
-        }
-        ROLE_HEARTBEAT_INTERVAL
+        self.role_timing.heartbeat_interval
     }
 
     /// Returns the liveness cutoff selected by this registry owner.
     #[must_use]
     fn liveness_cutoff(&self) -> Duration {
-        #[cfg(feature = "test-support")]
-        if let Some(timing) = self.role_timing {
-            return timing.liveness_cutoff;
-        }
-        ROLE_LIVENESS_CUTOFF
+        self.role_timing.liveness_cutoff
     }
 
     /// Validates a peer's exact durable Oracle role fence before mutation.

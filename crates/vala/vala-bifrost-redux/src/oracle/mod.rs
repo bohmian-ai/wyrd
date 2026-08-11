@@ -321,8 +321,17 @@ impl OracleTelemetry {
                 "oracle_query_files_scanned_total",
                 "oracle_query_partitions_scanned_total",
                 "oracle_query_spill_bytes_total",
+                "oracle_query_spill_files_total",
             ] {
                 metrics::counter!(family, "class" => class).increment(0);
+            }
+            for outcome in ["success", "error", "cancelled"] {
+                metrics::counter!(
+                    "oracle_query_spill_queries_total",
+                    "class" => class,
+                    "outcome" => outcome
+                )
+                .increment(0);
             }
             for outcome in [
                 OracleAdmissionOutcome::Admitted,
@@ -494,8 +503,6 @@ impl OracleTelemetry {
 enum OracleMemoryKind {
     /// Encoded or decoded source buffers.
     Source,
-    /// Exact-identity reconciliation state.
-    Reconciliation,
     /// Fenced live-tail batches retained through query completion.
     Tail,
 }

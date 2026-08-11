@@ -5,12 +5,11 @@
 //! so a foreign row cannot influence a filter, join, aggregate, or limit.
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(test)]
 use std::fs::File;
 #[cfg(test)]
 use std::future::Future;
-use std::io::{Seek, SeekFrom};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,8 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use arrow::array::{Array, UInt8Array, UInt32Array};
-use arrow::compute::{cast, concat_batches, take};
+use arrow::array::{Array, UInt8Array};
+use arrow::compute::cast;
+use arrow::compute::kernels::sort::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -32,13 +32,14 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
 };
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
@@ -58,7 +59,6 @@ use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
-use tempfile::NamedTempFile;
 use tracing::Instrument;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, QueryClass};
@@ -66,12 +66,12 @@ use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 #[cfg(test)]
 use crate::scribe::memory::{MemoryCeiling, MemoryRejection, MemoryRejectionKind};
-use crate::scribe::memory::{MemoryPurpose, OracleMemoryReservation, ParentMemoryReservation};
+use crate::scribe::memory::{MemoryPurpose, OracleMemoryReservation};
 
 use super::{
-    AccountedMemoryReservation, AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit,
-    OracleMemoryKind, OracleMemoryResources, OracleTelemetry, ReconcileError, RowIdentity,
-    SourceTier, VerifiedSecurityContext, query_class_label,
+    AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryKind,
+    OracleMemoryResources, OracleTelemetry, ReconcileError, RowIdentity, SourceTier,
+    VerifiedSecurityContext, query_class_label,
 };
 
 /// Shared physical scan state retained by one executing source plan.
@@ -453,8 +453,6 @@ impl ExecutionPlan for OracleIcebergScanExec {
 const SOURCE_TIER_COLUMN: &str = "__wyrd_oracle_source_tier";
 /// Record-batch target used while decoding one bounded hot Parquet file.
 const HOT_BATCH_ROWS: usize = 8_192;
-/// Fixed spill partition count bounding exact reconciliation skew.
-const RECONCILE_SPILL_PARTITIONS: usize = 32;
 
 /// Poll-enclosing lifecycle for one Oracle source or reconciliation stream.
 struct OracleStreamLifecycle<S> {
@@ -466,6 +464,8 @@ struct OracleStreamLifecycle<S> {
     span: tracing::Span,
     /// Optional closed source label for source-operation telemetry.
     source: Option<&'static str>,
+    /// Optional reconciliation sort and class used for actual terminal spill evidence.
+    reconcile_sort: Option<(Arc<SortExec>, QueryClass)>,
     /// Monotonic start covering pending time and every poll.
     started: Instant,
     /// Whether a terminal outcome was already emitted.
@@ -485,6 +485,26 @@ impl<S> OracleStreamLifecycle<S> {
             schema,
             span,
             source,
+            reconcile_sort: None,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    /// Wraps the reducer and retains its exact `SortExec` metric owner.
+    fn new_reconciliation(
+        stream: S,
+        schema: SchemaRef,
+        span: tracing::Span,
+        sort: Arc<SortExec>,
+        query_class: QueryClass,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            schema,
+            span,
+            source: None,
+            reconcile_sort: Some((sort, query_class)),
             started: Instant::now(),
             finished: false,
         }
@@ -499,6 +519,32 @@ impl<S> OracleStreamLifecycle<S> {
         if let Some(source) = self.source {
             metrics::histogram!("bifrost_oracle_source_operation_seconds", "source" => source, "outcome" => outcome)
                 .record(self.started.elapsed().as_secs_f64());
+        }
+        if let Some((sort, query_class)) = &self.reconcile_sort {
+            let sort_metrics = sort.metrics().unwrap_or_default();
+            let class = query_class_label(*query_class);
+            let query_outcome = if outcome == "failed" {
+                "error"
+            } else {
+                outcome
+            };
+            let spilled_bytes =
+                u64::try_from(sort_metrics.spilled_bytes().unwrap_or_default()).unwrap_or(u64::MAX);
+            let spill_count =
+                u64::try_from(sort_metrics.spill_count().unwrap_or_default()).unwrap_or(u64::MAX);
+            metrics::counter!("oracle_query_spill_bytes_total", "class" => class)
+                .increment(spilled_bytes);
+            metrics::counter!(
+                "oracle_query_spill_files_total",
+                "class" => class
+            )
+            .increment(spill_count);
+            metrics::counter!(
+                "oracle_query_spill_queries_total",
+                "class" => class,
+                "outcome" => query_outcome
+            )
+            .increment(1);
         }
         self.finished = true;
     }
@@ -1083,8 +1129,10 @@ impl ExecutionPlan for TenantTripwireExec {
 /// Exact identity reconciliation after tenant validation and before SQL operators.
 #[derive(Debug)]
 pub struct ReconcileExec {
-    /// Tenant-validated, source-tagged input.
+    /// Identity-sorted, tenant-validated, source-tagged input.
     input: Arc<dyn ExecutionPlan>,
+    /// Concrete sort owner retained for terminal spill metrics.
+    sort: Arc<SortExec>,
     /// Parent governor and configured reconciliation ceiling.
     memory: OracleMemoryResources,
     /// Production telemetry and class when constructed by the retained Oracle.
@@ -1131,13 +1179,51 @@ impl ReconcileExec {
         telemetry: Option<(Arc<OracleTelemetry>, QueryClass)>,
     ) -> DataFusionResult<Self> {
         let schema = schema_without(&input.schema(), SOURCE_TIER_COLUMN)?;
+        let ordering = identity_ordering(input.schema().as_ref())?;
+        let sort = Arc::new(SortExec::new(ordering, input));
         Ok(Self {
-            input,
+            input: sort.clone(),
+            sort,
             memory,
             telemetry,
             properties: plan_properties(schema),
         })
     }
+}
+
+/// Builds the mandatory ascending physical ordering for exact row identity.
+///
+/// Column indices are resolved by managed-column name so projections or schema
+/// evolution cannot silently sort on the wrong physical positions.
+///
+/// # Errors
+///
+/// Returns the existing invalid-identity source when either managed identity
+/// column is absent, or a plan error if the non-empty ordering cannot be built.
+fn identity_ordering(schema: &Schema) -> DataFusionResult<LexOrdering> {
+    let batch_index = schema
+        .index_of("wyrd_batch_id")
+        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
+    let ordinal_index = schema
+        .index_of("wyrd_row_ordinal")
+        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
+    LexOrdering::new(vec![
+        PhysicalSortExpr::new(
+            Arc::new(Column::new("wyrd_batch_id", batch_index)),
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        ),
+        PhysicalSortExpr::new(
+            Arc::new(Column::new("wyrd_row_ordinal", ordinal_index)),
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        ),
+    ])
+    .ok_or_else(|| DataFusionError::Plan("Oracle identity ordering cannot be empty".to_owned()))
 }
 
 impl DisplayAs for ReconcileExec {
@@ -1167,12 +1253,12 @@ impl ExecutionPlan for ReconcileExec {
         &self.properties
     }
 
-    /// Returns the tenant-tripwired union as the sole child.
+    /// Returns the identity sort as the sole child.
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
 
-    /// Rebuilds reconciliation around exactly one replacement child.
+    /// Rebuilds reconciliation and its identity sort around one replacement child.
     ///
     /// # Errors
     ///
@@ -1181,9 +1267,13 @@ impl ExecutionPlan for ReconcileExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let [input] = children
+        let [replacement] = children
             .try_into()
             .map_err(|_| DataFusionError::Plan("ReconcileExec requires one child".to_owned()))?;
+        let input = replacement
+            .as_any()
+            .downcast_ref::<SortExec>()
+            .map_or_else(|| Arc::clone(&replacement), |sort| Arc::clone(sort.input()));
         Ok(Arc::new(Self::new_inner(
             input,
             self.memory.clone(),
@@ -1191,16 +1281,12 @@ impl ExecutionPlan for ReconcileExec {
         )?))
     }
 
-    /// Consumes bounded source rows, verifies duplicates, and yields winners.
-    ///
-    /// The exact table-level state is charged to the shared Bifrost parent.
-    /// Exceeding the configured query reconciliation ceiling fails closed
-    /// before a global SQL operator can observe partial state.
+    /// Reduces consecutive sorted identities while retaining one winner.
     ///
     /// # Errors
     ///
     /// Returns a `DataFusion` execution error for invalid identities, unequal
-    /// duplicates, source failure, or parent-memory exhaustion.
+    /// duplicates, or a sorted-source failure.
     fn execute(
         &self,
         partition: usize,
@@ -1213,522 +1299,116 @@ impl ExecutionPlan for ReconcileExec {
         }
         let mut input = execute_stream(Arc::clone(&self.input), task)?;
         let schema = self.schema();
-        let memory = self.memory.clone();
-        let telemetry = self.telemetry.clone();
         let reconcile_span = tracing::info_span!(
             "bifrost.oracle.reconcile",
             operator = "exact_identity",
             outcome = tracing::field::Empty
         );
         let stream = async_stream::try_stream! {
-            let mut winners: BTreeMap<RowIdentity, ReconciledRow> = BTreeMap::new();
-            let mut reservations: Vec<ReconcileMemoryReservation> = Vec::new();
-            let mut charged = 0_usize;
-            let mut spill: Option<ReconcileSpill> = None;
+            let mut current: Option<CurrentIdentityWinner> = None;
             while let Some(batch) = input.next().await {
                 let batch = batch?;
-                if let Some(active_spill) = spill.take() {
-                    spill = Some(active_spill.append(batch).await?);
-                    continue;
-                }
-                let batch_bytes = batch.get_array_memory_size();
-                charged = charged.checked_add(batch_bytes).ok_or_else(|| {
-                    DataFusionError::ResourcesExhausted("reconciliation byte accounting overflow".to_owned())
-                })?;
-                if charged > memory.reconciliation_limit_bytes {
-                    let prior = winners
-                        .into_values()
-                        .map(|winner| winner.batch)
-                        .collect::<Vec<_>>();
-                    winners = BTreeMap::new();
-                    reservations.clear();
-                    charged = 0;
-                    spill = Some(ReconcileSpill::start(prior, batch).await?);
-                    continue;
-                }
-                let reservation = memory
-                    .governor
-                    .try_reserve_parent_classified(
-                        batch_bytes,
-                        MemoryPurpose::OracleReconciliation,
-                    )
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                reservations.push(match &telemetry {
-                    Some((telemetry, query_class)) => ReconcileMemoryReservation::Accounted(
-                        telemetry.account_memory(
-                            reservation,
-                            *query_class,
-                            OracleMemoryKind::Reconciliation,
-                        ),
-                    ),
-                    None => ReconcileMemoryReservation::Unaccounted(reservation),
-                });
-                reconcile_batch(&mut winners, &batch)?;
-            }
-            if let Some(spill) = spill {
-                let finished = tokio::task::spawn_blocking(move || spill.finish())
-                    .await
-                    .map_err(|error| DataFusionError::External(Box::new(error)))??;
-                metrics::counter!(
-                    "oracle_query_spill_bytes_total",
-                    "class" => query_class_label(
-                        telemetry.as_ref().map_or(QueryClass::Analytical, |(_, class)| *class)
-                    )
-                )
-                .increment(finished.spill_bytes);
-                for partition in 0..RECONCILE_SPILL_PARTITIONS {
-                    for batch in finished
-                        .reconcile_partition(partition, memory.clone(), telemetry.clone())
-                        .await?
-                    {
-                        yield batch;
+                for row in 0..batch.num_rows() {
+                    let candidate = CurrentIdentityWinner::begin(&batch, row)?;
+                    match current.as_mut() {
+                        Some(winner) if winner.identity == candidate.identity => {
+                            winner.reconcile(candidate)?;
+                        }
+                        Some(_) => {
+                            let prior = current.take().expect("current winner exists in matched branch");
+                            yield prior.finish()?;
+                            current = Some(candidate);
+                        }
+                        None => {
+                            current = Some(candidate);
+                        }
                     }
                 }
-            } else {
-                for row in winners.into_values() {
-                    yield remove_column(&row.batch, SOURCE_TIER_COLUMN)?;
-                }
             }
-            drop(reservations);
+            if let Some(winner) = current {
+                yield winner.finish()?;
+            }
         };
-        Ok(Box::pin(OracleStreamLifecycle::new(
+        let query_class = self
+            .telemetry
+            .as_ref()
+            .map_or(QueryClass::Analytical, |(_, query_class)| *query_class);
+        Ok(Box::pin(OracleStreamLifecycle::new_reconciliation(
             stream,
             schema,
             reconcile_span,
-            None,
+            Arc::clone(&self.sort),
+            query_class,
         )))
     }
 }
 
-/// Reconciliation reservation retained in production or isolated unit plans.
-enum ReconcileMemoryReservation {
-    /// Parent capacity without a production class context.
-    Unaccounted(ParentMemoryReservation),
-    /// Parent capacity coupled to canonical Oracle gauges.
-    Accounted(AccountedMemoryReservation),
-}
-
-impl Drop for ReconcileMemoryReservation {
-    /// Retains both reservation variants until the surrounding state releases.
-    fn drop(&mut self) {
-        match self {
-            Self::Unaccounted(reservation) => {
-                let _ = reservation.bytes();
-            }
-            Self::Accounted(reservation) => {
-                let _ = reservation.bytes;
-            }
-        }
-    }
-}
-
-/// One retained exact-identity winner.
-struct ReconciledRow {
+/// One retained winner for the current sorted identity.
+struct CurrentIdentityWinner {
+    /// Immutable identity shared by consecutive sorted duplicates.
+    identity: RowIdentity,
     /// Winning source tier.
     tier: SourceTier,
     /// Shallow one-row batch retaining the source arrays.
-    batch: RecordBatch,
+    row: RecordBatch,
 }
 
-/// Maps a full 16-byte batch id to one fixed reconciliation spill partition.
-///
-/// `ReconcileSpill::write_batch` fans retained rows across
-/// `RECONCILE_SPILL_PARTITIONS` files so each file reconciles under the
-/// per-partition byte bound applied in
-/// `FinishedReconcileSpill::reconcile_partition`. That bound only functions
-/// when rows spread uniformly, so partitioning MUST hash the entire batch id:
-/// every canonical batch id is a `UUIDv7` whose leading bytes are the top bits of
-/// the millisecond timestamp and are constant across the deployed timeframe, so
-/// hashing any fixed prefix collapses every row into one partition and defeats
-/// the bound. FNV-1a over all 16 bytes spreads rows on the random v7 tail while
-/// staying a pure deterministic function of the id, so identical identities (a
-/// `RowIdentity` shares its `batch_id`) always land in the same partition and
-/// exact-identity dedup is preserved.
-///
-/// # Panics
-///
-/// Never in practice: the result is a modulo of `RECONCILE_SPILL_PARTITIONS`
-/// and always fits `usize`; the invariant is named in the `expect` message.
-fn spill_partition(batch_id: &[u8]) -> usize {
-    /// FNV-1a 64-bit offset basis.
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    /// FNV-1a 64-bit prime.
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in batch_id {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    usize::try_from(hash % RECONCILE_SPILL_PARTITIONS as u64)
-        .expect("spill partition index is below RECONCILE_SPILL_PARTITIONS and fits usize")
-}
-
-/// Row bound for coalescing retained spill winners into one message.
-///
-/// Mirrors `DataFusion`'s default batch size so a coalesced spill message is the
-/// same shape the rest of the plan streams, keeping each partition file to a
-/// handful of large IPC messages instead of one message per retained winner.
-const RECONCILE_SPILL_COALESCE_ROWS: usize = 8192;
-
-/// Coalesces shallow one-row retained winners into bounded multi-row batches.
-///
-/// Retained reconciliation winners arrive as one-row slices of their source
-/// batches (see [`ReconciledRow`]), so spilling them verbatim would emit one
-/// Arrow IPC message per winner and keep each winner's full source array pinned
-/// behind its slice. Concatenating consecutive winners into batches of at most
-/// [`RECONCILE_SPILL_COALESCE_ROWS`] rows compacts those slices into fresh
-/// contiguous arrays — releasing the pinned source arrays — and lets
-/// [`ReconcileSpill::start`] write few large messages per partition. The result
-/// preserves winner order and never reorders across identities, so downstream
-/// hash partitioning and exact-identity dedup are unaffected.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` execution error when Arrow rejects a concatenation,
-/// for example on a schema mismatch among the retained winners.
-fn coalesce_retained_winners(
-    schema: &SchemaRef,
-    retained: Vec<RecordBatch>,
-) -> DataFusionResult<Vec<RecordBatch>> {
-    let mut coalesced = Vec::new();
-    let mut pending: Vec<RecordBatch> = Vec::new();
-    let mut pending_rows = 0_usize;
-    for winner in retained {
-        pending_rows += winner.num_rows();
-        pending.push(winner);
-        if pending_rows >= RECONCILE_SPILL_COALESCE_ROWS {
-            coalesced.push(concat_batches(schema, &pending).map_err(DataFusionError::from)?);
-            pending.clear();
-            pending_rows = 0;
-        }
-    }
-    if !pending.is_empty() {
-        coalesced.push(concat_batches(schema, &pending).map_err(DataFusionError::from)?);
-    }
-    Ok(coalesced)
-}
-
-/// Sums the resident slice memory of one decoded spill batch across its columns.
-///
-/// A batch decoded from an Arrow IPC stream slices a single shared message arena
-/// whose full buffer capacity `RecordBatch::get_array_memory_size` counts once
-/// per buffer, so that measure scales with message and buffer count rather than
-/// the rows actually present. The per-partition read bound in
-/// [`FinishedReconcileSpill::reconcile_partition`] must instead reflect the
-/// resident partition contents, so it charges each column's
-/// `ArrayData::get_slice_memory_size` — the bytes the batch's own slice occupies
-/// — and sums them. This is the bound's measure only; the accumulate-side
-/// trigger charge and the parent-governor reservation are unchanged.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` execution error when Arrow cannot compute a column's
-/// slice memory size, or when the per-column sum overflows `usize`.
-fn decoded_batch_slice_bytes(batch: &RecordBatch) -> DataFusionResult<usize> {
-    let mut total = 0_usize;
-    for column in batch.columns() {
-        let column_bytes = column
-            .to_data()
-            .get_slice_memory_size()
-            .map_err(DataFusionError::from)?;
-        total = total.checked_add(column_bytes).ok_or_else(|| {
-            DataFusionError::ResourcesExhausted(
-                "spill partition slice-byte accounting overflow".to_owned(),
-            )
-        })?;
-    }
-    Ok(total)
-}
-
-/// Blocking-tempfile spill state partitioned by immutable row identity.
-struct ReconcileSpill {
-    /// Tagged physical schema written to every partition.
-    schema: SchemaRef,
-    /// Open Arrow IPC writers, one per fixed hash partition.
-    writers: Vec<arrow::ipc::writer::StreamWriter<File>>,
-    /// Tempfiles retaining partition paths through the read phase.
-    files: Vec<NamedTempFile>,
-}
-
-impl ReconcileSpill {
-    /// Creates a spill owner and writes the retained winners plus triggering batch off-thread.
-    ///
-    /// The retained winners reach this owner as shallow one-row slices (one per
-    /// deduped identity), so writing them directly would emit one Arrow IPC
-    /// message per row and leave every winner's full source array pinned. They
-    /// are first coalesced into bounded multi-row batches via
-    /// [`coalesce_retained_winners`], which compacts the slices — releasing the
-    /// pinned source arrays — and keeps each partition file to a few large
-    /// messages so the per-partition read bound measures resident data rather
-    /// than per-message overhead. The post-trigger `append` path already carries
-    /// multi-row source batches and is left unchanged.
+impl CurrentIdentityWinner {
+    /// Validates and retains one row as the first winner for its identity.
     ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` error when the blocking task fails, coalescing
-    /// rejects a batch, or spill IO rejects a batch.
-    async fn start(retained: Vec<RecordBatch>, batch: RecordBatch) -> DataFusionResult<Self> {
-        tokio::task::spawn_blocking(move || {
-            let schema = batch.schema();
-            let coalesced = coalesce_retained_winners(&schema, retained)?;
-            let mut spill = Self::new(schema)?;
-            for coalesced_batch in coalesced {
-                spill.write_batch(&coalesced_batch)?;
-            }
-            spill.write_batch(&batch)?;
-            Ok(spill)
-        })
-        .await
-        .map_err(|error| DataFusionError::External(Box::new(error)))?
-    }
-
-    /// Appends one source batch to an active spill owner off-thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` error when the blocking task fails or spill IO rejects the batch.
-    async fn append(mut self, batch: RecordBatch) -> DataFusionResult<Self> {
-        tokio::task::spawn_blocking(move || {
-            self.write_batch(&batch)?;
-            Ok(self)
-        })
-        .await
-        .map_err(|error| DataFusionError::External(Box::new(error)))?
-    }
-
-    /// Creates every fixed spill partition before accepting rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` execution error when a tempfile, clone, or Arrow
-    /// writer cannot be created.
-    fn new(schema: SchemaRef) -> DataFusionResult<Self> {
-        let mut writers = Vec::with_capacity(RECONCILE_SPILL_PARTITIONS);
-        let mut files = Vec::with_capacity(RECONCILE_SPILL_PARTITIONS);
-        for _ in 0..RECONCILE_SPILL_PARTITIONS {
-            let file =
-                NamedTempFile::new().map_err(|error| DataFusionError::External(Box::new(error)))?;
-            let writer_file = file
-                .reopen()
-                .map_err(|error| DataFusionError::External(Box::new(error)))?;
-            writers.push(
-                arrow::ipc::writer::StreamWriter::try_new(writer_file, &schema)
-                    .map_err(DataFusionError::from)?,
-            );
-            files.push(file);
-        }
+    /// Returns the existing invalid-identity error for absent, null, malformed,
+    /// negative, or unknown managed identity/source values.
+    fn begin(batch: &RecordBatch, row: usize) -> DataFusionResult<Self> {
+        let (identity, tier) = row_identity_and_tier(batch, row)?;
         Ok(Self {
-            schema,
-            writers,
-            files,
+            identity,
+            tier,
+            row: batch.slice(row, 1),
         })
     }
 
-    /// Hash-partitions every row in one source batch into bounded spill files.
+    /// Verifies one equal-identity duplicate and retains the highest-precedence row.
     ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` execution error for malformed identities, Arrow
-    /// projection failure, or local spill IO failure.
-    fn write_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
-        if batch.schema() != self.schema {
-            return Err(DataFusionError::Execution(
-                "reconciliation spill schema changed".to_owned(),
-            ));
+    /// Returns the reconciliation invariant when logical values differ.
+    fn reconcile(&mut self, candidate: Self) -> DataFusionResult<()> {
+        if !logical_rows_equal(&self.row, &candidate.row)? {
+            metrics::counter!(
+                "bifrost_oracle_security_events_total",
+                "event_class" => "reconciliation"
+            )
+            .increment(1);
+            return Err(DataFusionError::External(Box::new(
+                BifrostError::QueryReconciliationInvariant,
+            )));
         }
-        let batch_index = batch
-            .schema()
-            .index_of("wyrd_batch_id")
-            .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-        let ordinals_index = batch
-            .schema()
-            .index_of("wyrd_row_ordinal")
-            .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-        let batch_ids = batch
-            .column(batch_index)
-            .as_any()
-            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
-            .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-        let ordinals = batch
-            .column(ordinals_index)
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-        let mut indices = vec![Vec::new(); RECONCILE_SPILL_PARTITIONS];
-        for row in 0..batch.num_rows() {
-            if batch_ids.is_null(row) || ordinals.is_null(row) || ordinals.value(row) < 0 {
-                return Err(DataFusionError::External(Box::new(
-                    ReconcileError::InvalidIdentity,
-                )));
-            }
-            let partition = spill_partition(batch_ids.value(row));
-            indices[partition].push(u32::try_from(row).map_err(|_| {
-                DataFusionError::Execution("spill row ordinal exceeds u32".to_owned())
-            })?);
+        let losing_source = if candidate.tier < self.tier {
+            self.tier
+        } else {
+            candidate.tier
+        };
+        if candidate.tier < self.tier {
+            self.tier = candidate.tier;
+            self.row = candidate.row;
         }
-        for (partition, rows) in indices.into_iter().enumerate() {
-            if rows.is_empty() {
-                continue;
-            }
-            let indices = UInt32Array::from(rows);
-            let columns = batch
-                .columns()
-                .iter()
-                .map(|column| take(column, &indices, None).map_err(DataFusionError::from))
-                .collect::<DataFusionResult<Vec<_>>>()?;
-            let partition_batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)
-                .map_err(DataFusionError::from)?;
-            self.writers[partition]
-                .write(&partition_batch)
-                .map_err(DataFusionError::from)?;
-        }
+        metrics::counter!(
+            "bifrost_oracle_rows_deduplicated_total",
+            "losing_source" => losing_source.label()
+        )
+        .increment(1);
         Ok(())
     }
 
-    /// Closes all partition writers and returns a retained read owner.
+    /// Removes the hidden source tier from the winning row.
     ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` execution error when Arrow cannot finish a file.
-    fn finish(mut self) -> DataFusionResult<FinishedReconcileSpill> {
-        for writer in &mut self.writers {
-            writer.finish().map_err(DataFusionError::from)?;
-        }
-        drop(self.writers);
-        let spill_bytes = self.files.iter().try_fold(0_u64, |total, file| {
-            let bytes = file
-                .as_file()
-                .metadata()
-                .map_err(|error| DataFusionError::External(Box::new(error)))?
-                .len();
-            total.checked_add(bytes).ok_or_else(|| {
-                DataFusionError::ResourcesExhausted(
-                    "reconciliation spill-byte accounting overflow".to_owned(),
-                )
-            })
-        })?;
-        Ok(FinishedReconcileSpill {
-            files: self.files,
-            spill_bytes,
-        })
-    }
-}
-
-/// Closed spill files read one bounded partition at a time.
-struct FinishedReconcileSpill {
-    /// Tempfiles retained until all partitions are reconciled.
-    files: Vec<NamedTempFile>,
-    /// Exact encoded bytes retained across every fixed partition.
-    spill_bytes: u64,
-}
-
-/// One decoded spill batch coupled to its parent-memory reservation.
-type SpillDecodedBatch = DataFusionResult<(RecordBatch, ParentMemoryReservation)>;
-/// Bounded spill decoder channel returned to the async reconciliation task.
-type SpillBatchReceiver = tokio::sync::mpsc::Receiver<SpillDecodedBatch>;
-/// Blocking decoder completion handle paired with a spill channel.
-type SpillDecoder = tokio::task::JoinHandle<DataFusionResult<()>>;
-
-impl FinishedReconcileSpill {
-    /// Decodes and reconciles one bounded spill partition before advancing to the next.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` error for decode failure, memory exhaustion,
-    /// invalid identities, task failure, or a partition exceeding the query bound.
-    async fn reconcile_partition(
-        &self,
-        partition: usize,
-        memory: OracleMemoryResources,
-        telemetry: Option<(Arc<OracleTelemetry>, QueryClass)>,
-    ) -> DataFusionResult<Vec<RecordBatch>> {
-        let (mut batches, decoder) = self.read_partition(partition, memory.clone())?;
-        let mut winners = BTreeMap::new();
-        let mut reservations = Vec::new();
-        let mut partition_bytes = 0_usize;
-        while let Some(decoded) = batches.recv().await {
-            let (batch, reservation) = decoded?;
-            partition_bytes = partition_bytes
-                .checked_add(decoded_batch_slice_bytes(&batch)?)
-                .ok_or_else(|| {
-                    DataFusionError::ResourcesExhausted(
-                        "spill partition byte accounting overflow".to_owned(),
-                    )
-                })?;
-            if partition_bytes > memory.reconciliation_limit_bytes {
-                return Err(DataFusionError::ResourcesExhausted(
-                    "one reconciliation spill partition exceeds the query limit".to_owned(),
-                ));
-            }
-            reservations.push(match &telemetry {
-                Some((telemetry, query_class)) => {
-                    ReconcileMemoryReservation::Accounted(telemetry.account_memory(
-                        reservation,
-                        *query_class,
-                        OracleMemoryKind::Reconciliation,
-                    ))
-                }
-                None => ReconcileMemoryReservation::Unaccounted(reservation),
-            });
-            reconcile_batch(&mut winners, &batch)?;
-        }
-        decoder
-            .await
-            .map_err(|error| DataFusionError::External(Box::new(error)))??;
-        let output = winners
-            .into_values()
-            .map(|row| remove_column(&row.batch, SOURCE_TIER_COLUMN))
-            .collect::<DataFusionResult<Vec<_>>>()?;
-        drop(reservations);
-        Ok(output)
-    }
-
-    /// Starts bounded decoding of one partition on Tokio's blocking pool.
-    ///
-    /// The two-batch channel is the only decoded lookahead. Each batch obtains
-    /// a parent-governor reservation before crossing back to the async query
-    /// task, and that reservation follows the batch until reconciliation has
-    /// yielded the partition winners.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` execution error for invalid partition, local IO,
-    /// Arrow IPC failure, or parent-memory exhaustion.
-    fn read_partition(
-        &self,
-        partition: usize,
-        memory: OracleMemoryResources,
-    ) -> DataFusionResult<(SpillBatchReceiver, SpillDecoder)> {
-        let mut file = self
-            .files
-            .get(partition)
-            .ok_or_else(|| DataFusionError::Execution("spill partition is invalid".to_owned()))?
-            .reopen()
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        let decoder = tokio::task::spawn_blocking(move || {
-            file.seek(SeekFrom::Start(0))
-                .map_err(|error| DataFusionError::External(Box::new(error)))?;
-            let reader = arrow::ipc::reader::StreamReader::try_new(file, None)
-                .map_err(DataFusionError::from)?;
-            for batch in reader {
-                let decoded = batch.map_err(DataFusionError::from).and_then(|batch| {
-                    let reservation = memory
-                        .governor
-                        .try_reserve_parent_classified(
-                            batch.get_array_memory_size(),
-                            MemoryPurpose::OracleReconciliation,
-                        )
-                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                    Ok((batch, reservation))
-                });
-                if sender.blocking_send(decoded).is_err() {
-                    break;
-                }
-            }
-            Ok(())
-        });
-        Ok((receiver, decoder))
+    /// Returns a plan error if the internally required source tier is absent.
+    fn finish(self) -> DataFusionResult<RecordBatch> {
+        remove_column(&self.row, SOURCE_TIER_COLUMN)
     }
 }
 
@@ -2131,16 +1811,22 @@ fn hot_stream(
     }
 }
 
-/// Reconciles one tagged source batch into the deterministic winner map.
+/// Reads and validates the exact identity and source tier for one physical row.
 ///
 /// # Errors
 ///
-/// Returns a `DataFusion` error for malformed identity/source columns or unequal
-/// logical duplicate rows.
-fn reconcile_batch(
-    winners: &mut BTreeMap<RowIdentity, ReconciledRow>,
+/// Returns the existing invalid-identity error for missing or incorrectly typed
+/// columns, an out-of-range row, null values, a negative ordinal, or an unknown
+/// source tier.
+fn row_identity_and_tier(
     batch: &RecordBatch,
-) -> DataFusionResult<()> {
+    row: usize,
+) -> DataFusionResult<(RowIdentity, SourceTier)> {
+    if row >= batch.num_rows() {
+        return Err(DataFusionError::External(Box::new(
+            ReconcileError::InvalidIdentity,
+        )));
+    }
     let batch_index = batch
         .schema()
         .index_of("wyrd_batch_id")
@@ -2168,62 +1854,27 @@ fn reconcile_batch(
         .as_any()
         .downcast_ref::<UInt8Array>()
         .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    for row in 0..batch.num_rows() {
-        if batches.is_null(row)
-            || ordinals.is_null(row)
-            || ordinals.value(row) < 0
-            || sources.is_null(row)
-        {
-            return Err(DataFusionError::External(Box::new(
-                ReconcileError::InvalidIdentity,
-            )));
-        }
-        let batch_id = batches
-            .value(row)
-            .try_into()
-            .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-        let identity = RowIdentity {
-            batch_id,
-            ordinal: u32::try_from(ordinals.value(row)).map_err(|_| {
-                DataFusionError::External(Box::new(ReconcileError::InvalidIdentity))
-            })?,
-        };
-        let tier = SourceTier::from_u8(sources.value(row))
-            .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-        let one = batch.slice(row, 1);
-        match winners.get_mut(&identity) {
-            Some(existing) => {
-                if !logical_rows_equal(&existing.batch, &one)? {
-                    metrics::counter!(
-                        "bifrost_oracle_security_events_total",
-                        "event_class" => "reconciliation"
-                    )
-                    .increment(1);
-                    return Err(DataFusionError::External(Box::new(
-                        BifrostError::QueryReconciliationInvariant,
-                    )));
-                }
-                let losing_source = if tier < existing.tier {
-                    existing.tier
-                } else {
-                    tier
-                };
-                if tier < existing.tier {
-                    existing.tier = tier;
-                    existing.batch = one;
-                }
-                metrics::counter!(
-                    "bifrost_oracle_rows_deduplicated_total",
-                    "losing_source" => losing_source.label()
-                )
-                .increment(1);
-            }
-            None => {
-                winners.insert(identity, ReconciledRow { tier, batch: one });
-            }
-        }
+    if batches.is_null(row)
+        || ordinals.is_null(row)
+        || ordinals.value(row) < 0
+        || sources.is_null(row)
+    {
+        return Err(DataFusionError::External(Box::new(
+            ReconcileError::InvalidIdentity,
+        )));
     }
-    Ok(())
+    let batch_id = batches
+        .value(row)
+        .try_into()
+        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
+    let identity = RowIdentity {
+        batch_id,
+        ordinal: u32::try_from(ordinals.value(row))
+            .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?,
+    };
+    let tier = SourceTier::from_u8(sources.value(row))
+        .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
+    Ok((identity, tier))
 }
 
 /// Compares one logical row by Arrow values after removing source bookkeeping.
@@ -2455,6 +2106,7 @@ mod tests {
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
+    use datafusion::prelude::SessionConfig;
     use wyrd_runtime::Principal;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_spec::auth::PrincipalId;
@@ -2807,46 +2459,154 @@ mod tests {
         .expect("test batch matches its schema")
     }
 
+    /// Builds one bounded multi-row source batch for external-sort tests.
+    fn tagged_rows(
+        batch_id: [u8; 16],
+        ordinals: std::ops::Range<i32>,
+        tier: SourceTier,
+    ) -> RecordBatch {
+        let count = usize::try_from(ordinals.end - ordinals.start).expect("non-negative range");
+        let mut ids = FixedSizeBinaryBuilder::with_capacity(count, 16);
+        let mut ordinal_values = Vec::with_capacity(count);
+        let mut values = Vec::with_capacity(count);
+        let mut tenants = Vec::with_capacity(count);
+        for ordinal in ordinals {
+            ids.append_value(batch_id)
+                .expect("test identity has fixed width");
+            ordinal_values.push(ordinal);
+            values.push(i64::from(ordinal));
+            tenants.push(uuid::Uuid::nil().to_string());
+        }
+        let schema = tagged_batch(batch_id, 0, 0, tier).schema();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(ids.finish()) as ArrayRef,
+                Arc::new(Int32Array::from(ordinal_values)) as ArrayRef,
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(Int64Array::from(values)) as ArrayRef,
+                Arc::new(UInt8Array::from(vec![tier.as_u8(); count])) as ArrayRef,
+            ],
+        )
+        .expect("multi-row test batch matches its schema")
+    }
+
+    /// Creates the production Oracle DataFusion pool with a deterministic test ceiling.
+    fn reconciliation_test_pool() -> (
+        crate::scribe::memory::BifrostMemoryGovernor,
+        Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) {
+        let governor = crate::scribe::memory::BifrostMemoryGovernor::new_with_test_child_limits(
+            4 * 1024 * 1024 * 1024,
+            256 << 20,
+            3 << 20,
+        )
+        .expect("test governor");
+        let pool = Arc::new(
+            crate::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(governor.clone()),
+        );
+        (governor, pool)
+    }
+
+    /// Executes source-tagged batches through the real sorted reconciliation plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns the production plan or stream error unchanged.
+    async fn run_sorted_reconciliation(
+        batches: Vec<RecordBatch>,
+    ) -> DataFusionResult<Vec<RecordBatch>> {
+        let source = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&batches),
+            batches[0].schema(),
+            None,
+        )?;
+        let plan = ReconcileExec::new(
+            source,
+            OracleMemoryResources {
+                governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
+                reconciliation_limit_bytes: 1024 * 1024,
+            },
+        )?;
+        let mut stream = plan.execute(
+            0,
+            datafusion::execution::context::SessionContext::new().task_ctx(),
+        )?;
+        let mut output = Vec::new();
+        while let Some(batch) = stream.next().await {
+            output.push(batch?);
+        }
+        Ok(output)
+    }
+
     /// Exact source precedence is independent of source arrival order.
-    #[test]
-    fn reconciliation_precedence_is_arrival_order_independent() {
+    #[tokio::test]
+    async fn reconciliation_precedence_is_arrival_order_independent() {
         let identity = [7_u8; 16];
         for order in [
             [SourceTier::Live, SourceTier::HotSealed, SourceTier::Iceberg],
             [SourceTier::Iceberg, SourceTier::Live, SourceTier::HotSealed],
             [SourceTier::HotSealed, SourceTier::Iceberg, SourceTier::Live],
         ] {
-            let mut winners = BTreeMap::new();
-            for tier in order {
-                reconcile_batch(&mut winners, &tagged_batch(identity, 3, 41, tier))
-                    .expect("equal duplicates reconcile");
-            }
-            let winner = winners
-                .get(&RowIdentity {
-                    batch_id: identity,
-                    ordinal: 3,
-                })
-                .expect("identity is retained");
-            assert_eq!(winner.tier, SourceTier::Iceberg);
+            let recorder = wyrd_bench::BenchmarkRecorder::default();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let output = run_sorted_reconciliation(
+                order
+                    .into_iter()
+                    .map(|tier| tagged_batch(identity, 3, 41, tier))
+                    .collect(),
+            )
+            .await
+            .expect("equal duplicates reconcile through production plan");
+            assert_eq!(output.len(), 1);
+            assert_eq!(winner_key(&output[0]).1, 41);
+            let snapshot = recorder.snapshot();
+            assert_eq!(
+                snapshot
+                    .counters
+                    .get("bifrost_oracle_rows_deduplicated_total{losing_source=\"live_tail\"}"),
+                Some(&1)
+            );
+            assert_eq!(
+                snapshot
+                    .counters
+                    .get("bifrost_oracle_rows_deduplicated_total{losing_source=\"hot_sealed\"}"),
+                Some(&1)
+            );
+            assert!(
+                snapshot
+                    .counters
+                    .get("bifrost_oracle_rows_deduplicated_total{losing_source=\"iceberg\"}")
+                    .is_none(),
+                "the highest-precedence Iceberg row must never be the loser"
+            );
         }
     }
 
     /// Unequal logical values for one immutable identity fail closed.
-    #[test]
-    fn reconciliation_rejects_unequal_duplicates() {
+    #[tokio::test]
+    async fn reconciliation_rejects_unequal_duplicates() {
         let identity = [9_u8; 16];
-        let mut winners = BTreeMap::new();
-        reconcile_batch(
-            &mut winners,
-            &tagged_batch(identity, 0, 1, SourceTier::HotSealed),
-        )
-        .expect("first row is valid");
-        let error = reconcile_batch(
-            &mut winners,
-            &tagged_batch(identity, 0, 2, SourceTier::Iceberg),
-        )
+        let error = run_sorted_reconciliation(vec![
+            tagged_batch(identity, 0, 1, SourceTier::HotSealed),
+            tagged_batch(identity, 0, 2, SourceTier::Iceberg),
+        ])
+        .await
         .expect_err("unequal duplicate must fail");
-        assert!(error.to_string().contains("reconciliation"));
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        let recovered = loop {
+            if let Some(bifrost) = source.downcast_ref::<BifrostError>() {
+                break bifrost;
+            }
+            source = source
+                .source()
+                .expect("reconciliation error retains its typed source");
+        };
+        assert!(matches!(
+            recovered,
+            BifrostError::QueryReconciliationInvariant
+        ));
     }
 
     /// Tenant validation finds foreign rows at every batch position.
@@ -2939,113 +2699,48 @@ mod tests {
         .expect("sort ordering");
         let global = SortExec::new(ordering, reconciled.clone());
         assert_eq!(global.children()[0].name(), "ReconcileExec");
+        assert_eq!(global.children()[0].children()[0].name(), "SortExec");
         assert_eq!(
-            global.children()[0].children()[0].name(),
+            global.children()[0].children()[0].children()[0].name(),
             "TenantTripwireExec"
         );
         assert_eq!(
-            global.children()[0].children()[0].children()[0].name(),
+            global.children()[0].children()[0].children()[0].children()[0].name(),
             "UnionExec"
         );
-    }
 
-    /// Reconciliation spills at its query ceiling across every fixed partition
-    /// and its union of winners equals the in-memory path's winner set exactly.
-    ///
-    /// The fixture mints canonical `UUIDv7`-shaped batch ids (shared timestamp
-    /// prefix, distinct random tails) — the only ids the system produces — so
-    /// the spill selector is exercised against its real input domain. Each
-    /// identity arrives in two source tiers with equal logical values, so exact
-    /// dedup runs across the spill boundary and the winner-set equality proves
-    /// the spilled reconciliation is identical to the in-memory reconciliation.
-    /// Before the D89 fix, every v7 id hashed on its constant first byte into a
-    /// single partition whose per-partition bound then rejected the read, so
-    /// this test fails closed against the defect. Under D90 the retained winners
-    /// spill through [`coalesce_retained_winners`] and are re-charged by
-    /// [`decoded_batch_slice_bytes`], so this winner-set-equality proof now also
-    /// pins reconciliation correctness across the coalesced spill path.
-    #[tokio::test]
-    async fn reconciliation_spills_in_fixed_identity_partitions() {
-        // Two tiers per identity so dedup is exercised through the spill path.
-        let mut batches = Vec::new();
-        for tail in 0_u8..128 {
-            let id = v7_style_id(tail);
-            batches.push(tagged_batch(id, 0, i64::from(tail), SourceTier::Live));
-            batches.push(tagged_batch(id, 0, i64::from(tail), SourceTier::Iceberg));
-        }
-
-        // Reference winners from the in-memory reconciliation over the identical
-        // input, stripped of source-tier bookkeeping exactly as both output
-        // paths do before yielding.
-        let mut reference = BTreeMap::new();
-        for batch in &batches {
-            reconcile_batch(&mut reference, batch).expect("reference input reconciles");
-        }
-        let expected = reference
-            .into_values()
-            .map(|row| {
-                winner_key(&remove_column(&row.batch, SOURCE_TIER_COLUMN).expect("strip tier"))
-            })
-            .collect::<std::collections::BTreeSet<_>>();
+        let rebuilt = reconciled
+            .clone()
+            .with_new_children(vec![Arc::clone(&reconciled.children()[0])])
+            .expect("optimizer replacement rebuilds reconciliation");
+        let rebuilt = rebuilt
+            .as_any()
+            .downcast_ref::<ReconcileExec>()
+            .expect("replacement preserves reconciliation owner");
+        let executed_sort = rebuilt.children()[0]
+            .as_any()
+            .downcast_ref::<SortExec>()
+            .expect("replacement retains one mandatory identity sort");
+        assert!(std::ptr::eq(executed_sort, rebuilt.sort.as_ref()));
+        assert_eq!(executed_sort.children()[0].name(), "TenantTripwireExec");
         assert_eq!(
-            expected.len(),
-            128,
-            "dedup collapses each identity to one winner"
+            executed_sort.children()[0].children()[0].name(),
+            "UnionExec"
         );
-
-        let per_batch = batches[0].get_array_memory_size();
-        let input = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&batches),
-            tagged_batch([0_u8; 16], 0, 0, SourceTier::Live).schema(),
-            None,
-        )
-        .expect("test memory source");
-        let governor = crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-            .expect("minimum test governor");
-        // The in-memory accumulator charges the compact source-batch size while
-        // each spilled row is re-charged at its larger IPC-decoded size, so the
-        // limit must sit above one partition's decoded rows yet below the total
-        // in-memory working set for a spill to trigger. 128x per_batch lands in
-        // that window for this fixture with comfortable margin on both sides.
-        let plan = ReconcileExec::new(
-            input,
-            OracleMemoryResources {
-                governor,
-                reconciliation_limit_bytes: per_batch.saturating_mul(128),
-            },
-        )
-        .expect("tagged input is valid");
-        let session = datafusion::execution::context::SessionContext::new();
-        let mut stream = plan
-            .execute(0, session.task_ctx())
-            .expect("spill plan executes");
-        let mut actual = std::collections::BTreeSet::new();
-        while let Some(batch) = stream.next().await {
-            let batch =
-                batch.expect("every spill partition reconciles under the per-partition bound");
-            for row in 0..batch.num_rows() {
-                assert!(
-                    actual.insert(winner_key(&batch.slice(row, 1))),
-                    "spill output must not repeat an identity"
-                );
-            }
-        }
-        assert_eq!(
-            actual, expected,
-            "spill-path winner union must equal the in-memory winner set"
+        assert!(
+            executed_sort.children()[0]
+                .as_any()
+                .downcast_ref::<SortExec>()
+                .is_none(),
+            "optimizer rebuild must not nest a second mandatory sort"
         );
     }
 
-    /// Builds a canonical UUIDv7-shaped batch id: a shared millisecond-timestamp
-    /// prefix with a distinct random-style tail, matching every id the system
-    /// mints via `Uuid::now_v7`.
+    /// Builds one canonical UUIDv7-shaped identity for sorted reconciliation tests.
     fn v7_style_id(tail: u8) -> [u8; 16] {
-        // Shared 48-bit unix-ms timestamp prefix (bytes 0..6) and version nibble
-        // (byte 6 high nibble 0x7), constant across ids as in a real v7 burst.
         let mut id = [
             0x01, 0x93, 0x8a, 0x4c, 0x2f, 0x10, 0x70, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0,
         ];
-        // Vary only the random tail bytes the way v7 randomness does.
         id[7] = tail.wrapping_mul(31).wrapping_add(7);
         id[9] = tail.wrapping_mul(97);
         id[15] = tail;
@@ -3069,242 +2764,353 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("output value column");
-        let batch_id: [u8; 16] = ids.value(0).try_into().expect("16-byte batch id");
         (
             RowIdentity {
-                batch_id,
+                batch_id: ids.value(0).try_into().expect("16-byte batch id"),
                 ordinal: u32::try_from(ordinals.value(0)).expect("non-negative ordinal"),
             },
             values.value(0),
         )
     }
 
-    /// Canonical `UUIDv7` batch ids sharing a timestamp prefix spread across more
-    /// than one spill partition, while identical ids stay colocated.
-    #[test]
-    fn spill_partition_spreads_v7_prefix_collisions() {
-        let ids = (0_u8..64).map(v7_style_id).collect::<Vec<_>>();
-        let partitions = ids
-            .iter()
-            .map(|id| spill_partition(id))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            partitions
-                .iter()
-                .all(|partition| *partition < RECONCILE_SPILL_PARTITIONS),
-            "every partition index stays within the fixed count"
-        );
-        assert!(
-            partitions.len() > 1,
-            "shared-prefix v7 ids must spread across partitions, got {partitions:?}"
-        );
-        // The pre-fix first-byte selector would have collapsed all of these ids
-        // into a single partition; assert the whole-id hash does not.
-        let first_byte_partitions = ids
-            .iter()
-            .map(|id| usize::from(id[0]) % RECONCILE_SPILL_PARTITIONS)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            first_byte_partitions.len(),
-            1,
-            "v7 first byte is constant, confirming the defect the hash fixes"
-        );
-        // Identical batch ids always map to the same partition (dedup invariant).
-        let repeated = v7_style_id(11);
-        assert_eq!(
-            spill_partition(&repeated),
-            spill_partition(&v7_style_id(11))
-        );
-    }
-
-    /// Builds one multi-row tagged batch sharing a single batch id.
-    ///
-    /// Every row carries `batch_id` with a distinct ordinal and value, so all
-    /// rows share one spill partition (dedup colocation) while remaining distinct
-    /// identities that reconcile without a duplicate-value conflict. Used to
-    /// drive multiple decoded messages into one spill partition.
-    fn tagged_rows(
-        batch_id: [u8; 16],
-        ordinals: std::ops::Range<i32>,
-        tier: SourceTier,
-    ) -> RecordBatch {
-        let count = usize::try_from(ordinals.end - ordinals.start).expect("non-negative range");
-        let mut ids = FixedSizeBinaryBuilder::with_capacity(count, 16);
-        let mut ord_values = Vec::with_capacity(count);
-        let mut int_values = Vec::with_capacity(count);
-        let mut tenants = Vec::with_capacity(count);
-        for ordinal in ordinals {
-            ids.append_value(batch_id)
-                .expect("test identity has fixed width");
-            ord_values.push(ordinal);
-            int_values.push(i64::from(ordinal));
-            tenants.push(uuid::Uuid::nil().to_string());
-        }
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-            Field::new("wyrd_row_ordinal", DataType::Int32, false),
-            Field::new("data_tenant_id", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-            Field::new(SOURCE_TIER_COLUMN, DataType::UInt8, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(ids.finish()) as ArrayRef,
-                Arc::new(Int32Array::from(ord_values)) as ArrayRef,
-                Arc::new(StringArray::from(tenants)) as ArrayRef,
-                Arc::new(Int64Array::from(int_values)) as ArrayRef,
-                Arc::new(UInt8Array::from(vec![tier.as_u8(); count])) as ArrayRef,
-            ],
-        )
-        .expect("multi-row test batch matches its schema")
-    }
-
-    /// Decodes one spill partition file, returning its IPC message and row counts.
-    fn partition_message_stats(spill: &FinishedReconcileSpill, partition: usize) -> (usize, usize) {
-        let file = spill.files[partition]
-            .reopen()
-            .expect("reopen partition file");
-        let reader =
-            arrow::ipc::reader::StreamReader::try_new(file, None).expect("open partition reader");
-        let mut messages = 0_usize;
-        let mut rows = 0_usize;
-        for batch in reader {
-            let batch = batch.expect("decode partition batch");
-            messages += 1;
-            rows += batch.num_rows();
-        }
-        (messages, rows)
-    }
-
-    /// Coalescing collapses many one-row retained winners into a bounded number
-    /// of spill messages instead of one message per winner.
-    ///
-    /// The retained winners are shallow one-row slices sharing a single batch id,
-    /// so they colocate in one partition. Before the D90 fix each was written as
-    /// its own IPC message, so the partition file held one message per winner
-    /// (here 20,000). Coalescing to `RECONCILE_SPILL_COALESCE_ROWS`-row batches
-    /// must reduce that to `ceil(rows / RECONCILE_SPILL_COALESCE_ROWS)` messages
-    /// while preserving every row, which is what lets the per-partition read
-    /// bound measure resident data rather than per-message overhead.
+    /// DataFusion external sort spills and yields the exact reference winners.
     #[tokio::test]
-    async fn spill_coalesces_one_row_winners_into_bounded_messages() {
-        const WINNERS: usize = 20_000;
-        let shared = v7_style_id(0);
-        let target = spill_partition(&shared);
-        // Route the triggering batch to a different partition so `target` holds
-        // only the coalesced retained winners.
-        let trigger_tail = (1_u8..=255)
-            .find(|tail| spill_partition(&v7_style_id(*tail)) != target)
-            .expect("a v7 tail maps to a different partition");
-        let trigger = tagged_batch(v7_style_id(trigger_tail), 0, -1, SourceTier::Live);
-
-        let retained = (0..WINNERS)
-            .map(|ordinal| {
-                let ordinal = i32::try_from(ordinal).expect("ordinal fits i32");
-                tagged_batch(shared, ordinal, i64::from(ordinal), SourceTier::Live)
+    async fn reconciliation_external_sort_spills_with_exact_winners() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        const BATCHES: i32 = 200;
+        const ROWS_PER_BATCH: i32 = 100;
+        let identity = v7_style_id(5);
+        let batches = (0..BATCHES)
+            .rev()
+            .flat_map(|batch| {
+                let start = batch * ROWS_PER_BATCH;
+                [
+                    tagged_rows(identity, start..start + ROWS_PER_BATCH, SourceTier::Live),
+                    tagged_rows(identity, start..start + ROWS_PER_BATCH, SourceTier::Iceberg),
+                ]
             })
             .collect::<Vec<_>>();
-
-        let spill = ReconcileSpill::start(retained, trigger)
-            .await
-            .expect("spill start coalesces and writes");
-        let finished = spill.finish().expect("spill finishes");
-
-        let expected_messages = WINNERS.div_ceil(RECONCILE_SPILL_COALESCE_ROWS);
-        let (messages, rows) = partition_message_stats(&finished, target);
-        assert_eq!(
-            messages, expected_messages,
-            "coalescing must bound the target partition to ceil(rows/coalesce) messages, not one per winner"
+        let source = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&batches),
+            batches[0].schema(),
+            None,
+        )
+        .expect("memory source");
+        let (governor, pool) = reconciliation_test_pool();
+        let plan = ReconcileExec::new(
+            source,
+            OracleMemoryResources {
+                governor: governor.clone(),
+                reconciliation_limit_bytes: 1024 * 1024,
+            },
+        )
+        .expect("reconciliation plan");
+        let scratch_root = tempfile::tempdir().expect("scratch root");
+        let spill = crate::oracle::spill::OracleSpillRuntime::new(scratch_root.path(), 16 << 20)
+            .expect("spill runtime");
+        let runtime = spill
+            .build_query_runtime(pool, 16 << 20)
+            .expect("query runtime");
+        let peak_memory = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak_disk = Arc::new(AtomicU64::new(0));
+        let sampling = Arc::new(AtomicBool::new(true));
+        let sampler = tokio::spawn({
+            let governor = governor.clone();
+            let runtime = Arc::clone(&runtime);
+            let peak_memory = Arc::clone(&peak_memory);
+            let peak_disk = Arc::clone(&peak_disk);
+            let sampling = Arc::clone(&sampling);
+            async move {
+                while sampling.load(Ordering::Acquire) {
+                    peak_memory.fetch_max(governor.snapshot().oracle_total_bytes, Ordering::AcqRel);
+                    peak_disk
+                        .fetch_max(runtime.spilling_progress().current_bytes, Ordering::AcqRel);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let session = datafusion::execution::context::SessionContext::new_with_config_rt(
+            SessionConfig::new().with_sort_spill_reservation_bytes(0),
+            runtime,
         );
+        let mut stream = plan
+            .execute(0, session.task_ctx())
+            .expect("external sort executes");
+        let mut ordinals = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("external sort reconciles");
+            ordinals.push(winner_key(&batch).0.ordinal);
+        }
+        sampling.store(false, Ordering::Release);
+        sampler.await.expect("peak sampler joins");
+        drop(stream);
         assert_eq!(
-            rows, WINNERS,
-            "coalescing must preserve every retained winner row"
+            ordinals.len(),
+            usize::try_from(BATCHES * ROWS_PER_BATCH).expect("row count")
+        );
+        assert!(ordinals.windows(2).all(|pair| pair[0] < pair[1]));
+        let metrics = plan.sort.metrics().expect("sort metrics");
+        assert!(metrics.spilled_bytes().unwrap_or_default() > 0);
+        assert!(metrics.spill_count().unwrap_or_default() > 0);
+        assert!(peak_memory.load(Ordering::Acquire) > 0);
+        assert!(peak_memory.load(Ordering::Acquire) <= governor.oracle_limit_bytes());
+        assert!(peak_disk.load(Ordering::Acquire) > 0);
+        assert!(peak_disk.load(Ordering::Acquire) <= 16 << 20);
+        let snapshot = recorder.snapshot();
+        assert!(
+            snapshot
+                .counters
+                .get("oracle_query_spill_bytes_total{class=\"analytical\"}")
+                .is_some_and(|bytes| *bytes > 0)
         );
         assert!(
-            messages < WINNERS,
-            "the pre-fix path wrote one message per winner ({WINNERS}); coalescing wrote {messages}"
+            snapshot
+                .counters
+                .get("oracle_query_spill_files_total{class=\"analytical\"}")
+                .is_some_and(|files| *files > 0)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_spill_queries_total{class=\"analytical\",outcome=\"success\"}"),
+            Some(&1)
+        );
+        assert_eq!(session.runtime_env().memory_pool.reserved(), 0);
+        drop(session);
+        assert!(
+            std::fs::read_dir(spill.spill_path())
+                .expect("inspect scratch")
+                .next()
+                .is_none(),
+            "completed sort removes every query spill file"
         );
     }
 
-    /// The per-partition read bound charges resident slice bytes, so a partition
-    /// whose genuine contents fit the limit reconciles even though its
-    /// IPC-decoded `get_array_memory_size` total would exceed it.
-    ///
-    /// Several multi-row source batches sharing one batch id land in one
-    /// partition as separate messages. Each decoded message slices a shared IPC
-    /// arena counted once per buffer, so `get_array_memory_size` over the
-    /// partition inflates far beyond its resident data. Setting the limit just
-    /// below that inflated total proves the old accounting would fail closed
-    /// while the slice-accurate accounting reconciles the partition.
+    /// A one-byte disk ceiling fails structurally and releases sort memory/files.
     #[tokio::test]
-    async fn spill_partition_charges_slice_bytes_not_message_overhead() {
-        const BATCHES: i32 = 6;
-        const ROWS_PER_BATCH: i32 = 256;
-        let shared = v7_style_id(0);
-        let target = spill_partition(&shared);
-
-        let mut spill = ReconcileSpill::start(
-            Vec::new(),
-            tagged_rows(shared, 0..ROWS_PER_BATCH, SourceTier::Live),
+    async fn reconciliation_disk_ceiling_fails_typed_and_cleans() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let identity = v7_style_id(6);
+        let batches = (0..400)
+            .rev()
+            .map(|batch| {
+                let start = batch * 100;
+                tagged_rows(identity, start..start + 100, SourceTier::Live)
+            })
+            .collect::<Vec<_>>();
+        let source = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&batches),
+            batches[0].schema(),
+            None,
         )
-        .await
-        .expect("spill start");
-        for index in 1..BATCHES {
-            let start = index * ROWS_PER_BATCH;
-            spill = spill
-                .append(tagged_rows(
-                    shared,
-                    start..start + ROWS_PER_BATCH,
-                    SourceTier::Live,
-                ))
-                .await
-                .expect("append same-partition batch");
-        }
-        let finished = spill.finish().expect("spill finishes");
-
-        // Decode the target partition once to measure both accountings.
-        let file = finished.files[target].reopen().expect("reopen target");
-        let reader =
-            arrow::ipc::reader::StreamReader::try_new(file, None).expect("open target reader");
-        let decoded = reader
-            .collect::<Result<Vec<_>, _>>()
-            .expect("decode target partition");
-        let slice_bytes = decoded
-            .iter()
-            .map(|batch| decoded_batch_slice_bytes(batch).expect("slice bytes"))
-            .sum::<usize>();
-        let array_bytes = decoded
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .sum::<usize>();
-        assert!(
-            array_bytes > slice_bytes,
-            "IPC-decoded get_array_memory_size ({array_bytes}) must inflate beyond resident slice bytes ({slice_bytes})"
+        .expect("memory source");
+        let (governor, pool) = reconciliation_test_pool();
+        let baseline = governor.snapshot();
+        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let plan = ReconcileExec::new_with_telemetry(
+            source,
+            OracleMemoryResources {
+                governor: governor.clone(),
+                reconciliation_limit_bytes: 1024 * 1024,
+            },
+            Arc::clone(&telemetry),
+            QueryClass::Analytical,
+        )
+        .expect("reconciliation plan");
+        let scratch_root = tempfile::tempdir().expect("scratch root");
+        let spill = crate::oracle::spill::OracleSpillRuntime::new(scratch_root.path(), 16 << 20)
+            .expect("spill runtime");
+        let runtime = spill.build_query_runtime(pool, 1).expect("query runtime");
+        let session = datafusion::execution::context::SessionContext::new_with_config_rt(
+            SessionConfig::new().with_sort_spill_reservation_bytes(0),
+            runtime,
         );
-
-        // A limit between the two measures: the old per-message accounting trips
-        // it, the slice-accurate accounting does not.
-        let limit = array_bytes - 1;
-        assert!(
-            slice_bytes <= limit,
-            "resident slice bytes must fit the limit the old accounting exceeds"
-        );
-        let memory = OracleMemoryResources {
-            governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                .expect("minimum test governor"),
-            reconciliation_limit_bytes: limit,
+        let mut stream = plan
+            .execute(0, session.task_ctx())
+            .expect("sort starts before disk exhaustion");
+        let error = loop {
+            match stream.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => {}
+                None => panic!("one-byte disk ceiling must fail"),
+            }
         };
-        let winners = finished
-            .reconcile_partition(target, memory, None)
-            .await
-            .expect("slice-accurate accounting reconciles the partition");
-        let total_rows = winners.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        drop(stream);
         assert_eq!(
-            total_rows,
-            usize::try_from(BATCHES * ROWS_PER_BATCH).expect("row count fits usize"),
-            "every distinct identity in the partition must reconcile to one winner"
+            recorder
+                .snapshot()
+                .counters
+                .get("oracle_query_spill_queries_total{class=\"analytical\",outcome=\"error\"}"),
+            Some(&1)
         );
+        assert_eq!(session.runtime_env().memory_pool.reserved(), 0);
+        assert_eq!(governor.snapshot(), baseline);
+        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
+        drop(session);
+        assert!(
+            std::fs::read_dir(spill.spill_path())
+                .expect("inspect scratch")
+                .next()
+                .is_none(),
+            "failed sort removes every query spill file"
+        );
+    }
+
+    /// Dropping after one sorted winner releases memory and query spill files.
+    #[tokio::test]
+    async fn reconciliation_drop_releases_sort_and_spill() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let identity = v7_style_id(10);
+        let batches = (0..400)
+            .rev()
+            .map(|batch| {
+                let start = batch * 100;
+                tagged_rows(identity, start..start + 100, SourceTier::Live)
+            })
+            .collect::<Vec<_>>();
+        let source = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&batches),
+            batches[0].schema(),
+            None,
+        )
+        .expect("memory source");
+        let (governor, pool) = reconciliation_test_pool();
+        let baseline = governor.snapshot();
+        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let plan = ReconcileExec::new_with_telemetry(
+            source,
+            OracleMemoryResources {
+                governor: governor.clone(),
+                reconciliation_limit_bytes: 1024 * 1024,
+            },
+            Arc::clone(&telemetry),
+            QueryClass::Analytical,
+        )
+        .expect("reconciliation plan");
+        let scratch_root = tempfile::tempdir().expect("scratch root");
+        let spill = crate::oracle::spill::OracleSpillRuntime::new(scratch_root.path(), 16 << 20)
+            .expect("spill runtime");
+        let runtime = spill
+            .build_query_runtime(pool, 16 << 20)
+            .expect("query runtime");
+        let session = datafusion::execution::context::SessionContext::new_with_config_rt(
+            SessionConfig::new().with_sort_spill_reservation_bytes(0),
+            runtime,
+        );
+        let mut stream = plan
+            .execute(0, session.task_ctx())
+            .expect("external sort executes");
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(
+            plan.sort
+                .metrics()
+                .expect("sort metrics")
+                .spilled_bytes()
+                .unwrap_or_default()
+                > 0
+        );
+        drop(stream);
+        assert_eq!(
+            recorder.snapshot().counters.get(
+                "oracle_query_spill_queries_total{class=\"analytical\",outcome=\"cancelled\"}"
+            ),
+            Some(&1)
+        );
+        assert_eq!(session.runtime_env().memory_pool.reserved(), 0);
+        assert_eq!(governor.snapshot(), baseline);
+        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
+        drop(session);
+        assert!(
+            std::fs::read_dir(spill.spill_path())
+                .expect("inspect scratch")
+                .next()
+                .is_none(),
+            "cancelled sort removes every query spill file"
+        );
+    }
+
+    /// Sorted reconciliation carries one identity across source batch boundaries.
+    #[tokio::test]
+    async fn reconciliation_identity_spans_sorted_batches() {
+        let identity = v7_style_id(7);
+        let batches = vec![
+            tagged_batch(identity, 3, 41, SourceTier::Live),
+            tagged_batch(v7_style_id(8), 0, 8, SourceTier::Iceberg),
+            tagged_batch(identity, 3, 41, SourceTier::Iceberg),
+        ];
+        let source = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&batches),
+            batches[0].schema(),
+            None,
+        )
+        .expect("memory source");
+        let plan = ReconcileExec::new(
+            source,
+            OracleMemoryResources {
+                governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                    .expect("test governor"),
+                reconciliation_limit_bytes: 1024 * 1024,
+            },
+        )
+        .expect("reconciliation plan");
+        let mut stream = plan
+            .execute(
+                0,
+                datafusion::execution::context::SessionContext::new().task_ctx(),
+            )
+            .expect("sorted reconciliation executes");
+        let mut actual = std::collections::BTreeSet::new();
+        while let Some(batch) = stream.next().await {
+            actual.insert(winner_key(&batch.expect("sorted batch reconciles")));
+        }
+        assert_eq!(actual.len(), 2);
+        assert!(actual.contains(&(
+            RowIdentity {
+                batch_id: identity,
+                ordinal: 3
+            },
+            41
+        )));
+    }
+
+    /// One batch-id group with many ordinals completes without hash-partition skew.
+    #[tokio::test]
+    async fn reconciliation_large_batch_id_group_uses_ordinals_without_skew() {
+        let identity = v7_style_id(9);
+        let batches = (0..2048)
+            .rev()
+            .map(|ordinal| tagged_batch(identity, ordinal, i64::from(ordinal), SourceTier::Live))
+            .collect::<Vec<_>>();
+        let source = MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&batches),
+            batches[0].schema(),
+            None,
+        )
+        .expect("memory source");
+        let plan = ReconcileExec::new(
+            source,
+            OracleMemoryResources {
+                governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+                    .expect("test governor"),
+                reconciliation_limit_bytes: 1024 * 1024,
+            },
+        )
+        .expect("reconciliation plan");
+        let mut stream = plan
+            .execute(
+                0,
+                datafusion::execution::context::SessionContext::new().task_ctx(),
+            )
+            .expect("sorted reconciliation executes");
+        let mut rows = 0;
+        while let Some(batch) = stream.next().await {
+            rows += batch.expect("ordinal group reconciles").num_rows();
+        }
+        assert_eq!(rows, 2048);
     }
 
     /// In-memory sources remain unavailable while hot reads aggregate actual bytes.

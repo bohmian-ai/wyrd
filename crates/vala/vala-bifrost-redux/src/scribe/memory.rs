@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use datafusion::error::DataFusionError;
-use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryLimit, MemoryPool};
 use num_traits::ToPrimitive;
 
 use crate::contracts::ScribeError;
@@ -733,8 +733,8 @@ impl BifrostMemoryGovernor {
     ///
     /// Returns [`ScribeError::Internal`] when the pod limit is invalid or the
     /// governor becomes shared before its test-only limits are installed.
-    #[cfg(test)]
-    pub(crate) fn new_with_test_child_limits(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_with_test_child_limits(
         pod_limit_bytes: usize,
         scribe_limit_bytes: usize,
         oracle_limit_bytes: usize,
@@ -1837,6 +1837,134 @@ enum DataFusionPoolTarget {
     Parent,
 }
 
+/// Share of one admitted query grant owned by its `DataFusion` execution pool.
+///
+/// The remaining thirty percent stays available for Oracle pipeline ownership
+/// outside `DataFusion`, including live tails, range reads, and response framing.
+const ORACLE_QUERY_EXECUTION_MEMORY_PERCENT: u64 = 70;
+
+/// Query-lifetime `DataFusion` pool backed by one exact Oracle governor lease.
+///
+/// The retained lease charges the shared Oracle child and Bifrost parent once.
+/// Operator reservations are then scheduled inside the fixed lease by
+/// [`FairSpillPool`] and never charge the governor a second time.
+#[derive(Debug)]
+pub(crate) struct OracleQueryMemoryPool {
+    /// `DataFusion`'s operator-aware allocator for this query only.
+    fair: FairSpillPool,
+    /// Exact Oracle-child and parent bytes retained until the pool is dropped.
+    _lease: OracleMemoryReservation,
+}
+
+impl OracleQueryMemoryPool {
+    /// Acquires seventy percent of an admitted query grant and builds its fair pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed overflow rejection when the grant cannot be converted or
+    /// multiplied safely, a request-too-large rejection when the derived lease
+    /// is zero, or the exact shared-governor rejection when the lease cannot fit.
+    pub(crate) fn try_new(
+        governor: &BifrostMemoryGovernor,
+        admitted_memory_bytes: u64,
+    ) -> Result<Self, MemoryRejection> {
+        let execution_u64 = admitted_memory_bytes
+            .checked_mul(ORACLE_QUERY_EXECUTION_MEMORY_PERCENT)
+            .map(|bytes| bytes / 100)
+            .ok_or_else(|| {
+                MemoryRejection::new(
+                    MemoryRejectionKind::CounterOverflow,
+                    MemoryPurpose::OracleQuery,
+                    MemoryCeiling::NotApplicable,
+                    usize::MAX,
+                    0,
+                    governor.oracle_limit_bytes(),
+                )
+            })?;
+        let execution_bytes = usize::try_from(execution_u64).map_err(|_| {
+            MemoryRejection::new(
+                MemoryRejectionKind::CounterOverflow,
+                MemoryPurpose::OracleQuery,
+                MemoryCeiling::NotApplicable,
+                usize::MAX,
+                0,
+                governor.oracle_limit_bytes(),
+            )
+        })?;
+        if execution_bytes == 0 {
+            return Err(MemoryRejection::new(
+                MemoryRejectionKind::RequestTooLarge,
+                MemoryPurpose::OracleQuery,
+                MemoryCeiling::OracleChild,
+                0,
+                governor.inner.oracle_total_bytes.load(Ordering::Acquire),
+                governor.oracle_limit_bytes(),
+            ));
+        }
+        let lease = governor
+            .oracle_budget()
+            .try_reserve_classified(execution_bytes, MemoryPurpose::OracleQuery)?;
+        Ok(Self {
+            fair: FairSpillPool::new(execution_bytes),
+            _lease: lease,
+        })
+    }
+}
+
+impl MemoryPool for OracleQueryMemoryPool {
+    /// Registers one query-local consumer with the fair allocator.
+    fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.fair.register(consumer);
+    }
+
+    /// Unregisters one query-local consumer after its reservation is empty.
+    fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.fair.unregister(consumer);
+    }
+
+    /// Infallibly grows an already-authorized `DataFusion` reservation.
+    fn grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) {
+        self.fair.grow(reservation, additional);
+    }
+
+    /// Shrinks one `DataFusion` reservation within the retained query lease.
+    fn shrink(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        shrink: usize,
+    ) {
+        self.fair.shrink(reservation, shrink);
+    }
+
+    /// Attempts one operator allocation under `DataFusion`'s fair-share policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataFusion` resource exhaustion when the consumer's fair share or
+    /// the query's finite execution lease cannot cover `additional` bytes.
+    fn try_grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.fair.try_grow(reservation, additional)
+    }
+
+    /// Returns bytes currently assigned to operators inside this query lease.
+    fn reserved(&self) -> usize {
+        self.fair.reserved()
+    }
+
+    /// Returns the exact finite execution lease visible to `DataFusion`.
+    fn memory_limit(&self) -> MemoryLimit {
+        self.fair.memory_limit()
+    }
+}
+
 /// `DataFusion` memory pool backed by the process-wide Bifrost governor.
 ///
 /// Construct with [`BifrostDataFusionMemoryPool::for_oracle`] for Oracle query
@@ -1849,7 +1977,9 @@ enum DataFusionPoolTarget {
 /// starve query execution below its floor (D79 isolation invariant).
 #[derive(Debug)]
 pub struct BifrostDataFusionMemoryPool {
+    /// Shared hard-limit and accounting owner.
     governor: BifrostMemoryGovernor,
+    /// Counter set charged by this pool.
     target: DataFusionPoolTarget,
 }
 
@@ -3789,6 +3919,81 @@ mod tests {
         let after = governor.snapshot();
         assert_eq!(after.oracle_total_bytes, 0);
         assert_eq!(after.bifrost_total_bytes, 0);
+    }
+
+    /// Proves one query lease bounds fair operator ownership without double charging.
+    #[test]
+    fn oracle_query_pool_leases_seventy_percent_and_releases_exactly() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        const MIB: usize = 1024 * 1024;
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
+            4 * 1024 * MIB,
+            Some(256 * MIB),
+            Some(256 * MIB),
+        )
+        .expect("governor with explicit children");
+        let pool: Arc<dyn MemoryPool> = Arc::new(
+            OracleQueryMemoryPool::try_new(&governor, 100 * MIB as u64)
+                .expect("query execution lease"),
+        );
+        assert!(matches!(pool.memory_limit(), MemoryLimit::Finite(limit) if limit == 70 * MIB));
+        let leased = governor.snapshot();
+        assert_eq!(leased.oracle_total_bytes, 70 * MIB);
+        assert_eq!(leased.bifrost_total_bytes, 70 * MIB);
+
+        let unspillable = MemoryConsumer::new("query-output").register(&pool);
+        let first = MemoryConsumer::new("sort-one")
+            .with_can_spill(true)
+            .register(&pool);
+        let second = MemoryConsumer::new("sort-two")
+            .with_can_spill(true)
+            .register(&pool);
+        unspillable
+            .try_grow(10 * MIB)
+            .expect("unspillable query ownership");
+        first.try_grow(30 * MIB).expect("first fair share");
+        second.try_grow(30 * MIB).expect("second fair share");
+        assert!(first.try_grow(1).is_err());
+        assert_eq!(pool.reserved(), 70 * MIB);
+
+        let during_operators = governor.snapshot();
+        assert_eq!(during_operators.oracle_total_bytes, 70 * MIB);
+        assert_eq!(during_operators.bifrost_total_bytes, 70 * MIB);
+        drop(unspillable);
+        drop(first);
+        drop(second);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(governor.snapshot().oracle_total_bytes, 70 * MIB);
+        drop(pool);
+        let released = governor.snapshot();
+        assert_eq!(released.oracle_total_bytes, 0);
+        assert_eq!(released.bifrost_total_bytes, 0);
+    }
+
+    /// Proves an execution lease refusal is typed and leaves no partial ownership.
+    #[test]
+    fn oracle_query_pool_refuses_before_execution_when_child_is_full() {
+        const MIB: usize = 1024 * 1024;
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
+            4 * 1024 * MIB,
+            Some(256 * MIB),
+            Some(256 * MIB),
+        )
+        .expect("governor with explicit children");
+        let occupied = governor
+            .oracle_budget()
+            .try_reserve_classified(256 * MIB, MemoryPurpose::OracleQuery)
+            .expect("full Oracle child");
+        let rejection = OracleQueryMemoryPool::try_new(&governor, 100 * MIB as u64)
+            .expect_err("full child must reject the query lease");
+        assert_eq!(rejection.kind(), MemoryRejectionKind::Occupied);
+        assert_eq!(rejection.purpose(), MemoryPurpose::OracleQuery);
+        assert_eq!(rejection.ceiling(), MemoryCeiling::OracleChild);
+        assert_eq!(governor.snapshot().oracle_total_bytes, 256 * MIB);
+        drop(occupied);
+        assert_eq!(governor.snapshot().oracle_total_bytes, 0);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
     }
 
     /// Proves that a full Scribe child cannot deny Oracle its own child budget.

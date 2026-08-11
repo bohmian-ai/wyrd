@@ -34,6 +34,12 @@ struct DeploymentFacts {
     image: String,
     /// HTTP readiness path.
     readiness_path: String,
+    /// Environment variables projected by stable name.
+    environment: BTreeMap<String, String>,
+    /// Container mount paths projected by volume name.
+    volume_mounts: BTreeMap<String, String>,
+    /// Pod volumes backed by an `emptyDir` object.
+    empty_dir_volumes: BTreeSet<String>,
 }
 
 /// Complete semantic projection of one multi-document manifest.
@@ -85,16 +91,49 @@ fn parse_manifest(source: &str) -> Result<ManifestFacts, String> {
                 let image = scalar(at(container, &["image"])?)?.to_owned();
                 let readiness_path =
                     scalar(at(container, &["readinessProbe", "httpGet", "path"])?)?.to_owned();
-                let roles = sequence(at(container, &["env"])?)?
+                let environment = sequence(at(container, &["env"])?)?
                     .iter()
-                    .find(|entry| at(entry, &["name"]).and_then(scalar).ok() == Some("WYRD_ROLES"))
+                    .map(|entry| {
+                        Ok((
+                            scalar(at(entry, &["name"])?)?.to_owned(),
+                            scalar(at(entry, &["value"])?)?.to_owned(),
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, String>>()?;
+                let roles = environment
+                    .get("WYRD_ROLES")
                     .ok_or_else(|| {
                         format!("deployment {} omits WYRD_ROLES", resource.metadata.name)
-                    })
-                    .and_then(|entry| at(entry, &["value"]))
-                    .and_then(scalar)?
+                    })?
                     .split(',')
                     .map(str::to_owned)
+                    .collect();
+                let volume_mounts = at(container, &["volumeMounts"])
+                    .ok()
+                    .map(sequence)
+                    .transpose()?
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| {
+                        Ok((
+                            scalar(at(entry, &["name"])?)?.to_owned(),
+                            scalar(at(entry, &["mountPath"])?)?.to_owned(),
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, String>>()?;
+                let empty_dir_volumes = at(&resource.spec, &["template", "spec", "volumes"])
+                    .ok()
+                    .map(sequence)
+                    .transpose()?
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        at(entry, &["emptyDir"])
+                            .ok()
+                            .and_then(|_| at(entry, &["name"]).ok())
+                            .and_then(|name| scalar(name).ok())
+                            .map(str::to_owned)
+                    })
                     .collect();
                 facts.deployments.insert(
                     resource.metadata.name,
@@ -103,6 +142,9 @@ fn parse_manifest(source: &str) -> Result<ManifestFacts, String> {
                         roles,
                         image,
                         readiness_path,
+                        environment,
+                        volume_mounts,
+                        empty_dir_volumes,
                     },
                 );
             }
@@ -288,6 +330,30 @@ fn validate_candidate(facts: &ManifestFacts, require_routes: bool) -> Result<(),
                 "role-separated manifest must contain Scribe and Oracle deployments".to_owned(),
             );
         }
+        for deployment in facts
+            .deployments
+            .values()
+            .filter(|deployment| deployment.roles.contains("oracle"))
+        {
+            let expected = "/var/lib/wyrd/bifrost";
+            if deployment
+                .environment
+                .get("WYRD_SCRIBE_WAL_DIR")
+                .map(String::as_str)
+                != Some(expected)
+                || deployment
+                    .volume_mounts
+                    .get("bifrost-data")
+                    .map(String::as_str)
+                    != Some(expected)
+                || !deployment.empty_dir_volumes.contains("bifrost-data")
+            {
+                return Err(
+                    "role-separated Oracle requires bifrost-data emptyDir mounted at WYRD_SCRIBE_WAL_DIR"
+                        .to_owned(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -368,6 +434,20 @@ fn bifrost_deployment_contract_rejects_broken_fixtures() -> Result<(), String> {
 
     let bad_readiness = separated.replacen("path: /readyz", "path: /wrong-ready", 1);
     assert!(validate_candidate(&parse_manifest(&bad_readiness)?, false).is_err());
+
+    let missing_oracle_mount = separated.replacen(
+        "          volumeMounts:\n            - {name: bifrost-data, mountPath: /var/lib/wyrd/bifrost}\n",
+        "",
+        1,
+    );
+    assert!(validate_candidate(&parse_manifest(&missing_oracle_mount)?, false).is_err());
+
+    let mismatched_oracle_path = separated.replacen(
+        "{name: WYRD_SCRIBE_WAL_DIR, value: /var/lib/wyrd/bifrost}",
+        "{name: WYRD_SCRIBE_WAL_DIR, value: /var/lib/wyrd/wrong}",
+        1,
+    );
+    assert!(validate_candidate(&parse_manifest(&mismatched_oracle_path)?, false).is_err());
 
     let bad_rollback = rollback.replacen("wyrd/server:stable", "wyrd/server:latest", 1);
     assert!(validate_rollback(&parse_manifest(&bad_rollback)?).is_err());

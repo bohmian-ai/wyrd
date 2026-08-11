@@ -140,6 +140,7 @@ pub struct AuthorizedQueryContext {
 
 /// Maps private dispatch failures to the only public/stale execution classes.
 fn map_dispatch_error(error: &dispatcher::DispatchError) -> OracleExecutionError {
+    tracing::error!(error = %error, "Oracle fragment dispatch failed");
     match error {
         dispatcher::DispatchError::StaleObject => OracleExecutionError::StaleObject,
         dispatcher::DispatchError::Terminal => {
@@ -1352,8 +1353,10 @@ struct SqlCutInput<'a> {
     live_batches: HashMap<String, Vec<RecordBatch>>,
     /// Immutable admission class.
     query_class: QueryClass,
-    /// Admitted durable/local query owner.
+    /// Admitted durable/local query owner used by distributed dispatch.
     admitted: &'a AdmittedQueryGuard,
+    /// Query-owned `DataFusion` runtime acquired before provider and data IO.
+    session: SessionContext,
     /// Absolute execution deadline.
     deadline: Instant,
     /// Immutable selected-file bytes used for logical scan telemetry.
@@ -1838,7 +1841,8 @@ impl Oracle {
         let query_class = planned.query_class;
         query_telemetry
             .get_or_insert_with(|| self.telemetry.start_query(request.visibility, query_class));
-        let mut admitted = self.admit_sql_query(context, query_class, deadline).await?;
+        let admitted = self.admit_sql_query(context, query_class, deadline).await?;
+        let (session, mut admitted) = self.lease_session(deadline, admitted, "lease rejection")?;
         let drained = match self
             .audit_and_drain_cut(CutAuditInput {
                 context,
@@ -1855,17 +1859,17 @@ impl Oracle {
             Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
         };
         admitted.live_reservations = drained.reservations;
-        let logical_bytes_selected = Self::logical_selected_bytes(&planned.cuts);
         let (schema, mut batches, scan_stats) = match self
             .execute_sql_cut(SqlCutInput {
                 context,
                 sql: &request.sql,
+                logical_bytes_selected: Self::logical_selected_bytes(&planned.cuts),
                 cuts: planned.cuts,
                 live_batches: drained.batches,
                 query_class,
                 admitted: &admitted,
+                session,
                 deadline,
-                logical_bytes_selected,
             })
             .await
         {
@@ -1911,10 +1915,7 @@ impl Oracle {
             let error = BifrostError::QueryExecutionFailed;
             return release_error(deadline, admitted, error, "missing telemetry");
         };
-        let schema_frame = match encode_schema_frame(&schema) {
-            Ok(schema_frame) => schema_frame,
-            Err(error) => return release_error(deadline, admitted, error, "schema preparation"),
-        };
+        let (schema_frame, admitted) = Self::prepare_schema_frame(deadline, admitted, &schema)?;
         Ok(Some(OracleQueryStream::new(QueryStreamInput {
             schema_frame,
             batches,
@@ -1947,7 +1948,6 @@ impl Oracle {
                 query_class,
                 deadline,
                 memory_ceiling: self.memory.reconciliation_limit_bytes as u64,
-                spill_eligible: matches!(query_class, QueryClass::Analytical),
                 cancellation: self.shutdown.child_token(),
             })
             .await
@@ -2104,7 +2104,6 @@ impl Oracle {
                 query_class: class,
                 deadline: options.deadline,
                 memory_ceiling: self.memory.reconciliation_limit_bytes as u64,
-                spill_eligible: true,
                 cancellation: self.shutdown.child_token(),
             })
             .await?;
@@ -2126,7 +2125,7 @@ impl Oracle {
         options: QueryOptions,
         class: QueryClass,
         query_telemetry: QueryTelemetryGuard,
-        mut admitted: AdmittedQueryGuard,
+        admitted: AdmittedQueryGuard,
     ) -> Result<OracleQueryStream, BifrostError> {
         self.preflight_query_capacity()?;
         let cuts = self
@@ -2138,6 +2137,11 @@ impl Oracle {
                 &self.catalog,
             )
             .await?;
+        let (session, mut admitted) = self.lease_session(
+            options.deadline,
+            admitted,
+            "typed execution lease rejection",
+        )?;
         let logical_bytes_selected = Self::logical_selected_bytes(&cuts);
         let fence_owner = TailFenceDrainer::new(
             &self.tails,
@@ -2186,7 +2190,6 @@ impl Oracle {
             })
             .await?;
         let rewritten = OraclePlanner::replace_typed_sources(plan, &providers)?;
-        let session = self.execution_session(&admitted)?;
         let (session, physical) = OraclePlanner::create_physical_plan(&rewritten, session).await?;
         let scan_stats = OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();
@@ -2400,7 +2403,7 @@ impl Oracle {
         mut input: SqlCutInput<'_>,
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
-        let session = self.execution_session(input.admitted)?;
+        let session = input.session;
         for cut in input.cuts {
             let table_name = cut.binding.table_ref.fqn();
             let mut hot_files = self.local_hot_sources(&cut)?;
@@ -2522,6 +2525,8 @@ impl Oracle {
     /// Every attempt receives a fresh `DataFusion` session. All attempts share
     /// Oracle-child and parent memory counters, while the admitted guard's
     /// immutable spill share becomes this session's exact disk ceiling.
+    /// `DataFusion`'s merge reservation remains enabled so external sorts retain
+    /// bounded progress memory before consuming their remaining fair share.
     ///
     /// # Errors
     ///
@@ -2532,18 +2537,62 @@ impl Oracle {
         admitted: &AdmittedQueryGuard,
     ) -> Result<SessionContext, BifrostError> {
         let pool = Arc::new(
-            crate::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(
-                self.memory.governor.clone(),
-            ),
+            crate::scribe::memory::OracleQueryMemoryPool::try_new(
+                &self.memory.governor,
+                admitted.memory_limit_bytes(),
+            )
+            .map_err(map_memory_rejection)?,
         );
         let runtime = self
             .spill_runtime
             .build_query_runtime(pool, admitted.spill_limit_bytes())?;
+        let config = datafusion::execution::context::SessionConfig::new()
+            .with_target_partitions(4)
+            .with_batch_size(1_024);
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
+            .with_config(config)
             .with_runtime_env(runtime)
             .build();
         Ok(SessionContext::new_with_state(state))
+    }
+
+    /// Acquires the query execution session or releases its admission atomically.
+    ///
+    /// This boundary prevents either SQL entry point from retaining class,
+    /// tenant, memory, or spill admission after the execution lease refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable typed execution-session error after synchronously
+    /// releasing the supplied admission owner.
+    fn lease_session(
+        &self,
+        deadline: Instant,
+        admitted: AdmittedQueryGuard,
+        failure_phase: &'static str,
+    ) -> Result<(SessionContext, AdmittedQueryGuard), BifrostError> {
+        match self.execution_session(&admitted) {
+            Ok(session) => Ok((session, admitted)),
+            Err(error) => release_error(deadline, admitted, error, failure_phase),
+        }
+    }
+
+    /// Encodes the response schema while retaining the admitted stream owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable schema error after synchronously releasing admission
+    /// when Arrow IPC schema encoding fails.
+    fn prepare_schema_frame(
+        deadline: Instant,
+        admitted: AdmittedQueryGuard,
+        schema: &SchemaRef,
+    ) -> Result<(QuerySchemaFrame, AdmittedQueryGuard), BifrostError> {
+        match encode_schema_frame(schema) {
+            Ok(frame) => Ok((frame, admitted)),
+            Err(error) => release_error(deadline, admitted, error, "schema preparation"),
+        }
     }
 
     /// Resolves leader-local hot file locations for one pinned cut.
@@ -3267,10 +3316,7 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     if let Some(rejection) = MemoryRejection::from_source_chain(error) {
         return map_memory_rejection(rejection);
     }
-    if matches!(
-        error,
-        datafusion::error::DataFusionError::ResourcesExhausted(_)
-    ) {
+    if datafusion_resources_exhausted(error) {
         return BifrostError::QueryAdmissionRejected;
     }
     let message = error.to_string().to_ascii_lowercase();
@@ -3283,6 +3329,27 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     } else {
         BifrostError::QueryExecutionFailed
     }
+}
+
+/// Reports whether any typed `DataFusion` source in an execution error chain is
+/// a resource-capacity refusal, including contextual wrappers added by plans.
+fn datafusion_resources_exhausted(error: &datafusion::error::DataFusionError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<datafusion::error::DataFusionError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    datafusion::error::DataFusionError::ResourcesExhausted(_)
+                )
+            })
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Projects one structured governor refusal into the stable public query catalog.
@@ -3358,8 +3425,9 @@ fn release_error<T>(
     _deadline: Instant,
     admitted: AdmittedQueryGuard,
     original: BifrostError,
-    _phase: &'static str,
+    phase: &'static str,
 ) -> Result<T, BifrostError> {
+    tracing::error!(phase, error = ?original, "Oracle query released after failure");
     admitted.release();
     Err(original)
 }
@@ -3428,8 +3496,12 @@ mod tests {
     /// Generic DataFusion resource exhaustion is classified structurally as capacity.
     #[test]
     fn datafusion_resource_exhaustion_maps_to_query_admission_rejected() {
-        let error = datafusion::error::DataFusionError::ResourcesExhausted(
+        let exhausted = datafusion::error::DataFusionError::ResourcesExhausted(
             "message intentionally contains no capacity keyword".to_owned(),
+        );
+        let error = datafusion::error::DataFusionError::Context(
+            "physical plan wrapper".to_owned(),
+            Box::new(exhausted),
         );
         assert_eq!(
             map_datafusion_error(&error),

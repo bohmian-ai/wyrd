@@ -29,9 +29,16 @@ spec:
     metadata:
       labels: {app: wyrd-bifrost-query, wyrd.ai/bifrost-oracle: "true", wyrd.ai/bifrost-private: "true"}
     spec:
+      volumes:
+        - name: bifrost-data
+          emptyDir: {}
       containers:
         - name: wyrd-server
           image: wyrd/server:latest
           ports: [{name: http, containerPort: 8080}, {name: grpc, containerPort: 50051}]
-          env: [{name: WYRD_ROLES, value: oracle}]
+          env:
+            - {name: WYRD_ROLES, value: oracle}
+            - {name: WYRD_SCRIBE_WAL_DIR, value: /var/lib/wyrd/bifrost}
+          volumeMounts:
+            - {name: bifrost-data, mountPath: /var/lib/wyrd/bifrost}
           readinessProbe: {httpGet: {path: /readyz, port: http}}

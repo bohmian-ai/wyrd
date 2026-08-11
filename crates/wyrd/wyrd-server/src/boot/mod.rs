@@ -852,6 +852,7 @@ pub async fn build_state(
         cluster: Arc::clone(&bifrost_parts.cluster_registry),
         node_id: bifrost_parts.node_id,
         advertise_addr: &config.bifrost.oracle.advertise_addr,
+        spill_root: None,
         #[cfg(feature = "test-support")]
         peer_credentials: None,
     }
@@ -1114,6 +1115,8 @@ struct OracleRoleBuilder<'a> {
     node_id: ClusterNodeId,
     /// Bound endpoint published in cluster membership.
     advertise_addr: &'a str,
+    /// Optional harness-owned Bifrost root replacing environment discovery.
+    spill_root: Option<std::path::PathBuf>,
     /// Optional test-harness credential owner replacing environment discovery.
     #[cfg(feature = "test-support")]
     peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
@@ -1146,6 +1149,7 @@ impl<'a> OracleRoleBuilder<'a> {
             cluster,
             node_id,
             advertise_addr,
+            spill_root,
             #[cfg(feature = "test-support")]
                 peer_credentials: injected_peer_credentials,
         } = self;
@@ -1334,9 +1338,11 @@ impl<'a> OracleRoleBuilder<'a> {
         let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
         let peer_transports =
             OraclePeerTransportDirectory::new(node_id, local_transport, remote_transport);
-        let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
+        let wal_dir = spill_root.unwrap_or_else(|| {
+            std::env::var_os("WYRD_SCRIBE_WAL_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"))
+        });
         let spill_runtime = match OracleSpillRuntime::new(
             &wal_dir.join("oracle-spill"),
             config.bifrost.oracle.spill_limit_bytes,
@@ -1586,6 +1592,7 @@ pub async fn attach_test_oracle_runtime_for_node_at(
         cluster,
         node_id,
         advertise_addr: &advertise_addr,
+        spill_root: None,
         peer_credentials: None,
     }
     .build()
@@ -1614,6 +1621,8 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
         peer_credentials,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -1627,6 +1636,8 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
     advertise_addr: String,
     peer_credentials: Arc<dyn OraclePeerCredentials>,
     audit_wal_root: Option<std::path::PathBuf>,
+    spill_root: Option<std::path::PathBuf>,
+    spill_limit_bytes: Option<u64>,
     role_timing: Option<RoleTiming>,
 ) -> Result<AppState, ServerBootError> {
     let node_id = ClusterNodeId::new(node_id.as_uuid());
@@ -1639,6 +1650,9 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
     config.auth.signing_key = Some(signing_key.clone());
     config.bifrost.oracle.audit_wal_root =
         Some(audit_wal_root.unwrap_or_else(|| test_oracle_audit_root(node_id.as_uuid())));
+    if let Some(spill_limit_bytes) = spill_limit_bytes {
+        config.bifrost.oracle.spill_limit_bytes = spill_limit_bytes;
+    }
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1646,6 +1660,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
         cluster,
         node_id,
         advertise_addr: &advertise_addr,
+        spill_root,
         peer_credentials: Some(peer_credentials),
     }
     .build()
@@ -1677,6 +1692,8 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
             ca_path,
             server_name,
             audit_wal_root: None,
+            spill_root: None,
+            spill_limit_bytes: None,
         },
         None,
     )
@@ -1692,6 +1709,10 @@ pub struct TestOracleTlsAttachment {
     pub server_name: String,
     /// Harness-owned audit WAL root.
     pub audit_wal_root: Option<std::path::PathBuf>,
+    /// Harness-owned Bifrost root for Oracle query scratch.
+    pub spill_root: Option<std::path::PathBuf>,
+    /// Optional deterministic Oracle query-spill ceiling.
+    pub spill_limit_bytes: Option<u64>,
 }
 
 /// Attach a TLS test Oracle role with an explicit harness-owned WAL root.
@@ -1719,6 +1740,9 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
     );
     config.bifrost.oracle.peer_ca_certificate_path = Some(tls.ca_path);
     config.bifrost.oracle.peer_server_name = Some(tls.server_name);
+    if let Some(spill_limit_bytes) = tls.spill_limit_bytes {
+        config.bifrost.oracle.spill_limit_bytes = spill_limit_bytes;
+    }
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1726,6 +1750,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
         cluster,
         node_id,
         advertise_addr: &advertise_addr,
+        spill_root: tls.spill_root,
         peer_credentials: Some(peer_credentials),
     }
     .build()
@@ -2484,6 +2509,7 @@ pub(crate) mod pg_tests {
                 cluster: Arc::clone(&cluster),
                 node_id,
                 advertise_addr: "127.0.0.1:9443",
+                spill_root: None,
                 peer_credentials: Some(peer_credentials),
             }
             .build()
@@ -2542,6 +2568,7 @@ pub(crate) mod pg_tests {
                 cluster: Arc::clone(&cluster),
                 node_id,
                 advertise_addr: "127.0.0.1:9443",
+                spill_root: None,
                 peer_credentials: Some(peer_credentials),
             }
             .build()

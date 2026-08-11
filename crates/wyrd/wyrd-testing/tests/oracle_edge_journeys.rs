@@ -78,6 +78,8 @@ const ORACLE_METRIC_LABELS: &[(&str, &[&str])] = &[
     ("oracle_query_files_scanned_total", &["class"]),
     ("oracle_query_partitions_scanned_total", &["class"]),
     ("oracle_query_spill_bytes_total", &["class"]),
+    ("oracle_query_spill_files_total", &["class"]),
+    ("oracle_query_spill_queries_total", &["class", "outcome"]),
     ("oracle_fragments_active", &[]),
     ("oracle_fragment_duration_seconds", &["outcome"]),
     ("oracle_query_cancellations_total", &["reason"]),
@@ -510,6 +512,56 @@ async fn strict_count_value(reader: &WyrdClient, table: &str) -> Result<u64, Jou
     value.ok_or_else(|| "COUNT scalar missing".into())
 }
 
+/// Streams the spill fixture's wide rows through an analytical public query
+/// and decodes exact row and value-byte totals from its successful terminal.
+///
+/// # Errors
+///
+/// Returns a typed client, Arrow, conversion, or terminal-contract error.
+async fn strict_spill_summary(
+    reader: &WyrdClient,
+    table: &str,
+) -> Result<(u64, u64), JourneyError> {
+    let mut stream = QueryClient::new(reader)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id, value FROM {table}"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(30_000),
+        })
+        .await?;
+    let mut row_count = 0_u64;
+    let mut value_bytes = 0_u64;
+    while let Some(batch) = stream.next_batch().await? {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("spill id result is not Int64")?;
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("spill value result is not Utf8")?;
+        if ids.len() != values.len() {
+            return Err("spill result columns have unequal lengths".into());
+        }
+        row_count = row_count
+            .checked_add(u64::try_from(ids.len())?)
+            .ok_or("spill row count overflow")?;
+        for value in values.iter() {
+            value_bytes = value_bytes
+                .checked_add(u64::try_from(value.ok_or("spill value is null")?.len())?)
+                .ok_or("spill value-byte count overflow")?;
+        }
+    }
+    let terminal = stream.terminal().ok_or("spill stream terminal missing")?;
+    if terminal.outcome != QueryTerminalOutcome::Success || terminal.error.is_some() {
+        return Err("spill stream terminal was not successful".into());
+    }
+    Ok((row_count, value_bytes))
+}
+
 /// Samples production Scribe/Oracle owners every ten milliseconds until cancelled.
 ///
 /// # Errors
@@ -770,6 +822,366 @@ async fn pg_bifrost_oracle_capacity_contract_journey() {
     );
 
     cluster.shutdown().await.expect("capacity cluster shutdown");
+}
+
+/// A production public query spills through the governed reconciliation sort,
+/// returns the exact durable row count, and releases every local owner.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed().with_oracle_test_limits(192 << 20, 1 << 30),
+    )
+    .await
+    .expect("spill success cluster");
+    let server = cluster.server(0).expect("spill success server");
+    let table = prepare_spill_table(&cluster, server, "oracle_spill_success", 400_000)
+        .await
+        .expect("spill success fixture");
+    let reader = client(server, "oracle-spill-success-reader")
+        .await
+        .expect("spill success reader");
+    let baseline = server
+        .oracle_runtime_inspection()
+        .expect("spill success baseline");
+    let memory = server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .expect("spill success governor")
+        .snapshot();
+    let memory_baseline = (memory.bifrost_total_bytes, memory.oracle_total_bytes);
+    let checkpoint = cluster.telemetry().checkpoint().expect("spill checkpoint");
+
+    assert_eq!(
+        strict_spill_summary(&reader, &format!("vala.bifrost.{table}"))
+            .await
+            .expect("spilling stream succeeds"),
+        (400_000, 102_400_000)
+    );
+
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .expect("spill metric delta");
+    for family in [
+        "oracle_query_spill_bytes_total",
+        "oracle_query_spill_files_total",
+    ] {
+        assert!(
+            delta
+                .metrics
+                .iter()
+                .any(|sample| sample.family == family && sample.value > 0.0),
+            "successful spilling query must emit positive {family}: {:?}",
+            delta.metrics
+        );
+    }
+    assert!(delta.metrics.iter().any(|sample| {
+        sample.family == "oracle_query_spill_queries_total"
+            && sample.labels.get("outcome").map(String::as_str) == Some("success")
+            && sample.value == 1.0
+    }));
+    assert_oracle_runtime_restored(server, baseline, memory_baseline)
+        .expect("success cleanup is exact");
+    cluster.shutdown().await.expect("spill success shutdown");
+}
+
+/// A production disk-ceiling refusal remains a typed public 429, cleans all
+/// partial ownership, and leaves a smaller durable query usable.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_spill_disk_ceiling_is_typed_and_recovers() {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed().with_oracle_test_limits(192 << 20, 1),
+    )
+    .await
+    .expect("spill ceiling cluster");
+    let server = cluster.server(0).expect("spill ceiling server");
+    let large = prepare_spill_table(&cluster, server, "oracle_spill_ceiling", 400_000)
+        .await
+        .expect("spill ceiling fixture");
+    let small = prepare_spill_table(&cluster, server, "oracle_spill_recovery", 2)
+        .await
+        .expect("spill recovery fixture");
+    let reader = client(server, "oracle-spill-ceiling-reader")
+        .await
+        .expect("spill ceiling reader");
+    let baseline = server
+        .oracle_runtime_inspection()
+        .expect("spill ceiling baseline");
+    let memory = server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .expect("spill ceiling governor")
+        .snapshot();
+    let memory_baseline = (memory.bifrost_total_bytes, memory.oracle_total_bytes);
+
+    let refusal = match QueryClient::new(&reader)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id, value FROM vala.bifrost.{large}"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(30_000),
+        })
+        .await
+    {
+        Ok(_) => panic!("one-byte disk quota must refuse before a public stream opens"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        refusal,
+        ValaSdkError::Transport(WyrdError::Vala {
+            error: BifrostError::QueryAdmissionRejected
+        })
+    ));
+    assert_oracle_runtime_restored(server, baseline, memory_baseline)
+        .expect("disk refusal cleanup is exact");
+    assert_eq!(
+        strict_count_value(&reader, &format!("vala.bifrost.{small}"))
+            .await
+            .expect("smaller recovery COUNT succeeds"),
+        2
+    );
+    assert_oracle_runtime_restored(server, baseline, memory_baseline)
+        .expect("recovery cleanup is exact");
+    cluster.shutdown().await.expect("spill ceiling shutdown");
+}
+
+/// Dropping a public response at the deterministic schema barrier cancels the
+/// active spilling query and releases its scratch before the journey proceeds.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed().with_oracle_test_limits(192 << 20, 1 << 30),
+    )
+    .await
+    .expect("spill cancellation cluster");
+    let server = cluster.server(0).expect("spill cancellation server");
+    let table = prepare_spill_table(&cluster, server, "oracle_spill_cancel", 400_000)
+        .await
+        .expect("spill cancellation fixture");
+    let reader = client(server, "oracle-spill-cancel-reader")
+        .await
+        .expect("spill cancellation reader");
+    let baseline = server
+        .oracle_runtime_inspection()
+        .expect("spill cancellation baseline");
+    let memory = server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .expect("spill cancellation governor")
+        .snapshot();
+    let memory_baseline = (memory.bifrost_total_bytes, memory.oracle_total_bytes);
+    let resource_baseline = Default::default();
+    let request = BifrostQueryRequest {
+        sql: format!("SELECT id, value FROM vala.bifrost.{table}"),
+        visibility: VisibilityMode::PublishedOnly,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: Some(30_000),
+    };
+    server.stall_next_query_after_schema();
+    let query = QueryClient::new(&reader);
+    let query_task = tokio::spawn(async move {
+        query
+            .collect_bounded(
+                &request,
+                CollectedQueryLimits {
+                    max_rows: 1,
+                    max_encoded_bytes: 1024,
+                },
+            )
+            .await
+    });
+    let query_id = server
+        .wait_query_schema_stall()
+        .await
+        .expect("spilling query reaches schema barrier");
+    let active = server
+        .oracle_runtime_inspection()
+        .expect("active spill inspection");
+    assert!(active.active_queries > baseline.active_queries);
+    assert!(active.spill_files > baseline.spill_files);
+    query_task.abort();
+    let _ = query_task.await;
+    server
+        .wait_bifrost_query_resources_released(&query_id, resource_baseline)
+        .await
+        .expect("cancellation resource release notification");
+    assert_oracle_runtime_restored(server, baseline, memory_baseline)
+        .expect("cancellation cleanup is exact");
+    assert_eq!(
+        strict_spill_summary(&reader, &format!("vala.bifrost.{table}"))
+            .await
+            .expect("durable rows remain readable after cancellation"),
+        (400_000, 102_400_000)
+    );
+    cluster
+        .shutdown()
+        .await
+        .expect("spill cancellation shutdown");
+}
+
+/// Losing the pod executing an active spill leaves its peer available, permits
+/// an exact public retry, and removes only owned crash residue on restart.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
+    let mut cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::two_mixed().with_oracle_test_limits(192 << 20, 1 << 30),
+    )
+    .await
+    .expect("spill pod-loss cluster");
+    let query_node = cluster.configured_node_ids()[0];
+    let table = {
+        let server = cluster
+            .server_by_node(query_node)
+            .expect("spill pod-loss fixture server");
+        prepare_spill_table(&cluster, server, "oracle_spill_pod_loss", 400_000)
+            .await
+            .expect("spill pod-loss fixture")
+    };
+    let reader = client(
+        cluster
+            .server_by_node(query_node)
+            .expect("spill pod-loss query server"),
+        "oracle-spill-pod-loss-reader",
+    )
+    .await
+    .expect("spill pod-loss reader");
+    cluster
+        .server_by_node(query_node)
+        .expect("spill pod-loss query server")
+        .stall_next_query_after_schema();
+    let query_table = format!("vala.bifrost.{table}");
+    let query = tokio::spawn(async move { strict_spill_summary(&reader, &query_table).await });
+    cluster
+        .server_by_node(query_node)
+        .expect("spill pod-loss query server")
+        .wait_query_schema_stall()
+        .await
+        .expect("spilling query reaches schema barrier");
+
+    let executing = cluster
+        .configured_node_ids()
+        .iter()
+        .copied()
+        .find(|node_id| {
+            cluster
+                .server_by_node(*node_id)
+                .and_then(|server| server.oracle_runtime_inspection().ok())
+                .is_some_and(|inspection| {
+                    inspection.active_queries > 0 && inspection.spill_files > 0
+                })
+        })
+        .expect("runtime inspection identifies the executing Oracle");
+    cluster
+        .stop_node(executing)
+        .await
+        .expect("executing Oracle stops");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(30), query)
+            .await
+            .expect("failed spill query terminates")
+            .expect("failed spill task joins")
+            .is_err(),
+        "pod loss must not report a successful in-flight terminal"
+    );
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("surviving Oracle membership refresh");
+    let survivor = cluster
+        .configured_node_ids()
+        .iter()
+        .copied()
+        .find(|node_id| *node_id != executing && cluster.server_by_node(*node_id).is_some())
+        .expect("surviving Oracle identity");
+    let survivor_server = cluster
+        .server_by_node(survivor)
+        .expect("surviving Oracle server");
+    let survivor_baseline = survivor_server
+        .oracle_runtime_inspection()
+        .expect("surviving Oracle baseline");
+    let survivor_memory = survivor_server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .expect("surviving Oracle governor")
+        .snapshot();
+    let survivor_memory_baseline = (
+        survivor_memory.bifrost_total_bytes,
+        survivor_memory.oracle_total_bytes,
+    );
+    let survivor_reader = client(survivor_server, "oracle-spill-survivor-reader")
+        .await
+        .expect("surviving Oracle reader");
+    assert_eq!(
+        strict_spill_summary(&survivor_reader, &format!("vala.bifrost.{table}"))
+            .await
+            .expect("surviving Oracle exact retry"),
+        (400_000, 102_400_000)
+    );
+    assert_oracle_runtime_restored(survivor_server, survivor_baseline, survivor_memory_baseline)
+        .expect("surviving Oracle cleanup is exact");
+
+    cluster
+        .seed_oracle_spill_restart_fixture(executing)
+        .expect("seed stopped-node crash residue");
+    assert_eq!(
+        cluster
+            .oracle_spill_restart_fixture_state(executing)
+            .expect("pre-restart residue state"),
+        (true, true)
+    );
+    cluster
+        .restart_node(executing)
+        .await
+        .expect("stopped Oracle restarts");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("restarted Oracle membership refresh");
+    assert_eq!(
+        cluster
+            .oracle_spill_restart_fixture_state(executing)
+            .expect("post-restart residue state"),
+        (false, true),
+        "restart must remove only the owned stale prefix"
+    );
+    let restarted = cluster
+        .server_by_node(executing)
+        .expect("restarted Oracle server");
+    let residual = restarted
+        .oracle_runtime_inspection()
+        .expect("restarted Oracle residuals");
+    assert_eq!(residual.active_queries, 0);
+    assert_eq!(residual.queued_queries, 0);
+    assert_eq!(residual.reserved_memory_bytes, 0);
+    assert_eq!(residual.reserved_spill_bytes, 0);
+    assert_eq!(residual.peer_pending, 0);
+    assert_eq!(residual.peer_running, 0);
+    let memory = restarted
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .expect("restarted Oracle governor")
+        .snapshot();
+    assert_eq!(memory.oracle_total_bytes, 0);
+    assert_eq!(memory.bifrost_total_bytes, 0);
+    let restarted_reader = client(restarted, "oracle-spill-restarted-reader")
+        .await
+        .expect("restarted Oracle reader");
+    assert_eq!(
+        strict_count_value(&restarted_reader, &format!("vala.bifrost.{table}"))
+            .await
+            .expect("restarted Oracle reads durable rows"),
+        400_000
+    );
+    cluster.shutdown().await.expect("spill pod-loss shutdown");
 }
 
 /// Sustained Oracle admission refusals leave the independent durable heartbeat
@@ -2768,6 +3180,131 @@ fn metric_label_value_is_closed(label: &str, value: &str) -> bool {
     }
 }
 
+/// Builds one deterministic sealed table large enough to force the configured
+/// production reconciliation sort through its disk spill path.
+///
+/// # Errors
+///
+/// Returns a catalog, authentication, public ingest, or durable flush error.
+async fn prepare_spill_table(
+    cluster: &WyrdTestCluster,
+    server: &wyrd_testing::WyrdTestServer,
+    prefix: &str,
+    row_count: usize,
+) -> Result<String, JourneyError> {
+    let table = unique_table(prefix);
+    register_table(server, cluster.data_tenant_id(), &table).await?;
+    let writer = client(server, &format!("{prefix}-writer")).await?;
+    let scribe_baseline = server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .ok_or("spill fixture lacks memory governor")?
+        .snapshot()
+        .scribe_total_bytes;
+    for start in (0..row_count).step_by(5_000) {
+        let end = (start + 5_000).min(row_count);
+        let chunk = u64::try_from(start / 5_000)?;
+        let batch_id = uuid::Uuid::new_v7(uuid::Timestamp::from_unix_time(
+            2_000_000_000_u64.saturating_sub(chunk),
+            0,
+            0,
+            0,
+        ));
+        let ids = (start..end)
+            .map(i64::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        BifrostGrpcTransport::connect(&writer)
+            .await?
+            .insert_batch(
+                &format!("vala.bifrost.{table}"),
+                batch_id.into_bytes(),
+                spill_ipc(&ids),
+            )
+            .await?;
+        server.flush_bifrost().await?;
+        wait_scribe_memory_restored(server, scribe_baseline).await?;
+    }
+    Ok(table)
+}
+
+/// Waits cooperatively for a completed flush to release its Scribe generation
+/// before the next bounded ingest chunk is admitted.
+///
+/// # Errors
+///
+/// Returns an inspection error or a timeout when the production governor does
+/// not return to the exact pre-fixture Scribe baseline.
+async fn wait_scribe_memory_restored(
+    server: &wyrd_testing::WyrdTestServer,
+    baseline: usize,
+) -> Result<(), JourneyError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let current = server
+            .state()
+            .bifrost_memory
+            .as_ref()
+            .ok_or("spill fixture lacks memory governor")?
+            .snapshot()
+            .scribe_total_bytes;
+        if current == baseline {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Scribe memory did not return to fixture baseline: baseline={baseline} current={current}"
+            )
+            .into());
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Requires query admission, parent/child memory, spill ownership, and local
+/// scratch files to match the exact pre-query baseline.
+///
+/// # Errors
+///
+/// Returns an inspection error or a diagnostic mismatch for any retained
+/// production owner.
+fn assert_oracle_runtime_restored(
+    server: &wyrd_testing::WyrdTestServer,
+    baseline: wyrd_testing::OracleRuntimeInspection,
+    memory_baseline: (usize, usize),
+) -> Result<(), JourneyError> {
+    let current = server.oracle_runtime_inspection()?;
+    if current.active_queries != baseline.active_queries
+        || current.queued_queries != baseline.queued_queries
+        || current.reserved_memory_bytes != baseline.reserved_memory_bytes
+        || current.reserved_spill_bytes != baseline.reserved_spill_bytes
+        || current.peer_pending != baseline.peer_pending
+        || current.peer_running != baseline.peer_running
+        || current.spill_directories != baseline.spill_directories
+        || current.spill_files != baseline.spill_files
+        || current.spill_file_bytes != baseline.spill_file_bytes
+    {
+        return Err(format!(
+            "Oracle runtime did not return to baseline: baseline={baseline:?} current={current:?}"
+        )
+        .into());
+    }
+    let memory = server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .ok_or("Oracle server lacks the shared memory governor")?
+        .snapshot();
+    if (memory.bifrost_total_bytes, memory.oracle_total_bytes) != memory_baseline {
+        return Err(format!(
+            "Oracle memory did not return to baseline: baseline={memory_baseline:?} current=({},{})",
+            memory.bifrost_total_bytes, memory.oracle_total_bytes
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Run one public gRPC-ingest to HTTP-query roundtrip and validate the terminal.
 async fn public_roundtrip(
     spec: BifrostClusterSpec,
@@ -3341,6 +3878,29 @@ fn ipc(ids: &[i64]) -> Vec<u8> {
     let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("valid schema");
     writer.write(&batch).expect("in-memory IPC write");
     writer.finish().expect("in-memory IPC finish");
+    bytes
+}
+
+/// Encodes production-shaped rows in bounded transport chunks so aggregate
+/// reconciliation state, rather than a single ingest request, owns the peak.
+fn spill_ipc(ids: &[i64]) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(vec!["x".repeat(256); ids.len()])),
+        ],
+    )
+    .expect("fixed spill arrays share a length");
+    let mut bytes = Vec::new();
+    let mut writer =
+        StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("valid spill schema");
+    writer.write(&batch).expect("in-memory spill IPC write");
+    writer.finish().expect("in-memory spill IPC finish");
     bytes
 }
 

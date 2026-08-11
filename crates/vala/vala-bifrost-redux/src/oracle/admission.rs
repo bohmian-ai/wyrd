@@ -93,8 +93,6 @@ struct Waiter {
     deadline: Instant,
     /// Existing per-query memory ceiling from the prepared request.
     memory_ceiling: u64,
-    /// Whether this request may reserve analytical spill.
-    spill_eligible: bool,
     /// One-shot notification carrying the granted resource amounts.
     tx: tokio::sync::oneshot::Sender<Grant>,
 }
@@ -136,10 +134,6 @@ struct ClassState {
     memory_limit: u64,
     /// Memory bytes currently reserved.
     memory_used: u64,
-    /// Total class spill budget.
-    spill_limit: u64,
-    /// Spill bytes currently reserved.
-    spill_used: u64,
     /// Stable first-enqueue tenant ring.
     tenants: Vec<(DataTenantId, TenantQueue)>,
     /// Next tenant index visited by round-robin grants.
@@ -148,7 +142,7 @@ struct ClassState {
 
 impl ClassState {
     /// Creates empty class counters with positive internal floors.
-    fn new(capacity: u32, single: u32, multi: u32, memory_limit: u64, spill_limit: u64) -> Self {
+    fn new(capacity: u32, single: u32, multi: u32, memory_limit: u64) -> Self {
         Self {
             capacity: capacity.max(1),
             used: 0,
@@ -156,8 +150,6 @@ impl ClassState {
             tenant_ceiling_multi: multi.max(1),
             memory_limit: memory_limit.max(1),
             memory_used: 0,
-            spill_limit,
-            spill_used: 0,
             tenants: Vec::new(),
             cursor: 0,
         }
@@ -205,9 +197,10 @@ impl ClassState {
         (self.memory_limit / u64::from(self.capacity)).max(1)
     }
 
-    /// Computes the fixed analytical spill share for one admitted query.
-    fn spill_per_query(&self) -> u64 {
-        (self.spill_limit / u64::from(self.capacity)).max(1)
+    /// Computes the positive class share from the pod-global spill ceiling.
+    fn spill_per_query(&self, pod_limit: u64) -> u64 {
+        let capacity = u64::from(self.capacity);
+        (pod_limit / capacity + u64::from(!pod_limit.is_multiple_of(capacity))).min(pod_limit)
     }
 }
 
@@ -217,6 +210,10 @@ struct AdmissionState {
     interactive: ClassState,
     /// Analytical class state.
     analytical: ClassState,
+    /// Pod-global spill bytes available to both scheduling classes.
+    spill_limit: u64,
+    /// Pod-global spill bytes retained by all active query grants.
+    spill_used: u64,
     /// Maximum number of queued waiters.
     queue_capacity: u32,
     /// Current queued waiter count.
@@ -271,13 +268,13 @@ impl LocalPermit {
             tracing::error!("Oracle admission state lock poisoned during release");
             return;
         };
+        // Release aggregate components in reverse acquisition order: spill,
+        // memory, tenant, then class.
+        state.spill_used = state.spill_used.saturating_sub(self.spill);
         let class = match self.class {
             AdmissionClass::Interactive => &mut state.interactive,
             AdmissionClass::Analytical => &mut state.analytical,
         };
-        // Release aggregate components in reverse acquisition order: spill,
-        // memory, tenant, then class.
-        class.spill_used = class.spill_used.saturating_sub(self.spill);
         class.memory_used = class.memory_used.saturating_sub(self.memory);
         if let Some((_, tenant)) = class.tenants.iter_mut().find(|(id, _)| *id == self.tenant) {
             tenant.active = tenant.active.saturating_sub(1);
@@ -308,8 +305,6 @@ pub(crate) struct PreparedAdmission {
     pub(crate) deadline: Instant,
     /// Existing per-query memory ceiling from the retained memory governor.
     pub(crate) memory_ceiling: u64,
-    /// Whether analytical spill is permitted for this request.
-    pub(crate) spill_eligible: bool,
     /// Caller/request cancellation authority.
     pub(crate) cancellation: CancellationToken,
 }
@@ -430,15 +425,15 @@ impl OracleAdmission {
                 config.single_tenant_ceiling,
                 config.multi_tenant_ceiling,
                 config.interactive_memory_bytes,
-                0,
             ),
             analytical: ClassState::new(
                 config.analytical_slots,
                 config.single_tenant_ceiling,
                 config.multi_tenant_ceiling,
                 config.analytical_memory_bytes,
-                config.spill_bytes,
             ),
+            spill_limit: config.spill_bytes,
+            spill_used: 0,
             queue_capacity: config.queue_capacity.max(1),
             queued: 0,
             generation: 0,
@@ -544,7 +539,7 @@ impl OracleAdmission {
             active_queries: state.active_queries,
             queued_queries: u64::from(state.queued),
             reserved_memory_bytes: state.interactive.memory_used + state.analytical.memory_used,
-            reserved_spill_bytes: state.interactive.spill_used + state.analytical.spill_used,
+            reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
             peer_running: self.slots.running_in_use(),
         }
@@ -562,7 +557,7 @@ impl OracleAdmission {
             active_queries: state.active_queries,
             queued_queries: u64::from(state.queued),
             reserved_memory_bytes: state.interactive.memory_used + state.analytical.memory_used,
-            reserved_spill_bytes: state.interactive.spill_used + state.analytical.spill_used,
+            reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
             peer_running: self.slots.running_in_use(),
         }
@@ -583,7 +578,6 @@ impl OracleAdmission {
             query_class,
             deadline,
             memory_ceiling,
-            spill_eligible,
             cancellation,
         } = request;
         if memory_ceiling == 0 {
@@ -603,7 +597,6 @@ impl OracleAdmission {
             class_kind,
             wait_deadline,
             memory_ceiling,
-            spill_eligible,
             query_class,
         )?;
         let grant = self
@@ -631,7 +624,6 @@ impl OracleAdmission {
         class_kind: AdmissionClass,
         wait_deadline: Instant,
         memory_ceiling: u64,
-        spill_eligible: bool,
         query_class: QueryClass,
     ) -> Result<PreparedWaiter, BifrostError> {
         let (tx, receiver) = tokio::sync::oneshot::channel();
@@ -666,7 +658,6 @@ impl OracleAdmission {
                 id: waiter_id,
                 deadline: wait_deadline,
                 memory_ceiling,
-                spill_eligible,
                 tx,
             });
             state.queued += 1;
@@ -887,19 +878,15 @@ fn grant_waiters(
                     class.tenants[index].1.waiters.push_front(waiter);
                     continue;
                 }
-                let spill = if matches!(kind, AdmissionClass::Analytical) && waiter.spill_eligible {
-                    class.spill_per_query()
-                } else {
-                    0
-                };
-                if class.spill_used.saturating_add(spill) > class.spill_limit {
+                let spill = class.spill_per_query(state.spill_limit);
+                if state.spill_used.saturating_add(spill) > state.spill_limit {
                     class.tenants[index].1.waiters.push_front(waiter);
                     continue;
                 }
                 let tenant = class.tenants[index].0;
                 class.used += 1;
                 class.memory_used += memory;
-                class.spill_used += spill;
+                state.spill_used += spill;
                 class.tenants[index].1.active += 1;
                 state.queued = state.queued.saturating_sub(1);
                 state.active_queries += 1;
@@ -937,11 +924,11 @@ fn notify_grants(shared: &Arc<AdmissionShared>, mut notifications: Vec<GrantNoti
 
 /// Reverses one grant's class, tenant, memory, spill, and active counters.
 fn rollback_counts(state: &mut AdmissionState, grant: &Grant) {
+    state.spill_used = state.spill_used.saturating_sub(grant.spill);
     let class = match grant.class {
         AdmissionClass::Interactive => &mut state.interactive,
         AdmissionClass::Analytical => &mut state.analytical,
     };
-    class.spill_used = class.spill_used.saturating_sub(grant.spill);
     class.memory_used = class.memory_used.saturating_sub(grant.memory);
     if let Some((_, tenant)) = class.tenants.iter_mut().find(|(id, _)| *id == grant.tenant) {
         tenant.active = tenant.active.saturating_sub(1);
@@ -989,6 +976,12 @@ impl Drop for AdmittedQueryGuard {
 }
 
 impl AdmittedQueryGuard {
+    /// Returns the immutable memory grant retained by local admission.
+    #[must_use]
+    pub(super) fn memory_limit_bytes(&self) -> u64 {
+        self.local_permit.as_ref().map_or(0, |permit| permit.memory)
+    }
+
     /// Returns the immutable spill share retained by this admitted query.
     #[must_use]
     pub(super) fn spill_limit_bytes(&self) -> u64 {
@@ -1034,8 +1027,10 @@ pub(super) fn admitted_guard_for_test()
 -> (AdmittedQueryGuard, Arc<AdmissionShared>, CancellationToken) {
     let shared = Arc::new(AdmissionShared {
         state: Mutex::new(AdmissionState {
-            interactive: ClassState::new(1, 1, 1, 1024, 0),
-            analytical: ClassState::new(1, 1, 1, 1024, 1024),
+            interactive: ClassState::new(1, 1, 1, 1024),
+            analytical: ClassState::new(1, 1, 1, 1024),
+            spill_limit: 1024,
+            spill_used: 0,
             queue_capacity: 1,
             queued: 0,
             generation: 0,
@@ -1110,15 +1105,15 @@ mod tests {
                     config.single_tenant_ceiling,
                     config.multi_tenant_ceiling,
                     config.interactive_memory_bytes,
-                    0,
                 ),
                 analytical: ClassState::new(
                     config.analytical_slots,
                     config.single_tenant_ceiling,
                     config.multi_tenant_ceiling,
                     config.analytical_memory_bytes,
-                    config.spill_bytes,
                 ),
+                spill_limit: config.spill_bytes,
+                spill_used: 0,
                 queue_capacity: config.queue_capacity,
                 queued: 0,
                 generation: 0,
@@ -1209,7 +1204,6 @@ mod tests {
                 id: 1,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: u64::MAX,
-                spill_eligible: false,
                 tx,
             });
         state.queued = 1;
@@ -1244,7 +1238,6 @@ mod tests {
                     id: number,
                     deadline: Instant::now() + Duration::from_secs(1),
                     memory_ceiling: u64::MAX,
-                    spill_eligible: false,
                     tx,
                 });
             state.queued += 1;
@@ -1272,7 +1265,6 @@ mod tests {
             query_class: QueryClass::Interactive,
             deadline: Instant::now() + Duration::from_secs(1),
             memory_ceiling: 1024,
-            spill_eligible: false,
             cancellation: CancellationToken::new(),
         };
         let active = owner.admit(request()).await.expect("active admission");
@@ -1297,6 +1289,7 @@ mod tests {
             interactive_slots: 3,
             single_tenant_ceiling: 3,
             multi_tenant_ceiling: 3,
+            spill_bytes: 300,
             ..Default::default()
         });
         let first = DataTenantId::new_v7();
@@ -1314,7 +1307,6 @@ mod tests {
                     id: number,
                     deadline: Instant::now() + Duration::from_secs(1),
                     memory_ceiling: u64::MAX,
-                    spill_eligible: false,
                     tx,
                 });
             state.queued += 1;
@@ -1329,7 +1321,6 @@ mod tests {
                 id: 3,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: u64::MAX,
-                spill_eligible: false,
                 tx,
             });
         state.queued += 1;
@@ -1359,13 +1350,12 @@ mod tests {
             id: 1,
             deadline: Instant::now() + Duration::from_secs(1),
             memory_ceiling: 10,
-            spill_eligible: true,
             tx,
         });
         state.queued = 1;
         let notifications = grant_waiters(&shared, &mut state);
         assert_eq!(state.analytical.memory_used, 10);
-        assert_eq!(state.analytical.spill_used, 50);
+        assert_eq!(state.spill_used, 50);
         drop(state);
         notify_grants(&shared, notifications);
         let grant = rx.try_recv().expect("prepared grant");
@@ -1394,7 +1384,6 @@ mod tests {
                     id,
                     deadline: Instant::now() + Duration::from_secs(1),
                     memory_ceiling: u64::MAX,
-                    spill_eligible: false,
                     tx,
                 });
             state.queued += 1;
@@ -1410,6 +1399,120 @@ mod tests {
             state.interactive.memory_used,
             state.interactive.memory_limit
         );
+        assert_eq!(
+            state.spill_used,
+            state.interactive.spill_per_query(state.spill_limit)
+        );
+    }
+
+    /// Proves both scheduling classes draw from one bounded global spill counter.
+    #[tokio::test]
+    async fn local_admission_mixed_classes_share_one_spill_ceiling() {
+        let owner = owner(OracleAdmissionConfig {
+            interactive_slots: 2,
+            analytical_slots: 2,
+            single_tenant_ceiling: 2,
+            multi_tenant_ceiling: 2,
+            spill_bytes: 100,
+            ..Default::default()
+        });
+        let request = |query_class| PreparedAdmission {
+            tenant: DataTenantId::new_v7(),
+            query_class,
+            deadline: Instant::now() + Duration::from_secs(1),
+            memory_ceiling: u64::MAX,
+            cancellation: CancellationToken::new(),
+        };
+        let interactive = owner
+            .admit(request(QueryClass::Interactive))
+            .await
+            .expect("interactive spill grant");
+        assert_eq!(interactive.spill_limit_bytes(), 50);
+        assert_eq!(owner.shared.state.lock().expect("state").spill_used, 50);
+        let analytical = owner
+            .admit(request(QueryClass::Analytical))
+            .await
+            .expect("analytical spill grant");
+        assert_eq!(analytical.spill_limit_bytes(), 50);
+        assert_eq!(owner.shared.state.lock().expect("state").spill_used, 100);
+
+        let queued_owner = Arc::clone(&owner);
+        let queued = tokio::spawn(async move {
+            queued_owner
+                .admit(PreparedAdmission {
+                    tenant: DataTenantId::new_v7(),
+                    query_class: QueryClass::Interactive,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    memory_ceiling: u64::MAX,
+                    cancellation: CancellationToken::new(),
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(owner.shared.state.lock().expect("state").spill_used, 100);
+        drop(interactive);
+        let replacement = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("replacement grant deadline")
+            .expect("replacement task")
+            .expect("replacement admission");
+        assert_eq!(replacement.spill_limit_bytes(), 50);
+        assert_eq!(owner.shared.state.lock().expect("state").spill_used, 100);
+        drop(replacement);
+        drop(analytical);
+        assert_eq!(owner.shared.state.lock().expect("state").spill_used, 0);
+    }
+
+    /// Proves a one-byte pod ceiling yields nonzero shares and serializes classes.
+    #[tokio::test]
+    async fn local_admission_one_byte_spill_limit_reduces_effective_concurrency() {
+        let owner = owner(OracleAdmissionConfig {
+            interactive_slots: 8,
+            analytical_slots: 4,
+            single_tenant_ceiling: 8,
+            multi_tenant_ceiling: 8,
+            spill_bytes: 1,
+            ..Default::default()
+        });
+        {
+            let state = owner.shared.state.lock().expect("state");
+            assert_eq!(state.interactive.spill_per_query(state.spill_limit), 1);
+            assert_eq!(state.analytical.spill_per_query(state.spill_limit), 1);
+        }
+        let first = owner
+            .admit(PreparedAdmission {
+                tenant: DataTenantId::new_v7(),
+                query_class: QueryClass::Interactive,
+                deadline: Instant::now() + Duration::from_secs(1),
+                memory_ceiling: u64::MAX,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("one-byte interactive grant");
+        assert_eq!(first.spill_limit_bytes(), 1);
+        let queued_owner = Arc::clone(&owner);
+        let queued = tokio::spawn(async move {
+            queued_owner
+                .admit(PreparedAdmission {
+                    tenant: DataTenantId::new_v7(),
+                    query_class: QueryClass::Analytical,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    memory_ceiling: u64::MAX,
+                    cancellation: CancellationToken::new(),
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(owner.shared.state.lock().expect("state").spill_used, 1);
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("one-byte replacement deadline")
+            .expect("one-byte replacement task")
+            .expect("one-byte analytical grant");
+        assert_eq!(second.spill_limit_bytes(), 1);
+        drop(second);
+        assert_eq!(owner.shared.state.lock().expect("state").spill_used, 0);
     }
 
     /// The admission queue never grants beyond its configured waiter bound.
@@ -1425,7 +1528,6 @@ mod tests {
             query_class: QueryClass::Interactive,
             deadline: Instant::now() + Duration::from_secs(2),
             memory_ceiling: 1024,
-            spill_eligible: false,
             cancellation: CancellationToken::new(),
         };
         let first = owner.admit(request()).await.expect("first admission");
@@ -1457,7 +1559,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1469,7 +1570,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: started + Duration::from_millis(20),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await;
@@ -1493,7 +1593,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: caller_one.clone(),
             })
             .await
@@ -1505,7 +1604,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: caller_two.clone(),
             })
             .await
@@ -1532,7 +1630,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1543,7 +1640,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1566,7 +1662,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1590,7 +1685,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await;
@@ -1616,7 +1710,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1627,7 +1720,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_millis(10),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await;
@@ -1650,7 +1742,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1665,7 +1756,6 @@ mod tests {
                     query_class: QueryClass::Interactive,
                     deadline: Instant::now() + Duration::from_secs(1),
                     memory_ceiling: 1024,
-                    spill_eligible: false,
                     cancellation: request_cancel_for_task,
                 })
                 .await
@@ -1685,7 +1775,6 @@ mod tests {
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 1024,
-                spill_eligible: false,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1737,7 +1826,6 @@ mod tests {
                 query_class: QueryClass::Analytical,
                 deadline: Instant::now() + Duration::from_secs(1),
                 memory_ceiling: 512,
-                spill_eligible: true,
                 cancellation: CancellationToken::new(),
             })
             .await
@@ -1746,7 +1834,7 @@ mod tests {
         let state = owner.shared.state.lock().expect("state");
         assert_eq!(state.analytical.used, 0);
         assert_eq!(state.analytical.memory_used, 0);
-        assert_eq!(state.analytical.spill_used, 0);
+        assert_eq!(state.spill_used, 0);
         assert_eq!(state.active_queries, 0);
     }
 
@@ -1779,7 +1867,6 @@ mod tests {
             query_class: QueryClass::Interactive,
             deadline: Instant::now() + Duration::from_secs(1),
             memory_ceiling: 1024,
-            spill_eligible: false,
             cancellation: CancellationToken::new(),
         };
         let active = owner.admit(request).await.expect("active admission");

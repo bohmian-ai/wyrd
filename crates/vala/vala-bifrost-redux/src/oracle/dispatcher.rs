@@ -1762,6 +1762,7 @@ impl FragmentDispatcher {
 
 /// Invalid or incomplete attempts are retryable because no bytes were admitted.
 fn attempt_error(error: AttemptError) -> DispatchError {
+    tracing::error!(error = %error, "Oracle fragment attempt buffer failed");
     record_peer_attempt(FragmentOutcome::Failed, PeerErrorClass::Attempt);
     if error == AttemptError::ParentCapacity {
         DispatchError::Capacity

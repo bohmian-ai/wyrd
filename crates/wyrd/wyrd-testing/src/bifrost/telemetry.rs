@@ -757,6 +757,38 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
     TelemetryBinding {
+        id: TelemetryBindingId("oracle.spill_files"),
+        selected_label_values: &[],
+        family: "oracle_query_spill_files_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[TelemetryLabelValues {
+            key: "class",
+            values: &["interactive", "analytical"],
+        }],
+    },
+    TelemetryBinding {
+        id: TelemetryBindingId("oracle.spill_queries"),
+        selected_label_values: &[],
+        family: "oracle_query_spill_queries_total",
+        kind: BifrostMetricKind::Counter,
+        unit: TelemetryUnit::Count,
+        aggregation: TelemetryAggregation::Delta,
+        requirement: TelemetryRequirement::Role("oracle"),
+        allowed_label_values: &[
+            TelemetryLabelValues {
+                key: "class",
+                values: &["interactive", "analytical"],
+            },
+            TelemetryLabelValues {
+                key: "outcome",
+                values: &["success", "error", "cancelled"],
+            },
+        ],
+    },
+    TelemetryBinding {
         id: TelemetryBindingId("postgres.acquire"),
         selected_label_values: &[],
         family: "vala_postgres_pool_acquire_seconds",

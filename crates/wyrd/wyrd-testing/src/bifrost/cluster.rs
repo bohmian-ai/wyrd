@@ -106,6 +106,10 @@ pub const fn full_bifrost_topology() -> BifrostTopology {
 pub struct TestOracleResources {
     /// Optional parent directory for the retained local spill root.
     pub spill_root: Option<PathBuf>,
+    /// Optional deterministic Oracle child memory ceiling.
+    pub memory_limit_bytes: Option<usize>,
+    /// Optional deterministic per-query spill ceiling.
+    pub spill_limit_bytes: Option<u64>,
 }
 
 /// Concrete role and identity descriptor for one Bifrost pod.
@@ -133,6 +137,23 @@ impl BifrostClusterSpec {
     #[must_use]
     pub fn one_mixed() -> Self {
         Self::mixed(1)
+    }
+
+    /// Applies deterministic Oracle memory and disk limits to every Oracle node.
+    #[must_use]
+    pub fn with_oracle_test_limits(
+        mut self,
+        memory_limit_bytes: usize,
+        spill_limit_bytes: u64,
+    ) -> Self {
+        for node in &mut self.nodes {
+            if node.roles.contains(&BifrostRuntimeRole::Oracle) {
+                let oracle = node.oracle.get_or_insert_with(TestOracleResources::default);
+                oracle.memory_limit_bytes = Some(memory_limit_bytes);
+                oracle.spill_limit_bytes = Some(spill_limit_bytes);
+            }
+        }
+        self
     }
 
     /// Construct two mixed nodes for direct peer-transport journeys.
@@ -366,6 +387,12 @@ pub struct OracleInspection {
     pub reserved_memory_bytes: u64,
     /// Spill reservations retained by Oracle queries.
     pub reserved_spill_bytes: u64,
+    /// Active Oracle-owned process/query scratch directories.
+    pub spill_directories: u64,
+    /// Regular files beneath all running Oracle-owned scratch prefixes.
+    pub spill_files: u64,
+    /// Exact regular-file bytes beneath all running Oracle-owned scratch prefixes.
+    pub spill_file_bytes: u64,
     /// Peer pending reservations across Oracle pods.
     pub peer_pending: u64,
     /// Peer running reservations across Oracle pods.
@@ -1693,6 +1720,12 @@ impl WyrdTestCluster {
         if let Some(timing) = resources.spec.role_timing {
             builder = builder.with_role_timing_for_test(timing);
         }
+        if let Some(oracle) = &resources.spec.oracle
+            && let (Some(memory), Some(spill)) =
+                (oracle.memory_limit_bytes, oracle.spill_limit_bytes)
+        {
+            builder = builder.with_oracle_capacity_for_test(memory, spill);
+        }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);
         if let Some(observer) = &self.forge_completion_observer {
@@ -1883,6 +1916,13 @@ impl WyrdTestCluster {
                 runtime.audit_wal_bytes = runtime
                     .audit_wal_bytes
                     .saturating_add(snapshot.audit_wal_bytes);
+                runtime.spill_directories = runtime
+                    .spill_directories
+                    .saturating_add(snapshot.spill_directories);
+                runtime.spill_files = runtime.spill_files.saturating_add(snapshot.spill_files);
+                runtime.spill_file_bytes = runtime
+                    .spill_file_bytes
+                    .saturating_add(snapshot.spill_file_bytes);
                 runtime.audit_oldest_age =
                     match (runtime.audit_oldest_age, snapshot.audit_oldest_age) {
                         (None, age) => age,
@@ -1902,6 +1942,9 @@ impl WyrdTestCluster {
             queued_queries: runtime.queued_queries,
             reserved_memory_bytes: runtime.reserved_memory_bytes,
             reserved_spill_bytes: runtime.reserved_spill_bytes,
+            spill_directories: runtime.spill_directories,
+            spill_files: runtime.spill_files,
+            spill_file_bytes: runtime.spill_file_bytes,
             peer_pending: runtime.peer_pending,
             peer_running: runtime.peer_running,
             audit_wal_records: runtime.audit_wal_records,
@@ -2064,6 +2107,56 @@ impl WyrdTestCluster {
         resources.http_addr = reserve_loopback_addr()?;
         resources.grpc_addr = reserve_loopback_addr()?;
         self.restart_node(node_id).await
+    }
+
+    /// Seeds crash residue and an unrelated sibling beneath one node's Oracle spill root.
+    ///
+    /// The owned `oracle-runtime-*` child models files left by a pod crash. The
+    /// unrelated sibling proves restart cleanup remains prefix-scoped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a resource error for an unknown node, a node without an Oracle
+    /// spill root, or any fixture-directory or marker-write failure.
+    pub fn seed_oracle_spill_restart_fixture(&self, node_id: NodeId) -> Result<(), ClusterError> {
+        let root = self
+            .nodes
+            .get(&node_id)
+            .and_then(|resources| resources.spill_root.as_ref())
+            .ok_or_else(|| ClusterError::Resource("Oracle spill root missing".to_owned()))?;
+        let oracle = root.path().join("oracle-spill");
+        for child in ["oracle-runtime-stale", "unrelated-sibling"] {
+            let directory = oracle.join(child);
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            std::fs::write(directory.join("marker"), b"restart-fixture")
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Reports whether restart residue and its unrelated sibling still exist.
+    ///
+    /// The tuple is `(owned_stale_exists, unrelated_sibling_exists)` and never
+    /// exposes filesystem paths outside the test harness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a resource error for an unknown node or missing Oracle spill root.
+    pub fn oracle_spill_restart_fixture_state(
+        &self,
+        node_id: NodeId,
+    ) -> Result<(bool, bool), ClusterError> {
+        let root = self
+            .nodes
+            .get(&node_id)
+            .and_then(|resources| resources.spill_root.as_ref())
+            .ok_or_else(|| ClusterError::Resource("Oracle spill root missing".to_owned()))?;
+        let oracle = root.path().join("oracle-spill");
+        Ok((
+            oracle.join("oracle-runtime-stale").exists(),
+            oracle.join("unrelated-sibling").exists(),
+        ))
     }
 
     /// Return the shared fixture tenant.

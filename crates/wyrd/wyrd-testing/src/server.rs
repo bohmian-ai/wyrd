@@ -199,8 +199,8 @@ struct WyrdTestServerInner {
     /// Lifetime guard retained only for local storage-backed servers.
     _storage_root: Option<Arc<tempfile::TempDir>>,
     _scribe_wal_root: Option<Arc<tempfile::TempDir>>,
-    /// Lifetime guard for the Forge DataFusion spill directory.
-    _forge_spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Lifetime guard for the Forge and Oracle DataFusion spill root.
+    _bifrost_spill_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for the cluster-retained Oracle audit WAL root.
     _oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     state: AppState,
@@ -239,7 +239,7 @@ pub struct ServerShutdownInspection {
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BifrostQueryResourceSnapshot {
     /// Durable Oracle admission slot units currently retained.
     pub admission_slots: u64,
@@ -272,6 +272,12 @@ pub struct OracleRuntimeInspection {
     pub audit_wal_bytes: u64,
     /// Age of the oldest retained WAL record.
     pub audit_oldest_age: Option<Duration>,
+    /// Active Oracle-owned process/query scratch directories.
+    pub spill_directories: u64,
+    /// Regular files beneath the Oracle-owned scratch prefix.
+    pub spill_files: u64,
+    /// Exact regular-file bytes beneath the Oracle-owned scratch prefix.
+    pub spill_file_bytes: u64,
 }
 
 /// Stable pointer identities for one server-owned runtime pool graph.
@@ -318,6 +324,10 @@ pub struct WyrdTestServerBuilder {
     scribe_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Cluster-retained Forge/Oracle spill root reused across restarts.
     oracle_spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Optional deterministic Oracle child ceiling for spill journeys.
+    oracle_memory_limit_bytes: Option<usize>,
+    /// Optional deterministic Oracle query-spill ceiling for spill journeys.
+    oracle_spill_limit_bytes: Option<u64>,
     /// Cluster-retained Oracle audit WAL root reused across restarts.
     oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Process-installed production telemetry guard shared by every node.
@@ -382,6 +392,8 @@ impl Default for WyrdTestServerBuilder {
             .collect(),
             scribe_wal_root: None,
             oracle_spill_root: None,
+            oracle_memory_limit_bytes: None,
+            oracle_spill_limit_bytes: None,
             oracle_audit_wal_root: None,
             telemetry: None,
             bind_addrs: None,
@@ -761,6 +773,7 @@ impl WyrdTestServer {
                 WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
             })?;
         let (admission, (records, bytes, oldest)) = runtime.oracle_runtime_inspection();
+        let (spill_directories, spill_files, spill_file_bytes) = self.inspect_oracle_spill()?;
         Ok(OracleRuntimeInspection {
             active_queries: admission.active_queries,
             queued_queries: admission.queued_queries,
@@ -771,7 +784,47 @@ impl WyrdTestServer {
             audit_wal_records: records,
             audit_wal_bytes: bytes,
             audit_oldest_age: oldest,
+            spill_directories,
+            spill_files,
+            spill_file_bytes,
         })
+    }
+
+    /// Counts Oracle-owned scratch state without exposing local paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when scratch metadata cannot be inspected.
+    fn inspect_oracle_spill(&self) -> Result<(u64, u64, u64), WyrdTestServerError> {
+        let Some(root) = self.inner._bifrost_spill_root.as_ref() else {
+            return Ok((0, 0, 0));
+        };
+        let oracle_root = root.path().join("oracle-spill");
+        if !oracle_root.exists() {
+            return Ok((0, 0, 0));
+        }
+        let mut directories = 0_u64;
+        let mut files = 0_u64;
+        let mut bytes = 0_u64;
+        let mut pending = vec![oracle_root];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory)
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
+            {
+                let entry = entry.map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+                let metadata = entry
+                    .metadata()
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+                if metadata.is_dir() {
+                    directories = directories.saturating_add(1);
+                    pending.push(entry.path());
+                } else if metadata.is_file() {
+                    files = files.saturating_add(1);
+                    bytes = bytes.saturating_add(metadata.len());
+                }
+            }
+        }
+        Ok((directories, files, bytes))
     }
 
     /// Pauses the production audit relay before its next Postgres attempt.
@@ -2174,6 +2227,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Applies deterministic Oracle memory and spill ceilings to a journey node.
+    #[must_use]
+    pub(crate) fn with_oracle_capacity_for_test(
+        mut self,
+        memory_limit_bytes: usize,
+        spill_limit_bytes: u64,
+    ) -> Self {
+        self.oracle_memory_limit_bytes = Some(memory_limit_bytes);
+        self.oracle_spill_limit_bytes = Some(spill_limit_bytes);
+        self
+    }
+
     /// Attach the process-installed production telemetry pipeline.
     #[must_use]
     pub(crate) fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
@@ -2378,22 +2443,32 @@ impl WyrdTestServerBuilder {
             )
         })?;
         let scribe_admission = self.scribe_admission.unwrap_or_default();
-        let bifrost_memory = BifrostMemoryGovernor::new_with_child_limits(
-            scribe_admission.memory_limit_bytes,
-            scribe_admission.scribe_memory_limit_bytes,
-            None,
-        )
-        .or_else(|error| {
-            if let Some(limit) = scribe_admission.scribe_memory_limit_bytes
-                && limit < 256 * 1024 * 1024
-            {
-                return BifrostMemoryGovernor::new_with_test_scribe_limit(
-                    scribe_admission.memory_limit_bytes,
-                    limit,
-                );
-            }
-            Err(error)
-        })
+        let bifrost_memory = if let Some(oracle_limit) = self.oracle_memory_limit_bytes {
+            BifrostMemoryGovernor::new_with_test_child_limits(
+                scribe_admission.memory_limit_bytes,
+                scribe_admission
+                    .scribe_memory_limit_bytes
+                    .unwrap_or(256 * 1024 * 1024),
+                oracle_limit,
+            )
+        } else {
+            BifrostMemoryGovernor::new_with_child_limits(
+                scribe_admission.memory_limit_bytes,
+                scribe_admission.scribe_memory_limit_bytes,
+                None,
+            )
+            .or_else(|error| {
+                if let Some(limit) = scribe_admission.scribe_memory_limit_bytes
+                    && limit < 256 * 1024 * 1024
+                {
+                    return BifrostMemoryGovernor::new_with_test_scribe_limit(
+                        scribe_admission.memory_limit_bytes,
+                        limit,
+                    );
+                }
+                Err(error)
+            })
+        }
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
@@ -2415,13 +2490,13 @@ impl WyrdTestServerBuilder {
         );
         let spill_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
             Some(
-                self.oracle_spill_root.unwrap_or(Arc::new(
+                self.oracle_spill_root.clone().unwrap_or(Arc::new(
                     tempfile::tempdir()
                         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
                 )),
             )
         } else {
-            self.oracle_spill_root
+            self.oracle_spill_root.clone()
         };
         let forge = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
             let root = spill_root.as_ref().ok_or_else(|| {
@@ -2672,6 +2747,11 @@ impl WyrdTestServerBuilder {
                             .oracle_audit_wal_root
                             .as_ref()
                             .map(|root| root.path().to_owned()),
+                        spill_root: self
+                            .oracle_spill_root
+                            .as_ref()
+                            .map(|root| root.path().to_owned()),
+                        spill_limit_bytes: self.oracle_spill_limit_bytes,
                     },
                     self.role_timing,
                 )
@@ -2686,6 +2766,10 @@ impl WyrdTestServerBuilder {
                     self.oracle_audit_wal_root
                         .as_ref()
                         .map(|root| root.path().to_owned()),
+                    self.oracle_spill_root
+                        .as_ref()
+                        .map(|root| root.path().to_owned()),
+                    self.oracle_spill_limit_bytes,
                     self.role_timing,
                 )
                 .await
@@ -2733,7 +2817,7 @@ impl WyrdTestServerBuilder {
                 fixture,
                 _storage_root: storage_root,
                 _scribe_wal_root: scribe_wal_root,
-                _forge_spill_root: spill_root,
+                _bifrost_spill_root: spill_root,
                 _oracle_audit_wal_root: self.oracle_audit_wal_root,
                 state,
                 router,

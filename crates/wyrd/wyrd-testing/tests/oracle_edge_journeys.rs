@@ -44,10 +44,6 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::Bootstrap;
-use wyrd_testing::bifrost::bench_dataset::{BifrostQualificationDataset, DatasetShape};
-use wyrd_testing::bifrost::bench_materializer::{
-    BackpressurePolicy, BifrostDatasetMaterializer, QUALIFICATION_TABLE,
-};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
@@ -710,9 +706,8 @@ async fn pg_bifrost_oracle_published_journey() {
     .expect("J1 PublishedOnly journey");
 }
 
-/// A retained production Oracle reservation produces the public typed 429,
-/// drives the real fast-capacity visibility policy within its bounded window,
-/// and allows queries to complete after the same reservation is released.
+/// A retained production Oracle reservation produces the public typed 429 and
+/// allows the same durable query to complete after capacity is released.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_capacity_contract_journey() {
@@ -774,62 +769,6 @@ async fn pg_bifrost_oracle_capacity_contract_journey() {
         2
     );
 
-    let retained = oracle
-        .try_reserve(oracle.limit_bytes())
-        .expect("retain Oracle capacity for the fast-policy journey");
-    let dataset = BifrostQualificationDataset::new(
-        DatasetShape::new(2, 2).expect("capacity dataset shape is valid"),
-    )
-    .expect("capacity dataset is valid");
-    let run_root = tempfile::tempdir().expect("capacity materializer root");
-    let fast_started = std::time::Instant::now();
-    let materializer = BifrostDatasetMaterializer::from_server(
-        server,
-        dataset,
-        vec![cluster.data_tenant_id()],
-        BackpressurePolicy::for_fast_capacity(
-            std::time::Instant::now() + std::time::Duration::from_secs(35),
-        ),
-        run_root.path().join("fast-capacity"),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("fast-capacity materializer");
-    let capacity_error = materializer
-        .materialize()
-        .await
-        .expect_err("retained Oracle capacity must exhaust the fast policy");
-    let scheduler_jitter = std::time::Duration::from_secs(2);
-    assert!(
-        fast_started.elapsed() <= std::time::Duration::from_secs(30) + scheduler_jitter,
-        "fast-capacity feedback exceeded its thirty-second budget plus scheduler jitter"
-    );
-    assert!(
-        capacity_error
-            .to_string()
-            .contains("fast visibility exhausted typed retryable capacity refusal"),
-        "capacity journey must exhaust only the typed fast-capacity path: {capacity_error}"
-    );
-    drop(retained);
-    let mut recovered = QueryClient::new(&reader)
-        .query(&BifrostQueryRequest {
-            sql: format!("SELECT row_id FROM vala.bifrost.{QUALIFICATION_TABLE} ORDER BY row_id"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: None,
-        })
-        .await
-        .expect("qualification query succeeds after retained capacity drains");
-    let mut recovered_rows = 0_usize;
-    while let Some(batch) = recovered
-        .next_batch()
-        .await
-        .expect("qualification recovery stream remains valid")
-    {
-        recovered_rows = recovered_rows.saturating_add(batch.num_rows());
-    }
-    assert_eq!(recovered_rows, 2);
-    drop(materializer);
     cluster.shutdown().await.expect("capacity cluster shutdown");
 }
 

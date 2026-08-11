@@ -1659,6 +1659,49 @@ mod tests {
         }
     }
 
+    /// Fast capacity exhausts only typed refusals within the locked budget.
+    #[tokio::test(start_paused = true)]
+    async fn fast_capacity_policy_exhausts_typed_refusal_within_budget() {
+        let backend = Arc::new(MockBackend::default());
+        backend.counts.lock().expect("counts").extend([
+            Err(capacity_refusal()),
+            Err(capacity_refusal()),
+            Err(capacity_refusal()),
+        ]);
+        let run_root = tempfile::tempdir().expect("run root").keep();
+        let started = Instant::now();
+        let materializer = BifrostDatasetMaterializer::with_backend(
+            backend.clone(),
+            dataset(),
+            vec![DataTenantId::SYSTEM_OWNER],
+            BackpressurePolicy::for_fast_capacity(started + Duration::from_secs(30)),
+            run_root,
+            CancellationToken::new(),
+        );
+        let error = materializer
+            .wait_for_visibility(
+                DataTenantId::SYSTEM_OWNER,
+                0,
+                4_096,
+                4_096,
+                &mut PartialProgress::default(),
+            )
+            .await
+            .expect_err("three typed capacity refusals exhaust fast visibility");
+        assert!(matches!(
+            error,
+            MaterializationError::Backend(message)
+                if message.starts_with(
+                    "fast visibility exhausted typed retryable capacity refusal attempts:"
+                )
+        ));
+        assert_eq!(backend.query_deadlines.lock().expect("deadlines").len(), 3);
+        assert!(
+            started.elapsed() <= Duration::from_secs(30) + Duration::from_secs(2),
+            "fast-capacity feedback exceeded its thirty-second budget plus scheduler jitter"
+        );
+    }
+
     /// Build one permanent oversized-memory visibility refusal.
     fn oversized_refusal() -> VisibleCountError {
         VisibleCountError {

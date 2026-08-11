@@ -426,13 +426,37 @@ impl OracleTelemetry {
         }
     }
 
-    /// Releases gauge accounting after the underlying governor reservation.
-    fn release_memory(&self, query_class: QueryClass, memory_kind: OracleMemoryKind, bytes: usize) {
-        let total = self
-            .memory_bytes
-            .fetch_sub(bytes as u64, Ordering::AcqRel)
-            .saturating_sub(bytes as u64);
-        let _ = (total, query_class, memory_kind, bytes);
+    /// Releases gauge accounting before the governor reservation is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` when the wrapper total cannot cover `bytes`; its
+    /// caller poisons the coupled governor because ownership no longer agrees.
+    fn release_memory(
+        &self,
+        query_class: QueryClass,
+        memory_kind: OracleMemoryKind,
+        bytes: usize,
+    ) -> Result<(), ()> {
+        let bytes = u64::try_from(bytes).map_err(|_| ())?;
+        let mut current = self.memory_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(total) = current.checked_sub(bytes) else {
+                return Err(());
+            };
+            match self.memory_bytes.compare_exchange(
+                current,
+                total,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let _ = (total, query_class, memory_kind, bytes);
+                    return Ok(());
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
@@ -635,11 +659,19 @@ struct AccountedMemoryReservation {
 }
 
 impl Drop for AccountedMemoryReservation {
-    /// Releases parent capacity and then updates current-memory gauges.
+    /// Releases checked wrapper accounting, then drops parent capacity.
     fn drop(&mut self) {
+        if self
+            .owner
+            .release_memory(self.query_class, self.memory_kind, self.bytes)
+            .is_err()
+        {
+            if let Some(reservation) = &self.reservation {
+                reservation.poison();
+            }
+            tracing::error!("Oracle memory wrapper cleanup poisoned accounting");
+        }
         self.reservation.take();
-        self.owner
-            .release_memory(self.query_class, self.memory_kind, self.bytes);
     }
 }
 

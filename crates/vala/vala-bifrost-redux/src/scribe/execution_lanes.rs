@@ -1136,17 +1136,31 @@ pub(crate) enum ScribeWalIoResult {
 /// Bounded filesystem lane for WAL append, sync, replay support, and retirement.
 #[derive(Debug, Clone)]
 pub struct ScribeWalIoPool {
+    /// Rayon executor dedicated to bounded WAL filesystem operations.
     pool: Arc<rayon::ThreadPool>,
+    /// Queue permits bounding active and waiting WAL operations.
     permits: Arc<Semaphore>,
+    /// Current queued and active operation count.
     depth: Arc<AtomicUsize>,
+    /// Current operations executing on Rayon workers.
     active: Arc<AtomicUsize>,
+    /// Worker panics converted into typed failures.
     panics: Arc<AtomicU64>,
+    /// Successfully completed WAL operations.
     completed: Arc<AtomicU64>,
+    /// WAL operations that returned a typed failure.
     failed: Arc<AtomicU64>,
+    /// Times admission encountered a full WAL queue.
     saturation_events: Arc<AtomicU64>,
+    /// Notification used by bounded drain waiters.
     drained: Arc<Notify>,
+    /// Deterministic synchronization delay used by approved test harnesses.
     sync_delay: std::time::Duration,
+    /// Maximum admitted WAL operations.
     capacity: usize,
+    /// Retire operations submitted through the production lane in unit tests.
+    #[cfg(test)]
+    retire_submissions: Arc<AtomicU64>,
 }
 
 impl ScribeWalIoPool {
@@ -1203,6 +1217,8 @@ impl ScribeWalIoPool {
             drained: Arc::new(Notify::new()),
             sync_delay,
             capacity,
+            #[cfg(test)]
+            retire_submissions: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1210,6 +1226,10 @@ impl ScribeWalIoPool {
         &self,
         operation: ScribeWalIoOp,
     ) -> Result<ScribeWalIoResult, ScribeError> {
+        #[cfg(test)]
+        if matches!(&operation, ScribeWalIoOp::RetireWal { .. }) {
+            self.retire_submissions.fetch_add(1, Ordering::AcqRel);
+        }
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
@@ -1308,6 +1328,12 @@ impl ScribeWalIoPool {
                 .unwrap_or("unnamed")
                 .to_owned()
         })
+    }
+
+    /// Returns retirement submissions observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn retire_submissions_for_test(&self) -> u64 {
+        self.retire_submissions.load(Ordering::Acquire)
     }
 }
 

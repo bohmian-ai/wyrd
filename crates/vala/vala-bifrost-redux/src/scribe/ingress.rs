@@ -78,14 +78,14 @@ impl ScribeImpl {
                 self.admission.config().event_time_window,
             )
             .await?;
-        memory.transfer_category(MemoryCategory::Decode);
+        memory.transfer_category(MemoryCategory::Decode)?;
         let estimated_bytes = rows
             .get_array_memory_size()
             .saturating_add(frame.measured_wire_bytes)
             .saturating_add(REQUEST_OVERHEAD_BYTES);
         reservation.resize(estimated_bytes)?;
         self.resize_ingress_after_pressure_seal(&mut memory, estimated_bytes, &table)?;
-        memory.transfer_category(MemoryCategory::Prepared);
+        memory.transfer_category(MemoryCategory::Prepared)?;
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
         let admitted = AdmittedAppend {

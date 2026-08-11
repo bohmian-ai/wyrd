@@ -801,7 +801,8 @@ impl ScribeImpl {
         });
         let memory_ledger = memory::MemoryLedger::new(&memory)
             .expect("zero-sized memory ledger reservations must be valid");
-        let admission = AdmissionController::with_config(config.admission);
+        let admission =
+            AdmissionController::with_config_and_memory(config.admission, memory.clone());
         let ScribeBuildConfig {
             operator,
             wal,
@@ -1933,11 +1934,15 @@ impl ScribeImpl {
     {
         for mut token in post_commit.into().0 {
             let result = async {
+                self.admission
+                    .preflight_transfer_immutable_to_active(token.memtable_bytes)?;
+                self.memory_ledger
+                    .preflight_move_immutable_to_active(token.memtable_bytes)?;
                 self.shards
                     .abort_post_commit(token.seal_id, token.shard_id, &token.seal_key)
                     .await?;
                 self.admission
-                    .transfer_immutable_to_active(token.memtable_bytes);
+                    .transfer_immutable_to_active(token.memtable_bytes)?;
                 self.memory_ledger
                     .move_immutable_to_active(token.memtable_bytes)
                     .map_err(|error| ScribeError::Internal {

@@ -43,7 +43,7 @@ struct PendingGeneration {
 type PendingGenerationsByKey =
     HashMap<crate::scribe::seal_key::SealKey, VecDeque<PendingGeneration>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RetainedGeneration {
     arrow_bytes: usize,
     wal_segments: Vec<crate::scribe::wal::WalSegmentRef>,
@@ -386,6 +386,9 @@ struct ShardOwner {
     pending: Arc<AtomicUsize>,
     /// Notification used by runtime drains to await accepted work.
     drained: Arc<Notify>,
+    /// One-shot retirement release fault used only by deterministic owner tests.
+    #[cfg(test)]
+    fail_next_retirement_release: bool,
 }
 
 /// Last owner-published state used by synchronous inspection surfaces.
@@ -601,6 +604,8 @@ impl ScribeShardRuntime {
                 snapshot: Arc::clone(&snapshots[id]),
                 pending: Arc::clone(&pending),
                 drained: Arc::clone(&drained),
+                #[cfg(test)]
+                fail_next_retirement_release: false,
             };
             let task = runtime.spawn(owner.run());
             if let Ok(mut handles) = abort_handles.lock() {
@@ -640,7 +645,7 @@ impl ScribeShardRuntime {
         let shard = shard_for(append.tenant, &append.table, append.batch_id);
         let table_name = append.table.fqn();
         if let Some(memory) = append.memory.as_mut() {
-            memory.transfer_category(MemoryCategory::Queued);
+            memory.transfer_category(MemoryCategory::Queued)?;
         }
         self.pending.fetch_add(1, Ordering::AcqRel);
         let result = self.senders[shard].try_send(ShardCommand::Append(Box::new(append)));
@@ -1124,20 +1129,13 @@ impl ShardOwner {
                 if let Err(error) = self.flush_expired(now) {
                     tracing::warn!(error = %error, shard = self.id, "age flush failed");
                 }
-                self.retire_committed().await;
+                if let Err(error) = self.retire_committed().await {
+                    tracing::warn!(error = %error, shard = self.id, "committed generation retirement failed");
+                }
             }
             #[cfg(any(test, feature = "test-support"))]
             ShardCommand::RetireCommittedForTest { response } => {
-                self.retire_committed().await;
-                let result = self
-                    .memtable
-                    .sweep_once_for_test()
-                    .and_then(|retired_bytes| {
-                        self.admission.release_immutable(retired_bytes);
-                        self.memory_ledger.release_immutable(retired_bytes)?;
-                        Ok(())
-                    });
-                let _ = response.send(result);
+                let _ = response.send(self.retire_committed().await);
             }
             ShardCommand::FlushAll { response } => {
                 let _ = response.send(self.flush_all());
@@ -1295,16 +1293,20 @@ impl ShardOwner {
         &mut self,
         seal_key: &crate::scribe::seal_key::SealKey,
     ) -> Result<Option<crate::scribe::memtable::FrozenMemtable>, ScribeError> {
-        let active_bytes = self.memtable.row_count(seal_key)?;
+        let active_bytes = self.memtable.writable_bytes(seal_key)?;
         if active_bytes == 0 {
             return Ok(None);
         }
+        self.admission
+            .preflight_transfer_active_to_immutable(active_bytes)?;
+        self.memory_ledger
+            .preflight_move_active_to_immutable(active_bytes)?;
         let mut frozen = self.memtable.freeze(seal_key)?;
         frozen.shard_id = self.id;
         self.memory_ledger
             .move_active_to_immutable(frozen.arrow_bytes)?;
         self.admission
-            .transfer_active_to_immutable(frozen.arrow_bytes);
+            .transfer_active_to_immutable(frozen.arrow_bytes)?;
         Ok(Some(frozen))
     }
 
@@ -1420,6 +1422,18 @@ impl ShardOwner {
             // pending entry; with none it returns the existing stranded one.
             // The seal is counted only for a newly created pending entry so a
             // retried freeze never double-counts `bifrost_scribe_seal_total`.
+            let active_bytes = self.memtable.writable_bytes(&seal_key)?;
+            if let Err(error) = self
+                .admission
+                .preflight_transfer_active_to_immutable(active_bytes)
+                .and_then(|()| {
+                    self.memory_ledger
+                        .preflight_move_active_to_immutable(active_bytes)
+                })
+            {
+                self.seal_retry.insert(seal_key.clone());
+                return Err(error);
+            }
             let frozen = self.memtable.freeze(&seal_key)?;
             if has_rows && let Some(trigger) = trigger {
                 record_seal(trigger);
@@ -1431,7 +1445,7 @@ impl ShardOwner {
                 self.memory_ledger
                     .move_active_to_immutable(frozen.arrow_bytes)?;
                 self.admission
-                    .transfer_active_to_immutable(frozen.arrow_bytes);
+                    .transfer_active_to_immutable(frozen.arrow_bytes)?;
                 self.seal_retry.remove(&seal_key);
                 continue;
             }
@@ -1507,7 +1521,7 @@ impl ShardOwner {
         self.memory_ledger
             .move_active_to_immutable(frozen.arrow_bytes)?;
         self.admission
-            .transfer_active_to_immutable(frozen.arrow_bytes);
+            .transfer_active_to_immutable(frozen.arrow_bytes)?;
         self.wal_segments.remove(seal_key);
         let generation = Arc::new(ImmutableGeneration::from_frozen(
             frozen,
@@ -1641,29 +1655,51 @@ impl ShardOwner {
     ///
     /// Cancellation may leave a generation retained; its memory and WAL
     /// references remain owned until the next retirement pass.
-    async fn retire_committed(&mut self) {
+    async fn retire_committed(&mut self) -> Result<(), ScribeError> {
         let generation_ids = self
             .retained_generations
             .keys()
             .copied()
             .collect::<Vec<_>>();
         for generation_id in generation_ids {
-            let retired = match self.memtable.retire_generation(generation_id) {
-                Ok(retired) => retired,
+            let Some(token) = (match self.memtable.plan_committed_retirement(generation_id) {
+                Ok(token) => token,
                 Err(error) => {
                     tracing::warn!(error = %error, generation_id, "shard generation retirement failed");
-                    continue;
+                    return Err(error);
                 }
-            };
-            if retired.is_none() {
+            }) else {
                 continue;
+            };
+            let Some(retained) = self.retained_generations.get(&generation_id).cloned() else {
+                continue;
+            };
+            if token.arrow_bytes != retained.arrow_bytes {
+                self.memory_ledger.poison();
+                return Err(ScribeError::Internal {
+                    detail: format!("retirement bytes mismatch for generation {generation_id}"),
+                });
             }
-            let Some(retained) = self.retained_generations.remove(&generation_id) else {
-                continue;
-            };
-            self.admission.release_immutable(retained.arrow_bytes);
-            let _ = self.memory_ledger.release_immutable(retained.arrow_bytes);
-            record_retirement(retained.arrow_bytes);
+            self.admission
+                .preflight_release_immutable(token.arrow_bytes)?;
+            self.memory_ledger
+                .preflight_release_immutable(token.arrow_bytes)?;
+            #[cfg(test)]
+            if self.fail_next_retirement_release {
+                self.fail_next_retirement_release = false;
+                self.memory_ledger.poison();
+                return Err(ScribeError::Internal {
+                    detail: "injected immutable retirement release failure".to_owned(),
+                });
+            }
+            self.admission.release_immutable(token.arrow_bytes)?;
+            self.memory_ledger.release_immutable(token.arrow_bytes)?;
+            if let Err(error) = self.memtable.commit_retirement(token) {
+                self.memory_ledger.poison();
+                return Err(error);
+            }
+            self.retained_generations.remove(&generation_id);
+            record_retirement(token.arrow_bytes);
             if let Err(error) = self
                 .wal_io
                 .submit(ScribeWalIoOp::RetireWal {
@@ -1675,6 +1711,7 @@ impl ShardOwner {
                 tracing::warn!(error = %error, generation_id, "WAL retirement submission failed");
             }
         }
+        Ok(())
     }
 
     /// Reconciles one persistence result with this owner's FIFO generation queue.
@@ -1868,7 +1905,9 @@ impl ShardOwner {
     async fn process_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
         let mut state = self.write_group(group).await?;
         if let Err(error) = self.sync_group(&state.touched).await {
-            self.release_active_reservations(&state.durable);
+            if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
+                tracing::error!(error = %cleanup_error, "active cleanup failed after group sync error");
+            }
             self.mark_wal_error(&error);
             Self::notify_prepared_error(&mut state.prepared, &error);
             return Err(error);
@@ -1887,7 +1926,9 @@ impl ShardOwner {
             let error = ScribeError::Internal {
                 detail: "injected post-sync WAL failure".to_owned(),
             };
-            self.release_active_reservations(&state.durable);
+            if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
+                tracing::error!(error = %cleanup_error, "active cleanup failed after injected group error");
+            }
             self.mark_wal_error(&error);
             Self::notify_prepared_error(&mut state.prepared, &error);
             return Err(error);
@@ -1931,7 +1972,7 @@ impl ShardOwner {
         let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
         for append in &mut prepared {
             if let Some(memory) = append.memory.as_mut() {
-                memory.transfer_category(MemoryCategory::Prepared);
+                memory.transfer_category(MemoryCategory::Prepared)?;
             }
             let batch_id = *append.batch_id.as_bytes();
             let slices = std::mem::take(&mut append.slices);
@@ -1947,26 +1988,31 @@ impl ShardOwner {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        self.release_active_reservations(&durable);
+                        if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                            tracing::error!(error = %cleanup_error, "active cleanup failed after row lookup error");
+                        }
                         Self::notify_prepared_error(&mut prepared, &error);
                         return Err(error);
                     }
                 }
                 let slice_id = slice.id.clone();
-                let (slice, result) =
-                    match if let Some(previous) = self.synced_not_inserted.get(&slice_id) {
-                        self.reuse_synced_slice(append, slice, previous.lsn)
-                    } else {
-                        self.write_prepared_slice(append, slice).await
-                    } {
-                        Ok(value) => value,
-                        Err(error) => {
-                            self.release_active_reservations(&durable);
-                            self.mark_wal_error(&error);
-                            Self::notify_prepared_error(&mut prepared, &error);
-                            return Err(error);
+                let (slice, result) = match if let Some(previous) =
+                    self.synced_not_inserted.get(&slice_id)
+                {
+                    self.reuse_synced_slice(append, slice, previous.lsn)
+                } else {
+                    self.write_prepared_slice(append, slice).await
+                } {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                            tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
                         }
-                    };
+                        self.mark_wal_error(&error);
+                        Self::notify_prepared_error(&mut prepared, &error);
+                        return Err(error);
+                    }
+                };
                 for segment in &result.touched_segments {
                     touched.insert(segment.path().to_path_buf(), Arc::clone(segment));
                     self.wal_segments
@@ -2009,22 +2055,26 @@ impl ShardOwner {
         let active_memory = if let Some(memory) = append.memory.as_mut() {
             memory.split(memtable_bytes)
         } else {
-            self.admission.release_active(memtable_bytes);
-            return Err(ScribeError::Internal {
+            let error = ScribeError::Internal {
                 detail: "prepared append lost its memory reservation".to_owned(),
-            });
+            };
+            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
         };
         let mut active_memory = match active_memory {
             Ok(value) => value,
             Err(error) => {
-                self.admission.release_active(memtable_bytes);
-                return Err(error);
+                return Err(self.preserve_primary_after_active_cleanup(
+                    error,
+                    memtable_bytes,
+                    false,
+                ));
             }
         };
-        active_memory.transfer_category(MemoryCategory::Active);
+        if let Err(error) = active_memory.transfer_category(MemoryCategory::Active) {
+            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
+        }
         if let Err(error) = self.memory_ledger.absorb_active(active_memory) {
-            self.admission.release_active(memtable_bytes);
-            return Err(error);
+            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
         }
         let wal_result = self
             .wal_io
@@ -2036,16 +2086,21 @@ impl ShardOwner {
         let result = match wal_result {
             Ok(ScribeWalIoResult::WalWritten { result }) => result,
             Ok(_) => {
-                self.admission.release_active(memtable_bytes);
-                let _ = self.memory_ledger.release_active(memtable_bytes);
-                return Err(ScribeError::Internal {
+                let error = ScribeError::Internal {
                     detail: "WAL IO lane returned the wrong shard append result".to_owned(),
-                });
+                };
+                return Err(self.preserve_primary_after_active_cleanup(
+                    error,
+                    memtable_bytes,
+                    true,
+                ));
             }
             Err(error) => {
-                self.admission.release_active(memtable_bytes);
-                let _ = self.memory_ledger.release_active(memtable_bytes);
-                return Err(error);
+                return Err(self.preserve_primary_after_active_cleanup(
+                    error,
+                    memtable_bytes,
+                    true,
+                ));
             }
         };
         Ok((
@@ -2090,24 +2145,32 @@ impl ShardOwner {
         let active_memory = if let Some(memory) = append.memory.as_mut() {
             memory.split(memtable_bytes)
         } else {
-            self.admission.release_active(memtable_bytes);
-            return Err(ScribeError::Internal {
+            let error = ScribeError::Internal {
                 detail: "prepared append lost its memory reservation during WAL retry".to_owned(),
-            });
+            };
+            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
         };
         let active_memory = match active_memory {
             Ok(mut value) => {
-                value.transfer_category(MemoryCategory::Active);
+                if let Err(error) = value.transfer_category(MemoryCategory::Active) {
+                    return Err(self.preserve_primary_after_active_cleanup(
+                        error,
+                        memtable_bytes,
+                        false,
+                    ));
+                }
                 value
             }
             Err(error) => {
-                self.admission.release_active(memtable_bytes);
-                return Err(error);
+                return Err(self.preserve_primary_after_active_cleanup(
+                    error,
+                    memtable_bytes,
+                    false,
+                ));
             }
         };
         if let Err(error) = self.memory_ledger.absorb_active(active_memory) {
-            self.admission.release_active(memtable_bytes);
-            return Err(error);
+            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
         }
         Ok((
             DurableSlice {
@@ -2189,13 +2252,9 @@ impl ShardOwner {
                 Err(error) => Err(error),
             };
             if let Err(error) = pre_insert_result {
-                self.admission.release_active(slice.memtable_bytes);
-                let _ = self.memory_ledger.release_active(slice.memtable_bytes);
-                for remaining in slices {
-                    self.admission.release_active(remaining.memtable_bytes);
-                    let _ = self.memory_ledger.release_active(remaining.memtable_bytes);
-                }
-                return Err(error);
+                let bytes = std::iter::once(slice.memtable_bytes)
+                    .chain(slices.map(|remaining| remaining.memtable_bytes));
+                return Err(self.preserve_primary_after_active_cleanups(error, bytes));
             }
             if let Err(error) = self.memtable.insert(
                 &slice.seal_key,
@@ -2209,13 +2268,9 @@ impl ShardOwner {
                 },
                 slice.rows,
             ) {
-                self.admission.release_active(slice.memtable_bytes);
-                let _ = self.memory_ledger.release_active(slice.memtable_bytes);
-                for remaining in slices {
-                    self.admission.release_active(remaining.memtable_bytes);
-                    let _ = self.memory_ledger.release_active(remaining.memtable_bytes);
-                }
-                return Err(error);
+                let bytes = std::iter::once(slice.memtable_bytes)
+                    .chain(slices.map(|remaining| remaining.memtable_bytes));
+                return Err(self.preserve_primary_after_active_cleanups(error, bytes));
             }
             self.synced_not_inserted.remove(&AppendSliceId {
                 batch_id: uuid::Uuid::from_bytes(slice.batch_id),
@@ -2237,11 +2292,78 @@ impl ShardOwner {
     }
 
     /// Releases active reservations after a failed group stage.
-    fn release_active_reservations(&self, durable: &[DurableSlice]) {
-        for slice in durable {
-            self.admission.release_active(slice.memtable_bytes);
-            let _ = self.memory_ledger.release_active(slice.memtable_bytes);
+    fn release_active_ownership(
+        &self,
+        bytes: usize,
+        already_absorbed: bool,
+    ) -> Result<(), ScribeError> {
+        self.admission.preflight_release_active(bytes)?;
+        if already_absorbed {
+            self.memory_ledger.preflight_release_active(bytes)?;
         }
+        self.admission.release_active(bytes)?;
+        if already_absorbed {
+            self.memory_ledger.release_active(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Release active reservations after a failed group stage.
+    fn release_active_reservations(&self, durable: &[DurableSlice]) -> Result<(), ScribeError> {
+        let mut first_error = None;
+        for slice in durable {
+            if let Err(error) = self.release_active_ownership(slice.memtable_bytes, true) {
+                tracing::error!(error = %error, "active cleanup failed; accounting is poisoned");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Preserves one primary group failure while containing an adjacent cleanup failure.
+    ///
+    /// Cleanup owns no later lifecycle mutation. A failed checked release has
+    /// already poisoned the shared governor; this helper records it once and
+    /// returns the original operation error so callers retain the actionable
+    /// WAL, split, or insertion diagnosis.
+    fn preserve_primary_after_active_cleanup(
+        &self,
+        primary: ScribeError,
+        bytes: usize,
+        already_absorbed: bool,
+    ) -> ScribeError {
+        if let Err(cleanup) = self.release_active_ownership(bytes, already_absorbed) {
+            tracing::error!(error = %cleanup, primary = %primary, "active cleanup failed after primary group error");
+        }
+        primary
+    }
+
+    /// Releases every still-owned absorbed slice while preserving one primary failure.
+    fn preserve_primary_after_active_cleanups(
+        &self,
+        primary: ScribeError,
+        bytes: impl IntoIterator<Item = usize>,
+    ) -> ScribeError {
+        let mut first_cleanup = None;
+        for owned in bytes {
+            if let Err(error) = self.release_active_ownership(owned, true)
+                && first_cleanup.is_none()
+            {
+                first_cleanup = Some(error);
+            }
+        }
+        if let Some(cleanup) = first_cleanup {
+            tracing::error!(error = %cleanup, primary = %primary, "active cleanup failed after primary group error");
+        }
+        primary
+    }
+
+    /// Arms the next retirement after both preflights but before any release mutation.
+    #[cfg(test)]
+    fn arm_retirement_release_fault_for_test(&mut self) {
+        self.fail_next_retirement_release = true;
     }
 
     /// Trips the admission breaker when WAL storage is full.
@@ -2335,8 +2457,8 @@ mod tests {
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::seal_key::{EventDay, SealKey};
     use crate::scribe::wal::{ScribeAppendMeta, WalLsn};
-    use arrow::array::Int64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Int64Array, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use chrono::NaiveDate;
     use std::sync::Arc;
@@ -2527,6 +2649,30 @@ mod tests {
         .expect("owner batch")
     }
 
+    /// Builds the same owner row with the managed event-time column required by preprocessing.
+    fn owner_prepared_batch() -> RecordBatch {
+        let event_micros = NaiveDate::from_ymd_opt(2026, 7, 24)
+            .and_then(|date| date.and_hms_opt(12, 0, 0))
+            .expect("valid event timestamp")
+            .and_utc()
+            .timestamp_micros();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(
+                    "wyrd_event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(TimestampMicrosecondArray::from(vec![event_micros]).with_timezone("UTC")),
+            ],
+        )
+        .expect("owner prepared batch")
+    }
+
     fn owner_meta(key: &SealKey) -> ScribeAppendMeta {
         ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
@@ -2556,14 +2702,24 @@ mod tests {
         wal_handle: WalHandle,
         stream: StreamIdentity,
     ) -> ShardOwner {
+        owner_for_completion_test_with_budget(memtable, wal, wal_handle, stream).0
+    }
+
+    /// Builds an isolated owner and returns its exact shared Scribe budget for fault setup.
+    fn owner_for_completion_test_with_budget(
+        memtable: Memtable,
+        wal: &Arc<WalWriter>,
+        wal_handle: WalHandle,
+        stream: StreamIdentity,
+    ) -> (ShardOwner, crate::scribe::memory::ScribeMemoryBudget) {
         let (_command_tx, receiver) = mpsc::channel(1);
         let (_pressure_tx, pressure_receiver) = watch::channel(None);
         let (completion_tx, _completion_rx) = mpsc::channel(1);
-        let budget = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
-            .expect("memory governor")
-            .scribe_budget();
+        let governor = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
+            .expect("memory governor");
+        let budget = governor.scribe_budget();
         let _ = wal;
-        ShardOwner {
+        let owner = ShardOwner {
             id: 0,
             receiver,
             pressure_receiver,
@@ -2574,7 +2730,10 @@ mod tests {
             pending_generations: PendingGenerationsByKey::new(),
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
-            admission: AdmissionController::new(),
+            admission: AdmissionController::with_config_and_memory(
+                crate::scribe::admission::AdmissionConfig::default(),
+                budget.clone(),
+            ),
             memtable,
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             wal_io: ScribeWalIoPool::new(1),
@@ -2586,7 +2745,9 @@ mod tests {
             snapshot: Arc::new(Mutex::new(ShardMemtableSnapshot::default())),
             pending: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
-        }
+            fail_next_retirement_release: false,
+        };
+        (owner, budget)
     }
 
     /// Proves shard insertion seals a full bucket before a crossing append lands.
@@ -2710,6 +2871,150 @@ mod tests {
             .try_reserve_active("owner-test", active_seed)
             .expect("seed active admission");
         (owner, wal, wal_root)
+    }
+
+    /// Builds one owner with a committed retained generation and matching immutable ownership.
+    ///
+    /// The fixture seeds admission and ledger ownership from the same Scribe
+    /// budget so retirement preflight succeeds before a post-preflight fault is
+    /// armed. Returning the budget lets callers snapshot every governor counter.
+    fn committed_retirement_owner_for_test() -> (
+        ShardOwner,
+        u64,
+        Arc<WalWriter>,
+        tempfile::TempDir,
+        crate::scribe::memory::ScribeMemoryBudget,
+    ) {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        memtable
+            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .expect("owner completion");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
+        owner.admission.sync_memtable_bytes(0, frozen.arrow_bytes);
+        owner
+            .memory_ledger
+            .reserve_immutable(frozen.arrow_bytes)
+            .expect("immutable ledger ownership");
+        owner
+            .admission
+            .preflight_release_immutable(frozen.arrow_bytes)
+            .expect("immutable admission preflight");
+        owner
+            .memory_ledger
+            .preflight_release_immutable(frozen.arrow_bytes)
+            .expect("immutable ledger preflight");
+        owner.retained_generations.insert(
+            frozen.seal_id,
+            RetainedGeneration {
+                arrow_bytes: frozen.arrow_bytes,
+                wal_segments: Vec::new(),
+                wal: wal_handle,
+            },
+        );
+        (owner, frozen.seal_id, wal, wal_root, budget)
+    }
+
+    /// Builds one real prepared append with reservations owned by `owner`'s budget.
+    ///
+    /// The initial charge deliberately exceeds the small owner batch so normal
+    /// preprocessing exercises the production resize and category-transfer path
+    /// before `process_group` owns the append.
+    fn prepared_append_for_group_test(
+        owner: &ShardOwner,
+        budget: &crate::scribe::memory::ScribeMemoryBudget,
+    ) -> PreparedAppend {
+        let initial_bytes = 1024 * 1024;
+        let reservation = owner
+            .admission
+            .try_reserve("owner-test".to_owned(), initial_bytes)
+            .expect("in-flight admission");
+        let memory = budget
+            .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
+            .expect("ingress memory");
+        let key = owner_key();
+        crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
+            batch_id: uuid::Uuid::now_v7(),
+            audit_event: owner_event(),
+            rows: owner_prepared_batch(),
+            measured_wire_bytes: initial_bytes,
+            admitted_bytes: initial_bytes,
+            reservation,
+            memory,
+            tenant: key.tenant,
+            table: key.table,
+            queued_at: std::time::Instant::now(),
+            durable_ack: None,
+        })
+        .expect("prepared append")
+    }
+
+    /// Lists deterministic relative WAL file paths and lengths beneath one test root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a WAL test directory cannot be
+    /// enumerated or one file's metadata cannot be read.
+    fn wal_file_snapshot(
+        root: &std::path::Path,
+    ) -> Result<Vec<(std::path::PathBuf, u64)>, ScribeError> {
+        /// Recursively appends file-relative entries for one WAL snapshot.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`ScribeError::Internal`] when a directory, entry, metadata,
+        /// or relative path cannot be read while walking the test WAL root.
+        fn visit(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            files: &mut Vec<(std::path::PathBuf, u64)>,
+        ) -> Result<(), ScribeError> {
+            for entry in std::fs::read_dir(directory).map_err(|error| ScribeError::Internal {
+                detail: format!("WAL snapshot directory read failed: {error}"),
+            })? {
+                let entry = entry.map_err(|error| ScribeError::Internal {
+                    detail: format!("WAL snapshot directory entry failed: {error}"),
+                })?;
+                let path = entry.path();
+                let metadata = entry.metadata().map_err(|error| ScribeError::Internal {
+                    detail: format!("WAL snapshot metadata read failed: {error}"),
+                })?;
+                if metadata.is_dir() {
+                    visit(root, &path, files)?;
+                } else if metadata.is_file() {
+                    let relative =
+                        path.strip_prefix(root)
+                            .map_err(|error| ScribeError::Internal {
+                                detail: format!("WAL snapshot relative path failed: {error}"),
+                            })?;
+                    files.push((relative.to_path_buf(), metadata.len()));
+                }
+            }
+            Ok(())
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files)?;
+        files.sort_unstable();
+        Ok(files)
     }
 
     /// A forced binding failure strands the seal in state A and keeps it
@@ -2951,7 +3256,8 @@ mod tests {
         );
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let generation = owner_generation(&key, &frozen, stream, wal_handle.clone());
-        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle.clone(), stream);
+        let (mut owner, _budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
         owner.pending_generations.insert(
             key.clone(),
             VecDeque::from([PendingGeneration {
@@ -3244,6 +3550,19 @@ mod tests {
         let wal_handle_a = wal.handle_for_shard(0).expect("WAL handle A");
         let mut owner_a = owner_for_completion_test(memtable_a, &wal, wal_handle_a, stream);
         owner_a.id = 0;
+        let active_bytes_a = owner_a
+            .memtable
+            .stats()
+            .expect("owner A stats")
+            .writable_bytes;
+        owner_a
+            .memory_ledger
+            .reserve_active(active_bytes_a)
+            .expect("owner A active memory");
+        owner_a
+            .admission
+            .try_reserve_active("owner-test", active_bytes_a)
+            .expect("owner A active admission");
 
         // Owner B — shard 5 (different lane, same key).
         let memtable_b = Memtable::new();
@@ -3253,6 +3572,19 @@ mod tests {
         let wal_handle_b = wal.handle_for_shard(5).expect("WAL handle B");
         let mut owner_b = owner_for_completion_test(memtable_b, &wal, wal_handle_b, stream);
         owner_b.id = 5;
+        let active_bytes_b = owner_b
+            .memtable
+            .stats()
+            .expect("owner B stats")
+            .writable_bytes;
+        owner_b
+            .memory_ledger
+            .reserve_active(active_bytes_b)
+            .expect("owner B active memory");
+        owner_b
+            .admission
+            .try_reserve_active("owner-test", active_bytes_b)
+            .expect("owner B active admission");
 
         let frozen_a = owner_a
             .freeze_key(&key)
@@ -3323,6 +3655,19 @@ mod tests {
         let wal_handle_a = wal.handle_for_shard(0).expect("WAL handle A");
         let mut owner_a = owner_for_completion_test(memtable_a, &wal, wal_handle_a, stream);
         owner_a.id = 0;
+        let active_bytes_a = owner_a
+            .memtable
+            .stats()
+            .expect("owner A stats")
+            .writable_bytes;
+        owner_a
+            .memory_ledger
+            .reserve_active(active_bytes_a)
+            .expect("owner A active memory");
+        owner_a
+            .admission
+            .try_reserve_active("owner-test", active_bytes_a)
+            .expect("owner A active admission");
 
         // Owner B — shard 5 holds a bucket for the same key (different route).
         let memtable_b = Memtable::new();
@@ -3332,6 +3677,19 @@ mod tests {
         let wal_handle_b = wal.handle_for_shard(5).expect("WAL handle B");
         let mut owner_b = owner_for_completion_test(memtable_b, &wal, wal_handle_b, stream);
         owner_b.id = 5;
+        let active_bytes_b = owner_b
+            .memtable
+            .stats()
+            .expect("owner B stats")
+            .writable_bytes;
+        owner_b
+            .memory_ledger
+            .reserve_active(active_bytes_b)
+            .expect("owner B active memory");
+        owner_b
+            .admission
+            .try_reserve_active("owner-test", active_bytes_b)
+            .expect("owner B active admission");
 
         // Empty owner — shard 3 holds no bucket and must contribute None.
         let wal_handle_c = wal.handle_for_shard(3).expect("WAL handle C");
@@ -3559,5 +3917,248 @@ mod tests {
                 .iter()
                 .any(|forbidden| key.contains(forbidden))
         }));
+    }
+
+    /// Retirement's existing committed-generation path proves planning failure preserves ownership.
+    #[tokio::test]
+    async fn explicit_retirement_preflight_failure_leaves_all_state_unchanged() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        memtable
+            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .expect("owner completion");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
+        owner.retained_generations.insert(
+            frozen.seal_id,
+            RetainedGeneration {
+                arrow_bytes: frozen.arrow_bytes,
+                wal_segments: Vec::new(),
+                wal: wal_handle,
+            },
+        );
+        let governor_before = budget.accounting_snapshot_for_test();
+        let admission_before = owner.admission.snapshot();
+        let active_ledger_before = owner.memory_ledger.active_bytes();
+        let immutable_ledger_before = owner.memory_ledger.immutable_bytes();
+        let wal_bytes_before = wal.bytes_on_disk();
+        let wal_files_before = wal_file_snapshot(wal_root.path()).expect("WAL file snapshot");
+        let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
+        let token_before = owner
+            .memtable
+            .plan_committed_retirement(frozen.seal_id)
+            .expect("retirement plan")
+            .expect("committed token");
+        let result = owner.retire_committed().await;
+        assert!(matches!(result, Err(ScribeError::Internal { .. })));
+        assert!(owner.retained_generations.contains_key(&frozen.seal_id));
+        assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
+        assert_eq!(owner.admission.snapshot(), admission_before);
+        assert_eq!(owner.memory_ledger.active_bytes(), active_ledger_before);
+        assert_eq!(
+            owner.memory_ledger.immutable_bytes(),
+            immutable_ledger_before
+        );
+        assert_eq!(wal.bytes_on_disk(), wal_bytes_before);
+        assert_eq!(
+            wal_file_snapshot(wal_root.path()).expect("WAL file snapshot"),
+            wal_files_before
+        );
+        assert_eq!(
+            owner.wal_io.retire_submissions_for_test(),
+            retire_submissions_before
+        );
+        let token_after = owner
+            .memtable
+            .plan_committed_retirement(frozen.seal_id)
+            .expect("retirement plan")
+            .expect("committed token remains");
+        assert_eq!(token_after.seal_id, token_before.seal_id);
+        assert_eq!(token_after.arrow_bytes, token_before.arrow_bytes);
+        assert_eq!(token_after.wal_range, token_before.wal_range);
+    }
+
+    /// Retirement does not remove a retained generation when immutable release cannot proceed.
+    #[tokio::test]
+    async fn immutable_release_failure_prevents_false_retirement() {
+        let (mut owner, generation_id, wal, root, budget) = committed_retirement_owner_for_test();
+        let token_before = owner
+            .memtable
+            .plan_committed_retirement(generation_id)
+            .expect("retirement plan")
+            .expect("token");
+        let governor_before = budget.accounting_snapshot_for_test();
+        let admission_before = owner.admission.snapshot();
+        let ledger_before = owner.memory_ledger.immutable_bytes();
+        let wal_before = wal.bytes_on_disk();
+        let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
+        let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
+        owner.arm_retirement_release_fault_for_test();
+        let error = owner
+            .retire_committed()
+            .await
+            .expect_err("retirement fault");
+        assert!(
+            matches!(error, ScribeError::Internal { detail } if detail == "injected immutable retirement release failure")
+        );
+        assert!(owner.retained_generations.contains_key(&generation_id));
+        assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
+        assert_eq!(owner.admission.snapshot(), admission_before);
+        assert_eq!(owner.memory_ledger.immutable_bytes(), ledger_before);
+        assert_eq!(wal.bytes_on_disk(), wal_before);
+        assert_eq!(
+            wal_file_snapshot(root.path()).expect("WAL file snapshot"),
+            wal_files_before
+        );
+        assert_eq!(
+            owner.wal_io.retire_submissions_for_test(),
+            retire_submissions_before
+        );
+        let token_after = owner
+            .memtable
+            .plan_committed_retirement(generation_id)
+            .expect("retirement plan")
+            .expect("token remains");
+        assert_eq!(token_after.seal_id, token_before.seal_id);
+        assert_eq!(token_after.arrow_bytes, token_before.arrow_bytes);
+        assert!(owner.memory_ledger.is_poisoned());
+    }
+
+    /// Test and periodic retirement callers both retain the generation on an error path.
+    #[tokio::test]
+    async fn retire_committed_callers_preserve_generation_on_error() {
+        let (mut owner, generation_id, wal, root, budget) = committed_retirement_owner_for_test();
+        let governor_before = budget.accounting_snapshot_for_test();
+        let wal_before = wal.bytes_on_disk();
+        let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
+        let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
+        owner.arm_retirement_release_fault_for_test();
+        owner
+            .handle_command(ShardCommand::FlushExpired {
+                now: std::time::Instant::now(),
+            })
+            .await;
+        assert!(owner.retained_generations.contains_key(&generation_id));
+        assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
+        assert_eq!(wal.bytes_on_disk(), wal_before);
+        assert_eq!(
+            wal_file_snapshot(root.path()).expect("WAL file snapshot"),
+            wal_files_before
+        );
+        assert_eq!(
+            owner.wal_io.retire_submissions_for_test(),
+            retire_submissions_before
+        );
+
+        let (mut owner, generation_id, wal, root, budget) = committed_retirement_owner_for_test();
+        let governor_before = budget.accounting_snapshot_for_test();
+        let wal_before = wal.bytes_on_disk();
+        let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
+        let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
+        owner.arm_retirement_release_fault_for_test();
+        let (response, result) = tokio::sync::oneshot::channel();
+        owner
+            .handle_command(ShardCommand::RetireCommittedForTest { response })
+            .await;
+        assert!(result.await.expect("test retirement response").is_err());
+        assert!(owner.retained_generations.contains_key(&generation_id));
+        assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
+        assert_eq!(wal.bytes_on_disk(), wal_before);
+        assert_eq!(
+            wal_file_snapshot(root.path()).expect("WAL file snapshot"),
+            wal_files_before
+        );
+        assert_eq!(
+            owner.wal_io.retire_submissions_for_test(),
+            retire_submissions_before
+        );
+        assert!(
+            owner
+                .memtable
+                .plan_committed_retirement(generation_id)
+                .expect("retirement plan")
+                .is_some()
+        );
+    }
+
+    /// A failed seal preparation leaves active ownership retry-reachable.
+    #[test]
+    fn seal_transfer_failure_preserves_retryable_active_state() {
+        let key = owner_key();
+        let seed = 1_usize << 20;
+        let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
+        let before = owner.admission.snapshot();
+        owner.admission.sync_memtable_bytes(0, 0);
+
+        let error = owner
+            .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
+            .expect_err("admission preflight must reject before freezing");
+        assert!(matches!(error, ScribeError::Internal { .. }));
+        assert!(owner.memtable.row_count(&key).expect("bucket bytes") > 0);
+        assert!(!owner.pending_generations.contains_key(&key));
+        assert!(owner.wal_segments.contains_key(&key));
+        assert!(owner.seal_retry.contains(&key));
+        assert_eq!(owner.memory_ledger.active_bytes(), seed);
+        assert_eq!(
+            owner.admission.snapshot().immutable_bytes,
+            before.immutable_bytes
+        );
+        assert!(owner.memory_ledger.is_poisoned());
+    }
+
+    /// Group cleanup reports the primary failure while the shared cleanup path poisons corruption.
+    #[tokio::test]
+    async fn cleanup_release_failure_preserves_primary_error_and_poisons() {
+        let memtable = Memtable::new();
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        let prepared = prepared_append_for_group_test(&owner, &budget);
+        wal.trip_post_sync_failure_for_test();
+        budget.arm_post_preflight_release_fault();
+        let error = owner
+            .process_group(vec![prepared])
+            .await
+            .expect_err("post-sync WAL fault");
+        assert!(
+            matches!(error, ScribeError::Internal { detail } if detail == "injected post-sync WAL failure")
+        );
+        assert!(owner.memory_ledger.is_poisoned());
+        assert_eq!(owner.synced_not_inserted.len(), 1);
+        let memtable = owner.memtable.stats().expect("memtable stats");
+        assert_eq!(memtable.writable_rows, 0);
+        assert_eq!(memtable.immutable_rows, 0);
+        assert_eq!(owner.admission.snapshot().active_bytes, 0);
+        assert!(owner.memory_ledger.active_bytes() > 0);
+        assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_err());
     }
 }

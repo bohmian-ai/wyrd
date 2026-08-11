@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::contracts::ScribeError;
+#[cfg(any(test, feature = "test-support"))]
+use crate::scribe::memory::BifrostMemoryGovernor;
+use crate::scribe::memory::ScribeMemoryBudget;
 
 /// Maximum request size accepted by the Scribe seam.
 pub const MAX_REQUEST_BYTES: usize = 33_554_432;
@@ -107,6 +110,7 @@ struct AdmissionInner {
     config: AdmissionConfig,
     state: Mutex<AdmissionState>,
     wal_available: AtomicBool,
+    memory: ScribeMemoryBudget,
 }
 
 /// Pod-global admission controller.
@@ -117,19 +121,30 @@ pub struct AdmissionController {
 
 impl AdmissionController {
     /// Construct an admission controller with the production defaults.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(AdmissionConfig::default())
     }
 
     /// Construct an admission controller with explicit limits.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_config(config: AdmissionConfig) -> Self {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024)
+            .expect("test admission governor must construct");
+        Self::with_config_and_memory(config, governor.scribe_budget())
+    }
+
+    /// Construct admission with the already-resolved process-wide governor.
+    #[must_use]
+    pub fn with_config_and_memory(config: AdmissionConfig, memory: ScribeMemoryBudget) -> Self {
         Self {
             inner: Arc::new(AdmissionInner {
                 config,
                 state: Mutex::new(AdmissionState::default()),
                 wal_available: AtomicBool::new(true),
+                memory,
             }),
         }
     }
@@ -153,6 +168,11 @@ impl AdmissionController {
         bytes: usize,
     ) -> Result<InflightFrameReservation, ScribeError> {
         let table = table.into();
+        if bytes > 0 && self.inner.memory.is_poisoned() {
+            return Err(ScribeError::Internal {
+                detail: "memory accounting poisoned; restart required".to_owned(),
+            });
+        }
         if !self.inner.wal_available.load(Ordering::Acquire) {
             super::record_scribe_rejection("wal");
             return Err(ScribeError::WalDiskFull);
@@ -165,13 +185,29 @@ impl AdmissionController {
                 detail: format!("admission state lock poisoned: {error}"),
             })?;
 
-        if state.items >= GLOBAL_INFLIGHT_ITEMS {
+        let next_items = state.items.checked_add(1).ok_or_else(|| {
+            self.inner.memory.poison();
+            ScribeError::Internal {
+                detail: "admission item counter overflow".to_owned(),
+            }
+        })?;
+        let next_bytes = state
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| ScribeError::IngestBusy {
+                table: table.clone(),
+            })?;
+        if next_items > GLOBAL_INFLIGHT_ITEMS {
             super::record_scribe_rejection("in_flight");
             return Err(ScribeError::IngestBusy { table });
         }
+        if next_bytes > self.memory_breaker_bytes() {
+            super::record_scribe_rejection("memory");
+            return Err(ScribeError::IngestBusy { table });
+        }
 
-        state.items += 1;
-        state.bytes += bytes;
+        state.items = next_items;
+        state.bytes = next_bytes;
         drop(state);
 
         Ok(InflightFrameReservation {
@@ -198,41 +234,171 @@ impl AdmissionController {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("admission state lock poisoned: {error}"),
             })?;
-        state.active_bytes = state.active_bytes.saturating_add(bytes);
+        state.active_bytes =
+            state
+                .active_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "admission active counter overflow".to_owned(),
+                })?;
         Ok(())
     }
 
     /// Release active Arrow bytes after a failed memtable insertion.
-    pub fn release_active(&self, bytes: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            state.active_bytes = state.active_bytes.saturating_sub(bytes);
+    pub fn release_active(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during active release".to_owned(),
+        })?;
+        if state.active_bytes < bytes {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission active counter underflow".to_owned(),
+            });
         }
+        state.active_bytes -= bytes;
+        Ok(())
+    }
+
+    /// Check active ownership before a coordinated cleanup releases counters.
+    ///
+    /// The shard owner calls this beside the matching memory-ledger preflight
+    /// so a detected mismatch leaves both ownership dimensions unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the shared governor when
+    /// the active counter cannot cover `bytes` or its lock is poisoned.
+    pub(crate) fn preflight_release_active(&self, bytes: usize) -> Result<(), ScribeError> {
+        let state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during active preflight".to_owned(),
+        })?;
+        if state.active_bytes < bytes {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission active counter underflow during preflight".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Transfer active bytes to the immutable generation tier.
-    pub fn transfer_active_to_immutable(&self, bytes: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            let moved = bytes.min(state.active_bytes);
-            state.active_bytes -= moved;
-            state.immutable_bytes = state.immutable_bytes.saturating_add(moved);
+    pub fn transfer_active_to_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during active transfer".to_owned(),
+        })?;
+        if state.active_bytes < bytes {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission active counter underflow during transfer".to_owned(),
+            });
         }
+        let immutable = state.immutable_bytes.checked_add(bytes).ok_or_else(|| {
+            self.inner.memory.poison();
+            ScribeError::Internal {
+                detail: "admission immutable counter overflow during transfer".to_owned(),
+            }
+        })?;
+        state.active_bytes -= bytes;
+        state.immutable_bytes = immutable;
+        Ok(())
+    }
+
+    /// Check an active-to-immutable move before its lifecycle owner mutates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the shared governor when
+    /// active ownership is insufficient, immutable ownership would overflow,
+    /// or the admission lock is poisoned.
+    pub(crate) fn preflight_transfer_active_to_immutable(
+        &self,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        let state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during active transfer preflight".to_owned(),
+        })?;
+        if state.active_bytes < bytes || state.immutable_bytes.checked_add(bytes).is_none() {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission active-to-immutable transfer failed preflight".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Release immutable bytes after a generation is retired.
-    pub fn release_immutable(&self, bytes: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            state.immutable_bytes = state.immutable_bytes.saturating_sub(bytes);
+    pub fn release_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during immutable release".to_owned(),
+        })?;
+        if state.immutable_bytes < bytes {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission immutable counter underflow".to_owned(),
+            });
         }
+        state.immutable_bytes -= bytes;
+        Ok(())
+    }
+
+    /// Check immutable ownership before an explicit retirement mutates counters.
+    pub(crate) fn preflight_release_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during immutable preflight".to_owned(),
+        })?;
+        if state.immutable_bytes < bytes {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission immutable counter underflow during preflight".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Transfer immutable bytes back to the active generation after a seal
     /// transaction rolls back.
-    pub fn transfer_immutable_to_active(&self, bytes: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            let moved = bytes.min(state.immutable_bytes);
-            state.immutable_bytes -= moved;
-            state.active_bytes = state.active_bytes.saturating_add(moved);
+    pub fn transfer_immutable_to_active(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during immutable transfer".to_owned(),
+        })?;
+        if state.immutable_bytes < bytes {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission immutable counter underflow during transfer".to_owned(),
+            });
         }
+        let active = state.active_bytes.checked_add(bytes).ok_or_else(|| {
+            self.inner.memory.poison();
+            ScribeError::Internal {
+                detail: "admission active counter overflow during transfer".to_owned(),
+            }
+        })?;
+        state.immutable_bytes -= bytes;
+        state.active_bytes = active;
+        Ok(())
+    }
+
+    /// Check immutable-to-active ownership before a post-commit abort mutates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the shared governor when
+    /// immutable ownership is insufficient, active ownership would overflow,
+    /// or the admission lock is poisoned.
+    pub(crate) fn preflight_transfer_immutable_to_active(
+        &self,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        let state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during immutable transfer preflight".to_owned(),
+        })?;
+        if state.immutable_bytes < bytes || state.active_bytes.checked_add(bytes).is_none() {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission immutable-to-active transfer failed preflight".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Reconcile the counters with the authoritative memtable statistics.
@@ -279,14 +445,23 @@ impl AdmissionController {
         self.inner.wal_available.store(false, Ordering::Release);
     }
 
-    fn release_request(&self, bytes: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            state.items = state.items.saturating_sub(1);
-            state.bytes = state.bytes.saturating_sub(bytes);
+    fn release_request(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned during request release".to_owned(),
+        })?;
+        if state.items == 0 || state.bytes < bytes {
+            self.inner.memory.poison();
+            return Err(ScribeError::Internal {
+                detail: "admission request counter underflow".to_owned(),
+            });
         }
+        state.items -= 1;
+        state.bytes -= bytes;
+        Ok(())
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for AdmissionController {
     fn default() -> Self {
         Self::new()
@@ -327,27 +502,40 @@ impl InflightFrameReservation {
                         table: "vala.bifrost".to_owned(),
                     })?;
         } else {
-            state.bytes = state.bytes.saturating_sub(self.bytes - bytes);
+            let released = self.bytes - bytes;
+            let Some(next_bytes) = state.bytes.checked_sub(released) else {
+                inner.memory.poison();
+                return Err(ScribeError::Internal {
+                    detail:
+                        "in-flight admission byte counter underflow while shrinking reservation"
+                            .to_owned(),
+                });
+            };
+            state.bytes = next_bytes;
         }
         self.bytes = bytes;
         Ok(())
     }
 
     /// Release the in-flight reservation immediately.
-    pub fn release(mut self) {
-        self.release_inner();
+    pub fn release(mut self) -> Result<(), ScribeError> {
+        self.release_inner()
     }
 
-    fn release_inner(&mut self) {
+    fn release_inner(&mut self) -> Result<(), ScribeError> {
         if let Some(inner) = self.inner.take() {
-            AdmissionController { inner }.release_request(self.bytes);
+            AdmissionController { inner }.release_request(self.bytes)
+        } else {
+            Ok(())
         }
     }
 }
 
 impl Drop for InflightFrameReservation {
     fn drop(&mut self) {
-        self.release_inner();
+        if let Err(error) = self.release_inner() {
+            tracing::error!(error = %error, "in-flight admission cleanup poisoned accounting");
+        }
     }
 }
 
@@ -394,7 +582,7 @@ mod tests {
     #[test]
     fn admission_rejects_after_fixed_global_item_bound() {
         let admission = AdmissionController::with_config(AdmissionConfig {
-            memory_limit_bytes: 100,
+            memory_limit_bytes: usize::MAX,
             scribe_memory_limit_bytes: None,
             event_time_window: EventTimeWindow::default(),
         });
@@ -462,10 +650,12 @@ mod tests {
         admission
             .try_reserve_active("events", 1)
             .expect("counters do not reserve memory");
-        admission.transfer_active_to_immutable(90);
+        admission
+            .transfer_active_to_immutable(90)
+            .expect("active transfer");
         assert_eq!(admission.snapshot().active_bytes, 1);
         assert_eq!(admission.snapshot().immutable_bytes, 90);
-        admission.release_immutable(90);
+        admission.release_immutable(90).expect("immutable release");
         assert_eq!(admission.snapshot().immutable_bytes, 0);
     }
 
@@ -479,5 +669,54 @@ mod tests {
         drop(reservation);
         assert_eq!(admission.snapshot().items, 0);
         assert_eq!(admission.snapshot().bytes, 0);
+    }
+
+    /// Admission observes the same governor poison bit as memory reservations.
+    #[test]
+    fn admission_uses_shared_governor_poison() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let admission = AdmissionController::with_config_and_memory(
+            AdmissionConfig::default(),
+            governor.scribe_budget(),
+        );
+        governor.poison();
+        assert!(matches!(
+            admission.try_reserve("events", 1),
+            Err(ScribeError::Internal { .. })
+        ));
+    }
+
+    /// Authoritative memtable synchronization repairs inspection counters without poisoning.
+    #[test]
+    fn authoritative_memtable_sync_does_not_poison() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let admission = AdmissionController::with_config_and_memory(
+            AdmissionConfig::default(),
+            governor.scribe_budget(),
+        );
+        admission.sync_memtable_bytes(64, 32);
+        assert_eq!(admission.snapshot().active_bytes, 64);
+        assert_eq!(admission.snapshot().immutable_bytes, 32);
+        assert!(!governor.is_poisoned());
+    }
+
+    /// A request-byte overflow rejects before either admission counter mutates.
+    #[test]
+    fn admission_byte_overflow_leaves_items_and_bytes_unchanged() {
+        let admission = AdmissionController::default();
+        let held = admission
+            .try_reserve("events", 1)
+            .expect("seed reservation");
+        let before = admission.snapshot();
+        assert!(matches!(
+            admission.try_reserve("events", usize::MAX),
+            Err(ScribeError::IngestBusy { .. })
+        ));
+        assert_eq!(admission.snapshot(), before);
+        drop(held);
+        let ordinary = admission
+            .try_reserve("events", 1)
+            .expect("ordinary reservation");
+        drop(ordinary);
     }
 }

@@ -152,7 +152,10 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         notify_completion(&mut durable_ack, &error);
         return Err(error);
     }
-    memory.transfer_category(MemoryCategory::Prepared);
+    if let Err(error) = memory.transfer_category(MemoryCategory::Prepared) {
+        notify_completion(&mut durable_ack, &error);
+        return Err(error);
+    }
 
     Ok(PreparedAppend {
         batch_id,

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use datafusion::error::DataFusionError;
@@ -123,6 +123,243 @@ pub enum MemoryCategory {
     Persistence = 6,
     /// Metadata and bookkeeping.
     Metadata = 7,
+}
+
+impl MemoryCategory {
+    /// Map Scribe categories to their entry-point-owned memory purpose.
+    const fn purpose(self) -> MemoryPurpose {
+        match self {
+            Self::Persistence => MemoryPurpose::ScribeMaintenance,
+            Self::Raw
+            | Self::Decode
+            | Self::Prepared
+            | Self::Queued
+            | Self::Active
+            | Self::Immutable
+            | Self::Metadata => MemoryPurpose::ScribeIngress,
+        }
+    }
+}
+
+/// Classifies why a governed memory operation was refused.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum MemoryRejectionKind {
+    /// The request could fit under the configured ceiling but current usage is
+    /// occupying the available headroom.
+    #[error("memory ceiling is occupied")]
+    Occupied,
+    /// The request itself is larger than the configured ceiling.
+    #[error("memory request is larger than its ceiling")]
+    RequestTooLarge,
+    /// Adding the request to an accounting counter would overflow `usize`.
+    #[error("memory accounting counter would overflow")]
+    CounterOverflow,
+    /// Prior accounting corruption poisoned this governor.
+    #[error("memory accounting is poisoned")]
+    AccountingPoisoned,
+}
+
+/// Identifies the owner and lifecycle purpose of a memory request.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum MemoryPurpose {
+    /// Scribe ingress decode and active-write ownership.
+    #[error("Scribe ingress")]
+    ScribeIngress,
+    /// Scribe persistence, replay, and maintenance workspace.
+    #[error("Scribe maintenance")]
+    ScribeMaintenance,
+    /// Forge parent workspace.
+    #[error("Forge workspace")]
+    ForgeWorkspace,
+    /// Oracle hot Parquet range bytes.
+    #[error("Oracle hot range")]
+    OracleHotRange,
+    /// Oracle decoded hot source batches.
+    #[error("Oracle hot decoded batch")]
+    OracleHotDecodedBatch,
+    /// Oracle reconciliation state.
+    #[error("Oracle reconciliation")]
+    OracleReconciliation,
+    /// Oracle query-only parent or child acquisition.
+    #[error("Oracle query")]
+    OracleQuery,
+}
+
+impl MemoryPurpose {
+    /// Closed purpose vocabulary used by diagnostics and tests.
+    const ALL: [Self; 7] = [
+        Self::ScribeIngress,
+        Self::ScribeMaintenance,
+        Self::ForgeWorkspace,
+        Self::OracleHotRange,
+        Self::OracleHotDecodedBatch,
+        Self::OracleReconciliation,
+        Self::OracleQuery,
+    ];
+    /// Return a bounded diagnostic label for structured logs.
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::ScribeIngress => "scribe_ingress",
+            Self::ScribeMaintenance => "scribe_maintenance",
+            Self::ForgeWorkspace => "forge_workspace",
+            Self::OracleHotRange => "oracle_hot_range",
+            Self::OracleHotDecodedBatch => "oracle_hot_decoded_batch",
+            Self::OracleReconciliation => "oracle_reconciliation",
+            Self::OracleQuery => "oracle_query",
+        }
+    }
+}
+
+/// Identifies the physical ceiling associated with a memory refusal.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum MemoryCeiling {
+    /// Cgroup breaker at 90% resident usage.
+    #[error("cgroup breaker")]
+    CgroupBreaker,
+    /// Parent cgroup hard limit.
+    #[error("cgroup parent")]
+    CgroupParent,
+    /// Scribe child budget.
+    #[error("Scribe child")]
+    ScribeChild,
+    /// Scribe ingress sublimit.
+    #[error("ingress sublimit")]
+    IngressSublimit,
+    /// Oracle child budget.
+    #[error("Oracle child")]
+    OracleChild,
+    /// Bifrost parent budget.
+    #[error("Bifrost parent")]
+    BifrostParent,
+    /// No physical ceiling was compared, as for overflow or poison.
+    #[error("not applicable")]
+    NotApplicable,
+}
+
+impl MemoryCeiling {
+    /// Return a bounded diagnostic label without exposing request identity.
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::CgroupBreaker => "cgroup_breaker",
+            Self::CgroupParent => "cgroup_parent",
+            Self::ScribeChild => "scribe_child",
+            Self::IngressSublimit => "ingress_sublimit",
+            Self::OracleChild => "oracle_child",
+            Self::BifrostParent => "bifrost_parent",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+/// Structured, bounded diagnostics for every governed refusal.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "memory rejected: kind={kind:?} purpose={purpose:?} ceiling={ceiling:?} requested={requested} current={current} limit={limit}"
+)]
+pub(crate) struct MemoryRejection {
+    kind: MemoryRejectionKind,
+    purpose: MemoryPurpose,
+    ceiling: MemoryCeiling,
+    requested: usize,
+    current: usize,
+    limit: usize,
+}
+
+impl MemoryRejection {
+    /// Construct a bounded refusal without retaining request or pointer identity.
+    fn new(
+        kind: MemoryRejectionKind,
+        purpose: MemoryPurpose,
+        ceiling: MemoryCeiling,
+        requested: usize,
+        current: usize,
+        limit: usize,
+    ) -> Self {
+        let _ = (purpose.as_label(), ceiling.as_label(), MemoryPurpose::ALL);
+        let rejection = Self {
+            kind,
+            purpose,
+            ceiling,
+            requested,
+            current,
+            limit,
+        };
+        rejection.emit_diagnostic();
+        debug_assert_eq!(Self::from_source_chain(&rejection), Some(rejection));
+        rejection
+    }
+
+    /// Return the refusal category.
+    pub(crate) const fn kind(self) -> MemoryRejectionKind {
+        self.kind
+    }
+
+    /// Return the owning memory purpose.
+    pub(crate) const fn purpose(self) -> MemoryPurpose {
+        self.purpose
+    }
+
+    /// Return the physical ceiling that was evaluated.
+    pub(crate) const fn ceiling(self) -> MemoryCeiling {
+        self.ceiling
+    }
+
+    /// Return the requested byte count.
+    pub(crate) const fn requested(self) -> usize {
+        self.requested
+    }
+
+    /// Return the counter value observed before refusal.
+    pub(crate) const fn current(self) -> usize {
+        self.current
+    }
+
+    /// Return the compared ceiling.
+    pub(crate) const fn limit(self) -> usize {
+        self.limit
+    }
+
+    /// Find a typed memory refusal anywhere in an external error source chain.
+    pub(crate) fn from_source_chain(error: &(dyn std::error::Error + 'static)) -> Option<Self> {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if let Some(rejection) = error.downcast_ref::<Self>() {
+                return Some(*rejection);
+            }
+            current = error.source();
+        }
+        None
+    }
+
+    /// Emits bounded structured operands for one refusal without request identity.
+    fn emit_diagnostic(self) {
+        tracing::warn!(
+            kind = ?self.kind(),
+            purpose = self.purpose().as_label(),
+            ceiling = self.ceiling().as_label(),
+            requested = self.requested(),
+            current = self.current(),
+            limit = self.limit(),
+            "Bifrost memory operation rejected"
+        );
+    }
+
+    /// Preserve the historical Scribe error while retaining typed diagnostics
+    /// for callers that inspect the source chain.
+    fn into_scribe_error(self) -> ScribeError {
+        match self.kind {
+            MemoryRejectionKind::Occupied | MemoryRejectionKind::RequestTooLarge => {
+                ScribeError::IngestBusy {
+                    table: "memory".to_owned(),
+                }
+            }
+            MemoryRejectionKind::CounterOverflow | MemoryRejectionKind::AccountingPoisoned => {
+                ScribeError::Internal {
+                    detail: self.to_string(),
+                }
+            }
+        }
+    }
 }
 
 /// Point-in-time category totals for all memory roles in the governor.
@@ -459,6 +696,14 @@ struct MemoryGovernorInner {
     cgroup_current: Mutex<Option<(Instant, Option<usize>)>>,
     /// Per-shard byte accounting for in-flight Arrow buffers.
     shard_bytes: Arc<Vec<AtomicUsize>>,
+    /// Process-wide fail-closed marker set after an ownership invariant fails.
+    poisoned: AtomicBool,
+    /// One-shot release CAS perturbation used only by deterministic fault tests.
+    #[cfg(test)]
+    fail_next_release_cas: AtomicBool,
+    /// One-shot shard-growth CAS perturbation used only by deterministic fault tests.
+    #[cfg(test)]
+    fail_next_shard_add_cas: AtomicBool,
 }
 
 impl BifrostMemoryGovernor {
@@ -558,6 +803,11 @@ impl BifrostMemoryGovernor {
                         .map(|_| AtomicUsize::new(0))
                         .collect(),
                 ),
+                poisoned: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_release_cas: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_shard_add_cas: AtomicBool::new(false),
             }),
         })
     }
@@ -603,6 +853,173 @@ impl BifrostMemoryGovernor {
     #[must_use]
     pub fn bifrost_limit_bytes(&self) -> usize {
         self.inner.bifrost_limit_bytes
+    }
+
+    /// Mark this process's shared accounting as poisoned and fail closed.
+    pub(crate) fn poison(&self) {
+        if !self.inner.poisoned.swap(true, Ordering::AcqRel) {
+            tracing::error!("Bifrost memory accounting poisoned; restart required");
+        }
+    }
+
+    /// Return whether a prior accounting failure has disabled non-zero admission.
+    #[must_use]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.inner.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Build the bounded refusal used when shared accounting is poisoned.
+    fn poisoned_rejection(&self, purpose: MemoryPurpose, requested: usize) -> MemoryRejection {
+        MemoryRejection::new(
+            MemoryRejectionKind::AccountingPoisoned,
+            purpose,
+            MemoryCeiling::NotApplicable,
+            requested,
+            self.inner.bifrost_total_bytes.load(Ordering::Acquire),
+            self.bifrost_limit_bytes(),
+        )
+    }
+
+    /// Release a complete ownership tuple without allowing an underflow to wrap.
+    fn release_checked(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+        shard: Option<(&Arc<Vec<AtomicUsize>>, usize)>,
+    ) -> Result<(), MemoryRejection> {
+        self.preflight_release_checked(category, bytes, shard)?;
+        let category_counter = &self.inner.categories[category as usize];
+        self.release_counter_checked(category_counter, bytes, category.purpose())?;
+        if let Some((shard_counters, shard_index)) = shard {
+            self.release_counter_checked(&shard_counters[shard_index], bytes, category.purpose())?;
+        }
+        self.release_counter_checked(&self.inner.scribe_total_bytes, bytes, category.purpose())?;
+        self.release_counter_checked(&self.inner.bifrost_total_bytes, bytes, category.purpose())?;
+        Ok(())
+    }
+
+    /// Validates every counter in one ownership tuple before explicit release mutates it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed counter-overflow rejection and poisons the governor when
+    /// category, shard, Scribe-child, or parent ownership cannot cover `bytes`.
+    fn preflight_release_checked(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+        shard: Option<(&Arc<Vec<AtomicUsize>>, usize)>,
+    ) -> Result<(), MemoryRejection> {
+        let current_category = self.inner.categories[category as usize].load(Ordering::Acquire);
+        let current_scribe = self.inner.scribe_total_bytes.load(Ordering::Acquire);
+        let current_parent = self.inner.bifrost_total_bytes.load(Ordering::Acquire);
+        let current_shard = shard.map(|(counters, index)| counters[index].load(Ordering::Acquire));
+        if current_category >= bytes
+            && current_scribe >= bytes
+            && current_parent >= bytes
+            && current_shard.is_none_or(|current| current >= bytes)
+        {
+            return Ok(());
+        }
+        let current = current_shard.into_iter().fold(
+            current_category.min(current_scribe).min(current_parent),
+            usize::min,
+        );
+        let rejection = MemoryRejection::new(
+            MemoryRejectionKind::CounterOverflow,
+            category.purpose(),
+            MemoryCeiling::NotApplicable,
+            bytes,
+            current,
+            self.bifrost_limit_bytes(),
+        );
+        self.poison();
+        Err(rejection)
+    }
+
+    /// Subtract one owned counter while retrying ordinary concurrent updates.
+    fn release_counter_checked(
+        &self,
+        counter: &AtomicUsize,
+        bytes: usize,
+        purpose: MemoryPurpose,
+    ) -> Result<(), MemoryRejection> {
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current < bytes {
+                self.poison();
+                return Err(MemoryRejection::new(
+                    MemoryRejectionKind::CounterOverflow,
+                    purpose,
+                    MemoryCeiling::NotApplicable,
+                    bytes,
+                    current,
+                    self.bifrost_limit_bytes(),
+                ));
+            }
+            #[cfg(test)]
+            if self
+                .inner
+                .fail_next_release_cas
+                .swap(false, Ordering::AcqRel)
+                && bytes > 0
+            {
+                counter.store(bytes - 1, Ordering::Release);
+            }
+            match counter.compare_exchange(
+                current,
+                current - bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Release one counter during a reservation rollback, poisoning on races.
+    fn release_counter_only(
+        &self,
+        counter: &AtomicUsize,
+        bytes: usize,
+        purpose: MemoryPurpose,
+    ) -> Result<(), MemoryRejection> {
+        let current = counter.load(Ordering::Acquire);
+        if current < bytes {
+            self.poison();
+            return Err(MemoryRejection::new(
+                MemoryRejectionKind::CounterOverflow,
+                purpose,
+                MemoryCeiling::NotApplicable,
+                bytes,
+                current,
+                self.bifrost_limit_bytes(),
+            ));
+        }
+        let mut current = current;
+        loop {
+            if current < bytes {
+                self.poison();
+                return Err(MemoryRejection::new(
+                    MemoryRejectionKind::CounterOverflow,
+                    purpose,
+                    MemoryCeiling::NotApplicable,
+                    bytes,
+                    current,
+                    self.bifrost_limit_bytes(),
+                ));
+            }
+            match counter.compare_exchange(
+                current,
+                current - bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Derive the Scribe-only child capability from this parent.
@@ -651,6 +1068,13 @@ impl BifrostMemoryGovernor {
     /// Returns [`ScribeError::IngestBusy`] when cgroup pressure is at 100% or
     /// when the parent ceiling would be exceeded.
     fn try_reserve_parent_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
+        if bytes > 0 && self.is_poisoned() {
+            return Err(ScribeError::Internal {
+                detail: self
+                    .poisoned_rejection(MemoryPurpose::ForgeWorkspace, bytes)
+                    .to_string(),
+            });
+        }
         if bytes > 0
             && let Some((current, limit)) = self.cgroup_pressure()
             && current.saturating_mul(100) >= limit.saturating_mul(100)
@@ -659,11 +1083,14 @@ impl BifrostMemoryGovernor {
                 table: "bifrost-parent".to_owned(),
             });
         }
-        reserve_with_limit(
+        reserve_with_limit_diagnostic(
             &self.inner.bifrost_total_bytes,
             self.bifrost_limit_bytes(),
             bytes,
+            MemoryPurpose::ForgeWorkspace,
+            MemoryCeiling::BifrostParent,
         )
+        .map_err(MemoryRejection::into_scribe_error)
     }
 
     /// Reserve bytes against the Oracle child limit and the parent ceiling.
@@ -678,32 +1105,82 @@ impl BifrostMemoryGovernor {
     /// Returns [`ScribeError::IngestBusy`] when the Oracle child limit or
     /// the parent ceiling would be exceeded.
     fn try_reserve_oracle_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
-        reserve_with_limit(
+        if bytes > 0 && self.is_poisoned() {
+            return Err(ScribeError::Internal {
+                detail: self
+                    .poisoned_rejection(MemoryPurpose::OracleQuery, bytes)
+                    .to_string(),
+            });
+        }
+        reserve_with_limit_diagnostic(
             &self.inner.oracle_total_bytes,
             self.inner.oracle_limit_bytes,
             bytes,
-        )?;
-        if let Err(error) = reserve_with_limit(
+            MemoryPurpose::OracleQuery,
+            MemoryCeiling::OracleChild,
+        )
+        .map_err(MemoryRejection::into_scribe_error)?;
+        if let Err(error) = reserve_with_limit_diagnostic(
             &self.inner.bifrost_total_bytes,
             self.bifrost_limit_bytes(),
             bytes,
+            MemoryPurpose::OracleQuery,
+            MemoryCeiling::BifrostParent,
         ) {
-            self.inner
-                .oracle_total_bytes
-                .fetch_sub(bytes, Ordering::AcqRel);
-            return Err(error);
+            if let Err(cleanup) = self.release_oracle_bytes_checked(bytes) {
+                tracing::error!(error = %cleanup, primary = %error, "Oracle child rollback failed after parent refusal");
+            }
+            return Err(error.into_scribe_error());
         }
         Ok(())
     }
 
     /// Release bytes from the Oracle child counter and the parent ceiling.
-    fn release_oracle_bytes(&self, bytes: usize) {
+    fn release_oracle_bytes_checked(&self, bytes: usize) -> Result<(), MemoryRejection> {
+        let oracle = self.inner.oracle_total_bytes.load(Ordering::Acquire);
+        let parent = self.inner.bifrost_total_bytes.load(Ordering::Acquire);
+        if oracle < bytes || parent < bytes {
+            self.poison();
+            return Err(MemoryRejection::new(
+                MemoryRejectionKind::CounterOverflow,
+                MemoryPurpose::OracleQuery,
+                MemoryCeiling::NotApplicable,
+                bytes,
+                oracle.min(parent),
+                self.oracle_limit_bytes(),
+            ));
+        }
         self.inner
             .oracle_total_bytes
-            .fetch_sub(bytes, Ordering::AcqRel);
-        self.inner
+            .compare_exchange(oracle, oracle - bytes, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|current| {
+                self.poison();
+                MemoryRejection::new(
+                    MemoryRejectionKind::CounterOverflow,
+                    MemoryPurpose::OracleQuery,
+                    MemoryCeiling::NotApplicable,
+                    bytes,
+                    current,
+                    self.oracle_limit_bytes(),
+                )
+            })?;
+        if self
+            .inner
             .bifrost_total_bytes
-            .fetch_sub(bytes, Ordering::AcqRel);
+            .compare_exchange(parent, parent - bytes, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.poison();
+            return Err(MemoryRejection::new(
+                MemoryRejectionKind::CounterOverflow,
+                MemoryPurpose::OracleQuery,
+                MemoryCeiling::NotApplicable,
+                bytes,
+                parent,
+                self.bifrost_limit_bytes(),
+            ));
+        }
+        Ok(())
     }
 
     /// Read parent and child totals.
@@ -762,6 +1239,42 @@ impl BifrostMemoryGovernor {
 }
 
 impl ScribeMemoryBudget {
+    /// Arms one test-only release compare-exchange fault on this shared governor.
+    #[cfg(test)]
+    pub(crate) fn arm_post_preflight_release_fault(&self) {
+        self.parent
+            .inner
+            .fail_next_release_cas
+            .store(true, Ordering::Release);
+    }
+
+    /// Arms one test-only shard-growth compare-exchange fault on this governor.
+    #[cfg(test)]
+    pub(crate) fn arm_post_preflight_shard_add_fault(&self) {
+        self.parent
+            .inner
+            .fail_next_shard_add_cas
+            .store(true, Ordering::Release);
+    }
+
+    /// Returns the complete governor and shard accounting state for owner tests.
+    #[cfg(test)]
+    pub(crate) fn accounting_snapshot_for_test(
+        &self,
+    ) -> (MemorySnapshot, [usize; SHARD_ACCOUNTING_COUNT]) {
+        (self.parent.snapshot(), self.shard_snapshot())
+    }
+    /// Mark the shared governor poisoned after an ownership invariant fails.
+    pub(crate) fn poison(&self) {
+        self.parent.poison();
+    }
+
+    /// Return whether the shared governor has entered fail-closed mode.
+    #[must_use]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.parent.is_poisoned()
+    }
+
     /// Return the Scribe child reservation limit.
     #[must_use]
     pub fn limit_bytes(&self) -> usize {
@@ -802,13 +1315,30 @@ impl ScribeMemoryBudget {
         category: MemoryCategory,
         bytes: usize,
     ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit(category, bytes, self.limit_bytes())
+        self.try_reserve_classified(category, bytes)
+            .map_err(MemoryRejection::into_scribe_error)
+    }
+
+    /// Reserve bytes and retain the exact structured refusal for crate callers.
+    pub(crate) fn try_reserve_classified(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+    ) -> Result<MemoryReservation, MemoryRejection> {
+        let purpose = category.purpose();
+        self.try_reserve_core(
+            category,
+            bytes,
+            self.limit_bytes(),
+            purpose,
+            MemoryCeiling::ScribeChild,
+        )
     }
 
     /// Reports whether the cgroup memory tripwire is engaged at or above 90%.
     ///
-    /// This mirrors the immediate fail-closed guard inside
-    /// [`Self::try_reserve_with_limit`]. Admission consults it to keep the
+    /// This mirrors the immediate fail-closed guard inside the classified
+    /// reservation core. Admission consults it to keep the
     /// cgroup tripwire an immediate `IngestBusy` rather than routing it through
     /// the ingress-pressure seal-and-retry path, which cannot relieve
     /// container-level pressure. Returns `false` when no cgroup limit is
@@ -868,22 +1398,23 @@ impl ScribeMemoryBudget {
         category: MemoryCategory,
         bytes: usize,
     ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit(category, bytes, self.limit_bytes())
+        self.try_reserve_maintenance_classified(category, bytes)
+            .map_err(MemoryRejection::into_scribe_error)
     }
 
-    fn try_reserve_with_limit(
+    /// Reserve maintenance or replay workspace with a structured refusal.
+    pub(crate) fn try_reserve_maintenance_classified(
         &self,
         category: MemoryCategory,
         bytes: usize,
-        scribe_limit: usize,
-    ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit_classified(
+    ) -> Result<MemoryReservation, MemoryRejection> {
+        self.try_reserve_core(
             category,
             bytes,
-            scribe_limit,
-            ScribeRejectionCeiling::ScribeChild,
+            self.limit_bytes(),
+            MemoryPurpose::ScribeMaintenance,
+            MemoryCeiling::ScribeChild,
         )
-        .map_err(ScribeRejectionCeiling::into_ingest_busy)
     }
 
     /// Reserve bytes against a Scribe-child limit, naming the tripped ceiling.
@@ -913,33 +1444,120 @@ impl ScribeMemoryBudget {
         scribe_limit: usize,
         child_ceiling: ScribeRejectionCeiling,
     ) -> Result<MemoryReservation, ScribeRejectionCeiling> {
+        self.try_reserve_core(
+            category,
+            bytes,
+            scribe_limit,
+            category.purpose(),
+            match child_ceiling {
+                ScribeRejectionCeiling::IngressSublimit => MemoryCeiling::IngressSublimit,
+                ScribeRejectionCeiling::ScribeChild => MemoryCeiling::ScribeChild,
+                ScribeRejectionCeiling::CgroupBreaker => MemoryCeiling::CgroupBreaker,
+                ScribeRejectionCeiling::BifrostParent => MemoryCeiling::BifrostParent,
+                ScribeRejectionCeiling::CgroupParent => MemoryCeiling::CgroupParent,
+            },
+        )
+        .map_err(|rejection| match rejection.ceiling() {
+            MemoryCeiling::CgroupBreaker => ScribeRejectionCeiling::CgroupBreaker,
+            MemoryCeiling::BifrostParent => ScribeRejectionCeiling::BifrostParent,
+            _ => child_ceiling,
+        })
+    }
+
+    /// Reserve Scribe bytes while preserving the structured refusal details.
+    fn try_reserve_core(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+        scribe_limit: usize,
+        purpose: MemoryPurpose,
+        child_ceiling: MemoryCeiling,
+    ) -> Result<MemoryReservation, MemoryRejection> {
+        if bytes > 0 && self.parent.is_poisoned() {
+            return Err(self.parent.poisoned_rejection(purpose, bytes));
+        }
         if bytes > 0
             && let Some((current, limit)) = self.parent.cgroup_pressure()
             && current.saturating_mul(100) >= limit.saturating_mul(90)
         {
-            return Err(ScribeRejectionCeiling::CgroupBreaker);
+            return Err(MemoryRejection::new(
+                MemoryRejectionKind::Occupied,
+                purpose,
+                MemoryCeiling::CgroupBreaker,
+                bytes,
+                current,
+                limit,
+            ));
         }
-        reserve_with_limit(&self.parent.inner.scribe_total_bytes, scribe_limit, bytes)
-            .map_err(|_| child_ceiling)?;
-        if reserve_with_limit(
+        reserve_with_limit_diagnostic(
+            &self.parent.inner.scribe_total_bytes,
+            scribe_limit,
+            bytes,
+            purpose,
+            child_ceiling,
+        )?;
+        if let Err(rejection) = reserve_with_limit_diagnostic(
             &self.parent.inner.bifrost_total_bytes,
             self.parent.bifrost_limit_bytes(),
             bytes,
-        )
-        .is_err()
-        {
-            self.parent
-                .inner
-                .scribe_total_bytes
-                .fetch_sub(bytes, Ordering::AcqRel);
-            return Err(ScribeRejectionCeiling::BifrostParent);
+            purpose,
+            MemoryCeiling::BifrostParent,
+        ) {
+            if self
+                .parent
+                .release_counter_only(&self.parent.inner.scribe_total_bytes, bytes, purpose)
+                .is_err()
+            {
+                self.parent.poison();
+                return Err(self.parent.poisoned_rejection(purpose, bytes));
+            }
+            return Err(rejection);
         }
-        self.parent.inner.categories[category as usize].fetch_add(bytes, Ordering::AcqRel);
+        let category_counter = &self.parent.inner.categories[category as usize];
+        let mut current_category = category_counter.load(Ordering::Acquire);
+        loop {
+            let Some(next_category) = current_category.checked_add(bytes) else {
+                if self
+                    .parent
+                    .release_counter_only(&self.parent.inner.scribe_total_bytes, bytes, purpose)
+                    .is_err()
+                    || self
+                        .parent
+                        .release_counter_only(
+                            &self.parent.inner.bifrost_total_bytes,
+                            bytes,
+                            purpose,
+                        )
+                        .is_err()
+                {
+                    self.parent.poison();
+                    return Err(self.parent.poisoned_rejection(purpose, bytes));
+                }
+                return Err(MemoryRejection::new(
+                    MemoryRejectionKind::CounterOverflow,
+                    purpose,
+                    MemoryCeiling::NotApplicable,
+                    bytes,
+                    current_category,
+                    usize::MAX,
+                ));
+            };
+            match category_counter.compare_exchange(
+                current_category,
+                next_category,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current_category = observed,
+            }
+        }
         Ok(MemoryReservation {
             governor: self.clone(),
             category,
             bytes,
             shard: None,
+            purpose,
         })
     }
 
@@ -957,44 +1575,64 @@ impl ScribeMemoryBudget {
         self.parent.snapshot()
     }
 
-    fn release(&self, category: MemoryCategory, bytes: usize) {
-        self.parent.inner.categories[category as usize].fetch_sub(bytes, Ordering::AcqRel);
-        self.parent
-            .inner
-            .scribe_total_bytes
-            .fetch_sub(bytes, Ordering::AcqRel);
-        self.parent
-            .inner
-            .bifrost_total_bytes
-            .fetch_sub(bytes, Ordering::AcqRel);
+    fn release(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+        shard: Option<(&Arc<Vec<AtomicUsize>>, usize)>,
+    ) -> Result<(), MemoryRejection> {
+        self.parent.release_checked(category, bytes, shard)
     }
 
     /// Reconcile one category with an authoritative owner snapshot.
-    pub fn reconcile_category(&self, category: MemoryCategory, target: usize) {
+    pub fn reconcile_category(
+        &self,
+        category: MemoryCategory,
+        target: usize,
+    ) -> Result<(), ScribeError> {
         let current = self.parent.inner.categories[category as usize].load(Ordering::Acquire);
         if target > current {
             let delta = target - current;
-            self.parent.inner.categories[category as usize].fetch_add(delta, Ordering::AcqRel);
+            self.parent.inner.categories[category as usize]
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(delta)
+                })
+                .map_err(|_| ScribeError::Internal {
+                    detail: "memory category reconciliation overflow".to_owned(),
+                })?;
             self.parent
                 .inner
                 .scribe_total_bytes
-                .fetch_add(delta, Ordering::AcqRel);
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(delta)
+                })
+                .map_err(|_| {
+                    self.parent.poison();
+                    ScribeError::Internal {
+                        detail: "Scribe reconciliation overflow".to_owned(),
+                    }
+                })?;
             self.parent
                 .inner
                 .bifrost_total_bytes
-                .fetch_add(delta, Ordering::AcqRel);
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(delta)
+                })
+                .map_err(|_| {
+                    self.parent.poison();
+                    ScribeError::Internal {
+                        detail: "Bifrost reconciliation overflow".to_owned(),
+                    }
+                })?;
         } else {
             let delta = current - target;
-            self.parent.inner.categories[category as usize].fetch_sub(delta, Ordering::AcqRel);
             self.parent
-                .inner
-                .scribe_total_bytes
-                .fetch_sub(delta, Ordering::AcqRel);
-            self.parent
-                .inner
-                .bifrost_total_bytes
-                .fetch_sub(delta, Ordering::AcqRel);
+                .release_checked(category, delta, None)
+                .map_err(|rejection| ScribeError::Internal {
+                    detail: rejection.to_string(),
+                })?;
         }
+        Ok(())
     }
 }
 
@@ -1043,7 +1681,9 @@ impl OracleMemoryReservation {
 
 impl Drop for OracleMemoryReservation {
     fn drop(&mut self) {
-        self.governor.release_oracle_bytes(self.bytes);
+        if let Err(rejection) = self.governor.release_oracle_bytes_checked(self.bytes) {
+            tracing::error!(error = %rejection, "Oracle memory cleanup poisoned accounting");
+        }
     }
 }
 
@@ -1063,14 +1703,22 @@ impl ParentMemoryReservation {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Poison the shared governor when a coupled outer owner detects corruption.
+    pub(crate) fn poison(&self) {
+        self.governor.poison();
+    }
 }
 
 impl Drop for ParentMemoryReservation {
     fn drop(&mut self) {
-        self.governor
-            .inner
-            .bifrost_total_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
+        if let Err(rejection) = self.governor.release_counter_only(
+            &self.governor.inner.bifrost_total_bytes,
+            self.bytes,
+            MemoryPurpose::ForgeWorkspace,
+        ) {
+            tracing::error!(error = %rejection, "parent memory cleanup poisoned accounting");
+        }
     }
 }
 
@@ -1154,22 +1802,39 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
     ) {
         match self.target {
             DataFusionPoolTarget::Oracle => {
-                self.governor
-                    .inner
-                    .oracle_total_bytes
-                    .fetch_add(additional, Ordering::AcqRel);
-                self.governor
-                    .inner
-                    .bifrost_total_bytes
-                    .fetch_add(additional, Ordering::AcqRel);
+                for counter in [
+                    &self.governor.inner.oracle_total_bytes,
+                    &self.governor.inner.bifrost_total_bytes,
+                ] {
+                    if counter
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                            value.checked_add(additional)
+                        })
+                        .is_err()
+                    {
+                        self.governor.poison();
+                        tracing::error!("DataFusion Oracle memory counter overflow during grow");
+                    }
+                }
             }
             DataFusionPoolTarget::Parent => {
                 let reserved = self
                     .governor
                     .inner
                     .bifrost_total_bytes
-                    .fetch_add(additional, Ordering::AcqRel)
-                    .saturating_add(additional);
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_add(additional)
+                    })
+                    .map_or_else(
+                        |_| {
+                            self.governor.poison();
+                            self.governor
+                                .inner
+                                .bifrost_total_bytes
+                                .load(Ordering::Acquire)
+                        },
+                        |value| value.saturating_add(additional),
+                    );
                 record_forge_memory(reservation, reserved, Some("accepted"));
             }
         }
@@ -1187,22 +1852,29 @@ impl MemoryPool for BifrostDataFusionMemoryPool {
     ) {
         match self.target {
             DataFusionPoolTarget::Oracle => {
-                self.governor
-                    .inner
-                    .oracle_total_bytes
-                    .fetch_sub(shrink, Ordering::AcqRel);
-                self.governor
-                    .inner
-                    .bifrost_total_bytes
-                    .fetch_sub(shrink, Ordering::AcqRel);
+                if let Err(error) = self.governor.release_oracle_bytes_checked(shrink) {
+                    tracing::error!(error = %error, "DataFusion Oracle shrink poisoned accounting");
+                }
             }
             DataFusionPoolTarget::Parent => {
-                let reserved = self
-                    .governor
-                    .inner
-                    .bifrost_total_bytes
-                    .fetch_sub(shrink, Ordering::AcqRel)
-                    .saturating_sub(shrink);
+                let reserved = match self.governor.release_counter_only(
+                    &self.governor.inner.bifrost_total_bytes,
+                    shrink,
+                    MemoryPurpose::ForgeWorkspace,
+                ) {
+                    Ok(()) => self
+                        .governor
+                        .inner
+                        .bifrost_total_bytes
+                        .load(Ordering::Acquire),
+                    Err(error) => {
+                        tracing::error!(error = %error, "DataFusion parent shrink poisoned accounting");
+                        self.governor
+                            .inner
+                            .bifrost_total_bytes
+                            .load(Ordering::Acquire)
+                    }
+                };
                 record_forge_memory(reservation, reserved, None);
             }
         }
@@ -1322,7 +1994,12 @@ impl MemoryLedger {
         let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
             detail: "active memory ledger lock poisoned".to_owned(),
         })?;
-        let target = active.bytes().saturating_add(bytes);
+        let target = active
+            .bytes()
+            .checked_add(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "active memory ledger byte count overflow".to_owned(),
+            })?;
         active.resize(target)
     }
 
@@ -1348,8 +2025,32 @@ impl MemoryLedger {
         let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
             detail: "active memory ledger lock poisoned".to_owned(),
         })?;
-        let target = active.bytes().saturating_sub(bytes);
+        let target = active
+            .bytes()
+            .checked_sub(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "active memory ledger byte count underflow".to_owned(),
+            })?;
         active.resize(target)
+    }
+
+    /// Check active ledger ownership before a coordinated cleanup releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the governor if the
+    /// ledger cannot cover `bytes` or its lock is poisoned.
+    pub(crate) fn preflight_release_active(&self, bytes: usize) -> Result<(), ScribeError> {
+        let active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned during release preflight".to_owned(),
+        })?;
+        if active.bytes() < bytes {
+            active.governor.parent.poison();
+            return Err(ScribeError::Internal {
+                detail: "active memory ledger underflow during release preflight".to_owned(),
+            });
+        }
+        active.preflight_release(bytes)
     }
 
     /// Move Arrow ownership from writable buckets to immutable generations.
@@ -1379,7 +2080,32 @@ impl MemoryLedger {
         let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?;
-        active.transfer_bytes_to(&mut immutable, bytes);
+        active.transfer_bytes_to(&mut immutable, bytes)
+    }
+
+    /// Check active and immutable ledger ownership before a lifecycle transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the governor when the
+    /// source cannot cover `bytes`, the target would overflow, or either lock
+    /// is poisoned.
+    pub(crate) fn preflight_move_active_to_immutable(
+        &self,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        let active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned during move preflight".to_owned(),
+        })?;
+        let immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned during move preflight".to_owned(),
+        })?;
+        if active.bytes() < bytes || immutable.bytes().checked_add(bytes).is_none() {
+            active.governor.parent.poison();
+            return Err(ScribeError::Internal {
+                detail: "active-to-immutable ledger move failed preflight".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -1404,7 +2130,33 @@ impl MemoryLedger {
         let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?;
-        immutable.transfer_bytes_to(&mut active, bytes);
+        immutable.transfer_bytes_to(&mut active, bytes)
+    }
+
+    /// Check immutable-to-active ledger ownership before a post-commit abort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the governor when the
+    /// immutable source cannot cover `bytes`, the active target would overflow,
+    /// or either ledger lock is poisoned.
+    pub(crate) fn preflight_move_immutable_to_active(
+        &self,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        let active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned during reverse move preflight".to_owned(),
+        })?;
+        let immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned during reverse move preflight"
+                .to_owned(),
+        })?;
+        if immutable.bytes() < bytes || active.bytes().checked_add(bytes).is_none() {
+            active.governor.parent.poison();
+            return Err(ScribeError::Internal {
+                detail: "immutable-to-active ledger move failed preflight".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -1413,8 +2165,39 @@ impl MemoryLedger {
         let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?;
-        let target = immutable.bytes().saturating_sub(bytes);
+        let target = immutable
+            .bytes()
+            .checked_sub(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "immutable memory ledger byte count underflow".to_owned(),
+            })?;
         immutable.resize(target)
+    }
+
+    /// Check immutable ledger ownership before explicit retirement mutates it.
+    pub(crate) fn preflight_release_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned during preflight".to_owned(),
+        })?;
+        if immutable.bytes() < bytes {
+            immutable.governor.parent.poison();
+            return Err(ScribeError::Internal {
+                detail: "immutable memory ledger underflow during preflight".to_owned(),
+            });
+        }
+        immutable.preflight_release(bytes)
+    }
+
+    /// Poison the shared governor after an impossible post-preflight mutation.
+    ///
+    /// Explicit retirement performs all recoverable checks before releasing
+    /// ownership. If the subsequent token commit nevertheless fails, the
+    /// accounting state may have partially advanced and all future admission
+    /// must fail closed.
+    pub(crate) fn poison(&self) {
+        if let Ok(immutable) = self.immutable.lock() {
+            immutable.governor.parent.poison();
+        }
     }
 
     /// Reserve immutable ownership during boot replay.
@@ -1422,7 +2205,12 @@ impl MemoryLedger {
         let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?;
-        let target = immutable.bytes().saturating_add(bytes);
+        let target = immutable
+            .bytes()
+            .checked_add(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "immutable memory ledger byte count overflow".to_owned(),
+            })?;
         immutable.resize(target)
     }
 
@@ -1460,15 +2248,42 @@ impl MemoryLedger {
             .expect("immutable memory ledger lock poisoned")
             .bytes()
     }
+
+    /// Reports the shared governor poison state for owner-level fault tests.
+    #[cfg(test)]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.active
+            .lock()
+            .expect("active memory ledger lock invariant for inspection")
+            .governor
+            .is_poisoned()
+    }
+}
+
+/// Preflighted attached-shard growth committed only after shared reservation succeeds.
+#[derive(Debug)]
+struct ShardGrowthPlan {
+    /// Shared shard counters containing the owned shard slot.
+    counters: Arc<Vec<AtomicUsize>>,
+    /// Index of the shard counter coupled to the reservation.
+    shard: usize,
+    /// Counter value observed before the replacement reservation was acquired.
+    current: usize,
 }
 
 /// RAII category reservation.
 #[derive(Debug)]
 pub struct MemoryReservation {
+    /// Shared Scribe budget charged by this reservation.
     governor: ScribeMemoryBudget,
+    /// Lifecycle category carrying the owned bytes.
     category: MemoryCategory,
+    /// Exact byte count released when this reservation drops.
     bytes: usize,
+    /// Optional shard counter charged alongside category and shared totals.
     shard: Option<(Arc<Vec<AtomicUsize>>, usize)>,
+    /// Entry-point purpose retained across category and shard transfers.
+    purpose: MemoryPurpose,
 }
 
 impl MemoryReservation {
@@ -1478,12 +2293,49 @@ impl MemoryReservation {
         self.bytes
     }
 
+    /// Validates this reservation and every coupled governor counter before release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the shared governor when
+    /// the reservation, category, shard, Scribe-child, or parent counter cannot
+    /// cover `bytes`.
+    fn preflight_release(&self, bytes: usize) -> Result<(), ScribeError> {
+        if self.bytes < bytes {
+            self.governor.parent.poison();
+            return Err(ScribeError::Internal {
+                detail: "memory reservation ownership underflow during release preflight"
+                    .to_owned(),
+            });
+        }
+        self.governor
+            .parent
+            .preflight_release_checked(
+                self.category,
+                bytes,
+                self.shard
+                    .as_ref()
+                    .map(|(counters, index)| (counters, *index)),
+            )
+            .map_err(MemoryRejection::into_scribe_error)
+    }
+
     /// Resize this reservation while preserving category ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when growth exceeds a ceiling, shared accounting
+    /// is poisoned, or checked shard/shared ownership cannot be updated exactly.
     pub fn resize(&mut self, bytes: usize) -> Result<(), ScribeError> {
         self.resize_with_limit(bytes, self.governor.limit_bytes())
     }
 
     /// Resize an ingress reservation without consuming persistence headroom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when growth exceeds the ingress or shared
+    /// ceiling, accounting is poisoned, or checked release/growth fails.
     pub fn resize_ingress(&mut self, bytes: usize) -> Result<(), ScribeError> {
         self.resize_ingress_classified(bytes)
             .map_err(ScribeRejectionCeiling::into_ingest_busy)
@@ -1493,9 +2345,9 @@ impl MemoryReservation {
     ///
     /// This is the ceiling-classified form of [`Self::resize_ingress`]: the
     /// grow path acquires the extra bytes against the ingress sublimit and the
-    /// shrink path releases, exactly as before, but a grow rejection returns the
+    /// shrink path performs a checked release. A grow rejection returns the
     /// closed [`ScribeRejectionCeiling`] that tripped so the admission caller can
-    /// label rejection telemetry (D84). A shrink never fails.
+    /// label rejection telemetry (D84); a corrupt shrink poisons and fails closed.
     ///
     /// # Errors
     ///
@@ -1521,9 +2373,10 @@ impl MemoryReservation {
     ///
     /// The classified core underneath both [`Self::resize`] and
     /// [`Self::resize_ingress`]. Growing acquires only the delta through the
-    /// classified reservation core and forgets the replacement so accounting is
-    /// unchanged; shrinking releases the delta and cannot fail. `child_ceiling`
-    /// names the ceiling to report on a Scribe-child overflow during a grow.
+    /// classified reservation core and forgets the replacement only after the
+    /// attached-shard CAS succeeds. Shrinking releases the delta with checked
+    /// accounting. `child_ceiling` names a physical grow refusal; corruption
+    /// poisons the shared governor and fails closed.
     ///
     /// # Errors
     ///
@@ -1537,20 +2390,31 @@ impl MemoryReservation {
     ) -> Result<(), ScribeRejectionCeiling> {
         if bytes > self.bytes {
             let extra = bytes - self.bytes;
+            let shard_plan = self
+                .preflight_shard_add(extra)
+                .map_err(|_| ScribeRejectionCeiling::ScribeChild)?;
             let replacement = self.governor.try_reserve_with_limit_classified(
                 self.category,
                 extra,
                 limit,
                 child_ceiling,
             )?;
+            self.commit_shard_add(shard_plan, extra)
+                .map_err(|_| ScribeRejectionCeiling::ScribeChild)?;
             self.bytes = bytes;
             std::mem::forget(replacement);
-            self.adjust_shard_add(extra);
         } else {
             let released = self.bytes - bytes;
-            self.governor.release(self.category, released);
+            self.governor
+                .release(
+                    self.category,
+                    released,
+                    self.shard
+                        .as_ref()
+                        .map(|(counters, index)| (counters, *index)),
+                )
+                .map_err(|_| ScribeRejectionCeiling::ScribeChild)?;
             self.bytes = bytes;
-            self.adjust_shard_sub(released);
         }
         Ok(())
     }
@@ -1559,25 +2423,145 @@ impl MemoryReservation {
         if shard >= shard_bytes.len() || self.shard.is_some() {
             return;
         }
-        shard_bytes[shard].fetch_add(self.bytes, Ordering::AcqRel);
+        let counter = &shard_bytes[shard];
+        let current = counter.load(Ordering::Acquire);
+        let Some(next) = current.checked_add(self.bytes) else {
+            self.governor.parent.poison();
+            tracing::error!("memory reservation shard accounting overflow during attach");
+            return;
+        };
+        if counter
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.governor.parent.poison();
+            tracing::error!("memory reservation shard accounting changed during attach");
+            return;
+        }
         self.shard = Some((shard_bytes, shard));
     }
 
-    fn adjust_shard_add(&self, bytes: usize) {
+    /// Validates an attached shard counter before a growth reservation is acquired.
+    ///
+    /// The returned plan pins the observed value used by the post-reservation
+    /// compare-exchange. The replacement reservation remains RAII-owned until
+    /// that compare-exchange succeeds, so a race cannot leak child, parent, or
+    /// category accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the governor when the
+    /// attached shard counter would overflow.
+    fn preflight_shard_add(&self, bytes: usize) -> Result<Option<ShardGrowthPlan>, ScribeError> {
         if let Some((shard_bytes, shard)) = &self.shard {
-            shard_bytes[*shard].fetch_add(bytes, Ordering::AcqRel);
+            let counter = &shard_bytes[*shard];
+            let current = counter.load(Ordering::Acquire);
+            current.checked_add(bytes).ok_or_else(|| {
+                self.governor.parent.poison();
+                ScribeError::Internal {
+                    detail: "memory reservation shard accounting overflow".to_owned(),
+                }
+            })?;
+            return Ok(Some(ShardGrowthPlan {
+                counters: Arc::clone(shard_bytes),
+                shard: *shard,
+                current,
+            }));
         }
+        Ok(None)
     }
 
-    fn adjust_shard_sub(&self, bytes: usize) {
-        if let Some((shard_bytes, shard)) = &self.shard {
-            shard_bytes[*shard].fetch_sub(bytes, Ordering::AcqRel);
+    /// Commits one preflighted attached-shard growth after replacement ownership exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the governor when the
+    /// shard counter changed after preflight or would overflow. The caller must
+    /// retain the replacement reservation so its `Drop` rolls back shared
+    /// category, child, and parent ownership on this failure path.
+    fn commit_shard_add(
+        &self,
+        shard_plan: Option<ShardGrowthPlan>,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        let Some(ShardGrowthPlan {
+            counters,
+            shard,
+            current,
+        }) = shard_plan
+        else {
+            return Ok(());
+        };
+        let next = current.checked_add(bytes).ok_or_else(|| {
+            self.governor.parent.poison();
+            ScribeError::Internal {
+                detail: "memory reservation shard accounting overflow".to_owned(),
+            }
+        })?;
+        let counter = &counters[shard];
+        #[cfg(test)]
+        if self
+            .governor
+            .parent
+            .inner
+            .fail_next_shard_add_cas
+            .swap(false, Ordering::AcqRel)
+            && bytes > 0
+        {
+            counter.store(current.saturating_add(1), Ordering::Release);
         }
+        counter
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                self.governor.parent.poison();
+                ScribeError::Internal {
+                    detail: "memory reservation shard accounting changed during growth".to_owned(),
+                }
+            })
+            .map(|_| ())
+    }
+
+    fn adjust_shard_sub(&self, bytes: usize) -> Result<(), ScribeError> {
+        if let Some((shard_bytes, shard)) = &self.shard {
+            let current = shard_bytes[*shard].load(Ordering::Acquire);
+            if current < bytes {
+                self.governor.parent.poison();
+                return Err(ScribeError::Internal {
+                    detail: "memory reservation shard accounting underflow".to_owned(),
+                });
+            }
+            shard_bytes[*shard]
+                .compare_exchange(
+                    current,
+                    current - bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| ScribeError::Internal {
+                    detail: "memory reservation shard accounting changed during release".to_owned(),
+                })?;
+        }
+        Ok(())
     }
 
     fn detach_shard(&mut self) {
         if let Some((shard_bytes, shard)) = self.shard.take() {
-            shard_bytes[shard].fetch_sub(self.bytes, Ordering::AcqRel);
+            let current = shard_bytes[shard].load(Ordering::Acquire);
+            if current < self.bytes {
+                self.governor.parent.poison();
+                tracing::error!("memory reservation shard accounting underflow during drop");
+            } else if shard_bytes[shard]
+                .compare_exchange(
+                    current,
+                    current - self.bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                self.governor.parent.poison();
+                tracing::error!("memory reservation shard accounting changed during drop");
+            }
         }
     }
 
@@ -1594,6 +2578,7 @@ impl MemoryReservation {
             category: self.category,
             bytes,
             shard: self.shard.clone(),
+            purpose: self.purpose,
         })
     }
 
@@ -1634,36 +2619,160 @@ impl MemoryReservation {
     /// category total is left untouched (the sub and add would cancel); the
     /// ledger reservations are shard-unattached, so their shard adjustments are
     /// no-ops. This operation is infallible and performs no pool interaction.
-    fn transfer_bytes_to(&mut self, other: &mut MemoryReservation, bytes: usize) {
-        let moved = bytes.min(self.bytes);
-        if self.category != other.category {
-            self.governor.parent.inner.categories[self.category as usize]
-                .fetch_sub(moved, Ordering::AcqRel);
-            self.governor.parent.inner.categories[other.category as usize]
-                .fetch_add(moved, Ordering::AcqRel);
+    fn transfer_bytes_to(
+        &mut self,
+        other: &mut MemoryReservation,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        if bytes > self.bytes {
+            return Err(ScribeError::Internal {
+                detail: "memory reservation transfer exceeds owned bytes".to_owned(),
+            });
         }
+        let moved = bytes;
+        let target_bytes = other.bytes.checked_add(moved).ok_or_else(|| {
+            self.governor.parent.poison();
+            ScribeError::Internal {
+                detail: "memory reservation transfer overflow".to_owned(),
+            }
+        })?;
+        if let Some((shard_bytes, shard)) = &self.shard
+            && shard_bytes[*shard].load(Ordering::Acquire) < moved
+        {
+            self.governor.parent.poison();
+            return Err(ScribeError::Internal {
+                detail: "memory reservation shard accounting underflow during transfer".to_owned(),
+            });
+        }
+        if let Some((shard_bytes, shard)) = &other.shard
+            && shard_bytes[*shard]
+                .load(Ordering::Acquire)
+                .checked_add(moved)
+                .is_none()
+        {
+            self.governor.parent.poison();
+            return Err(ScribeError::Internal {
+                detail: "memory reservation shard accounting overflow during transfer".to_owned(),
+            });
+        }
+        if self.category != other.category {
+            let source = &self.governor.parent.inner.categories[self.category as usize];
+            let target = &self.governor.parent.inner.categories[other.category as usize];
+            let source_current = source.load(Ordering::Acquire);
+            if source_current < moved {
+                self.governor.parent.poison();
+                return Err(ScribeError::Internal {
+                    detail: "memory reservation category accounting underflow during transfer"
+                        .to_owned(),
+                });
+            }
+            let target_current = target.load(Ordering::Acquire);
+            let target_next = target_current.checked_add(moved).ok_or_else(|| {
+                self.governor.parent.poison();
+                ScribeError::Internal {
+                    detail: "memory reservation category accounting overflow during transfer"
+                        .to_owned(),
+                }
+            })?;
+            source
+                .compare_exchange(
+                    source_current,
+                    source_current - moved,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| {
+                    self.governor.parent.poison();
+                    ScribeError::Internal {
+                        detail: "memory reservation category changed during transfer".to_owned(),
+                    }
+                })?;
+            target
+                .compare_exchange(
+                    target_current,
+                    target_next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| {
+                    self.governor.parent.poison();
+                    ScribeError::Internal {
+                        detail: "memory reservation category changed during transfer".to_owned(),
+                    }
+                })?;
+        }
+        let other_shard_plan = other.preflight_shard_add(moved)?;
         self.bytes -= moved;
-        other.bytes += moved;
-        self.adjust_shard_sub(moved);
-        other.adjust_shard_add(moved);
+        other.bytes = target_bytes;
+        self.adjust_shard_sub(moved)?;
+        other.commit_shard_add(other_shard_plan, moved)?;
+        Ok(())
     }
 
     /// Move accounting to another lifecycle category without changing totals.
-    pub fn transfer_category(&mut self, category: MemoryCategory) {
+    pub fn transfer_category(&mut self, category: MemoryCategory) -> Result<(), ScribeError> {
         if self.category != category {
+            let current = self.governor.parent.inner.categories[self.category as usize]
+                .load(Ordering::Acquire);
+            if current < self.bytes {
+                self.governor.parent.poison();
+                return Err(ScribeError::Internal {
+                    detail: "memory reservation category accounting underflow".to_owned(),
+                });
+            }
+            let target = &self.governor.parent.inner.categories[category as usize];
+            let target_current = target.load(Ordering::Acquire);
+            let target_next = target_current.checked_add(self.bytes).ok_or_else(|| {
+                self.governor.parent.poison();
+                ScribeError::Internal {
+                    detail: "memory reservation category accounting overflow during transfer"
+                        .to_owned(),
+                }
+            })?;
             self.governor.parent.inner.categories[self.category as usize]
-                .fetch_sub(self.bytes, Ordering::AcqRel);
-            self.governor.parent.inner.categories[category as usize]
-                .fetch_add(self.bytes, Ordering::AcqRel);
+                .compare_exchange(
+                    current,
+                    current - self.bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| {
+                    self.governor.parent.poison();
+                    ScribeError::Internal {
+                        detail: "memory reservation category accounting changed during transfer"
+                            .to_owned(),
+                    }
+                })?;
+            target
+                .compare_exchange(
+                    target_current,
+                    target_next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| {
+                    self.governor.parent.poison();
+                    ScribeError::Internal {
+                        detail: "memory reservation category accounting changed during transfer"
+                            .to_owned(),
+                    }
+                })?;
         }
         self.category = category;
+        Ok(())
     }
 }
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
-        self.detach_shard();
-        self.governor.release(self.category, self.bytes);
+        let shard = self
+            .shard
+            .as_ref()
+            .map(|(counters, index)| (counters, *index));
+        if let Err(rejection) = self.governor.release(self.category, self.bytes, shard) {
+            tracing::error!(error = %rejection, "memory reservation cleanup poisoned accounting");
+        }
+        self.shard = None;
     }
 }
 
@@ -1697,18 +2806,39 @@ fn resolve_child_limit(
     }
 }
 
-fn reserve_with_limit(total: &AtomicUsize, limit: usize, bytes: usize) -> Result<(), ScribeError> {
+/// Reserve one counter with checked addition and bounded diagnostic operands.
+fn reserve_with_limit_diagnostic(
+    total: &AtomicUsize,
+    limit: usize,
+    bytes: usize,
+    purpose: MemoryPurpose,
+    ceiling: MemoryCeiling,
+) -> Result<(), MemoryRejection> {
     let mut current = total.load(Ordering::Acquire);
     loop {
         let Some(next) = current.checked_add(bytes) else {
-            return Err(ScribeError::IngestBusy {
-                table: "memory".to_owned(),
-            });
+            return Err(MemoryRejection::new(
+                MemoryRejectionKind::CounterOverflow,
+                purpose,
+                MemoryCeiling::NotApplicable,
+                bytes,
+                current,
+                limit,
+            ));
         };
         if next > limit {
-            return Err(ScribeError::IngestBusy {
-                table: "memory".to_owned(),
-            });
+            return Err(MemoryRejection::new(
+                if bytes > limit {
+                    MemoryRejectionKind::RequestTooLarge
+                } else {
+                    MemoryRejectionKind::Occupied
+                },
+                purpose,
+                ceiling,
+                bytes,
+                current,
+                limit,
+            ));
         }
         match total.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Ok(()),
@@ -2029,7 +3159,9 @@ mod tests {
             .scribe_budget()
             .try_reserve(MemoryCategory::Decode, 512)
             .expect("reserve");
-        reservation.transfer_category(MemoryCategory::Prepared);
+        reservation
+            .transfer_category(MemoryCategory::Prepared)
+            .expect("category transfer");
         let snapshot = governor.snapshot();
         assert_eq!(snapshot.categories[MemoryCategory::Decode as usize], 0);
         assert_eq!(snapshot.categories[MemoryCategory::Prepared as usize], 512);
@@ -2064,7 +3196,9 @@ mod tests {
         assert_eq!(budget.shard_snapshot()[3], 384);
 
         let ledger = MemoryLedger::new(&budget).expect("ledger");
-        reservation.transfer_category(MemoryCategory::Active);
+        reservation
+            .transfer_category(MemoryCategory::Active)
+            .expect("category transfer");
         ledger.absorb_active(reservation).expect("absorb");
         assert_eq!(budget.shard_snapshot()[3], 0);
         ledger.release_active(384).expect("release");
@@ -2080,7 +3214,9 @@ mod tests {
             .try_reserve(MemoryCategory::Prepared, 512)
             .expect("prepared reservation");
         let mut active = prepared.split(256).expect("active split");
-        active.transfer_category(MemoryCategory::Active);
+        active
+            .transfer_category(MemoryCategory::Active)
+            .expect("category transfer");
         ledger.absorb_active(active).expect("absorb active lease");
 
         let snapshot = governor.snapshot();
@@ -2126,29 +3262,17 @@ mod tests {
         assert_eq!(after.scribe_total_bytes, before.scribe_total_bytes);
     }
 
-    /// An over-large move clamps to owned bytes and never fails.
-    ///
-    /// The net-zero move can only fail on a poisoned lock, never on inputs:
-    /// requesting more than the reservation owns moves exactly the owned bytes
-    /// and returns `Ok`. This is the reachable-failure half of the D97
-    /// two-legal-states proof — after any single move the bucket is either fully
-    /// Active-accounted (retryable) or fully Immutable-accounted (queued), never
-    /// a stranded partial state.
+    /// An over-large move is rejected without changing either category.
     #[test]
     fn seal_move_clamps_to_owned_bytes_without_failing() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let budget = governor.scribe_budget();
         let ledger = MemoryLedger::new(&budget).expect("ledger");
         ledger.reserve_active(2048).expect("reserve active");
-        ledger
-            .move_active_to_immutable(1_000_000)
-            .expect("clamped move");
+        assert!(ledger.move_active_to_immutable(1_000_000).is_err());
         let snapshot = governor.snapshot();
-        assert_eq!(snapshot.categories[MemoryCategory::Active as usize], 0);
-        assert_eq!(
-            snapshot.categories[MemoryCategory::Immutable as usize],
-            2048
-        );
+        assert_eq!(snapshot.categories[MemoryCategory::Active as usize], 2048);
+        assert_eq!(snapshot.categories[MemoryCategory::Immutable as usize], 0);
         assert_eq!(snapshot.scribe_total_bytes, 2048);
     }
 
@@ -2666,5 +3790,289 @@ mod tests {
             snap.bifrost_total_bytes,
             snap.scribe_total_bytes + snap.oracle_total_bytes
         );
+    }
+
+    /// Refusals retain the exact physical ceiling and the observed operands.
+    #[test]
+    fn reservation_rejection_names_ceiling_and_operands() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let budget = governor.scribe_budget();
+        let rejection = budget
+            .try_reserve_classified(MemoryCategory::Raw, budget.limit_bytes() + 1)
+            .expect_err("request larger than the child ceiling must reject");
+        assert_eq!(rejection.kind(), MemoryRejectionKind::RequestTooLarge);
+        assert_eq!(rejection.purpose(), MemoryPurpose::ScribeIngress);
+        assert_eq!(rejection.ceiling(), MemoryCeiling::ScribeChild);
+        assert_eq!(rejection.requested(), budget.limit_bytes() + 1);
+        assert_eq!(rejection.current(), 0);
+        assert_eq!(rejection.limit(), budget.limit_bytes());
+    }
+
+    /// Entry-point purpose remains stable when lifecycle categories change.
+    #[test]
+    fn reservation_purpose_follows_entry_point_and_survives_category_transfer() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let mut ingress = governor
+            .scribe_budget()
+            .try_reserve(MemoryCategory::Raw, 64)
+            .expect("ingress reservation");
+        ingress
+            .transfer_category(MemoryCategory::Immutable)
+            .expect("transfer");
+        assert_eq!(ingress.purpose, MemoryPurpose::ScribeIngress);
+        let maintenance = governor
+            .scribe_budget()
+            .try_reserve_maintenance(MemoryCategory::Decode, 64)
+            .expect("maintenance reservation");
+        assert_eq!(maintenance.purpose, MemoryPurpose::ScribeMaintenance);
+    }
+
+    /// Overflow has no physical Scribe ceiling label to emit.
+    #[test]
+    fn not_applicable_rejection_emits_no_scribe_ceiling_label() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+            let budget = governor.scribe_budget();
+            let limit = budget.ingress_limit_bytes();
+            assert!(
+                budget
+                    .try_reserve_ingress(MemoryCategory::Raw, limit + 1)
+                    .is_err()
+            );
+            crate::scribe::record_scribe_ceiling_rejection(ScribeRejectionCeiling::IngressSublimit);
+            let positive = recorder.snapshot();
+            assert_eq!(
+                positive
+                    .counters
+                    .get("bifrost_scribe_rejections_total{reason=\"ingress_sublimit\"}"),
+                Some(&1)
+            );
+            let before = positive.counters;
+            let counter = AtomicUsize::new(usize::MAX);
+            let rejection = reserve_with_limit_diagnostic(
+                &counter,
+                usize::MAX,
+                1,
+                MemoryPurpose::ScribeIngress,
+                MemoryCeiling::ScribeChild,
+            )
+            .expect_err("counter overflow");
+            assert_eq!(rejection.ceiling(), MemoryCeiling::NotApplicable);
+            governor.poison();
+            assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_err());
+            assert_eq!(recorder.snapshot().counters, before);
+        });
+    }
+
+    /// A checked release leaves all counters intact when category ownership is corrupt.
+    #[test]
+    fn checked_release_refuses_underflow_without_mutation() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let budget = governor.scribe_budget();
+        let reservation = budget
+            .try_reserve(MemoryCategory::Raw, 64)
+            .expect("reservation");
+        governor.inner.categories[MemoryCategory::Raw as usize].store(0, Ordering::Release);
+        let before = governor.snapshot();
+        let error = budget
+            .release(MemoryCategory::Raw, 64, None)
+            .expect_err("corrupt category must not release totals");
+        assert_eq!(error.kind(), MemoryRejectionKind::CounterOverflow);
+        let after = governor.snapshot();
+        assert_eq!(after.scribe_total_bytes, before.scribe_total_bytes);
+        assert_eq!(after.bifrost_total_bytes, before.bifrost_total_bytes);
+        std::mem::forget(reservation);
+    }
+
+    /// Drop underflow poisons without wrapping either shared total.
+    #[test]
+    fn drop_underflow_poison_does_not_wrap_or_panic() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let reservation = governor
+            .scribe_budget()
+            .try_reserve(MemoryCategory::Raw, 64)
+            .expect("reservation");
+        governor.inner.categories[MemoryCategory::Raw as usize].store(0, Ordering::Release);
+        drop(reservation);
+        assert!(governor.is_poisoned());
+        assert_eq!(governor.snapshot().scribe_total_bytes, 64);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 64);
+    }
+
+    /// Cleanup on a panicking path remains non-panicking and poisons admission.
+    #[test]
+    fn drop_underflow_during_unwind_does_not_double_panic() {
+        /// Deliberately starts the outer unwind after the reservation is live.
+        struct Sentinel;
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                panic!("sentinel unwind");
+            }
+        }
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let reservation = governor
+                .scribe_budget()
+                .try_reserve(MemoryCategory::Raw, 64)
+                .expect("reservation");
+            governor.inner.categories[MemoryCategory::Raw as usize].store(0, Ordering::Release);
+            let _sentinel = Sentinel;
+            let _ = reservation;
+        }));
+        let message = result
+            .expect_err("sentinel must panic")
+            .downcast::<&str>()
+            .expect("sentinel panic payload");
+        assert_eq!(*message, "sentinel unwind");
+        assert!(governor.is_poisoned());
+        assert_eq!(governor.snapshot().scribe_total_bytes, 64);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 64);
+    }
+
+    /// Distinct reservations can release concurrently and return shared totals to zero.
+    #[test]
+    fn concurrent_distinct_owner_releases_return_to_baseline() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let budget = governor.scribe_budget();
+            joins.push(std::thread::spawn(move || {
+                let reservation = budget
+                    .try_reserve(MemoryCategory::Raw, 1024)
+                    .expect("reservation");
+                drop(reservation);
+            }));
+        }
+        for join in joins {
+            join.join().expect("worker must not panic");
+        }
+        assert_eq!(governor.snapshot().scribe_total_bytes, 0);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
+        assert!(!governor.is_poisoned());
+    }
+
+    /// Poison rejects every nonzero Scribe, Oracle, and parent acquisition.
+    #[test]
+    fn poison_refuses_scribe_oracle_parent_and_datafusion_acquisitions() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        governor.poison();
+        assert!(
+            governor
+                .scribe_budget()
+                .try_reserve(MemoryCategory::Raw, 1)
+                .is_err()
+        );
+        assert!(governor.oracle_budget().try_reserve(1).is_err());
+        assert!(governor.try_reserve_parent(1).is_err());
+        let pool: Arc<dyn MemoryPool> = Arc::new(BifrostDataFusionMemoryPool::for_oracle(governor));
+        let reservation = MemoryConsumer::new("oracle-test").register(&pool);
+        assert!(reservation.try_grow(1).is_err());
+    }
+
+    /// DataFusion shrink corruption is contained by the shared poison bit.
+    #[test]
+    fn datafusion_shrink_underflow_poison_is_fail_closed() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(BifrostDataFusionMemoryPool::for_oracle(governor.clone()));
+        let reservation = MemoryConsumer::new("oracle-test").register(&pool);
+        reservation.try_grow(64).expect("grow");
+        governor
+            .inner
+            .oracle_total_bytes
+            .store(0, Ordering::Release);
+        drop(reservation);
+        assert!(governor.is_poisoned());
+        assert!(governor.oracle_budget().try_reserve(1).is_err());
+    }
+
+    /// Category and shard mismatches reject without subtracting shared totals.
+    #[test]
+    fn reserve_rollback_and_category_shard_release_are_checked() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let budget = governor.scribe_budget();
+        let mut reservation = budget
+            .try_reserve(MemoryCategory::Raw, 64)
+            .expect("reservation");
+        reservation.attach_shard(budget.shard_accounting(), 0);
+        governor.inner.shard_bytes[0].store(0, Ordering::Release);
+        let before = governor.snapshot();
+        assert!(
+            budget
+                .release(
+                    MemoryCategory::Raw,
+                    64,
+                    reservation
+                        .shard
+                        .as_ref()
+                        .map(|(counters, index)| (counters, *index)),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            governor.snapshot().scribe_total_bytes,
+            before.scribe_total_bytes
+        );
+        assert!(governor.is_poisoned());
+        reservation.shard = None;
+        std::mem::forget(reservation);
+    }
+
+    /// A one-shot post-preflight CAS fault poisons and contains partial release.
+    #[test]
+    fn post_preflight_fault_poison_contains_partial_release() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let budget = governor.scribe_budget();
+        let reservation = budget
+            .try_reserve(MemoryCategory::Raw, 64)
+            .expect("reservation");
+        budget.arm_post_preflight_release_fault();
+        drop(reservation);
+        assert!(governor.is_poisoned());
+        assert!(governor.snapshot().scribe_total_bytes <= 64);
+        assert!(governor.snapshot().bifrost_total_bytes <= 64);
+        assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_err());
+        assert!(governor.oracle_budget().try_reserve(1).is_err());
+        assert!(governor.try_reserve_parent(1).is_err());
+
+        let oracle_pool: Arc<dyn MemoryPool> =
+            Arc::new(BifrostDataFusionMemoryPool::for_oracle(governor.clone()));
+        let parent_pool: Arc<dyn MemoryPool> =
+            Arc::new(BifrostDataFusionMemoryPool::for_parent(governor.clone()));
+        let oracle = MemoryConsumer::new("poisoned-oracle").register(&oracle_pool);
+        let parent = MemoryConsumer::new("poisoned-parent").register(&parent_pool);
+        assert!(oracle.try_grow(1).is_err());
+        assert!(parent.try_grow(1).is_err());
+    }
+
+    /// A post-preflight shard race rolls back replacement ownership and preserves the lease.
+    #[test]
+    fn resize_growth_post_preflight_shard_fault_rolls_back_and_poisons() {
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
+        let budget = governor.scribe_budget();
+        let mut reservation = budget
+            .try_reserve(MemoryCategory::Raw, 64)
+            .expect("reservation");
+        reservation.attach_shard(budget.shard_accounting(), 0);
+        let before = budget.accounting_snapshot_for_test();
+        budget.arm_post_preflight_shard_add_fault();
+
+        assert!(reservation.resize(128).is_err());
+        let after = budget.accounting_snapshot_for_test();
+        assert_eq!(reservation.bytes(), 64);
+        assert!(governor.is_poisoned());
+        assert_eq!(after.0.bifrost_total_bytes, before.0.bifrost_total_bytes);
+        assert_eq!(after.0.scribe_total_bytes, before.0.scribe_total_bytes);
+        assert_eq!(after.0.categories, before.0.categories);
+        assert_eq!(after.1[0], before.1[0] + 1);
+        reservation.shard = None;
+        drop(reservation);
     }
 }

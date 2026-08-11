@@ -494,6 +494,23 @@ impl Memtable {
         Ok(buckets.get(seal_key).map_or(0, |b| b.row_count))
     }
 
+    /// Returns exact writable Arrow ownership for one seal-key before freeze.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the writable-bucket lock is poisoned.
+    pub(crate) fn writable_bytes(&self, seal_key: &SealKey) -> Result<usize, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable bucket lock poisoned: {error}"),
+            })?;
+        Ok(buckets
+            .get(seal_key)
+            .map_or(0, |bucket| bucket.bytes_accumulated))
+    }
+
     /// Report whether a stranded pending frozen generation exists for a key.
     ///
     /// The shard seal-retry path uses this to tell a genuinely stranded
@@ -862,42 +879,72 @@ impl Memtable {
             }))
     }
 
-    /// Retire one durably published generation by seal ID.
-    ///
-    /// Eligibility invariant: a generation retires iff its state is
-    /// [`ImmutableState::Committed`], which is only entered after the fenced
-    /// `vala.file_list` + audit transaction commits. This guarantees parquet is
-    /// always readable before the in-memory accounting is released.
-    ///
-    /// The ordering contract with WAL retirement is owned by the caller
-    /// (`ShardOwner::retire_committed`): `admission.release_immutable` and
-    /// `memory_ledger.release_immutable` are called before
-    /// `ScribeWalIoOp::RetireWal` is submitted.
+    /// Inspect one committed generation without removing its ownership.
     ///
     /// # Errors
+    /// Returns [`ScribeError::Internal`] when the immutable map lock is poisoned.
+    pub(crate) fn plan_committed_retirement(
+        &self,
+        seal_id: u64,
+    ) -> Result<Option<CommittedRetirement>, ScribeError> {
+        let immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        Ok(immutable.values().flatten().find_map(|entry| {
+            if entry.seal_id == seal_id && matches!(entry.state, ImmutableState::Committed { .. }) {
+                Some(CommittedRetirement {
+                    seal_id,
+                    arrow_bytes: entry.frozen.arrow_bytes,
+                    wal_range: entry.wal_range(),
+                })
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// Commit a previously planned retirement and remove exactly that entry.
     ///
-    /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
-    pub(crate) fn retire_generation(&self, seal_id: u64) -> Result<Option<WalRange>, ScribeError> {
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when the token no longer matches a
+    /// committed immutable generation or its lock is poisoned.
+    pub(crate) fn commit_retirement(
+        &self,
+        token: CommittedRetirement,
+    ) -> Result<WalRange, ScribeError> {
         let mut immutable = self
             .immutable
             .lock()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
-        let mut retired = None;
         for entries in immutable.values_mut() {
             let Some(index) = entries.iter().position(|entry| {
-                entry.seal_id() == seal_id
-                    && matches!(&entry.state, ImmutableState::Committed { .. })
+                entry.seal_id == token.seal_id
+                    && entry.frozen.arrow_bytes == token.arrow_bytes
+                    && matches!(entry.state, ImmutableState::Committed { .. })
             }) else {
                 continue;
             };
-            let entry = entries.remove(index);
-            retired = Some(entry.wal_range());
-            break;
+            let range = entries[index].wal_range();
+            if range != token.wal_range {
+                return Err(ScribeError::Internal {
+                    detail: format!(
+                        "retirement token WAL range changed for seal {}",
+                        token.seal_id
+                    ),
+                });
+            }
+            entries.remove(index);
+            immutable.retain(|_, values| !values.is_empty());
+            return Ok(token.wal_range);
         }
-        immutable.retain(|_, entries| !entries.is_empty());
-        Ok(retired)
+        Err(ScribeError::Internal {
+            detail: format!("retirement token no longer matches seal {}", token.seal_id),
+        })
     }
 
     /// Number of immutable generations currently retained.
@@ -1254,6 +1301,17 @@ pub struct WalRange {
     pub min: crate::scribe::wal::WalLsn,
     /// Inclusive upper LSN.
     pub max: crate::scribe::wal::WalLsn,
+}
+
+/// Private no-mutation retirement plan used by the shard owner preflight.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommittedRetirement {
+    /// Exact generation identity being retired.
+    pub(crate) seal_id: u64,
+    /// Arrow bytes that must be released with this generation.
+    pub(crate) arrow_bytes: usize,
+    /// WAL range released after ownership is removed.
+    pub(crate) wal_range: WalRange,
 }
 
 /// Frozen memtable snapshot for one seal-key.

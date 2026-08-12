@@ -1473,6 +1473,8 @@ pub struct DispatchContext {
     pub attempt_bytes: usize,
     /// In-memory threshold before query-scoped spill.
     pub attempt_memory_bytes: usize,
+    /// Shared pool from the leader's complete admitted query envelope.
+    pub query_memory_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
     /// Admission-owned cancellation propagated to every attempt await.
     pub cancellation: CancellationToken,
     /// Absolute deadline shared by reserve, execute, reads, and cleanup.
@@ -1701,14 +1703,20 @@ impl FragmentDispatcher {
             FragmentLocality::Remote
         };
         let mut telemetry = FragmentTelemetry::start(locality);
-        let mut buffer = match &self.memory_governor {
-            Some(governor) => AttemptBuffer::with_memory_governor(
+        let mut buffer = match (&context.query_memory_pool, &self.memory_governor) {
+            (Some(pool), _) => AttemptBuffer::with_memory_pool(
+                context.attempt_bytes,
+                context.attempt_memory_bytes,
+                pool,
+            )
+            .map_err(attempt_error)?,
+            (None, Some(governor)) => AttemptBuffer::with_memory_governor(
                 context.attempt_bytes,
                 context.attempt_memory_bytes,
                 governor,
             )
             .map_err(attempt_error)?,
-            None => {
+            (None, None) => {
                 AttemptBuffer::with_spill_limit(context.attempt_bytes, context.attempt_memory_bytes)
             }
         };
@@ -2554,6 +2562,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
+            query_memory_pool: None,
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
@@ -2622,6 +2631,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
+            query_memory_pool: None,
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
@@ -2688,6 +2698,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
+            query_memory_pool: None,
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_millis(10),
         };

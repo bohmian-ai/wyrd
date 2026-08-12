@@ -1,4 +1,4 @@
-//! Task 16 WAL failure, replay, and durable-ack closure coverage.
+//! WAL failure, replay, and durable-ack closure coverage.
 
 use std::sync::Arc;
 
@@ -42,8 +42,8 @@ fn audit() -> Vec<u8> {
     encode_audit_event(&AuditEvent {
         request_id: RequestId::now_v7(),
         trace_id: None,
-        operation: "task16.wal".to_owned(),
-        resource: "vala.bifrost.task16_wal".to_owned(),
+        operation: "scribe.wal".to_owned(),
+        resource: "vala.bifrost.scribe_wal".to_owned(),
         card_ref: None,
         principal_id: PrincipalId::new(Uuid::now_v7()),
         principal_kind: PrincipalKindTag::User,
@@ -504,7 +504,7 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
 #[test]
 /// Parent and Scribe hard limits reject before any WAL mutation.
 fn parent_scribe_and_wal_hard_limits_reject_before_append() {
-    // Use 4 GiB so both default 25% children fit within the 70% parent.
+    // Use 4 GiB so both protected role floors fit within managed memory.
     let governor = BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024).expect("memory governor");
     let parent = governor
         .try_reserve_parent(governor.bifrost_limit_bytes())

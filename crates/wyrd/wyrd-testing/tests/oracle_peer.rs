@@ -513,6 +513,7 @@ fn context(leader: NodeId) -> DispatchContext {
         permission_digest: "permission".to_owned(),
         attempt_bytes: 8 * 1024 * 1024,
         attempt_memory_bytes: 1,
+        query_memory_pool: None,
         cancellation: CancellationToken::new(),
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
     }

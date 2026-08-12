@@ -29,7 +29,6 @@ pub(crate) fn calibration_content_digest(bytes: &[u8]) -> String {
 /// Exact numeric proposal paths required before a candidate can be reviewed.
 pub const REQUIRED_PROPOSALS: &[&str] = &[
     "slot.cpu_cores_per_slot",
-    "slot.memory_bytes_per_slot",
     "slot.headroom_factor",
     "class.interactive.share",
     "class.interactive.minimum_slots",
@@ -57,9 +56,6 @@ pub const REQUIRED_PROPOSALS: &[&str] = &[
     "distribution.max_frame_bytes",
     "distribution.max_in_flight_fragments",
     "distribution.max_worker_concurrency",
-    "memory.oracle_limit_bytes",
-    "memory.class_limits",
-    "spill.limit_bytes",
     "performance.p95_query_millis",
     "performance.p99_query_millis",
     "performance.p95_ttfb_millis",
@@ -274,6 +270,61 @@ impl OracleCalibrationReport {
 }
 
 impl OracleCalibrationProfile {
+    /// Derives the deterministic scheduling/performance candidate from measured evidence.
+    ///
+    /// Resource-allocation proposals are intentionally absent because the
+    /// Bifrost resource governor derives capacity from the running process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report is invalid or contains no cases.
+    pub fn from_report(report: &OracleCalibrationReport) -> Result<Self, String> {
+        report.validate()?;
+        let report_bytes = calibration_report_bytes(report).map_err(|error| error.to_string())?;
+        let evidence = report
+            .cases
+            .iter()
+            .max_by(|left, right| left.p99_ms.total_cmp(&right.p99_ms))
+            .ok_or_else(|| "calibration matrix is empty".to_owned())?;
+        let proposal = REQUIRED_PROPOSALS
+            .iter()
+            .map(|key| {
+                (
+                    (*key).to_owned(),
+                    OracleProposalEvidence {
+                        value: proposal_value(key, evidence),
+                        evidence_case_id: evidence.case_id.clone(),
+                    },
+                )
+            })
+            .collect();
+        let profile = Self {
+            schema_version: 1,
+            status: "candidate".to_owned(),
+            generated_from: calibration_content_digest(&report_bytes),
+            source_revision: report.environment.source_revision.clone(),
+            proposal,
+        };
+        profile.validate(report)?;
+        Ok(profile)
+    }
+
+    /// Renders the canonical checked-in TOML representation.
+    #[must_use]
+    pub fn render_toml(&self) -> String {
+        let mut output = format!(
+            "schema_version = {}\nstatus = {:?}\ngenerated_from = {:?}\nsource_revision = {:?}\n",
+            self.schema_version, self.status, self.generated_from, self.source_revision
+        );
+        for (key, value) in &self.proposal {
+            output.push_str(&format!(
+                "\n[proposal.{key:?}]\nvalue = {}\nevidence_case_id = {:?}\n",
+                value.value, value.evidence_case_id
+            ));
+        }
+        output
+    }
+
     /// Validate candidate status and every evidence-linked proposal value.
     ///
     /// # Errors
@@ -314,9 +365,94 @@ impl OracleCalibrationProfile {
     }
 }
 
+/// Returns one measurement-derived scheduling or performance proposal.
+fn proposal_value(key: &str, evidence: &OracleCalibrationCase) -> f64 {
+    let measured_queries = f64::from(evidence.measurement_queries);
+    let peak_slots = f64::from(evidence.peak_slots);
+    let concurrency = f64::from(evidence.concurrency);
+    let per_query_bytes = evidence.input_bytes as f64 / measured_queries;
+    let bytes_per_row = per_query_bytes / evidence.input_rows as f64;
+    let workers = f64::from(evidence.pods.saturating_sub(1));
+    let observed_query_seconds = evidence.p99_ms * measured_queries / 1_000.0;
+    match key {
+        "slot.cpu_cores_per_slot" => evidence.cpu_seconds / observed_query_seconds / peak_slots,
+        "slot.headroom_factor" | "class.interactive.share" | "class.analytical.share" => {
+            peak_slots / concurrency
+        }
+        "class.interactive.minimum_slots"
+        | "class.analytical.minimum_slots"
+        | "tenant.single_tenant_limit"
+        | "tenant.multi_tenant_default_limit"
+        | "distribution.max_in_flight_fragments"
+        | "distribution.max_worker_concurrency" => peak_slots,
+        "classification.assumed_scan_bytes_per_second" => evidence.rows_per_second * bytes_per_row,
+        "classification.analytical_threshold_millis" | "performance.p95_query_millis" => {
+            evidence.p95_ms
+        }
+        "placement.max_attempts" => {
+            evidence.retry_rate * measured_queries + evidence.rejection_rate
+        }
+        "placement.deadline_millis" | "performance.p99_query_millis" => evidence.p99_ms,
+        "placement.jitter_min_millis" => evidence.p95_ms - evidence.p50_ms,
+        "placement.jitter_max_millis" => evidence.p99_ms - evidence.p50_ms,
+        "lease.cluster_ttl_seconds"
+        | "membership.expiration_seconds"
+        | "tail.fence_ttl_seconds" => evidence.p99_ms / 1_000.0,
+        "lease.renew_interval_seconds" | "reservation.pending_ttl_seconds" => {
+            evidence.p95_ms / 1_000.0
+        }
+        "tail.page_rows" => evidence.input_rows as f64,
+        "tail.page_encoded_bytes" | "distribution.max_frame_bytes" => per_query_bytes,
+        "distribution.max_workers_per_query" => workers,
+        "distribution.fragment_target_rows" => evidence.input_rows as f64 / evidence.pods as f64,
+        "distribution.fragment_target_bytes" | "distribution.max_fragment_bytes" => {
+            per_query_bytes / f64::from(evidence.pods)
+        }
+        "performance.p95_ttfb_millis" => evidence.p95_ttfb_ms,
+        "performance.p99_ttfb_millis" => evidence.p99_ttfb_ms,
+        "performance.minimum_rows_per_second" => evidence.rows_per_second,
+        "performance.last_stable_concurrency" => peak_slots,
+        "performance.maximum_tail_page_millis" => evidence.tail_ms,
+        "performance.maximum_object_store_throttle_rate" => evidence.retry_rate,
+        _ => peak_slots,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keeps the checked-in candidate derived from measured evidence and free of allocator policy.
+    #[test]
+    fn oracle_candidate_excludes_allocator_proposals_and_preserves_observations() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/oracle");
+        let report: OracleCalibrationReport = serde_json::from_slice(
+            &std::fs::read(directory.join("oracle-calibration.json"))
+                .expect("checked-in calibration report must be readable"),
+        )
+        .expect("checked-in calibration report must decode");
+        assert!(report.cases.iter().any(|case| case.peak_memory_bytes > 0));
+        assert!(report.cases.iter().all(|case| case.spill_bytes == 0));
+        let candidate = OracleCalibrationProfile::from_report(&report)
+            .expect("measured report must derive a candidate");
+        for removed in [
+            "slot.memory_bytes_per_slot",
+            "memory.oracle_limit_bytes",
+            "memory.class_limits",
+            "spill.limit_bytes",
+        ] {
+            assert!(!candidate.proposal.contains_key(removed));
+        }
+        let rendered = candidate.render_toml();
+        let path = directory.join("oracle-candidate.toml");
+        if std::env::var_os("WYRD_ORACLE_CALIBRATION_BLESS").is_some() {
+            std::fs::write(&path, &rendered).expect("candidate bless must write only TOML");
+        }
+        assert_eq!(
+            std::fs::read_to_string(path).expect("checked-in candidate must be readable"),
+            rendered
+        );
+    }
 
     /// Incomplete topology/workload matrices fail before profile generation.
     #[test]

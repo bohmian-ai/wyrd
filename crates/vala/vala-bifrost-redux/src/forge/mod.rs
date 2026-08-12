@@ -68,6 +68,8 @@ use rewrite::ForgeRewritePipeline;
 
 /// Construction-time dependency graph for one Forge maintenance handle.
 pub struct ForgeBuildConfig {
+    /// Narrow Forge capability issued by the one production composition.
+    pub resources: crate::resources::ForgeResources,
     /// SQL handle used by tenant-scoped durable Forge transitions.
     pub vala: vala_sql::ValaPostgres,
     /// Cross-tenant operator pool used by discovery and table leases.
@@ -78,8 +80,8 @@ pub struct ForgeBuildConfig {
     pub staging: Arc<opendal::Operator>,
     /// Object-store capability used by rewrites and garbage collection.
     pub object_store: Arc<dyn ForgeObjectStore>,
-    /// Shared `DataFusion` runtime provisioned by the hosting process.
-    pub rewrite_runtime: ForgeRewriteRuntime,
+    /// Pod-local base beneath which each leased rewrite owns scratch.
+    pub rewrite_spill_root: std::path::PathBuf,
     /// Bounded advisory Scribe wake-up inbox.
     pub hints: crate::maintenance::StagingFileInbox,
     /// Validated maintenance and rewrite limits.
@@ -108,6 +110,8 @@ pub struct Forge {
 
 /// Immutable dependency graph shared by one Forge owner.
 pub(crate) struct ForgeCore {
+    /// Narrow Forge capability used for exact rewrite resource leases.
+    resources: crate::resources::ForgeResources,
     /// Vala SQL handle used by tenant-scoped transitions.
     vala: vala_sql::ValaPostgres,
     /// Operator pool used by discovery and lease operations.
@@ -118,8 +122,10 @@ pub(crate) struct ForgeCore {
     staging: Arc<opendal::Operator>,
     /// Narrow object-store seam used by rewrite and garbage-collection IO.
     object_store: Arc<dyn ForgeObjectStore>,
-    /// Streaming and spillable rewrite pipeline.
+    /// Streaming rewrite dependencies; workers attach their leased runtime.
     rewrite: ForgeRewritePipeline,
+    /// Pod-local base for attempt-owned disposable scratch directories.
+    rewrite_spill_root: std::path::PathBuf,
     /// Validated maintenance and rewrite limits.
     config: ForgeConfig,
     /// Delay between periodic scheduler ticks.
@@ -143,8 +149,7 @@ impl Forge {
     /// # Errors
     ///
     /// Returns [`ForgeError::InvalidConfig`] when any Forge limit is unsafe,
-    /// the maintenance interval is zero, or the runtime and configured spill
-    /// ceilings differ.
+    /// or the maintenance interval is zero.
     pub fn new(build: ForgeBuildConfig) -> Result<Self, ForgeError> {
         if build.maintenance_interval.is_zero() {
             return Err(ForgeError::InvalidConfig {
@@ -152,25 +157,22 @@ impl Forge {
             });
         }
         build.config.validate()?;
-        if build.rewrite_runtime.spill_limit_bytes() != build.config.spill_limit_bytes {
-            return Err(ForgeError::InvalidConfig {
-                detail: "rewrite runtime spill limit must match Forge config".to_owned(),
-            });
-        }
+        ForgeRewriteRuntime::prepare_root(&build.rewrite_spill_root)?;
         let rewrite = ForgeRewritePipeline::new(
-            build.rewrite_runtime,
             Arc::clone(&build.staging),
             Arc::clone(&build.catalog),
             Arc::clone(&build.object_store),
             build.config.max_concurrent_reads,
         )?;
         let core = ForgeCore {
+            resources: build.resources,
             vala: build.vala,
             operator_pool: build.operator_pool,
             catalog: build.catalog,
             staging: build.staging,
             object_store: build.object_store,
             rewrite,
+            rewrite_spill_root: build.rewrite_spill_root,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
             clock: build.clock,
@@ -193,6 +195,17 @@ impl Forge {
     #[must_use]
     pub fn clock_for_test(&self) -> ForgeClock {
         self.core.clock.clone()
+    }
+
+    /// Returns this Forge's narrow resource capability for lifecycle assertions.
+    ///
+    /// The capability observes the same process root the worker leases from, so
+    /// a test can inspect baselines and root identity without gaining the
+    /// ability to construct a sibling governor or a raw pool.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn resources_for_test(&self) -> crate::resources::ForgeResources {
+        self.core.resources.clone()
     }
 
     /// Returns deterministic controls for manifest and expiry commit boundaries.

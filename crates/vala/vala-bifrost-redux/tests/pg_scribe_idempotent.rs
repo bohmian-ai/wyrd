@@ -1,4 +1,4 @@
-//! Durable WAL idempotency and replay coverage for the Task-15 Scribe path.
+//! Durable WAL idempotency and replay coverage for the Scribe persistence path.
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -42,7 +42,7 @@ fn audit_event(operation: &str) -> AuditEvent {
         request_id: RequestId::now_v7(),
         trace_id: None,
         operation: operation.to_owned(),
-        resource: "vala.bifrost.task15".to_owned(),
+        resource: "vala.bifrost.scribe_persistence".to_owned(),
         card_ref: None,
         principal_id: PrincipalId::new(Uuid::now_v7()),
         principal_kind: PrincipalKindTag::User,
@@ -58,7 +58,7 @@ fn audit_event(operation: &str) -> AuditEvent {
 fn seal_key(tenant: DataTenantId) -> SealKey {
     SealKey::new(
         tenant,
-        TableRef::new(BifrostNamespace::Bifrost, "task15_idempotent"),
+        TableRef::new(BifrostNamespace::Bifrost, "scribe_idempotent"),
         EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
     )
 }

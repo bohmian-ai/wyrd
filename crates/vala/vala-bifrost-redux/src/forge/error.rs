@@ -8,6 +8,9 @@ pub enum ForgeError {
     /// A construction or runtime limit cannot safely execute Forge.
     #[error("invalid Forge configuration: {detail}")]
     InvalidConfig { detail: String },
+    /// Pod-local elastic memory or scratch is temporarily occupied.
+    #[error("Forge resources are temporarily unavailable: {detail}")]
+    Capacity { detail: String },
     /// A lease acquisition, renewal, fence, or release query failed.
     #[error("Forge lease query failed: {0}")]
     Lease(#[source] vala_sql::SqlError),

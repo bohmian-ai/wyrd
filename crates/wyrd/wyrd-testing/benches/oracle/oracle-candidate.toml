@@ -55,16 +55,16 @@ evidence_case_id = "p6-fused-interactive-t2"
 value = 5
 evidence_case_id = "p6-fused-interactive-t2"
 
-[proposal."membership.expiration_seconds"]
+[proposal."lease.cluster_ttl_seconds"]
 value = 0.079222
 evidence_case_id = "p6-fused-interactive-t2"
 
-[proposal."memory.class_limits"]
-value = 3323952.5
+[proposal."lease.renew_interval_seconds"]
+value = 0.059187
 evidence_case_id = "p6-fused-interactive-t2"
 
-[proposal."memory.oracle_limit_bytes"]
-value = 6647905
+[proposal."membership.expiration_seconds"]
+value = 0.079222
 evidence_case_id = "p6-fused-interactive-t2"
 
 [proposal."performance.last_stable_concurrency"]
@@ -125,14 +125,6 @@ evidence_case_id = "p6-fused-interactive-t2"
 
 [proposal."slot.headroom_factor"]
 value = 0.125
-evidence_case_id = "p6-fused-interactive-t2"
-
-[proposal."slot.memory_bytes_per_slot"]
-value = 3323952.5
-evidence_case_id = "p6-fused-interactive-t2"
-
-[proposal."spill.limit_bytes"]
-value = 0
 evidence_case_id = "p6-fused-interactive-t2"
 
 [proposal."tail.fence_ttl_seconds"]

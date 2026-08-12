@@ -55,6 +55,8 @@ pub(super) struct TailFenceDrainer<'a> {
     pub(super) tails: &'a TailTransportDirectory,
     /// Parent-governed memory resources charged for decoded live batches.
     pub(super) memory: &'a OracleMemoryResources,
+    /// Query-local pool shared with `DataFusion` and retained live batches.
+    pub(super) query_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     /// Query telemetry retaining live-tail memory accounting.
     pub(super) telemetry: Arc<OracleTelemetry>,
     /// Immutable admission class applied to live-tail memory metrics.
@@ -128,6 +130,8 @@ pub(super) struct DrainedTailFence {
 pub(super) struct TailFenceDrainerConfig {
     /// Query telemetry retaining live-tail memory accounting.
     pub(super) telemetry: Arc<OracleTelemetry>,
+    /// Query-local pool charged for every decoded live batch.
+    pub(super) query_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     /// Immutable admission class applied to live-tail memory metrics.
     pub(super) query_class: QueryClass,
     /// Absolute deadline shared by fence acquisition and every page read.
@@ -222,6 +226,7 @@ impl TailFenceDrainer<'_> {
         TailFenceDrainer {
             tails,
             memory,
+            query_pool: config.query_pool,
             telemetry: config.telemetry,
             query_class: config.query_class,
             deadline: config.deadline,
@@ -766,14 +771,16 @@ impl TailFenceDrainer<'_> {
                 }
             };
             for batch in page.batches {
-                let Ok(reservation) = self.memory.governor.try_reserve_parent_classified(
+                let Ok(reservation) = crate::resources::OracleQueryMemoryReservation::try_new(
+                    &self.query_pool,
+                    self.memory.resources.governor(),
+                    "oracle-live-tail",
                     batch.get_array_memory_size(),
-                    MemoryPurpose::OracleQuery,
                 ) else {
                     self.release_one(&mut acquired).await;
                     return Err((table, BifrostError::QueryVisibilityUnavailable));
                 };
-                reservations.push(self.telemetry.account_memory(
+                reservations.push(self.telemetry.account_query_memory(
                     reservation,
                     self.query_class,
                     OracleMemoryKind::Tail,
@@ -1023,6 +1030,7 @@ mod tests {
             memory,
             TailFenceDrainerConfig {
                 telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                query_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
@@ -1084,6 +1092,13 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
             governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
@@ -1111,6 +1126,13 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
             governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
@@ -1140,6 +1162,13 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
             governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
@@ -1167,6 +1196,13 @@ mod tests {
         });
         let tails = TailTransportDirectory::default();
         let memory = OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
             governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,

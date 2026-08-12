@@ -1,4 +1,4 @@
-//! Restart/replay coverage for the Task-15 Scribe WAL and immutable path.
+//! Restart/replay coverage for the Scribe WAL and immutable persistence path.
 
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
@@ -69,7 +69,7 @@ fn audit_event(operation: &str, tenant: DataTenantId) -> AuditEvent {
         request_id: RequestId::now_v7(),
         trace_id: None,
         operation: operation.to_owned(),
-        resource: "vala.bifrost.task15".to_owned(),
+        resource: "vala.bifrost.scribe_persistence".to_owned(),
         card_ref: None,
         principal_id: PrincipalId::new(Uuid::now_v7()),
         principal_kind: PrincipalKindTag::User,
@@ -100,8 +100,8 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
         .expect("WAL writer");
     let tenant_a = DataTenantId::new_v7();
     let tenant_b = DataTenantId::new_v7();
-    let key_a = seal_key(tenant_a, "task15_restart_a");
-    let key_b = seal_key(tenant_b, "task15_restart_b");
+    let key_a = seal_key(tenant_a, "scribe_restart_a");
+    let key_b = seal_key(tenant_b, "scribe_restart_b");
     let data = batch_bytes(7);
 
     let audit_a = encode_audit_event(&audit_event("tenant-a", tenant_a)).expect("audit");
@@ -199,7 +199,7 @@ async fn replay_failure_keeps_scribe_unready() {
     let writer = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
         .expect("WAL writer");
     let tenant = DataTenantId::new_v7();
-    let key = seal_key(tenant, "task16_replay_failure");
+    let key = seal_key(tenant, "scribe_replay_failure");
     let audit = encode_audit_event(&audit_event("replay-failure", tenant)).expect("audit");
     writer
         .append_and_fsync_for_test(&key, *Uuid::now_v7().as_bytes(), &audit, &[1, 2, 3])

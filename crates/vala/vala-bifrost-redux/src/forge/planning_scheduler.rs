@@ -656,7 +656,7 @@ impl<'forge> ForgeScheduler<'forge> {
             candidates = discovered
                 .groups()
                 .iter()
-                .map(live_candidate)
+                .map(ForgePlanCandidate::from_live_group)
                 .collect::<Result<Vec<_>, ForgeError>>()?;
         }
         // Independent per-table maintenance trigger. Evaluated every tick from
@@ -844,44 +844,6 @@ impl<'forge> ForgeScheduler<'forge> {
         }
         Ok(())
     }
-}
-
-/// Maps one exact live rewrite group into the durable planner contract.
-///
-/// # Errors
-///
-/// Returns invariant errors when byte or parallelism estimates exceed their
-/// typed bounds.
-fn live_candidate(
-    group: &super::right_size::IcebergRewriteGroup,
-) -> Result<ForgePlanCandidate, ForgeError> {
-    let mut inputs = group
-        .files()
-        .iter()
-        .map(|file| file.catalog_path().to_owned())
-        .collect::<Vec<_>>();
-    inputs.sort();
-    inputs.dedup();
-    let bytes = group
-        .files()
-        .iter()
-        .try_fold(0_u64, |total, file| {
-            total.checked_add(file.file_size_bytes())
-        })
-        .ok_or_else(|| ForgeError::Invariant {
-            detail: "Forge group bytes overflow".to_owned(),
-        })?;
-    Ok(ForgePlanCandidate {
-        strategy: ForgeTaskStrategy::SmallFiles,
-        parallelism: u16::try_from(group.files().len()).map_err(|_| ForgeError::Invariant {
-            detail: "Forge planned parallelism exceeds u16".to_owned(),
-        })?,
-        memory_bytes: bytes,
-        spill_bytes: bytes,
-        inputs,
-        bytes,
-        parameters: serde_json::json!({"kind":"live_rewrite"}),
-    })
 }
 
 /// Pure count-OR-interval snapshot-expiry trigger predicate.

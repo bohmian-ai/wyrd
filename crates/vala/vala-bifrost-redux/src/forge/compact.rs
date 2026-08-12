@@ -697,17 +697,22 @@ impl Forge {
     /// reconstructed and validated.
     pub(super) async fn execute_staging_task(
         &self,
-        lease: &mut ForgeLease,
-        binding: &TenantTableBinding,
-        inputs: &[String],
-        task_id: Uuid,
-        attempt_id: Uuid,
-        stop: &CancellationToken,
+        request: StagingTaskRequest<'_>,
     ) -> Result<iceberg::table::Table, ForgeError> {
+        let StagingTaskRequest {
+            rewrite,
+            lease,
+            binding,
+            inputs,
+            task_id,
+            attempt_id,
+            stop,
+        } = request;
         let (key, bin) = self.load_exact_staging_bin(binding, inputs).await?;
         let policy = self.table_right_size_policy(binding).await?;
         let commit = self
             .compact_bin(StagingRewriteRequest {
+                rewrite,
                 lease,
                 key: &key,
                 binding,
@@ -1065,8 +1070,32 @@ fn plan_staging_bins(
         .collect()
 }
 
+/// Borrowed authority and exact payload for one durable staging-fold task.
+///
+/// The worker owns the attempt's rewrite pipeline and publication fence, so
+/// this request carries them by reference rather than letting the staging
+/// stage reach back into shared Forge state for either.
+pub(super) struct StagingTaskRequest<'a> {
+    /// Attempt-local pipeline bound to the retained operation lease.
+    pub(super) rewrite: &'a super::rewrite::ForgeRewritePipeline,
+    /// Mutable publication fence retained through every external effect.
+    pub(super) lease: &'a mut ForgeLease,
+    /// Tenant/table identity the persisted payload must belong to.
+    pub(super) binding: &'a TenantTableBinding,
+    /// Authoritative persisted input paths for this exact task.
+    pub(super) inputs: &'a [String],
+    /// Durable task identity used for commit bookkeeping.
+    pub(super) task_id: Uuid,
+    /// Attempt generation fencing this execution.
+    pub(super) attempt_id: Uuid,
+    /// Cooperative cancellation observed before any committed effect.
+    pub(super) stop: &'a CancellationToken,
+}
+
 /// Borrowed authority and exact payload for one staging rewrite transaction.
 struct StagingRewriteRequest<'a> {
+    /// Attempt-local pipeline bound to the retained operation lease.
+    rewrite: &'a super::rewrite::ForgeRewritePipeline,
     /// Mutable publication fence retained through every external effect.
     lease: &'a mut ForgeLease,
     /// Tenant/table/day identity for the exact staging bin.
@@ -1101,6 +1130,7 @@ impl Forge {
         request: StagingRewriteRequest<'_>,
     ) -> Result<CompactCommit, ForgeError> {
         let StagingRewriteRequest {
+            rewrite,
             lease,
             key,
             binding,
@@ -1126,9 +1156,7 @@ impl Forge {
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(ForgeError::Catalog)?,
         );
-        let rewrite = self
-            .core
-            .rewrite
+        let rewrite = rewrite
             .rewrite(
                 RewriteRequest {
                     attempt_generation,

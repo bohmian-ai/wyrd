@@ -18,7 +18,7 @@ use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectPages, ForgeObjectStore,
-    ForgeRewriteRuntime, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
+    ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
@@ -30,8 +30,9 @@ use vala_bifrost_redux::oracle::{
     Oracle, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
     OracleSpillRuntime, TailTransportDirectory,
 };
+use vala_bifrost_redux::resources::{BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources};
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
-use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
+use vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
@@ -442,6 +443,31 @@ fn resolve_forge_config(
     (config, maintenance_interval)
 }
 
+/// Resolves and creates the one disposable Oracle scratch directory.
+///
+/// An injected base is used by test support. Production otherwise uses the
+/// Scribe WAL base environment setting or the portable local default, then
+/// appends exactly one `oracle-spill` component. WAL contents remain outside
+/// the scratch allocator even when both directories share a filesystem.
+///
+/// # Errors
+///
+/// Returns a typed boot error when the canonical scratch directory cannot be
+/// created; callers must stop before Bifrost role activation or detection.
+fn prepare_oracle_spill_root(
+    base: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, ServerBootError> {
+    let base = base.unwrap_or_else(|| {
+        std::env::var_os("WYRD_SCRIBE_WAL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"))
+    });
+    let root = base.join("oracle-spill");
+    std::fs::create_dir_all(&root)
+        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
+    Ok(root)
+}
+
 /// Builds state plus unmounted Scribe dependencies for the authenticated boot path.
 ///
 /// # Errors
@@ -508,23 +534,38 @@ async fn build_bifrost_parts_from_boot(
         ClusterNodeId::new(node_id.as_uuid()),
     ));
     let scribe_config = bifrost_config.scribe;
-    let pod_memory_limit = BifrostMemoryGovernor::detect(1024 * 1024 * 1024)
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?
-        .pod_limit_bytes();
-    let bifrost_memory = BifrostMemoryGovernor::new_with_child_limits(
-        pod_memory_limit,
-        scribe_config.memory_limit_bytes,
-        bifrost_config.oracle.memory_limit_bytes,
-    )
+    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
+    let oracle_spill_root = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
+    let resource_roles = roles
+        .iter()
+        .map(|role| match role {
+            BifrostRuntimeRole::Scribe => BifrostRole::Scribe,
+            BifrostRuntimeRole::Forge => BifrostRole::Forge,
+            BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
+        })
+        .collect();
+    let runtime_resources = BifrostRuntimeResources::detect(BifrostResourcePolicy {
+        roles: resource_roles,
+        memory_limit_bytes: bifrost_config.resources.memory_limit_bytes,
+        unmanaged_reserve_bytes: bifrost_config.resources.unmanaged_reserve_bytes,
+        scratch_limit_bytes: bifrost_config.resources.scratch_limit_bytes,
+        effective_cpu: bifrost_config.resources.effective_cpu,
+        scratch_root: oracle_spill_root.clone(),
+    })
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    let bifrost_resources = runtime_resources
+        .compose_roles()
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    let resource_plan = bifrost_resources.plan();
+    let pod_memory_limit = resource_plan.managed_memory_bytes;
+    let bifrost_memory = bifrost_resources.memory_ledger();
     let bifrost_datafusion_memory_pool = Arc::new(BifrostDataFusionMemoryPool::for_oracle(
         bifrost_memory.clone(),
     ));
     let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
-    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_role = cluster_registry
             .reserve_scribe(
@@ -594,7 +635,8 @@ async fn build_bifrost_parts_from_boot(
             stream,
             admission: AdmissionConfig {
                 memory_limit_bytes: pod_memory_limit,
-                scribe_memory_limit_bytes: scribe_config.memory_limit_bytes,
+                scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0)
+                    .then_some(resource_plan.scribe_floor_bytes),
                 event_time_window: EventTimeWindow {
                     past: scribe_config
                         .event_time_past_window_secs
@@ -662,24 +704,22 @@ async fn build_bifrost_parts_from_boot(
 
     let forge = if roles.contains(&BifrostRuntimeRole::Forge) {
         let (forge_config, maintenance_interval) = resolve_forge_config(forge_runtime);
-        let forge_datafusion_memory_pool = Arc::new(BifrostDataFusionMemoryPool::for_parent(
-            bifrost_memory.clone(),
-        ));
-        let rewrite_runtime = ForgeRewriteRuntime::new(
-            forge_datafusion_memory_pool,
-            &wal_dir.join("forge-spill"),
-            forge_config.spill_limit_bytes,
-        )?;
+        let rewrite_spill_root = wal_dir.join("forge-spill");
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
         Some(Arc::new(Forge::new(ForgeBuildConfig {
+            resources: bifrost_resources.forge().ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "Forge role selected without a composed Forge capability".to_owned(),
+                )
+            })?,
             vala: postgres.vala().clone(),
             operator_pool: operator_pool.clone(),
             catalog: bifrost_redux.iceberg_catalog(),
             staging,
             object_store,
-            rewrite_runtime,
+            rewrite_spill_root,
             hints: staging_file_inbox,
             config: forge_config,
             maintenance_interval,
@@ -695,7 +735,8 @@ async fn build_bifrost_parts_from_boot(
     let mut state = AppState::new(postgres, storage, bifrost)
         .with_bifrost_node_id(ClusterNodeId::new(node_id.as_uuid()))
         .with_bifrost_redux(bifrost_redux)
-        .with_bifrost_memory_pool(bifrost_memory, bifrost_datafusion_memory_pool);
+        .with_bifrost_memory_pool(bifrost_memory, bifrost_datafusion_memory_pool)
+        .with_bifrost_resources(bifrost_resources);
     if let Some(forge) = forge {
         state = state.with_forge(forge);
     }
@@ -710,7 +751,7 @@ async fn build_bifrost_parts_from_boot(
 /// Build the bounded Forge worker future shared by embedded and worker roles.
 ///
 /// `worker_concurrency` sizes the executor pool; `per_tenant_active_cap` is the
-/// resolved D78 per-tenant admission bound (see
+/// resolved per-tenant admission bound (see
 /// [`crate::config::ForgeRuntimeConfig::resolved_per_tenant_active_cap`]).
 /// Passing them separately keeps tenant fairness decoupled from parallelism.
 ///
@@ -1165,28 +1206,39 @@ impl<'a> OracleRoleBuilder<'a> {
         let memory = state.bifrost_memory.clone().ok_or_else(|| {
             ServerBootError::OraclePeer("shared Bifrost memory governor is absent".to_owned())
         })?;
+        let roles = state.bifrost_resources.clone().ok_or_else(|| {
+            ServerBootError::OraclePeer("shared Bifrost role composition is absent".to_owned())
+        })?;
+        let resource_plan = roles.plan();
+        let resources = roles.oracle().ok_or_else(|| {
+            ServerBootError::OraclePeer(
+                "Oracle role selected without a composed Oracle capability".to_owned(),
+            )
+        })?;
         let catalog = state
             .bifrost_redux
             .as_ref()
             .ok_or_else(|| ServerBootError::OraclePeer("Redux catalog is absent".to_owned()))?;
-        let configured_cpu = config.bifrost.oracle.cpu_cores;
-        let cpu_cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let configured_cpu = resource_plan.effective_cpu as f64;
+        let cpu_cores = resource_plan.effective_cpu;
         let cpu_cores = u32::try_from(cpu_cores)
             .map_err(|_| ServerBootError::OraclePeer("CPU count exceeds u32".to_owned()))?;
         let memory_bytes_per_slot = 256_u64 * 1024 * 1024;
-        // Derive Oracle sizing from the resolved child limit — no unbounded-parent fallback (D79).
-        let memory_budget = memory.oracle_limit_bytes();
+        // Derive Oracle capability sizing from the portable resource plan.
+        let memory_budget = resource_plan
+            .oracle_floor_bytes
+            .checked_add(resource_plan.elastic_memory_bytes)
+            .ok_or_else(|| {
+                ServerBootError::OraclePeer("Oracle memory grant overflow".to_owned())
+            })?;
         let memory_budget_bytes = u64::try_from(memory_budget)
             .map_err(|_| ServerBootError::OraclePeer("memory budget exceeds u64".to_owned()))?;
         let memory_slots = (memory_budget_bytes / memory_bytes_per_slot).max(1);
         let raw_slots = u32::try_from(u64::from(cpu_cores).min(memory_slots).max(1))
             .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
-        let calibrated = crate::config::load_oracle_admission_translation(
-            &config.bifrost.oracle,
-            raw_slots,
-            memory_budget_bytes,
-        )
-        .map_err(ServerBootError::OraclePeer)?;
+        let calibrated =
+            crate::config::load_oracle_admission_translation(&config.bifrost.oracle, raw_slots)
+                .map_err(ServerBootError::OraclePeer)?;
         let capabilities = OracleCapabilitiesV1 {
             peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
                 .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
@@ -1338,21 +1390,15 @@ impl<'a> OracleRoleBuilder<'a> {
         let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
         let peer_transports =
             OraclePeerTransportDirectory::new(node_id, local_transport, remote_transport);
-        let wal_dir = spill_root.unwrap_or_else(|| {
-            std::env::var_os("WYRD_SCRIBE_WAL_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"))
-        });
-        let spill_runtime = match OracleSpillRuntime::new(
-            &wal_dir.join("oracle-spill"),
-            config.bifrost.oracle.spill_limit_bytes,
-        ) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                release_failed_oracle_role(&cluster, &role, "spill runtime construction").await;
-                return Err(ServerBootError::OraclePeer(error.to_string()));
-            }
-        };
+        let oracle_spill_root = prepare_oracle_spill_root(spill_root)?;
+        let spill_runtime =
+            match OracleSpillRuntime::new(&oracle_spill_root, resource_plan.scratch_limit_bytes) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    release_failed_oracle_role(&cluster, &role, "spill runtime construction").await;
+                    return Err(ServerBootError::OraclePeer(error.to_string()));
+                }
+            };
         let oracle = match Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(catalog),
             vala: state.postgres.vala().clone(),
@@ -1361,6 +1407,7 @@ impl<'a> OracleRoleBuilder<'a> {
             local_slots: slots,
             memory: OracleMemoryResources {
                 governor: memory,
+                resources,
                 reconciliation_limit_bytes,
             },
             spill_runtime,
@@ -1398,17 +1445,6 @@ impl<'a> OracleRoleBuilder<'a> {
                     std::time::Duration::from_millis(config.bifrost.oracle.max_queue_wait_ms),
                     |value| value.max_queue_wait,
                 ),
-                interactive_memory_bytes: calibrated
-                    .as_ref()
-                    .map_or(memory_budget_bytes, |value| value.interactive_memory_bytes),
-                analytical_memory_bytes: calibrated
-                    .as_ref()
-                    .map_or(memory_budget_bytes, |value| value.analytical_memory_bytes),
-                spill_bytes: calibrated
-                    .as_ref()
-                    .map_or(config.bifrost.oracle.spill_limit_bytes, |value| {
-                        value.spill_bytes
-                    }),
                 ..OracleConfig::default()
             },
         }) {
@@ -1619,12 +1655,23 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
         signing_key,
         advertise_addr,
         peer_credentials,
-        None,
-        None,
-        None,
-        None,
+        TestOracleAttachment::default(),
     )
     .await
+}
+
+/// Harness-owned storage and timing inputs for one attached Oracle role.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct TestOracleAttachment {
+    /// Optional durable audit WAL root.
+    pub audit_wal_root: Option<std::path::PathBuf>,
+    /// Optional disposable spill storage base.
+    pub spill_root: Option<std::path::PathBuf>,
+    /// Optional deterministic aggregate scratch ceiling.
+    pub spill_limit_bytes: Option<u64>,
+    /// Optional accelerated role heartbeat timing.
+    pub role_timing: Option<RoleTiming>,
 }
 
 /// Attach a test Oracle role while retaining an explicit harness-owned WAL root.
@@ -1635,11 +1682,14 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
     signing_key: secrecy::SecretString,
     advertise_addr: String,
     peer_credentials: Arc<dyn OraclePeerCredentials>,
-    audit_wal_root: Option<std::path::PathBuf>,
-    spill_root: Option<std::path::PathBuf>,
-    spill_limit_bytes: Option<u64>,
-    role_timing: Option<RoleTiming>,
+    attachment: TestOracleAttachment,
 ) -> Result<AppState, ServerBootError> {
+    let TestOracleAttachment {
+        audit_wal_root,
+        spill_root,
+        spill_limit_bytes,
+        role_timing,
+    } = attachment;
     let node_id = ClusterNodeId::new(node_id.as_uuid());
     let cluster = Arc::new(if let Some(timing) = role_timing {
         ClusterRegistry::new_with_role_timing(state.postgres.vala().clone(), node_id, timing)
@@ -1650,9 +1700,12 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
     config.auth.signing_key = Some(signing_key.clone());
     config.bifrost.oracle.audit_wal_root =
         Some(audit_wal_root.unwrap_or_else(|| test_oracle_audit_root(node_id.as_uuid())));
-    if let Some(spill_limit_bytes) = spill_limit_bytes {
-        config.bifrost.oracle.spill_limit_bytes = spill_limit_bytes;
+    if state.bifrost_resources.is_none() {
+        return Err(ServerBootError::OraclePeer(
+            "test Oracle attachment requires injected Bifrost runtime resources".to_owned(),
+        ));
     }
+    let _spill_limit_bytes = spill_limit_bytes;
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1740,9 +1793,12 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
     );
     config.bifrost.oracle.peer_ca_certificate_path = Some(tls.ca_path);
     config.bifrost.oracle.peer_server_name = Some(tls.server_name);
-    if let Some(spill_limit_bytes) = tls.spill_limit_bytes {
-        config.bifrost.oracle.spill_limit_bytes = spill_limit_bytes;
+    if state.bifrost_resources.is_none() {
+        return Err(ServerBootError::OraclePeer(
+            "TLS test Oracle attachment requires injected Bifrost runtime resources".to_owned(),
+        ));
     }
+    let _spill_limit_bytes = tls.spill_limit_bytes;
     OracleRoleBuilder {
         state,
         config: &config,
@@ -1984,6 +2040,28 @@ pub fn spawn_maintenance_scheduler(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Server composition appends one disposable component before detection.
+    #[test]
+    fn config_composes_one_oracle_spill_root_before_detection() {
+        let base = tempfile::tempdir().expect("scratch base");
+        let root = prepare_oracle_spill_root(Some(base.path().to_path_buf()))
+            .expect("scratch root creation");
+        assert_eq!(root, base.path().join("oracle-spill"));
+        assert!(root.is_dir());
+        assert!(!root.join("oracle-spill").exists());
+    }
+
+    /// An uncreatable scratch child fails before resource-owner construction.
+    #[test]
+    fn config_rejects_uncreatable_oracle_spill_root_before_activation() {
+        let base = tempfile::tempdir().expect("scratch fixture");
+        let file = base.path().join("not-a-directory");
+        std::fs::write(&file, b"occupied").expect("blocking file");
+        let error = prepare_oracle_spill_root(Some(file))
+            .expect_err("file-backed base cannot create a scratch child");
+        assert!(matches!(error, ServerBootError::OraclePeer(_)));
+    }
 
     /// An empty `forge` config resolves to the compiled `ForgeConfig` default
     /// and the default maintenance interval, pinning byte-identical no-config
@@ -2252,27 +2330,46 @@ pub(crate) mod pg_tests {
         let vala = crate::test_support::test_vala_postgres().await;
         let operator_pool: OperatorPool = crate::test_support::test_operator_pool().await;
         let (publisher, inbox) = staging_file_channel(16).expect("hint channel");
-        let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
-        let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
         let config = ForgeConfig {
             max_hints_per_wake: 16,
             ..ForgeConfig::default()
         };
         let spill = Box::leak(Box::new(tempdir().expect("spill directory")));
-        let rewrite_runtime =
-            ForgeRewriteRuntime::new(query_memory.clone(), spill.path(), config.spill_limit_bytes)
-                .expect("rewrite runtime");
+        let roles = vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+            vala_bifrost_redux::resources::SystemResourceSnapshot {
+                memory_limit_bytes: 1024 * 1024 * 1024,
+                effective_cpu: 2,
+                scratch_capacity_bytes: config.spill_limit_bytes * 4,
+                scratch_available_bytes: config.spill_limit_bytes * 4,
+                memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            },
+            vala_bifrost_redux::resources::BifrostResourcePolicy {
+                roles: [BifrostRole::Forge].into_iter().collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: Some(config.spill_limit_bytes),
+                effective_cpu: None,
+                scratch_root: spill.path().to_owned(),
+            },
+        )
+        .expect("test Bifrost runtime resources")
+        .compose_roles()
+        .expect("test Forge role composition");
+        let memory = roles.memory_ledger();
+        let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
         let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
+                resources: roles.forge().expect("composed Forge capability"),
                 vala,
                 operator_pool,
                 catalog: redux.iceberg_catalog(),
                 staging,
                 object_store,
-                rewrite_runtime,
+                rewrite_spill_root: spill.path().to_owned(),
                 hints: inbox,
                 config,
                 maintenance_interval: Duration::from_millis(10),

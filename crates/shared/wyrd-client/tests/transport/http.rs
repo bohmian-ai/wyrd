@@ -165,6 +165,7 @@ mod transport_behavior {
         status: u16,
         body: String,
         extra_headers: Vec<(String, String)>,
+        body_delay: Option<std::time::Duration>,
     }
 
     impl MockResponse {
@@ -173,6 +174,7 @@ mod transport_behavior {
                 status: 200,
                 body: body.to_owned(),
                 extra_headers: vec![],
+                body_delay: None,
             }
         }
 
@@ -181,11 +183,18 @@ mod transport_behavior {
                 status,
                 body: body.to_owned(),
                 extra_headers: vec![],
+                body_delay: None,
             }
         }
 
         fn with_header(mut self, name: &str, value: &str) -> Self {
             self.extra_headers.push((name.to_owned(), value.to_owned()));
+            self
+        }
+
+        /// Delays body bytes after response headers have been written.
+        fn with_body_delay(mut self, delay: std::time::Duration) -> Self {
+            self.body_delay = Some(delay);
             self
         }
     }
@@ -220,6 +229,7 @@ mod transport_behavior {
                         status,
                         body,
                         extra_headers,
+                        body_delay,
                     } = responses_inner
                         .lock()
                         .await
@@ -242,9 +252,11 @@ mod transport_behavior {
                         response.push_str(&format!("{name}: {value}\r\n"));
                     }
                     response.push_str("\r\n");
-                    response.push_str(&body);
-
                     let _ = stream.write_all(response.as_bytes()).await;
+                    if let Some(delay) = body_delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let _ = stream.write_all(body.as_bytes()).await;
                 });
             }
         });
@@ -666,6 +678,54 @@ mod transport_behavior {
         assert!(
             extract_header(&captured[0], "x-wyrd-access-token").is_some(),
             "streaming request carries the Wyrd bearer"
+        );
+    }
+
+    /// Proves terminal streams outlive the ordinary total-response deadline.
+    #[tokio::test]
+    async fn request_json_stream_outlives_ordinary_total_timeout() {
+        let delay = std::time::Duration::from_millis(80);
+        let server = spawn_mock(vec![
+            MockResponse::ok("ordinary").with_body_delay(delay),
+            MockResponse::ok("frame-bytes")
+                .with_header("content-type", "application/vnd.wyrd.bifrost-query-stream")
+                .with_body_delay(delay),
+        ])
+        .await;
+        let credential = ResolvedCredential::BearerToken("test-bearer".to_owned().into());
+        let config = ClientConfig::default();
+        let auth = AuthMiddleware::new(&config, credential).expect("auth builds");
+        let transport = HttpTransport::new(
+            &HttpConfig {
+                base_url: server.base_url,
+                timeout_ms: 20,
+                ..HttpConfig::default()
+            },
+            auth,
+        )
+        .expect("transport builds");
+
+        let ordinary = transport
+            .request_raw(reqwest::Method::GET, "/v1/ordinary")
+            .await
+            .expect("ordinary response headers arrive");
+        let ordinary_error = ordinary
+            .bytes()
+            .await
+            .expect_err("ordinary response body keeps its total deadline");
+        assert!(ordinary_error.is_timeout());
+
+        let streaming = transport
+            .request_json_stream(
+                reqwest::Method::POST,
+                "/v1/query",
+                &serde_json::json!({"sql": "SELECT 1"}),
+            )
+            .await
+            .expect("stream response headers arrive");
+        assert_eq!(
+            streaming.bytes().await.expect("delayed stream body"),
+            "frame-bytes"
         );
     }
 

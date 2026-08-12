@@ -19,6 +19,7 @@ pub mod namespaces;
 pub mod oracle;
 pub mod parquet;
 pub mod provider;
+pub mod resources;
 pub mod schema;
 pub mod scribe;
 pub mod tables;

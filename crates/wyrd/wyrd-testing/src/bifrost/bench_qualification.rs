@@ -52,11 +52,6 @@ const MATERIALIZATION_SAFETY_FACTOR: f64 = 2.0;
 const MIB: u64 = 1024 * 1024;
 /// One gibibyte in bytes.
 const GIB: u64 = 1024 * MIB;
-/// D79 lower clamp on the resolved Oracle child memory budget (256 MiB).
-const ORACLE_BUDGET_FLOOR_BYTES: u64 = 256 * MIB;
-/// D79 upper clamp on the resolved Oracle child memory budget (8 GiB).
-const ORACLE_BUDGET_CEIL_BYTES: u64 = 8 * GIB;
-
 /// Locked setup deadline: materialization must complete within 30 minutes.
 const DEFAULT_SETUP_SECONDS: u64 = 30 * 60;
 /// Locked total-runtime budget: the whole qualification run within 3 hours.
@@ -64,82 +59,33 @@ const DEFAULT_TOTAL_SECONDS: u64 = 3 * 60 * 60;
 /// Locked disk budget under the run root: 32 GiB.
 const DEFAULT_DISK_BYTES: u64 = 32 * GIB;
 
-/// Effective Oracle memory budget used by the D70 shape-selection rule.
+/// Effective Oracle complete-query grant used by shape selection.
 ///
-/// Resolved from the same runtime configuration surface the server uses: an
-/// explicit `OracleRuntimeConfig::memory_limit_bytes`, else the D79 default
-/// (25% of pod memory clamped to `[256 MiB, 8 GiB]`), else — when the runtime
-/// cannot resolve a bounded pool — the unbounded branch that drops the
-/// memory-multiple constraint and records `memory_budget_basis: "unbounded"`.
+/// Production qualification records the exact grant derived from the portable
+/// Bifrost resource plan rather than a role-specific configuration default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryBudget {
-    /// A bounded effective budget in bytes with the basis it was resolved from.
-    Bounded {
-        /// Effective budget in bytes.
-        bytes: u64,
-        /// Whether the value came from explicit config or the D79 default.
-        basis: MemoryBudgetBasis,
-    },
-    /// The runtime treats the pool as unbounded; the memory multiple is dropped.
-    Unbounded,
-}
-
-/// Provenance of a resolved bounded [`MemoryBudget`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryBudgetBasis {
-    /// An explicit `OracleRuntimeConfig::memory_limit_bytes` value.
-    Configured,
-    /// The D79 default derived from probed pod memory.
-    Default,
+pub struct MemoryBudget {
+    /// Exact allocator-issued complete-query bytes.
+    bytes: u64,
 }
 
 impl MemoryBudget {
-    /// Resolve the effective budget from explicit config and probed pod memory.
-    ///
-    /// Mirrors the server's D79 resolution read-only: an explicit configured
-    /// value wins (floored at the 256 MiB minimum the server enforces), else the
-    /// default is `pod_memory / 4` clamped to `[256 MiB, 8 GiB]`, else — when pod
-    /// memory cannot be probed — [`MemoryBudget::Unbounded`].
+    /// Constructs a bounded budget from the exact allocator-issued query grant.
     #[must_use]
-    pub fn resolve(config_limit_bytes: Option<u64>, pod_memory_bytes: Option<u64>) -> Self {
-        if let Some(configured) = config_limit_bytes {
-            return Self::Bounded {
-                bytes: configured.max(ORACLE_BUDGET_FLOOR_BYTES),
-                basis: MemoryBudgetBasis::Configured,
-            };
-        }
-        match pod_memory_bytes {
-            Some(pod) => Self::Bounded {
-                bytes: (pod / 4).clamp(ORACLE_BUDGET_FLOOR_BYTES, ORACLE_BUDGET_CEIL_BYTES),
-                basis: MemoryBudgetBasis::Default,
-            },
-            None => Self::Unbounded,
-        }
+    pub const fn from_resource_plan(bytes: u64) -> Self {
+        Self { bytes }
     }
 
     /// Return the stable manifest string recorded for this budget basis.
     #[must_use]
     fn basis_label(self) -> &'static str {
-        match self {
-            Self::Bounded {
-                basis: MemoryBudgetBasis::Configured,
-                ..
-            } => "configured",
-            Self::Bounded {
-                basis: MemoryBudgetBasis::Default,
-                ..
-            } => "default",
-            Self::Unbounded => "unbounded",
-        }
+        "bifrost_resource_plan"
     }
 
-    /// Return the bounded byte value, or `None` when unbounded.
+    /// Returns the exact bounded byte value for manifest compatibility.
     #[must_use]
     fn bounded_bytes(self) -> Option<u64> {
-        match self {
-            Self::Bounded { bytes, .. } => Some(bytes),
-            Self::Unbounded => None,
-        }
+        Some(self.bytes)
     }
 }
 
@@ -256,18 +202,10 @@ pub fn select_qualification_shape(
         materialization_estimate_seconds(rows_per_day, rows_per_second) <= deadline
     };
 
-    let chosen = match budget {
-        MemoryBudget::Bounded { bytes, .. } => {
-            let threshold = bytes.saturating_mul(MEMORY_SCAN_MULTIPLE);
-            SHAPE_LADDER
-                .into_iter()
-                .find(|&rows| q4_scan_bytes(rows) >= threshold && fits_deadline(rows))
-        }
-        MemoryBudget::Unbounded => SHAPE_LADDER
-            .into_iter()
-            .rev()
-            .find(|&rows| fits_deadline(rows)),
-    };
+    let threshold = budget.bytes.saturating_mul(MEMORY_SCAN_MULTIPLE);
+    let chosen = SHAPE_LADDER
+        .into_iter()
+        .find(|&rows| q4_scan_bytes(rows) >= threshold && fits_deadline(rows));
 
     let rows_per_day = chosen.ok_or(ShapeSelectionError::NoFeasibleShape {
         ladder: SHAPE_LADDER,
@@ -1176,10 +1114,7 @@ mod tests {
 
     /// Build a bounded budget of `bytes` for the D70 selection rule.
     fn bounded(bytes: u64) -> MemoryBudget {
-        MemoryBudget::Bounded {
-            bytes,
-            basis: MemoryBudgetBasis::Default,
-        }
+        MemoryBudget::from_resource_plan(bytes)
     }
 
     /// A brisk calibration used where selection is not deadline-bound.
@@ -1193,7 +1128,7 @@ mod tests {
         let selection = select_qualification_shape(bounded(10_000_000), calib(100_000.0), 1800)
             .expect("rung0 selectable");
         assert_eq!(selection.shape.rows_per_day, 200_000);
-        assert_eq!(selection.memory_budget_basis, "default");
+        assert_eq!(selection.memory_budget_basis, "bifrost_resource_plan");
     }
 
     #[test]
@@ -1229,55 +1164,19 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_selects_largest_rung_within_deadline() {
-        // rung estimates at 100_000 rows/s: rung0 16s, rung1 64s, rung2 256s.
-        let selection = select_qualification_shape(MemoryBudget::Unbounded, calib(100_000.0), 100)
-            .expect("unbounded selectable");
-        assert_eq!(selection.shape.rows_per_day, 800_000);
-        assert_eq!(selection.memory_budget_basis, "unbounded");
-        assert_eq!(selection.effective_memory_budget_bytes, None);
-    }
-
-    #[test]
-    fn unbounded_no_shape_when_no_estimate_fits() {
-        let error = select_qualification_shape(MemoryBudget::Unbounded, calib(10.0), 1)
-            .expect_err("no unbounded rung fits");
-        assert!(matches!(error, ShapeSelectionError::NoFeasibleShape { .. }));
-    }
-
-    #[test]
     fn rejects_nonpositive_calibration() {
-        let error = select_qualification_shape(MemoryBudget::Unbounded, calib(0.0), 1800)
+        let error = select_qualification_shape(bounded(GIB), calib(0.0), 1800)
             .expect_err("zero throughput rejected");
         assert!(matches!(error, ShapeSelectionError::InvalidCalibration(_)));
     }
 
+    /// Exact complete-query grants retain resource-plan provenance without clamping.
     #[test]
-    fn memory_budget_resolves_configured_and_default_and_unbounded() {
+    fn memory_budget_uses_exact_resource_plan_grant() {
         assert_eq!(
-            MemoryBudget::resolve(Some(GIB), None),
-            MemoryBudget::Bounded {
-                bytes: GIB,
-                basis: MemoryBudgetBasis::Configured
-            }
+            MemoryBudget::from_resource_plan(GIB),
+            MemoryBudget { bytes: GIB }
         );
-        // Configured below the floor is raised to the floor.
-        assert_eq!(
-            MemoryBudget::resolve(Some(1), None),
-            MemoryBudget::Bounded {
-                bytes: ORACLE_BUDGET_FLOOR_BYTES,
-                basis: MemoryBudgetBasis::Configured
-            }
-        );
-        // Default is a clamped quarter of pod memory.
-        assert_eq!(
-            MemoryBudget::resolve(None, Some(16 * GIB)),
-            MemoryBudget::Bounded {
-                bytes: 4 * GIB,
-                basis: MemoryBudgetBasis::Default
-            }
-        );
-        assert_eq!(MemoryBudget::resolve(None, None), MemoryBudget::Unbounded);
     }
 
     #[test]

@@ -31,6 +31,92 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::NanValueCountVisitor;
+/// Lease-owned rewrite resources for exactly one Forge attempt.
+///
+/// The attempt's `DataFusion` runtime is built from the pool and scratch bytes
+/// the root governor granted, so no attempt can execute against capacity it did
+/// not acquire. Field order is load-bearing: `runtime` is declared before
+/// `lease`, so the attempt drops its runtime — releasing the spill child — before
+/// the exact root lease is returned to the governor.
+pub(crate) struct ForgeAttemptResources {
+    /// Attempt runtime shared with the attempt-local execution pipeline view.
+    runtime: Arc<ForgeRewriteRuntime>,
+    /// Exact memory and scratch lease returned to the root governor on drop.
+    lease: crate::resources::ForgeRewriteResources,
+}
+
+impl ForgeAttemptResources {
+    /// Atomically acquires the exact request, then builds its attempt runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Capacity`] when the root governor refuses either
+    /// counter, a runtime construction error when the owned spill child cannot
+    /// be created, and [`ForgeError::Invariant`] when the constructed runtime
+    /// did not retain the lease-issued pool.
+    pub(crate) fn acquire(
+        resources: &crate::resources::ForgeResources,
+        request: crate::resources::ForgeRewriteRequest,
+        pod_spill_root: &Path,
+    ) -> Result<Self, ForgeError> {
+        let lease =
+            resources
+                .try_acquire_rewrite(request)
+                .map_err(|error| ForgeError::Capacity {
+                    detail: error.to_string(),
+                })?;
+        let pool = lease.memory_pool();
+        let runtime = ForgeRewriteRuntime::new_attempt(
+            Arc::clone(&pool),
+            pod_spill_root,
+            lease.scratch_bytes(),
+        )?;
+        if !runtime.uses_memory_pool(&pool) {
+            return Err(ForgeError::Invariant {
+                detail: "Forge rewrite runtime did not retain its operation lease pool".to_owned(),
+            });
+        }
+        Ok(Self {
+            runtime: Arc::new(runtime),
+            lease,
+        })
+    }
+
+    /// Creates the attempt-local execution view backed by this leased runtime.
+    pub(crate) fn pipeline(&self, base: &ForgeRewritePipeline) -> ForgeRewritePipeline {
+        base.for_runtime(Arc::clone(&self.runtime))
+    }
+
+    /// Returns the runtime this attempt lends to its execution pipeline view.
+    #[cfg(test)]
+    pub(crate) fn runtime(&self) -> &ForgeRewriteRuntime {
+        &self.runtime
+    }
+
+    /// Returns the exact pool this attempt leased, for lifecycle assertions.
+    #[cfg(test)]
+    pub(crate) fn memory_pool(&self) -> Arc<dyn MemoryPool> {
+        self.lease.memory_pool()
+    }
+}
+
+impl Drop for ForgeAttemptResources {
+    /// Verifies the execution view released the runtime before the lease returns.
+    ///
+    /// A surviving pipeline view would keep the spill child alive past the
+    /// governor's scratch release, so a violation is reported rather than
+    /// silently tolerated. Dropping proceeds either way; the lease must return.
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.runtime) != 1 {
+            tracing::error!(
+                scratch_bytes = self.lease.scratch_bytes(),
+                "invariant: Forge attempt runtime outlived its resource lease"
+            );
+            debug_assert!(false, "Forge attempt runtime outlived its resource lease");
+        }
+    }
+}
+
 #[cfg(test)]
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
 use iceberg::spec::{DataFile, Literal, SchemaRef as IcebergSchemaRef, Struct};
@@ -46,19 +132,115 @@ use super::compact::{ForgeObjectStore, project_by_name, validate_tenant_column};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::path::{catalog_path_to_object_key, validate_table_location};
+use super::planner::{ForgeCapacity, ForgePlanCandidate, ForgePlanner};
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::{BIFROST_WRITER_RECIPE_VERSION, bifrost_writer_properties};
+use crate::resources::ForgeRewriteRequest;
 use vala_sql::OperatorPool;
+use vala_sql::row_types::forge_tasks::ForgeTaskEstimates;
 
 /// Maximum rows decoded from one Parquet source batch.
 const REWRITE_BATCH_ROWS: usize = 8_192;
+/// Fixed working set every rewrite plan needs regardless of input size.
+///
+/// The rewrite executes a `DataFusion` sort/merge into one Parquet writer.
+/// That plan reserves whole decoded batches for `ExternalSorterMerge`, a sort
+/// spill reservation, and the output writer's buffers before it can make any
+/// progress, so a demand derived purely from selected input bytes starves a
+/// small-file compaction — the most common maintenance case. Requests are
+/// therefore raised to this floor and still bounded by the validated
+/// [`ForgeCapacity`] memory ceiling.
+pub(crate) const REWRITE_WORKING_SET_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Upper bound for `DataFusion` spill handles to finish dropping after cancel.
 const SPILL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Raises one validated memory estimate to the executable rewrite working set.
+///
+/// The estimate has already been proven to fit `capacity`, so raising it to
+/// [`REWRITE_WORKING_SET_FLOOR_BYTES`] and re-bounding by the same validated
+/// memory ceiling never admits a task the planner refused: it only ensures the
+/// leased pool can actually run the rewrite plan. Both request constructors
+/// share this operation so a durable claim and a directly replaced live group
+/// lease byte-identical memory.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Capacity`] when the resulting demand exceeds this
+/// platform's `usize` domain.
+fn rewrite_working_set_bytes(
+    estimate_bytes: u64,
+    capacity: ForgeCapacity,
+) -> Result<usize, ForgeError> {
+    let demand = estimate_bytes
+        .max(REWRITE_WORKING_SET_FLOOR_BYTES)
+        .min(capacity.max_memory_bytes);
+    usize::try_from(demand).map_err(|_| ForgeError::Capacity {
+        detail: "planned memory bytes exceed this platform".to_owned(),
+    })
+}
+
+impl ForgeRewriteRequest {
+    /// Forms the one exact rewrite demand from a durable claim's estimates.
+    ///
+    /// The persisted estimates already passed planner capacity classification,
+    /// so this operation only re-proves the invariants the resource root
+    /// depends on: positive demand, representability in this platform's
+    /// `usize`, and conformance to the same validated [`ForgeCapacity`]
+    /// ceilings. The durable estimate is then raised only to the executable
+    /// rewrite working set (see [`rewrite_working_set_bytes`]); it is never
+    /// inflated toward a configuration ceiling by the estimate itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Capacity`] when either estimate is zero, exceeds
+    /// its validated ceiling, or exceeds this platform's `usize` domain.
+    pub(crate) fn from_claim(
+        estimates: &ForgeTaskEstimates,
+        capacity: ForgeCapacity,
+    ) -> Result<Self, ForgeError> {
+        ForgePlanner::new(capacity)
+            .validate_candidate_estimates(estimates.memory_bytes, estimates.spill_bytes)?;
+        Ok(Self {
+            memory_bytes: rewrite_working_set_bytes(estimates.memory_bytes, capacity)?,
+            scratch_bytes: estimates.spill_bytes,
+        })
+    }
+
+    /// Forms the exact rewrite demand a directly replaced live group requires.
+    ///
+    /// The group is first mapped through the sole production candidate
+    /// estimation algorithm ([`ForgePlanCandidate::from_live_group`]), so the
+    /// resulting request is byte-identical to the one
+    /// [`Self::from_claim`] would form for the task the planner would have
+    /// persisted for the same group, including the shared working-set floor.
+    /// Configuration ceilings bound the request; they are never themselves the
+    /// requested demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the group's input bytes overflow
+    /// or its file count exceeds the durable parallelism domain, and
+    /// [`ForgeError::Capacity`] for the same conditions as [`Self::from_claim`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn from_live_group(
+        group: &super::right_size::IcebergRewriteGroup,
+        capacity: ForgeCapacity,
+    ) -> Result<Self, ForgeError> {
+        let candidate = ForgePlanCandidate::from_live_group(group)?;
+        ForgePlanner::new(capacity)
+            .validate_candidate_estimates(candidate.memory_bytes, candidate.spill_bytes)?;
+        Ok(Self {
+            memory_bytes: rewrite_working_set_bytes(candidate.memory_bytes, capacity)?,
+            scratch_bytes: candidate.spill_bytes,
+        })
+    }
+}
+
 /// Owned rewrite dependencies shared by every serialized Forge operation.
 pub(crate) struct ForgeRewritePipeline {
-    /// Process-wide [`DataFusion`] runtime and its owned spill directory.
-    runtime: ForgeRewriteRuntime,
+    /// Attempt-local runtime installed only on the worker-owned execution view.
+    runtime: Option<Arc<ForgeRewriteRuntime>>,
     /// Staging operator used for deterministic rewritten-object PUTs.
     staging: Arc<opendal::Operator>,
     /// Iceberg catalog used to re-check live references before cleanup.
@@ -531,7 +713,6 @@ impl ForgeRewritePipeline {
     ///
     /// Returns [`ForgeError::InvalidConfig`] when the concurrency limit is zero.
     pub(crate) fn new(
-        runtime: ForgeRewriteRuntime,
         staging: Arc<opendal::Operator>,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
@@ -543,13 +724,37 @@ impl ForgeRewritePipeline {
             });
         }
         Ok(Self {
-            runtime,
+            runtime: None,
             staging,
             catalog,
             object_store,
             max_concurrent_reads,
             blocking_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_reads)),
         })
+    }
+
+    /// Creates an attempt-local execution view over the retained dependencies.
+    pub(crate) fn for_runtime(&self, runtime: Arc<ForgeRewriteRuntime>) -> Self {
+        Self {
+            runtime: Some(runtime),
+            staging: Arc::clone(&self.staging),
+            catalog: Arc::clone(&self.catalog),
+            object_store: Arc::clone(&self.object_store),
+            max_concurrent_reads: self.max_concurrent_reads,
+            blocking_permits: Arc::clone(&self.blocking_permits),
+        }
+    }
+
+    /// Returns the worker-installed runtime for this execution view.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a caller bypasses [`Self::for_runtime`] and attempts IO on
+    /// the dependency-only pipeline retained by [`Forge`](super::Forge).
+    fn runtime(&self) -> &ForgeRewriteRuntime {
+        self.runtime
+            .as_ref()
+            .expect("invariant: Forge rewrite execution installs its leased runtime")
     }
 
     /// Confirm the pipeline retained the exact host-supplied staging operator.
@@ -578,7 +783,7 @@ impl ForgeRewritePipeline {
         lease: &mut ForgeLease,
         operator_pool: &OperatorPool,
     ) -> Result<RewriteOutput, ForgeError> {
-        let initial_spill = self.runtime.runtime.spilling_progress();
+        let initial_spill = self.runtime().runtime.spilling_progress();
         if initial_spill.active_files_count != 0 {
             return Err(ForgeError::Invariant {
                 detail: "Forge rewrite began with active spill files".to_owned(),
@@ -626,7 +831,7 @@ impl ForgeRewritePipeline {
     ) -> RewriteBatchResult {
         let reservation =
             datafusion::execution::memory_pool::MemoryConsumer::new("forge-rewrite-output")
-                .register(&self.runtime.runtime.memory_pool);
+                .register(&self.runtime().runtime.memory_pool);
         let mut state = RewriteBatchState::with_reservation(Some(reservation));
         while let Some(batch) = tokio::select! {
             () = stop.cancelled() => return state.fail(ForgeError::Shutdown),
@@ -730,7 +935,7 @@ impl ForgeRewritePipeline {
         })?;
         *state = returned;
         result?;
-        state.observe_spill(self.runtime.runtime.spilling_progress().current_bytes);
+        state.observe_spill(self.runtime().runtime.spilling_progress().current_bytes);
         Ok(())
     }
 
@@ -824,7 +1029,7 @@ impl ForgeRewritePipeline {
                 .await;
             return Err(error);
         }
-        let final_spill = self.runtime.runtime.spilling_progress();
+        let final_spill = self.runtime().runtime.spilling_progress();
         if final_spill.active_files_count != 0 {
             self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
                 .await;
@@ -858,7 +1063,13 @@ impl ForgeRewritePipeline {
     /// bounded shutdown interval.
     async fn await_spill_cleanup(&self) -> Result<(), ForgeError> {
         let cleanup = async {
-            while self.runtime.runtime.spilling_progress().active_files_count != 0 {
+            while self
+                .runtime()
+                .runtime
+                .spilling_progress()
+                .active_files_count
+                != 0
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         };
@@ -921,7 +1132,7 @@ impl ForgeRewritePipeline {
         let sort = Arc::new(SortExec::new(ordering, source));
         let session = datafusion::prelude::SessionContext::new_with_config_rt(
             datafusion::prelude::SessionConfig::new(),
-            self.runtime.runtime(),
+            self.runtime().runtime(),
         );
         let sort_plan: Arc<dyn ExecutionPlan> = sort.clone();
         let stream =
@@ -1201,10 +1412,10 @@ impl ForgeRewritePipeline {
         let detail = error.to_string();
         if detail.contains("temp")
             && detail.contains("limit")
-            && detail.contains(&self.runtime.spill_limit_bytes.to_string())
+            && detail.contains(&self.runtime().spill_limit_bytes.to_string())
         {
             ForgeError::SpillLimitExceeded {
-                limit_bytes: self.runtime.spill_limit_bytes,
+                limit_bytes: self.runtime().spill_limit_bytes,
             }
         } else {
             ForgeError::DataFusion(error)
@@ -1531,11 +1742,17 @@ impl ForgeRewriteRuntime {
         pod_spill_root: &Path,
         spill_limit_bytes: u64,
     ) -> Result<Self, ForgeError> {
-        if spill_limit_bytes == 0 {
-            return Err(ForgeError::InvalidConfig {
-                detail: "Forge spill limit must be positive".to_owned(),
-            });
-        }
+        Self::prepare_root(pod_spill_root)?;
+        Self::new_attempt(memory_pool, pod_spill_root, spill_limit_bytes)
+    }
+
+    /// Cleans stale owned children once while constructing the Forge owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Parquet`] when the root cannot be created, read,
+    /// or cleaned before any worker becomes active.
+    pub(crate) fn prepare_root(pod_spill_root: &Path) -> Result<(), ForgeError> {
         std::fs::create_dir_all(pod_spill_root).map_err(|error| ForgeError::Parquet {
             detail: error.to_string(),
         })?;
@@ -1559,6 +1776,28 @@ impl ForgeRewriteRuntime {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    /// Creates one attempt runtime without touching concurrent sibling directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] for a zero lease or a Parquet or
+    /// `DataFusion` error when its unique child or runtime cannot be built.
+    pub(crate) fn new_attempt(
+        memory_pool: Arc<dyn MemoryPool>,
+        pod_spill_root: &Path,
+        spill_limit_bytes: u64,
+    ) -> Result<Self, ForgeError> {
+        if spill_limit_bytes == 0 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge spill limit must be positive".to_owned(),
+            });
+        }
+        std::fs::create_dir_all(pod_spill_root).map_err(|error| ForgeError::Parquet {
+            detail: error.to_string(),
+        })?;
         let spill_dir = tempfile::Builder::new()
             .prefix("forge-runtime-")
             .tempdir_in(pod_spill_root)
@@ -1591,6 +1830,12 @@ impl ForgeRewriteRuntime {
         Arc::clone(&self.runtime)
     }
 
+    /// Reports whether this runtime retained the exact leased memory pool.
+    #[must_use]
+    pub(crate) fn uses_memory_pool(&self, pool: &Arc<dyn MemoryPool>) -> bool {
+        Arc::ptr_eq(&self.runtime.memory_pool, pool)
+    }
+
     /// Return the owned spill path for diagnostics and tests.
     #[must_use]
     #[cfg(test)]
@@ -1604,6 +1849,146 @@ mod tests {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
 
     use super::*;
+
+    /// Proves an attempt executes on its leased pool and restores baselines.
+    ///
+    /// The attempt is acquired through the same production capability the Forge
+    /// worker uses, so this pins lease-issued pool identity, spill-child
+    /// ownership, and exact release of both counters on drop.
+    #[test]
+    fn forge_attempt_resources_use_lease_pool_and_restore_baselines_on_drop() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            2 * 1024 * 1024 * 1024,
+            4 * 1024 * 1024,
+            [crate::resources::BifrostRole::Forge],
+        );
+        let forge = roles
+            .forge()
+            .expect("composition must enable the Forge capability");
+        let baseline = forge.snapshot().expect("live baseline");
+        let root = tempfile::tempdir().expect("pod spill root");
+        ForgeRewriteRuntime::prepare_root(root.path()).expect("prepared root");
+
+        let attempt = ForgeAttemptResources::acquire(
+            &forge,
+            crate::resources::ForgeRewriteRequest {
+                memory_bytes: 1_024 * 1_024,
+                scratch_bytes: 1_024 * 1_024,
+            },
+            root.path(),
+        )
+        .expect("attempt resources");
+        assert!(
+            attempt.runtime().uses_memory_pool(&attempt.memory_pool()),
+            "the attempt runtime must execute on the exact leased pool"
+        );
+
+        let held = forge.snapshot().expect("held snapshot");
+        assert_eq!(
+            held.elastic_memory_used_bytes,
+            baseline.elastic_memory_used_bytes + 1_024 * 1_024
+        );
+        assert_eq!(
+            held.scratch_used_bytes,
+            baseline.scratch_used_bytes + 1_024 * 1_024
+        );
+
+        drop(attempt);
+        let after = forge.snapshot().expect("restored snapshot");
+        assert_eq!(
+            after.elastic_memory_used_bytes,
+            baseline.elastic_memory_used_bytes
+        );
+        assert_eq!(after.scratch_used_bytes, baseline.scratch_used_bytes);
+        assert!(
+            std::fs::read_dir(root.path())
+                .expect("root readable")
+                .next()
+                .is_none(),
+            "the attempt must remove its owned spill child"
+        );
+    }
+
+    /// Returns ceilings wide enough to admit the parity fixture's exact demand.
+    #[cfg(feature = "test-support")]
+    fn parity_capacity() -> ForgeCapacity {
+        ForgeCapacity {
+            max_files: 8,
+            max_bytes: 4_096,
+            max_parallelism: 8,
+            max_memory_bytes: 256 * 1024 * 1024,
+            max_spill_bytes: 4_096,
+            max_large_task_bytes: 8_192,
+        }
+    }
+
+    /// Builds one deterministic candidate input of the requested size.
+    #[cfg(feature = "test-support")]
+    fn parity_file(path: &str, bytes: u64) -> super::super::right_size::IcebergCandidateFile {
+        super::super::right_size::IcebergCandidateFile {
+            catalog_path: path.to_owned(),
+            object_path: path.to_owned(),
+            file_size_bytes: bytes,
+            record_count: 1,
+            schema_id: 1,
+            partition_spec_id: 1,
+            partition_day: chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                .expect("fixed parity day is valid"),
+            sort_order_id: Some(1),
+            writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
+            min_event_time: chrono::DateTime::from_timestamp(1, 0)
+                .expect("fixed parity timestamp is valid"),
+            max_event_time: chrono::DateTime::from_timestamp(2, 0)
+                .expect("fixed parity timestamp is valid"),
+            source_snapshot_id: 1,
+            data_sequence_number: Some(1),
+            file_sequence_number: Some(1),
+        }
+    }
+
+    /// The direct live-replacement request equals the request a persisted plan
+    /// for the same group would produce.
+    ///
+    /// This is the sole guard that the `test-support` replacement path cannot
+    /// drift into acquiring configuration ceilings instead of exact demand: the
+    /// group's request is compared against the request derived from the durable
+    /// estimates the production planner persists for the identical group.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn live_group_request_matches_planned_candidate_estimates() {
+        let capacity = parity_capacity();
+        let group = super::super::right_size::IcebergRewriteGroup {
+            files: vec![parity_file("a.parquet", 300), parity_file("b.parquet", 500)],
+            reason: super::super::right_size::IcebergRewriteReason::Undersized,
+        };
+
+        let direct = ForgeRewriteRequest::from_live_group(&group, capacity)
+            .expect("live group must form an exact request");
+
+        let candidate =
+            ForgePlanCandidate::from_live_group(&group).expect("group must map to a candidate");
+        let planned = ForgePlanner::new(capacity)
+            .plan_table(&super::super::planner::ForgeTableSnapshot {
+                snapshot_id: 1,
+                candidates: vec![candidate],
+            })
+            .expect("candidate must plan");
+        let persisted = ForgeRewriteRequest::from_claim(&planned[0].estimates, capacity)
+            .expect("persisted estimates must form an exact request");
+
+        assert_eq!(direct, persisted);
+        assert_eq!(
+            u64::try_from(direct.memory_bytes).ok(),
+            Some(REWRITE_WORKING_SET_FLOOR_BYTES),
+            "a small group leases exactly the executable working set"
+        );
+        assert_eq!(direct.scratch_bytes, 800);
+        assert_ne!(
+            u64::try_from(direct.memory_bytes).ok(),
+            Some(capacity.max_memory_bytes),
+            "demand is never the configuration ceiling itself"
+        );
+    }
 
     /// A zero spill ceiling cannot create an unbounded rewrite runtime.
     #[test]

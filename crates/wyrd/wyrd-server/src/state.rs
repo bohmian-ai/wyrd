@@ -22,6 +22,7 @@ use vala_bifrost_redux::gate::IngressCpuProjection;
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle;
+use vala_bifrost_redux::resources::BifrostRoleResources;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
@@ -796,6 +797,11 @@ pub struct AppState {
     pub bifrost_redux: Option<Arc<BifrostCatalog>>,
     /// Shared parent memory governor used by Scribe, Forge, and Oracle reads.
     pub bifrost_memory: Option<BifrostMemoryGovernor>,
+    /// Narrow per-role capabilities issued by the one Bifrost resource root.
+    ///
+    /// The server retains the composition, never a raw governor, so no server
+    /// path can construct a sibling root or derive its own grant.
+    pub bifrost_resources: Option<BifrostRoleResources>,
     /// Shared DataFusion pool bounded by the Bifrost parent ceiling.
     pub bifrost_query_memory: Option<Arc<dyn MemoryPool>>,
     /// Complete Gate/Scribe ingest subsystem, absent only when Bifrost ingest is disabled.
@@ -854,6 +860,7 @@ impl AppState {
             bifrost,
             bifrost_redux: None,
             bifrost_memory: None,
+            bifrost_resources: None,
             bifrost_query_memory: None,
             bifrost_ingest: None,
             bifrost_gate: None,
@@ -996,6 +1003,13 @@ impl AppState {
     ) -> Self {
         self.bifrost_query_memory = Some(query_memory);
         self.bifrost_memory = Some(memory);
+        self
+    }
+
+    /// Attaches the Bifrost-owned role composition issued at boot.
+    #[must_use]
+    pub fn with_bifrost_resources(mut self, resources: BifrostRoleResources) -> Self {
+        self.bifrost_resources = Some(resources);
         self
     }
 

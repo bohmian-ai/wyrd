@@ -1,5 +1,5 @@
 mod pg_tests {
-    //! Integration proof that the D84 governor and memtable gauges move during a
+    //! Integration proof that the global governor and memtable gauges move during a
     //! real Postgres-backed ingest.
     //!
     //! Unit tests prove each gauge family carries only closed labels; this test
@@ -7,7 +7,7 @@ mod pg_tests {
     //! live, non-zero values once rows are buffered. It appends a batch that stays
     //! resident in the writable memtable (no seal), drives one age-scan tick under
     //! a scoped [`wyrd_bench::BenchmarkRecorder`], and asserts the per-child
-    //! occupancy, the D83 ingress watermarks, and the memtable gauges reflect the
+    //! occupancy, ingress watermarks, and memtable gauges reflect the
     //! buffered state rather than sitting at zero.
     //!
     //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
@@ -21,8 +21,13 @@ mod pg_tests {
     use vala_bifrost_redux::catalog::TableRef;
     use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use vala_bifrost_redux::resources::{
+        BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
+        ResourceSource, SystemResourceSnapshot,
+    };
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
-    use vala_bifrost_redux::scribe::ScribeImpl;
+    use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+    use vala_bifrost_redux::scribe::{ScribeEmbeddedConfig, ScribeImpl, ScribeLaneConfig};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
     use wyrd_spec::DataTenantId;
@@ -31,7 +36,7 @@ mod pg_tests {
 
     /// Stand up a tenant-seeded Postgres fixture and an embedded Scribe over an
     /// in-memory object store, mirroring the seal integration harness.
-    async fn setup() -> (PgFixture, DataTenantId, ScribeImpl) {
+    async fn setup() -> (PgFixture, DataTenantId, ScribeImpl, BifrostRoleResources) {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
         fixture
@@ -64,11 +69,52 @@ mod pg_tests {
             )
             .expect("WAL writer"),
         );
+        let scratch_root = temp_dir.path().to_owned();
         // Leak the temp dir so WAL segments survive for the test lifetime.
         std::mem::forget(temp_dir);
 
-        let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &node_id.to_string(), 1);
-        (fixture, tenant, scribe)
+        let runtime_resources = BifrostRuntimeResources::from_snapshot(
+            SystemResourceSnapshot {
+                memory_limit_bytes: 768 * 1024 * 1024,
+                effective_cpu: 4,
+                scratch_capacity_bytes: 1280 * 1024 * 1024,
+                scratch_available_bytes: 1280 * 1024 * 1024,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            },
+            BifrostResourcePolicy {
+                roles: [BifrostRole::Scribe, BifrostRole::Oracle]
+                    .into_iter()
+                    .collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: None,
+                effective_cpu: None,
+                scratch_root,
+            },
+        )
+        .expect("global runtime resources");
+        let resources = runtime_resources
+            .compose_roles()
+            .expect("role composition from the one runtime owner");
+        let memory = resources.memory_ledger();
+        let scribe = ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
+            operator,
+            wal,
+            &node_id.to_string(),
+            1,
+            std::time::Duration::ZERO,
+            ScribeEmbeddedConfig {
+                lane_config: ScribeLaneConfig::resolved(),
+                admission: AdmissionConfig::default(),
+                coordination_runtime: tokio::runtime::Handle::current(),
+                persistence: None,
+                memory_budget: Some(memory.scribe_budget()),
+                staging_file_publisher: None,
+            },
+        )
+        .expect("embedded Scribe");
+        (fixture, tenant, scribe, resources)
     }
 
     /// Build a single-day Arrow batch of monotonically increasing rows.
@@ -116,13 +162,13 @@ mod pg_tests {
     /// The governor and memtable gauges report live occupancy during an ingest.
     ///
     /// Appends a resident (unsealed) batch, then drives one production age-scan
-    /// tick under a scoped recorder and asserts the D84 governor gauges
-    /// (per-child used/limit and the D83 ingress watermarks) and the memtable
+    /// tick under a scoped recorder and asserts the global governor gauges,
+    /// ingress watermarks, and memtable
     /// gauges reflect the buffered rows rather than sitting at zero. This is the
     /// AC2 evidence: steady-state occupancy only arises through a real ingest.
     #[tokio::test]
     async fn governor_gauges_move_during_pg_ingest() {
-        let (_fixture, tenant, scribe) = setup().await;
+        let (_fixture, tenant, scribe, resources) = setup().await;
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .expect("time")
             .timestamp_micros();
@@ -150,24 +196,33 @@ mod pg_tests {
         });
         let snapshot = recorder.snapshot();
 
-        // Per-child limits are structural and always positive.
+        // The one global allocator reports its managed plan and live Scribe owner.
         assert!(
-            gauge(&snapshot, "bifrost_memory_limit_bytes{consumer=\"scribe\"}") > 0.0,
-            "scribe child limit gauge must be exported and positive"
+            gauge(&snapshot, "bifrost_resource_memory_bytes{kind=\"managed\"}") > 0.0,
+            "managed memory gauge must be exported and positive"
         );
-        assert!(
-            gauge(&snapshot, "bifrost_memory_limit_bytes{consumer=\"parent\"}") > 0.0,
-            "parent limit gauge must be exported and positive"
-        );
-        // The buffered ingest charges the Scribe child, so used bytes moved.
         assert!(
             gauge(
                 &snapshot,
-                "bifrost_memory_reserved_bytes{consumer=\"scribe\"}"
+                "bifrost_resource_memory_bytes{kind=\"scribe_floor\"}"
             ) > 0.0,
-            "scribe reserved bytes must move while rows are buffered"
+            "Scribe floor gauge must be exported and positive"
         );
-        // The D83 ingress watermarks: limit is the denominator (positive) and
+        assert!(
+            gauge(
+                &snapshot,
+                "bifrost_resource_memory_bytes{kind=\"scribe_used\"}"
+            ) > 0.0,
+            "Scribe live ownership must move while rows are buffered"
+        );
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("live global snapshot")
+                .scribe_memory_used_bytes,
+            scribe.memory_snapshot().scribe_total_bytes
+        );
+        // Ingress limit is the denominator (positive) and
         // occupancy tracks the live charge (moved by the ingest).
         assert!(
             gauge(

@@ -28,13 +28,16 @@ use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
-    ForgeRewriteRuntime, ForgeSchedulerTrigger, ForgeWorkerCompletionObserver,
+    ForgeSchedulerTrigger, ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
+use vala_bifrost_redux::resources::{
+    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+    SystemResourceSnapshot,
+};
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_sdk::{BifrostGrpcTransport, IngestTransport};
 use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
@@ -324,10 +327,8 @@ pub struct WyrdTestServerBuilder {
     scribe_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Cluster-retained Forge/Oracle spill root reused across restarts.
     oracle_spill_root: Option<Arc<tempfile::TempDir>>,
-    /// Optional deterministic Oracle child ceiling for spill journeys.
-    oracle_memory_limit_bytes: Option<usize>,
-    /// Optional deterministic Oracle query-spill ceiling for spill journeys.
-    oracle_spill_limit_bytes: Option<u64>,
+    /// Complete process observations injected into the production resource policy.
+    system_resources: Option<SystemResourceSnapshot>,
     /// Cluster-retained Oracle audit WAL root reused across restarts.
     oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Process-installed production telemetry guard shared by every node.
@@ -392,8 +393,7 @@ impl Default for WyrdTestServerBuilder {
             .collect(),
             scribe_wal_root: None,
             oracle_spill_root: None,
-            oracle_memory_limit_bytes: None,
-            oracle_spill_limit_bytes: None,
+            system_resources: None,
             oracle_audit_wal_root: None,
             telemetry: None,
             bind_addrs: None,
@@ -2227,15 +2227,16 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Applies deterministic Oracle memory and spill ceilings to a journey node.
+    /// Injects complete process-visible resources into the production bootstrap.
+    ///
+    /// Tests vary raw observations through this seam; all reserve, floor,
+    /// elastic, lease, and partition calculations remain production-owned.
     #[must_use]
-    pub(crate) fn with_oracle_capacity_for_test(
+    pub(crate) fn with_system_resources_for_test(
         mut self,
-        memory_limit_bytes: usize,
-        spill_limit_bytes: u64,
+        snapshot: SystemResourceSnapshot,
     ) -> Self {
-        self.oracle_memory_limit_bytes = Some(memory_limit_bytes);
-        self.oracle_spill_limit_bytes = Some(spill_limit_bytes);
+        self.system_resources = Some(snapshot);
         self
     }
 
@@ -2443,33 +2444,53 @@ impl WyrdTestServerBuilder {
             )
         })?;
         let scribe_admission = self.scribe_admission.unwrap_or_default();
-        let bifrost_memory = if let Some(oracle_limit) = self.oracle_memory_limit_bytes {
-            BifrostMemoryGovernor::new_with_test_child_limits(
-                scribe_admission.memory_limit_bytes,
-                scribe_admission
-                    .scribe_memory_limit_bytes
-                    .unwrap_or(256 * 1024 * 1024),
-                oracle_limit,
+        let resource_roles = self
+            .bifrost_roles
+            .iter()
+            .map(|role| match role {
+                BifrostRuntimeRole::Scribe => BifrostRole::Scribe,
+                BifrostRuntimeRole::Forge => BifrostRole::Forge,
+                BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
+            })
+            .collect();
+        let spill_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
+            Some(
+                self.oracle_spill_root.clone().unwrap_or(Arc::new(
+                    tempfile::tempdir()
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                )),
             )
         } else {
-            BifrostMemoryGovernor::new_with_child_limits(
-                scribe_admission.memory_limit_bytes,
-                scribe_admission.scribe_memory_limit_bytes,
-                None,
-            )
-            .or_else(|error| {
-                if let Some(limit) = scribe_admission.scribe_memory_limit_bytes
-                    && limit < 256 * 1024 * 1024
-                {
-                    return BifrostMemoryGovernor::new_with_test_scribe_limit(
-                        scribe_admission.memory_limit_bytes,
-                        limit,
-                    );
-                }
-                Err(error)
-            })
-        }
+            self.oracle_spill_root.clone()
+        };
+        let scratch_root = spill_root
+            .as_ref()
+            .map_or_else(std::path::PathBuf::new, |root| root.path().to_owned());
+        let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
+            memory_limit_bytes: 1024 * 1024 * 1024,
+            effective_cpu: 4,
+            scratch_capacity_bytes: 1280 * 1024 * 1024,
+            scratch_available_bytes: 1280 * 1024 * 1024,
+            memory_source: ResourceSource::Injected,
+            cpu_source: ResourceSource::Injected,
+        });
+        let runtime_resources = BifrostRuntimeResources::from_snapshot(
+            snapshot,
+            BifrostResourcePolicy {
+                roles: resource_roles,
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: None,
+                effective_cpu: None,
+                scratch_root,
+            },
+        )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let bifrost_resources = runtime_resources
+            .compose_roles()
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let bifrost_memory = bifrost_resources.memory_ledger();
+        let resource_plan = runtime_resources.plan();
         let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
             ..ForgeConfig::default()
@@ -2483,33 +2504,20 @@ impl WyrdTestServerBuilder {
                 bifrost_memory.clone(),
             ),
         );
-        let forge_memory = Arc::new(
-            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::for_parent(
-                bifrost_memory.clone(),
-            ),
-        );
-        let spill_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
-            Some(
-                self.oracle_spill_root.clone().unwrap_or(Arc::new(
-                    tempfile::tempdir()
-                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-                )),
-            )
-        } else {
-            self.oracle_spill_root.clone()
-        };
         let forge = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
             let root = spill_root.as_ref().ok_or_else(|| {
                 WyrdTestServerError::Start("Forge spill root is unavailable".to_owned())
             })?;
-            let forge_runtime =
-                ForgeRewriteRuntime::new(forge_memory, root.path(), forge_config.spill_limit_bytes)
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             let staging = Arc::new(storage.operator().clone());
             let object_store: Arc<dyn ForgeObjectStore> =
                 Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));
             Some(Arc::new(
                 Forge::new(ForgeBuildConfig {
+                    resources: bifrost_resources.forge().ok_or_else(|| {
+                        WyrdTestServerError::Start(
+                            "Forge role selected without a composed Forge capability".to_owned(),
+                        )
+                    })?,
                     vala: postgres.vala().clone(),
                     operator_pool: operator_pool.clone(),
                     catalog: self
@@ -2517,7 +2525,7 @@ impl WyrdTestServerBuilder {
                         .unwrap_or_else(|| bifrost_redux.iceberg_catalog()),
                     staging,
                     object_store,
-                    rewrite_runtime: forge_runtime,
+                    rewrite_spill_root: root.path().to_owned(),
                     hints: forge_inbox,
                     config: forge_config,
                     maintenance_interval: self.forge_interval,
@@ -2677,6 +2685,7 @@ impl WyrdTestServerBuilder {
             .with_bifrost_node_id(node_id)
             .with_bifrost_redux(Arc::clone(&bifrost_redux))
             .with_bifrost_memory_pool(bifrost_memory, query_memory)
+            .with_bifrost_resources(bifrost_resources)
             .with_bifrost_roles(self.bifrost_roles.clone())
             .with_query_stream_fault(query_stream_fault.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
@@ -2751,7 +2760,7 @@ impl WyrdTestServerBuilder {
                             .oracle_spill_root
                             .as_ref()
                             .map(|root| root.path().to_owned()),
-                        spill_limit_bytes: self.oracle_spill_limit_bytes,
+                        spill_limit_bytes: Some(resource_plan.scratch_limit_bytes),
                     },
                     self.role_timing,
                 )
@@ -2763,14 +2772,18 @@ impl WyrdTestServerBuilder {
                     SecretString::from(crate::keys::private_key_pem().to_owned()),
                     advertise_addr,
                     credentials,
-                    self.oracle_audit_wal_root
-                        .as_ref()
-                        .map(|root| root.path().to_owned()),
-                    self.oracle_spill_root
-                        .as_ref()
-                        .map(|root| root.path().to_owned()),
-                    self.oracle_spill_limit_bytes,
-                    self.role_timing,
+                    wyrd_server::boot::TestOracleAttachment {
+                        audit_wal_root: self
+                            .oracle_audit_wal_root
+                            .as_ref()
+                            .map(|root| root.path().to_owned()),
+                        spill_root: self
+                            .oracle_spill_root
+                            .as_ref()
+                            .map(|root| root.path().to_owned()),
+                        spill_limit_bytes: Some(resource_plan.scratch_limit_bytes),
+                        role_timing: self.role_timing,
+                    },
                 )
                 .await
             }
@@ -3273,4 +3286,81 @@ pub fn server_postgres_from_fixture(fixture: &PgFixture) -> ServerPostgres {
         fixture.wyrd_postgres().clone(),
         fixture.vala_postgres().clone(),
     )
+}
+
+/// Proves the test server boots on the one production resource composition.
+#[cfg(test)]
+mod production_composition_tests {
+    use vala_bifrost_redux::resources::{
+        BifrostResourcePolicy, BifrostRuntimeResources, ResourceSource, SystemResourceSnapshot,
+    };
+
+    use std::sync::Arc;
+
+    use super::{BifrostRuntimeRole, NodeId, WyrdTestServerBuilder};
+
+    /// Injected raw observations reach production composition unmodified.
+    ///
+    /// The harness supplies only raw process-visible observations and the
+    /// enabled roles. Every reserve, floor, elastic, scratch, and partition
+    /// number the booted server holds must therefore equal the plan
+    /// [`BifrostRuntimeResources`] derives from the same observation, proving
+    /// the harness derives no allocator output of its own.
+    #[tokio::test]
+    async fn test_server_injects_observations_and_uses_production_composition() {
+        let observation = SystemResourceSnapshot {
+            memory_limit_bytes: 3 * 1024 * 1024 * 1024,
+            effective_cpu: 6,
+            scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+            memory_source: ResourceSource::Injected,
+            cpu_source: ResourceSource::Injected,
+        };
+        let spill = Arc::new(tempfile::tempdir().expect("Oracle spill root"));
+        let scratch_root = spill.path().to_owned();
+        let server = WyrdTestServerBuilder::default()
+            .with_bifrost_node(
+                NodeId::new(uuid::Uuid::now_v7()),
+                [BifrostRuntimeRole::Oracle].into_iter().collect(),
+            )
+            .with_bifrost_roots(None, Some(Arc::clone(&spill)), None)
+            .with_system_resources_for_test(observation)
+            .start_in_process()
+            .await
+            .expect("test server boots on production composition");
+        let composed = server
+            .state()
+            .bifrost_resources
+            .clone()
+            .expect("the booted server retains its composed Bifrost roles");
+
+        let expected = BifrostRuntimeResources::from_snapshot(
+            observation,
+            BifrostResourcePolicy {
+                roles: [vala_bifrost_redux::resources::BifrostRole::Oracle]
+                    .into_iter()
+                    .collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: None,
+                effective_cpu: None,
+                scratch_root,
+            },
+        )
+        .expect("independent production composition of the same observation")
+        .plan();
+
+        assert_eq!(composed.plan(), expected);
+        assert!(
+            composed.oracle().is_some(),
+            "an Oracle node must receive its narrow Oracle capability"
+        );
+        assert!(
+            composed.forge().is_none(),
+            "composition must not issue capabilities for unselected roles"
+        );
+        let sources = composed.sources();
+        assert_eq!(sources.memory, ResourceSource::Injected);
+        assert_eq!(sources.cpu, ResourceSource::Injected);
+    }
 }

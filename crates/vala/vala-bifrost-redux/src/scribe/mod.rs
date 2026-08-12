@@ -30,11 +30,11 @@ mod pg_scribe_crash_injection;
 #[path = "tests/pg_scribe_restart.rs"]
 mod pg_scribe_restart;
 #[cfg(test)]
-#[path = "tests/task15_scribe_path.rs"]
-mod task15_scribe_path;
+#[path = "tests/scribe_persistence_path.rs"]
+mod scribe_persistence_path;
 #[cfg(test)]
-#[path = "tests/task16_wal_closeout.rs"]
-mod task16_wal_closeout;
+#[path = "tests/wal_closeout.rs"]
+mod wal_closeout;
 use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
@@ -65,7 +65,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use uuid::Uuid;
 use vala_sql::TenantConn;
 
 /// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
@@ -1302,6 +1301,7 @@ impl ScribeImpl {
     pub fn check_age(&self, now: std::time::Instant) {
         let snapshot = self.pressure_snapshot();
         snapshot.emit_governor_gauges();
+        self.memory.emit_root_resource_gauges();
         tracing::debug!(
             scribe_total = snapshot.scribe_total_bytes,
             oracle_total = snapshot.oracle_total_bytes,
@@ -1765,28 +1765,18 @@ impl ScribeImpl {
             coherent.or(latest).ok_or_else(|| ScribeError::Internal {
                 detail: "inspection could not read bucket and shard ownership".to_owned(),
             })?;
-        let bucket_memory = owner_snapshots
-            .iter()
-            .flat_map(|snapshot| snapshot.bucket_memory.clone())
-            .collect::<Vec<_>>();
         let mut memory_by_shard = [0_usize; crate::scribe::routing::SCRIBE_SHARD_COUNT];
-        let mut memory_by_bucket = Vec::with_capacity(bucket_memory.len());
-        for bucket in bucket_memory {
-            let bytes = bucket.writable_bytes.saturating_add(bucket.immutable_bytes);
-            // Attribution-only: under batch-spread routing a bucket's shard
-            // depends on the client batch_id (not available here), so a
-            // stable placeholder is used for approximate telemetry attribution.
-            let shard = crate::scribe::routing::shard_for(
-                bucket.seal_key.tenant,
-                &bucket.seal_key.table,
-                Uuid::nil(),
-            );
-            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
-            memory_by_bucket.push(ScribeBucketMemorySnapshot {
-                seal_key: bucket.seal_key,
-                writable_bytes: bucket.writable_bytes,
-                immutable_bytes: bucket.immutable_bytes,
-            });
+        let mut memory_by_bucket = Vec::new();
+        for (shard, snapshot) in owner_snapshots.into_iter().enumerate() {
+            for bucket in snapshot.bucket_memory {
+                let bytes = bucket.writable_bytes.saturating_add(bucket.immutable_bytes);
+                memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
+                memory_by_bucket.push(ScribeBucketMemorySnapshot {
+                    seal_key: bucket.seal_key,
+                    writable_bytes: bucket.writable_bytes,
+                    immutable_bytes: bucket.immutable_bytes,
+                });
+            }
         }
         for (shard, bytes) in transient_by_shard.into_iter().enumerate() {
             memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);

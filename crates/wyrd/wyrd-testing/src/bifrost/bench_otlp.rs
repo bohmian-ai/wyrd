@@ -739,7 +739,7 @@ fn emit_report(report: &Report) -> Result<(), BenchError> {
         || {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../..")
-                .join("target/bifrost-benchmarks/task16/otlp.json")
+                .join("target/bifrost-benchmarks/production-readiness/otlp.json")
         },
         std::path::PathBuf::from,
     );

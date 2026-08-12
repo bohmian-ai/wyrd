@@ -16,6 +16,7 @@ use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::{
     OraclePeerCredentials, OraclePeerTls, TonicOraclePeerTransport,
 };
+use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -106,10 +107,8 @@ pub const fn full_bifrost_topology() -> BifrostTopology {
 pub struct TestOracleResources {
     /// Optional parent directory for the retained local spill root.
     pub spill_root: Option<PathBuf>,
-    /// Optional deterministic Oracle child memory ceiling.
-    pub memory_limit_bytes: Option<usize>,
-    /// Optional deterministic per-query spill ceiling.
-    pub spill_limit_bytes: Option<u64>,
+    /// Complete raw process observation retained across node restarts.
+    pub system_resources: Option<SystemResourceSnapshot>,
 }
 
 /// Concrete role and identity descriptor for one Bifrost pod.
@@ -139,18 +138,16 @@ impl BifrostClusterSpec {
         Self::mixed(1)
     }
 
-    /// Applies deterministic Oracle memory and disk limits to every Oracle node.
+    /// Applies one raw process observation to every Oracle node.
+    ///
+    /// Restarted nodes retain this observation and rerun the production policy;
+    /// the cluster never derives a desired query grant.
     #[must_use]
-    pub fn with_oracle_test_limits(
-        mut self,
-        memory_limit_bytes: usize,
-        spill_limit_bytes: u64,
-    ) -> Self {
+    pub fn with_system_resources(mut self, snapshot: SystemResourceSnapshot) -> Self {
         for node in &mut self.nodes {
             if node.roles.contains(&BifrostRuntimeRole::Oracle) {
                 let oracle = node.oracle.get_or_insert_with(TestOracleResources::default);
-                oracle.memory_limit_bytes = Some(memory_limit_bytes);
-                oracle.spill_limit_bytes = Some(spill_limit_bytes);
+                oracle.system_resources = Some(snapshot);
             }
         }
         self
@@ -1720,11 +1717,13 @@ impl WyrdTestCluster {
         if let Some(timing) = resources.spec.role_timing {
             builder = builder.with_role_timing_for_test(timing);
         }
-        if let Some(oracle) = &resources.spec.oracle
-            && let (Some(memory), Some(spill)) =
-                (oracle.memory_limit_bytes, oracle.spill_limit_bytes)
+        if let Some(snapshot) = resources
+            .spec
+            .oracle
+            .as_ref()
+            .and_then(|oracle| oracle.system_resources)
         {
-            builder = builder.with_oracle_capacity_for_test(memory, spill);
+            builder = builder.with_system_resources_for_test(snapshot);
         }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);
@@ -2515,17 +2514,32 @@ mod tests {
         );
     }
 
-    /// A stopped node retains its physical roots and restarts into the same slot.
+    /// A stopped node retains raw observations and re-derives the same clean plan.
     #[tokio::test]
-    async fn restartable_node_slot_preserves_roots() {
-        let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
-            .await
-            .expect("cluster starts");
+    async fn cluster_restart_rederives_same_plan_from_retained_snapshot() {
+        let observation = SystemResourceSnapshot {
+            memory_limit_bytes: 768 * 1024 * 1024,
+            effective_cpu: 3,
+            scratch_capacity_bytes: 1280 * 1024 * 1024,
+            scratch_available_bytes: 1280 * 1024 * 1024,
+            memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+        };
+        let mut cluster = WyrdTestCluster::start_spec(
+            BifrostClusterSpec::one_mixed().with_system_resources(observation),
+        )
+        .await
+        .expect("cluster starts");
         let node_id = cluster.ready_query_nodes()[0];
-        let original_identity = cluster
-            .server_by_node(node_id)
-            .expect("running node")
-            .postgres_pool_identity();
+        let original = cluster.server_by_node(node_id).expect("running node");
+        let original_identity = original.postgres_pool_identity();
+        let original_resources = original
+            .state()
+            .bifrost_resources
+            .as_ref()
+            .expect("original global resources")
+            .snapshot()
+            .expect("original resource snapshot");
         let wal_root = cluster.wal_dirs().next().expect("WAL root").to_path_buf();
         cluster.stop_node(node_id).await.expect("node stops");
         assert!(cluster.server_by_node(node_id).is_none());
@@ -2533,6 +2547,18 @@ mod tests {
         let server = cluster.server_by_node(node_id).expect("node is running");
         assert_ne!(server.postgres_pool_identity(), original_identity);
         assert_eq!(cluster.wal_dirs().next(), Some(wal_root.as_path()));
+        let restarted_resources = server
+            .state()
+            .bifrost_resources
+            .as_ref()
+            .expect("restarted global resources")
+            .snapshot()
+            .expect("restarted resource snapshot");
+        assert_eq!(restarted_resources.plan, original_resources.plan);
+        assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
+        assert_eq!(restarted_resources.elastic_memory_used_bytes, 0);
+        assert_eq!(restarted_resources.scratch_used_bytes, 0);
+        assert!(!restarted_resources.oracle_query_active);
         let mut system_conn = cluster
             .fixture
             .tenant_conn_for(DataTenantId::SYSTEM_OWNER)

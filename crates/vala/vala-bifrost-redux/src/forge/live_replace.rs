@@ -21,7 +21,9 @@ use super::compact::forge_transition_event;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::metrics::{ForgeCatalogCommitStrategy, ForgeTelemetry};
-use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
+use super::rewrite::{
+    ForgeAttemptGeneration, ForgeRewritePipeline, RewriteOutput, RewriteRequest, RewriteSourceFile,
+};
 use super::right_size::IcebergRewriteGroup;
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
@@ -72,6 +74,8 @@ pub(crate) struct TaskLiveRewriteResult {
 
 /// Exact claimed live-rewrite payload with its publication authority.
 pub(crate) struct TaskLiveRewriteRequest<'a> {
+    /// Attempt-local pipeline bound to the retained operation lease.
+    pub(crate) rewrite: &'a ForgeRewritePipeline,
     /// Mutable table publication fence.
     pub(crate) lease: &'a mut ForgeLease,
     /// Server-resolved physical table binding.
@@ -92,6 +96,8 @@ pub(crate) struct TaskLiveRewriteRequest<'a> {
 
 /// Shared live-rewrite workflow inputs for compatibility and task callers.
 struct LiveRewriteRequest<'a> {
+    /// Attempt-local pipeline bound to the retained operation lease.
+    rewrite: &'a ForgeRewritePipeline,
     /// Mutable table publication fence.
     lease: &'a mut ForgeLease,
     /// Server-resolved physical table binding.
@@ -176,8 +182,19 @@ impl Forge {
         group: &IcebergRewriteGroup,
         stop: &CancellationToken,
     ) -> Result<IcebergRewriteDisposition, ForgeError> {
+        let request = crate::resources::ForgeRewriteRequest::from_live_group(
+            group,
+            super::planner::ForgeCapacity::try_from(&self.core.config)?,
+        )?;
+        let resources = super::rewrite::ForgeAttemptResources::acquire(
+            &self.core.resources,
+            request,
+            &self.core.rewrite_spill_root,
+        )?;
+        let rewrite = resources.pipeline(&self.core.rewrite);
         Ok(self
             .replace_live_group_inner(LiveRewriteRequest {
+                rewrite: &rewrite,
                 lease,
                 binding,
                 table,
@@ -203,6 +220,7 @@ impl Forge {
         request: TaskLiveRewriteRequest<'_>,
     ) -> Result<TaskLiveRewriteResult, ForgeError> {
         self.replace_live_group_inner(LiveRewriteRequest {
+            rewrite: request.rewrite,
             lease: request.lease,
             binding: request.binding,
             table: request.table,
@@ -248,7 +266,7 @@ impl Forge {
             Err(error) => Err(error),
         };
         if let Err(error) = prepared {
-            self.core
+            request
                 .rewrite
                 .cleanup_unprepared_outputs(
                     &operation.rewrite.object_paths,
@@ -341,8 +359,7 @@ impl Forge {
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(ForgeError::Catalog)?,
         );
-        let rewrite = self
-            .core
+        let rewrite = request
             .rewrite
             .rewrite(
                 RewriteRequest {

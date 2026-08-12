@@ -1,4 +1,4 @@
-//! Concrete WAL/manifest crash-seam coverage for Task 15.
+//! Concrete WAL/manifest crash-seam coverage for Scribe persistence.
 
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
@@ -54,8 +54,8 @@ fn audit() -> Vec<u8> {
     encode_audit_event(&AuditEvent {
         request_id: RequestId::now_v7(),
         trace_id: None,
-        operation: "task15.crash-seam".to_owned(),
-        resource: "vala.bifrost.task15".to_owned(),
+        operation: "scribe.crash-seam".to_owned(),
+        resource: "vala.bifrost.scribe_persistence".to_owned(),
         card_ref: None,
         principal_id: PrincipalId::new(Uuid::now_v7()),
         principal_kind: PrincipalKindTag::User,
@@ -73,7 +73,7 @@ fn audit() -> Vec<u8> {
 fn key() -> SealKey {
     SealKey::new(
         DataTenantId::new_v7(),
-        TableRef::new(BifrostNamespace::Bifrost, "task15_crash"),
+        TableRef::new(BifrostNamespace::Bifrost, "scribe_crash"),
         EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
     )
 }

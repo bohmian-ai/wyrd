@@ -14,6 +14,7 @@ use datafusion::datasource::default_table_source::DefaultTableSource;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
+use num_traits::ToPrimitive;
 use wyrd_spec::vala::api::ClusterCapabilities;
 
 use super::*;
@@ -175,6 +176,7 @@ impl OraclePlanner {
             catalog,
             audit,
             memory,
+            query_pool,
             telemetry,
         } = inputs;
         let mut providers = std::collections::HashMap::with_capacity(cuts.len());
@@ -191,6 +193,7 @@ impl OraclePlanner {
                 table_name: table_name.clone(),
                 audit: Arc::clone(&audit),
                 memory: memory.clone(),
+                query_pool: Arc::clone(&query_pool),
                 telemetry: Arc::clone(&telemetry),
                 query_class: class,
             })
@@ -311,6 +314,34 @@ impl OraclePlanner {
             live_cpu,
             optimized_plan_is_complex(&optimized_plan) || reconciliation_complex,
         );
+        let local_bytes = cuts.iter().try_fold(0_u64, |total, cut| {
+            cut.hot_files.iter().try_fold(total, |total, file| {
+                let bytes = u64::try_from(file.file_size)
+                    .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+                total
+                    .checked_add(bytes)
+                    .ok_or(BifrostError::QueryAdmissionRejected)
+            })
+        })?;
+        let remote_bytes = cuts.iter().try_fold(0_u64, |total, cut| {
+            cut.iceberg_files.iter().try_fold(total, |total, file| {
+                total
+                    .checked_add(file.file_size)
+                    .ok_or(BifrostError::QueryAdmissionRejected)
+            })
+        })?;
+        let total_bytes = local_bytes
+            .checked_add(remote_bytes)
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
+        let local_ratio = if total_bytes == 0 {
+            0.0
+        } else {
+            local_bytes
+                .to_f64()
+                .zip(total_bytes.to_f64())
+                .map(|(local, total)| local / total)
+                .ok_or(BifrostError::QueryAdmissionRejected)?
+        };
         tracing::Span::current()
             .record("query_class", query_class_label(classification.query_class));
         OracleTelemetry::record_classification(classification);
@@ -318,6 +349,7 @@ impl OraclePlanner {
         Ok(PlannedSqlCut {
             cuts,
             query_class: classification.query_class,
+            local_ratio,
         })
     }
 
@@ -391,6 +423,8 @@ pub(super) struct TypedProviderInputs<'a> {
     pub(super) audit: Arc<dyn OracleAudit>,
     /// Parent memory governor and reconciliation ceiling.
     pub(super) memory: OracleMemoryResources,
+    /// Query-local pool shared by `DataFusion` and Wyrd source owners.
+    pub(super) query_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     /// Production source/reconciliation telemetry owner.
     pub(super) telemetry: Arc<OracleTelemetry>,
 }

@@ -23,8 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use super::calibration::{
     OracleCalibrationCase, OracleCalibrationEnvironment, OracleCalibrationProfile,
-    OracleCalibrationReport, OracleProposalEvidence, REQUIRED_PROPOSALS,
-    calibration_content_digest, calibration_report_bytes,
+    OracleCalibrationReport, calibration_content_digest, calibration_report_bytes,
 };
 use super::{BifrostTopology, WyrdTestCluster};
 use crate::Bootstrap;
@@ -528,94 +527,10 @@ pub async fn calibrate(base: BifrostScenario) -> Result<(), BenchError> {
         .validate()
         .map_err(|error| -> BenchError { error.into() })?;
     let report_bytes = calibration_report_bytes(&report)?;
-    let report_digest = calibration_content_digest(&report_bytes);
-    let evidence = report
-        .cases
-        .iter()
-        .max_by(|left, right| left.p99_ms.total_cmp(&right.p99_ms))
-        .ok_or("calibration matrix is empty")?;
-    let proposal = REQUIRED_PROPOSALS
-        .iter()
-        .map(|key| {
-            (
-                (*key).to_owned(),
-                OracleProposalEvidence {
-                    value: proposal_value(key, evidence),
-                    evidence_case_id: evidence.case_id.clone(),
-                },
-            )
-        })
-        .collect();
-    let profile = OracleCalibrationProfile {
-        schema_version: 1,
-        status: "candidate".to_owned(),
-        generated_from: report_digest,
-        source_revision,
-        proposal,
-    };
-    profile
-        .validate(&report)
+    let profile = OracleCalibrationProfile::from_report(&report)
         .map_err(|error| -> BenchError { error.into() })?;
     write_calibration_artifacts(&report, &report_bytes, &profile)?;
     Ok(())
-}
-
-/// Return a measurement-derived proposal for one required architecture path.
-fn proposal_value(key: &str, evidence: &OracleCalibrationCase) -> f64 {
-    let measured_queries = f64::from(evidence.measurement_queries);
-    let peak_slots = f64::from(evidence.peak_slots);
-    let concurrency = f64::from(evidence.concurrency);
-    let per_query_bytes = evidence.input_bytes as f64 / measured_queries;
-    let bytes_per_row = per_query_bytes / evidence.input_rows as f64;
-    let workers = f64::from(evidence.pods.saturating_sub(1));
-    let observed_query_seconds = evidence.p99_ms * measured_queries / 1_000.0;
-    match key {
-        "slot.cpu_cores_per_slot" => evidence.cpu_seconds / observed_query_seconds / peak_slots,
-        "slot.memory_bytes_per_slot" | "memory.class_limits" => {
-            evidence.peak_memory_bytes as f64 / peak_slots
-        }
-        "slot.headroom_factor" | "class.interactive.share" | "class.analytical.share" => {
-            peak_slots / concurrency
-        }
-        "class.interactive.minimum_slots"
-        | "class.analytical.minimum_slots"
-        | "tenant.single_tenant_limit"
-        | "tenant.multi_tenant_default_limit"
-        | "distribution.max_in_flight_fragments"
-        | "distribution.max_worker_concurrency" => peak_slots,
-        "classification.assumed_scan_bytes_per_second" => evidence.rows_per_second * bytes_per_row,
-        "classification.analytical_threshold_millis" | "performance.p95_query_millis" => {
-            evidence.p95_ms
-        }
-        "placement.max_attempts" => {
-            evidence.retry_rate * measured_queries + evidence.rejection_rate
-        }
-        "placement.deadline_millis" | "performance.p99_query_millis" => evidence.p99_ms,
-        "placement.jitter_min_millis" => evidence.p95_ms - evidence.p50_ms,
-        "placement.jitter_max_millis" => evidence.p99_ms - evidence.p50_ms,
-        "lease.cluster_ttl_seconds"
-        | "membership.expiration_seconds"
-        | "tail.fence_ttl_seconds" => evidence.p99_ms / 1_000.0,
-        "lease.renew_interval_seconds" | "reservation.pending_ttl_seconds" => {
-            evidence.p95_ms / 1_000.0
-        }
-        "tail.page_rows" => evidence.input_rows as f64,
-        "tail.page_encoded_bytes" | "distribution.max_frame_bytes" => per_query_bytes,
-        "distribution.max_workers_per_query" => workers,
-        "distribution.fragment_target_rows" => evidence.input_rows as f64 / evidence.pods as f64,
-        "distribution.fragment_target_bytes" | "distribution.max_fragment_bytes" => {
-            per_query_bytes / f64::from(evidence.pods)
-        }
-        "performance.p95_ttfb_millis" => evidence.p95_ttfb_ms,
-        "performance.p99_ttfb_millis" => evidence.p99_ttfb_ms,
-        "performance.minimum_rows_per_second" => evidence.rows_per_second,
-        "performance.last_stable_concurrency" => peak_slots,
-        "performance.maximum_tail_page_millis" => evidence.tail_ms,
-        "performance.maximum_object_store_throttle_rate" => evidence.retry_rate,
-        "memory.oracle_limit_bytes" => evidence.peak_memory_bytes as f64,
-        "spill.limit_bytes" => evidence.spill_bytes as f64,
-        _ => peak_slots,
-    }
 }
 
 /// Emit JSON, Markdown, and candidate TOML beside the benchmark adapter.
@@ -659,17 +574,10 @@ fn write_calibration_artifacts(
         "\nProposal values are derived from the slowest measured case: observed resource-per-slot ratios, scan bytes/row and throughput, latency deltas, topology worker count, and recorder values. Zero spill, retry, or tail time means the production recorder observed no such activity in that case; it is not a fabricated floor or an approval claim. The candidate remains blocked on maintainer review of safety margins and workload representativeness.\n",
     );
     std::fs::write(directory.join("oracle-calibration.md"), markdown)?;
-    let mut toml = format!(
-        "schema_version = {}\nstatus = {:?}\ngenerated_from = {:?}\nsource_revision = {:?}\n",
-        profile.schema_version, profile.status, profile.generated_from, profile.source_revision
-    );
-    for (key, value) in &profile.proposal {
-        toml.push_str(&format!(
-            "\n[proposal.{key:?}]\nvalue = {}\nevidence_case_id = {:?}\n",
-            value.value, value.evidence_case_id
-        ));
-    }
-    std::fs::write(directory.join("oracle-candidate.toml"), toml)?;
+    std::fs::write(
+        directory.join("oracle-candidate.toml"),
+        profile.render_toml(),
+    )?;
     Ok(())
 }
 
@@ -695,14 +603,14 @@ fn calibration_directory() -> std::path::PathBuf {
 fn default_lane_report_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
-        .join("target/bifrost-benchmarks/task16/oracle.json")
+        .join("target/bifrost-benchmarks/production-readiness/oracle.json")
 }
 
 /// Return the per-case direct measurement sidecar path.
 fn oracle_case_report_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
-        .join("target/bifrost-benchmarks/task16/oracle-case.json")
+        .join("target/bifrost-benchmarks/production-readiness/oracle-case.json")
 }
 
 /// Build one machine-authenticated public SDK client for an explicit tenant.

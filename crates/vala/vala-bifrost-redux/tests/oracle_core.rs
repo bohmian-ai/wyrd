@@ -44,7 +44,6 @@ use vala_bifrost_redux::oracle::{
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
-use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::memtable::Memtable;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
@@ -63,8 +62,7 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest,
     FreshnessPolicy, OracleCapabilitiesV1, QueryAuditDigest, QueryClass, QueryExecutionMode,
-    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalOutcome, ScribeCapabilitiesV1,
-    VisibilityMode,
+    QueryStreamFrame, QueryTerminalOutcome, ScribeCapabilitiesV1, VisibilityMode,
 };
 use wyrd_spec::vala::api::{NodeId as OracleNodeId, SignedPeerTicket};
 
@@ -101,6 +99,37 @@ impl PeerTicketVerifier for DeterministicTestVerifier {
     }
 }
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
+
+/// Composes Oracle capabilities from one injected raw observation.
+///
+/// The fixture supplies only raw observations and the enabled role; the
+/// production policy and role-composition stages produce every grant, so no
+/// test path constructs a sibling root or a raw pool.
+fn composed_oracle_roles() -> vala_bifrost_redux::resources::BifrostRoleResources {
+    vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+        vala_bifrost_redux::resources::SystemResourceSnapshot {
+            memory_limit_bytes: 1024 * 1024 * 1024,
+            effective_cpu: 4,
+            scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+            memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+        },
+        vala_bifrost_redux::resources::BifrostResourcePolicy {
+            roles: [vala_bifrost_redux::resources::BifrostRole::Oracle]
+                .into_iter()
+                .collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: Some(1024 * 1024 * 1024),
+            effective_cpu: None,
+            scratch_root: std::path::PathBuf::new(),
+        },
+    )
+    .expect("injected observation must satisfy the resource policy")
+    .compose_roles()
+    .expect("composition must be issued from an unpoisoned root")
+}
 
 /// Deterministic role-lifecycle clock used without wall-clock sleeps.
 struct InjectedRoleClock {
@@ -608,13 +637,19 @@ impl OracleFixture {
             cluster: Arc::clone(&self.cluster),
             local_role: self.role.clone(),
             local_slots: Arc::new(OracleSlotManager::new(16, 16)),
-            memory: OracleMemoryResources {
-                governor: BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor"),
-                reconciliation_limit_bytes,
+            memory: {
+                let roles = composed_oracle_roles();
+                OracleMemoryResources {
+                    governor: roles.memory_ledger(),
+                    resources: roles
+                        .oracle()
+                        .expect("composition must issue the Oracle capability"),
+                    reconciliation_limit_bytes,
+                }
             },
             spill_runtime: vala_bifrost_redux::oracle::OracleSpillRuntime::new(
                 &self.spill_root.path().join("oracle-spill"),
-                config.spill_bytes,
+                1024 * 1024 * 1024,
             )
             .expect("Oracle spill runtime"),
             tails,
@@ -1301,6 +1336,23 @@ fn assert_counter_value(
     );
 }
 
+/// Asserts that one canonical counter is absent or has the exact zero value.
+///
+/// Metrics may omit a series when no recording site was reached. This helper
+/// preserves the stronger pre-byte invariant by rejecting every positive
+/// value without requiring a synthetic zero observation.
+///
+/// # Panics
+///
+/// Panics when the named series has a nonzero value.
+fn assert_counter_absent_or_zero(snapshot: &wyrd_bench::BenchmarkMetricSnapshot, series: &str) {
+    assert_eq!(
+        snapshot.counters.get(series).copied().unwrap_or(0),
+        0,
+        "unexpected counter {series}: {snapshot:?}"
+    );
+}
+
 /// Asserts one exact canonical histogram has at least one observation.
 ///
 /// # Panics
@@ -1598,16 +1650,19 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_tripwire_c
         format!("SELECT count(*) AS total FROM {table}"),
         format!("SELECT a.value FROM {table} a JOIN {table} b ON a.value = b.value"),
     ] {
-        let result = published_query(&oracle, &fixture, sql).await;
-        assert!(
-            result.batches.is_empty(),
-            "foreign row reached SQL operator"
-        );
-        assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Failed);
-        assert_eq!(
-            result.terminal.error.expect("tripwire error").code,
-            QueryTerminalErrorCode::QueryTenantInvariant
-        );
+        let error = oracle
+            .query_sql(
+                fixture.context(),
+                BifrostQueryRequest {
+                    sql,
+                    visibility: VisibilityMode::PublishedOnly,
+                    freshness: FreshnessPolicy::Strict,
+                    deadline_ms: Some(5_000),
+                },
+            )
+            .await
+            .expect_err("tenant tripwire must reject before stream framing");
+        assert_eq!(error, BifrostError::QueryTenantInvariant);
     }
     let mut conn = fixture
         .pg
@@ -1658,18 +1713,19 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_tripwire_a
             OracleConfig::default(),
         )
         .await;
-    let result = published_query(
-        &oracle,
-        &fixture,
-        format!("SELECT count(*) AS total FROM {}", fixture.table.fqn()),
-    )
-    .await;
-    assert!(result.batches.is_empty());
-    assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Failed);
-    assert_eq!(
-        result.terminal.error.expect("audit failure terminal").code,
-        QueryTerminalErrorCode::QueryAuditUnavailable
-    );
+    let error = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT count(*) AS total FROM {}", fixture.table.fqn()),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect_err("security audit failure must reject before stream framing");
+    assert_eq!(error, BifrostError::QueryAuditUnavailable);
     let mut conn = fixture
         .pg
         .tenant_conn_for(fixture.tenant)
@@ -2179,12 +2235,10 @@ fn assert_telemetry_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
     ] {
         assert_counter(snapshot, fragment);
     }
-    for fragment in [
+    assert_counter(
+        snapshot,
         "bifrost_oracle_rows_deduplicated_total{losing_source=\"live_tail\"}",
-        "oracle_query_spill_bytes_total{class=\"analytical\"}",
-    ] {
-        assert_counter(snapshot, fragment);
-    }
+    );
     assert_counter_value(
         snapshot,
         "bifrost_oracle_files_pruned_total{reason=\"snapshot_overlap\",source=\"hot_sealed\"}",
@@ -2206,6 +2260,11 @@ fn assert_telemetry_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
         2,
     );
     assert_counter_value(snapshot, "oracle_query_rows_total{class=\"analytical\"}", 1);
+    assert_counter_value(
+        snapshot,
+        "oracle_query_spill_bytes_total{class=\"analytical\"}",
+        0,
+    );
 }
 
 /// Verifies histogram presence, gauge lifetimes, and low-cardinality labels.
@@ -2341,7 +2400,7 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_stale_file
         .await;
     let recorder = wyrd_bench::BenchmarkRecorder::new();
     let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-    let mut query = oracle
+    let error = oracle
         .query_sql(
             fixture.context(),
             BifrostQueryRequest {
@@ -2352,23 +2411,8 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_stale_file
             },
         )
         .await
-        .expect("second stale attempt returns a closed failed stream");
-    let mut observed_batch = false;
-    let mut observed_terminal = None;
-    while let Some(frame) = query.frames.next().await {
-        match frame.expect("stale query frame") {
-            QueryStreamFrame::Batch(_) => observed_batch = true,
-            QueryStreamFrame::Terminal(terminal) => observed_terminal = Some(terminal),
-            QueryStreamFrame::Schema(_) => {}
-        }
-    }
-    assert!(!observed_batch, "stale retry emitted a query batch");
-    let terminal = observed_terminal.expect("stale query terminal");
-    assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
-    assert_eq!(
-        terminal.error.expect("stale terminal error").code,
-        QueryTerminalErrorCode::QueryExecutionFailed
-    );
+        .expect_err("second stale attempt fails before stream framing");
+    assert_eq!(error, BifrostError::QueryExecutionFailed);
     let mut conn = fixture
         .pg
         .tenant_conn_for(fixture.tenant)
@@ -2388,17 +2432,19 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_stale_file
     assert!(details[0].contains("\"retry_ordinal\":0"));
     assert!(details[1].contains("\"retry_ordinal\":1"));
     let snapshot = recorder.snapshot();
-    assert_counter(
+    assert_counter_absent_or_zero(
         &snapshot,
         "oracle_query_bytes_scanned_total{class=\"interactive\"}",
     );
-    assert_counter(
+    assert_counter_value(
         &snapshot,
         "oracle_query_files_scanned_total{class=\"interactive\"}",
+        0,
     );
-    assert_counter(
+    assert_counter_value(
         &snapshot,
         "oracle_query_partitions_scanned_total{class=\"interactive\"}",
+        0,
     );
     assert!(
         snapshot
@@ -2847,7 +2893,7 @@ async fn typed_first_batch_error_releases_admission_and_query_scratch() {
         multi_tenant_ceiling: 1,
         ..OracleConfig::default()
     };
-    let exact_share = config.spill_bytes;
+    let exact_share = 1024 * 1024 * 1024;
     let oracle = fixture
         .oracle(
             Arc::new(TestPostgresOracleAudit::new(
@@ -2934,7 +2980,7 @@ async fn sql_stream_drop_releases_admission_and_query_scratch() {
         .expect("real SQL stream must start");
     let active = oracle.runtime_inspection();
     assert_eq!(active.active_queries, 1);
-    assert_eq!(active.reserved_spill_bytes, 0);
+    assert_eq!(active.reserved_spill_bytes, 1024 * 1024 * 1024);
     assert_eq!(fixture.spill_descendant_count(), scratch_baseline);
 
     drop(stream);
@@ -2963,7 +3009,7 @@ async fn typed_stream_drop_releases_admission_and_query_scratch() {
         multi_tenant_ceiling: 1,
         ..OracleConfig::default()
     };
-    let exact_share = config.spill_bytes;
+    let exact_share = 1024 * 1024 * 1024;
     let oracle = fixture
         .oracle(
             Arc::new(TestPostgresOracleAudit::new(

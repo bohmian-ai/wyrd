@@ -25,6 +25,9 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::resources::{
+    MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
+};
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
 use vala_sdk::{
@@ -61,6 +64,87 @@ use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
 use wyrd_tonic::wyrd::v1::{QueryTracesRequest, QueryWindow};
 
 type JourneyError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Builds a complete pod observation for production resource-policy journeys.
+///
+/// The fixture states only process-visible inputs. The Bifrost runtime derives
+/// reserves, role floors, elastic capacity, leases, and target partitions.
+///
+/// # Panics
+///
+/// Panics only if the fixed test scratch observation exceeds `u64` capacity.
+fn spill_system_resources(scratch_bytes: u64) -> SystemResourceSnapshot {
+    let observed_scratch = scratch_bytes
+        .checked_add(MIN_SCRATCH_FREE_BYTES)
+        .expect("fixed spill observation fits u64");
+    SystemResourceSnapshot {
+        memory_limit_bytes: 768 << 20,
+        effective_cpu: 4,
+        scratch_capacity_bytes: observed_scratch,
+        scratch_available_bytes: observed_scratch,
+        memory_source: ResourceSource::Injected,
+        cpu_source: ResourceSource::Injected,
+    }
+}
+
+/// Asserts the production-derived mixed-role plan before costly fixture ingest.
+///
+/// # Panics
+///
+/// Panics when the server does not expose the single runtime owner or any
+/// production-derived input, floor, elastic, scratch, CPU, or source differs.
+fn assert_spill_resource_plan(server: &wyrd_testing::WyrdTestServer, scratch_bytes: u64) {
+    let resources = server
+        .state()
+        .bifrost_resources
+        .as_ref()
+        .expect("server owns global Bifrost resources");
+    let plan = resources.plan();
+    assert_eq!(plan.memory_limit_bytes, 768 << 20);
+    assert_eq!(plan.unmanaged_reserve_bytes, 256 << 20);
+    assert_eq!(plan.managed_memory_bytes, 512 << 20);
+    assert_eq!(plan.scribe_floor_bytes, 256 << 20);
+    assert_eq!(plan.oracle_floor_bytes, 256 << 20);
+    assert_eq!(plan.elastic_memory_bytes, 0);
+    assert_eq!(plan.scratch_limit_bytes, scratch_bytes);
+    assert_eq!(plan.effective_cpu, 4);
+    assert_eq!(resources.sources().memory, ResourceSource::Injected);
+    assert_eq!(resources.sources().cpu, ResourceSource::Injected);
+    assert_eq!(resources.sources().scratch, ResourceSource::Filesystem);
+}
+
+/// Asserts the exact lease held at the public query's schema barrier.
+///
+/// # Panics
+///
+/// Panics when the admitted query does not own the production-derived memory,
+/// scratch, or adaptive partition envelope.
+fn assert_active_spill_query_resources(server: &wyrd_testing::WyrdTestServer, scratch_bytes: u64) {
+    let resources = server
+        .state()
+        .bifrost_resources
+        .as_ref()
+        .expect("server owns global Bifrost resources");
+    let snapshot = resources.snapshot().expect("active resource snapshot");
+    assert!(snapshot.oracle_query_active);
+    assert_eq!(snapshot.elastic_memory_used_bytes, 0);
+    assert_eq!(snapshot.scratch_used_bytes, scratch_bytes);
+    let query_memory = snapshot
+        .plan
+        .oracle_floor_bytes
+        .checked_add(snapshot.elastic_memory_used_bytes)
+        .expect("fixed query memory fits usize");
+    assert_eq!(query_memory, 256 << 20);
+    assert_eq!(
+        vala_bifrost_redux::resources::oracle_target_partitions(
+            snapshot.plan.effective_cpu,
+            1.0,
+            query_memory,
+        )
+        .expect("active partition plan"),
+        1
+    );
+}
 
 /// Complete normative production metric inventory and exact label-key sets.
 const ORACLE_METRIC_LABELS: &[(&str, &[&str])] = &[
@@ -830,12 +914,13 @@ async fn pg_bifrost_oracle_capacity_contract_journey() {
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
     let cluster = WyrdTestCluster::start_spec(
-        BifrostClusterSpec::one_mixed().with_oracle_test_limits(192 << 20, 1 << 30),
+        BifrostClusterSpec::one_mixed().with_system_resources(spill_system_resources(1 << 30)),
     )
     .await
     .expect("spill success cluster");
     let server = cluster.server(0).expect("spill success server");
-    let table = prepare_spill_table(&cluster, server, "oracle_spill_success", 400_000)
+    assert_spill_resource_plan(server, 1 << 30);
+    let table = prepare_spill_table(&cluster, server, "oracle_spill_success", 1_000_000)
         .await
         .expect("spill success fixture");
     let reader = client(server, "oracle-spill-success-reader")
@@ -857,7 +942,7 @@ async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
         strict_spill_summary(&reader, &format!("vala.bifrost.{table}"))
             .await
             .expect("spilling stream succeeds"),
-        (400_000, 102_400_000)
+        (1_000_000, 256_000_000)
     );
 
     let delta = cluster
@@ -893,12 +978,13 @@ async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_spill_disk_ceiling_is_typed_and_recovers() {
     let cluster = WyrdTestCluster::start_spec(
-        BifrostClusterSpec::one_mixed().with_oracle_test_limits(192 << 20, 1),
+        BifrostClusterSpec::one_mixed().with_system_resources(spill_system_resources(1)),
     )
     .await
     .expect("spill ceiling cluster");
     let server = cluster.server(0).expect("spill ceiling server");
-    let large = prepare_spill_table(&cluster, server, "oracle_spill_ceiling", 400_000)
+    assert_spill_resource_plan(server, 1);
+    let large = prepare_spill_table(&cluster, server, "oracle_spill_ceiling", 1_000_000)
         .await
         .expect("spill ceiling fixture");
     let small = prepare_spill_table(&cluster, server, "oracle_spill_recovery", 2)
@@ -955,12 +1041,13 @@ async fn pg_bifrost_oracle_spill_disk_ceiling_is_typed_and_recovers() {
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
     let cluster = WyrdTestCluster::start_spec(
-        BifrostClusterSpec::one_mixed().with_oracle_test_limits(192 << 20, 1 << 30),
+        BifrostClusterSpec::one_mixed().with_system_resources(spill_system_resources(1 << 30)),
     )
     .await
     .expect("spill cancellation cluster");
     let server = cluster.server(0).expect("spill cancellation server");
-    let table = prepare_spill_table(&cluster, server, "oracle_spill_cancel", 400_000)
+    assert_spill_resource_plan(server, 1 << 30);
+    let table = prepare_spill_table(&cluster, server, "oracle_spill_cancel", 1_000_000)
         .await
         .expect("spill cancellation fixture");
     let reader = client(server, "oracle-spill-cancel-reader")
@@ -985,7 +1072,7 @@ async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
     };
     server.stall_next_query_after_schema();
     let query = QueryClient::new(&reader);
-    let query_task = tokio::spawn(async move {
+    let mut query_task = tokio::spawn(async move {
         query
             .collect_bounded(
                 &request,
@@ -996,13 +1083,18 @@ async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
             )
             .await
     });
-    let query_id = server
-        .wait_query_schema_stall()
-        .await
-        .expect("spilling query reaches schema barrier");
+    let query_id = tokio::select! {
+        stalled = server.wait_query_schema_stall() => {
+            stalled.expect("spilling query reaches schema barrier")
+        }
+        completed = &mut query_task => {
+            panic!("spilling query completed before cancellation barrier: {completed:?}")
+        }
+    };
     let active = server
         .oracle_runtime_inspection()
         .expect("active spill inspection");
+    assert_active_spill_query_resources(server, 1 << 30);
     assert!(active.active_queries > baseline.active_queries);
     assert!(active.spill_files > baseline.spill_files);
     query_task.abort();
@@ -1017,7 +1109,7 @@ async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
         strict_spill_summary(&reader, &format!("vala.bifrost.{table}"))
             .await
             .expect("durable rows remain readable after cancellation"),
-        (400_000, 102_400_000)
+        (1_000_000, 256_000_000)
     );
     cluster
         .shutdown()
@@ -1031,16 +1123,19 @@ async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
     let mut cluster = WyrdTestCluster::start_spec(
-        BifrostClusterSpec::two_mixed().with_oracle_test_limits(192 << 20, 1 << 30),
+        BifrostClusterSpec::two_mixed().with_system_resources(spill_system_resources(1 << 30)),
     )
     .await
     .expect("spill pod-loss cluster");
+    for server in cluster.servers() {
+        assert_spill_resource_plan(server, 1 << 30);
+    }
     let query_node = cluster.configured_node_ids()[0];
     let table = {
         let server = cluster
             .server_by_node(query_node)
             .expect("spill pod-loss fixture server");
-        prepare_spill_table(&cluster, server, "oracle_spill_pod_loss", 400_000)
+        prepare_spill_table(&cluster, server, "oracle_spill_pod_loss", 1_000_000)
             .await
             .expect("spill pod-loss fixture")
     };
@@ -1123,7 +1218,7 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
         strict_spill_summary(&survivor_reader, &format!("vala.bifrost.{table}"))
             .await
             .expect("surviving Oracle exact retry"),
-        (400_000, 102_400_000)
+        (1_000_000, 256_000_000)
     );
     assert_oracle_runtime_restored(survivor_server, survivor_baseline, survivor_memory_baseline)
         .expect("surviving Oracle cleanup is exact");
@@ -1179,7 +1274,7 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
         strict_count_value(&restarted_reader, &format!("vala.bifrost.{table}"))
             .await
             .expect("restarted Oracle reads durable rows"),
-        400_000
+        1_000_000
     );
     cluster.shutdown().await.expect("spill pod-loss shutdown");
 }

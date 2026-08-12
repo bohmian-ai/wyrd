@@ -1269,7 +1269,7 @@ fn emit_report(report: &ScribeReport) -> Result<(), BenchError> {
 fn repository_report_path(file_name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
-        .join("target/bifrost-benchmarks/task16")
+        .join("target/bifrost-benchmarks/production-readiness")
         .join(file_name)
 }
 

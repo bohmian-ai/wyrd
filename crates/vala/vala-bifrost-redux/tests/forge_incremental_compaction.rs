@@ -14,7 +14,6 @@ mod pg_tests {
         TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::execution::memory_pool::GreedyMemoryPool;
     use iceberg::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, NullOrder,
         PrimitiveType, SortDirection, StatisticsFile, Struct, TableMetadata, Transform, Type,
@@ -37,7 +36,7 @@ mod pg_tests {
     };
     use vala_bifrost_redux::forge::{
         Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError, ForgeLease, ForgeObjectPages,
-        ForgeObjectStore, ForgeRewriteRuntime, ForgeScheduleOutcome, ForgeScheduler, ForgeWorker,
+        ForgeObjectStore, ForgeScheduleOutcome, ForgeScheduler, ForgeWorker,
         ForgeWorkerCompletionObserver, ForgeWorkerConfig, IcebergCandidateFile,
         IcebergRewriteGroup, deterministic_output_path_for_test, forge_lease_key,
     };
@@ -283,6 +282,38 @@ mod pg_tests {
     }
 
     /// Real dependencies used by all incremental Forge proofs.
+    /// Returns the fixture's complete raw resource observation.
+    ///
+    /// The fixture injects observations only; the production policy and role
+    /// composition derive every grant from them, so no fixture path computes a
+    /// reserve, floor, elastic, grant, scratch, or partition value itself.
+    fn fixture_snapshot() -> SystemResourceSnapshot {
+        SystemResourceSnapshot {
+            memory_limit_bytes: 1024 * 1024 * 1024,
+            effective_cpu: 4,
+            scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+            memory_source: ResourceSource::Injected,
+            cpu_source: ResourceSource::Injected,
+        }
+    }
+
+    /// Returns the Forge-only policy every fixture worker composes from.
+    fn forge_policy(scratch_limit_bytes: u64) -> BifrostResourcePolicy {
+        BifrostResourcePolicy {
+            roles: [BifrostRole::Forge].into_iter().collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: Some(scratch_limit_bytes),
+            effective_cpu: None,
+            scratch_root: std::path::PathBuf::new(),
+        }
+    }
+
+    use vala_bifrost_redux::resources::{
+        BifrostResourcePolicy, BifrostRole, ResourceSource, SystemResourceSnapshot,
+    };
+
     struct Fixture {
         /// Embedded Postgres fixture.
         pg: PgFixture,
@@ -306,6 +337,12 @@ mod pg_tests {
         scheduler_owner: uuid::Uuid,
         /// Production worker owner used to drain exact durable fixture tasks.
         worker: ForgeWorker,
+        /// The one role composition every worker in this fixture leases from.
+        ///
+        /// Retaining the composition rather than a raw governor is what makes
+        /// the primary and sibling workers provably share a single process
+        /// root instead of contending against independent ledgers.
+        roles: vala_bifrost_redux::resources::BifrostRoleResources,
         /// Supervised completion observer shared with the worker under test.
         ///
         /// Present only for fixtures built to drive the supervised
@@ -418,7 +455,7 @@ mod pg_tests {
                 },
                 false,
                 4,
-                16 * 1024 * 1024,
+                fixture_snapshot(),
             )
             .await
         }
@@ -433,13 +470,13 @@ mod pg_tests {
             config: ForgeConfig,
             aged_inputs: bool,
             initial_file_count: usize,
-            memory_pool_bytes: usize,
+            snapshot: SystemResourceSnapshot,
         ) -> Self {
             Self::build(
                 config,
                 aged_inputs,
                 initial_file_count,
-                memory_pool_bytes,
+                snapshot,
                 None,
                 None,
             )
@@ -463,7 +500,7 @@ mod pg_tests {
                 ForgeConfig::default(),
                 true,
                 2,
-                64 * 1024 * 1024,
+                fixture_snapshot(),
                 Some(observer),
                 None,
             )
@@ -480,7 +517,7 @@ mod pg_tests {
             config: ForgeConfig,
             aged_inputs: bool,
             initial_file_count: usize,
-            memory_pool_bytes: usize,
+            snapshot: SystemResourceSnapshot,
             completion: Option<ForgeWorkerCompletionObserver>,
             catalog_decorator: Option<CatalogDecorator>,
         ) -> Self {
@@ -522,23 +559,24 @@ mod pg_tests {
                 list_page_entries: AtomicUsize::new(0),
             });
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
-            let runtime = ForgeRewriteRuntime::new(
-                // DataFusion 53 reserves 10 MiB for an external-sort merge.
-                // Leave that reservation available, then make the fixture
-                // exceed the remaining bounded pool with real Arrow batches.
-                Arc::new(GreedyMemoryPool::new(memory_pool_bytes)),
-                &root.path().join("spill"),
-                config.spill_limit_bytes,
+            let roles = vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+                snapshot,
+                forge_policy(config.spill_limit_bytes),
             )
-            .expect("runtime");
+            .expect("injected observation must satisfy the resource policy")
+            .compose_roles()
+            .expect("composition must be issued from an unpoisoned root");
             let forge = Arc::new(
                 Forge::new(ForgeBuildConfig {
+                    resources: roles
+                        .forge()
+                        .expect("composition must issue the Forge capability"),
                     vala: pg.vala_postgres().clone(),
                     operator_pool: operator_pool.clone(),
                     catalog: Arc::clone(&catalog),
                     staging: Arc::clone(&staging),
                     object_store: Arc::clone(&reads) as Arc<dyn ForgeObjectStore>,
-                    rewrite_runtime: runtime,
+                    rewrite_spill_root: root.path().join("spill"),
                     hints,
                     config,
                     maintenance_interval: Duration::from_millis(10),
@@ -570,6 +608,7 @@ mod pg_tests {
                 forge,
                 scheduler_owner: uuid::Uuid::now_v7(),
                 worker,
+                roles,
                 completion,
             };
             fixture.seed_files(initial_file_count, aged_inputs).await;
@@ -624,20 +663,18 @@ mod pg_tests {
                 ..ForgeConfig::default()
             };
             let (_publisher, hints) = staging_file_channel(16).expect("sibling hint channel");
-            let runtime = ForgeRewriteRuntime::new(
-                Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024)),
-                &self.root.path().join("sibling-spill"),
-                config.spill_limit_bytes,
-            )
-            .expect("sibling runtime");
             let forge = Arc::new(
                 Forge::new(ForgeBuildConfig {
+                    resources: self
+                        .roles
+                        .forge()
+                        .expect("the sibling worker must share the fixture's one Forge root"),
                     vala: self.pg.vala_postgres().clone(),
                     operator_pool: self.operator_pool.clone(),
                     catalog: Arc::clone(&self.catalog),
                     staging: Arc::clone(&self.staging),
                     object_store: Arc::clone(&self.reads) as Arc<dyn ForgeObjectStore>,
-                    rewrite_runtime: runtime,
+                    rewrite_spill_root: self.root.path().join("sibling-spill"),
                     hints,
                     config,
                     maintenance_interval: Duration::from_millis(10),
@@ -1579,7 +1616,7 @@ mod pg_tests {
             },
             false,
             0,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let path = deterministic_output_path_for_test(
@@ -1834,7 +1871,7 @@ mod pg_tests {
             },
             false,
             0,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         // One entry per page against a single-page cap means each run may only
@@ -1900,7 +1937,7 @@ mod pg_tests {
             },
             false,
             0,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let orphan = seed_evidenced_orphan(&fixture, 0).await;
@@ -1946,7 +1983,7 @@ mod pg_tests {
             },
             false,
             0,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
             None,
             Some(Box::new(move |inner| {
                 Arc::new(ProbeCatalog {
@@ -1995,7 +2032,7 @@ mod pg_tests {
             },
             false,
             0,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
             None,
             Some(Box::new(move |inner| {
                 Arc::new(ProbeCatalog {
@@ -2045,7 +2082,7 @@ mod pg_tests {
             },
             false,
             0,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         // Evidenced and aged past the TTL: eligible for deletion.
@@ -2109,7 +2146,7 @@ mod pg_tests {
             max_retained_snapshots_per_table: 1,
             ..ForgeConfig::default()
         };
-        let fixture = Fixture::new_with_config(capped, true, 4, 16 * 1024 * 1024).await;
+        let fixture = Fixture::new_with_config(capped, true, 4, fixture_snapshot()).await;
         fixture.schedule_and_execute().await;
         let table = fixture
             .catalog
@@ -2136,7 +2173,7 @@ mod pg_tests {
     #[tokio::test]
     async fn maintenance_protection_real_catalog_inventory_and_cap() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 4, 16 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 4, fixture_snapshot()).await;
         fixture.schedule_and_execute().await;
         let table = fixture
             .catalog
@@ -2236,7 +2273,7 @@ mod pg_tests {
             },
             false,
             0,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let table = fixture
@@ -2274,7 +2311,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
 
@@ -2430,7 +2467,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         fixture.schedule_and_execute().await;
@@ -2492,7 +2529,7 @@ mod pg_tests {
             },
             true,
             9,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         // Build a deep manifest history directly, one fast-append per seeded
@@ -2602,7 +2639,7 @@ mod pg_tests {
     #[tokio::test]
     async fn reserved_slot_prefers_maintenance_over_ready_compaction() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, fixture_snapshot()).await;
         let tasks = ForgeTasks::new(fixture.operator_pool.clone());
         tasks
             .enqueue(&fixture.durable_task(
@@ -2649,7 +2686,7 @@ mod pg_tests {
     #[tokio::test]
     async fn reserved_slot_falls_back_to_compaction_without_maintenance() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, fixture_snapshot()).await;
         let tasks = ForgeTasks::new(fixture.operator_pool.clone());
         tasks
             .enqueue(&fixture.durable_task(
@@ -2955,7 +2992,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let claim = prepare_maintenance_claim(&fixture).await;
@@ -3097,7 +3134,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let claim = prepare_maintenance_claim(&fixture).await;
@@ -3205,7 +3242,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let claim = prepare_maintenance_claim(&fixture).await;
@@ -3251,7 +3288,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let claim = prepare_maintenance_claim(&fixture).await;
@@ -3367,7 +3404,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         fixture.schedule_and_execute().await;
@@ -3612,7 +3649,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         fixture.schedule_and_execute().await;
@@ -3714,7 +3751,7 @@ mod pg_tests {
             },
             false,
             3,
-            64 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let table = fixture
@@ -3799,7 +3836,7 @@ mod pg_tests {
             },
             true,
             2,
-            64 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let table = fixture
@@ -3890,7 +3927,7 @@ mod pg_tests {
     #[tokio::test]
     async fn superseded_worker_task_has_no_external_effect_and_replans() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let stop = CancellationToken::new();
         let scheduler =
             ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
@@ -4009,7 +4046,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_rejects_reserved_and_malformed_tasks_before_effect() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, fixture_snapshot()).await;
         let tasks = ForgeTasks::new(fixture.operator_pool.clone());
         for (strategy, plan, hash) in [
             (
@@ -4066,7 +4103,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_quarantines_unknown_strategy_and_continues_slot() {
         let unknown_fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 16 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let tasks = ForgeTasks::new(unknown_fixture.operator_pool.clone());
         let unknown_id = tasks
             .enqueue(&unknown_fixture.durable_task(
@@ -4162,7 +4199,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_rejects_claim_tenant_mismatch_before_every_effect() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, fixture_snapshot()).await;
         let tasks = ForgeTasks::new(fixture.operator_pool.clone());
         let task_id = tasks
             .enqueue(&fixture.durable_task(
@@ -4232,7 +4269,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_rejects_invalid_claim_identity_before_every_effect() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), false, 0, 16 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, fixture_snapshot()).await;
         let task_id = ForgeTasks::new(fixture.operator_pool.clone())
             .enqueue(&fixture.durable_task(
                 ForgeTaskStrategy::StagingFold,
@@ -4341,7 +4378,7 @@ mod pg_tests {
     /// loss within the bounded heartbeat interval or reports the wrong class.
     async fn assert_worker_authority_loss(loss: WorkerAuthorityLoss) {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let claim = fixture.plan_and_claim().await;
         let task_id = claim.task_id;
         let claim_owner = claim.claimed_by.expect("claimed worker owner");
@@ -4450,7 +4487,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_same_table_lease_excludes_publication() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let claim = fixture.plan_and_claim().await;
         let competing = ForgeLease::acquire(
             &fixture.operator_pool,
@@ -4477,6 +4514,49 @@ mod pg_tests {
                 .await
                 .expect("competing lease release")
         );
+    }
+
+    /// Resource refusal returns the durable claim to retryable before rewrite IO.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the production worker performs object output, retains its
+    /// claim, or projects anything other than typed capacity pressure.
+    #[tokio::test]
+    async fn forge_waits_without_io_when_resources_do_not_fit() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
+        let resources = fixture.forge.resources_for_test();
+        let plan = fixture.roles.plan();
+        let blocker = resources
+            .try_acquire_rewrite(vala_bifrost_redux::resources::ForgeRewriteRequest {
+                memory_bytes: plan.elastic_memory_bytes,
+                scratch_bytes: plan.scratch_limit_bytes,
+            })
+            .expect("test owner occupies all Forge resources");
+        let claim = fixture.plan_and_claim().await;
+        let task_id = claim.task_id;
+        let outputs_before = fixture.reads.output_put_calls();
+        let result = fixture
+            .worker
+            .execute_and_settle_claim_for_test(claim, &CancellationToken::new())
+            .await;
+        assert!(
+            matches!(result, Err(ForgeError::Capacity { .. })),
+            "{result:?}"
+        );
+        assert_eq!(fixture.reads.output_put_calls(), outputs_before);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("capacity-refused task state");
+        assert_eq!(state, "retryable");
+        drop(blocker);
+        let snapshot = resources.snapshot().expect("released resource snapshot");
+        assert_eq!(snapshot.elastic_memory_used_bytes, 0);
+        assert_eq!(snapshot.scratch_used_bytes, 0);
     }
 
     /// Enqueues one exact ordinary staging task for a registered fixture table.
@@ -4539,7 +4619,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_independent_tables_execute_concurrently() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let second_binding = fixture.register_seeded_table().await;
         for (binding, hash) in [(&fixture.binding, 206_u8), (&second_binding, 207_u8)] {
             enqueue_exact_staging_task(&fixture, binding, hash).await;
@@ -4621,7 +4701,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_active_shutdown_releases_retryable_then_successor_reclaims() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let claim = fixture.plan_and_claim().await;
         let task_id = claim.task_id;
         fixture.reads.pause_after_next_output_put();
@@ -4711,7 +4791,7 @@ mod pg_tests {
             },
             true,
             4,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let claim = prepare_maintenance_claim(&fixture).await;
@@ -4768,7 +4848,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_running_crash_without_cancel_is_reclaimed_after_expiry() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let claim = fixture.plan_and_claim().await;
         let task_id = claim.task_id;
         sqlx::query(
@@ -4886,7 +4966,7 @@ mod pg_tests {
     #[tokio::test]
     async fn prepared_claim_shutdown_release_is_benign_and_retained() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let claim = fixture.plan_and_claim().await;
         let task_id = claim.task_id;
         let attempt = claim.attempt_id.expect("claimed task carries an attempt");
@@ -4968,7 +5048,7 @@ mod pg_tests {
     #[tokio::test]
     async fn worker_recovers_exact_evidence_read_without_rewrite() {
         let fixture =
-            Fixture::new_with_config(ForgeConfig::default(), true, 2, 64 * 1024 * 1024).await;
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let claim = fixture.plan_and_claim().await;
         let task_id = claim.task_id;
         fixture.reads.fail_next_metadata_read();
@@ -5078,7 +5158,7 @@ mod pg_tests {
             },
             true,
             2,
-            16 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
@@ -5348,7 +5428,7 @@ mod pg_tests {
             max_open_operations_per_table: 1,
             ..ForgeConfig::default()
         };
-        let fixture = Fixture::new_with_config(config, true, 4, 16 * 1024 * 1024).await;
+        let fixture = Fixture::new_with_config(config, true, 4, fixture_snapshot()).await;
         let mut conn = fixture
             .pg
             .vala_postgres()
@@ -5831,7 +5911,7 @@ mod pg_tests {
             },
             true,
             2,
-            64 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let (table, base_snapshot_id, group, mut lease) = prepare_live_transition(&fixture).await;
@@ -5901,7 +5981,7 @@ mod pg_tests {
             },
             true,
             2,
-            64 * 1024 * 1024,
+            fixture_snapshot(),
         )
         .await;
         let (mut lease, output_key) = prepare_abandoned_live_operation(&fixture).await;

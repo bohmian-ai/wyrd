@@ -304,9 +304,6 @@ pub struct ScribeRuntimeConfig {
     /// WAL IO worker count.
     #[serde(default = "default_scribe_wal_io_threads")]
     pub wal_io_threads: usize,
-    /// Optional Scribe memory budget. When absent, cgroup detection is authoritative.
-    #[serde(default)]
-    pub memory_limit_bytes: Option<usize>,
     /// Optional Scribe WAL disk budget. When absent, filesystem capacity is authoritative.
     #[serde(default)]
     pub wal_disk_limit_bytes: Option<u64>,
@@ -355,18 +352,6 @@ pub struct OracleRuntimeConfig {
     /// CPU budget used for admission calibration.
     #[serde(default = "default_oracle_cpu_cores")]
     pub cpu_cores: f64,
-    /// Optional Oracle child memory budget in bytes.
-    ///
-    /// When unset, the governor applies the D79 default: `25%` of pod memory
-    /// clamped to `[256 MiB, 8 GiB]`. The explicit value must be at least
-    /// `256 MiB`; the sum of this child plus the Scribe child must not exceed
-    /// the Bifrost parent ceiling (`70%` of pod memory). Both constraints are
-    /// enforced fail-closed at governor construction.
-    #[serde(default)]
-    pub memory_limit_bytes: Option<usize>,
-    /// Spill byte ceiling.
-    #[serde(default = "default_oracle_spill_limit_bytes")]
-    pub spill_limit_bytes: u64,
     /// Concurrent planning permits.
     #[serde(default = "default_oracle_planning_permits")]
     pub planning_permits: usize,
@@ -425,9 +410,6 @@ fn default_oracle_advertise_addr() -> String {
 fn default_oracle_cpu_cores() -> f64 {
     1.0
 }
-fn default_oracle_spill_limit_bytes() -> u64 {
-    1 << 30
-}
 fn default_oracle_planning_permits() -> usize {
     2
 }
@@ -484,8 +466,6 @@ impl Default for OracleRuntimeConfig {
             peer_ca_certificate_path: None,
             peer_server_name: None,
             cpu_cores: default_oracle_cpu_cores(),
-            memory_limit_bytes: None,
-            spill_limit_bytes: default_oracle_spill_limit_bytes(),
             planning_permits: default_oracle_planning_permits(),
             admission_waiters: default_oracle_admission_waiters(),
             max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
@@ -627,12 +607,6 @@ pub(crate) struct OracleAdmissionTranslation {
     pub queue_capacity: u32,
     /// Absolute queue wait cap.
     pub max_queue_wait: Duration,
-    /// Interactive class memory cap.
-    pub interactive_memory_bytes: u64,
-    /// Analytical class memory cap.
-    pub analytical_memory_bytes: u64,
-    /// Spill cap.
-    pub spill_bytes: u64,
 }
 
 /// Translate validated calibration evidence into private Redux primitives.
@@ -643,7 +617,6 @@ fn translate_oracle_calibration(
     profile: &OracleCalibrationProfile,
     runtime: &OracleRuntimeConfig,
     raw_slots: u32,
-    parent_memory_bytes: u64,
 ) -> Result<OracleAdmissionTranslation, String> {
     if !profile.slot.headroom.is_finite() || !(0.0..1.0).contains(&profile.slot.headroom) {
         return Err("slot.headroom must be finite and in [0, 1)".to_owned());
@@ -692,9 +665,6 @@ fn translate_oracle_calibration(
     let (interactive_slots, analytical_slots) = (interactive, analytical);
     let single = proposal_u32(&profile.proposal, "tenant.single_tenant_limit")?;
     let multi = proposal_u32(&profile.proposal, "tenant.multi_tenant_default_limit")?;
-    let memory = proposal_u64(&profile.proposal, "memory.class_limits")?;
-    let spill =
-        proposal_u64(&profile.proposal, "spill.limit_bytes")?.min(runtime.spill_limit_bytes);
     Ok(OracleAdmissionTranslation {
         interactive_slots,
         analytical_slots,
@@ -703,9 +673,6 @@ fn translate_oracle_calibration(
         queue_capacity: u32::try_from(runtime.admission_waiters)
             .map_err(|_| "queue capacity exceeds u32".to_owned())?,
         max_queue_wait: Duration::from_millis(runtime.max_queue_wait_ms),
-        interactive_memory_bytes: memory.min(parent_memory_bytes),
-        analytical_memory_bytes: memory.min(parent_memory_bytes),
-        spill_bytes: spill,
     })
 }
 
@@ -743,7 +710,6 @@ fn checked_minimum_slots(value: u64, name: &str) -> Result<u32, String> {
 pub(crate) fn load_oracle_admission_translation(
     runtime: &OracleRuntimeConfig,
     raw_slots: u32,
-    parent_memory_bytes: u64,
 ) -> Result<Option<OracleAdmissionTranslation>, String> {
     if runtime.calibration_profile.as_os_str().is_empty() {
         return Ok(None);
@@ -752,7 +718,7 @@ pub(crate) fn load_oracle_admission_translation(
         .map_err(|error| format!("failed to read Oracle calibration profile: {error}"))?;
     let profile: OracleCalibrationProfile = toml::from_str(&contents)
         .map_err(|error| format!("failed to parse Oracle calibration profile: {error}"))?;
-    translate_oracle_calibration(&profile, runtime, raw_slots, parent_memory_bytes).map(Some)
+    translate_oracle_calibration(&profile, runtime, raw_slots).map(Some)
 }
 
 /// Reads one positive integer calibration proposal leaf.
@@ -1023,12 +989,33 @@ fn calibration_evidence_value<'a>(
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostRuntimeConfig {
+    /// Portable absolute resource caps consumed by the Bifrost-owned detector.
+    #[serde(default)]
+    pub resources: BifrostResourceConfig,
     /// Scribe runtime bounds.
     #[serde(default)]
     pub scribe: ScribeRuntimeConfig,
     /// Oracle runtime bounds.
     #[serde(default)]
     pub oracle: OracleRuntimeConfig,
+}
+
+/// Optional absolute caps for portable Bifrost resource discovery.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BifrostResourceConfig {
+    /// Optional process memory cap; detection may select a tighter bound.
+    #[serde(default)]
+    pub memory_limit_bytes: Option<usize>,
+    /// Optional unmanaged process reserve, never below 256 MiB.
+    #[serde(default)]
+    pub unmanaged_reserve_bytes: Option<usize>,
+    /// Optional disposable scratch cap; filesystem availability may be tighter.
+    #[serde(default)]
+    pub scratch_limit_bytes: Option<u64>,
+    /// Optional effective CPU cap; process/cgroup affinity may be tighter.
+    #[serde(default)]
+    pub effective_cpu: Option<usize>,
 }
 
 fn default_scribe_coordination_threads() -> usize {
@@ -1059,7 +1046,6 @@ impl Default for ScribeRuntimeConfig {
             ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
             persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
             wal_io_threads: default_scribe_wal_io_threads(),
-            memory_limit_bytes: None,
             wal_disk_limit_bytes: None,
             event_time_past_window_secs: None,
             event_time_future_window_secs: None,
@@ -1078,12 +1064,6 @@ impl ScribeRuntimeConfig {
         ];
         if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
             return Err(format!("scribe.{name} must be at least 1"));
-        }
-        let min_bytes = 256 * 1024 * 1024;
-        if let Some(value) = self.memory_limit_bytes
-            && value < min_bytes
-        {
-            return Err("scribe.memory_limit_bytes must be at least 268435456 bytes".to_owned());
         }
         if let Some(value) = self.wal_disk_limit_bytes
             && value == 0
@@ -1661,6 +1641,22 @@ impl WyrdServerConfig {
                 }
             };
         }
+        self.bifrost.resources.memory_limit_bytes = parse_optional_env(
+            "WYRD_BIFROST_MEMORY_LIMIT_BYTES",
+            self.bifrost.resources.memory_limit_bytes,
+        )?;
+        self.bifrost.resources.unmanaged_reserve_bytes = parse_optional_env(
+            "WYRD_BIFROST_UNMANAGED_RESERVE_BYTES",
+            self.bifrost.resources.unmanaged_reserve_bytes,
+        )?;
+        self.bifrost.resources.scratch_limit_bytes = parse_optional_env(
+            "WYRD_BIFROST_SCRATCH_LIMIT_BYTES",
+            self.bifrost.resources.scratch_limit_bytes,
+        )?;
+        self.bifrost.resources.effective_cpu = parse_optional_env(
+            "WYRD_BIFROST_EFFECTIVE_CPU",
+            self.bifrost.resources.effective_cpu,
+        )?;
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -1913,7 +1909,6 @@ impl WyrdServerConfig {
                 || self.bifrost.oracle.admission_waiters == 0
                 || self.bifrost.oracle.max_queue_wait_ms == 0
                 || self.bifrost.oracle.max_frame_bytes == 0
-                || self.bifrost.oracle.spill_limit_bytes == 0
                 || self.bifrost.oracle.audit_wal_max_records == 0
                 || self.bifrost.oracle.audit_wal_max_bytes == 0
                 || self.bifrost.oracle.audit_wal_max_age_seconds == 0
@@ -1942,16 +1937,6 @@ impl WyrdServerConfig {
                 .scribe
                 .validate()
                 .map_err(|message| ConfigError::Invalid { message })?;
-            if let Some(value) = self.bifrost.oracle.memory_limit_bytes {
-                let min_bytes = 256 * 1024 * 1024;
-                if value < min_bytes {
-                    return Err(ConfigError::Invalid {
-                        message:
-                            "bifrost.oracle.memory_limit_bytes must be at least 268435456 bytes"
-                                .to_owned(),
-                    });
-                }
-            }
             self.validate_oracle_calibration()?;
 
             if self.grpc.certificate_chain_path.is_some() != self.grpc.private_key_path.is_some() {
@@ -2319,6 +2304,30 @@ fn env_opt(key: &str) -> Result<Option<String>, ConfigError> {
             message: "value is not valid UTF-8".to_string(),
         }),
     }
+}
+
+/// Parses one optional absolute resource override while preserving file config.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when the environment value is empty, non-Unicode,
+/// or cannot be parsed into the requested numeric type.
+fn parse_optional_env<T>(key: &str, current: Option<T>) -> Result<Option<T>, ConfigError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    env_opt(key)?
+        .map(|value| {
+            value
+                .parse::<T>()
+                .map(Some)
+                .map_err(|error| ConfigError::BadEnvVar {
+                    key: key.to_owned(),
+                    message: error.to_string(),
+                })
+        })
+        .unwrap_or(Ok(current))
 }
 
 /// Load Wyrd's own signing-key PEM from the environment.
@@ -2704,6 +2713,7 @@ minimum_slots = 2
         config.bifrost.oracle.peer_ca_certificate_path = Some(directory.path().join("ca.pem"));
         config.bifrost.oracle.peer_server_name = Some("oracle.test".to_owned());
         config.bifrost.oracle.advertise_addr = "https://oracle.test:50052".to_owned();
+        config.bifrost.oracle.audit_wal_root = Some(directory.path().join("oracle-audit"));
         assert!(config.validate().is_err());
 
         std::fs::write(&path, complete_oracle_calibration("approved"))
@@ -2735,6 +2745,7 @@ minimum_slots = 2
         config.bifrost.oracle.peer_server_name = Some("oracle.test".to_owned());
         assert!(config.validate().is_err());
         config.bifrost.oracle.advertise_addr = "https://oracle.test:50052".to_owned();
+        config.bifrost.oracle.audit_wal_root = Some(directory.path().join("oracle-audit"));
         config
             .validate()
             .expect("complete production Oracle TLS configuration validates");
@@ -2777,7 +2788,6 @@ minimum_slots = 2
     fn scribe_runtime_defaults_match_bounded_contract() {
         let cfg = ScribeRuntimeConfig::default();
         assert_eq!(cfg.coordination_threads, 2);
-        assert_eq!(cfg.memory_limit_bytes, None);
         assert_eq!(cfg.wal_disk_limit_bytes, None);
         cfg.validate().expect("resolved defaults must validate");
     }
@@ -2790,12 +2800,7 @@ minimum_slots = 2
         };
         assert!(cfg.validate().is_err());
 
-        let mut cfg = ScribeRuntimeConfig {
-            memory_limit_bytes: Some(1024),
-            ..ScribeRuntimeConfig::default()
-        };
-        assert!(cfg.validate().is_err());
-        cfg.memory_limit_bytes = None;
+        let mut cfg = ScribeRuntimeConfig::default();
         cfg.wal_disk_limit_bytes = Some(0);
         assert!(cfg.validate().is_err());
     }
@@ -3568,27 +3573,23 @@ minimum_slots = 2
             measurements: toml::Table::new(),
         };
         let runtime = OracleRuntimeConfig::default();
-        let translated =
-            translate_oracle_calibration(&profile, &runtime, 8, 512).expect("translation");
+        let translated = translate_oracle_calibration(&profile, &runtime, 8).expect("translation");
         assert_eq!(translated.interactive_slots, 3);
         assert_eq!(translated.analytical_slots, 3);
-        assert_eq!(translated.interactive_memory_bytes, 512);
-        assert_eq!(translated.spill_bytes, 4096.min(runtime.spill_limit_bytes));
-
         assert!(
-            translate_oracle_calibration(&profile, &runtime, 1, 512)
+            translate_oracle_calibration(&profile, &runtime, 1)
                 .expect_err("one usable slot must fail closed")
                 .contains("at least 2")
         );
         profile.class.interactive.minimum_slots = 0;
         assert!(
-            translate_oracle_calibration(&profile, &runtime, 8, 512)
+            translate_oracle_calibration(&profile, &runtime, 8)
                 .expect_err("zero class minimum must fail closed")
                 .contains("must be positive")
         );
         profile.class.interactive.minimum_slots = u64::from(u32::MAX) + 1;
         assert!(
-            translate_oracle_calibration(&profile, &runtime, 8, 512)
+            translate_oracle_calibration(&profile, &runtime, 8)
                 .expect_err("oversized class minimum must fail closed")
                 .contains("exceeds u32")
         );
@@ -3597,7 +3598,7 @@ minimum_slots = 2
         profile.class.interactive.share = 1.0;
         profile.class.analytical.share = 1.0;
         assert!(
-            translate_oracle_calibration(&profile, &runtime, 3, 512)
+            translate_oracle_calibration(&profile, &runtime, 3)
                 .expect_err("class allocations exceeding usable slots must fail closed")
                 .contains("exceeds usable slots")
         );

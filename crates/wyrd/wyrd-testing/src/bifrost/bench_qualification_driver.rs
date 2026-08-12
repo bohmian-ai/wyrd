@@ -33,7 +33,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use wyrd_server::config::OracleRuntimeConfig;
 
 use super::bench_dataset::{
     BifrostQualificationDataset, DatasetShape, dataset_manifest_digest, smoke_dataset_shape,
@@ -533,8 +532,8 @@ fn fingerprint_dataset_digest(shape: DatasetShape) -> Result<String, Qualificati
 ///
 /// Refuses a dirty source tree, provisions the run's shared resources, measures
 /// the calibration slice, resolves the live effective Oracle memory budget
-/// ([`OracleRuntimeConfig::memory_limit_bytes`], else unbounded — the harness
-/// leaves the limit unset and does not probe pod memory), selects the D70 shape,
+/// (the exact 512 MiB complete-query grant derived from the Gate resource plan),
+/// selects the qualification shape,
 /// persists the run record, then runs [`QualificationRun::orchestrate`] (one
 /// materialization over the shared resources, every family serial over them,
 /// budgets enforced). Because `orchestrate` performs the work while taking the
@@ -571,12 +570,7 @@ pub async fn execute_qualification_run(
     );
 
     let calibration = driver.calibrate().await?;
-    let budget = MemoryBudget::resolve(
-        OracleRuntimeConfig::default()
-            .memory_limit_bytes
-            .map(|bytes| bytes as u64),
-        None,
-    );
+    let budget = MemoryBudget::from_resource_plan(512 * 1024 * 1024);
     let selection = select_qualification_shape(budget, calibration, budgets.setup.as_secs())?;
 
     let source_commit = git_head();

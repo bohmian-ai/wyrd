@@ -100,6 +100,53 @@ pub struct ForgePlanCandidate {
     pub parameters: serde_json::Value,
 }
 
+impl ForgePlanCandidate {
+    /// Derives the one exact candidate a live rewrite group would be planned as.
+    ///
+    /// This is the sole candidate-estimation algorithm for live rewrite groups.
+    /// The durable planning scheduler and the `test-support` direct replacement
+    /// path both call it, so a directly replaced group produces byte-identical
+    /// estimates to the task the planner would have persisted for that group.
+    /// Input identities are sorted and deduplicated, and selected input bytes
+    /// are checked-summed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the selected input bytes overflow
+    /// `u64` or the selected file count exceeds the durable parallelism domain.
+    pub(crate) fn from_live_group(
+        group: &super::right_size::IcebergRewriteGroup,
+    ) -> Result<Self, ForgeError> {
+        let mut inputs = group
+            .files()
+            .iter()
+            .map(|file| file.catalog_path().to_owned())
+            .collect::<Vec<_>>();
+        inputs.sort();
+        inputs.dedup();
+        let bytes = group
+            .files()
+            .iter()
+            .try_fold(0_u64, |total, file| {
+                total.checked_add(file.file_size_bytes())
+            })
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge group bytes overflow".to_owned(),
+            })?;
+        Ok(Self {
+            strategy: ForgeTaskStrategy::SmallFiles,
+            parallelism: u16::try_from(group.files().len()).map_err(|_| ForgeError::Invariant {
+                detail: "Forge planned parallelism exceeds u16".to_owned(),
+            })?,
+            memory_bytes: bytes,
+            spill_bytes: bytes,
+            inputs,
+            bytes,
+            parameters: serde_json::json!({"kind":"live_rewrite"}),
+        })
+    }
+}
+
 /// Complete stable metadata view supplied after catalog IO finishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeTableSnapshot {
@@ -183,6 +230,37 @@ impl ForgePlanner {
             .iter()
             .map(|candidate| self.plan_candidate(snapshot.snapshot_id, candidate))
             .collect()
+    }
+
+    /// Validates one candidate's resource estimates against this planner's ceilings.
+    ///
+    /// This is the shared admission predicate for both the durable plan path and
+    /// the direct live-replacement path: memory and spill estimates must be
+    /// positive and must not exceed the already validated [`ForgeCapacity`]
+    /// ceilings. It never clamps, inflates, or otherwise rewrites an estimate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Capacity`] when either estimate is zero or exceeds
+    /// its ceiling.
+    pub(crate) fn validate_candidate_estimates(
+        &self,
+        memory_bytes: u64,
+        spill_bytes: u64,
+    ) -> Result<(), ForgeError> {
+        if memory_bytes == 0 || spill_bytes == 0 {
+            return Err(ForgeError::Capacity {
+                detail: "Forge rewrite demand must be positive".to_owned(),
+            });
+        }
+        if memory_bytes > self.capacity.max_memory_bytes
+            || spill_bytes > self.capacity.max_spill_bytes
+        {
+            return Err(ForgeError::Capacity {
+                detail: "Forge rewrite demand exceeds its validated capacity ceiling".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Builds and hashes one exact candidate without performing IO.

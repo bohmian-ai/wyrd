@@ -57,13 +57,16 @@ const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
 
 /// Async `reqwest` HTTP transport for Wyrd read and admin paths.
 ///
-/// Holds one [`reqwest::Client`] built from [`HttpConfig`] (timeout, optional
-/// gzip) and a shared [`AuthMiddleware`] (D3: same `Arc` as gRPC). Each
-/// request helper resolves the bearer via [`AuthMiddleware::bearer`], attaches
-/// `wyrd-request-id`, and applies the retry policy before returning.
+/// Holds bounded and streaming [`reqwest::Client`] handles built from one
+/// [`HttpConfig`] plus a shared [`AuthMiddleware`] (D3: same `Arc` as gRPC).
+/// Ordinary requests retain the configured total deadline. Terminal streams
+/// bound connection establishment but let the server query deadline and caller
+/// cancellation govern response-body lifetime.
 #[derive(Clone)]
 pub struct HttpTransport {
     client: reqwest::Client,
+    /// Connection-bounded client whose response body has no generic deadline.
+    stream_client: reqwest::Client,
     auth: Arc<AuthMiddleware>,
     base_url: String,
 }
@@ -85,16 +88,19 @@ impl HttpTransport {
     }
     /// Build a transport from config and a shared auth middleware.
     ///
-    /// Sets the per-request timeout from `config.timeout_ms` and enables gzip
-    /// decompression when `config.compression` is `true`.
+    /// Builds ordinary and terminal-stream clients from one TLS/compression
+    /// configuration. `config.timeout_ms` is the ordinary total deadline and
+    /// the streaming connection deadline.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when the underlying
     /// `reqwest::Client` cannot be constructed.
     pub fn new(config: &HttpConfig, auth: Arc<AuthMiddleware>) -> Result<Self, WyrdClientError> {
-        let client = build_http_client(config)?;
+        let client = build_http_client(config, HttpClientDeadline::Total)?;
+        let stream_client = build_http_client(config, HttpClientDeadline::ConnectOnly)?;
         Ok(Self {
             client,
+            stream_client,
             auth,
             base_url: config.base_url.trim_end_matches('/').to_owned(),
         })
@@ -310,7 +316,7 @@ impl HttpTransport {
             details: serde_json::json!({}),
         })?;
         let response = self
-            .client
+            .stream_client
             .request(method, url)
             .header(
                 HEADER_WYRD_ACCESS_TOKEN,
@@ -607,12 +613,33 @@ impl HttpTransport {
 /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
 /// already owns the process or Reqwest rejects the client configuration.
 ///
-fn build_http_client(config: &HttpConfig) -> Result<reqwest::Client, WyrdClientError> {
+/// Deadline mode for one concrete HTTP client pool.
+enum HttpClientDeadline {
+    /// Bound connect and complete response-body consumption.
+    Total,
+    /// Bound connection establishment while leaving body lifetime to its owner.
+    ConnectOnly,
+}
+
+/// Builds one Reqwest client with the selected deadline semantics.
+///
+/// # Errors
+///
+/// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+/// already owns the process or Reqwest rejects the client configuration.
+fn build_http_client(
+    config: &HttpConfig,
+    deadline: HttpClientDeadline,
+) -> Result<reqwest::Client, WyrdClientError> {
     wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
         transport: "http".to_owned(),
         message: error.to_string(),
     })?;
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_millis(config.timeout_ms));
+    let timeout = Duration::from_millis(config.timeout_ms);
+    let mut builder = match deadline {
+        HttpClientDeadline::Total => reqwest::Client::builder().timeout(timeout),
+        HttpClientDeadline::ConnectOnly => reqwest::Client::builder().connect_timeout(timeout),
+    };
     if config.compression {
         builder = builder.gzip(true);
     }

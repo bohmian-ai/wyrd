@@ -308,9 +308,7 @@ impl RawQueryStream {
                     }
                 }
                 Some(Err(error)) => {
-                    return Err(ValaSdkError::Protocol(format!(
-                        "response body failed: {error}"
-                    )));
+                    return Err(query_body_transport_error(error));
                 }
                 None => {
                     self.decoder
@@ -336,6 +334,34 @@ impl RawQueryStream {
     fn received_bytes(&self) -> usize {
         self.received_bytes
     }
+}
+
+/// Maps a Reqwest body failure without confusing transport with framing.
+///
+/// The stable projection retains machine-readable phase and Reqwest
+/// classifications. The structured diagnostic keeps the original error as the
+/// tracing source for operators while the public detail remains scrubbed.
+fn query_body_transport_error(error: reqwest::Error) -> ValaSdkError {
+    let details = serde_json::json!({
+        "transport": "http",
+        "phase": "response_body",
+        "timeout": error.is_timeout(),
+        "connect": error.is_connect(),
+        "body": error.is_body(),
+    });
+    tracing::error!(
+        error = ?error,
+        transport = "http",
+        phase = "response_body",
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        body = error.is_body(),
+        "Oracle query response body failed"
+    );
+    ValaSdkError::Transport(WyrdError::UpstreamFailure {
+        message: "Oracle query response body failed".to_owned(),
+        details,
+    })
 }
 
 /// Arrow-projecting query stream that preserves terminal metadata.
@@ -591,6 +617,8 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use bytes::Bytes;
     use futures_util::stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::api::{
         QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame, QuerySource,
@@ -601,6 +629,49 @@ mod tests {
     use wyrd_tonic::wyrd::v1 as proto;
 
     use super::*;
+
+    /// Proves an HTTP body failure remains a structured transport error.
+    #[tokio::test]
+    async fn query_body_failure_is_structured_transport_error() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client connects");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("request reads");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/vnd.wyrd.bifrost-query-stream\r\ncontent-length: 100\r\nconnection: close\r\n\r\nabc",
+                )
+                .await
+                .expect("truncated response writes");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/v1/query"))
+            .send()
+            .await
+            .expect("response headers arrive");
+        let mut stream = RawQueryStream::new(
+            response.bytes_stream(),
+            VisibilityMode::PublishedOnly,
+        );
+
+        let error = stream
+            .next_frame()
+            .await
+            .expect_err("truncated body is a transport failure");
+        let ValaSdkError::Transport(WyrdError::UpstreamFailure { details, .. }) = error else {
+            panic!("body failure must retain the transport projection");
+        };
+        assert_eq!(details["transport"], "http");
+        assert_eq!(details["phase"], "response_body");
+        assert_eq!(details["timeout"], false);
+        assert_eq!(details["connect"], false);
+        assert_eq!(details["body"], true);
+        server.await.expect("test server exits");
+    }
 
     /// Stable metadata accessors preserve typed transport and terminal diagnostics.
     #[test]

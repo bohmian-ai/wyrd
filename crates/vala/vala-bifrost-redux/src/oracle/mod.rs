@@ -24,7 +24,6 @@ use datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use datafusion::sql::resolve::resolve_table_references;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use futures_util::{Stream, StreamExt};
-use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -48,10 +47,7 @@ use wyrd_spec::vala::api::{
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
-use crate::scribe::memory::{
-    BifrostMemoryGovernor, MemoryPurpose, MemoryRejection, MemoryRejectionKind,
-    OracleMemoryReservation, ParentMemoryReservation,
-};
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryRejection, MemoryRejectionKind};
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
 mod admission;
@@ -219,6 +215,8 @@ pub struct QueryOptions {
 pub struct OracleMemoryResources {
     /// Parent process-wide memory governor.
     pub governor: BifrostMemoryGovernor,
+    /// Narrow Oracle capability issued by the one production composition.
+    pub resources: crate::resources::OracleResources,
     /// Maximum bytes reserved by one query for reconciliation state.
     pub reconciliation_limit_bytes: usize,
 }
@@ -427,37 +425,18 @@ impl OracleTelemetry {
         }
     }
 
-    /// Couples one parent-governor reservation to Oracle and class gauges.
+    /// Couples a nested query-pool reservation to canonical Oracle gauges.
     #[must_use]
-    fn account_memory(
+    fn account_query_memory(
         self: &Arc<Self>,
-        reservation: ParentMemoryReservation,
+        reservation: crate::resources::OracleQueryMemoryReservation,
         query_class: QueryClass,
         memory_kind: OracleMemoryKind,
     ) -> AccountedMemoryReservation {
         let bytes = reservation.bytes();
         self.charge_memory(bytes, query_class, memory_kind);
         AccountedMemoryReservation {
-            reservation: Some(OracleGovernorReservation::Parent(reservation)),
-            owner: Arc::clone(self),
-            query_class,
-            memory_kind,
-            bytes,
-        }
-    }
-
-    /// Couples one Oracle-child reservation to canonical Oracle memory gauges.
-    #[must_use]
-    fn account_oracle_memory(
-        self: &Arc<Self>,
-        reservation: OracleMemoryReservation,
-        query_class: QueryClass,
-        memory_kind: OracleMemoryKind,
-    ) -> AccountedMemoryReservation {
-        let bytes = reservation.bytes();
-        self.charge_memory(bytes, query_class, memory_kind);
-        AccountedMemoryReservation {
-            reservation: Some(OracleGovernorReservation::Oracle(reservation)),
+            reservation: Some(OracleGovernorReservation::Query(reservation)),
             owner: Arc::clone(self),
             query_class,
             memory_kind,
@@ -683,18 +662,15 @@ impl Drop for AdmissionWaitTelemetryGuard {
 
 /// Governor reservation coupled to canonical Oracle memory gauges.
 enum OracleGovernorReservation {
-    /// Parent-only ownership used by reconciliation and live-source state.
-    Parent(ParentMemoryReservation),
-    /// Oracle-child plus parent ownership used by hot source buffers.
-    Oracle(OracleMemoryReservation),
+    /// Nested ownership inside the complete query envelope.
+    Query(crate::resources::OracleQueryMemoryReservation),
 }
 
 impl OracleGovernorReservation {
     /// Poison the shared governor after wrapper-accounting corruption.
     fn poison(&self) {
         match self {
-            Self::Parent(reservation) => reservation.poison(),
-            Self::Oracle(reservation) => reservation.poison(),
+            Self::Query(reservation) => reservation.poison(),
         }
     }
 }
@@ -1263,12 +1239,6 @@ pub struct OracleConfig {
     pub queue_capacity: u32,
     /// Absolute queue wait cap.
     pub max_queue_wait: Duration,
-    /// Interactive class memory budget.
-    pub interactive_memory_bytes: u64,
-    /// Analytical class memory budget.
-    pub analytical_memory_bytes: u64,
-    /// Spill budget.
-    pub spill_bytes: u64,
 }
 
 impl Default for OracleConfig {
@@ -1289,9 +1259,6 @@ impl Default for OracleConfig {
             multi_tenant_ceiling: 4,
             queue_capacity: 64,
             max_queue_wait: Duration::from_millis(250),
-            interactive_memory_bytes: 256 * 1024 * 1024,
-            analytical_memory_bytes: 256 * 1024 * 1024,
-            spill_bytes: 1 << 30,
         }
     }
 }
@@ -1369,6 +1336,8 @@ struct PlannedSqlCut {
     cuts: Vec<PinnedSealedTable>,
     /// Server-derived admission class.
     query_class: QueryClass,
+    /// Fraction of pinned sealed bytes in the local hot tier.
+    local_ratio: f64,
 }
 
 /// Inputs for live-fence acquisition, mandatory audit, and bounded drain.
@@ -1629,10 +1598,8 @@ impl Oracle {
                 multi_tenant_ceiling: config.config.multi_tenant_ceiling,
                 queue_capacity: config.config.queue_capacity,
                 max_queue_wait: config.config.max_queue_wait,
-                interactive_memory_bytes: config.config.interactive_memory_bytes,
-                analytical_memory_bytes: config.config.analytical_memory_bytes,
-                spill_bytes: config.config.spill_bytes,
             },
+            config.memory.resources.clone(),
         ));
         let initial_snapshot = cluster.snapshot();
         admission.refresh(&initial_snapshot);
@@ -1789,7 +1756,6 @@ impl Oracle {
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
-        self.preflight_query_capacity()?;
         let deadline = request
             .deadline_ms
             .map_or(self.planner.config.default_deadline, Duration::from_millis);
@@ -1841,7 +1807,9 @@ impl Oracle {
         let query_class = planned.query_class;
         query_telemetry
             .get_or_insert_with(|| self.telemetry.start_query(request.visibility, query_class));
-        let admitted = self.admit_sql_query(context, query_class, deadline).await?;
+        let admitted = self
+            .admit_sql_query(context, query_class, planned.local_ratio, deadline)
+            .await?;
         let (session, mut admitted) = self.lease_session(deadline, admitted, "lease rejection")?;
         let drained = match self
             .audit_and_drain_cut(CutAuditInput {
@@ -1940,14 +1908,15 @@ impl Oracle {
         &self,
         context: &AuthorizedQueryContext,
         query_class: QueryClass,
+        local_ratio: f64,
         deadline: Instant,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
         self.admission
             .admit(admission::PreparedAdmission {
                 tenant: context.data_tenant_id,
                 query_class,
+                local_ratio,
                 deadline,
-                memory_ceiling: self.memory.reconciliation_limit_bytes as u64,
                 cancellation: self.shutdown.child_token(),
             })
             .await
@@ -1976,11 +1945,16 @@ impl Oracle {
         &self,
         input: CutAuditInput<'_>,
     ) -> Result<DrainedTails, BifrostError> {
+        let query_pool = input
+            .admitted
+            .memory_pool()
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
         let drainer = TailFenceDrainer::new(
             &self.tails,
             &self.memory,
             TailFenceDrainerConfig {
                 telemetry: Arc::clone(&self.telemetry),
+                query_pool,
                 query_class: input.query_class,
                 deadline: input.deadline,
                 cancellation: input.admitted.cancellation.clone(),
@@ -2102,8 +2076,8 @@ impl Oracle {
             .admit(admission::PreparedAdmission {
                 tenant: context.data_tenant_id,
                 query_class: class,
+                local_ratio: 0.0,
                 deadline: options.deadline,
-                memory_ceiling: self.memory.reconciliation_limit_bytes as u64,
                 cancellation: self.shutdown.child_token(),
             })
             .await?;
@@ -2127,7 +2101,6 @@ impl Oracle {
         query_telemetry: QueryTelemetryGuard,
         admitted: AdmittedQueryGuard,
     ) -> Result<OracleQueryStream, BifrostError> {
-        self.preflight_query_capacity()?;
         let cuts = self
             .planner
             .prepare_typed_cuts(
@@ -2148,6 +2121,9 @@ impl Oracle {
             &self.memory,
             TailFenceDrainerConfig {
                 telemetry: Arc::clone(&self.telemetry),
+                query_pool: admitted
+                    .memory_pool()
+                    .ok_or(BifrostError::QueryAdmissionRejected)?,
                 query_class: class,
                 deadline: options.deadline,
                 cancellation: admitted.cancellation.clone(),
@@ -2186,6 +2162,7 @@ impl Oracle {
                 catalog: &self.catalog,
                 audit: Arc::clone(&self.audit),
                 memory: self.memory.clone(),
+                query_pool: Arc::clone(&session.runtime_env().memory_pool),
                 telemetry: Arc::clone(&self.telemetry),
             })
             .await?;
@@ -2195,13 +2172,7 @@ impl Oracle {
         let schema = physical.schema();
         let mut batches = execute_stream(physical, session.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
-        let remaining = options
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BifrostError::QueryTimeout)?;
-        let first = tokio::time::timeout(remaining, batches.next())
-            .await
-            .map_err(|_| BifrostError::QueryTimeout)?;
+        let first = await_first_batch(&mut batches, options.deadline).await?;
         if let Some(error) = map_first_batch_failure(first.as_ref()) {
             return release_error(
                 options.deadline,
@@ -2484,6 +2455,7 @@ impl Oracle {
                 table_name: table_name.clone(),
                 audit: Arc::clone(&self.audit),
                 memory: self.memory.clone(),
+                query_pool: Arc::clone(&session.runtime_env().memory_pool),
                 telemetry: Arc::clone(&self.telemetry),
                 query_class: input.query_class,
             })
@@ -2497,27 +2469,6 @@ impl Oracle {
         }
         self.execute_session(&session, input.sql, input.logical_bytes_selected)
             .await
-    }
-
-    /// Rejects a query before IO when the shared Oracle child cannot accept any work.
-    ///
-    /// The reversible one-byte reservation observes the same atomic child and
-    /// parent ceilings as range and `DataFusion` allocations, then releases
-    /// immediately so it does not become query-lifetime accounting.
-    ///
-    /// # Errors
-    ///
-    /// Returns the stable public capacity, oversized, or poisoned projection
-    /// for the governor's typed refusal.
-    fn preflight_query_capacity(&self) -> Result<(), BifrostError> {
-        let probe = self
-            .memory
-            .governor
-            .oracle_budget()
-            .try_reserve_classified(1, MemoryPurpose::OracleQuery)
-            .map_err(map_memory_rejection)?;
-        drop(probe);
-        Ok(())
     }
 
     /// Builds one Oracle execution session over governed memory and query spill.
@@ -2536,18 +2487,14 @@ impl Oracle {
         &self,
         admitted: &AdmittedQueryGuard,
     ) -> Result<SessionContext, BifrostError> {
-        let pool = Arc::new(
-            crate::scribe::memory::OracleQueryMemoryPool::try_new(
-                &self.memory.governor,
-                admitted.memory_limit_bytes(),
-            )
-            .map_err(map_memory_rejection)?,
-        );
+        let pool = admitted
+            .memory_pool()
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
         let runtime = self
             .spill_runtime
             .build_query_runtime(pool, admitted.spill_limit_bytes())?;
         let config = datafusion::execution::context::SessionConfig::new()
-            .with_target_partitions(4)
+            .with_target_partitions(admitted.target_partitions())
             .with_batch_size(1_024);
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
@@ -2837,6 +2784,7 @@ impl Oracle {
             permission_digest,
             attempt_bytes: self.planner.config.attempt_max_bytes,
             attempt_memory_bytes: self.planner.config.attempt_memory_bytes,
+            query_memory_pool: input.admitted.memory_pool(),
             cancellation: input.admitted.cancellation.clone(),
             deadline: input.deadline.into(),
         };
@@ -2848,6 +2796,25 @@ impl Oracle {
             context: dispatch_context,
         })
     }
+}
+
+/// Awaits one stream lookahead within the query's absolute deadline.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryTimeout`] when the deadline has elapsed or the
+/// lookahead does not complete in the remaining interval. Cancellation of the
+/// caller drops the pending poll without consuming a later batch.
+async fn await_first_batch(
+    batches: &mut SendableRecordBatchStream,
+    deadline: Instant,
+) -> Result<Option<datafusion::error::Result<RecordBatch>>, BifrostError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(BifrostError::QueryTimeout)?;
+    tokio::time::timeout(remaining, batches.next())
+        .await
+        .map_err(|_| BifrostError::QueryTimeout)
 }
 
 /// Computes the exact active sealed-fragment bound from selected and admitted capacity.
@@ -3466,7 +3433,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::atomic::AtomicUsize;
 
-    /// Every typed governor kind wins over generic DataFusion capacity mapping.
+    /// Every typed governor kind wins over generic `DataFusion` capacity mapping.
     #[test]
     fn datafusion_capacity_mapping_preserves_all_typed_memory_kinds() {
         for (kind, expected) in [
@@ -3493,7 +3460,7 @@ mod tests {
         }
     }
 
-    /// Generic DataFusion resource exhaustion is classified structurally as capacity.
+    /// Generic `DataFusion` resource exhaustion is classified structurally as capacity.
     #[test]
     fn datafusion_resource_exhaustion_maps_to_query_admission_rejected() {
         let exhausted = datafusion::error::DataFusionError::ResourcesExhausted(
@@ -4136,6 +4103,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
+            query_memory_pool: None,
             cancellation: CancellationToken::new(),
             deadline: (Instant::now() + Duration::from_secs(5)).into(),
         };

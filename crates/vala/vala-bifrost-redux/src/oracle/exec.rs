@@ -31,6 +31,7 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
@@ -63,10 +64,6 @@ use tracing::Instrument;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, QueryClass};
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
-
-#[cfg(test)]
-use crate::scribe::memory::{MemoryCeiling, MemoryRejection, MemoryRejectionKind};
-use crate::scribe::memory::{MemoryPurpose, OracleMemoryReservation};
 
 use super::{
     AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryKind,
@@ -617,6 +614,8 @@ pub(crate) struct OracleTableInputs {
     pub(crate) audit: Arc<dyn OracleAudit>,
     /// Parent-governed source and reconciliation memory.
     pub(crate) memory: OracleMemoryResources,
+    /// Query-local pool shared by `DataFusion` and Wyrd-owned source buffers.
+    pub(crate) query_pool: Arc<dyn MemoryPool>,
     /// Production memory telemetry owner.
     pub(crate) telemetry: Arc<OracleTelemetry>,
     /// Admission class charged by this provider.
@@ -649,6 +648,8 @@ pub(crate) struct OracleTableProvider {
     audit: Arc<dyn OracleAudit>,
     /// Parent-governed reconciliation and source memory.
     memory: OracleMemoryResources,
+    /// Query-local pool shared by every physical operator and source owner.
+    query_pool: Arc<dyn MemoryPool>,
     /// Production memory accounting shared with the retained Oracle.
     telemetry: Arc<OracleTelemetry>,
     /// Immutable admission class charged by this table execution.
@@ -708,6 +709,7 @@ impl OracleTableProvider {
             table_name,
             audit,
             memory,
+            query_pool,
             telemetry,
             query_class,
         } = inputs;
@@ -746,6 +748,7 @@ impl OracleTableProvider {
             table: table_name,
             audit,
             memory,
+            query_pool,
             telemetry,
             query_class,
         })
@@ -819,10 +822,13 @@ impl TableProvider for OracleTableProvider {
                 self.hot_files.clone(),
                 self.file_io.clone(),
                 Arc::clone(&self.physical_schema),
-                self.memory.clone(),
-                Arc::clone(&self.telemetry),
-                self.query_class,
-                Arc::new(OracleScanMetricsHandle::default()),
+                HotParquetRuntime {
+                    memory: self.memory.clone(),
+                    memory_pool: Arc::clone(&self.query_pool),
+                    telemetry: Arc::clone(&self.telemetry),
+                    query_class: self.query_class,
+                    metrics: Arc::new(OracleScanMetricsHandle::default()),
+                },
             ));
             inputs.push(Arc::new(SourceTagExec::new(hot, SourceTier::HotSealed)?));
         }
@@ -1425,7 +1431,7 @@ struct AccountedRangeOwner {
     /// Exact bytes returned by the storage range read.
     bytes: bytes::Bytes,
     /// Oracle child and parent capacity retained through the final byte owner.
-    reservation: OracleMemoryReservation,
+    reservation: crate::resources::OracleQueryMemoryReservation,
     /// Canonical Oracle telemetry owner charged for the same byte lifetime.
     telemetry: Arc<OracleTelemetry>,
     /// Immutable query class used for balanced gauge release.
@@ -1436,7 +1442,7 @@ impl AccountedRangeOwner {
     /// Couples exact range capacity to the canonical Oracle memory gauges.
     fn new(
         bytes: bytes::Bytes,
-        reservation: OracleMemoryReservation,
+        reservation: crate::resources::OracleQueryMemoryReservation,
         telemetry: Arc<OracleTelemetry>,
         query_class: QueryClass,
     ) -> Self {
@@ -1479,7 +1485,9 @@ struct IcebergParquetReader {
     /// Pinned manifest size used to reject invalid ranges.
     size: u64,
     /// Shared Oracle child capability used for every metadata and data range.
-    memory: crate::scribe::memory::OracleMemoryBudget,
+    memory_pool: Arc<dyn MemoryPool>,
+    /// Pod governor poisoned if coupled telemetry diverges from pool ownership.
+    resources: crate::resources::BifrostResourceGovernor,
     /// Shared physical scan counters retained to terminal query emission.
     metrics: Arc<OracleScanMetricsHandle>,
     /// Canonical Oracle memory telemetry coupled to range ownership.
@@ -1496,7 +1504,8 @@ impl IcebergParquetReader {
     fn new(
         reader: Box<dyn FileRead>,
         size: u64,
-        memory: crate::scribe::memory::OracleMemoryBudget,
+        memory_pool: Arc<dyn MemoryPool>,
+        resources: crate::resources::BifrostResourceGovernor,
         metrics: Arc<OracleScanMetricsHandle>,
         telemetry: Arc<OracleTelemetry>,
         query_class: QueryClass,
@@ -1504,7 +1513,8 @@ impl IcebergParquetReader {
         Self {
             reader,
             size,
-            memory,
+            memory_pool,
+            resources,
             metrics,
             telemetry,
             query_class,
@@ -1544,10 +1554,13 @@ impl AsyncFileReader for IcebergParquetReader {
             let requested = usize::try_from(requested_u64).map_err(|_| {
                 ParquetError::General("hot Parquet range length exceeds usize".to_owned())
             })?;
-            let reservation = self
-                .memory
-                .try_reserve_classified(requested, MemoryPurpose::OracleHotRange)
-                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            let reservation = crate::resources::OracleQueryMemoryReservation::try_new(
+                &self.memory_pool,
+                self.resources.clone(),
+                "oracle-hot-range",
+                requested,
+            )
+            .map_err(|error| ParquetError::External(Box::new(error)))?;
             self.metrics.record_hot_range(requested);
             #[cfg(test)]
             let bytes = if let Some((location, reader)) = self.reader_override.as_ref() {
@@ -1613,6 +1626,8 @@ struct HotParquetExec {
     schema: SchemaRef,
     /// Shared governor used for each range and decoded source batch.
     memory: OracleMemoryResources,
+    /// Query-local pool shared with `DataFusion` operators.
+    memory_pool: Arc<dyn MemoryPool>,
     /// Production memory accounting shared with the retained Oracle.
     telemetry: Arc<OracleTelemetry>,
     /// Immutable admission class charged by source buffers.
@@ -1624,6 +1639,20 @@ struct HotParquetExec {
     reader_override: Option<HotReadOverride>,
     /// Cached bounded leaf properties.
     properties: Arc<PlanProperties>,
+}
+
+/// Query-scoped dependencies shared by every hot Parquet source owner.
+struct HotParquetRuntime {
+    /// Pod allocator and compatibility memory handles used by range owners.
+    memory: OracleMemoryResources,
+    /// Shared query-local pool used by operators and source buffers.
+    memory_pool: Arc<dyn MemoryPool>,
+    /// Canonical Oracle memory telemetry owner.
+    telemetry: Arc<OracleTelemetry>,
+    /// Immutable scheduling class used only for telemetry labels.
+    query_class: QueryClass,
+    /// Terminal scan metrics retained through stream completion.
+    metrics: Arc<OracleScanMetricsHandle>,
 }
 
 impl fmt::Debug for HotParquetExec {
@@ -1642,18 +1671,16 @@ impl HotParquetExec {
         files: Vec<HotFileSource>,
         file_io: FileIO,
         schema: SchemaRef,
-        memory: OracleMemoryResources,
-        telemetry: Arc<OracleTelemetry>,
-        query_class: QueryClass,
-        metrics: Arc<OracleScanMetricsHandle>,
+        runtime: HotParquetRuntime,
     ) -> Self {
         Self {
             files,
             file_io,
-            memory,
-            telemetry,
-            query_class,
-            metrics,
+            memory: runtime.memory,
+            memory_pool: runtime.memory_pool,
+            telemetry: runtime.telemetry,
+            query_class: runtime.query_class,
+            metrics: runtime.metrics,
             #[cfg(test)]
             reader_override: None,
             properties: plan_properties(Arc::clone(&schema)),
@@ -1749,6 +1776,7 @@ fn hot_stream(
     let file_io = exec.file_io.clone();
     let schema = Arc::clone(&exec.schema);
     let memory = exec.memory.clone();
+    let memory_pool = Arc::clone(&exec.memory_pool);
     let telemetry = Arc::clone(&exec.telemetry);
     let query_class = exec.query_class;
     let metrics = Arc::clone(&exec.metrics);
@@ -1769,7 +1797,8 @@ fn hot_stream(
             let reader = IcebergParquetReader::new(
                 reader,
                 size,
-                memory.governor.oracle_budget(),
+                Arc::clone(&memory_pool),
+                memory.resources.governor(),
                 Arc::clone(&metrics),
                 Arc::clone(&telemetry),
                 query_class,
@@ -1791,15 +1820,14 @@ fn hot_stream(
                 let batch = decoded
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 let batch = project_batch(&batch, Arc::clone(&schema))?;
-                let decoded_reservation = memory
-                    .governor
-                    .oracle_budget()
-                    .try_reserve_classified(
-                        batch.get_array_memory_size(),
-                        MemoryPurpose::OracleHotDecodedBatch,
-                    )
+                let decoded_reservation = crate::resources::OracleQueryMemoryReservation::try_new(
+                    &memory_pool,
+                    memory.resources.governor(),
+                    "oracle-hot-decoded-batch",
+                    batch.get_array_memory_size(),
+                )
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let decoded_reservation = telemetry.account_oracle_memory(
+                let decoded_reservation = telemetry.account_query_memory(
                     decoded_reservation,
                     query_class,
                     OracleMemoryKind::Source,
@@ -2491,7 +2519,7 @@ mod tests {
         .expect("multi-row test batch matches its schema")
     }
 
-    /// Creates the production Oracle DataFusion pool with a deterministic test ceiling.
+    /// Creates the production Oracle `DataFusion` pool with a deterministic test ceiling.
     fn reconciliation_test_pool() -> (
         crate::scribe::memory::BifrostMemoryGovernor,
         Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
@@ -2524,6 +2552,13 @@ mod tests {
         let plan = ReconcileExec::new(
             source,
             OracleMemoryResources {
+                resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    [crate::resources::BifrostRole::Oracle],
+                )
+                .oracle()
+                .expect("composition must enable the Oracle capability"),
                 governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                     .map_err(|error| DataFusionError::External(Box::new(error)))?,
                 reconciliation_limit_bytes: 1024 * 1024,
@@ -2575,10 +2610,9 @@ mod tests {
                 Some(&1)
             );
             assert!(
-                snapshot
-                    .counters
-                    .get("bifrost_oracle_rows_deduplicated_total{losing_source=\"iceberg\"}")
-                    .is_none(),
+                !snapshot.counters.contains_key(
+                    "bifrost_oracle_rows_deduplicated_total{losing_source=\"iceberg\"}"
+                ),
                 "the highest-precedence Iceberg row must never be the loser"
             );
         }
@@ -2681,6 +2715,13 @@ mod tests {
         );
         let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
         let memory = OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
             governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("memory governor"),
             reconciliation_limit_bytes: 1024 * 1024,
@@ -2711,7 +2752,7 @@ mod tests {
 
         let rebuilt = reconciled
             .clone()
-            .with_new_children(vec![Arc::clone(&reconciled.children()[0])])
+            .with_new_children(vec![Arc::clone(reconciled.children()[0])])
             .expect("optimizer replacement rebuilds reconciliation");
         let rebuilt = rebuilt
             .as_any()
@@ -2773,13 +2814,163 @@ mod tests {
         )
     }
 
-    /// DataFusion external sort spills and yields the exact reference winners.
+    /// Drains a projected hot stream, checking each batch and sampling peaks.
+    ///
+    /// Every batch must carry exactly the projected single-column schema and
+    /// the fixture's values, and the pool and telemetry peaks are sampled once
+    /// per batch so the caller can prove the scan never exceeded its budget.
+    async fn drain_projected_int64_batches(
+        batches: &mut datafusion::execution::SendableRecordBatchStream,
+        projected: &Arc<Schema>,
+        observed: (&Arc<dyn MemoryPool>, &Arc<OracleTelemetry>),
+        peaks: (&Arc<AtomicU64>, &Arc<AtomicU64>),
+    ) -> usize {
+        let (query_pool, telemetry) = observed;
+        let (peak_pool, peak_telemetry) = peaks;
+        let mut rows = 0;
+        while let Some(batch) = batches.next().await {
+            let batch = batch.expect("bounded batch");
+            assert_eq!(&batch.schema(), projected);
+            assert_eq!(batch.num_columns(), 1);
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("projected values remain Int64");
+            assert_eq!(values.values().as_ref(), &[1, 2, 3]);
+            rows += batch.num_rows();
+            peak_pool.fetch_max(query_pool.reserved() as u64, Ordering::AcqRel);
+            peak_telemetry.fetch_max(
+                telemetry.memory_bytes.load(Ordering::Acquire),
+                Ordering::AcqRel,
+            );
+        }
+        rows
+    }
+
+    /// Builds a reader that slices the fixture and tallies every requested byte.
+    ///
+    /// The success and retry attempts of the causal-boundary proof read the
+    /// same fixture identically; sharing one constructor keeps their byte
+    /// accounting provably equal to the scanned-bytes counter under test.
+    fn counting_slice_reader(bytes: &bytes::Bytes, requested: &Arc<AtomicU64>) -> HotReadOverride {
+        let bytes = bytes.clone();
+        let requested = Arc::clone(requested);
+        Arc::new(move |_, range| {
+            requested.fetch_add(range.end - range.start, Ordering::AcqRel);
+            let bytes = bytes.clone();
+            Box::pin(async move {
+                Ok(bytes.slice(
+                    usize::try_from(range.start).expect("range start")
+                        ..usize::try_from(range.end).expect("range end"),
+                ))
+            })
+        })
+    }
+
+    /// Asserts the interactive scan counters match the reader's own tallies.
+    ///
+    /// Every hot attempt — successful, failed, abandoned, and retried — must
+    /// publish exactly one file and one partition observation, and the scanned
+    /// bytes must equal what the injected reader was actually asked for.
+    fn assert_interactive_scan_counters(
+        snapshot: &wyrd_bench::BenchmarkMetricSnapshot,
+        expected_bytes: u64,
+        expected_attempts: u64,
+    ) {
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_bytes_scanned_total{class=\"interactive\"}"),
+            Some(&expected_bytes)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_files_scanned_total{class=\"interactive\"}"),
+            Some(&expected_attempts)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_partitions_scanned_total{class=\"interactive\"}"),
+            Some(&expected_attempts)
+        );
+    }
+
+    /// Asserts a finished hot scan returned every governed byte it charged.
+    ///
+    /// A completed stream must leave the root governor, the query pool, and the
+    /// Oracle telemetry gauge all back at zero; a nonzero residue is a leaked
+    /// reservation rather than a measurement artifact.
+    fn assert_hot_scan_baselines(
+        governor: &crate::scribe::memory::BifrostMemoryGovernor,
+        query_pool: &Arc<dyn MemoryPool>,
+        telemetry: &OracleTelemetry,
+    ) {
+        assert_eq!(governor.snapshot().oracle_total_bytes, 0);
+        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
+        assert_eq!(query_pool.reserved(), 0);
+        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// Asserts one analytical query recorded nonzero spill bytes and files once.
+    ///
+    /// The spill counters are the operator-visible evidence that the query
+    /// actually reached disk under its own lease, so a successful spilling
+    /// query must publish positive bytes, positive files, and exactly one
+    /// successful spilling-query observation.
+    fn assert_analytical_spill_success_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
+        assert!(
+            snapshot
+                .counters
+                .get("oracle_query_spill_bytes_total{class=\"analytical\"}")
+                .is_some_and(|bytes| *bytes > 0)
+        );
+        assert!(
+            snapshot
+                .counters
+                .get("oracle_query_spill_files_total{class=\"analytical\"}")
+                .is_some_and(|files| *files > 0)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("oracle_query_spill_queries_total{class=\"analytical\",outcome=\"success\"}"),
+            Some(&1)
+        );
+    }
+
+    /// Composes one Oracle memory capability over the given governor.
+    ///
+    /// Every exec-level proof leases through the one production composition, so
+    /// this helper only injects a raw observation and pairs the issued Oracle
+    /// capability with the governor and reconciliation ceiling under test. It
+    /// derives no reserve, floor, elastic, or partition value itself.
+    fn oracle_memory_resources(
+        governor: crate::scribe::memory::BifrostMemoryGovernor,
+        reconciliation_limit_bytes: usize,
+    ) -> OracleMemoryResources {
+        OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
+            governor,
+            reconciliation_limit_bytes,
+        }
+    }
+
+    /// `DataFusion` external sort spills and yields the exact reference winners.
     #[tokio::test]
     async fn reconciliation_external_sort_spills_with_exact_winners() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let _guard = metrics::set_default_local_recorder(&recorder);
         const BATCHES: i32 = 200;
         const ROWS_PER_BATCH: i32 = 100;
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let identity = v7_style_id(5);
         let batches = (0..BATCHES)
             .rev()
@@ -2800,10 +2991,7 @@ mod tests {
         let (governor, pool) = reconciliation_test_pool();
         let plan = ReconcileExec::new(
             source,
-            OracleMemoryResources {
-                governor: governor.clone(),
-                reconciliation_limit_bytes: 1024 * 1024,
-            },
+            oracle_memory_resources(governor.clone(), 1024 * 1024),
         )
         .expect("reconciliation plan");
         let scratch_root = tempfile::tempdir().expect("scratch root");
@@ -2857,25 +3045,7 @@ mod tests {
         assert!(peak_memory.load(Ordering::Acquire) <= governor.oracle_limit_bytes());
         assert!(peak_disk.load(Ordering::Acquire) > 0);
         assert!(peak_disk.load(Ordering::Acquire) <= 16 << 20);
-        let snapshot = recorder.snapshot();
-        assert!(
-            snapshot
-                .counters
-                .get("oracle_query_spill_bytes_total{class=\"analytical\"}")
-                .is_some_and(|bytes| *bytes > 0)
-        );
-        assert!(
-            snapshot
-                .counters
-                .get("oracle_query_spill_files_total{class=\"analytical\"}")
-                .is_some_and(|files| *files > 0)
-        );
-        assert_eq!(
-            snapshot
-                .counters
-                .get("oracle_query_spill_queries_total{class=\"analytical\",outcome=\"success\"}"),
-            Some(&1)
-        );
+        assert_analytical_spill_success_counters(&recorder.snapshot());
         assert_eq!(session.runtime_env().memory_pool.reserved(), 0);
         drop(session);
         assert!(
@@ -2911,10 +3081,7 @@ mod tests {
         let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
         let plan = ReconcileExec::new_with_telemetry(
             source,
-            OracleMemoryResources {
-                governor: governor.clone(),
-                reconciliation_limit_bytes: 1024 * 1024,
-            },
+            oracle_memory_resources(governor.clone(), 1024 * 1024),
             Arc::clone(&telemetry),
             QueryClass::Analytical,
         )
@@ -2983,10 +3150,7 @@ mod tests {
         let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
         let plan = ReconcileExec::new_with_telemetry(
             source,
-            OracleMemoryResources {
-                governor: governor.clone(),
-                reconciliation_limit_bytes: 1024 * 1024,
-            },
+            oracle_memory_resources(governor.clone(), 1024 * 1024),
             Arc::clone(&telemetry),
             QueryClass::Analytical,
         )
@@ -3051,6 +3215,13 @@ mod tests {
         let plan = ReconcileExec::new(
             source,
             OracleMemoryResources {
+                resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    [crate::resources::BifrostRole::Oracle],
+                )
+                .oracle()
+                .expect("composition must enable the Oracle capability"),
                 governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                     .expect("test governor"),
                 reconciliation_limit_bytes: 1024 * 1024,
@@ -3094,6 +3265,13 @@ mod tests {
         let plan = ReconcileExec::new(
             source,
             OracleMemoryResources {
+                resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    [crate::resources::BifrostRole::Oracle],
+                )
+                .oracle()
+                .expect("composition must enable the Oracle capability"),
                 governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                     .expect("test governor"),
                 reconciliation_limit_bytes: 1024 * 1024,
@@ -3389,6 +3567,13 @@ mod tests {
         let size = usize::try_from(std::fs::metadata(&path).expect("hot metadata").len())
             .expect("hot size fits usize");
         let memory = OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
             governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("hot memory governor"),
             reconciliation_limit_bytes: 1024 * 1024,
@@ -3403,10 +3588,13 @@ mod tests {
                 }],
                 FileIO::new_with_fs(),
                 Arc::clone(&schema),
-                memory.clone(),
-                Arc::clone(&telemetry),
-                QueryClass::Interactive,
-                Arc::clone(&metrics),
+                HotParquetRuntime {
+                    memory: memory.clone(),
+                    memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+                    telemetry: Arc::clone(&telemetry),
+                    query_class: QueryClass::Interactive,
+                    metrics: Arc::clone(&metrics),
+                },
             );
             (exec, metrics)
         };
@@ -3526,19 +3714,29 @@ mod tests {
         governor: &crate::scribe::memory::BifrostMemoryGovernor,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
         short: bool,
-    ) -> IcebergParquetReader {
-        IcebergParquetReader::new(
+    ) -> (IcebergParquetReader, Arc<dyn MemoryPool>) {
+        let resources = crate::resources::BifrostRuntimeResources::composed_for_test(
+            768 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        )
+        .oracle()
+        .expect("composition must enable the Oracle capability");
+        let pool = crate::resources::bounded_memory_pool(governor.oracle_limit_bytes());
+        let reader = IcebergParquetReader::new(
             Box::new(RecordingRangeReader {
                 bytes: fixture.bytes.clone(),
                 ranges,
                 short,
             }),
             u64::try_from(fixture.bytes.len()).expect("fixture size fits u64"),
-            governor.oracle_budget(),
+            Arc::clone(&pool),
+            resources.governor(),
             Arc::new(OracleScanMetricsHandle::default()),
             Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
             QueryClass::Interactive,
-        )
+        );
+        (reader, pool)
     }
 
     /// Hot Parquet uses strict sub-file requests and never reserves the object size.
@@ -3548,7 +3746,8 @@ mod tests {
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let governor = crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
             .expect("hot range governor");
-        let reader = governed_fixture_reader(&fixture, &governor, Arc::clone(&ranges), false);
+        let (reader, pool) =
+            governed_fixture_reader(&fixture, &governor, Arc::clone(&ranges), false);
         let mut batches = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .expect("ranged metadata")
@@ -3566,6 +3765,7 @@ mod tests {
             range.start != 0
                 || range.end != u64::try_from(fixture.bytes.len()).expect("fixture size")
         }));
+        assert_eq!(pool.reserved(), 0);
         assert_eq!(governor.snapshot().oracle_total_bytes, 0);
     }
 
@@ -3585,13 +3785,12 @@ mod tests {
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&ranges);
         let source = fixture.bytes.clone();
-        let peak_oracle = Arc::new(AtomicU64::new(0));
-        let peak_parent = Arc::new(AtomicU64::new(0));
+        let peak_pool = Arc::new(AtomicU64::new(0));
         let peak_telemetry = Arc::new(AtomicU64::new(0));
-        let range_governor = governor.clone();
+        let query_pool = crate::resources::bounded_memory_pool(governor.oracle_limit_bytes());
+        let observed_pool = Arc::clone(&query_pool);
         let range_telemetry = Arc::clone(&telemetry);
-        let range_peak_oracle = Arc::clone(&peak_oracle);
-        let range_peak_parent = Arc::clone(&peak_parent);
+        let range_peak_pool = Arc::clone(&peak_pool);
         let range_peak_telemetry = Arc::clone(&peak_telemetry);
         let projected = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -3605,18 +3804,16 @@ mod tests {
             }],
             FileIO::new_with_fs(),
             Arc::clone(&projected),
-            OracleMemoryResources {
-                governor: governor.clone(),
-                reconciliation_limit_bytes: 1024,
+            HotParquetRuntime {
+                memory: oracle_memory_resources(governor.clone(), 1024),
+                memory_pool: Arc::clone(&query_pool),
+                telemetry: Arc::clone(&telemetry),
+                query_class: QueryClass::Interactive,
+                metrics: Arc::clone(&metrics),
             },
-            Arc::clone(&telemetry),
-            QueryClass::Interactive,
-            Arc::clone(&metrics),
         )
         .with_test_reader(Arc::new(move |_, range| {
-            let snapshot = range_governor.snapshot();
-            range_peak_oracle.fetch_max(snapshot.oracle_total_bytes as u64, Ordering::AcqRel);
-            range_peak_parent.fetch_max(snapshot.bifrost_total_bytes as u64, Ordering::AcqRel);
+            range_peak_pool.fetch_max(observed_pool.reserved() as u64, Ordering::AcqRel);
             range_peak_telemetry.fetch_max(
                 range_telemetry.memory_bytes.load(Ordering::Acquire),
                 Ordering::AcqRel,
@@ -3639,26 +3836,13 @@ mod tests {
                 datafusion::execution::context::SessionContext::new().task_ctx(),
             )
             .expect("production hot stream");
-        let mut rows = 0;
-        while let Some(batch) = batches.next().await {
-            let batch = batch.expect("bounded batch");
-            assert_eq!(batch.schema(), projected);
-            assert_eq!(batch.num_columns(), 1);
-            let values = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("projected values remain Int64");
-            assert_eq!(values.values().as_ref(), &[1, 2, 3]);
-            rows += batch.num_rows();
-            let snapshot = governor.snapshot();
-            peak_oracle.fetch_max(snapshot.oracle_total_bytes as u64, Ordering::AcqRel);
-            peak_parent.fetch_max(snapshot.bifrost_total_bytes as u64, Ordering::AcqRel);
-            peak_telemetry.fetch_max(
-                telemetry.memory_bytes.load(Ordering::Acquire),
-                Ordering::AcqRel,
-            );
-        }
+        let rows = drain_projected_int64_batches(
+            &mut batches,
+            &projected,
+            (&query_pool, &telemetry),
+            (&peak_pool, &peak_telemetry),
+        )
+        .await;
         assert_eq!(rows, 3);
         assert!(fixture.bytes.len() > budget);
         let ranges = ranges.lock().expect("recorded ranges");
@@ -3673,19 +3857,14 @@ mod tests {
             .expect("at least one range");
         assert!(max_range <= budget);
         assert_eq!(metrics.terminal_values(), (Some(physical), 1, 1));
-        let peak_oracle =
-            usize::try_from(peak_oracle.load(Ordering::Acquire)).expect("Oracle peak fits usize");
-        let peak_parent =
-            usize::try_from(peak_parent.load(Ordering::Acquire)).expect("parent peak fits usize");
+        let peak_pool =
+            usize::try_from(peak_pool.load(Ordering::Acquire)).expect("query peak fits usize");
         let peak_telemetry = usize::try_from(peak_telemetry.load(Ordering::Acquire))
             .expect("telemetry peak fits usize");
-        assert!(peak_oracle > 0 && peak_oracle <= budget);
-        assert!(peak_parent > 0 && peak_parent <= governor.bifrost_limit_bytes());
+        assert!(peak_pool > 0 && peak_pool <= budget);
         assert!(peak_telemetry > 0 && peak_telemetry <= budget);
         drop(ranges);
-        assert_eq!(governor.snapshot().oracle_total_bytes, 0);
-        assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
-        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
+        assert_hot_scan_baselines(&governor, &query_pool, &telemetry);
     }
 
     /// Footer metadata is fetched only through governed ranged IO.
@@ -3695,7 +3874,8 @@ mod tests {
         let governor = crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
             .expect("metadata governor");
         let ranges = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = governed_fixture_reader(&fixture, &governor, Arc::clone(&ranges), false);
+        let (mut reader, pool) =
+            governed_fixture_reader(&fixture, &governor, Arc::clone(&ranges), false);
         let metadata = reader.get_metadata(None).await.expect("governed metadata");
         assert_eq!(metadata.file_metadata().num_rows(), 3);
         let ranges = ranges.lock().expect("recorded ranges");
@@ -3705,6 +3885,7 @@ mod tests {
                 .iter()
                 .all(|range| range.end <= fixture.bytes.len() as u64)
         );
+        assert_eq!(pool.reserved(), 0);
         assert_eq!(governor.snapshot().oracle_total_bytes, 0);
     }
 
@@ -3714,17 +3895,17 @@ mod tests {
         let fixture = build_hot_causal_fixture();
         let governor = crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
             .expect("clone governor");
-        let mut reader =
+        let (mut reader, pool) =
             governed_fixture_reader(&fixture, &governor, Arc::new(Mutex::new(Vec::new())), false);
         let bytes = reader.get_bytes(0..16).await.expect("governed range");
         let clone = bytes.clone();
         let slice = clone.slice(4..12);
-        assert_eq!(governor.snapshot().oracle_total_bytes, 16);
+        assert_eq!(pool.reserved(), 16);
         drop(bytes);
         drop(clone);
-        assert_eq!(governor.snapshot().oracle_total_bytes, 16);
+        assert_eq!(pool.reserved(), 16);
         drop(slice);
-        assert_eq!(governor.snapshot().oracle_total_bytes, 0);
+        assert_eq!(pool.reserved(), 0);
     }
 
     /// A short storage result fails closed and releases its pre-IO reservation.
@@ -3733,7 +3914,7 @@ mod tests {
         let fixture = build_hot_causal_fixture();
         let governor = crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
             .expect("short-read governor");
-        let mut reader =
+        let (mut reader, pool) =
             governed_fixture_reader(&fixture, &governor, Arc::new(Mutex::new(Vec::new())), true);
         let error = reader
             .get_bytes(0..16)
@@ -3745,6 +3926,7 @@ mod tests {
                 .contains("requested 16 bytes, received 15")
         );
         assert_eq!(governor.snapshot().oracle_total_bytes, 0);
+        assert_eq!(pool.reserved(), 0);
     }
 
     /// An indivisible range above its ceiling is rejected before storage IO.
@@ -3758,26 +3940,20 @@ mod tests {
         )
         .expect("tiny Oracle child");
         let ranges = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = governed_fixture_reader(&fixture, &governor, Arc::clone(&ranges), false);
+        let (mut reader, pool) =
+            governed_fixture_reader(&fixture, &governor, Arc::clone(&ranges), false);
         let parquet_error = reader
             .get_bytes(0..9)
             .await
             .expect_err("oversized range fails");
         let error = DataFusionError::External(Box::new(parquet_error));
-        let rejection = MemoryRejection::from_source_chain(&error)
-            .expect("typed rejection survives Parquet and DataFusion source chain");
-        assert_eq!(rejection.kind(), MemoryRejectionKind::RequestTooLarge);
-        assert_eq!(rejection.purpose(), MemoryPurpose::OracleHotRange);
-        assert_eq!(rejection.ceiling(), MemoryCeiling::OracleChild);
-        assert_eq!(rejection.requested(), 9);
-        assert_eq!(rejection.current(), 0);
-        assert_eq!(rejection.limit(), 8);
         assert_eq!(
             crate::oracle::map_first_batch_failure(Some(&Err(error))),
-            Some(BifrostError::QueryMemoryRequestTooLarge)
+            Some(BifrostError::QueryAdmissionRejected)
         );
         assert!(ranges.lock().expect("recorded ranges").is_empty());
         assert_eq!(governor.snapshot().oracle_total_bytes, 0);
+        assert_eq!(pool.reserved(), 0);
     }
 
     /// Dropping after one production yield releases decoded and ranged ownership.
@@ -3790,6 +3966,7 @@ mod tests {
         let attempts = Arc::new(AtomicU64::new(0));
         let observed = Arc::clone(&attempts);
         let source = fixture.bytes.clone();
+        let query_pool = crate::resources::bounded_memory_pool(governor.oracle_limit_bytes());
         let exec = HotParquetExec::new(
             vec![HotFileSource {
                 location: fixture.path.to_string_lossy().into_owned(),
@@ -3797,13 +3974,13 @@ mod tests {
             }],
             FileIO::new_with_fs(),
             Arc::clone(&fixture.schema),
-            OracleMemoryResources {
-                governor: governor.clone(),
-                reconciliation_limit_bytes: 1024,
+            HotParquetRuntime {
+                memory: oracle_memory_resources(governor.clone(), 1024),
+                memory_pool: Arc::clone(&query_pool),
+                telemetry: Arc::clone(&telemetry),
+                query_class: QueryClass::Interactive,
+                metrics: Arc::new(OracleScanMetricsHandle::default()),
             },
-            Arc::clone(&telemetry),
-            QueryClass::Interactive,
-            Arc::new(OracleScanMetricsHandle::default()),
         )
         .with_test_reader(Arc::new(move |_, range| {
             observed.fetch_add(1, Ordering::AcqRel);
@@ -3827,14 +4004,14 @@ mod tests {
             .expect("first yielded frame")
             .expect("first yielded batch");
         assert_eq!(batch.num_rows(), 3);
-        let live = governor.snapshot();
-        assert!(live.oracle_total_bytes > 0);
-        assert!(live.bifrost_total_bytes > 0);
+        assert!(query_pool.reserved() > 0);
         assert!(telemetry.memory_bytes.load(Ordering::Acquire) > 0);
         let attempts_at_yield = attempts.load(Ordering::Acquire);
         drop(stream);
+        drop(batch);
         assert_eq!(governor.snapshot().oracle_total_bytes, 0);
         assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
+        assert_eq!(query_pool.reserved(), 0);
         assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
         assert_eq!(attempts.load(Ordering::Acquire), attempts_at_yield);
     }
@@ -3865,11 +4042,11 @@ mod tests {
     async fn hot_reader_boundary_records_causal_attempts_once() {
         let fixture = build_hot_causal_fixture();
         let requested = fixture.bytes.len();
-        let memory = OracleMemoryResources {
-            governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
+        let memory = oracle_memory_resources(
+            crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
                 .expect("hot causal governor"),
-            reconciliation_limit_bytes: 1024 * 1024,
-        };
+            1024 * 1024,
+        );
         let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -3883,29 +4060,21 @@ mod tests {
                 }],
                 FileIO::new_with_fs(),
                 Arc::clone(&fixture.schema),
-                memory.clone(),
-                Arc::clone(&telemetry),
-                QueryClass::Interactive,
-                Arc::clone(&metrics),
+                HotParquetRuntime {
+                    memory: memory.clone(),
+                    memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+                    telemetry: Arc::clone(&telemetry),
+                    query_class: QueryClass::Interactive,
+                    metrics: Arc::clone(&metrics),
+                },
             )
             .with_test_reader(reader);
             (exec, metrics)
         };
 
-        let success_bytes = fixture.bytes.clone();
-        let success_requested = Arc::clone(&requested_bytes);
         let (success, _) = make_exec(
             requested,
-            Arc::new(move |_, range| {
-                success_requested.fetch_add(range.end - range.start, Ordering::AcqRel);
-                let success_bytes = success_bytes.clone();
-                Box::pin(async move {
-                    Ok(success_bytes.slice(
-                        usize::try_from(range.start).expect("range start")
-                            ..usize::try_from(range.end).expect("range end"),
-                    ))
-                })
-            }),
+            counting_slice_reader(&fixture.bytes, &requested_bytes),
         );
         drain_hot_terminal(&telemetry, success).await;
 
@@ -3949,42 +4118,16 @@ mod tests {
         );
         drop(pending_stream);
 
-        let retry_bytes = fixture.bytes.clone();
-        let retry_requested = Arc::clone(&requested_bytes);
         let (retry, _) = make_exec(
             requested,
-            Arc::new(move |_, range| {
-                retry_requested.fetch_add(range.end - range.start, Ordering::AcqRel);
-                let retry_bytes = retry_bytes.clone();
-                Box::pin(async move {
-                    Ok(retry_bytes.slice(
-                        usize::try_from(range.start).expect("range start")
-                            ..usize::try_from(range.end).expect("range end"),
-                    ))
-                })
-            }),
+            counting_slice_reader(&fixture.bytes, &requested_bytes),
         );
         drain_hot_terminal(&telemetry, retry).await;
 
-        let snapshot = recorder.snapshot();
-        let expected_bytes = requested_bytes.load(Ordering::Acquire);
-        assert_eq!(
-            snapshot
-                .counters
-                .get("oracle_query_bytes_scanned_total{class=\"interactive\"}"),
-            Some(&expected_bytes)
-        );
-        assert_eq!(
-            snapshot
-                .counters
-                .get("oracle_query_files_scanned_total{class=\"interactive\"}"),
-            Some(&4)
-        );
-        assert_eq!(
-            snapshot
-                .counters
-                .get("oracle_query_partitions_scanned_total{class=\"interactive\"}"),
-            Some(&4)
+        assert_interactive_scan_counters(
+            &recorder.snapshot(),
+            requested_bytes.load(Ordering::Acquire),
+            4,
         );
     }
 }

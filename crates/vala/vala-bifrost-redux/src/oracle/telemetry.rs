@@ -76,13 +76,15 @@ pub(crate) enum OracleAdmissionReason {
     Spill,
     /// Audit WAL could not accept the decision.
     AuditUnavailable,
+    /// No live local Oracle membership may accept new work.
+    Membership,
     /// Oracle shutdown closed admission.
     Shutdown,
 }
 
 impl OracleAdmissionReason {
     /// Every wire value used by contract tests and dashboards.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::ClassCapacity,
         Self::TenantBudget,
         Self::QueueFull,
@@ -90,6 +92,7 @@ impl OracleAdmissionReason {
         Self::Memory,
         Self::Spill,
         Self::AuditUnavailable,
+        Self::Membership,
         Self::Shutdown,
     ];
     /// Return the canonical label value.
@@ -102,6 +105,7 @@ impl OracleAdmissionReason {
             Self::Memory => "memory",
             Self::Spill => "spill",
             Self::AuditUnavailable => "audit_unavailable",
+            Self::Membership => "membership",
             Self::Shutdown => "shutdown",
         }
     }

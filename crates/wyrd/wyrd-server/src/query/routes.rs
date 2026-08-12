@@ -12,6 +12,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use vala_bifrost_redux::oracle::OracleQueryStream;
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_tonic::frame_codec::FrameEncoder;
@@ -23,6 +24,53 @@ use crate::state::AppState;
 
 /// Content type of the length-delimited Bifrost query frame stream.
 const QUERY_STREAM_CONTENT_TYPE: &str = "application/vnd.wyrd.bifrost-query-stream";
+
+/// Closed failure classification for the shared HTTP query body boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryBodyFailure {
+    /// Oracle could not produce the next logical frame.
+    OracleStream,
+    /// The logical frame could not be encoded for the HTTP body.
+    FrameEncoding,
+}
+
+impl QueryBodyFailure {
+    /// Returns the static diagnostic value emitted without request data.
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::OracleStream => "oracle_stream",
+            Self::FrameEncoding => "frame_encoding",
+        }
+    }
+}
+
+/// Logs one scrubbed body-boundary failure and retains its cause for Axum.
+///
+/// The tracing event accepts only the closed static failure classification.
+/// Dynamic error text is carried solely by the returned [`io::Error`], so SQL,
+/// payload, credential, caller, and tenant data cannot become event fields.
+fn query_body_error(failure: QueryBodyFailure, error: impl std::fmt::Display) -> io::Error {
+    tracing::error!(
+        failure = failure.diagnostic(),
+        "Oracle HTTP response body failed"
+    );
+    io::Error::other(error.to_string())
+}
+
+/// Encodes one production Oracle frame through the shared HTTP body boundary.
+///
+/// # Errors
+///
+/// Returns an IO error when Oracle frame production or protobuf encoding
+/// fails. Both production and fault-injected transports call this function.
+fn encode_query_frame(
+    frame: Result<wyrd_spec::vala::api::QueryStreamFrame, BifrostError>,
+) -> Result<Bytes, io::Error> {
+    let frame = frame.map_err(|error| query_body_error(QueryBodyFailure::OracleStream, error))?;
+    FrameEncoder::encode(&wyrd_tonic::wyrd::v1::QueryStreamFrame::from(frame))
+        .map(Bytes::from)
+        .map_err(|error| query_body_error(QueryBodyFailure::FrameEncoding, error))
+}
 
 /// Standalone query router for the `/v1` group.
 pub fn router() -> Router<AppState> {
@@ -136,14 +184,7 @@ fn query_stream_response_with_fault(
             Some(query) => query.frames.next().await,
             None => None,
         } {
-            let frame = match frame {
-                Ok(frame) => FrameEncoder::encode(
-                    &wyrd_tonic::wyrd::v1::QueryStreamFrame::from(frame),
-                )
-                .map(Bytes::from)
-                .map_err(|error| io::Error::other(error.to_string())),
-                Err(error) => Err(io::Error::other(error.to_string())),
-            };
+            let frame = encode_query_frame(frame);
             yield frame;
             emitted = emitted.saturating_add(1);
             match fault {
@@ -195,14 +236,7 @@ fn query_stream_response_with_fault(
     let mut frames = result.frames;
     let body = Body::from_stream(async_stream::stream! {
         while let Some(frame) = frames.next().await {
-            let frame = match frame {
-                Ok(frame) => FrameEncoder::encode(
-                    &wyrd_tonic::wyrd::v1::QueryStreamFrame::from(frame),
-                )
-                .map(Bytes::from)
-                .map_err(|error| io::Error::other(error.to_string())),
-                Err(error) => Err(io::Error::other(error.to_string())),
-            };
+            let frame = encode_query_frame(frame);
             yield frame;
         }
     });
@@ -253,6 +287,33 @@ mod tests {
     use wyrd_tonic::frame_codec::FrameDecoder;
 
     use super::*;
+
+    /// Proves both route configurations share one scrubbed failure boundary.
+    #[tokio::test]
+    async fn query_body_failures_use_shared_scrubbed_boundary() {
+        assert_eq!(
+            QueryBodyFailure::OracleStream.diagnostic(),
+            "oracle_stream"
+        );
+        assert_eq!(
+            QueryBodyFailure::FrameEncoding.diagnostic(),
+            "frame_encoding"
+        );
+        let secret = "SELECT secret FROM tenant_private";
+        let error = query_body_error(QueryBodyFailure::OracleStream, secret);
+        assert_eq!(error.to_string(), secret);
+        assert!(!QueryBodyFailure::OracleStream.diagnostic().contains(secret));
+
+        let frames = futures_util::stream::iter([Err(
+            wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+        )]);
+        let response = query_stream_response(OracleQueryStream::test_new(
+            "abcd".to_owned(),
+            Box::pin(frames),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        assert!(response.into_body().collect().await.is_err());
+    }
 
     /// Builds the required complete source set for a published-only terminal.
     fn complete_sources() -> Vec<SourceCompletion> {

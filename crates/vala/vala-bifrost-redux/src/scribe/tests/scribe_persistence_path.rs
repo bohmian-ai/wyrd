@@ -46,7 +46,7 @@ fn batch(day: NaiveDate) -> RecordBatch {
             Arc::new(Int64Array::from(vec![42])),
         ],
     )
-    .expect("task 15 batch")
+    .expect("scribe persistence batch")
 }
 
 /// Build the tenant principal used by public-shaped append cases.
@@ -64,7 +64,7 @@ fn principal(tenant: DataTenantId) -> Principal {
 /// Production shards expose exact projections and WAL bounds to tail readers.
 async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let tenant = DataTenantId::new_v7();
-    let table = TableRef::new(BifrostNamespace::Bifrost, "task15_tail");
+    let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_tail");
     let day = NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day");
     let rows = batch(day);
     let batch_id = Uuid::now_v7();
@@ -147,8 +147,8 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
 /// Oracle hot snapshots retain Arrow identity and isolate event days.
 async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     let tenant = DataTenantId::new_v7();
-    let pointer_table = TableRef::new(BifrostNamespace::Bifrost, "task16_pointer_identity");
-    let day_table = TableRef::new(BifrostNamespace::Bifrost, "task16_day_isolation");
+    let pointer_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_pointer_identity");
+    let day_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_day_isolation");
     let day_one = NaiveDate::from_ymd_opt(2026, 7, 24).expect("day one");
     let day_two = NaiveDate::from_ymd_opt(2026, 7, 25).expect("day two");
     let source = batch(day_one);
@@ -354,7 +354,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
     writer.trip_disk_full_for_test();
     let seal_key = SealKey::new(
         DataTenantId::new_v7(),
-        TableRef::new(BifrostNamespace::Bifrost, "task15_wal_failure"),
+        TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure"),
         EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
     );
 
@@ -369,7 +369,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
 /// A shard WAL failure reaches the caller's durable completion boundary.
 async fn shard_wal_failure_reaches_the_durable_completion() {
     let tenant = DataTenantId::new_v7();
-    let table = TableRef::new(BifrostNamespace::Bifrost, "task15_wal_failure");
+    let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure");
     let day = NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day");
     let temp_dir = TempDir::new().expect("WAL temp dir");
     let operator = Arc::new(

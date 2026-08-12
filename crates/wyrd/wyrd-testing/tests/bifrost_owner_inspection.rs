@@ -1,4 +1,4 @@
-//! Task-15 fixed-topology and ownership inspection.
+//! Bifrost fixed-topology and ownership inspection.
 
 use std::sync::Arc;
 
@@ -144,7 +144,8 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
         .collect::<Vec<_>>();
 
     let concentrated_tenant = tenants[0];
-    let concentrated_table = TableRef::new(BifrostNamespace::Bifrost, "task15_concentrated_0");
+    let concentrated_table =
+        TableRef::new(BifrostNamespace::Bifrost, "bifrost_owner_concentrated_0");
     // A fixed batch id models a client retrying one logical batch. Every attempt
     // must route to the same shard lane so the lane's dedup state absorbs it.
     let shared_batch = Uuid::now_v7();
@@ -212,13 +213,13 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
         .inspection_snapshots()
         .expect("concentrated inspection snapshot")
         .remove(0);
+    let concentrated_lane_count = concentrated_snapshot
+        .memory_by_shard
+        .iter()
+        .filter(|bytes| **bytes > 0)
+        .count();
     assert!(
-        concentrated_snapshot
-            .memory_by_shard
-            .iter()
-            .filter(|bytes| **bytes > 0)
-            .count()
-            > 1,
+        concentrated_lane_count > 1,
         "distinct batch ids must spread the hot table across more than one lane"
     );
 
@@ -227,7 +228,7 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
     for index in 1..400_usize {
         let table = TableRef::new(
             BifrostNamespace::Bifrost,
-            format!("task15_concentrated_{index}"),
+            format!("bifrost_owner_concentrated_{index}"),
         );
         scribe
             .append_durable(ScribeAppend {
@@ -250,7 +251,7 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
         let table = table_for_shard(
             tenants[tenant_index],
             target_shard,
-            "task15_dispersed",
+            "bifrost_owner_dispersed",
             &mut candidate,
         );
         scribe
@@ -275,8 +276,9 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
     assert_eq!(snapshot.shard_channel_count, 16);
     assert!(snapshot.memory_by_shard.iter().all(|bytes| *bytes > 0));
     assert!(snapshot.open_wal_stream_count <= 16);
-    assert_eq!(snapshot.writable_bucket_count, 1_000);
-    assert_eq!(snapshot.memory_by_bucket.len(), 1_000);
+    let expected_bucket_count = 999 + concentrated_lane_count;
+    assert_eq!(snapshot.writable_bucket_count, expected_bucket_count);
+    assert_eq!(snapshot.memory_by_bucket.len(), expected_bucket_count);
     assert_eq!(
         snapshot.memory_by_shard.iter().copied().sum::<usize>(),
         snapshot.total_accounted_memory

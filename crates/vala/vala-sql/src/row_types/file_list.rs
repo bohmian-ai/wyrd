@@ -26,6 +26,8 @@ pub struct HotFileRow {
     pub compacted: bool,
     /// Iceberg snapshot that contains this file, when published.
     pub committed_snapshot_id: Option<i64>,
+    /// Stable Forge operation that prepared and published this input.
+    pub publication_operation_id: Option<Uuid>,
     /// Producing Scribe node.
     pub node_id: Uuid,
     /// Producing writer epoch.

@@ -12,9 +12,9 @@ use axum::routing::post;
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use vala_bifrost_redux::oracle::OracleQueryStream;
-use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameEncoder;
 
 use crate::components::auth::Caller;
@@ -291,10 +291,7 @@ mod tests {
     /// Proves both route configurations share one scrubbed failure boundary.
     #[tokio::test]
     async fn query_body_failures_use_shared_scrubbed_boundary() {
-        assert_eq!(
-            QueryBodyFailure::OracleStream.diagnostic(),
-            "oracle_stream"
-        );
+        assert_eq!(QueryBodyFailure::OracleStream.diagnostic(), "oracle_stream");
         assert_eq!(
             QueryBodyFailure::FrameEncoding.diagnostic(),
             "frame_encoding"

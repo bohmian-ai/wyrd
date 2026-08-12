@@ -1,8 +1,8 @@
 //! `DataFusion` physical sources and invariant operators owned by Oracle.
 //!
-//! Every table enters `DataFusion` through one complete tagged source union.
-//! Tenant validation surrounds that union before exact identity reconciliation,
-//! so a foreign row cannot influence a filter, join, aggregate, or limit.
+//! Every table enters `DataFusion` through one disjoint source union. Tenant
+//! validation surrounds that union so a foreign row cannot influence a filter,
+//! join, aggregate, or limit.
 
 use std::any::Any;
 use std::fmt;
@@ -15,13 +15,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::task::{Context, Poll};
-use std::time::Instant;
 
-use arrow::array::{Array, UInt8Array};
+use arrow::array::Array;
 use arrow::compute::cast;
-use arrow::compute::kernels::sort::SortOptions;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+#[cfg(test)]
+use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -33,19 +32,18 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
 };
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    RecordBatchStream, SendableRecordBatchStream, execute_stream,
+    SendableRecordBatchStream,
 };
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -67,8 +65,7 @@ use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use super::{
     AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryKind,
-    OracleMemoryResources, OracleTelemetry, ReconcileError, RowIdentity, SourceTier,
-    VerifiedSecurityContext, query_class_label,
+    OracleMemoryResources, OracleTelemetry, VerifiedSecurityContext,
 };
 
 /// Shared physical scan state retained by one executing source plan.
@@ -446,144 +443,8 @@ impl ExecutionPlan for OracleIcebergScanExec {
     }
 }
 
-/// Hidden physical column carrying Oracle's closed source precedence.
-const SOURCE_TIER_COLUMN: &str = "__wyrd_oracle_source_tier";
 /// Record-batch target used while decoding one bounded hot Parquet file.
 const HOT_BATCH_ROWS: usize = 8_192;
-
-/// Poll-enclosing lifecycle for one Oracle source or reconciliation stream.
-struct OracleStreamLifecycle<S> {
-    /// Stream whose entire poll is enclosed by the exact production span.
-    inner: Pin<Box<S>>,
-    /// Schema forwarded through the `RecordBatchStream` contract.
-    schema: SchemaRef,
-    /// Exact span entered before every child poll.
-    span: tracing::Span,
-    /// Optional closed source label for source-operation telemetry.
-    source: Option<&'static str>,
-    /// Optional reconciliation sort and class used for actual terminal spill evidence.
-    reconcile_sort: Option<(Arc<SortExec>, QueryClass)>,
-    /// Monotonic start covering pending time and every poll.
-    started: Instant,
-    /// Whether a terminal outcome was already emitted.
-    finished: bool,
-}
-
-impl<S> OracleStreamLifecycle<S> {
-    /// Wrap one stream before its first poll.
-    fn new(
-        stream: S,
-        schema: SchemaRef,
-        span: tracing::Span,
-        source: Option<&'static str>,
-    ) -> Self {
-        Self {
-            inner: Box::pin(stream),
-            schema,
-            span,
-            source,
-            reconcile_sort: None,
-            started: Instant::now(),
-            finished: false,
-        }
-    }
-
-    /// Wraps the reducer and retains its exact `SortExec` metric owner.
-    fn new_reconciliation(
-        stream: S,
-        schema: SchemaRef,
-        span: tracing::Span,
-        sort: Arc<SortExec>,
-        query_class: QueryClass,
-    ) -> Self {
-        Self {
-            inner: Box::pin(stream),
-            schema,
-            span,
-            source: None,
-            reconcile_sort: Some((sort, query_class)),
-            started: Instant::now(),
-            finished: false,
-        }
-    }
-
-    /// Emit one exact terminal outcome and disarm cancellation-on-drop.
-    fn finish(&mut self, outcome: &'static str) {
-        if self.finished {
-            return;
-        }
-        self.span.record("outcome", outcome);
-        if let Some(source) = self.source {
-            metrics::histogram!("bifrost_oracle_source_operation_seconds", "source" => source, "outcome" => outcome)
-                .record(self.started.elapsed().as_secs_f64());
-        }
-        if let Some((sort, query_class)) = &self.reconcile_sort {
-            let sort_metrics = sort.metrics().unwrap_or_default();
-            let class = query_class_label(*query_class);
-            let query_outcome = if outcome == "failed" {
-                "error"
-            } else {
-                outcome
-            };
-            let spilled_bytes =
-                u64::try_from(sort_metrics.spilled_bytes().unwrap_or_default()).unwrap_or(u64::MAX);
-            let spill_count =
-                u64::try_from(sort_metrics.spill_count().unwrap_or_default()).unwrap_or(u64::MAX);
-            metrics::counter!("oracle_query_spill_bytes_total", "class" => class)
-                .increment(spilled_bytes);
-            metrics::counter!(
-                "oracle_query_spill_files_total",
-                "class" => class
-            )
-            .increment(spill_count);
-            metrics::counter!(
-                "oracle_query_spill_queries_total",
-                "class" => class,
-                "outcome" => query_outcome
-            )
-            .increment(1);
-        }
-        self.finished = true;
-    }
-}
-
-impl<S> Stream for OracleStreamLifecycle<S>
-where
-    S: Stream<Item = DataFusionResult<RecordBatch>>,
-{
-    type Item = DataFusionResult<RecordBatch>;
-
-    /// Poll the complete child operation inside its exact production span.
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let span = self.span.clone();
-        let polled = span.in_scope(|| self.inner.as_mut().poll_next(context));
-        match &polled {
-            Poll::Ready(Some(Err(_))) => self.finish("failed"),
-            Poll::Ready(None) => self.finish("success"),
-            Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
-        }
-        polled
-    }
-}
-
-impl<S> RecordBatchStream for OracleStreamLifecycle<S>
-where
-    S: Stream<Item = DataFusionResult<RecordBatch>> + Send,
-{
-    /// Forward the child stream schema unchanged.
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-}
-
-impl<S> Drop for OracleStreamLifecycle<S> {
-    /// Record cancellation when the consumer drops before exhaustion or error.
-    fn drop(&mut self) {
-        if !self.finished {
-            self.finish("cancelled");
-        }
-    }
-}
 
 /// One validated immutable hot-file source selected by the pinned cut.
 #[derive(Debug, Clone)]
@@ -773,7 +634,7 @@ impl TableProvider for OracleTableProvider {
     }
 
     /// Reports no pushed filters because Oracle applies complete SQL semantics
-    /// above its tenant-tripwired and reconciled table result.
+    /// above its tenant-tripwired disjoint source union.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -784,7 +645,7 @@ impl TableProvider for OracleTableProvider {
         ])
     }
 
-    /// Builds the exact `Iceberg + hot + live -> tripwire -> reconcile` source.
+    /// Builds the exact `Iceberg + hot + live -> tripwire` disjoint source.
     ///
     /// Row IO remains lazy in returned execution plans. Iceberg and hot Parquet
     /// bytes are first accessed only when `DataFusion` executes the already
@@ -805,17 +666,11 @@ impl TableProvider for OracleTableProvider {
         if let Some(batches) = &self.distributed_iceberg_batches {
             let published =
                 Self::validated_memory_source(batches, Arc::clone(&self.physical_schema))?;
-            inputs.push(Arc::new(SourceTagExec::new(
-                published,
-                SourceTier::Iceberg,
-            )?));
+            inputs.push(published);
         } else {
             let published = self.iceberg.scan(state, None, &[], None).await?;
             let published = Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
-            inputs.push(Arc::new(SourceTagExec::new(
-                published,
-                SourceTier::Iceberg,
-            )?));
+            inputs.push(published);
         }
         if !self.hot_files.is_empty() {
             let hot = Arc::new(HotParquetExec::new(
@@ -830,21 +685,21 @@ impl TableProvider for OracleTableProvider {
                     metrics: Arc::new(OracleScanMetricsHandle::default()),
                 },
             ));
-            inputs.push(Arc::new(SourceTagExec::new(hot, SourceTier::HotSealed)?));
+            inputs.push(hot);
         }
         if !self.distributed_hot_batches.is_empty() {
             let hot = Self::validated_memory_source(
                 &self.distributed_hot_batches,
                 Arc::clone(&self.physical_schema),
             )?;
-            inputs.push(Arc::new(SourceTagExec::new(hot, SourceTier::HotSealed)?));
+            inputs.push(hot);
         }
         if !self.live_batches.is_empty() {
             let live = Self::validated_memory_source(
                 &self.live_batches,
                 Arc::clone(&self.physical_schema),
             )?;
-            inputs.push(Arc::new(SourceTagExec::new(live, SourceTier::Live)?));
+            inputs.push(live);
         }
         let union = UnionExec::try_new(inputs)?;
         let tripwire = Arc::new(TenantTripwireExec::new(
@@ -853,124 +708,7 @@ impl TableProvider for OracleTableProvider {
             self.table.clone(),
             Arc::clone(&self.audit),
         )?);
-        let reconciled = Arc::new(ReconcileExec::new_with_telemetry(
-            tripwire,
-            self.memory.clone(),
-            Arc::clone(&self.telemetry),
-            self.query_class,
-        )?);
-        project_plan(reconciled, projection)
-    }
-}
-
-/// Adds the closed physical source tier to every batch from one source.
-#[derive(Debug)]
-struct SourceTagExec {
-    /// Source plan receiving the hidden tag column.
-    input: Arc<dyn ExecutionPlan>,
-    /// Constant source tier for every yielded row.
-    tier: SourceTier,
-    /// Cached tagged output properties.
-    properties: Arc<PlanProperties>,
-}
-
-impl SourceTagExec {
-    /// Creates a source tagger over one schema-compatible source.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` error when the hidden tag field cannot be appended.
-    fn new(input: Arc<dyn ExecutionPlan>, tier: SourceTier) -> DataFusionResult<Self> {
-        let schema = schema_with_source(input.schema().as_ref())?;
-        let partition_count = input.output_partitioning().partition_count();
-        Ok(Self {
-            input,
-            tier,
-            properties: plan_properties_with_partitions(schema, partition_count),
-        })
-    }
-}
-
-impl DisplayAs for SourceTagExec {
-    /// Renders the closed source tier without paths or tenant identifiers.
-    fn fmt_as(
-        &self,
-        _format: DisplayFormatType,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        write!(formatter, "SourceTagExec tier={:?}", self.tier)
-    }
-}
-
-impl ExecutionPlan for SourceTagExec {
-    /// Returns the stable physical operator name.
-    fn name(&self) -> &'static str {
-        "SourceTagExec"
-    }
-
-    /// Exposes this concrete physical node for downcasts.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Returns cached bounded plan properties.
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    /// Returns the single tagged child.
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    /// Rebuilds the tagger around exactly one replacement child.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` planning error unless exactly one child is supplied.
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let [input] = children
-            .try_into()
-            .map_err(|_| DataFusionError::Plan("SourceTagExec requires one child".to_owned()))?;
-        Ok(Arc::new(Self::new(input, self.tier)?))
-    }
-
-    /// Appends one constant source tag array to each incoming batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` execution error for an invalid partition, child
-    /// stream failure, or Arrow batch construction failure.
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, context)?;
-        let schema = self.schema();
-        let tier = self.tier.as_u8();
-        let source = self.tier.label();
-        let stream = input.map(move |batch| {
-            let batch = batch?;
-            let mut columns = batch.columns().to_vec();
-            columns.push(Arc::new(UInt8Array::from_value(tier, batch.num_rows())));
-            RecordBatch::try_new(Arc::clone(&schema), columns).map_err(DataFusionError::from)
-        });
-        let output_schema = self.schema();
-        let span = tracing::info_span!(
-            "bifrost.oracle.source",
-            source,
-            outcome = tracing::field::Empty
-        );
-        Ok(Box::pin(OracleStreamLifecycle::new(
-            stream,
-            output_schema,
-            span,
-            Some(source),
-        )))
+        project_plan(tripwire, projection)
     }
 }
 
@@ -1129,292 +867,6 @@ impl ExecutionPlan for TenantTripwireExec {
             }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-}
-
-/// Exact identity reconciliation after tenant validation and before SQL operators.
-#[derive(Debug)]
-pub struct ReconcileExec {
-    /// Identity-sorted, tenant-validated, source-tagged input.
-    input: Arc<dyn ExecutionPlan>,
-    /// Concrete sort owner retained for terminal spill metrics.
-    sort: Arc<SortExec>,
-    /// Parent governor and configured reconciliation ceiling.
-    memory: OracleMemoryResources,
-    /// Production telemetry and class when constructed by the retained Oracle.
-    telemetry: Option<(Arc<OracleTelemetry>, QueryClass)>,
-    /// Output properties after source bookkeeping is stripped.
-    properties: Arc<PlanProperties>,
-}
-
-impl ReconcileExec {
-    /// Creates the reconciliation operator over one validated table union.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error when source bookkeeping is absent.
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        memory: OracleMemoryResources,
-    ) -> DataFusionResult<Self> {
-        Self::new_inner(input, memory, None)
-    }
-
-    /// Creates production reconciliation with class-aware memory accounting.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error when source bookkeeping is absent.
-    fn new_with_telemetry(
-        input: Arc<dyn ExecutionPlan>,
-        memory: OracleMemoryResources,
-        telemetry: Arc<OracleTelemetry>,
-        query_class: QueryClass,
-    ) -> DataFusionResult<Self> {
-        Self::new_inner(input, memory, Some((telemetry, query_class)))
-    }
-
-    /// Builds the common reconciliation plan shape with optional accounting.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error when source bookkeeping is absent.
-    fn new_inner(
-        input: Arc<dyn ExecutionPlan>,
-        memory: OracleMemoryResources,
-        telemetry: Option<(Arc<OracleTelemetry>, QueryClass)>,
-    ) -> DataFusionResult<Self> {
-        let schema = schema_without(&input.schema(), SOURCE_TIER_COLUMN)?;
-        let ordering = identity_ordering(input.schema().as_ref())?;
-        let sort = Arc::new(SortExec::new(ordering, input));
-        Ok(Self {
-            input: sort.clone(),
-            sort,
-            memory,
-            telemetry,
-            properties: plan_properties(schema),
-        })
-    }
-}
-
-/// Builds the mandatory ascending physical ordering for exact row identity.
-///
-/// Column indices are resolved by managed-column name so projections or schema
-/// evolution cannot silently sort on the wrong physical positions.
-///
-/// # Errors
-///
-/// Returns the existing invalid-identity source when either managed identity
-/// column is absent, or a plan error if the non-empty ordering cannot be built.
-fn identity_ordering(schema: &Schema) -> DataFusionResult<LexOrdering> {
-    let batch_index = schema
-        .index_of("wyrd_batch_id")
-        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    let ordinal_index = schema
-        .index_of("wyrd_row_ordinal")
-        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    LexOrdering::new(vec![
-        PhysicalSortExpr::new(
-            Arc::new(Column::new("wyrd_batch_id", batch_index)),
-            SortOptions {
-                descending: false,
-                nulls_first: false,
-            },
-        ),
-        PhysicalSortExpr::new(
-            Arc::new(Column::new("wyrd_row_ordinal", ordinal_index)),
-            SortOptions {
-                descending: false,
-                nulls_first: false,
-            },
-        ),
-    ])
-    .ok_or_else(|| DataFusionError::Plan("Oracle identity ordering cannot be empty".to_owned()))
-}
-
-impl DisplayAs for ReconcileExec {
-    /// Renders the bounded exact-identity operator.
-    fn fmt_as(
-        &self,
-        _format: DisplayFormatType,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        write!(formatter, "ReconcileExec")
-    }
-}
-
-impl ExecutionPlan for ReconcileExec {
-    /// Returns the stable physical operator name.
-    fn name(&self) -> &'static str {
-        "ReconcileExec"
-    }
-
-    /// Exposes this concrete reconciliation node for downcasts.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Returns cached bounded plan properties.
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    /// Returns the identity sort as the sole child.
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    /// Rebuilds reconciliation and its identity sort around one replacement child.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error unless exactly one child is supplied.
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let [replacement] = children
-            .try_into()
-            .map_err(|_| DataFusionError::Plan("ReconcileExec requires one child".to_owned()))?;
-        let input = replacement
-            .as_any()
-            .downcast_ref::<SortExec>()
-            .map_or_else(|| Arc::clone(&replacement), |sort| Arc::clone(sort.input()));
-        Ok(Arc::new(Self::new_inner(
-            input,
-            self.memory.clone(),
-            self.telemetry.clone(),
-        )?))
-    }
-
-    /// Reduces consecutive sorted identities while retaining one winner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` execution error for invalid identities, unequal
-    /// duplicates, or a sorted-source failure.
-    fn execute(
-        &self,
-        partition: usize,
-        task: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "ReconcileExec has no partition {partition}"
-            )));
-        }
-        let mut input = execute_stream(Arc::clone(&self.input), task)?;
-        let schema = self.schema();
-        let reconcile_span = tracing::info_span!(
-            "bifrost.oracle.reconcile",
-            operator = "exact_identity",
-            outcome = tracing::field::Empty
-        );
-        let stream = async_stream::try_stream! {
-            let mut current: Option<CurrentIdentityWinner> = None;
-            while let Some(batch) = input.next().await {
-                let batch = batch?;
-                for row in 0..batch.num_rows() {
-                    let candidate = CurrentIdentityWinner::begin(&batch, row)?;
-                    match current.as_mut() {
-                        Some(winner) if winner.identity == candidate.identity => {
-                            winner.reconcile(candidate)?;
-                        }
-                        Some(_) => {
-                            let prior = current.take().expect("current winner exists in matched branch");
-                            yield prior.finish()?;
-                            current = Some(candidate);
-                        }
-                        None => {
-                            current = Some(candidate);
-                        }
-                    }
-                }
-            }
-            if let Some(winner) = current {
-                yield winner.finish()?;
-            }
-        };
-        let query_class = self
-            .telemetry
-            .as_ref()
-            .map_or(QueryClass::Analytical, |(_, query_class)| *query_class);
-        Ok(Box::pin(OracleStreamLifecycle::new_reconciliation(
-            stream,
-            schema,
-            reconcile_span,
-            Arc::clone(&self.sort),
-            query_class,
-        )))
-    }
-}
-
-/// One retained winner for the current sorted identity.
-struct CurrentIdentityWinner {
-    /// Immutable identity shared by consecutive sorted duplicates.
-    identity: RowIdentity,
-    /// Winning source tier.
-    tier: SourceTier,
-    /// Shallow one-row batch retaining the source arrays.
-    row: RecordBatch,
-}
-
-impl CurrentIdentityWinner {
-    /// Validates and retains one row as the first winner for its identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns the existing invalid-identity error for absent, null, malformed,
-    /// negative, or unknown managed identity/source values.
-    fn begin(batch: &RecordBatch, row: usize) -> DataFusionResult<Self> {
-        let (identity, tier) = row_identity_and_tier(batch, row)?;
-        Ok(Self {
-            identity,
-            tier,
-            row: batch.slice(row, 1),
-        })
-    }
-
-    /// Verifies one equal-identity duplicate and retains the highest-precedence row.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reconciliation invariant when logical values differ.
-    fn reconcile(&mut self, candidate: Self) -> DataFusionResult<()> {
-        if !logical_rows_equal(&self.row, &candidate.row)? {
-            metrics::counter!(
-                "bifrost_oracle_security_events_total",
-                "event_class" => "reconciliation"
-            )
-            .increment(1);
-            return Err(DataFusionError::External(Box::new(
-                BifrostError::QueryReconciliationInvariant,
-            )));
-        }
-        let losing_source = if candidate.tier < self.tier {
-            self.tier
-        } else {
-            candidate.tier
-        };
-        if candidate.tier < self.tier {
-            self.tier = candidate.tier;
-            self.row = candidate.row;
-        }
-        metrics::counter!(
-            "bifrost_oracle_rows_deduplicated_total",
-            "losing_source" => losing_source.label()
-        )
-        .increment(1);
-        Ok(())
-    }
-
-    /// Removes the hidden source tier from the winning row.
-    ///
-    /// # Errors
-    ///
-    /// Returns a plan error if the internally required source tier is absent.
-    fn finish(self) -> DataFusionResult<RecordBatch> {
-        remove_column(&self.row, SOURCE_TIER_COLUMN)
     }
 }
 
@@ -1839,88 +1291,6 @@ fn hot_stream(
     }
 }
 
-/// Reads and validates the exact identity and source tier for one physical row.
-///
-/// # Errors
-///
-/// Returns the existing invalid-identity error for missing or incorrectly typed
-/// columns, an out-of-range row, null values, a negative ordinal, or an unknown
-/// source tier.
-fn row_identity_and_tier(
-    batch: &RecordBatch,
-    row: usize,
-) -> DataFusionResult<(RowIdentity, SourceTier)> {
-    if row >= batch.num_rows() {
-        return Err(DataFusionError::External(Box::new(
-            ReconcileError::InvalidIdentity,
-        )));
-    }
-    let batch_index = batch
-        .schema()
-        .index_of("wyrd_batch_id")
-        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    let ordinal_index = batch
-        .schema()
-        .index_of("wyrd_row_ordinal")
-        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    let source_index = batch
-        .schema()
-        .index_of(SOURCE_TIER_COLUMN)
-        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    let batches = batch
-        .column(batch_index)
-        .as_any()
-        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
-        .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    let ordinals = batch
-        .column(ordinal_index)
-        .as_any()
-        .downcast_ref::<arrow::array::Int32Array>()
-        .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    let sources = batch
-        .column(source_index)
-        .as_any()
-        .downcast_ref::<UInt8Array>()
-        .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    if batches.is_null(row)
-        || ordinals.is_null(row)
-        || ordinals.value(row) < 0
-        || sources.is_null(row)
-    {
-        return Err(DataFusionError::External(Box::new(
-            ReconcileError::InvalidIdentity,
-        )));
-    }
-    let batch_id = batches
-        .value(row)
-        .try_into()
-        .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    let identity = RowIdentity {
-        batch_id,
-        ordinal: u32::try_from(ordinals.value(row))
-            .map_err(|_| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?,
-    };
-    let tier = SourceTier::from_u8(sources.value(row))
-        .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
-    Ok((identity, tier))
-}
-
-/// Compares one logical row by Arrow values after removing source bookkeeping.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` error when either row omits Oracle's source field.
-fn logical_rows_equal(left: &RecordBatch, right: &RecordBatch) -> DataFusionResult<bool> {
-    let left = remove_column(left, SOURCE_TIER_COLUMN)?;
-    let right = remove_column(right, SOURCE_TIER_COLUMN)?;
-    Ok(left.schema() == right.schema()
-        && left
-            .columns()
-            .iter()
-            .zip(right.columns())
-            .all(|(left, right)| left.to_data() == right.to_data()))
-}
-
 /// Returns the first tenant mismatch row, or `None` for a valid batch.
 ///
 /// # Errors
@@ -1970,29 +1340,6 @@ fn project_batch(batch: &RecordBatch, schema: SchemaRef) -> DataFusionResult<Rec
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-/// Appends Oracle's source bookkeeping field to one physical schema.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` plan error if the reserved private name already exists.
-fn schema_with_source(schema: &Schema) -> DataFusionResult<SchemaRef> {
-    if schema.index_of(SOURCE_TIER_COLUMN).is_ok() {
-        return Err(DataFusionError::Plan(
-            "physical schema already contains Oracle source bookkeeping".to_owned(),
-        ));
-    }
-    let mut fields = schema
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect::<Vec<_>>();
-    fields.push(Field::new(SOURCE_TIER_COLUMN, DataType::UInt8, false));
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    )))
 }
 
 /// Removes one named physical field from a schema.
@@ -2089,354 +1436,25 @@ fn plan_properties_with_partitions(
     )
 }
 
-impl SourceTier {
-    /// Returns the physical precedence tag encoded into source batches.
-    const fn as_u8(self) -> u8 {
-        match self {
-            Self::Iceberg => 0,
-            Self::HotSealed => 1,
-            Self::Live => 2,
-        }
-    }
-
-    /// Parses one physical precedence tag.
-    const fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Iceberg),
-            1 => Some(Self::HotSealed),
-            2 => Some(Self::Live),
-            _ => None,
-        }
-    }
-
-    /// Returns the closed telemetry label for a losing source.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Iceberg => "iceberg",
-            Self::HotSealed => "hot_sealed",
-            Self::Live => "live_tail",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::*;
     use crate::oracle::{BifrostQueryReadDecision, OracleSlotManager};
-    use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use async_trait::async_trait;
-    use datafusion::physical_expr::expressions::Column;
-    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
-    use datafusion::prelude::SessionConfig;
     use wyrd_runtime::Principal;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::AuthMethod;
     use wyrd_spec::vala::api::QueryStreamFrame;
-
-    /// Minimal single-thread subscriber exposing the currently entered span.
-    #[derive(Default)]
-    struct PollCaptureSubscriber {
-        /// Monotonic span identifier source.
-        next: AtomicU64,
-        /// Metadata retained for each live test span.
-        metadata: Mutex<HashMap<u64, &'static tracing::Metadata<'static>>>,
-        /// Entered span stack for the manually polled test thread.
-        entered: Mutex<Vec<tracing::span::Id>>,
-        /// Span names observed on subscriber entry around child polls.
-        observed: Arc<Mutex<Vec<String>>>,
-        /// Exact field updates retained with their owning span name.
-        records: Arc<Mutex<Vec<(String, String, String)>>>,
-    }
-
-    /// Visitor retaining exact field values recorded on one Oracle span.
-    struct SpanFieldVisitor<'a> {
-        /// Owning span name resolved from the subscriber registry.
-        span: &'a str,
-        /// Shared terminal-record sink.
-        records: &'a Mutex<Vec<(String, String, String)>>,
-    }
-
-    impl tracing::field::Visit for SpanFieldVisitor<'_> {
-        /// Retain string fields without debug quoting.
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.records.lock().expect("span records").push((
-                self.span.to_owned(),
-                field.name().to_owned(),
-                value.to_owned(),
-            ));
-        }
-
-        /// Retain non-string fields using tracing's canonical debug representation.
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.records.lock().expect("span records").push((
-                self.span.to_owned(),
-                field.name().to_owned(),
-                format!("{value:?}"),
-            ));
-        }
-    }
-
-    impl tracing::Subscriber for PollCaptureSubscriber {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-            self.metadata
-                .lock()
-                .expect("span metadata")
-                .insert(id, attributes.metadata());
-            tracing::span::Id::from_u64(id)
-        }
-        fn record(&self, id: &tracing::span::Id, record: &tracing::span::Record<'_>) {
-            let span = self.metadata.lock().expect("span metadata")[&id.into_u64()]
-                .name()
-                .to_owned();
-            record.record(&mut SpanFieldVisitor {
-                span: &span,
-                records: &self.records,
-            });
-        }
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, _: &tracing::Event<'_>) {}
-        fn enter(&self, id: &tracing::span::Id) {
-            let name = self.metadata.lock().expect("span metadata")[&id.into_u64()]
-                .name()
-                .to_owned();
-            self.observed.lock().expect("observed spans").push(name);
-            self.entered.lock().expect("entered spans").push(id.clone());
-        }
-        fn exit(&self, id: &tracing::span::Id) {
-            let popped = self.entered.lock().expect("entered spans").pop();
-            assert_eq!(popped.as_ref(), Some(id));
-        }
-    }
-
-    /// Deterministic child stream that exposes one pending poll before its terminal result.
-    struct PendingChild {
-        /// Child schema forwarded by the lifecycle wrapper.
-        schema: SchemaRef,
-        /// Terminal item returned after the first pending poll.
-        item: Option<DataFusionResult<RecordBatch>>,
-        /// Whether the deliberate pending poll already occurred.
-        pending_observed: bool,
-        /// Test-controlled terminal release.
-        ready: Arc<AtomicBool>,
-    }
-
-    impl Stream for PendingChild {
-        type Item = DataFusionResult<RecordBatch>;
-
-        /// Return one pending poll, then the configured item, then EOF.
-        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            if !self.pending_observed || !self.ready.load(Ordering::Acquire) {
-                self.pending_observed = true;
-                return Poll::Pending;
-            }
-            Poll::Ready(self.item.take())
-        }
-    }
-
-    impl RecordBatchStream for PendingChild {
-        /// Forward the deterministic child schema.
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-    }
-
-    /// Poll one lifecycle manually without timing-dependent synchronization.
-    fn poll_lifecycle<S: Stream<Item = DataFusionResult<RecordBatch>>>(
-        lifecycle: Pin<&mut OracleStreamLifecycle<S>>,
-    ) -> Poll<Option<DataFusionResult<RecordBatch>>> {
-        let waker = futures_util::task::noop_waker();
-        lifecycle.poll_next(&mut Context::from_waker(&waker))
-    }
-
-    /// Assert one exact terminal outcome was recorded on a named Oracle span.
-    fn assert_span_outcome(
-        records: &Mutex<Vec<(String, String, String)>>,
-        span: &str,
-        outcome: &str,
-    ) {
-        assert!(
-            records.lock().expect("span records").iter().any(
-                |record| record == &(span.to_owned(), "outcome".to_owned(), outcome.to_owned())
-            ),
-            "missing {span} outcome={outcome}"
-        );
-    }
-
-    /// Pending source and reconcile children record exact success spans and elapsed work.
-    #[test]
-    fn oracle_stream_lifecycle_records_pending_source_and_reconcile_success() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = PollCaptureSubscriber {
-            observed: Arc::clone(&observed),
-            records: Arc::clone(&records),
-            ..PollCaptureSubscriber::default()
-        };
-        tracing::subscriber::with_default(subscriber, || {
-            metrics::with_local_recorder(&recorder, || {
-                let schema = Arc::new(Schema::empty());
-                let batch = RecordBatch::new_empty(Arc::clone(&schema));
-                let source_ready = Arc::new(AtomicBool::new(false));
-                let mut successful = Box::pin(OracleStreamLifecycle::new(
-                    PendingChild {
-                        schema: Arc::clone(&schema),
-                        item: Some(Ok(batch)),
-                        pending_observed: false,
-                        ready: Arc::clone(&source_ready),
-                    },
-                    Arc::clone(&schema),
-                    tracing::info_span!("bifrost.oracle.source", outcome = tracing::field::Empty),
-                    Some("live_tail"),
-                ));
-                assert!(matches!(poll_lifecycle(successful.as_mut()), Poll::Pending));
-                source_ready.store(true, Ordering::Release);
-                assert!(matches!(
-                    poll_lifecycle(successful.as_mut()),
-                    Poll::Ready(Some(Ok(_)))
-                ));
-                assert!(matches!(
-                    poll_lifecycle(successful.as_mut()),
-                    Poll::Ready(None)
-                ));
-
-                let reconcile_ready = Arc::new(AtomicBool::new(false));
-                let mut reconciled = Box::pin(OracleStreamLifecycle::new(
-                    PendingChild {
-                        schema: Arc::clone(&schema),
-                        item: None,
-                        pending_observed: false,
-                        ready: Arc::clone(&reconcile_ready),
-                    },
-                    Arc::clone(&schema),
-                    tracing::info_span!(
-                        "bifrost.oracle.reconcile",
-                        outcome = tracing::field::Empty
-                    ),
-                    None,
-                ));
-                assert!(matches!(poll_lifecycle(reconciled.as_mut()), Poll::Pending));
-                reconcile_ready.store(true, Ordering::Release);
-                assert!(matches!(
-                    poll_lifecycle(reconciled.as_mut()),
-                    Poll::Ready(None)
-                ));
-            });
-        });
-        let observed = observed.lock().expect("observed poll spans");
-        assert!(observed.iter().any(|name| name == "bifrost.oracle.source"));
-        assert!(
-            observed
-                .iter()
-                .any(|name| name == "bifrost.oracle.reconcile")
-        );
-        assert_span_outcome(&records, "bifrost.oracle.source", "success");
-        assert_span_outcome(&records, "bifrost.oracle.reconcile", "success");
-        let snapshot = recorder.snapshot();
-        assert!(
-            snapshot
-                .histograms
-                .get("bifrost_oracle_source_operation_seconds{outcome=\"success\",source=\"live_tail\"}")
-                .is_some_and(|value| value.max > 0)
-        );
-    }
-
-    /// A pending child failure records the exact span outcome and preserves its error.
-    #[test]
-    fn oracle_stream_lifecycle_records_failed_child() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = PollCaptureSubscriber {
-            records: Arc::clone(&records),
-            ..PollCaptureSubscriber::default()
-        };
-        tracing::subscriber::with_default(subscriber, || {
-            metrics::with_local_recorder(&recorder, || {
-                let schema = Arc::new(Schema::empty());
-                let ready = Arc::new(AtomicBool::new(false));
-                let mut failed = Box::pin(OracleStreamLifecycle::new(
-                    PendingChild {
-                        schema: Arc::clone(&schema),
-                        item: Some(Err(DataFusionError::Execution("child failure".to_owned()))),
-                        pending_observed: false,
-                        ready: Arc::clone(&ready),
-                    },
-                    schema,
-                    tracing::info_span!("bifrost.oracle.source", outcome = tracing::field::Empty),
-                    Some("hot_sealed"),
-                ));
-                assert!(matches!(poll_lifecycle(failed.as_mut()), Poll::Pending));
-                ready.store(true, Ordering::Release);
-                let error = match poll_lifecycle(failed.as_mut()) {
-                    Poll::Ready(Some(Err(error))) => error,
-                    other => panic!("expected unchanged child error, got {other:?}"),
-                };
-                assert_eq!(error.to_string(), "Execution error: child failure");
-            });
-        });
-        assert_span_outcome(&records, "bifrost.oracle.source", "failed");
-        assert_eq!(
-            recorder
-                .snapshot()
-                .histograms
-                .get("bifrost_oracle_source_operation_seconds{outcome=\"failed\",source=\"hot_sealed\"}")
-                .map(|value| value.count),
-            Some(1)
-        );
-    }
-
-    /// Dropping a polled pending child records the exact cancelled span outcome.
-    #[test]
-    fn oracle_stream_lifecycle_records_cancelled_child() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = PollCaptureSubscriber {
-            records: Arc::clone(&records),
-            ..PollCaptureSubscriber::default()
-        };
-        tracing::subscriber::with_default(subscriber, || {
-            metrics::with_local_recorder(&recorder, || {
-                let schema = Arc::new(Schema::empty());
-                let mut cancelled = Box::pin(OracleStreamLifecycle::new(
-                    PendingChild {
-                        schema: Arc::clone(&schema),
-                        item: None,
-                        pending_observed: false,
-                        ready: Arc::new(AtomicBool::new(false)),
-                    },
-                    schema,
-                    tracing::info_span!("bifrost.oracle.source", outcome = tracing::field::Empty),
-                    Some("iceberg"),
-                ));
-                assert!(matches!(poll_lifecycle(cancelled.as_mut()), Poll::Pending));
-                drop(cancelled);
-            });
-        });
-        assert_span_outcome(&records, "bifrost.oracle.source", "cancelled");
-        assert_eq!(
-            recorder
-                .snapshot()
-                .histograms
-                .get(
-                    "bifrost_oracle_source_operation_seconds{outcome=\"cancelled\",source=\"iceberg\"}",
-                )
-                .map(|value| value.count),
-            Some(1)
-        );
-    }
 
     /// In-memory audit sink used only to inspect physical plan structure.
     struct NoopAudit;
@@ -2460,187 +1478,6 @@ mod tests {
         ) -> Result<(), BifrostError> {
             Ok(())
         }
-    }
-
-    /// Builds one source-tagged physical row for exact reconciliation tests.
-    fn tagged_batch(batch_id: [u8; 16], ordinal: i32, value: i64, tier: SourceTier) -> RecordBatch {
-        let mut ids = FixedSizeBinaryBuilder::with_capacity(1, 16);
-        ids.append_value(batch_id)
-            .expect("test identity has fixed width");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-            Field::new("wyrd_row_ordinal", DataType::Int32, false),
-            Field::new("data_tenant_id", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-            Field::new(SOURCE_TIER_COLUMN, DataType::UInt8, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(ids.finish()) as ArrayRef,
-                Arc::new(Int32Array::from(vec![ordinal])) as ArrayRef,
-                Arc::new(StringArray::from(vec![uuid::Uuid::nil().to_string()])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![value])) as ArrayRef,
-                Arc::new(UInt8Array::from(vec![tier.as_u8()])) as ArrayRef,
-            ],
-        )
-        .expect("test batch matches its schema")
-    }
-
-    /// Builds one bounded multi-row source batch for external-sort tests.
-    fn tagged_rows(
-        batch_id: [u8; 16],
-        ordinals: std::ops::Range<i32>,
-        tier: SourceTier,
-    ) -> RecordBatch {
-        let count = usize::try_from(ordinals.end - ordinals.start).expect("non-negative range");
-        let mut ids = FixedSizeBinaryBuilder::with_capacity(count, 16);
-        let mut ordinal_values = Vec::with_capacity(count);
-        let mut values = Vec::with_capacity(count);
-        let mut tenants = Vec::with_capacity(count);
-        for ordinal in ordinals {
-            ids.append_value(batch_id)
-                .expect("test identity has fixed width");
-            ordinal_values.push(ordinal);
-            values.push(i64::from(ordinal));
-            tenants.push(uuid::Uuid::nil().to_string());
-        }
-        let schema = tagged_batch(batch_id, 0, 0, tier).schema();
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(ids.finish()) as ArrayRef,
-                Arc::new(Int32Array::from(ordinal_values)) as ArrayRef,
-                Arc::new(StringArray::from(tenants)) as ArrayRef,
-                Arc::new(Int64Array::from(values)) as ArrayRef,
-                Arc::new(UInt8Array::from(vec![tier.as_u8(); count])) as ArrayRef,
-            ],
-        )
-        .expect("multi-row test batch matches its schema")
-    }
-
-    /// Creates the production Oracle `DataFusion` pool with a deterministic test ceiling.
-    fn reconciliation_test_pool() -> (
-        crate::scribe::memory::BifrostMemoryGovernor,
-        Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
-    ) {
-        let governor = crate::scribe::memory::BifrostMemoryGovernor::new_with_test_child_limits(
-            4 * 1024 * 1024 * 1024,
-            256 << 20,
-            3 << 20,
-        )
-        .expect("test governor");
-        let pool = Arc::new(
-            crate::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(governor.clone()),
-        );
-        (governor, pool)
-    }
-
-    /// Executes source-tagged batches through the real sorted reconciliation plan.
-    ///
-    /// # Errors
-    ///
-    /// Returns the production plan or stream error unchanged.
-    async fn run_sorted_reconciliation(
-        batches: Vec<RecordBatch>,
-    ) -> DataFusionResult<Vec<RecordBatch>> {
-        let source = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&batches),
-            batches[0].schema(),
-            None,
-        )?;
-        let plan = ReconcileExec::new(
-            source,
-            OracleMemoryResources {
-                resources: crate::resources::BifrostRuntimeResources::composed_for_test(
-                    1024 * 1024 * 1024,
-                    1024 * 1024 * 1024,
-                    [crate::resources::BifrostRole::Oracle],
-                )
-                .oracle()
-                .expect("composition must enable the Oracle capability"),
-                governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
-                reconciliation_limit_bytes: 1024 * 1024,
-            },
-        )?;
-        let mut stream = plan.execute(
-            0,
-            datafusion::execution::context::SessionContext::new().task_ctx(),
-        )?;
-        let mut output = Vec::new();
-        while let Some(batch) = stream.next().await {
-            output.push(batch?);
-        }
-        Ok(output)
-    }
-
-    /// Exact source precedence is independent of source arrival order.
-    #[tokio::test]
-    async fn reconciliation_precedence_is_arrival_order_independent() {
-        let identity = [7_u8; 16];
-        for order in [
-            [SourceTier::Live, SourceTier::HotSealed, SourceTier::Iceberg],
-            [SourceTier::Iceberg, SourceTier::Live, SourceTier::HotSealed],
-            [SourceTier::HotSealed, SourceTier::Iceberg, SourceTier::Live],
-        ] {
-            let recorder = wyrd_bench::BenchmarkRecorder::default();
-            let _guard = metrics::set_default_local_recorder(&recorder);
-            let output = run_sorted_reconciliation(
-                order
-                    .into_iter()
-                    .map(|tier| tagged_batch(identity, 3, 41, tier))
-                    .collect(),
-            )
-            .await
-            .expect("equal duplicates reconcile through production plan");
-            assert_eq!(output.len(), 1);
-            assert_eq!(winner_key(&output[0]).1, 41);
-            let snapshot = recorder.snapshot();
-            assert_eq!(
-                snapshot
-                    .counters
-                    .get("bifrost_oracle_rows_deduplicated_total{losing_source=\"live_tail\"}"),
-                Some(&1)
-            );
-            assert_eq!(
-                snapshot
-                    .counters
-                    .get("bifrost_oracle_rows_deduplicated_total{losing_source=\"hot_sealed\"}"),
-                Some(&1)
-            );
-            assert!(
-                !snapshot.counters.contains_key(
-                    "bifrost_oracle_rows_deduplicated_total{losing_source=\"iceberg\"}"
-                ),
-                "the highest-precedence Iceberg row must never be the loser"
-            );
-        }
-    }
-
-    /// Unequal logical values for one immutable identity fail closed.
-    #[tokio::test]
-    async fn reconciliation_rejects_unequal_duplicates() {
-        let identity = [9_u8; 16];
-        let error = run_sorted_reconciliation(vec![
-            tagged_batch(identity, 0, 1, SourceTier::HotSealed),
-            tagged_batch(identity, 0, 2, SourceTier::Iceberg),
-        ])
-        .await
-        .expect_err("unequal duplicate must fail");
-        let mut source: &(dyn std::error::Error + 'static) = &error;
-        let recovered = loop {
-            if let Some(bifrost) = source.downcast_ref::<BifrostError>() {
-                break bifrost;
-            }
-            source = source
-                .source()
-                .expect("reconciliation error retains its typed source");
-        };
-        assert!(matches!(
-            recovered,
-            BifrostError::QueryReconciliationInvariant
-        ));
     }
 
     /// Tenant validation finds foreign rows at every batch position.
@@ -2675,16 +1512,24 @@ mod tests {
         }
     }
 
-    /// Keeps tenant tripwire and reconciliation below a global sort operator.
+    /// Keeps the tenant tripwire immediately above an unordered source union.
     #[test]
-    fn source_invariants_remain_below_global_operator() {
-        let batch = tagged_batch([7_u8; 16], 0, 41, SourceTier::Iceberg);
-        let source: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&vec![batch]),
-            tagged_batch([0_u8; 16], 0, 0, SourceTier::Iceberg).schema(),
-            None,
+    fn unordered_union_has_no_mandatory_reconciliation_sort() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            DATA_TENANT_ID,
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![
+                wyrd_spec::DataTenantId::new_v7().to_string(),
+            ])) as ArrayRef],
         )
-        .expect("source batch schema");
+        .expect("source batch");
+        let source: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(std::slice::from_ref(&vec![batch]), schema, None)
+                .expect("source batch schema");
         let tenant = wyrd_spec::DataTenantId::new_v7();
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
@@ -2713,105 +1558,33 @@ mod tests {
             )
             .expect("tripwire plan"),
         );
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
-        let memory = OracleMemoryResources {
+        assert_eq!(tripwire.name(), "TenantTripwireExec");
+        assert_eq!(tripwire.children()[0].name(), "UnionExec");
+        assert!(tripwire.as_any().downcast_ref::<SortExec>().is_none());
+        assert!(
+            tripwire.children()[0]
+                .as_any()
+                .downcast_ref::<SortExec>()
+                .is_none()
+        );
+    }
+
+    /// Composes one Oracle capability for hot-read resource tests.
+    fn oracle_memory_resources(
+        governor: crate::scribe::memory::BifrostMemoryGovernor,
+        reconciliation_limit_bytes: usize,
+    ) -> OracleMemoryResources {
+        OracleMemoryResources {
             resources: crate::resources::BifrostRuntimeResources::composed_for_test(
                 1024 * 1024 * 1024,
                 1024 * 1024 * 1024,
                 [crate::resources::BifrostRole::Oracle],
             )
             .oracle()
-            .expect("composition must enable the Oracle capability"),
-            governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                .expect("memory governor"),
-            reconciliation_limit_bytes: 1024 * 1024,
-        };
-        let reconciled = Arc::new(
-            ReconcileExec::new_with_telemetry(tripwire, memory, telemetry, QueryClass::Interactive)
-                .expect("reconcile plan"),
-        );
-        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
-            Arc::new(Column::new("value", 3)),
-            arrow::compute::SortOptions {
-                descending: false,
-                nulls_first: false,
-            },
-        )])
-        .expect("sort ordering");
-        let global = SortExec::new(ordering, reconciled.clone());
-        assert_eq!(global.children()[0].name(), "ReconcileExec");
-        assert_eq!(global.children()[0].children()[0].name(), "SortExec");
-        assert_eq!(
-            global.children()[0].children()[0].children()[0].name(),
-            "TenantTripwireExec"
-        );
-        assert_eq!(
-            global.children()[0].children()[0].children()[0].children()[0].name(),
-            "UnionExec"
-        );
-
-        let rebuilt = reconciled
-            .clone()
-            .with_new_children(vec![Arc::clone(reconciled.children()[0])])
-            .expect("optimizer replacement rebuilds reconciliation");
-        let rebuilt = rebuilt
-            .as_any()
-            .downcast_ref::<ReconcileExec>()
-            .expect("replacement preserves reconciliation owner");
-        let executed_sort = rebuilt.children()[0]
-            .as_any()
-            .downcast_ref::<SortExec>()
-            .expect("replacement retains one mandatory identity sort");
-        assert!(std::ptr::eq(executed_sort, rebuilt.sort.as_ref()));
-        assert_eq!(executed_sort.children()[0].name(), "TenantTripwireExec");
-        assert_eq!(
-            executed_sort.children()[0].children()[0].name(),
-            "UnionExec"
-        );
-        assert!(
-            executed_sort.children()[0]
-                .as_any()
-                .downcast_ref::<SortExec>()
-                .is_none(),
-            "optimizer rebuild must not nest a second mandatory sort"
-        );
-    }
-
-    /// Builds one canonical UUIDv7-shaped identity for sorted reconciliation tests.
-    fn v7_style_id(tail: u8) -> [u8; 16] {
-        let mut id = [
-            0x01, 0x93, 0x8a, 0x4c, 0x2f, 0x10, 0x70, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        id[7] = tail.wrapping_mul(31).wrapping_add(7);
-        id[9] = tail.wrapping_mul(97);
-        id[15] = tail;
-        id
-    }
-
-    /// Extracts the exact identity and value of one reconciled output row.
-    fn winner_key(batch: &RecordBatch) -> (RowIdentity, i64) {
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
-            .expect("output batch id column");
-        let ordinals = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("output ordinal column");
-        let values = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("output value column");
-        (
-            RowIdentity {
-                batch_id: ids.value(0).try_into().expect("16-byte batch id"),
-                ordinal: u32::try_from(ordinals.value(0)).expect("non-negative ordinal"),
-            },
-            values.value(0),
-        )
+            .expect("composition enables Oracle"),
+            governor,
+            reconciliation_limit_bytes,
+        }
     }
 
     /// Drains a projected hot stream, checking each batch and sampling peaks.
@@ -2912,383 +1685,6 @@ mod tests {
         assert_eq!(governor.snapshot().bifrost_total_bytes, 0);
         assert_eq!(query_pool.reserved(), 0);
         assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
-    }
-
-    /// Asserts one analytical query recorded nonzero spill bytes and files once.
-    ///
-    /// The spill counters are the operator-visible evidence that the query
-    /// actually reached disk under its own lease, so a successful spilling
-    /// query must publish positive bytes, positive files, and exactly one
-    /// successful spilling-query observation.
-    fn assert_analytical_spill_success_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
-        assert!(
-            snapshot
-                .counters
-                .get("oracle_query_spill_bytes_total{class=\"analytical\"}")
-                .is_some_and(|bytes| *bytes > 0)
-        );
-        assert!(
-            snapshot
-                .counters
-                .get("oracle_query_spill_files_total{class=\"analytical\"}")
-                .is_some_and(|files| *files > 0)
-        );
-        assert_eq!(
-            snapshot
-                .counters
-                .get("oracle_query_spill_queries_total{class=\"analytical\",outcome=\"success\"}"),
-            Some(&1)
-        );
-    }
-
-    /// Composes one Oracle memory capability over the given governor.
-    ///
-    /// Every exec-level proof leases through the one production composition, so
-    /// this helper only injects a raw observation and pairs the issued Oracle
-    /// capability with the governor and reconciliation ceiling under test. It
-    /// derives no reserve, floor, elastic, or partition value itself.
-    fn oracle_memory_resources(
-        governor: crate::scribe::memory::BifrostMemoryGovernor,
-        reconciliation_limit_bytes: usize,
-    ) -> OracleMemoryResources {
-        OracleMemoryResources {
-            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
-                1024 * 1024 * 1024,
-                1024 * 1024 * 1024,
-                [crate::resources::BifrostRole::Oracle],
-            )
-            .oracle()
-            .expect("composition must enable the Oracle capability"),
-            governor,
-            reconciliation_limit_bytes,
-        }
-    }
-
-    /// `DataFusion` external sort spills and yields the exact reference winners.
-    #[tokio::test]
-    async fn reconciliation_external_sort_spills_with_exact_winners() {
-        const BATCHES: i32 = 200;
-        const ROWS_PER_BATCH: i32 = 100;
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let identity = v7_style_id(5);
-        let batches = (0..BATCHES)
-            .rev()
-            .flat_map(|batch| {
-                let start = batch * ROWS_PER_BATCH;
-                [
-                    tagged_rows(identity, start..start + ROWS_PER_BATCH, SourceTier::Live),
-                    tagged_rows(identity, start..start + ROWS_PER_BATCH, SourceTier::Iceberg),
-                ]
-            })
-            .collect::<Vec<_>>();
-        let source = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&batches),
-            batches[0].schema(),
-            None,
-        )
-        .expect("memory source");
-        let (governor, pool) = reconciliation_test_pool();
-        let plan = ReconcileExec::new(
-            source,
-            oracle_memory_resources(governor.clone(), 1024 * 1024),
-        )
-        .expect("reconciliation plan");
-        let scratch_root = tempfile::tempdir().expect("scratch root");
-        let spill = crate::oracle::spill::OracleSpillRuntime::new(scratch_root.path(), 16 << 20)
-            .expect("spill runtime");
-        let runtime = spill
-            .build_query_runtime(pool, 16 << 20)
-            .expect("query runtime");
-        let peak_memory = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let peak_disk = Arc::new(AtomicU64::new(0));
-        let sampling = Arc::new(AtomicBool::new(true));
-        let sampler = tokio::spawn({
-            let governor = governor.clone();
-            let runtime = Arc::clone(&runtime);
-            let peak_memory = Arc::clone(&peak_memory);
-            let peak_disk = Arc::clone(&peak_disk);
-            let sampling = Arc::clone(&sampling);
-            async move {
-                while sampling.load(Ordering::Acquire) {
-                    peak_memory.fetch_max(governor.snapshot().oracle_total_bytes, Ordering::AcqRel);
-                    peak_disk
-                        .fetch_max(runtime.spilling_progress().current_bytes, Ordering::AcqRel);
-                    tokio::task::yield_now().await;
-                }
-            }
-        });
-        let session = datafusion::execution::context::SessionContext::new_with_config_rt(
-            SessionConfig::new().with_sort_spill_reservation_bytes(0),
-            runtime,
-        );
-        let mut stream = plan
-            .execute(0, session.task_ctx())
-            .expect("external sort executes");
-        let mut ordinals = Vec::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.expect("external sort reconciles");
-            ordinals.push(winner_key(&batch).0.ordinal);
-        }
-        sampling.store(false, Ordering::Release);
-        sampler.await.expect("peak sampler joins");
-        drop(stream);
-        assert_eq!(
-            ordinals.len(),
-            usize::try_from(BATCHES * ROWS_PER_BATCH).expect("row count")
-        );
-        assert!(ordinals.windows(2).all(|pair| pair[0] < pair[1]));
-        let metrics = plan.sort.metrics().expect("sort metrics");
-        assert!(metrics.spilled_bytes().unwrap_or_default() > 0);
-        assert!(metrics.spill_count().unwrap_or_default() > 0);
-        assert!(peak_memory.load(Ordering::Acquire) > 0);
-        assert!(peak_memory.load(Ordering::Acquire) <= governor.oracle_limit_bytes());
-        assert!(peak_disk.load(Ordering::Acquire) > 0);
-        assert!(peak_disk.load(Ordering::Acquire) <= 16 << 20);
-        assert_analytical_spill_success_counters(&recorder.snapshot());
-        assert_eq!(session.runtime_env().memory_pool.reserved(), 0);
-        drop(session);
-        assert!(
-            std::fs::read_dir(spill.spill_path())
-                .expect("inspect scratch")
-                .next()
-                .is_none(),
-            "completed sort removes every query spill file"
-        );
-    }
-
-    /// A one-byte disk ceiling fails structurally and releases sort memory/files.
-    #[tokio::test]
-    async fn reconciliation_disk_ceiling_fails_typed_and_cleans() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let identity = v7_style_id(6);
-        let batches = (0..400)
-            .rev()
-            .map(|batch| {
-                let start = batch * 100;
-                tagged_rows(identity, start..start + 100, SourceTier::Live)
-            })
-            .collect::<Vec<_>>();
-        let source = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&batches),
-            batches[0].schema(),
-            None,
-        )
-        .expect("memory source");
-        let (governor, pool) = reconciliation_test_pool();
-        let baseline = governor.snapshot();
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
-        let plan = ReconcileExec::new_with_telemetry(
-            source,
-            oracle_memory_resources(governor.clone(), 1024 * 1024),
-            Arc::clone(&telemetry),
-            QueryClass::Analytical,
-        )
-        .expect("reconciliation plan");
-        let scratch_root = tempfile::tempdir().expect("scratch root");
-        let spill = crate::oracle::spill::OracleSpillRuntime::new(scratch_root.path(), 16 << 20)
-            .expect("spill runtime");
-        let runtime = spill.build_query_runtime(pool, 1).expect("query runtime");
-        let session = datafusion::execution::context::SessionContext::new_with_config_rt(
-            SessionConfig::new().with_sort_spill_reservation_bytes(0),
-            runtime,
-        );
-        let mut stream = plan
-            .execute(0, session.task_ctx())
-            .expect("sort starts before disk exhaustion");
-        let error = loop {
-            match stream.next().await {
-                Some(Err(error)) => break error,
-                Some(Ok(_)) => {}
-                None => panic!("one-byte disk ceiling must fail"),
-            }
-        };
-        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
-        drop(stream);
-        assert_eq!(
-            recorder
-                .snapshot()
-                .counters
-                .get("oracle_query_spill_queries_total{class=\"analytical\",outcome=\"error\"}"),
-            Some(&1)
-        );
-        assert_eq!(session.runtime_env().memory_pool.reserved(), 0);
-        assert_eq!(governor.snapshot(), baseline);
-        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
-        drop(session);
-        assert!(
-            std::fs::read_dir(spill.spill_path())
-                .expect("inspect scratch")
-                .next()
-                .is_none(),
-            "failed sort removes every query spill file"
-        );
-    }
-
-    /// Dropping after one sorted winner releases memory and query spill files.
-    #[tokio::test]
-    async fn reconciliation_drop_releases_sort_and_spill() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let identity = v7_style_id(10);
-        let batches = (0..400)
-            .rev()
-            .map(|batch| {
-                let start = batch * 100;
-                tagged_rows(identity, start..start + 100, SourceTier::Live)
-            })
-            .collect::<Vec<_>>();
-        let source = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&batches),
-            batches[0].schema(),
-            None,
-        )
-        .expect("memory source");
-        let (governor, pool) = reconciliation_test_pool();
-        let baseline = governor.snapshot();
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
-        let plan = ReconcileExec::new_with_telemetry(
-            source,
-            oracle_memory_resources(governor.clone(), 1024 * 1024),
-            Arc::clone(&telemetry),
-            QueryClass::Analytical,
-        )
-        .expect("reconciliation plan");
-        let scratch_root = tempfile::tempdir().expect("scratch root");
-        let spill = crate::oracle::spill::OracleSpillRuntime::new(scratch_root.path(), 16 << 20)
-            .expect("spill runtime");
-        let runtime = spill
-            .build_query_runtime(pool, 16 << 20)
-            .expect("query runtime");
-        let session = datafusion::execution::context::SessionContext::new_with_config_rt(
-            SessionConfig::new().with_sort_spill_reservation_bytes(0),
-            runtime,
-        );
-        let mut stream = plan
-            .execute(0, session.task_ctx())
-            .expect("external sort executes");
-        assert!(matches!(stream.next().await, Some(Ok(_))));
-        assert!(
-            plan.sort
-                .metrics()
-                .expect("sort metrics")
-                .spilled_bytes()
-                .unwrap_or_default()
-                > 0
-        );
-        drop(stream);
-        assert_eq!(
-            recorder.snapshot().counters.get(
-                "oracle_query_spill_queries_total{class=\"analytical\",outcome=\"cancelled\"}"
-            ),
-            Some(&1)
-        );
-        assert_eq!(session.runtime_env().memory_pool.reserved(), 0);
-        assert_eq!(governor.snapshot(), baseline);
-        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
-        drop(session);
-        assert!(
-            std::fs::read_dir(spill.spill_path())
-                .expect("inspect scratch")
-                .next()
-                .is_none(),
-            "cancelled sort removes every query spill file"
-        );
-    }
-
-    /// Sorted reconciliation carries one identity across source batch boundaries.
-    #[tokio::test]
-    async fn reconciliation_identity_spans_sorted_batches() {
-        let identity = v7_style_id(7);
-        let batches = vec![
-            tagged_batch(identity, 3, 41, SourceTier::Live),
-            tagged_batch(v7_style_id(8), 0, 8, SourceTier::Iceberg),
-            tagged_batch(identity, 3, 41, SourceTier::Iceberg),
-        ];
-        let source = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&batches),
-            batches[0].schema(),
-            None,
-        )
-        .expect("memory source");
-        let plan = ReconcileExec::new(
-            source,
-            OracleMemoryResources {
-                resources: crate::resources::BifrostRuntimeResources::composed_for_test(
-                    1024 * 1024 * 1024,
-                    1024 * 1024 * 1024,
-                    [crate::resources::BifrostRole::Oracle],
-                )
-                .oracle()
-                .expect("composition must enable the Oracle capability"),
-                governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                    .expect("test governor"),
-                reconciliation_limit_bytes: 1024 * 1024,
-            },
-        )
-        .expect("reconciliation plan");
-        let mut stream = plan
-            .execute(
-                0,
-                datafusion::execution::context::SessionContext::new().task_ctx(),
-            )
-            .expect("sorted reconciliation executes");
-        let mut actual = std::collections::BTreeSet::new();
-        while let Some(batch) = stream.next().await {
-            actual.insert(winner_key(&batch.expect("sorted batch reconciles")));
-        }
-        assert_eq!(actual.len(), 2);
-        assert!(actual.contains(&(
-            RowIdentity {
-                batch_id: identity,
-                ordinal: 3
-            },
-            41
-        )));
-    }
-
-    /// One batch-id group with many ordinals completes without hash-partition skew.
-    #[tokio::test]
-    async fn reconciliation_large_batch_id_group_uses_ordinals_without_skew() {
-        let identity = v7_style_id(9);
-        let batches = (0..2048)
-            .rev()
-            .map(|ordinal| tagged_batch(identity, ordinal, i64::from(ordinal), SourceTier::Live))
-            .collect::<Vec<_>>();
-        let source = MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&batches),
-            batches[0].schema(),
-            None,
-        )
-        .expect("memory source");
-        let plan = ReconcileExec::new(
-            source,
-            OracleMemoryResources {
-                resources: crate::resources::BifrostRuntimeResources::composed_for_test(
-                    1024 * 1024 * 1024,
-                    1024 * 1024 * 1024,
-                    [crate::resources::BifrostRole::Oracle],
-                )
-                .oracle()
-                .expect("composition must enable the Oracle capability"),
-                governor: crate::scribe::memory::BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                    .expect("test governor"),
-                reconciliation_limit_bytes: 1024 * 1024,
-            },
-        )
-        .expect("reconciliation plan");
-        let mut stream = plan
-            .execute(
-                0,
-                datafusion::execution::context::SessionContext::new().task_ctx(),
-            )
-            .expect("sorted reconciliation executes");
-        let mut rows = 0;
-        while let Some(batch) = stream.next().await {
-            rows += batch.expect("ordinal group reconciles").num_rows();
-        }
-        assert_eq!(rows, 2048);
     }
 
     /// In-memory sources remain unavailable while hot reads aggregate actual bytes.

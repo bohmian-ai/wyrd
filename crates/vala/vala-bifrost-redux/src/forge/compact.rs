@@ -1196,7 +1196,8 @@ impl Forge {
             ForgeCompactionPhase::Prepared,
             None,
         )?;
-        self.prepare_inputs(lease, key, bin, prepared).await?;
+        self.prepare_inputs(lease, key, bin, operation_id, prepared)
+            .await?;
         let committed_table = self
             .commit_rewrite(
                 lease,
@@ -1533,6 +1534,7 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeGroupKey,
         bin: &RewriteBin,
+        operation_id: Uuid,
         detail: AuditDetail,
     ) -> Result<(), ForgeError> {
         if !lease.renew(&self.core.operator_pool).await? {
@@ -1549,11 +1551,12 @@ impl Forge {
         let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
         let result = sqlx::query(
             r"UPDATE vala.file_list
-              SET compacted = true
-            WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5)
+              SET compacted = true, publication_operation_id = $1
+            WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
+              AND partition_day = $5 AND id = ANY($6)
               AND committed_snapshot_id IS NULL",
         )
+        .bind(operation_id)
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
         .bind(&key.table_ref.name)
@@ -1604,7 +1607,7 @@ impl Forge {
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_day = $5 AND id = ANY($6)
-              AND compacted
+              AND compacted AND publication_operation_id = $7
               AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
         .bind(snapshot_id)
@@ -1613,6 +1616,7 @@ impl Forge {
         .bind(&key.table_ref.name)
         .bind(key.partition_day)
         .bind(&ids)
+        .bind(operation_id)
         .execute(&mut **conn.transaction())
         .await
         .map_err(|error| ForgeError::Sql(error.into()))?;
@@ -1661,16 +1665,19 @@ impl Forge {
         let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
         let result = sqlx::query(
             r"UPDATE vala.file_list
-              SET compacted = false, committed_snapshot_id = NULL
+              SET compacted = false, committed_snapshot_id = NULL,
+                  publication_operation_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5)
-              AND committed_snapshot_id IS NULL",
+              AND committed_snapshot_id IS NULL
+              AND publication_operation_id = $6",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
         .bind(&key.table_ref.name)
         .bind(key.partition_day)
         .bind(&ids)
+        .bind(operation_id)
         .execute(&mut **conn.transaction())
         .await
         .map_err(|error| ForgeError::Sql(error.into()))?;
@@ -1778,7 +1785,8 @@ impl Forge {
             .map_err(ForgeError::Sql)?;
         let result = sqlx::query(
             r"UPDATE vala.file_list
-              SET compacted = false, committed_snapshot_id = NULL
+              SET compacted = false, committed_snapshot_id = NULL,
+                  publication_operation_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5)
               AND committed_snapshot_id IS NULL",

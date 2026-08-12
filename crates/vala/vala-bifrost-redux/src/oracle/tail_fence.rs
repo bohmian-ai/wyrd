@@ -45,6 +45,51 @@ pub trait TailStreamDiscovery: Send + Sync {
 /// remote attempts, which remain idempotent and recoverable by the Scribe TTL.
 const TAIL_FENCE_RELEASE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Derives the exclusive live-tail cursor from every sealed row in the pinned cut.
+///
+/// The complete manifest is intentional: rows already represented by the pinned
+/// Iceberg snapshot no longer need a hot-Parquet scan, but still fence the live
+/// WAL interval. The maximum represented LSN makes the live source disjoint from
+/// both sealed physical sources.
+///
+/// # Errors
+///
+/// Returns visibility unavailable when a matching persisted LSN is negative.
+fn sealed_watermark(
+    manifest: &[vala_sql::row_types::file_list::HotFileRow],
+    node_id: uuid::Uuid,
+    writer_epoch: u64,
+    event_day: &str,
+) -> Result<wyrd_spec::vala::api::TailCursor, BifrostError> {
+    let wal_lsn = manifest
+        .iter()
+        .filter(|file| {
+            file.node_id == node_id
+                && u64::try_from(file.writer_epoch).ok() == Some(writer_epoch)
+                && file.partition_day.format("%Y-%m-%d").to_string() == event_day
+        })
+        .map(|file| {
+            u64::try_from(file.wal_lsn_max).map_err(|_| BifrostError::QueryVisibilityUnavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max();
+    Ok(match wal_lsn {
+        Some(wal_lsn) => wyrd_spec::vala::api::TailCursor {
+            writer_epoch,
+            wal_lsn,
+            batch_id: uuid::Uuid::from_u128(u128::MAX),
+            row_ordinal: u32::MAX,
+        },
+        None => wyrd_spec::vala::api::TailCursor {
+            writer_epoch,
+            wal_lsn: 0,
+            batch_id: uuid::Uuid::nil(),
+            row_ordinal: 0,
+        },
+    })
+}
+
 /// Owns the dependencies and invariants for one query's bounded live-tail cut.
 ///
 /// The owner keeps fence discovery, parent-memory accounting, telemetry,
@@ -435,7 +480,7 @@ impl TailFenceDrainer<'_> {
                     Arc<dyn TailReadTransport>,
                 ),
             >::new();
-            for file in &cut.hot_files {
+            for file in &cut.sealed_manifest {
                 let event_day = wyrd_spec::vala::api::EventDay::new(
                     file.partition_day.format("%Y-%m-%d").to_string(),
                 )
@@ -569,30 +614,12 @@ impl TailFenceDrainer<'_> {
                 }
             };
             for route in routes {
-                let exclusive = cut
-                    .hot_files
-                    .iter()
-                    .filter(|file| {
-                        file.node_id == route.stream.node_id.as_uuid()
-                            && u64::try_from(file.writer_epoch).ok()
-                                == Some(route.stream.writer_epoch)
-                            && file.partition_day.format("%Y-%m-%d").to_string()
-                                == route.event_day.as_str()
-                    })
-                    .map(|file| u64::try_from(file.wal_lsn_max).unwrap_or_default())
-                    .max()
-                    .map(|wal_lsn| wyrd_spec::vala::api::TailCursor {
-                        writer_epoch: route.stream.writer_epoch,
-                        wal_lsn,
-                        batch_id: uuid::Uuid::from_u128(u128::MAX),
-                        row_ordinal: u32::MAX,
-                    })
-                    .unwrap_or(wyrd_spec::vala::api::TailCursor {
-                        writer_epoch: route.stream.writer_epoch,
-                        wal_lsn: 0,
-                        batch_id: uuid::Uuid::nil(),
-                        row_ordinal: 0,
-                    });
+                let exclusive = sealed_watermark(
+                    &cut.sealed_manifest,
+                    route.stream.node_id.as_uuid(),
+                    route.stream.writer_epoch,
+                    route.event_day.as_str(),
+                )?;
                 let request = tail_fence_request(
                     cut,
                     route.event_day,
@@ -930,6 +957,39 @@ mod tests {
 
     use super::*;
     use crate::scribe::tail_rpc::{FenceRelease, LocalTailPage, TailReadError};
+
+    /// Proves Iceberg-represented sealed rows still fence the exclusive live interval.
+    #[test]
+    fn sealed_watermark_makes_live_tail_disjoint() {
+        let node_id = uuid::Uuid::now_v7();
+        let operation = uuid::Uuid::now_v7();
+        let row = vala_sql::row_types::file_list::HotFileRow {
+            id: uuid::Uuid::now_v7(),
+            data_tenant_id: uuid::Uuid::now_v7(),
+            namespace: "vala.bifrost".to_owned(),
+            table_name: "events".to_owned(),
+            file_path: "events/sealed.parquet".to_owned(),
+            file_size: 1,
+            row_count: 1,
+            partition_day: chrono::NaiveDate::from_ymd_opt(2026, 8, 12).expect("valid event day"),
+            compacted: true,
+            committed_snapshot_id: Some(91),
+            publication_operation_id: Some(operation),
+            node_id,
+            writer_epoch: 4,
+            wal_lsn_min: 10,
+            wal_lsn_max: 20,
+            created_at: chrono::Utc::now(),
+        };
+
+        let cursor = sealed_watermark(&[row], node_id, 4, "2026-08-12")
+            .expect("represented sealed lineage must produce a live-tail watermark");
+
+        assert_eq!(cursor.writer_epoch, 4);
+        assert_eq!(cursor.wal_lsn, 20);
+        assert_eq!(cursor.batch_id, uuid::Uuid::from_u128(u128::MAX));
+        assert_eq!(cursor.row_ordinal, u32::MAX);
+    }
 
     /// Deterministic remote-style transport for fence cleanup and drain lifecycle tests.
     struct TailLifecycleTransport {

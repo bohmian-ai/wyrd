@@ -294,7 +294,9 @@ impl HttpTransport {
 
     /// Send an authenticated JSON request and return its response body as a
     /// stream. This is used by terminal-safe query clients so response bytes
-    /// are decoded incrementally without buffering the result.
+    /// are decoded incrementally without buffering the result. Connection
+    /// establishment is bounded by `HttpConfig::timeout_ms`; body lifetime is
+    /// intentionally not subject to the ordinary total-request deadline.
     ///
     /// # Errors
     ///

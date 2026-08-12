@@ -161,14 +161,20 @@ mod transport_behavior {
         _handle: tokio::task::JoinHandle<()>,
     }
 
+    /// Scripted local HTTP response with optional delayed body delivery.
     struct MockResponse {
+        /// Numeric HTTP response status.
         status: u16,
+        /// Complete response body written after any configured delay.
         body: String,
+        /// Additional response headers appended to the fixture defaults.
         extra_headers: Vec<(String, String)>,
+        /// Optional delay between response headers and body bytes.
         body_delay: Option<std::time::Duration>,
     }
 
     impl MockResponse {
+        /// Builds a successful JSON fixture response.
         fn ok(body: &str) -> Self {
             Self {
                 status: 200,
@@ -178,6 +184,7 @@ mod transport_behavior {
             }
         }
 
+        /// Builds a fixture response with an explicit status.
         fn status(status: u16, body: &str) -> Self {
             Self {
                 status,
@@ -187,6 +194,7 @@ mod transport_behavior {
             }
         }
 
+        /// Appends one response header.
         fn with_header(mut self, name: &str, value: &str) -> Self {
             self.extra_headers.push((name.to_owned(), value.to_owned()));
             self

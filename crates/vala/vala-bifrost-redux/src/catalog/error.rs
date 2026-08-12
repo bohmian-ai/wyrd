@@ -23,6 +23,15 @@ pub enum BifrostCatalogError {
     /// Durable catalog metadata is internally inconsistent.
     #[error("catalog metadata inconsistency: {0}")]
     MetadataMismatch(String),
+    /// Iceberg changed around every attempted tenant manifest projection.
+    #[error("catalog visibility cut did not stabilize after {attempts} attempts")]
+    UnstableCut {
+        /// Number of complete snapshot/SQL/snapshot attempts discarded.
+        attempts: u8,
+    },
+    /// A prepared row cannot be placed safely in either snapshot or hot membership.
+    #[error("catalog publication visibility is ambiguous")]
+    AmbiguousPublication,
     /// The physical tenant/table binding is invalid.
     #[error("invalid tenant table binding: {0}")]
     InvalidBinding(String),
@@ -47,6 +56,9 @@ impl BifrostCatalogError {
             Self::MetadataMismatch(detail) | Self::InvalidBinding(detail) => {
                 PublicError::MetadataMismatch { detail }
             }
+            Self::UnstableCut { .. } | Self::AmbiguousPublication => {
+                PublicError::QueryVisibilityUnavailable
+            }
             Self::AuditUnavailable(detail) => PublicError::AuditUnavailable { detail },
             Self::DataFusion(error) => {
                 tracing::error!(error = %error, "Redux DataFusion provider construction failed");
@@ -67,5 +79,19 @@ impl BifrostCatalogError {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ambiguous publication metadata fails as visibility unavailable.
+    #[test]
+    fn ambiguous_publication_maps_to_visibility_unavailable() {
+        assert!(matches!(
+            BifrostCatalogError::AmbiguousPublication.into_public(),
+            wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable
+        ));
     }
 }

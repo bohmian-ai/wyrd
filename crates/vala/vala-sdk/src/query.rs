@@ -9,6 +9,7 @@ use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use futures_util::{Stream, StreamExt};
 use wyrd_client::WyrdClient;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
 };
@@ -348,6 +349,7 @@ fn query_body_transport_error(error: reqwest::Error) -> ValaSdkError {
         "timeout": error.is_timeout(),
         "connect": error.is_connect(),
         "body": error.is_body(),
+        "decode": error.is_decode(),
     });
     tracing::error!(
         error = ?error,
@@ -356,6 +358,7 @@ fn query_body_transport_error(error: reqwest::Error) -> ValaSdkError {
         timeout = error.is_timeout(),
         connect = error.is_connect(),
         body = error.is_body(),
+        decode = error.is_decode(),
         "Oracle query response body failed"
     );
     ValaSdkError::Transport(WyrdError::UpstreamFailure {
@@ -653,10 +656,8 @@ mod tests {
             .send()
             .await
             .expect("response headers arrive");
-        let mut stream = RawQueryStream::new(
-            response.bytes_stream(),
-            VisibilityMode::PublishedOnly,
-        );
+        let mut stream =
+            RawQueryStream::new(response.bytes_stream(), VisibilityMode::PublishedOnly);
 
         let error = stream
             .next_frame()
@@ -669,7 +670,8 @@ mod tests {
         assert_eq!(details["phase"], "response_body");
         assert_eq!(details["timeout"], false);
         assert_eq!(details["connect"], false);
-        assert_eq!(details["body"], true);
+        assert_eq!(details["body"], false);
+        assert_eq!(details["decode"], true);
         server.await.expect("test server exits");
     }
 

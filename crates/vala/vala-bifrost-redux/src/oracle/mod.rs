@@ -80,8 +80,8 @@ use admission::AdmittedQueryGuard;
 pub use admission::OracleAdmission;
 #[cfg(feature = "test-support")]
 pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
+pub use exec::TenantTripwireExec;
 use exec::{HotFileSource, OracleQueryScanStats, OracleTableInputs, OracleTableProvider};
-pub use exec::{ReconcileExec, TenantTripwireExec};
 use planner::OracleClassification;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
@@ -2893,37 +2893,6 @@ fn register_session_table(
         .register_table(TableReference::bare(binding.table_ref.fqn()), alias)
         .map_err(|error| map_datafusion_error(&error))?;
     Ok(())
-}
-
-/// Source tier used to resolve duplicate immutable row identities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SourceTier {
-    /// Published Iceberg data has highest precedence.
-    Iceberg,
-    /// Sealed hot files not yet present in Iceberg.
-    HotSealed,
-    /// Fenced live-tail data has lowest precedence.
-    Live,
-}
-
-/// Exact identity carried by every physical Bifrost row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RowIdentity {
-    /// Immutable batch UUID bytes.
-    pub batch_id: [u8; 16],
-    /// Non-negative batch-local row ordinal.
-    pub ordinal: u32,
-}
-
-/// Reconciliation failures that must fail the query rather than drop data.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum ReconcileError {
-    /// A required identity column was absent or had the wrong Arrow type.
-    #[error("source batch has invalid row identity columns")]
-    InvalidIdentity,
-    /// One immutable identity contained unequal logical row values.
-    #[error("row identity has unequal values across source tiers")]
-    UnequalDuplicate,
 }
 
 /// Stream of terminal-aware logical query frames.

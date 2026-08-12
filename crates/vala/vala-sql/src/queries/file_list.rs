@@ -1,5 +1,6 @@
 //! Tenant-scoped reads of the sealed `vala.file_list` manifest.
 
+use std::collections::BTreeSet;
 use wyrd_sql::TenantConn;
 
 use crate::SqlError;
@@ -11,6 +12,36 @@ pub struct HotFileCatalog {
     namespace: String,
     /// Logical table name whose sealed files this reader projects.
     table_name: String,
+}
+
+/// Cut-aware scan membership and complete sealed lineage for one table.
+pub struct HotFileCut {
+    /// Rows that remain unresolved and must be scanned as hot Parquet.
+    pub hot_files: Vec<HotFileRow>,
+    /// Every sealed row retained for live-tail watermark derivation.
+    pub sealed_manifest: Vec<HotFileRow>,
+    /// Whether a legacy prepared row lacked safe publication evidence.
+    pub ambiguous_publication: bool,
+}
+
+/// Classifies one row against the pinned publication cut.
+fn is_unresolved_hot(
+    row: &HotFileRow,
+    pinned_paths: &BTreeSet<String>,
+    pinned_operation: Option<uuid::Uuid>,
+) -> (bool, bool) {
+    let represented_by_path = pinned_paths.contains(&row.file_path);
+    let represented_by_operation = row.compacted
+        && pinned_operation.is_some()
+        && row.publication_operation_id == pinned_operation;
+    let ambiguous = row.compacted
+        && row.committed_snapshot_id.is_none()
+        && row.publication_operation_id.is_none()
+        && !represented_by_path;
+    (
+        row.committed_snapshot_id.is_none() && !represented_by_path && !represented_by_operation,
+        ambiguous,
+    )
 }
 
 impl HotFileCatalog {
@@ -30,12 +61,14 @@ impl HotFileCatalog {
     ///
     /// # Errors
     /// Returns [`SqlError`] when the RLS-bound transaction or manifest query fails.
-    pub async fn active_files(
+    pub async fn unresolved_for_cut(
         &self,
         conn: &mut TenantConn<'_>,
-    ) -> Result<Vec<HotFileRow>, SqlError> {
+        pinned_paths: &BTreeSet<String>,
+        pinned_operation: Option<uuid::Uuid>,
+    ) -> Result<HotFileCut, SqlError> {
         let rows = sqlx::query_as::<_, HotFileRow>(
-            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, partition_day, compacted, committed_snapshot_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_day, created_at, id",
+            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, partition_day, compacted, committed_snapshot_id, publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_day, created_at, id",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(&self.namespace)
@@ -43,7 +76,20 @@ impl HotFileCatalog {
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
-        Ok(rows)
+        let mut hot_files = Vec::new();
+        let mut ambiguous_publication = false;
+        for row in &rows {
+            let (unresolved, ambiguous) = is_unresolved_hot(row, pinned_paths, pinned_operation);
+            ambiguous_publication |= ambiguous;
+            if unresolved {
+                hot_files.push(row.clone());
+            }
+        }
+        Ok(HotFileCut {
+            hot_files,
+            sealed_manifest: rows,
+            ambiguous_publication,
+        })
     }
 }
 
@@ -109,4 +155,65 @@ pub async fn list_nonterminal_files(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds one valid manifest row for cut-membership policy tests.
+    fn row(compacted: bool, committed: Option<i64>, operation: Option<uuid::Uuid>) -> HotFileRow {
+        HotFileRow {
+            id: uuid::Uuid::now_v7(),
+            data_tenant_id: uuid::Uuid::now_v7(),
+            namespace: "vala.bifrost".to_owned(),
+            table_name: "events".to_owned(),
+            file_path: "events/a.parquet".to_owned(),
+            file_size: 1,
+            row_count: 1,
+            partition_day: chrono::NaiveDate::from_ymd_opt(2026, 8, 12).expect("valid day"),
+            compacted,
+            committed_snapshot_id: committed,
+            publication_operation_id: operation,
+            node_id: uuid::Uuid::now_v7(),
+            writer_epoch: 1,
+            wal_lsn_min: 1,
+            wal_lsn_max: 2,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Covers hot, path, operation, committed, reset, unrelated, and ambiguous states.
+    #[test]
+    fn hot_cut_excludes_only_snapshot_represented_rows() {
+        let pinned = uuid::Uuid::from_u128(7);
+        let unrelated = uuid::Uuid::from_u128(8);
+        let empty = BTreeSet::new();
+        assert_eq!(
+            is_unresolved_hot(&row(false, None, None), &empty, Some(pinned)),
+            (true, false)
+        );
+        assert_eq!(
+            is_unresolved_hot(&row(true, None, Some(unrelated)), &empty, Some(pinned)),
+            (true, false)
+        );
+        assert_eq!(
+            is_unresolved_hot(&row(true, None, Some(pinned)), &empty, Some(pinned)),
+            (false, false)
+        );
+        assert_eq!(
+            is_unresolved_hot(&row(true, Some(9), Some(pinned)), &empty, Some(pinned)),
+            (false, false)
+        );
+        assert_eq!(
+            is_unresolved_hot(&row(true, None, None), &empty, Some(pinned)),
+            (true, true)
+        );
+        let mut path = BTreeSet::new();
+        path.insert("events/a.parquet".to_owned());
+        assert_eq!(
+            is_unresolved_hot(&row(true, None, None), &path, Some(pinned)),
+            (false, false)
+        );
+    }
 }

@@ -303,16 +303,10 @@ impl OraclePlanner {
                 ClusterCapabilities::ScribeV1(_) => None,
             })
             .sum::<f64>();
-        let reconciliation_complex = cuts.iter().any(|cut| {
-            Self::sealed_sources_require_reconciliation(
-                cut.iceberg_files.len(),
-                cut.hot_files.len(),
-            )
-        });
         let classification = Self::classification(
             estimated_bytes,
             live_cpu,
-            optimized_plan_is_complex(&optimized_plan) || reconciliation_complex,
+            optimized_plan_is_complex(&optimized_plan),
         );
         let local_bytes = cuts.iter().try_fold(0_u64, |total, cut| {
             cut.hot_files.iter().try_fold(total, |total, file| {
@@ -351,16 +345,6 @@ impl OraclePlanner {
             query_class: classification.query_class,
             local_ratio,
         })
-    }
-
-    /// Reports whether pinned sealed sources require mandatory identity reconciliation.
-    ///
-    /// A single physical source can stream without cross-source identity arbitration.
-    /// Any second Iceberg or hot source makes the production reconciliation sort
-    /// mandatory and therefore forces analytical admission independently of SQL text.
-    #[must_use]
-    fn sealed_sources_require_reconciliation(iceberg_files: usize, hot_files: usize) -> bool {
-        iceberg_files.saturating_add(hot_files) > 1
     }
 
     /// Lowers and optimizes SQL against schema-only providers from one cut.
@@ -615,24 +599,20 @@ mod tests {
         ));
     }
 
-    /// Multi-source pinned cuts classify as analytical without a SQL marker operator.
+    /// Physical source count does not force analytical scheduling for simple SQL.
     #[test]
-    fn mandatory_multi_source_reconciliation_classifies_analytical() {
-        let complex = OraclePlanner::sealed_sources_require_reconciliation(1, 1);
-        assert!(complex);
+    fn disjoint_multi_source_union_preserves_sql_classification() {
         assert_eq!(
-            OraclePlanner::classify(0, 1.0, complex),
-            crate::oracle::QueryClass::Analytical
+            OraclePlanner::classify(0, 1.0, false),
+            crate::oracle::QueryClass::Interactive
         );
     }
 
     /// One small sealed source remains eligible for interactive scheduling.
     #[test]
     fn simple_single_source_cut_classifies_interactive() {
-        let complex = OraclePlanner::sealed_sources_require_reconciliation(1, 0);
-        assert!(!complex);
         assert_eq!(
-            OraclePlanner::classify(0, 1.0, complex),
+            OraclePlanner::classify(0, 1.0, false),
             crate::oracle::QueryClass::Interactive
         );
     }

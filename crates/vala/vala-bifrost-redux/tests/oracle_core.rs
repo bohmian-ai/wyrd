@@ -2052,26 +2052,12 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
     );
     assert_eq!(int64_values(&result, "total"), [2]);
     assert_eq!(int64_values(&result, "total_value"), [16]);
-    let captured_spans = spans.snapshot();
-    // The pinned Iceberg leaf executes through the source query plane
-    // (`bifrost.oracle.source`, source="iceberg"), not the dispatcher fragment
-    // path — iceberg-leaf reads carry pod_local_v1 accounting, so this query
-    // never emits a `bifrost.oracle.fragment` span. Witness the source span.
-    assert!(
-        captured_spans.iter().any(|span| {
-            span.name == "bifrost.oracle.source"
-                && span.fields.get("source").map(String::as_str) == Some("iceberg")
-        }),
-        "iceberg source span must carry the closed source label: {captured_spans:?}",
-    );
     let metrics = recorder.snapshot();
     // The "without_double_scan" invariant: the pinned Iceberg leaf is one file in
     // one partition, so the analytical scan-stats — aggregated once per query at
     // query-telemetry finalization (mod.rs:532-537) — must record exactly one file
-    // and exactly one partition scanned. The `bifrost_oracle_source_operation_seconds`
-    // histogram cannot witness this: it is recorded per DataFusion execution
-    // partition in `OracleStreamLifecycle::finish` (exec.rs:482-490), so its count
-    // tracks execution parallelism, not logical scans.
+    // and exactly one partition scanned. These scan counters are the source-level
+    // proof now that the disjoint union no longer tags or reconciles physical rows.
     assert_counter_value(
         &metrics,
         "oracle_query_files_scanned_total{class=\"analytical\"}",
@@ -2161,7 +2147,7 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_telemetry(
         fail_acquire: false,
         fail_release: false,
         releases: Arc::clone(&releases),
-        batches: vec![seeded.batch.slice(0, 1)],
+        batches: Vec::new(),
         page_reads: Arc::new(AtomicUsize::new(0)),
     });
     tails.insert(fixture.table.fqn(), Arc::clone(&transport));
@@ -2211,7 +2197,11 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_telemetry(
         [1_025],
         "the Iceberg-overlapping hot object must not be scanned twice"
     );
-    assert_eq!(releases.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        releases.load(Ordering::SeqCst),
+        3,
+        "complete sealed lineage and the live-only stream release every fence"
+    );
 
     let snapshot = recorder.snapshot();
     assert_telemetry_counters(&snapshot);
@@ -2235,10 +2225,6 @@ fn assert_telemetry_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
     ] {
         assert_counter(snapshot, fragment);
     }
-    assert_counter(
-        snapshot,
-        "bifrost_oracle_rows_deduplicated_total{losing_source=\"live_tail\"}",
-    );
     assert_counter_value(
         snapshot,
         "bifrost_oracle_files_pruned_total{reason=\"snapshot_overlap\",source=\"hot_sealed\"}",
@@ -2246,24 +2232,18 @@ fn assert_telemetry_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
     );
     assert_counter_value(
         snapshot,
-        "bifrost_oracle_rows_deduplicated_total{losing_source=\"live_tail\"}",
-        1,
-    );
-    assert_counter_value(
-        snapshot,
         "bifrost_oracle_tail_pages_total{locality=\"local\",outcome=\"success\"}",
-        2,
+        3,
     );
     assert_counter_value(
         snapshot,
         "bifrost_oracle_tail_fences_total{locality=\"local\",outcome=\"success\"}",
-        2,
+        3,
     );
     assert_counter_value(snapshot, "oracle_query_rows_total{class=\"analytical\"}", 1);
-    assert_counter_value(
+    assert_counter_absent_or_zero(
         snapshot,
         "oracle_query_spill_bytes_total{class=\"analytical\"}",
-        0,
     );
 }
 
@@ -2350,18 +2330,13 @@ fn assert_telemetry_spans(captured: &[CapturedSpan]) {
         .expect("tail drain span");
     assert_eq!(
         drain_span.fields.get("fence_count").map(String::as_str),
-        Some("2")
+        Some("3")
     );
     assert_eq!(
         drain_span.fields.get("freshness").map(String::as_str),
         Some("Strict")
     );
-    for name in [
-        "bifrost.oracle.plan",
-        "bifrost.oracle.audit",
-        "bifrost.oracle.source",
-        "bifrost.oracle.reconcile",
-    ] {
+    for name in ["bifrost.oracle.plan", "bifrost.oracle.audit"] {
         assert!(
             captured.iter().any(|span| span.name == name),
             "missing production span {name}: {captured:?}"

@@ -132,7 +132,9 @@ use super::compact::{ForgeObjectStore, project_by_name, validate_tenant_column};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::path::{catalog_path_to_object_key, validate_table_location};
-use super::planner::{ForgeCapacity, ForgePlanCandidate, ForgePlanner};
+#[cfg(feature = "test-support")]
+use super::planner::ForgePlanCandidate;
+use super::planner::{ForgeCapacity, ForgePlanner};
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::{BIFROST_WRITER_RECIPE_VERSION, bifrost_writer_properties};
 use crate::resources::ForgeRewriteRequest;

@@ -18,7 +18,7 @@ mod pg_tests {
     };
     use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
     use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-    use vala_sql::queries::file_list::HotFileCatalog;
+    use vala_sql::queries::file_list::{HotFileCatalog, HotFileCut};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
@@ -173,6 +173,27 @@ mod pg_tests {
         .fetch_one(pool)
         .await
         .expect("index shape")
+    }
+
+    /// Reads one committed cut through the production tenant-bound catalog owner.
+    async fn read_hot_cut(
+        fixture: &PgFixture,
+        tenant: DataTenantId,
+        catalog: &HotFileCatalog,
+        pinned_paths: &std::collections::BTreeSet<String>,
+        operation_id: Option<Uuid>,
+    ) -> HotFileCut {
+        let mut conn = fixture
+            .vala_postgres()
+            .tenant_conn(tenant)
+            .await
+            .expect("tenant connection");
+        let cut = catalog
+            .unresolved_for_cut(&mut conn, pinned_paths, operation_id)
+            .await
+            .expect("cut-aware manifest");
+        conn.commit().await.expect("commit manifest read");
+        cut
     }
 
     #[tokio::test]
@@ -528,16 +549,103 @@ mod pg_tests {
             .await
             .expect("tenant connection");
         let rows = catalog
-            .active_files(&mut conn)
+            .unresolved_for_cut(&mut conn, &std::collections::BTreeSet::new(), None)
             .await
             .expect("tenant-scoped Oracle manifest");
         conn.commit().await.expect("commit manifest read");
         let observed = rows
+            .sealed_manifest
             .iter()
             .find(|candidate| candidate.id == row.id)
             .expect("transition row remains visible until pinned subtraction");
         assert!(observed.compacted);
         assert_eq!(observed.committed_snapshot_id, Some(77));
+    }
+
+    /// Proves every Forge publication phase selects a file through exactly one sealed source.
+    #[tokio::test]
+    async fn forge_publication_operation_closes_catalog_commit_window() {
+        let (fixture, tenant, _) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
+        let row = insert_row(&binding, Uuid::now_v7(), 3, 40, 50);
+        let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        insert_and_audit(&mut conn, &row, &[audit_event()])
+            .await
+            .expect("file-list insert");
+        conn.commit().await.expect("commit insert");
+
+        let catalog = HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
+        let operation = Uuid::now_v7();
+        let unrelated = Uuid::now_v7();
+        let empty_paths = std::collections::BTreeSet::new();
+        let initial = read_hot_cut(&fixture, tenant, &catalog, &empty_paths, None).await;
+        assert_eq!(
+            initial
+                .hot_files
+                .iter()
+                .filter(|file| file.id == row.id)
+                .count(),
+            1
+        );
+
+        let superuser = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query(
+            "UPDATE vala.file_list SET compacted = true, publication_operation_id = $1 WHERE id = $2",
+        )
+        .bind(operation)
+        .bind(row.id)
+        .execute(&superuser)
+        .await
+        .expect("prepare publication");
+
+        let matching =
+            read_hot_cut(&fixture, tenant, &catalog, &empty_paths, Some(operation)).await;
+        assert!(!matching.hot_files.iter().any(|file| file.id == row.id));
+        assert!(
+            matching
+                .sealed_manifest
+                .iter()
+                .any(|file| file.id == row.id)
+        );
+        let unrelated_cut =
+            read_hot_cut(&fixture, tenant, &catalog, &empty_paths, Some(unrelated)).await;
+        assert_eq!(
+            unrelated_cut
+                .hot_files
+                .iter()
+                .filter(|file| file.id == row.id)
+                .count(),
+            1
+        );
+
+        sqlx::query("UPDATE vala.file_list SET committed_snapshot_id = 91 WHERE id = $1")
+            .bind(row.id)
+            .execute(&superuser)
+            .await
+            .expect("stamp publication");
+        let stamped = read_hot_cut(&fixture, tenant, &catalog, &empty_paths, Some(operation)).await;
+        assert!(!stamped.hot_files.iter().any(|file| file.id == row.id));
+        assert!(stamped.sealed_manifest.iter().any(|file| file.id == row.id));
+
+        sqlx::query(
+            "UPDATE vala.file_list SET compacted = false, committed_snapshot_id = NULL, publication_operation_id = NULL WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&superuser)
+        .await
+        .expect("reset publication");
+        let reset = read_hot_cut(&fixture, tenant, &catalog, &empty_paths, Some(operation)).await;
+        assert_eq!(
+            reset
+                .hot_files
+                .iter()
+                .filter(|file| file.id == row.id)
+                .count(),
+            1
+        );
+        assert!(!reset.ambiguous_publication);
     }
 
     #[tokio::test]

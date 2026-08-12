@@ -125,6 +125,8 @@ pub struct PinnedSealedTable {
     pub iceberg_files: Vec<PinnedIcebergFile>,
     /// Ordered tenant hot rows absent from the exact pinned snapshot manifest.
     pub hot_files: Vec<vala_sql::row_types::file_list::HotFileRow>,
+    /// Complete validated sealed manifest retained for live-tail watermarks.
+    pub sealed_manifest: Vec<vala_sql::row_types::file_list::HotFileRow>,
     /// Stable digest of the ordered, post-subtraction hot manifest.
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
@@ -146,12 +148,26 @@ pub struct PinnedIcebergFile {
 struct PinnedIcebergState {
     /// Current snapshot identity, when the table has committed data.
     snapshot_id: Option<i64>,
+    /// Validated Forge publication operation recorded by the current snapshot.
+    publication_operation_id: Option<uuid::Uuid>,
     /// Canonical paths used to exclude hot-manifest overlap.
     file_paths: BTreeSet<String>,
     /// Exact immutable metadata keyed by canonical path.
     files: BTreeMap<String, PinnedIcebergFile>,
     /// Checked sum of immutable object bytes.
     estimated_bytes: u64,
+}
+
+impl PinnedIcebergState {
+    /// Returns the canonical identity digest used to stabilize a cross-system cut.
+    fn digest(&self) -> String {
+        digest_strings(
+            self.snapshot_id
+                .map(|id| id.to_string())
+                .into_iter()
+                .chain(self.file_paths.iter().cloned()),
+        )
+    }
 }
 
 /// Redux catalog shared by Gate, Forge, Oracle, and server catalog routes.
@@ -180,25 +196,17 @@ impl BifrostCatalog {
         };
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-        let pinned = self.pin_iceberg_snapshot(&iceberg_table, &binding).await?;
+        let (iceberg_table, pinned, cut) = self.acquire_stable_cut(&binding, tenant).await?;
         let snapshot_id = pinned.snapshot_id;
         let iceberg_file_paths = pinned.file_paths;
         let iceberg_files = pinned.files;
         let mut estimated_bytes = pinned.estimated_bytes;
-        let hot_file_catalog = HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
-        let mut conn = self.postgres.tenant_conn(tenant).await?;
-        let mut hot_files = hot_file_catalog.active_files(&mut conn).await?;
-        conn.commit().await?;
-        let hot_file_count = hot_files.len();
-        hot_files.retain(|row| !iceberg_file_paths.contains(&row.file_path));
-        metrics::counter!(
-            "bifrost_oracle_files_pruned_total",
-            "source" => "hot_sealed",
-            "reason" => "snapshot_overlap"
-        )
-        .increment(hot_file_count.saturating_sub(hot_files.len()) as u64);
-        for row in &hot_files {
+        if cut.ambiguous_publication {
+            return Err(BifrostCatalogError::AmbiguousPublication);
+        }
+        let hot_files = cut.hot_files;
+        let sealed_manifest = cut.sealed_manifest;
+        for row in &sealed_manifest {
             let valid_identity = row.data_tenant_id == tenant.as_uuid()
                 && row.namespace == binding.logical_namespace
                 && row.table_name == binding.table_name
@@ -210,9 +218,18 @@ impl BifrostCatalog {
                 && binding.validate_object_path(&row.file_path).is_some();
             if !valid_identity {
                 return Err(BifrostCatalogError::MetadataMismatch(
-                    "hot manifest row violates its tenant/table binding".to_owned(),
+                    "sealed manifest row violates its tenant/table binding".to_owned(),
                 ));
             }
+        }
+        let hot_file_count = sealed_manifest.len();
+        metrics::counter!(
+            "bifrost_oracle_files_pruned_total",
+            "source" => "hot_sealed",
+            "reason" => "snapshot_overlap"
+        )
+        .increment(hot_file_count.saturating_sub(hot_files.len()) as u64);
+        for row in &hot_files {
             estimated_bytes = estimated_bytes
                 .checked_add(u64::try_from(row.file_size).map_err(|_| {
                     BifrostCatalogError::MetadataMismatch(
@@ -245,9 +262,54 @@ impl BifrostCatalog {
             iceberg_file_paths,
             iceberg_files: iceberg_files.into_values().collect(),
             hot_files,
+            sealed_manifest,
             hot_manifest_digest,
             estimated_bytes,
         })
+    }
+
+    /// Acquires one stable Iceberg/SQL/Iceberg cut for a tenant table.
+    ///
+    /// # Errors
+    ///
+    /// Returns a catalog or SQL error for one failed read, or `UnstableCut`
+    /// after three complete snapshot identity mismatches. Cancellation drops
+    /// the in-flight attempt without exposing partial state.
+    async fn acquire_stable_cut(
+        &self,
+        binding: &TenantTableBinding,
+        tenant: DataTenantId,
+    ) -> Result<
+        (
+            iceberg::table::Table,
+            PinnedIcebergState,
+            vala_sql::queries::file_list::HotFileCut,
+        ),
+        BifrostCatalogError,
+    > {
+        for _attempt in 1..=3_u8 {
+            let iceberg_a = self.catalog.load_table(&binding.table_ident()).await?;
+            let pinned_a = self.pin_iceberg_snapshot(&iceberg_a, binding).await?;
+            let hot_file_catalog =
+                HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
+            let mut conn = self.postgres.tenant_conn(tenant).await?;
+            let cut = hot_file_catalog
+                .unresolved_for_cut(
+                    &mut conn,
+                    &pinned_a.file_paths,
+                    pinned_a.publication_operation_id,
+                )
+                .await?;
+            conn.commit().await?;
+            let iceberg_b = self.catalog.load_table(&binding.table_ident()).await?;
+            let pinned_b = self.pin_iceberg_snapshot(&iceberg_b, binding).await?;
+            if pinned_a.snapshot_id == pinned_b.snapshot_id
+                && pinned_a.digest() == pinned_b.digest()
+            {
+                return Ok((iceberg_b, pinned_b, cut));
+            }
+        }
+        Err(BifrostCatalogError::UnstableCut { attempts: 3 })
     }
 
     /// Collects and validates the immutable files of one current Iceberg snapshot.
@@ -268,11 +330,24 @@ impl BifrostCatalog {
         let Some(snapshot) = iceberg_table.metadata().current_snapshot() else {
             return Ok(PinnedIcebergState {
                 snapshot_id,
+                publication_operation_id: None,
                 file_paths,
                 files,
                 estimated_bytes,
             });
         };
+        let publication_operation_id = snapshot
+            .summary()
+            .additional_properties
+            .get("forge.operation_id")
+            .map(|value| {
+                uuid::Uuid::parse_str(value).map_err(|_| {
+                    BifrostCatalogError::MetadataMismatch(
+                        "current snapshot has malformed forge.operation_id".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
         let manifests = iceberg_table.manifest_list_reader(snapshot).load().await?;
         for manifest_file in manifests.entries() {
             let manifest = manifest_file.load_manifest(iceberg_table.file_io()).await?;
@@ -314,6 +389,7 @@ impl BifrostCatalog {
         }
         Ok(PinnedIcebergState {
             snapshot_id,
+            publication_operation_id,
             file_paths,
             files,
             estimated_bytes,

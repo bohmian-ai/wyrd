@@ -7,8 +7,20 @@ WITH cursor AS MATERIALIZED (
     SELECT t.*
     FROM vala.forge_tasks t
     WHERE t.state IN ('ready', 'retryable')
+      AND NOT EXISTS (
+          SELECT 1 FROM vala.forge_worker_registry worker
+          WHERE worker.worker_id = $1 AND worker.quarantined
+      )
       AND t.ready_at <= statement_timestamp()
+      AND t.next_eligible_at <= statement_timestamp()
       AND ($11::text[] IS NULL OR t.strategy = ANY($11::text[]))
+      AND (
+          $12::text IS NULL
+          OR t.failed_volume_identity IS NULL
+          OR t.failed_volume_identity <> $12
+          OR statement_timestamp() >= t.next_eligible_at
+             + LEAST(power(2, t.attempt_count) * interval '30 seconds', interval '15 minutes')
+      )
       AND NOT EXISTS (
           SELECT 1
           FROM vala.forge_tasks active
@@ -82,7 +94,8 @@ SELECT c.execution_tenant_id,
        t.estimated_memory_bytes, t.estimated_spill_bytes,
        t.large_task_ceiling_bytes, t.state, t.attempt_id, t.claimed_by,
        t.claim_expires_at, t.watermark_snapshot_id,
-       t.watermark_timestamp_ms, t.evidence, t.ready_at, t.created_at,
+       t.watermark_timestamp_ms, t.evidence, t.attempt_count, t.failure_class,
+       t.next_eligible_at, t.failed_volume_identity, t.ready_at, t.created_at,
        t.updated_at
 FROM claimed t
 JOIN candidate c USING (task_id)

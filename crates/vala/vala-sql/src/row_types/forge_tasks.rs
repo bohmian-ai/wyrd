@@ -60,6 +60,10 @@ pub struct ForgePlanningDemand {
     pub last_source: ForgePlanningDemandSource,
     /// Positive monotonic generation captured for CAS acknowledgement.
     pub generation: i64,
+    /// Snapshot cause most recently acknowledged by a successful maintenance no-op.
+    pub acknowledged_snapshot_id: Option<i64>,
+    /// Retained commit count paired with the acknowledged snapshot cause.
+    pub acknowledged_commit_count: Option<u64>,
 }
 
 /// SQL projection used to validate demand rows before catalog access.
@@ -81,6 +85,10 @@ pub(crate) struct ForgePlanningDemandSqlRow {
     pub last_source: String,
     /// Persisted CAS generation.
     pub generation: i64,
+    /// Persisted acknowledged snapshot cause.
+    pub acknowledged_snapshot_id: Option<i64>,
+    /// Persisted acknowledged retained commit count.
+    pub acknowledged_commit_count: Option<i64>,
 }
 
 impl TryFrom<ForgePlanningDemandSqlRow> for ForgePlanningDemand {
@@ -102,6 +110,14 @@ impl TryFrom<ForgePlanningDemandSqlRow> for ForgePlanningDemand {
                 detail: "Forge planning demand generation must be positive".to_owned(),
             });
         }
+        let acknowledged_commit_count = row
+            .acknowledged_commit_count
+            .map(|value| {
+                u64::try_from(value).map_err(|_| SqlError::InvariantViolation {
+                    detail: "Forge acknowledged commit count must be non-negative".to_owned(),
+                })
+            })
+            .transpose()?;
         Ok(Self {
             data_tenant_id,
             table_ref,
@@ -109,8 +125,24 @@ impl TryFrom<ForgePlanningDemandSqlRow> for ForgePlanningDemand {
             last_requested_at: row.last_requested_at,
             last_source: ForgePlanningDemandSource::from_sql(&row.last_source)?,
             generation: row.generation,
+            acknowledged_snapshot_id: row.acknowledged_snapshot_id,
+            acknowledged_commit_count,
         })
     }
+}
+
+/// Durable consequence of one successful Forge task attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskProgressEffect {
+    /// The task changed its due-condition and requests a fresh planning generation.
+    Progressed,
+    /// The task completed without changing its observed maintenance trigger.
+    NoOpAcknowledged {
+        /// Snapshot identity whose unchanged trigger was acknowledged.
+        snapshot_id: i64,
+        /// Retained commit count observed for the acknowledged snapshot.
+        commit_count: u64,
+    },
 }
 
 /// Validated logical Iceberg table identity stored in separate SQL columns.
@@ -887,6 +919,14 @@ pub struct ForgeTask {
     pub watermark: Option<SnapshotWatermark>,
     /// Publication or cleanup evidence.
     pub evidence: Option<ForgeTaskEvidence>,
+    /// Attempt-consuming failures observed for this task.
+    pub attempt_count: u32,
+    /// Closed persisted failure classification, when the prior attempt failed.
+    pub failure_class: Option<String>,
+    /// Durable time before which this task may not be claimed.
+    pub next_eligible_at: DateTime<Utc>,
+    /// Scratch volume that produced the prior storage-health failure.
+    pub failed_volume_identity: Option<String>,
     /// Next eligibility time.
     pub ready_at: DateTime<Utc>,
     /// Creation time.
@@ -932,6 +972,14 @@ pub struct ForgeTaskClaim {
     pub watermark: Option<SnapshotWatermark>,
     /// Publication or cleanup evidence.
     pub evidence: Option<ForgeTaskEvidence>,
+    /// Attempt-consuming failures observed for this task.
+    pub attempt_count: u32,
+    /// Closed persisted failure classification, when the prior attempt failed.
+    pub failure_class: Option<String>,
+    /// Durable time before which this task may not be claimed.
+    pub next_eligible_at: DateTime<Utc>,
+    /// Scratch volume that produced the prior storage-health failure.
+    pub failed_volume_identity: Option<String>,
     /// Next eligibility time.
     pub ready_at: DateTime<Utc>,
     /// Creation time.
@@ -1047,6 +1095,10 @@ pub(crate) struct ForgeTaskSqlRow {
     watermark_snapshot_id: Option<i64>,
     watermark_timestamp_ms: Option<i64>,
     evidence: Option<serde_json::Value>,
+    attempt_count: i32,
+    failure_class: Option<String>,
+    next_eligible_at: DateTime<Utc>,
+    failed_volume_identity: Option<String>,
     ready_at: DateTime<Utc>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -1109,6 +1161,10 @@ impl TryFrom<ForgeTaskClaimSqlRow> for ForgeTaskClaim {
             claim_expires_at: task.claim_expires_at,
             watermark: task.watermark,
             evidence: task.evidence,
+            attempt_count: task.attempt_count,
+            failure_class: task.failure_class,
+            next_eligible_at: task.next_eligible_at,
+            failed_volume_identity: task.failed_volume_identity,
             ready_at: task.ready_at,
             created_at: task.created_at,
             updated_at: task.updated_at,
@@ -1223,6 +1279,20 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
             .map_err(|_| SqlError::InvariantViolation {
                 detail: "invalid persisted Forge estimates".to_owned(),
             })?;
+        let attempt_count =
+            u32::try_from(row.attempt_count).map_err(|_| SqlError::InvariantViolation {
+                detail: "invalid Forge attempt count".to_owned(),
+            })?;
+        if row.failure_class.as_deref().is_some_and(|class| {
+            !matches!(
+                class,
+                "data_refusal" | "transient_object_store" | "storage_health" | "capacity_refused"
+            )
+        }) {
+            return Err(SqlError::InvariantViolation {
+                detail: "unknown Forge failure class".to_owned(),
+            });
+        }
         Ok(Self {
             task_id: row.task_id,
             data_tenant_id,
@@ -1238,6 +1308,10 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
             claim_expires_at: row.claim_expires_at,
             watermark,
             evidence,
+            attempt_count,
+            failure_class: row.failure_class,
+            next_eligible_at: row.next_eligible_at,
+            failed_volume_identity: row.failed_volume_identity,
             ready_at: row.ready_at,
             created_at: row.created_at,
             updated_at: row.updated_at,

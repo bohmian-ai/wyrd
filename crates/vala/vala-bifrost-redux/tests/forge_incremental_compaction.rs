@@ -710,12 +710,16 @@ mod pg_tests {
         /// Panics when the runtime, Forge, or worker cannot be constructed; these
         /// are test-environment invariants.
         fn sibling_worker_with_retry_timeout(&self, retry_timeout: Duration) -> ForgeWorker {
-            let config = ForgeConfig {
+            self.sibling_worker_with_config(ForgeConfig {
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 iceberg_total_retry_timeout: retry_timeout,
                 ..ForgeConfig::default()
-            };
+            })
+        }
+
+        /// Builds a same-owner worker with caller-selected execution policy.
+        fn sibling_worker_with_config(&self, config: ForgeConfig) -> ForgeWorker {
             let (_publisher, hints) = staging_file_channel(16).expect("sibling hint channel");
             let forge = Arc::new(
                 Forge::new(ForgeBuildConfig {
@@ -2607,12 +2611,46 @@ mod pg_tests {
         fixture.set_live_target_file_size(&table, target).await;
     }
 
+    /// Appends timestamp-distinct snapshots so maintenance fault tests reach a real expiry effect.
+    async fn append_expirable_history(fixture: &Fixture) {
+        fixture.seed_files_at(900, 3, false).await;
+        for index in 900..903 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let table = fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("maintenance history table");
+            fixture.append_seed_manifest(&table, index).await;
+        }
+        fixture.delete_file_list_history().await;
+        make_current_files_right_sized(fixture).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("maintenance history verification table");
+        let current_timestamp = table
+            .metadata()
+            .current_snapshot()
+            .expect("maintenance history current snapshot")
+            .timestamp_ms();
+        assert!(
+            table
+                .metadata()
+                .snapshots()
+                .filter(|snapshot| snapshot.timestamp_ms() < current_timestamp)
+                .count()
+                >= 2,
+            "maintenance history must contain timestamp-distinct expirable ancestors"
+        );
+    }
+
     /// Builds two committed snapshots and claims the resulting periodic maintenance task.
     async fn prepare_maintenance_claim(fixture: &Fixture) -> ForgeTaskClaim {
         fixture.schedule_and_execute().await;
-        fixture.seed_files_at(100, 4, true).await;
-        fixture.schedule_and_execute().await;
         make_current_files_right_sized(fixture).await;
+        append_expirable_history(fixture).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
         let identity = ForgeTaskTableIdentity::new(
             "wyrd-redux",
@@ -2624,7 +2662,12 @@ mod pg_tests {
             .upsert_periodic(fixture.tenant, &identity)
             .await
             .expect("periodic maintenance demand");
-        fixture.plan_and_claim().await
+        let claim = fixture.plan_and_claim().await;
+        assert!(matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+        ));
+        claim
     }
 
     /// A due maintenance trigger leads planning even while a live compaction
@@ -2681,6 +2724,81 @@ mod pg_tests {
             ),
             "a due maintenance trigger must lead planning ahead of a live compaction candidate: {:?}",
             claim.strategy
+        );
+    }
+
+    /// A durable no-op acknowledgement prevents a still-due trigger from starving compaction.
+    #[tokio::test]
+    async fn acknowledged_noop_maintenance_allows_staging_debt_to_converge() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            fixture_snapshot(),
+        )
+        .await;
+        fixture.schedule_and_execute().await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("no-op table");
+        let snapshot = table.metadata().current_snapshot().expect("no-op snapshot");
+        let manifest = format!("{}/metadata/missing.avro", table.metadata().location());
+        let mut no_op_task = fixture.durable_task(
+            ForgeTaskStrategy::SnapshotExpiry,
+            ForgeTaskPlan {
+                version: FORGE_TASK_PAYLOAD_VERSION,
+                inputs: vec![manifest],
+                parameters: serde_json::json!({"kind":"maintenance","trigger_commit_count":0}),
+            },
+            219,
+        );
+        no_op_task.base_snapshot_id = snapshot.snapshot_id();
+        ForgeTasks::new(fixture.operator_pool.clone())
+            .enqueue(&no_op_task)
+            .await
+            .expect("no-op task");
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("no-op claim")
+            .expect("no-op task claim");
+        fixture
+            .sibling_worker_with_config(ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
+                snapshot_retention: Duration::from_hours(24 * 365),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            })
+            .execute_claim(claim, &CancellationToken::new())
+            .await
+            .expect("production no-op settlement");
+        fixture.seed_files_at(500, 4, true).await;
+
+        let mut remaining = 4_i64;
+        for _ in 0..4 {
+            fixture.schedule_and_execute().await;
+            remaining = sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND NOT compacted")
+                .bind(fixture.tenant.as_uuid())
+                .bind(&fixture.binding.logical_namespace)
+                .bind(&fixture.binding.table_name)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("remaining staging debt");
+            if remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            remaining, 0,
+            "acknowledged no-op must not starve staging debt"
         );
     }
 
@@ -2783,6 +2901,7 @@ mod pg_tests {
             fixture.append_seed_manifest(&table, index).await;
         }
         fixture.delete_file_list_history().await;
+        make_current_files_right_sized(&fixture).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
         tasks
             .upsert_periodic(fixture.tenant, &identity)
@@ -3154,7 +3273,10 @@ mod pg_tests {
         ] {
             assert_maintenance_authority_loss(expiry_submission, loss).await;
         }
-        assert_maintenance_shutdown_completes_through(expiry_submission).await;
+        Box::pin(assert_maintenance_shutdown_completes_through(
+            expiry_submission,
+        ))
+        .await;
     }
 
     /// Stops one maintenance boundary on genuine authority loss with no durable effect.
@@ -3313,6 +3435,7 @@ mod pg_tests {
     async fn assert_maintenance_shutdown_completes_through(expiry_submission: bool) {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 ..ForgeConfig::default()
@@ -3395,13 +3518,13 @@ mod pg_tests {
     /// Manifest submission stops before expiry under claim, lease, and shutdown loss.
     #[tokio::test]
     async fn maintenance_manifest_submission_cancellation_matrix_is_effect_ordered() {
-        assert_maintenance_boundary_loss(false).await;
+        Box::pin(assert_maintenance_boundary_loss(false)).await;
     }
 
     /// Expiry submission preserves only its Prepared evidence under every cancellation source.
     #[tokio::test]
     async fn maintenance_expiry_submission_cancellation_matrix_is_effect_ordered() {
-        assert_maintenance_boundary_loss(true).await;
+        Box::pin(assert_maintenance_boundary_loss(true)).await;
     }
 
     /// A manifest commit that outlives its retry timeout retains the claim for recovery.
@@ -3421,6 +3544,7 @@ mod pg_tests {
     async fn maintenance_commit_timeout_retains_claim_for_recovery() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 ..ForgeConfig::default()
@@ -3467,6 +3591,7 @@ mod pg_tests {
     async fn maintenance_accepted_then_cancel_recovers_without_duplicate_catalog_effect() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 ..ForgeConfig::default()
@@ -3828,6 +3953,7 @@ mod pg_tests {
     async fn scheduled_maintenance_deletes_only_evidenced_expired_objects() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 ..ForgeConfig::default()
@@ -3838,9 +3964,8 @@ mod pg_tests {
         )
         .await;
         fixture.schedule_and_execute().await;
-        fixture.seed_files_at(100, 4, true).await;
-        fixture.schedule_and_execute().await;
         make_current_files_right_sized(&fixture).await;
+        append_expirable_history(&fixture).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         let identity = ForgeTaskTableIdentity::new(
@@ -4717,6 +4842,7 @@ mod pg_tests {
             .try_acquire_rewrite(vala_bifrost_redux::resources::ForgeRewriteRequest {
                 memory_bytes: plan.elastic_memory_bytes,
                 scratch_bytes: plan.scratch_limit_bytes,
+                reader_permits: u16::try_from(plan.effective_cpu).unwrap_or(u16::MAX),
             })
             .expect("test owner occupies all Forge resources");
         let claim = fixture.plan_and_claim().await;
@@ -4970,6 +5096,7 @@ mod pg_tests {
     async fn worker_post_effect_shutdown_retains_claim_via_settlement() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 ..ForgeConfig::default()

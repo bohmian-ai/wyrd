@@ -88,6 +88,8 @@ pub struct ForgePlanCandidate {
     pub strategy: ForgeTaskStrategy,
     /// Sorted, duplicate-free immutable input identities.
     pub inputs: Vec<String>,
+    /// Per-input bytes aligned with `inputs` for deterministic capacity splitting.
+    pub input_bytes: Vec<u64>,
     /// Estimated total input bytes.
     pub bytes: u64,
     /// Planned bounded parallelism.
@@ -98,6 +100,76 @@ pub struct ForgePlanCandidate {
     pub spill_bytes: u64,
     /// Stable strategy parameters.
     pub parameters: serde_json::Value,
+}
+
+/// Complete streaming-shape resource envelope persisted for one Forge task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForgeTaskEnvelope {
+    /// Memory reserved for concurrently decoded input batches.
+    pub(crate) decoded_input_bytes: u64,
+    /// Disposable scratch available to `DataFusion` sort spill.
+    pub(crate) sort_spill_bytes: u64,
+    /// Fixed Parquet encoder working set.
+    pub(crate) encoder_buffer_bytes: u64,
+    /// Fixed bounded upload buffer.
+    pub(crate) upload_chunk_bytes: u64,
+    /// Aggregate attempt scratch, including spill and pending output files.
+    pub(crate) scratch_bytes: u64,
+    /// Concurrent source readers acquired with the envelope.
+    pub(crate) reader_permits: u16,
+}
+
+impl ForgeTaskEnvelope {
+    /// Sizes a rewrite from concurrent streaming terms and live capacity.
+    ///
+    /// Total input bytes size disposable scratch only. Resident terms are
+    /// proportionally bounded by the governor ceiling so small topologies can
+    /// reduce readers and buffers without deriving memory from input volume.
+    #[must_use]
+    pub(crate) fn for_rewrite(
+        total_input_bytes: u64,
+        max_concurrent_reads: usize,
+        capacity: ForgeCapacity,
+    ) -> Self {
+        let budget = capacity.max_memory_bytes.max(1);
+        let upload = (super::rewrite::UPLOAD_CHUNK_BYTES as u64).min((budget / 8).max(1));
+        let encoder =
+            (super::rewrite::ENCODER_BUFFER_ALLOWANCE_BYTES as u64).min((budget / 4).max(1));
+        let decoded_budget = budget.saturating_sub(upload).saturating_sub(encoder).max(1);
+        let target_per_reader = (2 * super::rewrite::DECODED_BATCH_TARGET_BYTES) as u64;
+        let capacity_readers =
+            usize::try_from((decoded_budget / target_per_reader).max(1)).unwrap_or(usize::MAX);
+        let reader_permits = u16::try_from(max_concurrent_reads.max(1).min(capacity_readers))
+            .unwrap_or(u16::MAX)
+            .min(capacity.max_parallelism)
+            .max(1);
+        let decoded_input_bytes = u64::from(reader_permits)
+            .saturating_mul(target_per_reader)
+            .min(decoded_budget);
+        let scratch_term = total_input_bytes
+            .max(super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES.saturating_mul(16))
+            .min((capacity.max_spill_bytes / 2).max(1));
+        let sort_spill_bytes = scratch_term;
+        Self {
+            decoded_input_bytes,
+            sort_spill_bytes,
+            encoder_buffer_bytes: encoder,
+            upload_chunk_bytes: upload,
+            scratch_bytes: scratch_term
+                .saturating_add(scratch_term)
+                .max(1)
+                .min(capacity.max_spill_bytes),
+            reader_permits,
+        }
+    }
+
+    /// Returns resident memory, excluding disposable scratch.
+    #[must_use]
+    pub(crate) const fn memory_bytes(self) -> u64 {
+        self.decoded_input_bytes
+            .saturating_add(self.encoder_buffer_bytes)
+            .saturating_add(self.upload_chunk_bytes)
+    }
 }
 
 impl ForgePlanCandidate {
@@ -112,18 +184,27 @@ impl ForgePlanCandidate {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Invariant`] when the selected input bytes overflow
-    /// `u64` or the selected file count exceeds the durable parallelism domain.
+    /// Returns [`ForgeError::Invariant`] when selected input bytes overflow
+    /// `u64`, concurrency is zero, or the bounded read width exceeds the
+    /// durable parallelism domain.
     pub(crate) fn from_live_group(
         group: &super::right_size::IcebergRewriteGroup,
+        max_concurrent_reads: usize,
+        capacity: ForgeCapacity,
     ) -> Result<Self, ForgeError> {
-        let mut inputs = group
+        if max_concurrent_reads == 0 {
+            return Err(ForgeError::Invariant {
+                detail: "Forge live-group concurrency must be positive".to_owned(),
+            });
+        }
+        let mut input_terms = group
             .files()
             .iter()
-            .map(|file| file.catalog_path().to_owned())
+            .map(|file| (file.catalog_path().to_owned(), file.file_size_bytes()))
             .collect::<Vec<_>>();
-        inputs.sort();
-        inputs.dedup();
+        input_terms.sort_by(|left, right| left.0.cmp(&right.0));
+        input_terms.dedup_by(|left, right| left.0 == right.0);
+        let (inputs, input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
         let bytes = group
             .files()
             .iter()
@@ -133,14 +214,17 @@ impl ForgePlanCandidate {
             .ok_or_else(|| ForgeError::Invariant {
                 detail: "Forge group bytes overflow".to_owned(),
             })?;
+        let envelope = ForgeTaskEnvelope::for_rewrite(bytes, max_concurrent_reads, capacity);
         Ok(Self {
             strategy: ForgeTaskStrategy::SmallFiles,
-            parallelism: u16::try_from(group.files().len()).map_err(|_| ForgeError::Invariant {
-                detail: "Forge planned parallelism exceeds u16".to_owned(),
-            })?,
-            memory_bytes: bytes,
-            spill_bytes: bytes,
+            parallelism: envelope
+                .reader_permits
+                .min(u16::try_from(group.files().len()).unwrap_or(u16::MAX))
+                .max(1),
+            memory_bytes: envelope.memory_bytes(),
+            spill_bytes: envelope.scratch_bytes,
             inputs,
+            input_bytes,
             bytes,
             parameters: serde_json::json!({"kind":"live_rewrite"}),
         })
@@ -225,11 +309,74 @@ impl ForgePlanner {
         &self,
         snapshot: &ForgeTableSnapshot,
     ) -> Result<Vec<PlannedForgeTask>, ForgeError> {
-        snapshot
-            .candidates
-            .iter()
-            .map(|candidate| self.plan_candidate(snapshot.snapshot_id, candidate))
-            .collect()
+        let mut planned = Vec::new();
+        for candidate in &snapshot.candidates {
+            for split in self.split_candidate(candidate)? {
+                planned.push(self.plan_candidate(snapshot.snapshot_id, &split)?);
+            }
+        }
+        Ok(planned)
+    }
+
+    /// Splits an oversized multi-file candidate into stable contiguous fitting groups.
+    ///
+    /// A singleton is preserved for ordinary/large-lane classification. Splits
+    /// retain sorted path order and recompute the streaming envelope from each
+    /// group's exact bytes, so total input never becomes resident memory.
+    ///
+    /// # Errors
+    /// Returns an invariant error when per-input sizes are missing or misaligned.
+    fn split_candidate(
+        &self,
+        candidate: &ForgePlanCandidate,
+    ) -> Result<Vec<ForgePlanCandidate>, ForgeError> {
+        if candidate.inputs.len() != candidate.input_bytes.len()
+            || candidate.input_bytes.contains(&0)
+        {
+            return Err(ForgeError::Invariant {
+                detail: "Forge candidate paths and input byte terms must align".to_owned(),
+            });
+        }
+        if candidate.inputs.len() <= 1
+            || (candidate.inputs.len() <= self.capacity.max_files as usize
+                && candidate.bytes <= self.capacity.max_bytes)
+        {
+            return Ok(vec![candidate.clone()]);
+        }
+        let mut groups = Vec::new();
+        let mut start = 0;
+        while start < candidate.inputs.len() {
+            let mut end = start;
+            let mut bytes = 0_u64;
+            while end < candidate.inputs.len()
+                && end - start < self.capacity.max_files as usize
+                && bytes.saturating_add(candidate.input_bytes[end]) <= self.capacity.max_bytes
+            {
+                bytes = bytes.saturating_add(candidate.input_bytes[end]);
+                end += 1;
+            }
+            if end == start {
+                end += 1;
+                bytes = candidate.input_bytes[start];
+            }
+            let envelope = ForgeTaskEnvelope::for_rewrite(
+                bytes,
+                usize::from(candidate.parallelism).min(end - start),
+                self.capacity,
+            );
+            groups.push(ForgePlanCandidate {
+                strategy: candidate.strategy,
+                inputs: candidate.inputs[start..end].to_vec(),
+                input_bytes: candidate.input_bytes[start..end].to_vec(),
+                bytes,
+                parallelism: envelope.reader_permits,
+                memory_bytes: envelope.memory_bytes(),
+                spill_bytes: envelope.scratch_bytes,
+                parameters: candidate.parameters.clone(),
+            });
+            start = end;
+        }
+        Ok(groups)
     }
 
     /// Validates one candidate's resource estimates against this planner's ceilings.
@@ -282,6 +429,7 @@ impl ForgePlanner {
             || candidate.parallelism == 0
             || candidate.memory_bytes == 0
             || candidate.spill_bytes == 0
+            || candidate.inputs.len() != candidate.input_bytes.len()
             || candidate.inputs.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(ForgeError::Invariant {
@@ -359,6 +507,7 @@ mod tests {
         ForgePlanCandidate {
             strategy: ForgeTaskStrategy::SmallFiles,
             inputs: vec!["a.parquet".to_owned()],
+            input_bytes: vec![50],
             bytes: 50,
             parallelism: 1,
             memory_bytes: 40,
@@ -372,9 +521,6 @@ mod tests {
     fn planner_classifies_all_capacity_dimensions_and_singleton_lane() {
         let owner = ForgePlanner::new(capacity());
         for mutate in [
-            |c: &mut ForgePlanCandidate| {
-                c.inputs = (0..5).map(|i| format!("{i}.parquet")).collect();
-            },
             |c: &mut ForgePlanCandidate| c.bytes = 201,
             |c: &mut ForgePlanCandidate| c.parallelism = 3,
             |c: &mut ForgePlanCandidate| c.memory_bytes = 81,
@@ -402,6 +548,7 @@ mod tests {
 
         let mut multi_file_overflow = candidate();
         multi_file_overflow.inputs = vec!["a.parquet".to_owned(), "b.parquet".to_owned()];
+        multi_file_overflow.input_bytes = vec![75, 75];
         multi_file_overflow.bytes = 150;
         let tasks = owner
             .plan_table(&ForgeTableSnapshot {
@@ -409,7 +556,114 @@ mod tests {
                 candidates: vec![multi_file_overflow],
             })
             .expect("multi-file overflow plan");
-        assert_eq!(tasks[0].capacity, ForgePlanCapacity::Unschedulable);
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.capacity == ForgePlanCapacity::Ordinary)
+        );
+        assert_ne!(tasks[0].plan_hash, tasks[1].plan_hash);
+    }
+
+    /// A production-shaped 51-file group is admitted from bounded streaming terms.
+    #[test]
+    fn fifty_one_file_group_schedules_with_bounded_streaming_envelope() {
+        let capacity = ForgeCapacity {
+            max_files: 64,
+            max_bytes: 4 * 1024 * 1024 * 1024,
+            max_parallelism: 4,
+            max_memory_bytes: 512 * 1024 * 1024,
+            max_spill_bytes: 8 * 1024 * 1024 * 1024,
+            max_large_task_bytes: 8 * 1024 * 1024 * 1024,
+        };
+        let input_bytes = vec![64 * 1024 * 1024; 51];
+        let bytes = input_bytes.iter().sum();
+        let envelope = ForgeTaskEnvelope::for_rewrite(bytes, 4, capacity);
+        let candidate = ForgePlanCandidate {
+            strategy: ForgeTaskStrategy::SmallFiles,
+            inputs: (0..51).map(|index| format!("{index:02}.parquet")).collect(),
+            input_bytes,
+            bytes,
+            parallelism: envelope.reader_permits,
+            memory_bytes: envelope.memory_bytes(),
+            spill_bytes: envelope.scratch_bytes,
+            parameters: serde_json::json!({"kind":"live_rewrite"}),
+        };
+        let first = ForgePlanner::new(capacity)
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 9,
+                candidates: vec![candidate.clone()],
+            })
+            .expect("51-file group plans");
+        let second = ForgePlanner::new(capacity)
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 9,
+                candidates: vec![candidate],
+            })
+            .expect("repeat plan is deterministic");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].capacity, ForgePlanCapacity::Ordinary);
+        assert_eq!(first[0].plan_hash, second[0].plan_hash);
+        assert!(first[0].estimates.memory_bytes < first[0].estimates.bytes);
+    }
+
+    /// Live-group admission uses execution concurrency rather than file count.
+    #[test]
+    fn live_group_parallelism_is_bounded_by_concurrent_reads() {
+        let group = super::super::right_size::IcebergRewriteGroup {
+            files: (0..20)
+                .map(|index| {
+                    super::super::right_size::candidate_file_for_test(
+                        &format!("{index:02}.parquet"),
+                        10,
+                    )
+                })
+                .collect(),
+            reason: super::super::right_size::IcebergRewriteReason::Undersized,
+        };
+        let candidate = ForgePlanCandidate::from_live_group(
+            &group,
+            4,
+            ForgeCapacity {
+                max_files: 64,
+                max_bytes: u64::MAX,
+                max_parallelism: 4,
+                max_memory_bytes: 512 * 1024 * 1024,
+                max_spill_bytes: 1024 * 1024 * 1024,
+                max_large_task_bytes: u64::MAX,
+            },
+        )
+        .expect("bounded live group must produce a candidate");
+        assert_eq!(candidate.parallelism, 4);
+    }
+
+    /// Live-group persisted readers equal the readers used to size decoded memory.
+    #[test]
+    fn live_group_parallelism_scales_to_memory_capacity() {
+        let group = super::super::right_size::IcebergRewriteGroup {
+            files: (0..8)
+                .map(|index| {
+                    super::super::right_size::candidate_file_for_test(
+                        &format!("{index:02}.parquet"),
+                        10,
+                    )
+                })
+                .collect(),
+            reason: super::super::right_size::IcebergRewriteReason::Undersized,
+        };
+        let capacity = ForgeCapacity {
+            max_files: 64,
+            max_bytes: u64::MAX,
+            max_parallelism: 8,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_spill_bytes: 1024 * 1024 * 1024,
+            max_large_task_bytes: u64::MAX,
+        };
+        let candidate = ForgePlanCandidate::from_live_group(&group, 8, capacity)
+            .expect("constrained live group candidate");
+        let envelope = ForgeTaskEnvelope::for_rewrite(candidate.bytes, 8, capacity);
+        assert_eq!(candidate.parallelism, envelope.reader_permits);
+        assert_eq!(candidate.memory_bytes, envelope.memory_bytes());
     }
 
     /// Configuration conversion copies every field and rejects invalid relationships.

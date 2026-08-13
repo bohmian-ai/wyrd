@@ -166,7 +166,7 @@ pub(crate) const ROW_GROUP_FLUSH_BYTES: usize = 32 * 1024 * 1024;
 /// Fixed encoder working-set reservation held before an output writer exists.
 pub(crate) const ENCODER_BUFFER_ALLOWANCE_BYTES: usize = 2 * ROW_GROUP_FLUSH_BYTES;
 /// Target decoded batch bytes used by the envelope and footer refusal rule.
-pub(crate) const DECODED_BATCH_TARGET_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const DECODED_BATCH_TARGET_BYTES: usize = 16 * 1024 * 1024;
 /// Total upload openings permitted for one sealed output in one attempt.
 const OUTPUT_UPLOAD_ATTEMPTS: usize = 2;
 /// Fixed working set every rewrite plan needs regardless of input size.
@@ -233,6 +233,7 @@ impl ForgeRewriteRequest {
         Ok(Self {
             memory_bytes: rewrite_working_set_bytes(estimates.memory_bytes, capacity)?,
             scratch_bytes: estimates.spill_bytes,
+            reader_permits: estimates.parallelism,
         })
     }
 
@@ -256,13 +257,17 @@ impl ForgeRewriteRequest {
         group: &super::right_size::IcebergRewriteGroup,
         capacity: ForgeCapacity,
     ) -> Result<Self, ForgeError> {
-        let candidate =
-            ForgePlanCandidate::from_live_group(group, usize::from(capacity.max_parallelism))?;
+        let candidate = ForgePlanCandidate::from_live_group(
+            group,
+            usize::from(capacity.max_parallelism),
+            capacity,
+        )?;
         ForgePlanner::new(capacity)
             .validate_candidate_estimates(candidate.memory_bytes, candidate.spill_bytes)?;
         Ok(Self {
             memory_bytes: rewrite_working_set_bytes(candidate.memory_bytes, capacity)?,
             scratch_bytes: candidate.spill_bytes,
+            reader_permits: candidate.parallelism,
         })
     }
 }
@@ -2169,8 +2174,7 @@ pub struct ForgeRewriteRuntime {
 impl ForgeRewriteRuntime {
     /// Construct a runtime rooted under the pod-owned spill directory.
     ///
-    /// Only stale `forge-runtime-*` directories beneath the supplied root are
-    /// removed. The root and unrelated entries are never deleted.
+    /// The root is created without listing or deleting attempt children.
     ///
     /// # Errors
     ///
@@ -2193,37 +2197,16 @@ impl ForgeRewriteRuntime {
         )
     }
 
-    /// Cleans stale owned children once while constructing the Forge owner.
+    /// Creates the pod scratch root without inferring attempt ownership.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Parquet`] when the root cannot be created, read,
-    /// or cleaned before any worker becomes active.
+    /// Returns [`ForgeError::ScratchIo`] when the root cannot be created.
     pub(crate) fn prepare_root(pod_spill_root: &Path) -> Result<(), ForgeError> {
-        std::fs::create_dir_all(pod_spill_root).map_err(|error| ForgeError::Parquet {
+        std::fs::create_dir_all(pod_spill_root).map_err(|error| ForgeError::ScratchIo {
+            kind: error.kind(),
             detail: error.to_string(),
-        })?;
-        for entry in std::fs::read_dir(pod_spill_root).map_err(|error| ForgeError::Parquet {
-            detail: error.to_string(),
-        })? {
-            let entry = entry.map_err(|error| ForgeError::Parquet {
-                detail: error.to_string(),
-            })?;
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with("forge-runtime-")
-                && entry
-                    .file_type()
-                    .map_err(|error| ForgeError::Parquet {
-                        detail: error.to_string(),
-                    })?
-                    .is_dir()
-            {
-                std::fs::remove_dir_all(entry.path()).map_err(|error| ForgeError::Parquet {
-                    detail: error.to_string(),
-                })?;
-            }
-        }
-        Ok(())
+        })
     }
 
     /// Creates one attempt runtime without touching concurrent sibling directories.
@@ -2251,14 +2234,16 @@ impl ForgeRewriteRuntime {
                         .to_owned(),
             });
         }
-        std::fs::create_dir_all(pod_spill_root).map_err(|error| ForgeError::Parquet {
+        std::fs::create_dir_all(pod_spill_root).map_err(|error| ForgeError::ScratchIo {
+            kind: error.kind(),
             detail: error.to_string(),
         })?;
         let prefix = format!("forge-runtime-{task_id}-{attempt_id}-");
         let spill_dir = tempfile::Builder::new()
             .prefix(&prefix)
             .tempdir_in(pod_spill_root)
-            .map_err(|error| ForgeError::Parquet {
+            .map_err(|error| ForgeError::ScratchIo {
+                kind: error.kind(),
                 detail: error.to_string(),
             })?;
         let runtime = RuntimeEnvBuilder::new()
@@ -2383,6 +2368,7 @@ mod tests {
             crate::resources::ForgeRewriteRequest {
                 memory_bytes: 1_024 * 1_024,
                 scratch_bytes: 1_024 * 1_024,
+                reader_permits: 1,
             },
             root.path(),
             Uuid::nil(),
@@ -2476,9 +2462,12 @@ mod tests {
         let direct = ForgeRewriteRequest::from_live_group(&group, capacity)
             .expect("live group must form an exact request");
 
-        let candidate =
-            ForgePlanCandidate::from_live_group(&group, usize::from(capacity.max_parallelism))
-                .expect("group must map to a candidate");
+        let candidate = ForgePlanCandidate::from_live_group(
+            &group,
+            usize::from(capacity.max_parallelism),
+            capacity,
+        )
+        .expect("group must map to a candidate");
         let planned = ForgePlanner::new(capacity)
             .plan_table(&super::super::planner::ForgeTableSnapshot {
                 snapshot_id: 1,
@@ -2491,10 +2480,10 @@ mod tests {
         assert_eq!(direct, persisted);
         assert_eq!(
             u64::try_from(direct.memory_bytes).ok(),
-            Some(REWRITE_WORKING_SET_FLOOR_BYTES),
-            "a small group leases exactly the executable working set"
+            Some(planned[0].estimates.memory_bytes),
+            "a small group leases its persisted streaming envelope"
         );
-        assert_eq!(direct.scratch_bytes, 800);
+        assert_eq!(direct.scratch_bytes, planned[0].estimates.spill_bytes);
         assert_ne!(
             u64::try_from(direct.memory_bytes).ok(),
             Some(capacity.max_memory_bytes),
@@ -2513,7 +2502,7 @@ mod tests {
 
     /// Runtime startup removes only stale Forge-owned child directories.
     #[test]
-    fn rewrite_runtime_cleans_owned_spill_child() {
+    fn rewrite_runtime_preserves_unscoped_spill_children() {
         let root = tempfile::tempdir().expect("test spill root must be created");
         let stale = root.path().join("forge-runtime-stale");
         let unrelated = root.path().join("scribe-wal");
@@ -2523,7 +2512,7 @@ mod tests {
             ForgeRewriteRuntime::new(Arc::new(GreedyMemoryPool::new(1_024)), root.path(), 1_024)
                 .expect("bounded rewrite runtime must be created");
         let active = runtime.spill_path().to_path_buf();
-        assert!(!stale.exists());
+        assert!(stale.exists());
         assert!(unrelated.exists());
         assert!(active.exists());
         drop(runtime);

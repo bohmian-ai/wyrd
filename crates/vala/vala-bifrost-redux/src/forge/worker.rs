@@ -25,7 +25,7 @@ use vala_sql::row_types::forge_tasks::{
     ForgeClaimStrategy, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
     ForgePreparedTaskClaim, ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskState,
     ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES,
-    SnapshotWatermark,
+    SnapshotWatermark, TaskProgressEffect,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -1218,77 +1218,24 @@ impl ForgeWorker {
     /// Applies the supervised slot's single in-execution cooperative-shutdown
     /// settlement to a failed [`Self::execute_claim`] result.
     ///
-    /// This is the one owner of the in-execution release decision for the whole
-    /// claim lifecycle (`execute_claim` is its production caller): the baseline
-    /// per-checkpoint release inside `execute_fenced` was migrated here so a
-    /// checkpoint only classifies the cancellation and the claim owner decides
-    /// retain-vs-release before recording terminal telemetry. A pre-effect
-    /// [`ForgeError::Shutdown`] fired before any
-    /// durable side effect, so the claim drains through the single
-    /// [`Self::release_cancelled_claim`] seam; its SQL guard matches only
-    /// `claimed`/`running` rows for this owner and attempt, so a claim that has
-    /// since advanced to `prepared` no-matches and is conservatively retained
-    /// for lease-expiry recovery. Every other outcome — a post-effect
-    /// [`ForgeError::ShutdownRetained`] whose durable effect already committed,
-    /// or any genuine execution error — is retained here for evidence-based and
-    /// lease-expiry recovery, never released. A transiently failed release logs
-    /// and falls back to the same retention path.
+    /// Executes one planted claim through the production settlement path.
     ///
-    /// # Panics
-    ///
-    /// Never panics; a release failure is logged and the claim is retained.
-    async fn settle_cancelled_claim(
-        &self,
-        task_id: Uuid,
-        attempt_id: Option<Uuid>,
-        error: &ForgeError,
-    ) {
-        match error {
-            ForgeError::Shutdown | ForgeError::Capacity { .. } => {
-                if let Some(attempt) = attempt_id
-                    && let Err(release_error) = self.release_cancelled_claim(task_id, attempt).await
-                {
-                    tracing::warn!(worker = %self.owner, task_id = %task_id, error = %release_error, "Forge claim shutdown release failed; durable state retained for lease recovery");
-                }
-            }
-            error => {
-                tracing::warn!(worker = %self.owner, error = %error, "Forge task execution stopped; durable state retained for recovery");
-            }
-        }
-    }
-
-    /// Executes one planted claim and applies the supervised slot's cooperative
-    /// shutdown settlement, exactly as [`Self::run_slot`] does after
+    /// This narrow seam lets integration tests prove pre-effect retry and
+    /// post-effect retention without adding a second settlement after
     /// [`Self::execute_claim`].
-    ///
-    /// This narrow seam lets an integration test drive the migrated single
-    /// release decision ([`Self::settle_cancelled_claim`]) directly against one
-    /// claim — proving pre-effect drain-to-`retryable` and post-effect retention
-    /// — without standing up the full supervised [`Self::run`] loop and its
-    /// claim-fair scheduling. It composes the same production methods in the
-    /// same order the slot uses, so it exercises the real seam rather than a
-    /// reimplementation.
     ///
     /// # Errors
     ///
     /// Returns the underlying [`Self::execute_claim`] result unchanged: a
-    /// pre-effect cancellation still surfaces [`ForgeError::Shutdown`] after the
-    /// claim has been drained, and a post-effect cancellation surfaces
-    /// [`ForgeError::ShutdownRetained`] with the claim retained.
+    /// pre-effect cancellation still surfaces [`ForgeError::Shutdown`], and a
+    /// post-effect cancellation surfaces [`ForgeError::ShutdownRetained`].
     #[cfg(feature = "test-support")]
     pub async fn execute_and_settle_claim_for_test(
         &self,
         claim: ForgeTaskClaim,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        let task_id = claim.task_id;
-        let attempt_id = claim.attempt_id;
-        let result = self.execute_claim(claim, shutdown).await;
-        if let Err(error) = &result {
-            self.settle_cancelled_claim(task_id, attempt_id, error)
-                .await;
-        }
-        result
+        self.execute_claim(claim, shutdown).await
     }
 
     /// Executes one exact claimed task through validation, table fencing,
@@ -1541,6 +1488,8 @@ impl ForgeWorker {
             operation_stop.clone(),
             operation_stop.clone(),
         )?;
+        let progressed = evidence.committed_snapshot_id != Some(task.base_snapshot_id)
+            || evidence.deleted_candidate_count > 0;
         let reconciliation = self
             .resume_prepared_effect(
                 task,
@@ -1574,6 +1523,12 @@ impl ForgeWorker {
                 &task.table_ref,
                 attempt,
                 &lease,
+                task_progress_effect(
+                    &ForgeClaimStrategy::Known(task.strategy),
+                    task.base_snapshot_id,
+                    &task.plan.parameters,
+                    progressed,
+                ),
             )
             .await
         }
@@ -1785,9 +1740,19 @@ impl ForgeWorker {
             .ok_or_else(|| ForgeError::Invariant {
                 detail: "Forge task parameters must be an object".to_owned(),
             })?;
-        if parameters.len() != 1
-            || parameters.get("kind").and_then(serde_json::Value::as_str) != Some(expected_kind)
-        {
+        let valid_parameters = parameters.get("kind").and_then(serde_json::Value::as_str)
+            == Some(expected_kind)
+            && match task.strategy {
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
+                    parameters.len() == 2
+                        && parameters
+                            .get("trigger_commit_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some()
+                }
+                _ => parameters.len() == 1,
+            };
+        if !valid_parameters {
             return Err(ForgeError::Invariant {
                 detail: "Forge task parameters do not match the strategy contract".to_owned(),
             });
@@ -2052,6 +2017,13 @@ impl ForgeWorker {
                     &claim.table_ref,
                     attempt,
                     lease,
+                    task_progress_effect(
+                        &claim.strategy,
+                        claim.base_snapshot_id,
+                        &claim.plan.parameters,
+                        evidence.committed_snapshot_id != Some(claim.base_snapshot_id)
+                            || evidence.deleted_candidate_count > 0,
+                    ),
                 )
                 .await
             }
@@ -2936,6 +2908,13 @@ impl ForgeWorker {
                     next: ForgeTaskState::Succeeded,
                 },
                 &claim.table_ref,
+                task_progress_effect(
+                    &claim.strategy,
+                    claim.base_snapshot_id,
+                    &claim.plan.parameters,
+                    evidence.committed_snapshot_id != Some(claim.base_snapshot_id)
+                        || evidence.deleted_candidate_count > 0,
+                ),
                 &task_event(
                     claim.task_id,
                     ForgeTaskState::Succeeded,
@@ -2965,6 +2944,7 @@ impl ForgeWorker {
         table_ref: &ForgeTaskTableIdentity,
         attempt: Uuid,
         lease: &ForgeLease,
+        progress_effect: TaskProgressEffect,
     ) -> Result<(), ForgeError> {
         let mut terminal = self
             .forge
@@ -2984,6 +2964,7 @@ impl ForgeWorker {
                     next: ForgeTaskState::Succeeded,
                 },
                 table_ref,
+                progress_effect,
                 &task_event(
                     task_id,
                     ForgeTaskState::Succeeded,
@@ -3074,8 +3055,14 @@ impl ForgeWorker {
                 if class == ForgeFailureClass::DataRefusal
                     || attempts.saturating_add(1) >= ATTEMPT_BOUND
                 {
-                    self.terminal_failure(claim, attempt, class, error.to_string())
-                        .await
+                    self.terminal_failure(
+                        claim,
+                        attempt,
+                        class,
+                        volume.as_ref().map(ScratchVolumeIdentity::as_str),
+                        error.to_string(),
+                    )
+                    .await
                 } else {
                     self.tasks
                         .retry_failure(
@@ -3102,6 +3089,7 @@ impl ForgeWorker {
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         class: ForgeFailureClass,
+        failed_volume_identity: Option<&str>,
         detail: String,
     ) -> Result<(), ForgeError> {
         let mut conn = self
@@ -3112,7 +3100,12 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .qualify_terminal_failure(&mut conn, claim.task_id, class.as_str(), None)
+            .qualify_terminal_failure(
+                &mut conn,
+                claim.task_id,
+                class.as_str(),
+                failed_volume_identity,
+            )
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
@@ -3247,6 +3240,14 @@ impl ForgeWorker {
     ///
     /// Returns invalid configuration when the claim TTL exceeds `u32`.
     fn claim_limits(&self) -> Result<ForgeClaimLimits, ForgeError> {
+        let governor =
+            self.forge
+                .core
+                .resources
+                .snapshot()
+                .map_err(|error| ForgeError::Capacity {
+                    detail: error.to_string(),
+                })?;
         Ok(ForgeClaimLimits {
             max_active_per_tenant: u32::try_from(self.config.per_tenant_active_cap)
                 .unwrap_or(u32::MAX),
@@ -3257,9 +3258,18 @@ impl ForgeWorker {
             )?,
             max_files: self.capacity.max_files,
             max_bytes: self.capacity.max_bytes,
-            max_parallelism: self.capacity.max_parallelism,
-            max_memory_bytes: self.capacity.max_memory_bytes,
-            max_spill_bytes: self.capacity.max_spill_bytes,
+            max_parallelism: self
+                .capacity
+                .max_parallelism
+                .min(u16::try_from(governor.plan.effective_cpu).unwrap_or(u16::MAX)),
+            max_memory_bytes: self
+                .capacity
+                .max_memory_bytes
+                .min(u64::try_from(governor.plan.elastic_memory_bytes).unwrap_or(u64::MAX)),
+            max_spill_bytes: self
+                .capacity
+                .max_spill_bytes
+                .min(governor.plan.scratch_limit_bytes),
             max_large_task_bytes: self.capacity.max_large_task_bytes,
         })
     }
@@ -3294,6 +3304,26 @@ fn task_event(task_id: Uuid, state: ForgeTaskState, reason: &str) -> AuditEvent 
         AuditResult::Success,
         reason.to_owned(),
     )
+}
+
+/// Maps execution evidence onto the durable planning consequence for settlement.
+#[must_use]
+fn task_progress_effect(
+    strategy: &ForgeClaimStrategy,
+    base_snapshot_id: i64,
+    parameters: &serde_json::Value,
+    progressed: bool,
+) -> TaskProgressEffect {
+    if progressed || strategy != &ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) {
+        return TaskProgressEffect::Progressed;
+    }
+    TaskProgressEffect::NoOpAcknowledged {
+        snapshot_id: base_snapshot_id,
+        commit_count: parameters
+            .get("trigger_commit_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    }
 }
 
 #[cfg(test)]

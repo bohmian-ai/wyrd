@@ -108,6 +108,37 @@ mod pg_tests {
         }
     }
 
+    /// Persisted envelope terms drive both fair claim admission and skew visibility.
+    #[tokio::test]
+    async fn persisted_envelope_claim_gate_and_unclaimable_signal_match() {
+        let (fixture, _admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let fitting = task(tenant, "envelope-fit", ForgeTaskLane::Ordinary, 201);
+        let mut oversized = task(tenant, "envelope-over", ForgeTaskLane::Ordinary, 202);
+        oversized.estimates.memory_bytes = 1_001;
+        tasks.enqueue(&fitting).await.expect("fitting envelope");
+        tasks.enqueue(&oversized).await.expect("oversized envelope");
+        let fitting_id = tasks.task_id_for_plan(&fitting).await.expect("fitting id");
+        let oversized_id = tasks
+            .task_id_for_plan(&oversized)
+            .await
+            .expect("oversized id");
+        let claim = tasks
+            .claim_fair(Uuid::now_v7(), limits(2), None)
+            .await
+            .expect("claim query")
+            .expect("fitting task");
+        assert_eq!(claim.task_id, fitting_id);
+        assert_eq!(
+            tasks
+                .unclaimable_ready_task_ids(limits(2))
+                .await
+                .expect("unclaimable identities"),
+            vec![oversized_id]
+        );
+    }
+
     /// Proves worker admission is independent of scheduler leadership and only
     /// advances its durable cursor after a successful fitting claim.
     ///
@@ -1219,6 +1250,231 @@ mod pg_tests {
         assert_eq!(taken.claimed_by, Some(successor));
     }
 
+    /// Proves success and successor demand share one caller-owned transaction.
+    ///
+    /// # Panics
+    /// Panics when rollback exposes either effect or commit does not expose both.
+    #[tokio::test]
+    async fn terminal_success_atomically_requests_successor_demand() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let table = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "atomic-successor")
+            .expect("table identity");
+        let owner = Uuid::now_v7();
+        let task_id = tasks
+            .enqueue(&task(
+                tenant,
+                "atomic-successor",
+                ForgeTaskLane::Ordinary,
+                91,
+            ))
+            .await
+            .expect("enqueue");
+        let claim = tasks
+            .claim_fair(owner, limits(1), None)
+            .await
+            .expect("claim")
+            .expect("task");
+        let attempt = claim.attempt_id.expect("attempt");
+        tasks
+            .start(
+                task_id,
+                attempt,
+                owner,
+                SnapshotWatermark {
+                    snapshot_id: 91,
+                    timestamp_ms: 91,
+                },
+            )
+            .await
+            .expect("start");
+        let evidence = ForgeTaskEvidence {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            committed_snapshot_id: Some(92),
+            committed_metadata_location: Some("metadata/v92.json".to_owned()),
+            committed_metadata_digest: Some(format!("sha256:{}", "9".repeat(64))),
+            cleanup_candidates: Vec::new(),
+            deleted_candidate_count: 0,
+        };
+        let mut prepared = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("prepared tenant");
+        tasks
+            .prepared(
+                &mut prepared,
+                task_id,
+                attempt,
+                owner,
+                &evidence,
+                &event("forge.task.prepared", task_id),
+            )
+            .await
+            .expect("prepared");
+        prepared.commit().await.expect("commit prepared");
+
+        let transition = ForgeTaskTransition {
+            task_id,
+            attempt_id: attempt,
+            owner,
+            expected: ForgeTaskState::Prepared,
+            next: ForgeTaskState::Succeeded,
+        };
+        let mut rolled_back = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("rollback tenant");
+        tasks
+            .terminal_and_request_replan(
+                &mut rolled_back,
+                transition,
+                &table,
+                vala_sql::row_types::forge_tasks::TaskProgressEffect::Progressed,
+                &event("forge.task.succeeded", task_id),
+            )
+            .await
+            .expect("stage terminal and demand");
+        drop(rolled_back);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(&admin)
+                .await
+                .expect("state after rollback");
+        assert_eq!(state, "prepared");
+        let demand_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2")
+            .bind(tenant.as_uuid())
+            .bind(&table.table)
+            .fetch_one(&admin)
+            .await
+            .expect("demand after rollback");
+        assert_eq!(demand_count, 0);
+
+        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            .fetch_one(&admin)
+            .await
+            .expect("audit before");
+        let mut committed = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("commit tenant");
+        tasks
+            .terminal_and_request_replan(
+                &mut committed,
+                transition,
+                &table,
+                vala_sql::row_types::forge_tasks::TaskProgressEffect::Progressed,
+                &event("forge.task.succeeded", task_id),
+            )
+            .await
+            .expect("commit terminal and demand");
+        committed.commit().await.expect("commit both effects");
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(&admin)
+                .await
+                .expect("state after commit");
+        assert_eq!(state, "succeeded");
+        let demand_generation: i64 = sqlx::query_scalar("SELECT generation FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2")
+            .bind(tenant.as_uuid())
+            .bind(&table.table)
+            .fetch_one(&admin)
+            .await
+            .expect("successor demand");
+        assert_eq!(demand_generation, 1);
+        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            .fetch_one(&admin)
+            .await
+            .expect("audit after");
+        assert_eq!(audit_after, audit_before + 1);
+
+        let noop_table = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            "vala.bifrost",
+            "atomic-noop-acknowledgement",
+        )
+        .expect("no-op table identity");
+        let noop_id = tasks
+            .enqueue(&task(
+                tenant,
+                "atomic-noop-acknowledgement",
+                ForgeTaskLane::Ordinary,
+                93,
+            ))
+            .await
+            .expect("enqueue no-op");
+        let noop_claim = tasks
+            .claim_fair(owner, limits(1), None)
+            .await
+            .expect("claim no-op")
+            .expect("no-op task");
+        let noop_attempt = noop_claim.attempt_id.expect("no-op attempt");
+        tasks
+            .start(
+                noop_id,
+                noop_attempt,
+                owner,
+                SnapshotWatermark {
+                    snapshot_id: 93,
+                    timestamp_ms: 93,
+                },
+            )
+            .await
+            .expect("start no-op");
+        let mut noop_prepared = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("no-op prepared tenant");
+        tasks
+            .prepared(
+                &mut noop_prepared,
+                noop_id,
+                noop_attempt,
+                owner,
+                &ForgeTaskEvidence {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    committed_snapshot_id: Some(93),
+                    committed_metadata_location: Some("metadata/v93.json".to_owned()),
+                    committed_metadata_digest: Some(format!("sha256:{}", "a".repeat(64))),
+                    cleanup_candidates: Vec::new(),
+                    deleted_candidate_count: 0,
+                },
+                &event("forge.task.prepared", noop_id),
+            )
+            .await
+            .expect("prepare no-op");
+        noop_prepared.commit().await.expect("commit no-op prepared");
+        let mut noop_terminal = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("no-op terminal tenant");
+        tasks
+            .terminal_and_request_replan(
+                &mut noop_terminal,
+                ForgeTaskTransition {
+                    task_id: noop_id,
+                    attempt_id: noop_attempt,
+                    owner,
+                    expected: ForgeTaskState::Prepared,
+                    next: ForgeTaskState::Succeeded,
+                },
+                &noop_table,
+                vala_sql::row_types::forge_tasks::TaskProgressEffect::NoOpAcknowledged {
+                    snapshot_id: 93,
+                    commit_count: 7,
+                },
+                &event("forge.task.succeeded", noop_id),
+            )
+            .await
+            .expect("terminal no-op");
+        noop_terminal
+            .commit()
+            .await
+            .expect("commit no-op acknowledgement");
+        let acknowledged: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT acknowledged_snapshot_id,acknowledged_commit_count FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2",
+        ).bind(tenant.as_uuid()).bind(&noop_table.table).fetch_one(&admin).await
+            .expect("durable no-op acknowledgement");
+        assert_eq!(acknowledged, (Some(93), Some(7)));
+    }
+
     /// Proves bounded watermark/status failure modes, pruning safety, RLS, and grants.
     ///
     /// # Panics
@@ -1614,7 +1870,7 @@ mod pg_tests {
             stale_terminal_count, 0,
             "fence loss rolls back terminal task and audit"
         );
-        assert!(
+        assert_eq!(
             tasks
                 .enqueue_and_acknowledge(
                     successor,
@@ -1627,7 +1883,8 @@ mod pg_tests {
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
-                .expect("successor ack")
+                .expect("successor ack"),
+            1
         );
         assert!(
             tasks
@@ -1671,7 +1928,7 @@ mod pg_tests {
             .0
             .remove(0);
         let terminal = task(tenant, "demand", ForgeTaskLane::LargeSingleton, 43);
-        assert!(
+        assert_eq!(
             tasks
                 .enqueue_and_acknowledge(
                     successor,
@@ -1684,7 +1941,8 @@ mod pg_tests {
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
-                .expect("terminal ack")
+                .expect("terminal ack"),
+            1
         );
         let terminal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='demand' AND state='unschedulable'").bind(tenant.as_uuid()).fetch_one(&admin).await.expect("terminal count");
         assert_eq!(terminal_count, 1);
@@ -1987,7 +2245,7 @@ mod pg_tests {
             current.data_tenant_id, first.data_tenant_id,
             "a stale generation conflict leaves the tenant cursor unchanged"
         );
-        assert!(
+        assert_eq!(
             tasks
                 .enqueue_and_acknowledge(
                     owner,
@@ -2000,7 +2258,8 @@ mod pg_tests {
                     |id| event("forge.task.unschedulable", id),
                 )
                 .await
-                .expect("acknowledge current generation")
+                .expect("acknowledge current generation"),
+            0
         );
         let second = tasks
             .planning_demands(owner, fence, 1)

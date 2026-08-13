@@ -627,7 +627,8 @@ impl Forge {
     ///
     /// Each returned candidate is executable by one task and one Iceberg
     /// transaction. Cross-day staging rows therefore never enter a single
-    /// durable payload that the worker could only publish partially.
+    /// durable payload that the worker could only publish partially. `capacity`
+    /// is the scheduler's live governor-clamped envelope authority.
     ///
     /// # Errors
     ///
@@ -636,6 +637,7 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         current_day: NaiveDate,
+        capacity: super::planner::ForgeCapacity,
     ) -> Result<Vec<ForgePlanCandidate>, ForgeError> {
         let rows = sqlx::query(
             r"SELECT id,file_path,file_size,min_event_time,max_event_time,partition_day
@@ -694,7 +696,6 @@ impl Forge {
             });
         }
         let policy = self.table_right_size_policy(binding).await?;
-        let capacity = super::planner::ForgeCapacity::try_from(&self.core.config)?;
         let mut candidates = Vec::new();
         for (day, files) in grouped {
             for bin in plan_staging_bins(
@@ -705,12 +706,13 @@ impl Forge {
                 current_day,
             ) {
                 let total_bytes = bin.total_bytes;
-                let mut inputs = bin
+                let mut input_terms = bin
                     .files
                     .into_iter()
-                    .map(|file| file.path)
+                    .map(|file| (file.path, file.size))
                     .collect::<Vec<_>>();
-                inputs.sort();
+                input_terms.sort_by(|left, right| left.0.cmp(&right.0));
+                let (inputs, input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
                 let envelope = super::planner::ForgeTaskEnvelope::for_rewrite(
                     total_bytes,
                     self.core.config.max_concurrent_reads,
@@ -722,6 +724,7 @@ impl Forge {
                     memory_bytes: envelope.memory_bytes(),
                     spill_bytes: envelope.scratch_bytes,
                     inputs,
+                    input_bytes,
                     bytes: total_bytes,
                     parameters: serde_json::json!({"kind":"staging_fold"}),
                 });

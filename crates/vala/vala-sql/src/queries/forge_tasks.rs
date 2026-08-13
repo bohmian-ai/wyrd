@@ -19,12 +19,12 @@ use crate::row_types::forge_tasks::{
     ForgePreparedTaskClaimSqlRow, ForgeTask, ForgeTaskClaim, ForgeTaskClaimSqlRow,
     ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow, ForgeTaskState, ForgeTaskStrategy,
     ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask,
-    SnapshotWatermark,
+    SnapshotWatermark, TaskProgressEffect,
 };
 use crate::{OperatorPool, SqlError, TenantConn};
 
-const TASK_PROJECTION: &str = "task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,ready_at,created_at,updated_at";
-const CLAIM_TASK_PROJECTION: &str = "t.task_id,t.data_tenant_id,t.catalog_name,t.namespace_name,t.table_name,t.strategy,t.lane,t.base_snapshot_id,t.plan,t.estimated_files,t.estimated_bytes,t.estimated_parallelism,t.estimated_memory_bytes,t.estimated_spill_bytes,t.large_task_ceiling_bytes,t.state,t.attempt_id,t.claimed_by,t.claim_expires_at,t.watermark_snapshot_id,t.watermark_timestamp_ms,t.evidence,t.ready_at,t.created_at,t.updated_at";
+const TASK_PROJECTION: &str = "task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,attempt_count,failure_class,next_eligible_at,failed_volume_identity,ready_at,created_at,updated_at";
+const CLAIM_TASK_PROJECTION: &str = "t.task_id,t.data_tenant_id,t.catalog_name,t.namespace_name,t.table_name,t.strategy,t.lane,t.base_snapshot_id,t.plan,t.estimated_files,t.estimated_bytes,t.estimated_parallelism,t.estimated_memory_bytes,t.estimated_spill_bytes,t.large_task_ceiling_bytes,t.state,t.attempt_id,t.claimed_by,t.claim_expires_at,t.watermark_snapshot_id,t.watermark_timestamp_ms,t.evidence,t.attempt_count,t.failure_class,t.next_eligible_at,t.failed_volume_identity,t.ready_at,t.created_at,t.updated_at";
 
 /// Exact PostgreSQL-16 fair-claim statement used by production and scale-plan proof.
 pub const FAIR_CLAIM_SQL: &str = include_str!("forge_fair_claim.sql");
@@ -69,6 +69,83 @@ pub struct ForgeTasks {
 }
 
 impl ForgeTasks {
+    /// Returns ready task identities whose persisted envelope cannot fit one pod capacity.
+    ///
+    /// # Errors
+    /// Returns SQL errors while reading durable task envelopes.
+    pub async fn unclaimable_ready_task_ids(
+        &self,
+        limits: ForgeClaimLimits,
+    ) -> Result<Vec<Uuid>, SqlError> {
+        sqlx::query_scalar("SELECT task_id FROM vala.forge_tasks WHERE state IN ('ready','retryable') AND (estimated_parallelism>$1 OR estimated_memory_bytes>$2 OR estimated_spill_bytes>$3) ORDER BY task_id")
+            .bind(i32::from(limits.max_parallelism))
+            .bind(i64::try_from(limits.max_memory_bytes).unwrap_or(i64::MAX))
+            .bind(i64::try_from(limits.max_spill_bytes).unwrap_or(i64::MAX))
+            .fetch_all(self.operator_pool.pool())
+            .await
+            .map_err(SqlError::from)
+    }
+
+    /// Registers a healthy worker or clears quarantine after a successful probe.
+    ///
+    /// # Errors
+    /// Returns SQL errors when the durable worker registry cannot be updated.
+    pub async fn register_healthy_worker(
+        &self,
+        worker: Uuid,
+        volume: &str,
+    ) -> Result<(), SqlError> {
+        sqlx::query("INSERT INTO vala.forge_worker_registry(worker_id,scratch_volume_identity,quarantined,quarantine_reason,quarantined_at,heartbeat_at) VALUES($1,$2,false,NULL,NULL,statement_timestamp()) ON CONFLICT(worker_id) DO UPDATE SET scratch_volume_identity=EXCLUDED.scratch_volume_identity,quarantined=false,quarantine_reason=NULL,quarantined_at=NULL,heartbeat_at=statement_timestamp()")
+            .bind(worker).bind(volume).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    /// Quarantines one worker after a typed local-storage failure.
+    ///
+    /// # Errors
+    /// Returns SQL errors when quarantine cannot be persisted.
+    pub async fn quarantine_worker(&self, worker: Uuid, volume: &str) -> Result<(), SqlError> {
+        sqlx::query("INSERT INTO vala.forge_worker_registry(worker_id,scratch_volume_identity,quarantined,quarantine_reason,quarantined_at,heartbeat_at) VALUES($1,$2,true,'storage_health',statement_timestamp(),statement_timestamp()) ON CONFLICT(worker_id) DO UPDATE SET scratch_volume_identity=EXCLUDED.scratch_volume_identity,quarantined=true,quarantine_reason='storage_health',quarantined_at=statement_timestamp(),heartbeat_at=statement_timestamp()")
+            .bind(worker).bind(volume).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    /// Reads the durable attempt count for worker-side bounded settlement.
+    ///
+    /// # Errors
+    /// Returns SQL or invariant errors when the task is absent or malformed.
+    pub async fn attempt_count(&self, task_id: Uuid) -> Result<u32, SqlError> {
+        let count: Option<i32> =
+            sqlx::query_scalar("SELECT attempt_count FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_optional(self.operator_pool.pool())
+                .await
+                .map_err(SqlError::from)?;
+        let count = count.ok_or_else(|| SqlError::Conflict {
+            detail: "Forge task is absent".to_owned(),
+        })?;
+        u32::try_from(count).map_err(|_| SqlError::InvariantViolation {
+            detail: "negative Forge attempt count".to_owned(),
+        })
+    }
+
+    /// Records the closed failure class inside a caller-owned audited transaction.
+    ///
+    /// # Errors
+    /// Returns conflict when the task is not owned by the transaction tenant.
+    pub async fn qualify_terminal_failure(
+        &self,
+        conn: &mut TenantConn<'_>,
+        task_id: Uuid,
+        failure_class: &str,
+        failed_volume_identity: Option<&str>,
+    ) -> Result<(), SqlError> {
+        let changed = sqlx::query("UPDATE vala.forge_tasks SET attempt_count=attempt_count+1,failure_class=$3,failed_volume_identity=$4,next_eligible_at=statement_timestamp(),updated_at=statement_timestamp() WHERE task_id=$1 AND data_tenant_id=$2")
+            .bind(task_id).bind(conn.data_tenant_id().as_uuid()).bind(failure_class).bind(failed_volume_identity)
+            .execute(&mut **conn.transaction()).await.map_err(SqlError::from)?.rows_affected();
+        exact_one(changed, "qualify terminal failure")
+    }
+
     /// Constructs the durable task owner.
     #[must_use]
     pub fn new(operator_pool: OperatorPool) -> Self {
@@ -164,7 +241,7 @@ impl ForgeTasks {
                 detail: "planning demand cap must be positive".to_owned(),
             });
         }
-        let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation FROM ranked d CROSS JOIN scheduler s WHERE d.tenant_rank=1 ORDER BY (s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
+        let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation,d.acknowledged_snapshot_id,d.acknowledged_commit_count FROM ranked d CROSS JOIN scheduler s WHERE d.tenant_rank=1 ORDER BY (s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
             .bind(owner).bind(scheduler_fence).bind(i64::from(cap) + 1).fetch_all(self.operator_pool.pool()).await.map_err(SqlError::from)?;
         let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp())")
             .bind(owner).bind(scheduler_fence).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;
@@ -200,7 +277,7 @@ impl ForgeTasks {
         scheduler_fence: i64,
         demand: &ForgePlanningDemand,
     ) -> Result<Option<ForgePlanningDemand>, SqlError> {
-        let row = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT singleton FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation FROM vala.forge_planning_demands d CROSS JOIN scheduler WHERE d.data_tenant_id=$3 AND d.catalog_name=$4 AND d.namespace_name=$5 AND d.table_name=$6")
+        let row = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT singleton FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation,d.acknowledged_snapshot_id,d.acknowledged_commit_count FROM vala.forge_planning_demands d CROSS JOIN scheduler WHERE d.data_tenant_id=$3 AND d.catalog_name=$4 AND d.namespace_name=$5 AND d.table_name=$6")
             .bind(owner).bind(scheduler_fence).bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table)
             .fetch_optional(self.operator_pool.pool()).await.map_err(SqlError::from)?;
         if let Some(row) = row {
@@ -235,7 +312,7 @@ impl ForgeTasks {
         demand: &ForgePlanningDemand,
         batch: ForgeEnqueueBatch<'_>,
         unschedulable_event: F,
-    ) -> Result<bool, SqlError>
+    ) -> Result<u64, SqlError>
     where
         F: Fn(Uuid) -> AuditEvent,
     {
@@ -264,12 +341,14 @@ impl ForgeTasks {
                 detail: "Forge scheduler fence is stale".to_owned(),
             });
         }
+        let mut inserted_count = 0_u64;
         for task in batch.executable {
             task.plan.validate(false)?;
             task.estimates.validate()?;
             let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
-            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'ready',$17) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING")
+            let inserted = sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'ready',$17) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING")
                 .bind(Uuid::now_v7()).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.lane.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(i32::from(task.estimates.parallelism)).bind(i64::try_from(task.estimates.memory_bytes).map_err(|_|SqlError::Conflict{detail:"memory estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.spill_bytes).map_err(|_|SqlError::Conflict{detail:"spill estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.large_ceiling_bytes).map_err(|_|SqlError::Conflict{detail:"large ceiling overflow".to_owned()})?).bind(task.ready_at).execute(&mut *tx).await.map_err(SqlError::from)?;
+            inserted_count = inserted_count.saturating_add(inserted.rows_affected());
         }
         for task in batch.unschedulable {
             task.plan.validate(false)?;
@@ -280,6 +359,7 @@ impl ForgeTasks {
                 .bind(task_id).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.lane.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(i32::from(task.estimates.parallelism)).bind(i64::try_from(task.estimates.memory_bytes).map_err(|_|SqlError::Conflict{detail:"memory estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.spill_bytes).map_err(|_|SqlError::Conflict{detail:"spill estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.large_ceiling_bytes).map_err(|_|SqlError::Conflict{detail:"large ceiling overflow".to_owned()})?).bind(task.ready_at)
                 .fetch_optional(&mut *tx).await.map_err(SqlError::from)?;
             if let Some(inserted_id) = inserted {
+                inserted_count = inserted_count.saturating_add(1);
                 let event = unschedulable_event(inserted_id);
                 validate_audit_event(&event, inserted_id, ForgeTaskState::Unschedulable)?;
                 OperatorAudit::new(demand.data_tenant_id, &mut tx)
@@ -287,9 +367,17 @@ impl ForgeTasks {
                     .await?;
             }
         }
-        let deleted = sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND generation=$5")
-            .bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table).bind(demand.generation).execute(&mut *tx).await.map_err(SqlError::from)?.rows_affected();
-        if deleted != 1 {
+        let acknowledged = if batch.executable.is_empty()
+            && batch.unschedulable.is_empty()
+            && demand.acknowledged_snapshot_id.is_some()
+        {
+            sqlx::query("UPDATE vala.forge_planning_demands SET last_requested_at=statement_timestamp() WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND generation=$5")
+                .bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table).bind(demand.generation).execute(&mut *tx).await.map_err(SqlError::from)?.rows_affected()
+        } else {
+            sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND generation=$5")
+                .bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table).bind(demand.generation).execute(&mut *tx).await.map_err(SqlError::from)?.rows_affected()
+        };
+        if acknowledged != 1 {
             return Err(SqlError::ForgeDemandGenerationChanged);
         }
         {
@@ -302,7 +390,7 @@ impl ForgeTasks {
             }
         }
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(true)
+        Ok(inserted_count)
     }
 
     /// Reads bounded authoritative pending demand and nonterminal task status.
@@ -441,6 +529,21 @@ impl ForgeTasks {
         limits: ForgeClaimLimits,
         strategy_filter: Option<&[ForgeTaskStrategy]>,
     ) -> Result<Option<ForgeTaskClaim>, SqlError> {
+        self.claim_fair_for_volume(owner, limits, strategy_filter, None)
+            .await
+    }
+
+    /// Claims fairly while softly deferring a prior failure on the same volume.
+    ///
+    /// # Errors
+    /// Returns the same validation, decoding, and SQL errors as [`Self::claim_fair`].
+    pub async fn claim_fair_for_volume(
+        &self,
+        owner: Uuid,
+        limits: ForgeClaimLimits,
+        strategy_filter: Option<&[ForgeTaskStrategy]>,
+        scratch_volume_identity: Option<&str>,
+    ) -> Result<Option<ForgeTaskClaim>, SqlError> {
         if limits.max_active_per_tenant == 0
             || limits.lease_seconds == 0
             || limits.max_files == 0
@@ -500,6 +603,7 @@ impl ForgeTasks {
                 })?,
             )
             .bind(strategy_filter)
+            .bind(scratch_volume_identity)
             .fetch_optional(&mut *tx)
             .await
             .map_err(SqlError::from)?;
@@ -625,6 +729,38 @@ impl ForgeTasks {
         exact_one(changed, "retry")
     }
 
+    /// Persists one attempt-consuming failure with bounded exponential backoff.
+    ///
+    /// The owned attempt is released only by this statement. The returned count
+    /// lets the audited worker settlement decide whether the next failure must
+    /// terminalize at the fixed attempt bound.
+    ///
+    /// # Errors
+    /// Returns conflict for stale ownership or an unknown closed failure class.
+    pub async fn retry_failure(
+        &self,
+        task_id: Uuid,
+        attempt: Uuid,
+        owner: Uuid,
+        failure_class: &str,
+        failed_volume_identity: Option<&str>,
+    ) -> Result<u32, SqlError> {
+        if !matches!(failure_class, "transient_object_store" | "storage_health") {
+            return Err(SqlError::Conflict {
+                detail: "retry failure class is not retryable".to_owned(),
+            });
+        }
+        let count: Option<i32> = sqlx::query_scalar("UPDATE vala.forge_tasks SET state='retryable',attempt_count=attempt_count+1,failure_class=$4,failed_volume_identity=$5,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,updated_at=statement_timestamp() WHERE task_id=$1 AND state IN ('claimed','running') AND attempt_id=$2 AND claimed_by=$3 RETURNING attempt_count")
+            .bind(task_id).bind(attempt).bind(owner).bind(failure_class).bind(failed_volume_identity)
+            .fetch_optional(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        let count = count.ok_or_else(|| SqlError::Conflict {
+            detail: "retry failure lost attempt ownership".to_owned(),
+        })?;
+        u32::try_from(count).map_err(|_| SqlError::InvariantViolation {
+            detail: "negative Forge attempt count".to_owned(),
+        })
+    }
+
     /// Atomically records Prepared evidence and the supplied tenant audit event.
     ///
     /// # Errors
@@ -725,6 +861,79 @@ impl ForgeTasks {
         self.audited_transition(conn, transition, None, event).await
     }
 
+    /// Atomically marks exact Prepared work successful and requests fresh planning.
+    ///
+    /// The task identity, tenant connection, and table identity are validated
+    /// before the audited transition. The successor demand is advanced in the
+    /// caller-owned transaction, so a crash cannot expose Succeeded without a
+    /// durable request to inspect the newly committed Iceberg snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns conflict unless the transition is an exact Prepared-to-Succeeded
+    /// transition for the supplied tenant/table, or returns audit/SQL errors.
+    /// Caller rollback removes both the terminal state and successor demand.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation before the caller commits rolls back both durable effects.
+    pub async fn terminal_and_request_replan(
+        &self,
+        conn: &mut TenantConn<'_>,
+        transition: ForgeTaskTransition,
+        table: &ForgeTaskTableIdentity,
+        progress_effect: TaskProgressEffect,
+        event: &AuditEvent,
+    ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
+        if transition.expected != ForgeTaskState::Prepared
+            || transition.next != ForgeTaskState::Succeeded
+        {
+            return Err(SqlError::Conflict {
+                detail: "Forge successful continuation requires Prepared-to-Succeeded".to_owned(),
+            });
+        }
+        let bound: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM vala.forge_tasks WHERE task_id=$1 AND data_tenant_id=$2 AND catalog_name=$3 AND namespace_name=$4 AND table_name=$5)",
+        )
+        .bind(transition.task_id)
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(&table.catalog)
+        .bind(&table.namespace)
+        .bind(&table.table)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+        if !bound {
+            return Err(SqlError::Conflict {
+                detail: "Forge successful continuation does not match tenant/table binding"
+                    .to_owned(),
+            });
+        }
+        let outcome = self.terminal(conn, transition, event).await?;
+        sqlx::query("UPDATE vala.forge_tasks SET failure_class=NULL,failed_volume_identity=NULL,next_eligible_at=statement_timestamp() WHERE task_id=$1 AND state='succeeded'")
+            .bind(transition.task_id)
+            .execute(&mut **conn.transaction()).await.map_err(SqlError::from)?;
+        match progress_effect {
+            TaskProgressEffect::Progressed => {
+                sqlx::query_scalar::<_, i64>("INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'periodic') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1,acknowledged_snapshot_id=NULL,acknowledged_commit_count=NULL RETURNING generation")
+                    .bind(conn.data_tenant_id().as_uuid()).bind(&table.catalog).bind(&table.namespace).bind(&table.table)
+                    .fetch_one(&mut **conn.transaction()).await.map_err(SqlError::from)?;
+            }
+            TaskProgressEffect::NoOpAcknowledged {
+                snapshot_id,
+                commit_count,
+            } => {
+                let commit_count = i64::try_from(commit_count).map_err(|_| SqlError::Conflict {
+                    detail: "Forge acknowledged commit count exceeds i64".to_owned(),
+                })?;
+                sqlx::query_scalar::<_, i64>("INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source,acknowledged_snapshot_id,acknowledged_commit_count) VALUES ($1,$2,$3,$4,'periodic',$5,$6) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1,acknowledged_snapshot_id=EXCLUDED.acknowledged_snapshot_id,acknowledged_commit_count=EXCLUDED.acknowledged_commit_count RETURNING generation")
+                    .bind(conn.data_tenant_id().as_uuid()).bind(&table.catalog).bind(&table.namespace).bind(&table.table).bind(snapshot_id).bind(commit_count)
+                    .fetch_one(&mut **conn.transaction()).await.map_err(SqlError::from)?;
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Atomically cancels a superseded claimed attempt and requests a fresh plan.
     ///
     /// The audited terminal transition clears the exact attempt ownership
@@ -811,7 +1020,7 @@ impl ForgeTasks {
     /// # Cancellation
     /// Reclaim is one bounded statement and cannot commit partial progress.
     pub async fn reclaim_expired(&self, cap: u32) -> Result<u64, SqlError> {
-        let changed=sqlx::query("WITH victims AS (SELECT task_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE vala.forge_tasks t SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp(),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id").bind(i64::from(cap)).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        let changed=sqlx::query("WITH victims AS (SELECT task_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE vala.forge_tasks t SET state='retryable',attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id").bind(i64::from(cap)).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
         Ok(changed)
     }
 

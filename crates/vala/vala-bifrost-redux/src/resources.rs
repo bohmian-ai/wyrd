@@ -169,6 +169,8 @@ pub struct ResourceSnapshot {
     pub elastic_memory_used_bytes: usize,
     /// Disposable scratch held by Oracle or Forge.
     pub scratch_used_bytes: u64,
+    /// Concurrent Forge input-reader permits held by active rewrites.
+    pub forge_reader_permits_used: usize,
     /// Whether the sole Oracle query owner is active.
     pub oracle_query_active: bool,
 }
@@ -185,6 +187,7 @@ struct ResourceState {
     scribe_memory_used_bytes: usize,
     elastic_memory_used_bytes: usize,
     scratch_used_bytes: u64,
+    forge_reader_permits_used: usize,
     oracle_query_active: bool,
     poisoned: bool,
 }
@@ -517,6 +520,8 @@ pub struct ForgeRewriteRequest {
     pub memory_bytes: usize,
     /// Exact disposable spill demand in bytes.
     pub scratch_bytes: u64,
+    /// Concurrent input readers reserved before any source object is opened.
+    pub reader_permits: u16,
 }
 
 /// Sole issuer of Forge rewrite leases against the shared process root.
@@ -536,8 +541,11 @@ impl ForgeResources {
         &self,
         request: ForgeRewriteRequest,
     ) -> Result<ForgeRewriteResources, BifrostResourceError> {
-        self.governor
-            .try_acquire_forge(request.memory_bytes, request.scratch_bytes)
+        self.governor.try_acquire_forge(
+            request.memory_bytes,
+            request.scratch_bytes,
+            request.reader_permits,
+        )
     }
 
     /// Captures exact live ownership for inspection and cleanup assertions.
@@ -721,6 +729,7 @@ impl BifrostResourceGovernor {
             scribe_memory_used_bytes: state.scribe_memory_used_bytes,
             elastic_memory_used_bytes: state.elastic_memory_used_bytes,
             scratch_used_bytes: state.scratch_used_bytes,
+            forge_reader_permits_used: state.forge_reader_permits_used,
             oracle_query_active: state.oracle_query_active,
         })
     }
@@ -934,6 +943,7 @@ impl BifrostResourceGovernor {
         &self,
         memory_bytes: usize,
         scratch_bytes: u64,
+        reader_permits: u16,
     ) -> Result<ForgeRewriteResources, BifrostResourceError> {
         let mut state = self.lock_state()?;
         let plan = self.plan();
@@ -945,16 +955,27 @@ impl BifrostResourceGovernor {
             .scratch_used_bytes
             .checked_add(scratch_bytes)
             .ok_or_else(accounting_overflow)?;
-        if next_memory > plan.elastic_memory_bytes || next_scratch > plan.scratch_limit_bytes {
+        let next_readers = state
+            .forge_reader_permits_used
+            .checked_add(usize::from(reader_permits))
+            .ok_or_else(accounting_overflow)?;
+        if reader_permits == 0
+            || next_memory > plan.elastic_memory_bytes
+            || next_scratch > plan.scratch_limit_bytes
+            || next_readers > plan.effective_cpu
+        {
             return Err(BifrostResourceError::Occupied {
-                detail: "Forge request exceeds currently free elastic memory or scratch".to_owned(),
+                detail: "Forge request exceeds currently free memory, scratch, or reader permits"
+                    .to_owned(),
             });
         }
         state.elastic_memory_used_bytes = next_memory;
         state.scratch_used_bytes = next_scratch;
+        state.forge_reader_permits_used = next_readers;
         Ok(ForgeRewriteResources {
             memory_bytes,
             scratch_bytes,
+            reader_permits: usize::from(reader_permits),
             memory_pool: bounded_memory_pool(memory_bytes),
             governor: self.clone(),
             released: false,
@@ -1123,6 +1144,8 @@ impl Drop for OracleQueryResources {
 pub struct ForgeRewriteResources {
     memory_bytes: usize,
     scratch_bytes: u64,
+    /// Reader permits coupled to this exact attempt lease.
+    reader_permits: usize,
     /// Operation-local pool nested inside this exact root lease.
     memory_pool: Arc<dyn MemoryPool>,
     governor: BifrostResourceGovernor,
@@ -1152,10 +1175,12 @@ impl Drop for ForgeRewriteResources {
         match self.governor.lock_state() {
             Ok(mut state)
                 if state.elastic_memory_used_bytes >= self.memory_bytes
-                    && state.scratch_used_bytes >= self.scratch_bytes =>
+                    && state.scratch_used_bytes >= self.scratch_bytes
+                    && state.forge_reader_permits_used >= self.reader_permits =>
             {
                 state.elastic_memory_used_bytes -= self.memory_bytes;
                 state.scratch_used_bytes -= self.scratch_bytes;
+                state.forge_reader_permits_used -= self.reader_permits;
                 self.released = true;
             }
             Ok(mut state) => {
@@ -1606,6 +1631,7 @@ mod tests {
                 scribe_memory_used_bytes: 0,
                 elastic_memory_used_bytes: 0,
                 scratch_used_bytes: 0,
+                forge_reader_permits_used: 0,
                 oracle_query_active: false,
             }
         );
@@ -1742,7 +1768,7 @@ mod tests {
         )
         .expect("Forge-only plan");
         let lease = governor
-            .try_acquire_forge(128 * MIB, 64 * MIB as u64)
+            .try_acquire_forge(128 * MIB, 64 * MIB as u64, 1)
             .expect("Forge operation lease");
         let pool = lease.memory_pool();
         let reservation = MemoryConsumer::new("forge-operation-test").register(&pool);
@@ -1813,6 +1839,7 @@ mod tests {
             .try_acquire_rewrite(ForgeRewriteRequest {
                 memory_bytes: 64 * MIB,
                 scratch_bytes: 64 * MIB as u64,
+                reader_permits: 1,
             })
             .expect("Forge lease");
         assert_eq!(
@@ -1886,6 +1913,7 @@ mod tests {
                 .try_acquire_rewrite(ForgeRewriteRequest {
                     memory_bytes: plan.elastic_memory_bytes + 1,
                     scratch_bytes: 1,
+                    reader_permits: 1,
                 })
                 .is_err(),
             "memory beyond the elastic pool must be refused"
@@ -1897,11 +1925,63 @@ mod tests {
                 .try_acquire_rewrite(ForgeRewriteRequest {
                     memory_bytes: 1,
                     scratch_bytes: plan.scratch_limit_bytes + 1,
+                    reader_permits: 1,
                 })
                 .is_err(),
             "scratch beyond the disposable ceiling must be refused"
         );
         assert_eq!(forge.snapshot().expect("after scratch refusal"), baseline);
+
+        assert!(
+            forge
+                .try_acquire_rewrite(ForgeRewriteRequest {
+                    memory_bytes: 1,
+                    scratch_bytes: 1,
+                    reader_permits: u16::try_from(plan.effective_cpu + 1).unwrap_or(u16::MAX),
+                })
+                .is_err(),
+            "reader permits beyond live CPU capacity must be refused atomically"
+        );
+        assert_eq!(forge.snapshot().expect("after reader refusal"), baseline);
+    }
+
+    /// Concurrent Forge grants contend on reader permits in the same atomic ledger.
+    #[test]
+    fn forge_reader_permits_are_atomic_under_contention() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Forge],
+        );
+        let forge = roles.forge().expect("Forge capability");
+        let permits = u16::try_from(roles.plan().effective_cpu).unwrap_or(u16::MAX);
+        let lease = forge
+            .try_acquire_rewrite(ForgeRewriteRequest {
+                memory_bytes: 1,
+                scratch_bytes: 1,
+                reader_permits: permits,
+            })
+            .expect("first lease owns every reader permit");
+        let held = forge.snapshot().expect("held snapshot");
+        assert_eq!(held.forge_reader_permits_used, usize::from(permits));
+        assert!(
+            forge
+                .try_acquire_rewrite(ForgeRewriteRequest {
+                    memory_bytes: 1,
+                    scratch_bytes: 1,
+                    reader_permits: 1,
+                })
+                .is_err()
+        );
+        assert_eq!(forge.snapshot().expect("refusal snapshot"), held);
+        drop(lease);
+        assert_eq!(
+            forge
+                .snapshot()
+                .expect("released")
+                .forge_reader_permits_used,
+            0
+        );
     }
 
     /// The Oracle runtime pool is the lease's own, and drop restores baselines.
@@ -1950,6 +2030,7 @@ mod tests {
             .try_acquire_rewrite(ForgeRewriteRequest {
                 memory_bytes: 128 * MIB,
                 scratch_bytes: 64 * MIB as u64,
+                reader_permits: 1,
             })
             .expect("Forge operation lease");
         let pool = lease.memory_pool();
@@ -1996,12 +2077,12 @@ mod tests {
             .try_acquire_oracle(OracleResourceRequest { local_ratio: 0.0 })
             .expect("Oracle owns only its floor and shared elastic memory");
         assert_eq!(query.memory_bytes, plan.oracle_floor_bytes + 212 * MIB);
-        assert!(governor.try_acquire_forge(1, 1).is_err());
+        assert!(governor.try_acquire_forge(1, 1, 1).is_err());
         assert_eq!(governor.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         drop(query);
         drop(scribe_owner);
         let forge = governor
-            .try_acquire_forge(plan.elastic_memory_bytes, plan.scratch_limit_bytes)
+            .try_acquire_forge(plan.elastic_memory_bytes, plan.scratch_limit_bytes, 1)
             .expect("Forge may own all elastic resources after Oracle releases");
         assert_eq!(governor.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         drop(forge);

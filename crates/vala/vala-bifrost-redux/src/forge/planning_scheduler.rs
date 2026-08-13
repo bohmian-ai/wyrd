@@ -12,7 +12,7 @@ use num_traits::ToPrimitive;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::SqlError;
-use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
+use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
     ForgePlanningDemand, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
@@ -24,6 +24,7 @@ use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use super::Forge;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
+use super::metrics::{ForgeDemandTransitionResult, ForgeTaskMetricStrategy};
 use super::planner::{
     ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
 };
@@ -41,8 +42,12 @@ pub struct ForgeScheduleOutcome {
     pub demands_acknowledged: usize,
     /// Exact executable tasks offered to durable enqueue.
     pub tasks_enqueued: usize,
+    /// Planned rows dropped by idempotent enqueue conflicts.
+    pub tasks_not_inserted: usize,
     /// Plans classified terminally outside every lane.
     pub unschedulable: usize,
+    /// Ready rows whose persisted envelope exceeds this pod's governor capacity.
+    pub unclaimable_tasks: usize,
     /// Maximum-minus-minimum admitted task count across this complete pass's tenants.
     pub fairness_lag_tasks: usize,
     /// Whether the bounded page or any demand remained incomplete.
@@ -54,6 +59,8 @@ pub struct ForgeScheduleOutcome {
 struct DemandPlanningResult {
     /// Tasks passed to the atomic enqueue transaction.
     tasks_enqueued: usize,
+    /// Planned rows not inserted because the exact task already existed.
+    tasks_not_inserted: usize,
     /// Tasks terminalized because no configured lane can execute them.
     unschedulable: usize,
     /// Whether the exact observed demand generation was acknowledged.
@@ -66,6 +73,8 @@ pub struct ForgeScheduler<'forge> {
     forge: &'forge Forge,
     /// Single pure planner used by hints and periodic roster repair.
     planner: ForgePlanner,
+    /// Live governor-clamped capacity shared by candidate sizing and admission.
+    capacity: ForgeCapacity,
     /// Durable task and demand owner.
     tasks: ForgeTasks,
     /// Stable scheduler lease owner for this process.
@@ -152,10 +161,32 @@ impl<'forge> ForgeScheduler<'forge> {
     /// Returns invalid configuration when derived capacity is not positive.
     fn with_owner(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
         let config = &forge.core.config;
-        let capacity = ForgeCapacity::try_from(config)?;
+        let configured = ForgeCapacity::try_from(config)?;
+        let governor = forge
+            .core
+            .resources
+            .snapshot()
+            .map_err(|error| ForgeError::Capacity {
+                detail: error.to_string(),
+            })?;
+        let capacity = ForgeCapacity {
+            max_files: configured.max_files,
+            max_bytes: configured.max_bytes,
+            max_parallelism: configured
+                .max_parallelism
+                .min(u16::try_from(governor.plan.effective_cpu).unwrap_or(u16::MAX)),
+            max_memory_bytes: configured
+                .max_memory_bytes
+                .min(u64::try_from(governor.plan.elastic_memory_bytes).unwrap_or(u64::MAX)),
+            max_spill_bytes: configured
+                .max_spill_bytes
+                .min(governor.plan.scratch_limit_bytes),
+            max_large_task_bytes: configured.max_large_task_bytes,
+        };
         Ok(Self {
             forge,
             planner: ForgePlanner::new(capacity),
+            capacity,
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
             owner,
             demand_cap: u32::try_from(config.max_hints_per_wake).unwrap_or(u32::MAX),
@@ -371,6 +402,9 @@ impl<'forge> ForgeScheduler<'forge> {
                         outcome.tasks_enqueued = outcome
                             .tasks_enqueued
                             .saturating_add(planned.tasks_enqueued);
+                        outcome.tasks_not_inserted = outcome
+                            .tasks_not_inserted
+                            .saturating_add(planned.tasks_not_inserted);
                         outcome.unschedulable =
                             outcome.unschedulable.saturating_add(planned.unschedulable);
                         outcome.demands_acknowledged = outcome
@@ -390,6 +424,9 @@ impl<'forge> ForgeScheduler<'forge> {
                     Err(ForgeError::Sql(SqlError::ForgeDemandGenerationChanged))
                         if generation_retries == 0 && !stop.is_cancelled() =>
                     {
+                        self.forge.core.telemetry.record_demand_transition(
+                            ForgeDemandTransitionResult::GenerationChanged,
+                        );
                         generation_retries = generation_retries.saturating_add(1);
                         outcome.incomplete = true;
                         let Some(refreshed) = self
@@ -409,6 +446,10 @@ impl<'forge> ForgeScheduler<'forge> {
                         demand = refreshed;
                     }
                     Err(error) => {
+                        self.forge
+                            .core
+                            .telemetry
+                            .record_demand_transition(ForgeDemandTransitionResult::Failed);
                         outcome.incomplete = true;
                         tracing::warn!(data_tenant_id = %demand.data_tenant_id, table = %demand.table_ref.table, error = %error, "Forge demand planning failed; retaining demand and continuing tenant page");
                         break;
@@ -518,6 +559,19 @@ impl<'forge> ForgeScheduler<'forge> {
         fence: i64,
     ) -> Result<DemandPlanningResult, ForgeError> {
         let snapshot = self.discover_snapshot(demand).await?;
+        for candidate in &snapshot.candidates {
+            self.forge.core.telemetry.record_discovered_candidate(
+                ForgeTaskMetricStrategy::try_from(candidate.strategy).map_err(|strategy| {
+                    ForgeError::Invariant {
+                        detail: format!(
+                            "Forge candidate strategy lacks a metric mapping: {strategy:?}"
+                        ),
+                    }
+                })?,
+                candidate.inputs.len(),
+                candidate.bytes,
+            );
+        }
         let planned = self.planner.plan_table(&snapshot)?;
         let mut executable = Vec::new();
         let mut unschedulable = Vec::new();
@@ -544,29 +598,10 @@ impl<'forge> ForgeScheduler<'forge> {
                 executable.push(durable);
             }
         }
-        let result = DemandPlanningResult {
-            tasks_enqueued: executable.len().saturating_add(unschedulable.len()),
-            unschedulable: unschedulable.len(),
+        let inserted = {
             #[cfg(feature = "test-support")]
-            acknowledged: {
-                self.pause_before_demand_acknowledgement_if_armed().await;
-                self.tasks
-                    .enqueue_and_acknowledge(
-                        self.owner,
-                        fence,
-                        demand,
-                        ForgeEnqueueBatch {
-                            executable: &executable,
-                            unschedulable: &unschedulable,
-                        },
-                        unschedulable_event,
-                    )
-                    .await
-                    .map_err(ForgeError::Sql)?
-            },
-            #[cfg(not(feature = "test-support"))]
-            acknowledged: self
-                .tasks
+            self.pause_before_demand_acknowledgement_if_armed().await;
+            self.tasks
                 .enqueue_and_acknowledge(
                     self.owner,
                     fence,
@@ -578,8 +613,23 @@ impl<'forge> ForgeScheduler<'forge> {
                     unschedulable_event,
                 )
                 .await
-                .map_err(ForgeError::Sql)?,
+                .map_err(ForgeError::Sql)?
         };
+        let result = DemandPlanningResult {
+            tasks_enqueued: usize::try_from(inserted).unwrap_or(usize::MAX),
+            tasks_not_inserted: executable
+                .len()
+                .saturating_add(unschedulable.len())
+                .saturating_sub(usize::try_from(inserted).unwrap_or(usize::MAX)),
+            unschedulable: unschedulable.len(),
+            acknowledged: true,
+        };
+        if result.acknowledged && result.tasks_enqueued == 0 {
+            self.forge
+                .core
+                .telemetry
+                .record_demand_transition(ForgeDemandTransitionResult::Drained);
+        }
         if result.acknowledged
             && let Some(observer) = &self.forge.core.completion_observer
         {
@@ -650,32 +700,31 @@ impl<'forge> ForgeScheduler<'forge> {
             .await?;
         let mut candidates = self
             .forge
-            .discover_staging_task_candidates(&binding, current_day)
+            .discover_staging_task_candidates(&binding, current_day, self.capacity)
             .await?;
         if candidates.is_empty() {
             candidates = discovered
                 .groups()
                 .iter()
-                .map(ForgePlanCandidate::from_live_group)
+                .map(|group| {
+                    ForgePlanCandidate::from_live_group(
+                        group,
+                        self.forge.core.config.max_concurrent_reads,
+                        self.capacity,
+                    )
+                })
                 .collect::<Result<Vec<_>, ForgeError>>()?;
         }
         // Independent per-table maintenance trigger. Evaluated every tick from
         // the current metadata, not from the presence of compaction work, so
         // snapshot expiry can never be starved by sustained compaction load.
         // When maintenance is due it leads the candidate list, taking this
-        // tick's single planned slot ahead of compaction; otherwise the
-        // both-empty fallback still materializes expiry when no compaction is
-        // ready, preserving staging-first compaction priority in the steady
-        // state.
-        let maintenance_due = self.maintenance_due(&table)?;
-        if (maintenance_due || candidates.is_empty())
-            && let Some(candidate) = self.maintenance_candidate(&table).await?
-        {
-            if maintenance_due {
-                candidates.insert(0, candidate);
-            } else {
-                candidates.push(candidate);
-            }
+        // tick's single planned slot ahead of compaction. Retention eligibility
+        // is part of the due predicate so a successful no-op expiry cannot
+        // create an endless successor-demand loop ahead of compaction.
+        let maintenance_due = self.maintenance_due(&table, demand)?;
+        if maintenance_due && let Some(candidate) = self.maintenance_candidate(&table).await? {
+            candidates.insert(0, candidate);
         }
         Ok(ForgeTableSnapshot {
             snapshot_id: discovered.base_snapshot_id(),
@@ -698,10 +747,21 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     ///
     /// Returns a clock error when the current time cannot be read.
-    fn maintenance_due(&self, table: &iceberg::table::Table) -> Result<bool, ForgeError> {
+    fn maintenance_due(
+        &self,
+        table: &iceberg::table::Table,
+        demand: &ForgePlanningDemand,
+    ) -> Result<bool, ForgeError> {
         let retained = table.metadata().snapshots().count();
         let commits = retained.saturating_sub(self.forge.core.config.retain_last);
         if commits == 0 {
+            return Ok(false);
+        }
+        if demand.acknowledged_snapshot_id == table.metadata().current_snapshot_id()
+            && demand
+                .acknowledged_commit_count
+                .is_some_and(|acknowledged| commits as u64 <= acknowledged)
+        {
             return Ok(false);
         }
         let now_ms = self.forge.core.clock.now()?.timestamp_millis();
@@ -718,6 +778,7 @@ impl<'forge> ForgeScheduler<'forge> {
             oldest_age,
             self.forge.core.config.maintenance_trigger_snapshot_count,
             self.forge.core.config.maintenance_trigger_interval,
+            self.forge.core.config.snapshot_retention,
         ))
     }
 
@@ -747,6 +808,7 @@ impl<'forge> ForgeScheduler<'forge> {
             .await
             .map_err(ForgeError::Catalog)?;
         let mut inputs = Vec::new();
+        let mut input_bytes = Vec::new();
         let mut bytes = 0_u64;
         for manifest in manifests
             .entries()
@@ -767,9 +829,12 @@ impl<'forge> ForgeScheduler<'forge> {
             }
             bytes = next;
             inputs.push(manifest.manifest_path.clone());
+            input_bytes.push(size.max(1));
         }
-        inputs.sort();
-        inputs.dedup();
+        let mut input_terms = inputs.into_iter().zip(input_bytes).collect::<Vec<_>>();
+        input_terms.sort_by(|left, right| left.0.cmp(&right.0));
+        input_terms.dedup_by(|left, right| left.0 == right.0);
+        let (inputs, input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
         if inputs.is_empty() {
             return Ok(None);
         }
@@ -782,21 +847,26 @@ impl<'forge> ForgeScheduler<'forge> {
         // applies), wedging deep-history tables. The full manifest window still
         // drives `inputs`, so successive expiries retire bounded slices and the
         // plan hash advances as history shrinks.
-        let parallelism = u16::try_from(
+        let envelope = super::planner::ForgeTaskEnvelope::for_rewrite(
+            estimate,
             inputs
                 .len()
                 .min(self.forge.core.config.max_concurrent_reads),
-        )
-        .unwrap_or(u16::MAX)
-        .max(1);
+            self.capacity,
+        );
         Ok(Some(ForgePlanCandidate {
             strategy: ForgeTaskStrategy::SnapshotExpiry,
             inputs,
+            input_bytes,
             bytes: estimate,
-            parallelism,
-            memory_bytes: estimate,
-            spill_bytes: estimate,
-            parameters: serde_json::json!({"kind":"maintenance"}),
+            parallelism: envelope.reader_permits,
+            memory_bytes: envelope.memory_bytes(),
+            spill_bytes: envelope.scratch_bytes,
+            parameters: serde_json::json!({
+                "kind":"maintenance",
+                "trigger_commit_count": table.metadata().snapshots().count()
+                    .saturating_sub(self.forge.core.config.retain_last),
+            }),
         }))
     }
 
@@ -824,6 +894,43 @@ impl<'forge> ForgeScheduler<'forge> {
             .planning_status(self.demand_cap)
             .await
             .map_err(ForgeError::Sql)?;
+        let governor =
+            self.forge
+                .core
+                .resources
+                .snapshot()
+                .map_err(|error| ForgeError::Capacity {
+                    detail: error.to_string(),
+                })?;
+        let capacity = ForgeCapacity::try_from(&self.forge.core.config)?;
+        let limits = ForgeClaimLimits {
+            max_active_per_tenant: u32::MAX,
+            lease_seconds: 1,
+            max_files: capacity.max_files,
+            max_bytes: capacity.max_bytes,
+            max_parallelism: capacity
+                .max_parallelism
+                .min(u16::try_from(governor.plan.effective_cpu).unwrap_or(u16::MAX)),
+            max_memory_bytes: capacity
+                .max_memory_bytes
+                .min(u64::try_from(governor.plan.elastic_memory_bytes).unwrap_or(u64::MAX)),
+            max_spill_bytes: capacity
+                .max_spill_bytes
+                .min(governor.plan.scratch_limit_bytes),
+            max_large_task_bytes: capacity.max_large_task_bytes,
+        };
+        let unclaimable_task_ids = self
+            .tasks
+            .unclaimable_ready_task_ids(limits)
+            .await
+            .map_err(ForgeError::Sql)?;
+        outcome.unclaimable_tasks = unclaimable_task_ids.len();
+        for task_id in unclaimable_task_ids {
+            tracing::warn!(
+                %task_id,
+                "Forge ready tasks exceed the live pod governor envelope"
+            );
+        }
         self.renew_fence(fence).await?;
         if should_publish_gauges(outcome, overflowed) {
             metrics::gauge!("bifrost_forge_planning_backlog").set(exact_gauge(backlog));
@@ -846,23 +953,28 @@ impl<'forge> ForgeScheduler<'forge> {
     }
 }
 
-/// Pure count-OR-interval snapshot-expiry trigger predicate.
+/// Pure retention-gated count-OR-interval snapshot-expiry trigger predicate.
 ///
 /// `commits` is the count of retained snapshots past `retain_last`, and
 /// `oldest_age` is the age of the oldest retained snapshot when the table has
-/// any. Maintenance is due when `commits >= count_threshold`, or when
-/// `oldest_age` has reached `interval` with at least one accrued commit. A
-/// table with zero accrued commits is never due, so the interval arm cannot
-/// fire on an empty or freshly maintained table. Extracted as a free function
-/// so the four trigger outcomes are exercised without catalog or clock IO.
+/// any. The oldest snapshot must first cross the configured retention cutoff;
+/// otherwise expiry would be a successful no-op and successor demands could
+/// starve compaction forever. Once eligible, maintenance is due when
+/// `commits >= count_threshold`, or when `oldest_age` has reached `interval`.
+/// A table with zero accrued commits is never due. Extracted as a free function
+/// so trigger and retention outcomes are exercised without catalog or clock IO.
 #[must_use]
 fn maintenance_trigger_due(
     commits: usize,
     oldest_age: Option<Duration>,
     count_threshold: usize,
     interval: Duration,
+    retention: Duration,
 ) -> bool {
     if commits == 0 {
+        return false;
+    }
+    if oldest_age.is_none_or(|age| age < retention) {
         return false;
     }
     if commits >= count_threshold {
@@ -913,8 +1025,7 @@ mod source_tests {
 
     use super::{ForgeScheduleOutcome, maintenance_trigger_due, should_publish_gauges};
 
-    /// The count arm fires once accrued commits reach the threshold, even when
-    /// the oldest snapshot is younger than the interval.
+    /// The count arm fires at threshold once the oldest snapshot is eligible.
     #[test]
     fn count_arm_fires_at_threshold() {
         assert!(maintenance_trigger_due(
@@ -922,6 +1033,7 @@ mod source_tests {
             Some(Duration::from_secs(1)),
             32,
             Duration::from_hours(1),
+            Duration::from_secs(1),
         ));
     }
 
@@ -934,6 +1046,7 @@ mod source_tests {
             Some(Duration::from_hours(2)),
             32,
             Duration::from_hours(1),
+            Duration::from_hours(1),
         ));
     }
 
@@ -944,6 +1057,7 @@ mod source_tests {
             5,
             Some(Duration::from_mins(10)),
             32,
+            Duration::from_hours(1),
             Duration::from_hours(1),
         ));
     }
@@ -957,6 +1071,19 @@ mod source_tests {
             Some(Duration::from_hours(100)),
             1,
             Duration::from_hours(1),
+            Duration::from_hours(1),
+        ));
+    }
+
+    /// Count pressure cannot schedule expiry before retention makes work eligible.
+    #[test]
+    fn count_arm_waits_for_retention_cutoff() {
+        assert!(!maintenance_trigger_due(
+            200,
+            Some(Duration::from_hours(24)),
+            32,
+            Duration::from_hours(1),
+            Duration::from_hours(24 * 7),
         ));
     }
 

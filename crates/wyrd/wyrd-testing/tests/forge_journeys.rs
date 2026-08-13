@@ -8,8 +8,8 @@ use secrecy::SecretString;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::forge::{
-    ForgeError, ForgeLease, ForgeScheduler, ForgeSchedulerTrigger, ForgeWorker,
-    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeCapacity, ForgeEnvelopeSizer, ForgeError, ForgeLease, ForgeScheduler,
+    ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use vala_sql::queries::forge_tasks::ForgeTasks;
@@ -50,6 +50,35 @@ const SPANS_PER_WRITE: usize = 6;
 
 /// Stable scheduler identity for maintenance journey fixtures.
 const MAINTENANCE_JOURNEY_SCHEDULER_OWNER: u128 = 0x0198_39f4_2b51_7000_8000_0000_0000_0005;
+
+/// Sizes one journey task from the same config-clamped live governor capacity as production.
+fn journey_envelope(
+    fixture: &wyrd_testing::bifrost::forge_harness::ForgeFixture,
+    input_bytes: u64,
+    file_count: usize,
+) -> vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+    let mut capacity = ForgeCapacity::try_from(&fixture.config).expect("journey Forge capacity");
+    let plan = fixture
+        .forge
+        .resources_for_test()
+        .snapshot()
+        .expect("journey resource snapshot")
+        .plan;
+    capacity.max_memory_bytes = capacity
+        .max_memory_bytes
+        .min(u64::try_from(plan.elastic_memory_bytes).expect("journey memory capacity"));
+    capacity.max_spill_bytes = capacity.max_spill_bytes.min(plan.scratch_limit_bytes);
+    capacity.max_parallelism = capacity
+        .max_parallelism
+        .min(u16::try_from(plan.effective_cpu).unwrap_or(u16::MAX));
+    ForgeEnvelopeSizer::size(
+        input_bytes,
+        file_count,
+        fixture.config.max_concurrent_reads,
+        capacity,
+    )
+    .expect("journey executable envelope")
+}
 
 /// One bounded production scheduler and worker pair for a lifecycle proof.
 struct JourneyMaintenance {
@@ -247,6 +276,7 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
     assert_ne!(current_snapshot, 0, "fresh task base must be stale");
 
     let tasks = ForgeTasks::new(fixture.operator_pool.clone());
+    let envelope = journey_envelope(&fixture, 1, 1);
     let task_id = tasks
         .enqueue(&NewForgeTask {
             data_tenant_id: fixture.tenant,
@@ -266,11 +296,12 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
             },
             plan_hash: [0xA5; 32],
             estimates: ForgeTaskEstimates {
+                envelope: Some(envelope),
                 files: 1,
                 bytes: 1,
                 parallelism: 1,
-                memory_bytes: 1,
-                spill_bytes: 1,
+                memory_bytes: envelope.memory_bytes().expect("journey resident total"),
+                spill_bytes: envelope.scratch_bytes().expect("journey scratch total"),
                 large_ceiling_bytes: 1,
             },
             ready_at: chrono::Utc::now(),

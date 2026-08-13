@@ -19,6 +19,64 @@ use super::right_size::{
 use crate::catalog::TenantTableBinding;
 
 impl Forge {
+    /// Inspect the current live data files and production right-size bounds.
+    ///
+    /// This test-support projection runs the same manifest validation used by
+    /// production discovery and performs no catalog or object-store writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, layout, metadata, or manifest invariant errors from
+    /// production discovery.
+    #[cfg(feature = "test-support")]
+    pub async fn inspect_live_files_for_test(
+        &self,
+        binding: &TenantTableBinding,
+        table: &Table,
+    ) -> Result<(i64, ForgeRightSizePolicy, Vec<IcebergCandidateFile>), ForgeError> {
+        let snapshot =
+            table
+                .metadata()
+                .current_snapshot()
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "Forge inspection requires a current snapshot".to_owned(),
+                })?;
+        let schema_id = snapshot.schema_id().ok_or_else(|| ForgeError::Invariant {
+            detail: "current snapshot lacks a schema identity".to_owned(),
+        })?;
+        let schema =
+            table
+                .metadata()
+                .schema_by_id(schema_id)
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "current snapshot schema is absent from metadata".to_owned(),
+                })?;
+        validate_supported_layout(
+            schema,
+            table.metadata().default_partition_spec(),
+            table.metadata().default_sort_order(),
+        )?;
+        let target = u64::try_from(
+            table
+                .metadata()
+                .table_properties()
+                .map_err(ForgeError::Catalog)?
+                .write_target_file_size_bytes,
+        )
+        .map_err(|_| ForgeError::Invariant {
+            detail: "Iceberg target file size exceeds u64".to_owned(),
+        })?;
+        let policy = ForgeRightSizePolicy::new(
+            target,
+            schema_id,
+            table.metadata().default_partition_spec_id(),
+            table.metadata().default_sort_order_id(),
+        )?;
+        let mut files = self.live_candidates(binding, table, snapshot).await?;
+        files.sort_by(|left, right| left.catalog_path().cmp(right.catalog_path()));
+        Ok((snapshot.snapshot_id(), policy, files))
+    }
+
     /// Load one current Iceberg snapshot and produce its deterministic live-file plan.
     ///
     /// Manifest IO is bounded to the snapshot selected by `table`; all candidate

@@ -55,6 +55,18 @@ mod pg_tests {
                 memory_bytes: 100,
                 spill_bytes: 100,
                 large_ceiling_bytes: 1000,
+                envelope: Some(vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+                    version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
+                    reader_permits: 1,
+                    decoded_batch_bytes: 10,
+                    decoded_input_bytes: 10,
+                    sort_working_bytes: 30,
+                    sort_merge_reservation_bytes: 10,
+                    encoder_buffer_bytes: 40,
+                    upload_chunk_bytes: 20,
+                    sort_spill_bytes: 50,
+                    output_scratch_bytes: 50,
+                }),
             },
             ready_at: Utc::now(),
         }
@@ -108,6 +120,113 @@ mod pg_tests {
         }
     }
 
+    /// Version-one envelope terms survive enqueue and fair-claim decoding exactly.
+    #[tokio::test]
+    async fn forge_envelope_v1_round_trips_and_aggregates_match() {
+        let (fixture, _admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let expected = task(
+            fixture.data_tenant_id(),
+            "envelope-round-trip",
+            ForgeTaskLane::Ordinary,
+            211,
+        );
+        tasks.enqueue(&expected).await.expect("enqueue envelope");
+
+        let claim = tasks
+            .claim_fair(Uuid::now_v7(), limits(1), None)
+            .await
+            .expect("claim query")
+            .expect("claim");
+
+        assert_eq!(claim.estimates.files, expected.estimates.files);
+        assert_eq!(claim.estimates.bytes, expected.estimates.bytes);
+        assert_eq!(claim.estimates.parallelism, expected.estimates.parallelism);
+        assert_eq!(
+            claim.estimates.memory_bytes,
+            expected.estimates.memory_bytes
+        );
+        assert_eq!(claim.estimates.spill_bytes, expected.estimates.spill_bytes);
+        assert_eq!(claim.estimates.envelope, expected.estimates.envelope);
+        let envelope = claim.estimates.envelope.expect("version-one envelope");
+        assert_eq!(
+            envelope.memory_bytes().expect("resident total"),
+            claim.estimates.memory_bytes
+        );
+        assert_eq!(
+            envelope.scratch_bytes().expect("scratch total"),
+            claim.estimates.spill_bytes
+        );
+    }
+
+    /// Version-zero rows decode without manufacturing executable detail terms.
+    #[tokio::test]
+    async fn legacy_envelope_defaults_are_non_executable() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let legacy = task(
+            fixture.data_tenant_id(),
+            "legacy-default",
+            ForgeTaskLane::Ordinary,
+            212,
+        );
+        let task_id = tasks.enqueue(&legacy).await.expect("enqueue legacy seed");
+        make_legacy(&admin, task_id, false).await;
+
+        let claim = tasks
+            .claim_fair(Uuid::now_v7(), limits(1), None)
+            .await
+            .expect("claim query")
+            .expect("legacy claim");
+
+        assert_eq!(claim.task_id, task_id);
+        assert_eq!(claim.estimates.envelope, None);
+        assert_eq!(claim.estimates.memory_bytes, 100);
+        assert_eq!(claim.estimates.spill_bytes, 100);
+    }
+
+    /// Oversized legacy rows bypass only envelope and lane resource bounds.
+    #[tokio::test]
+    async fn oversized_legacy_envelope_bypasses_resource_bounds_for_supersession() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let legacy = task(
+            fixture.data_tenant_id(),
+            "legacy-oversized",
+            ForgeTaskLane::LargeSingleton,
+            213,
+        );
+        let task_id = tasks.enqueue(&legacy).await.expect("enqueue legacy seed");
+        make_legacy(&admin, task_id, true).await;
+
+        let claim = tasks
+            .claim_fair(Uuid::now_v7(), limits(1), None)
+            .await
+            .expect("claim query")
+            .expect("oversized legacy claim");
+
+        assert_eq!(claim.task_id, task_id);
+        assert_eq!(claim.estimates.envelope, None);
+        assert_eq!(claim.estimates.files, 1);
+        assert_eq!(claim.estimates.memory_bytes, 100_000);
+    }
+
+    /// Converts one seeded version-one row into the migration-defined legacy shape.
+    ///
+    /// # Panics
+    /// Panics when the exact test row cannot be converted.
+    async fn make_legacy(admin: &PgPool, task_id: Uuid, oversized: bool) {
+        let estimate = if oversized { 100_000_i64 } else { 100_i64 };
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=$2, estimated_parallelism=1, estimated_memory_bytes=$2, estimated_spill_bytes=$2, large_task_ceiling_bytes=$2 WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .bind(estimate)
+        .execute(admin)
+        .await
+        .expect("convert legacy row");
+    }
+
     /// Persisted envelope terms drive both fair claim admission and skew visibility.
     #[tokio::test]
     async fn persisted_envelope_claim_gate_and_unclaimable_signal_match() {
@@ -117,6 +236,12 @@ mod pg_tests {
         let fitting = task(tenant, "envelope-fit", ForgeTaskLane::Ordinary, 201);
         let mut oversized = task(tenant, "envelope-over", ForgeTaskLane::Ordinary, 202);
         oversized.estimates.memory_bytes = 1_001;
+        oversized
+            .estimates
+            .envelope
+            .as_mut()
+            .expect("version-one test envelope")
+            .encoder_buffer_bytes = 941;
         tasks.enqueue(&fitting).await.expect("fitting envelope");
         tasks.enqueue(&oversized).await.expect("oversized envelope");
         let fitting_id = tasks.task_id_for_plan(&fitting).await.expect("fitting id");
@@ -137,6 +262,158 @@ mod pg_tests {
                 .expect("unclaimable identities"),
             vec![oversized_id]
         );
+    }
+
+    /// Retry settlement persists the closed class, bounded delay, and volume deferral.
+    #[tokio::test]
+    async fn failure_taxonomy_backoff_and_volume_deferral_are_durable() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let task = task(tenant, "fault-taxonomy", ForgeTaskLane::Ordinary, 203);
+        let task_id = tasks.enqueue(&task).await.expect("enqueue fault task");
+        let defaults: (i32, Option<String>, bool, Option<String>) = sqlx::query_as(
+            "SELECT attempt_count,failure_class,next_eligible_at<=statement_timestamp(),failed_volume_identity FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(&admin)
+        .await
+        .expect("failure taxonomy defaults");
+        assert_eq!(defaults, (0, None, true, None));
+        let claim = tasks
+            .claim_fair_for_volume(owner, limits(1), None, Some("volume-a"))
+            .await
+            .expect("initial claim")
+            .expect("fault task");
+        let attempt = claim.attempt_id.expect("attempt identity");
+
+        assert_eq!(
+            tasks
+                .retry_failure(task_id, attempt, owner, "storage_health", Some("volume-a"))
+                .await
+                .expect("storage-health retry"),
+            1
+        );
+        let persisted: (String, i32, Option<String>, Option<String>, bool) = sqlx::query_as(
+            "SELECT state,attempt_count,failure_class,failed_volume_identity,next_eligible_at>statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(&admin)
+        .await
+        .expect("persisted failure taxonomy");
+        assert_eq!(persisted.0, "retryable");
+        assert_eq!(persisted.1, 1);
+        assert_eq!(persisted.2.as_deref(), Some("storage_health"));
+        assert_eq!(persisted.3.as_deref(), Some("volume-a"));
+        assert!(persisted.4, "backoff remains in the future");
+        assert!(
+            tasks
+                .claim_fair_for_volume(Uuid::now_v7(), limits(1), None, Some("volume-b"))
+                .await
+                .expect("claim during backoff")
+                .is_none(),
+            "all volumes honor next eligibility"
+        );
+
+        sqlx::query("UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp() WHERE task_id=$1")
+            .bind(task_id)
+            .execute(&admin)
+            .await
+            .expect("advance first eligibility");
+        assert!(
+            tasks
+                .claim_fair_for_volume(Uuid::now_v7(), limits(1), None, Some("volume-a"))
+                .await
+                .expect("same-volume deferred claim")
+                .is_none(),
+            "the failed volume is softly deferred for one additional backoff"
+        );
+        let healthy_claim = tasks
+            .claim_fair_for_volume(Uuid::now_v7(), limits(1), None, Some("volume-b"))
+            .await
+            .expect("different-volume claim")
+            .expect("a healthy volume may take over");
+        assert_eq!(healthy_claim.task_id, task_id);
+    }
+
+    /// Capacity refusal preserves retry budget while lease reclaim consumes it without audit.
+    #[tokio::test]
+    async fn capacity_refusal_and_expired_reclaim_have_distinct_settlement() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let capacity = task(tenant, "capacity-refusal", ForgeTaskLane::Ordinary, 204);
+        let capacity_id = tasks
+            .enqueue(&capacity)
+            .await
+            .expect("enqueue capacity task");
+        let claim = tasks
+            .claim_fair(owner, limits(1), None)
+            .await
+            .expect("capacity claim")
+            .expect("capacity task");
+        tasks
+            .release_capacity_refused(
+                capacity_id,
+                claim.attempt_id.expect("capacity attempt"),
+                owner,
+            )
+            .await
+            .expect("release capacity refusal");
+        let capacity_row: (i32, Option<String>) = sqlx::query_as(
+            "SELECT attempt_count,failure_class FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(capacity_id)
+        .fetch_one(&admin)
+        .await
+        .expect("capacity settlement");
+        assert_eq!(capacity_row.0, 0);
+        assert_eq!(capacity_row.1.as_deref(), Some("capacity_refused"));
+
+        sqlx::query("UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp() WHERE task_id=$1")
+            .bind(capacity_id)
+            .execute(&admin)
+            .await
+            .expect("make capacity task eligible");
+        let reclaimed_claim = tasks
+            .claim_fair(owner, limits(1), None)
+            .await
+            .expect("reclaim candidate")
+            .expect("capacity task claimable again");
+        let reclaimed_attempt = reclaimed_claim.attempt_id.expect("reclaimed attempt");
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+            .bind(capacity_id)
+            .execute(&admin)
+            .await
+            .expect("expire attempt");
+        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            .fetch_one(&admin)
+            .await
+            .expect("audit count before reclaim");
+        assert_eq!(
+            tasks
+                .reclaim_expired_attempts(1)
+                .await
+                .expect("bounded reclaim"),
+            vec![(capacity_id, reclaimed_attempt)]
+        );
+        let reclaimed: (String, i32, bool) = sqlx::query_as(
+            "SELECT state,attempt_count,next_eligible_at>statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(capacity_id)
+        .fetch_one(&admin)
+        .await
+        .expect("reclaimed state");
+        assert_eq!(reclaimed.0, "retryable");
+        assert_eq!(reclaimed.1, 1);
+        assert!(reclaimed.2);
+        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            .fetch_one(&admin)
+            .await
+            .expect("audit count after reclaim");
+        assert_eq!(audit_after, audit_before, "reclaim remains audit-free");
     }
 
     /// Proves worker admission is independent of scheduler leadership and only

@@ -193,9 +193,10 @@ mod pg_tests {
             &self,
             operator: &opendal::Operator,
             path: &str,
+            chunk_bytes: usize,
         ) -> opendal::Result<opendal::Writer> {
             self.output_writer_opens.fetch_add(1, Ordering::AcqRel);
-            operator.writer_with(path).chunk(8 * 1024 * 1024).await
+            operator.writer_with(path).chunk(chunk_bytes).await
         }
 
         /// Records bounded chunks and optionally injects one retryable failure.
@@ -870,12 +871,24 @@ mod pg_tests {
                 plan,
                 plan_hash: [hash; 32],
                 estimates: ForgeTaskEstimates {
+                    envelope: Some(vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+                        version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
+                        reader_permits: 1,
+                        decoded_batch_bytes: 16 * 1024 * 1024,
+                        decoded_input_bytes: 16 * 1024 * 1024,
+                        sort_working_bytes: 42 * 1024 * 1024,
+                        sort_merge_reservation_bytes: 10 * 1024 * 1024,
+                        encoder_buffer_bytes: 32 * 1024 * 1024,
+                        upload_chunk_bytes: 8 * 1024 * 1024,
+                        sort_spill_bytes: 512 * 1024 * 1024,
+                        output_scratch_bytes: 512 * 1024 * 1024,
+                    }),
                     files: 1,
                     bytes: 1,
                     parallelism: 1,
-                    memory_bytes: 1,
-                    spill_bytes: 1,
-                    large_ceiling_bytes: 1,
+                    memory_bytes: 98 * 1024 * 1024,
+                    spill_bytes: 1024 * 1024 * 1024,
+                    large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },
                 ready_at: chrono::Utc::now() - chrono::Duration::seconds(1),
             }
@@ -2320,7 +2333,7 @@ mod pg_tests {
 
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.
     #[tokio::test]
-    async fn streaming_rewrite_spills_and_commits_multiple_outputs() {
+    async fn constrained_streaming_rewrite_respects_complete_envelope() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
                 max_files_per_bin: 32,
@@ -2345,24 +2358,68 @@ mod pg_tests {
         // pool while exactly consuming the benchmark-shaped shared file budget.
         fixture.seed_files(32, true).await;
         vala_bifrost_redux::resources::reset_memory_peak_for_test();
+        vala_bifrost_redux::forge::reset_scratch_peak_for_test();
         let outcome = fixture.schedule_and_execute().await;
         assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
+        let envelope: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,sort_spill_bytes,output_scratch_bytes,estimated_memory_bytes FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("persisted execution envelope");
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
-        assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
+        assert!(
+            fixture.reads.peak_reads.load(Ordering::Relaxed)
+                <= usize::try_from(envelope.1 / envelope.0).expect("reader permits")
+        );
         assert!(
             fixture.reads.output_chunks.load(Ordering::Acquire) > 1,
             "a multi-output rewrite must traverse the bounded chunk seam"
         );
         assert!(
-            fixture.reads.largest_output_chunk.load(Ordering::Acquire) <= 8 * 1024 * 1024,
-            "no upload write may exceed UPLOAD_CHUNK_BYTES"
+            fixture.reads.largest_output_chunk.load(Ordering::Acquire)
+                <= usize::try_from(envelope.5).expect("upload term"),
+            "no upload write may exceed the persisted upload term"
         );
         let peak_memory = vala_bifrost_redux::resources::memory_peak_for_test();
         assert!(
-            peak_memory <= 256 * 1024 * 1024,
+            peak_memory <= usize::try_from(envelope.8).expect("resident total"),
             "leased-pool peak must remain independent of total output: {peak_memory}"
         );
+        assert_eq!(envelope.2, 2 * envelope.0 + envelope.3);
+        assert_eq!(
+            envelope.8,
+            envelope.1 + envelope.2 + envelope.4 + envelope.5
+        );
+        assert!(
+            vala_bifrost_redux::resources::memory_consumer_peak_for_test(
+                "forge-rewrite-decoded-batch"
+            ) <= usize::try_from(envelope.0).expect("decoded term")
+        );
+        assert!(
+            vala_bifrost_redux::resources::memory_consumer_peak_for_test("forge-rewrite-output")
+                <= usize::try_from(envelope.4 + envelope.5).expect("output resident terms")
+        );
+        let sort_peak = vala_bifrost_redux::resources::memory_consumer_peak_for_test("Sort");
+        assert!(
+            sort_peak <= usize::try_from(envelope.2).expect("sort working term"),
+            "sort peak {sort_peak} exceeds persisted term {}",
+            envelope.2
+        );
+        assert!(
+            vala_bifrost_redux::forge::scratch_peak_for_test()
+                <= u64::try_from(envelope.6 + envelope.7).expect("scratch total")
+        );
+        let released = fixture
+            .forge
+            .resources_for_test()
+            .snapshot()
+            .expect("released resource snapshot");
+        assert_eq!(released.elastic_memory_used_bytes, 0);
+        assert_eq!(released.scratch_used_bytes, 0);
+        assert_eq!(released.forge_reader_permits_used, 0);
         let (output_files, output_rows) = committed_output_totals(&fixture).await;
         assert!(output_files >= 2, "rotation must commit multiple outputs");
         assert_eq!(
@@ -2438,7 +2495,7 @@ mod pg_tests {
 
     /// One output larger than the upload bound reaches the store as many chunks.
     #[tokio::test]
-    async fn streaming_output_uses_multiple_bounded_chunks() {
+    async fn scaled_upload_uses_exact_chunk_and_bounded_buffer() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
                 max_files_per_bin: 64,
@@ -3293,8 +3350,8 @@ mod pg_tests {
     ) {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
-                orphan_gc_ttl: Duration::from_nanos(1),
                 ..ForgeConfig::default()
             },
             true,
@@ -3437,7 +3494,6 @@ mod pg_tests {
             ForgeConfig {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
-                orphan_gc_ttl: Duration::from_nanos(1),
                 ..ForgeConfig::default()
             },
             true,
@@ -3659,10 +3715,24 @@ mod pg_tests {
         )
         .expect("successor worker");
         assert!(
+            !successor
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("accepted expiry reclaim"),
+            "an expired accepted attempt is reclaimed into durable backoff"
+        );
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp()-interval '1 second',ready_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("advance accepted recovery eligibility");
+        assert!(
             successor
                 .execute_one_for_test(&CancellationToken::new())
                 .await
-                .expect("accepted expiry recovery")
+                .expect("accepted expiry recovery after backoff")
         );
         let recovered_location = fixture
             .catalog
@@ -4838,8 +4908,24 @@ mod pg_tests {
             Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
         let resources = fixture.forge.resources_for_test();
         let plan = fixture.roles.plan();
+        let blocker_envelope = vala_bifrost_redux::forge::ForgeEnvelopeSizer::size(
+            1,
+            1,
+            1,
+            vala_bifrost_redux::forge::ForgeCapacity {
+                max_files: 1,
+                max_bytes: u64::MAX,
+                max_parallelism: 1,
+                max_memory_bytes: u64::try_from(plan.elastic_memory_bytes)
+                    .expect("blocker memory capacity"),
+                max_spill_bytes: plan.scratch_limit_bytes,
+                max_large_task_bytes: u64::MAX,
+            },
+        )
+        .expect("blocker envelope");
         let blocker = resources
             .try_acquire_rewrite(vala_bifrost_redux::resources::ForgeRewriteRequest {
+                envelope: blocker_envelope,
                 memory_bytes: plan.elastic_memory_bytes,
                 scratch_bytes: plan.scratch_limit_bytes,
                 reader_permits: u16::try_from(plan.effective_cpu).unwrap_or(u16::MAX),
@@ -4868,6 +4954,142 @@ mod pg_tests {
         let snapshot = resources.snapshot().expect("released resource snapshot");
         assert_eq!(snapshot.elastic_memory_used_bytes, 0);
         assert_eq!(snapshot.scratch_used_bytes, 0);
+    }
+
+    /// Execution-envelope exhaustion terminalizes immediately without retry.
+    #[tokio::test]
+    async fn execution_envelope_exhaustion_terminalizes_without_retry() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
+        let stop = CancellationToken::new();
+        let planned = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("fixture scheduler")
+            .schedule_once(&stop)
+            .await
+            .expect("planning pass");
+        assert_eq!(planned.tasks_enqueued, 1);
+        let decoded = 16_i64 * 1024 * 1024;
+        let merge = 1024_i64 * 1024;
+        let updated = sqlx::query(
+            "UPDATE vala.forge_tasks SET decoded_batch_bytes=$2,decoded_input_bytes=$2,estimated_parallelism=1,sort_merge_reservation_bytes=$3,sort_working_bytes=2*$2+$3,sort_spill_bytes=1,estimated_memory_bytes=3*$2+$3+encoder_buffer_bytes+upload_chunk_bytes,estimated_spill_bytes=1+output_scratch_bytes WHERE data_tenant_id=$1 AND state='ready'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(decoded)
+        .bind(merge)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("constrain persisted production sort envelope")
+        .rows_affected();
+        assert_eq!(updated, 1);
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("constrained claim query")
+            .expect("constrained claim");
+        let task_id = claim.task_id;
+        let result = fixture
+            .worker
+            .execute_and_settle_claim_for_test(claim, &stop)
+            .await;
+        assert!(
+            matches!(result, Err(ForgeError::ExecutionEnvelopeExceeded { .. })),
+            "production SortExec must surface typed envelope exhaustion: {result:?}"
+        );
+
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("execution refusal evidence tenant connection");
+        let settled: (String, i32, Option<String>, i64) = sqlx::query_as(
+            "SELECT state,attempt_count,failure_class,(SELECT count(*) FROM vala.audit_outbox WHERE resource='forge-task:' || $1::text AND operation='forge.task.failed') FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("settled execution refusal");
+        assert_eq!(
+            settled,
+            (
+                "failed".to_owned(),
+                1,
+                Some("capacity_refused".to_owned()),
+                1
+            )
+        );
+        assert_eq!(fixture.reads.output_put_calls(), 0);
+        assert!(
+            !fixture
+                .worker
+                .execute_one_for_test(&stop)
+                .await
+                .expect("terminal capacity refusal cannot be reclaimed")
+        );
+        let released = fixture
+            .forge
+            .resources_for_test()
+            .snapshot()
+            .expect("released resource snapshot");
+        assert_eq!(released.elastic_memory_used_bytes, 0);
+        assert_eq!(released.scratch_used_bytes, 0);
+        assert_eq!(released.forge_reader_permits_used, 0);
+    }
+
+    /// A claimed legacy task is auditedly superseded and replanned before input IO.
+    #[tokio::test]
+    async fn legacy_task_is_auditedly_superseded_and_replanned_before_io() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 2, fixture_snapshot()).await;
+        let stop = CancellationToken::new();
+        let planned = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("fixture scheduler")
+            .schedule_once(&stop)
+            .await
+            .expect("planning pass");
+        assert_eq!(planned.tasks_enqueued, 1);
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=9223372036854775807, estimated_parallelism=1, estimated_memory_bytes=9223372036854775807, estimated_spill_bytes=9223372036854775807, large_task_ceiling_bytes=9223372036854775807 WHERE data_tenant_id=$1 AND state='ready'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("convert planned task to legacy");
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("claim query")
+            .expect("legacy claim");
+        let task_id = claim.task_id;
+        let reads_before = fixture.reads.ranged_reads.load(Ordering::Relaxed);
+        fixture
+            .worker
+            .execute_claim(claim, &stop)
+            .await
+            .expect("legacy supersession");
+
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("legacy evidence tenant connection");
+        let evidence: (String, i32, i64, i64) = sqlx::query_as(
+            "SELECT state,attempt_count,(SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1),(SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1 AND operation='forge.task.cancelled') FROM vala.forge_tasks WHERE task_id=$2",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(task_id)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("legacy settlement evidence");
+        assert_eq!(evidence, ("cancelled".to_owned(), 0, 1, 1));
+        assert_eq!(
+            fixture.reads.ranged_reads.load(Ordering::Relaxed),
+            reads_before
+        );
+        assert_eq!(fixture.reads.output_put_calls(), 0);
     }
 
     /// Enqueues one exact ordinary staging task for a registered fixture table.
@@ -4904,12 +5126,24 @@ mod pg_tests {
                 },
                 plan_hash: [hash; 32],
                 estimates: ForgeTaskEstimates {
+                    envelope: Some(vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+                        version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
+                        reader_permits: 1,
+                        decoded_batch_bytes: 16 * 1024 * 1024,
+                        decoded_input_bytes: 16 * 1024 * 1024,
+                        sort_working_bytes: 42 * 1024 * 1024,
+                        sort_merge_reservation_bytes: 10 * 1024 * 1024,
+                        encoder_buffer_bytes: 32 * 1024 * 1024,
+                        upload_chunk_bytes: 8 * 1024 * 1024,
+                        sort_spill_bytes: 512 * 1024 * 1024,
+                        output_scratch_bytes: 512 * 1024 * 1024,
+                    }),
                     files: 2,
                     bytes: 200,
                     parallelism: 1,
-                    memory_bytes: 200,
-                    spill_bytes: 200,
-                    large_ceiling_bytes: 1_000,
+                    memory_bytes: 98 * 1024 * 1024,
+                    spill_bytes: 1024 * 1024 * 1024,
+                    large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },
                 ready_at: chrono::Utc::now(),
             })
@@ -5164,7 +5398,7 @@ mod pg_tests {
         let claim = fixture.plan_and_claim().await;
         let task_id = claim.task_id;
         sqlx::query(
-            "UPDATE vala.forge_tasks SET state='running', watermark_snapshot_id=0, watermark_timestamp_ms=0, claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+            "UPDATE vala.forge_tasks SET state='running', watermark_snapshot_id=0, watermark_timestamp_ms=0, claim_expires_at=statement_timestamp()-interval '1 second',next_eligible_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
         )
         .bind(task_id)
         .execute(fixture.operator_pool.pool())
@@ -5180,10 +5414,24 @@ mod pg_tests {
         )
         .expect("successor worker");
         assert!(
+            !successor
+                .execute_one_for_test(&CancellationToken::new())
+                .await
+                .expect("successor bounded reclaim"),
+            "lease reclaim persists backoff before another attempt"
+        );
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp()-interval '1 second',ready_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("advance reclaimed task eligibility");
+        assert!(
             successor
                 .execute_one_for_test(&CancellationToken::new())
                 .await
-                .expect("successor reclaim execution")
+                .expect("successor execution after backoff")
         );
         let (state, _) = task_state_and_active_claims(&fixture, task_id).await;
         assert_eq!(state, "succeeded");
@@ -5379,7 +5627,7 @@ mod pg_tests {
                 .fetch_one(fixture.operator_pool.pool())
                 .await
                 .expect("retained evidence failure");
-        assert_eq!(retained, ("running".to_owned(), true));
+        assert_eq!(retained, ("retryable".to_owned(), true));
         let committed = fixture
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -5407,7 +5655,7 @@ mod pg_tests {
             "recovery must search retained metadata rather than current bytes"
         );
         sqlx::query(
-            "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
+            "UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp()-interval '1 second',ready_at=statement_timestamp()-interval '1 second' WHERE task_id=$1",
         )
         .bind(task_id)
         .execute(fixture.operator_pool.pool())

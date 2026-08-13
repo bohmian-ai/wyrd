@@ -14,7 +14,9 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Datelike;
 use datafusion::execution::TaskContext;
-use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
@@ -33,6 +35,121 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::NanValueCountVisitor;
+
+/// Attempt-local pool view enforcing persisted resident term families.
+#[derive(Debug)]
+struct ForgeAttemptMemoryPool {
+    /// Aggregate production pool issued by the root lease.
+    inner: Arc<dyn MemoryPool>,
+    /// Limits and live counters for decoded, sort, and output ownership.
+    terms: [(usize, AtomicU64); 3],
+}
+
+impl ForgeAttemptMemoryPool {
+    /// Wraps the aggregate lease with decoded, sort, and output ceilings.
+    fn new(inner: Arc<dyn MemoryPool>, decoded: usize, sort: usize, output: usize) -> Self {
+        Self {
+            inner,
+            terms: [
+                (decoded, AtomicU64::new(0)),
+                (sort, AtomicU64::new(0)),
+                (output, AtomicU64::new(0)),
+            ],
+        }
+    }
+
+    /// Returns the persisted term family for one known consumer.
+    fn term(&self, reservation: &MemoryReservation) -> Option<&(usize, AtomicU64)> {
+        let name = reservation.consumer().name();
+        if name.contains("forge-rewrite-decoded-batch") {
+            Some(&self.terms[0])
+        } else if name.contains("Sort") || name.contains("ExternalSorter") {
+            Some(&self.terms[1])
+        } else if name.contains("forge-rewrite-output") {
+            Some(&self.terms[2])
+        } else {
+            None
+        }
+    }
+
+    /// Claims a named term before aggregate pool growth.
+    fn claim_term(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<Option<&AtomicU64>> {
+        let Some((limit, counter)) = self.term(reservation) else {
+            return Ok(None);
+        };
+        let additional = u64::try_from(additional).unwrap_or(u64::MAX);
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(additional)
+                    .filter(|next| *next <= u64::try_from(*limit).unwrap_or(u64::MAX))
+            })
+            .map_err(|used| datafusion::error::DataFusionError::ResourcesExhausted(format!(
+                "Forge consumer {} exceeds persisted term: used={used}, additional={additional}, limit={limit}",
+                reservation.consumer().name()
+            )))?;
+        Ok(Some(counter))
+    }
+}
+
+impl MemoryPool for ForgeAttemptMemoryPool {
+    /// Delegates registration to the aggregate pool.
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    /// Delegates removal to the aggregate pool.
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    /// Grows after enforcing the named term.
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.claim_term(reservation, additional)
+            .expect("infallible Forge growth remains within its persisted term");
+        self.inner.grow(reservation, additional);
+    }
+
+    /// Releases aggregate and named ownership together.
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+        if let Some((_, counter)) = self.term(reservation) {
+            counter.fetch_sub(u64::try_from(shrink).unwrap_or(u64::MAX), Ordering::AcqRel);
+        }
+    }
+
+    /// Refuses named growth before aggregate accounting changes.
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        let counter = self.claim_term(reservation, additional)?;
+        if let Err(error) = self.inner.try_grow(reservation, additional) {
+            if let Some(counter) = counter {
+                counter.fetch_sub(
+                    u64::try_from(additional).unwrap_or(u64::MAX),
+                    Ordering::AcqRel,
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Returns aggregate live ownership.
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    /// Returns the aggregate finite limit.
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
+}
 /// Lease-owned rewrite resources for exactly one Forge attempt.
 ///
 /// The attempt's `DataFusion` runtime is built from the pool and scratch bytes
@@ -42,9 +159,11 @@ use iceberg::arrow::NanValueCountVisitor;
 /// the exact root lease is returned to the governor.
 pub(crate) struct ForgeAttemptResources {
     /// Attempt runtime shared with the attempt-local execution pipeline view.
-    runtime: Arc<ForgeRewriteRuntime>,
+    runtime: Option<Arc<ForgeRewriteRuntime>>,
     /// Exact memory and scratch lease returned to the root governor on drop.
-    lease: crate::resources::ForgeRewriteResources,
+    lease: Option<crate::resources::ForgeRewriteResources>,
+    /// First finalization result retained for idempotent explicit and drop paths.
+    release_result: Option<crate::resources::ForgeResourceReleaseResult>,
 }
 
 impl ForgeAttemptResources {
@@ -69,24 +188,63 @@ impl ForgeAttemptResources {
                 .map_err(|error| ForgeError::Capacity {
                     detail: format!("{error}; request={request:?}"),
                 })?;
-        let pool = lease.memory_pool();
-        let output_allowance = ENCODER_BUFFER_ALLOWANCE_BYTES
-            .saturating_add(UPLOAD_CHUNK_BYTES)
-            .min(request.memory_bytes / 2)
-            .max(UPLOAD_CHUNK_BYTES.min(request.memory_bytes));
-        let sort_spill_bytes = if lease.scratch_bytes() <= 1 {
-            lease.scratch_bytes()
-        } else {
-            lease.scratch_bytes() / 2
-        };
+        let decoded_batch_bytes =
+            usize::try_from(request.envelope.decoded_batch_bytes).map_err(|_| {
+                ForgeError::Capacity {
+                    detail: "decoded batch exceeds this platform".to_owned(),
+                }
+            })?;
+        let sort_working_bytes =
+            usize::try_from(request.envelope.sort_working_bytes).map_err(|_| {
+                ForgeError::Capacity {
+                    detail: "sort working term exceeds this platform".to_owned(),
+                }
+            })?;
+        let output_allowance = usize::try_from(
+            request
+                .envelope
+                .encoder_buffer_bytes
+                .checked_add(request.envelope.upload_chunk_bytes)
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "Forge output allowance overflows".to_owned(),
+                })?,
+        )
+        .map_err(|_| ForgeError::Capacity {
+            detail: "Forge output allowance exceeds this platform".to_owned(),
+        })?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
+            lease.memory_pool(),
+            decoded_batch_bytes,
+            sort_working_bytes,
+            output_allowance,
+        ));
+        let sort_spill_bytes = request.envelope.sort_spill_bytes;
         let runtime = ForgeRewriteRuntime::new_attempt(
             Arc::clone(&pool),
             pod_spill_root,
-            lease.scratch_bytes(),
-            sort_spill_bytes,
             task_id,
             attempt_id,
-            output_allowance,
+            ForgeAttemptEnvelope {
+                spill_limit_bytes: lease.scratch_bytes(),
+                sort_spill_limit_bytes: sort_spill_bytes,
+                output_allowance_bytes: output_allowance,
+                decoded_batch_bytes,
+                sort_merge_reservation_bytes: usize::try_from(
+                    request.envelope.sort_merge_reservation_bytes,
+                )
+                .map_err(|_| ForgeError::Capacity {
+                    detail: "sort merge reservation exceeds this platform".to_owned(),
+                })?,
+                encoder_flush_bytes: usize::try_from(request.envelope.encoder_buffer_bytes / 2)
+                    .map_err(|_| ForgeError::Capacity {
+                        detail: "encoder flush threshold exceeds this platform".to_owned(),
+                    })?,
+                upload_chunk_bytes: usize::try_from(request.envelope.upload_chunk_bytes).map_err(
+                    |_| ForgeError::Capacity {
+                        detail: "upload chunk exceeds this platform".to_owned(),
+                    },
+                )?,
+            },
         )?;
         if !runtime.uses_memory_pool(&pool) {
             return Err(ForgeError::Invariant {
@@ -94,26 +252,67 @@ impl ForgeAttemptResources {
             });
         }
         Ok(Self {
-            runtime: Arc::new(runtime),
-            lease,
+            runtime: Some(Arc::new(runtime)),
+            lease: Some(lease),
+            release_result: None,
         })
     }
 
     /// Creates the attempt-local execution view backed by this leased runtime.
     pub(crate) fn pipeline(&self, base: &ForgeRewritePipeline) -> ForgeRewritePipeline {
-        base.for_runtime(Arc::clone(&self.runtime))
+        base.for_runtime(Arc::clone(
+            self.runtime
+                .as_ref()
+                .expect("invariant: active attempt retains its runtime"),
+        ))
     }
 
     /// Returns the runtime this attempt lends to its execution pipeline view.
     #[cfg(test)]
     pub(crate) fn runtime(&self) -> &ForgeRewriteRuntime {
-        &self.runtime
+        self.runtime
+            .as_ref()
+            .expect("invariant: active attempt retains its runtime")
     }
 
     /// Returns the exact pool this attempt leased, for lifecycle assertions.
     #[cfg(test)]
     pub(crate) fn memory_pool(&self) -> Arc<dyn MemoryPool> {
-        self.lease.memory_pool()
+        Arc::clone(
+            &self
+                .runtime
+                .as_ref()
+                .expect("invariant: active attempt retains its runtime")
+                .runtime
+                .memory_pool,
+        )
+    }
+
+    /// Drops runtime ownership before explicitly releasing or poisoning the lease.
+    fn finish(&mut self) -> crate::resources::ForgeResourceReleaseResult {
+        if let Some(result) = self.release_result {
+            return result;
+        }
+        let runtime = self
+            .runtime
+            .take()
+            .expect("invariant: unfinished attempt retains its runtime");
+        let surviving_handle = Arc::strong_count(&runtime) != 1;
+        drop(runtime);
+        let mut lease = self
+            .lease
+            .take()
+            .expect("invariant: unfinished attempt retains its lease");
+        let result = if surviving_handle {
+            lease.poison_without_release()
+        } else if let Err(error) = lease.release() {
+            tracing::error!(%error, "Forge attempt resource release failed");
+            crate::resources::ForgeResourceReleaseResult::Poisoned
+        } else {
+            crate::resources::ForgeResourceReleaseResult::Released
+        };
+        self.release_result = Some(result);
+        result
     }
 }
 
@@ -124,13 +323,7 @@ impl Drop for ForgeAttemptResources {
     /// governor's scratch release, so a violation is reported rather than
     /// silently tolerated. Dropping proceeds either way; the lease must return.
     fn drop(&mut self) {
-        if Arc::strong_count(&self.runtime) != 1 {
-            tracing::error!(
-                scratch_bytes = self.lease.scratch_bytes(),
-                "invariant: Forge attempt runtime outlived its resource lease"
-            );
-            debug_assert!(false, "Forge attempt runtime outlived its resource lease");
-        }
+        let _ = self.finish();
     }
 }
 
@@ -159,13 +352,11 @@ use vala_sql::row_types::forge_tasks::ForgeTaskEstimates;
 
 /// Maximum rows decoded from one Parquet source batch.
 const REWRITE_BATCH_ROWS: usize = 8_192;
-/// Chunk size for bounded sealed-file reads and streaming object uploads.
-pub(crate) const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// Byte threshold that forces the current Parquet row group to flush.
+#[cfg(test)]
 pub(crate) const ROW_GROUP_FLUSH_BYTES: usize = 32 * 1024 * 1024;
-/// Fixed encoder working-set reservation held before an output writer exists.
-pub(crate) const ENCODER_BUFFER_ALLOWANCE_BYTES: usize = 2 * ROW_GROUP_FLUSH_BYTES;
 /// Target decoded batch bytes used by the envelope and footer refusal rule.
+#[cfg(test)]
 pub(crate) const DECODED_BATCH_TARGET_BYTES: usize = 16 * 1024 * 1024;
 /// Total upload openings permitted for one sealed output in one attempt.
 const OUTPUT_UPLOAD_ATTEMPTS: usize = 2;
@@ -184,29 +375,21 @@ pub(crate) const REWRITE_WORKING_SET_FLOOR_BYTES: u64 =
 /// Upper bound for `DataFusion` spill handles to finish dropping after cancel.
 const SPILL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Raises one validated memory estimate to the executable rewrite working set.
-///
-/// The estimate has already been proven to fit `capacity`, so raising it to
-/// [`REWRITE_WORKING_SET_FLOOR_BYTES`] and re-bounding by the same validated
-/// memory ceiling never admits a task the planner refused: it only ensures the
-/// leased pool can actually run the rewrite plan. Both request constructors
-/// share this operation so a durable claim and a directly replaced live group
-/// lease byte-identical memory.
-///
-/// # Errors
-///
-/// Returns [`ForgeError::Capacity`] when the resulting demand exceeds this
-/// platform's `usize` domain.
-fn rewrite_working_set_bytes(
-    estimate_bytes: u64,
-    capacity: ForgeCapacity,
-) -> Result<usize, ForgeError> {
-    let demand = estimate_bytes
-        .max(REWRITE_WORKING_SET_FLOOR_BYTES)
-        .min(capacity.max_memory_bytes);
-    usize::try_from(demand).map_err(|_| ForgeError::Capacity {
-        detail: "planned memory bytes exceed this platform".to_owned(),
-    })
+/// Largest combined sort/output scratch observation in serialized production tests.
+#[cfg(feature = "test-support")]
+static TEST_SCRATCH_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Resets the production scratch high-water observation used by integration tests.
+#[cfg(feature = "test-support")]
+pub fn reset_scratch_peak_for_test() {
+    TEST_SCRATCH_PEAK_BYTES.store(0, Ordering::Release);
+}
+
+/// Returns the production scratch high-water observation since the last reset.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn scratch_peak_for_test() -> u64 {
+    TEST_SCRATCH_PEAK_BYTES.load(Ordering::Acquire)
 }
 
 impl ForgeRewriteRequest {
@@ -228,12 +411,35 @@ impl ForgeRewriteRequest {
         estimates: &ForgeTaskEstimates,
         capacity: ForgeCapacity,
     ) -> Result<Self, ForgeError> {
+        estimates
+            .validate()
+            .map_err(|error| ForgeError::Invariant {
+                detail: error.to_string(),
+            })?;
         ForgePlanner::new(capacity)
             .validate_candidate_estimates(estimates.memory_bytes, estimates.spill_bytes)?;
+        let envelope = estimates.envelope.ok_or_else(|| ForgeError::Invariant {
+            detail: "legacy Forge envelope is not executable".to_owned(),
+        })?;
+        envelope.validate().map_err(|error| ForgeError::Invariant {
+            detail: error.to_string(),
+        })?;
         Ok(Self {
-            memory_bytes: rewrite_working_set_bytes(estimates.memory_bytes, capacity)?,
-            scratch_bytes: estimates.spill_bytes,
-            reader_permits: estimates.parallelism,
+            envelope,
+            memory_bytes: usize::try_from(envelope.memory_bytes().map_err(|error| {
+                ForgeError::Invariant {
+                    detail: error.to_string(),
+                }
+            })?)
+            .map_err(|_| ForgeError::Capacity {
+                detail: "planned memory bytes exceed this platform".to_owned(),
+            })?,
+            scratch_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            reader_permits: envelope.reader_permits,
         })
     }
 
@@ -264,9 +470,27 @@ impl ForgeRewriteRequest {
         )?;
         ForgePlanner::new(capacity)
             .validate_candidate_estimates(candidate.memory_bytes, candidate.spill_bytes)?;
+        let envelope = super::planner::ForgeEnvelopeSizer::size(
+            candidate.bytes,
+            candidate.inputs.len(),
+            usize::from(candidate.parallelism),
+            capacity,
+        )?;
         Ok(Self {
-            memory_bytes: rewrite_working_set_bytes(candidate.memory_bytes, capacity)?,
-            scratch_bytes: candidate.spill_bytes,
+            envelope,
+            memory_bytes: usize::try_from(envelope.memory_bytes().map_err(|error| {
+                ForgeError::Invariant {
+                    detail: error.to_string(),
+                }
+            })?)
+            .map_err(|_| ForgeError::Capacity {
+                detail: "planned memory bytes exceed this platform".to_owned(),
+            })?,
+            scratch_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
             reader_permits: candidate.parallelism,
         })
     }
@@ -554,8 +778,8 @@ impl RewriteBatchState {
     /// The caller holds the fixed encoder and upload reservation before this
     /// method can create its scratch-backed writer. Encoding never grows that
     /// reservation after allocation. The writer flushes its current row group
-    /// at [`ROW_GROUP_FLUSH_BYTES`] so encoded buffering stays within the fixed
-    /// envelope while completed bytes stream to attempt-owned scratch.
+    /// at the persisted encoder threshold so encoded buffering stays within
+    /// the fixed envelope while completed bytes stream to attempt-owned scratch.
     ///
     /// # Errors
     ///
@@ -567,6 +791,7 @@ impl RewriteBatchState {
         schema: &SchemaRef,
         iceberg_schema: &IcebergSchemaRef,
         batch: &RecordBatch,
+        encoder_flush_bytes: usize,
     ) -> Result<(), ForgeError> {
         self.nan_value_counts
             .compute(Arc::clone(iceberg_schema), batch.clone())
@@ -601,7 +826,7 @@ impl RewriteBatchState {
             kind: std::io::ErrorKind::StorageFull,
             detail: format!("write bounded Parquet scratch output: {error}"),
         })?;
-        if writer.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+        if writer.in_progress_size() >= encoder_flush_bytes {
             writer.flush().map_err(|error| ForgeError::ScratchIo {
                 kind: std::io::ErrorKind::Other,
                 detail: format!("flush Parquet row group: {error}"),
@@ -651,6 +876,11 @@ impl RewriteBatchState {
     /// Retain the largest runtime spill observation seen between batches.
     fn observe_spill(&mut self, spill_bytes: u64) {
         self.peak_spill_bytes = self.peak_spill_bytes.max(spill_bytes);
+        #[cfg(feature = "test-support")]
+        TEST_SCRATCH_PEAK_BYTES.fetch_max(
+            spill_bytes.saturating_add(self.output_scratch_limit_bytes),
+            Ordering::AcqRel,
+        );
     }
 
     /// Transfer accumulated output ownership alongside a successful terminal result.
@@ -739,6 +969,8 @@ struct OutputMetadataRequest {
     partition_spec_id: i32,
     /// Iceberg sort-order identifier for the destination table.
     sort_order_id: i32,
+    /// Exact bounded read size used for the sealed-file checksum pass.
+    checksum_chunk_bytes: usize,
 }
 
 /// Bytes and Iceberg metadata derived together from one completed Parquet output.
@@ -775,13 +1007,17 @@ fn verify_output_checksum(expected: u32, uploaded: u32) -> Result<(), ForgeError
 /// # Errors
 ///
 /// Returns [`ForgeError::ScratchIo`] when rewind or read-back fails.
-fn checksum_sealed_file(source: &mut std::fs::File, path: &Path) -> Result<u32, ForgeError> {
+fn checksum_sealed_file(
+    source: &mut std::fs::File,
+    path: &Path,
+    chunk_bytes: usize,
+) -> Result<u32, ForgeError> {
     source.rewind().map_err(|error| ForgeError::ScratchIo {
         kind: error.kind(),
         detail: format!("rewind {} for checksum: {error}", path.display()),
     })?;
     let mut reader = BufReader::new(source);
-    let mut chunk = vec![0_u8; UPLOAD_CHUNK_BYTES];
+    let mut chunk = vec![0_u8; chunk_bytes];
     let mut checksum = 0;
     loop {
         let read = reader
@@ -862,8 +1098,9 @@ fn validate_row_group_footers(
 /// executor responsive without allocating the next batch speculatively.
 async fn reserve_decoded_batch_slot(
     reservation: &datafusion::execution::memory_pool::MemoryReservation,
+    decoded_batch_bytes: usize,
 ) {
-    while reservation.try_grow(DECODED_BATCH_TARGET_BYTES).is_err() {
+    while reservation.try_grow(decoded_batch_bytes).is_err() {
         tokio::task::yield_now().await;
     }
 }
@@ -890,6 +1127,7 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         partition_day,
         partition_spec_id,
         sort_order_id,
+        checksum_chunk_bytes,
     } = request;
     let mut sink = writer.into_inner().map_err(|error| ForgeError::Parquet {
         detail: error.to_string(),
@@ -960,7 +1198,7 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         });
     }
     let mut source_file = source_file;
-    let checksum = checksum_sealed_file(&mut source_file, &scratch_path)?;
+    let checksum = checksum_sealed_file(&mut source_file, &scratch_path, checksum_chunk_bytes)?;
     Ok(FinalizedOutput {
         scratch_path,
         bytes: output_size,
@@ -1101,7 +1339,8 @@ impl ForgeRewritePipeline {
                 None,
                 self.runtime().scratch_path().to_path_buf(),
             )
-            .fail(ForgeError::Capacity {
+            .fail(ForgeError::ExecutionEnvelopeExceeded {
+                resource: "memory",
                 detail: format!("Forge fixed output allowance was refused: {error}"),
             });
         }
@@ -1127,7 +1366,7 @@ impl ForgeRewritePipeline {
         } {
             let batch = match batch {
                 Ok(batch) => batch,
-                Err(error) => return state.fail(self.map_datafusion_error(error)),
+                Err(error) => return state.fail(Self::map_datafusion_error(error)),
             };
             if batch.num_rows() == 0 {
                 continue;
@@ -1220,9 +1459,11 @@ impl ForgeRewritePipeline {
                 detail: format!("Forge blocking permit closed: {error}"),
             })?,
         };
+        let encoder_flush_bytes = self.runtime().encoder_flush_bytes;
         let join = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let result = detached.write_batch(&schema, &iceberg_schema, &batch);
+            let result =
+                detached.write_batch(&schema, &iceberg_schema, &batch, encoder_flush_bytes);
             (detached, result)
         });
         let (returned, result) = join.await.map_err(|error| ForgeError::Invariant {
@@ -1392,6 +1633,7 @@ impl ForgeRewritePipeline {
             Arc::clone(&self.object_store),
             self.max_concurrent_reads,
             Arc::clone(&self.runtime().runtime.memory_pool),
+            self.runtime().decoded_batch_bytes,
         ));
         let tenant_index =
             request
@@ -1428,7 +1670,8 @@ impl ForgeRewritePipeline {
         })?;
         let sort = Arc::new(SortExec::new(ordering, source));
         let session = datafusion::prelude::SessionContext::new_with_config_rt(
-            datafusion::prelude::SessionConfig::new(),
+            datafusion::prelude::SessionConfig::new()
+                .with_sort_spill_reservation_bytes(self.runtime().sort_merge_reservation_bytes),
             self.runtime().runtime(),
         );
         let sort_plan: Arc<dyn ExecutionPlan> = sort.clone();
@@ -1503,6 +1746,7 @@ impl ForgeRewritePipeline {
         let partition_spec_id = request.partition_spec_id;
         let sort_order_id = request.sort_order_id;
         let iceberg_schema = Arc::clone(&request.iceberg_schema);
+        let checksum_chunk_bytes = self.runtime().upload_chunk_bytes;
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
             permit = self.blocking_permits.clone().acquire_owned() => permit.map_err(|error| ForgeError::Invariant {
@@ -1521,6 +1765,7 @@ impl ForgeRewritePipeline {
                 partition_day,
                 partition_spec_id,
                 sort_order_id,
+                checksum_chunk_bytes,
             })
         });
         tokio::pin!(join);
@@ -1585,12 +1830,16 @@ impl ForgeRewritePipeline {
             })?;
             let mut output = self
                 .object_store
-                .output_writer(&self.staging, object_path)
+                .output_writer(
+                    &self.staging,
+                    object_path,
+                    self.runtime().upload_chunk_bytes,
+                )
                 .await
                 .map_err(ForgeError::ObjectStore)?;
             let mut uploaded = 0_u64;
             let mut uploaded_checksum = 0_u32;
-            let mut chunk = vec![0_u8; UPLOAD_CHUNK_BYTES];
+            let mut chunk = vec![0_u8; self.runtime().upload_chunk_bytes];
             let write_result = async {
                 use tokio::io::AsyncReadExt;
                 loop {
@@ -1790,7 +2039,7 @@ impl ForgeRewritePipeline {
     }
 
     /// Preserve the public spill-ceiling distinction for resource exhaustion.
-    fn map_datafusion_error(&self, error: datafusion::error::DataFusionError) -> ForgeError {
+    fn map_datafusion_error(error: datafusion::error::DataFusionError) -> ForgeError {
         if let datafusion::error::DataFusionError::External(source) = error {
             return match source.downcast::<ForgeError>() {
                 Ok(error) => *error,
@@ -1799,16 +2048,14 @@ impl ForgeRewritePipeline {
                 }
             };
         }
-        let detail = error.to_string();
-        if detail.contains("temp")
-            && detail.contains("limit")
-            && detail.contains(&self.runtime().spill_limit_bytes.to_string())
-        {
-            ForgeError::SpillLimitExceeded {
-                limit_bytes: self.runtime().spill_limit_bytes,
+        match error {
+            datafusion::error::DataFusionError::ResourcesExhausted(detail) => {
+                ForgeError::ExecutionEnvelopeExceeded {
+                    resource: "memory",
+                    detail,
+                }
             }
-        } else {
-            ForgeError::DataFusion(error)
+            error => ForgeError::DataFusion(error),
         }
     }
 }
@@ -1871,6 +2118,7 @@ impl StagingParquetExec {
         object_store: Arc<dyn ForgeObjectStore>,
         max_concurrent_reads: usize,
         memory_pool: Arc<dyn MemoryPool>,
+        decoded_batch_bytes: usize,
     ) -> Self {
         let properties = Arc::new(
             PlanProperties::new(
@@ -1889,9 +2137,7 @@ impl StagingParquetExec {
             permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_reads)),
             max_concurrent_reads,
             memory_pool,
-            decoded_allowance_bytes: max_concurrent_reads
-                .saturating_mul(2)
-                .saturating_mul(DECODED_BATCH_TARGET_BYTES),
+            decoded_allowance_bytes: decoded_batch_bytes,
             properties,
         }
     }
@@ -1950,11 +2196,12 @@ impl StagingParquetExec {
         let decoded =
             datafusion::execution::memory_pool::MemoryConsumer::new("forge-rewrite-decoded-batch")
                 .register(&self.memory_pool);
+        let decoded_batch_bytes = self.decoded_allowance_bytes;
         let projected = async_stream::try_stream! {
             futures_util::pin_mut!(stream);
             loop {
                 decoded.free();
-                reserve_decoded_batch_slot(&decoded).await;
+                reserve_decoded_batch_slot(&decoded, decoded_batch_bytes).await;
                 let Some(batch) = stream.next().await else { break; };
                 let batch = batch.map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
                 validate_tenant_column(&batch, tenant)
@@ -1966,10 +2213,10 @@ impl StagingParquetExec {
                 let projected = project_by_name(&batch, Arc::clone(&schema))
                     .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
                 let decoded_bytes = projected.get_array_memory_size();
-                if decoded_bytes > DECODED_BATCH_TARGET_BYTES {
+                if decoded_bytes > decoded_batch_bytes {
                     Err(datafusion::error::DataFusionError::External(Box::new(
                         ForgeError::DataRefusal {
-                            detail: format!("decoded batch requires {decoded_bytes} bytes but slot target is {DECODED_BATCH_TARGET_BYTES}"),
+                            detail: format!("decoded batch requires {decoded_bytes} bytes but slot target is {decoded_batch_bytes}"),
                         },
                     )))?;
                 }
@@ -2109,6 +2356,7 @@ impl ExecutionPlan for StagingParquetExec {
         let permits = Arc::clone(&self.permits);
         let stream_schema = Arc::clone(&schema);
         let max_concurrent_reads = self.max_concurrent_reads;
+        let decoded_batch_bytes = self.decoded_allowance_bytes;
         let memory_pool = Arc::clone(&self.memory_pool);
         let stream = futures_util::stream::iter(files)
             .map(move |file| {
@@ -2125,6 +2373,7 @@ impl ExecutionPlan for StagingParquetExec {
                         store,
                         max_concurrent_reads,
                         memory_pool,
+                        decoded_batch_bytes,
                     )
                     .open_staging_stream_with_permits(file, permits)
                     .await
@@ -2169,34 +2418,36 @@ pub struct ForgeRewriteRuntime {
     output_scratch_used_bytes: Arc<AtomicU64>,
     /// Fixed encoder/upload reservation derived from the acquired envelope.
     output_allowance_bytes: usize,
+    /// Exact bytes reserved before polling each decoded stream.
+    decoded_batch_bytes: usize,
+    /// Explicit `DataFusion` sort merge reservation.
+    sort_merge_reservation_bytes: usize,
+    /// Exact row-group flush threshold derived from the encoder term.
+    encoder_flush_bytes: usize,
+    /// Exact bounded upload allocation and writer chunk.
+    upload_chunk_bytes: usize,
+}
+
+/// Exact runtime terms used to construct one attempt-owned execution environment.
+#[derive(Clone, Copy)]
+pub(crate) struct ForgeAttemptEnvelope {
+    /// Aggregate scratch lease.
+    spill_limit_bytes: u64,
+    /// Scratch sibling assigned to `DataFusion` sort spill.
+    sort_spill_limit_bytes: u64,
+    /// Combined encoder and upload resident allowance.
+    output_allowance_bytes: usize,
+    /// Exact decoder reservation per active source.
+    decoded_batch_bytes: usize,
+    /// Explicit sort merge reservation.
+    sort_merge_reservation_bytes: usize,
+    /// Parquet row-group flush threshold.
+    encoder_flush_bytes: usize,
+    /// Upload allocation and backend writer chunk.
+    upload_chunk_bytes: usize,
 }
 
 impl ForgeRewriteRuntime {
-    /// Construct a runtime rooted under the pod-owned spill directory.
-    ///
-    /// The root is created without listing or deleting attempt children.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::InvalidConfig`] for a zero ceiling and a Parquet
-    /// or `DataFusion` error when the owned directory or runtime cannot be built.
-    pub fn new(
-        memory_pool: Arc<dyn MemoryPool>,
-        pod_spill_root: &Path,
-        spill_limit_bytes: u64,
-    ) -> Result<Self, ForgeError> {
-        Self::prepare_root(pod_spill_root)?;
-        Self::new_attempt(
-            memory_pool,
-            pod_spill_root,
-            spill_limit_bytes,
-            spill_limit_bytes / 2,
-            Uuid::nil(),
-            Uuid::nil(),
-            ENCODER_BUFFER_ALLOWANCE_BYTES.saturating_add(UPLOAD_CHUNK_BYTES),
-        )
-    }
-
     /// Creates the pod scratch root without inferring attempt ownership.
     ///
     /// # Errors
@@ -2218,15 +2469,26 @@ impl ForgeRewriteRuntime {
     pub(crate) fn new_attempt(
         memory_pool: Arc<dyn MemoryPool>,
         pod_spill_root: &Path,
-        spill_limit_bytes: u64,
-        sort_spill_limit_bytes: u64,
         task_id: Uuid,
         attempt_id: Uuid,
-        output_allowance_bytes: usize,
+        envelope: ForgeAttemptEnvelope,
     ) -> Result<Self, ForgeError> {
+        let ForgeAttemptEnvelope {
+            spill_limit_bytes,
+            sort_spill_limit_bytes,
+            output_allowance_bytes,
+            decoded_batch_bytes,
+            sort_merge_reservation_bytes,
+            encoder_flush_bytes,
+            upload_chunk_bytes,
+        } = envelope;
         if spill_limit_bytes == 0
             || sort_spill_limit_bytes == 0
             || sort_spill_limit_bytes > spill_limit_bytes
+            || decoded_batch_bytes == 0
+            || sort_merge_reservation_bytes == 0
+            || encoder_flush_bytes == 0
+            || upload_chunk_bytes == 0
         {
             return Err(ForgeError::InvalidConfig {
                 detail:
@@ -2259,6 +2521,10 @@ impl ForgeRewriteRuntime {
             output_scratch_limit_bytes: spill_limit_bytes - sort_spill_limit_bytes,
             output_scratch_used_bytes: Arc::new(AtomicU64::new(0)),
             output_allowance_bytes,
+            decoded_batch_bytes,
+            sort_merge_reservation_bytes,
+            encoder_flush_bytes,
+            upload_chunk_bytes,
         })
     }
 
@@ -2270,8 +2536,8 @@ impl ForgeRewriteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Capacity`] if another pending output already owns
-    /// any portion of the attempt's fixed output-scratch term.
+    /// Returns [`ForgeError::ExecutionEnvelopeExceeded`] if another pending
+    /// output already owns any portion of the attempt's fixed scratch term.
     fn reserve_output_scratch(&self) -> Result<OutputScratchReservation, ForgeError> {
         self.output_scratch_used_bytes
             .compare_exchange(
@@ -2280,7 +2546,8 @@ impl ForgeRewriteRuntime {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map_err(|used| ForgeError::Capacity {
+            .map_err(|used| ForgeError::ExecutionEnvelopeExceeded {
+                resource: "scratch",
                 detail: format!(
                     "Forge output scratch is already reserved: used={used}, limit={}",
                     self.output_scratch_limit_bytes
@@ -2344,6 +2611,43 @@ mod tests {
 
     use super::*;
 
+    /// A claim request retains every validated persisted term without reconstruction.
+    #[test]
+    fn rewrite_request_preserves_every_persisted_term() {
+        let capacity = ForgeCapacity {
+            max_files: 4,
+            max_bytes: u64::MAX,
+            max_parallelism: 4,
+            max_memory_bytes: 256 * 1024 * 1024,
+            max_spill_bytes: 1024 * 1024 * 1024,
+            max_large_task_bytes: u64::MAX,
+        };
+        let envelope = crate::forge::ForgeEnvelopeSizer::size(1, 4, 4, capacity).expect("envelope");
+        let estimates = ForgeTaskEstimates {
+            files: 4,
+            bytes: 1,
+            parallelism: envelope.reader_permits,
+            memory_bytes: envelope.memory_bytes().expect("resident total"),
+            spill_bytes: envelope.scratch_bytes().expect("scratch total"),
+            large_ceiling_bytes: i64::MAX as u64,
+            envelope: Some(envelope),
+        };
+
+        let request = ForgeRewriteRequest::from_claim(&estimates, capacity).expect("request");
+
+        assert_eq!(request.envelope, envelope);
+        assert_eq!(
+            request.memory_bytes,
+            usize::try_from(envelope.memory_bytes().expect("resident total"))
+                .expect("platform total")
+        );
+        assert_eq!(
+            request.scratch_bytes,
+            envelope.scratch_bytes().expect("scratch total")
+        );
+        assert_eq!(request.reader_permits, envelope.reader_permits);
+    }
+
     /// Proves an attempt executes on its leased pool and restores baselines.
     ///
     /// The attempt is acquired through the same production capability the Forge
@@ -2363,11 +2667,27 @@ mod tests {
         let root = tempfile::tempdir().expect("pod spill root");
         ForgeRewriteRuntime::prepare_root(root.path()).expect("prepared root");
 
+        let envelope = crate::forge::ForgeEnvelopeSizer::size(
+            1,
+            1,
+            1,
+            crate::forge::ForgeCapacity {
+                max_files: 1,
+                max_bytes: u64::MAX,
+                max_parallelism: 1,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_spill_bytes: 4 * 1024 * 1024,
+                max_large_task_bytes: u64::MAX,
+            },
+        )
+        .expect("test envelope");
         let attempt = ForgeAttemptResources::acquire(
             &forge,
             crate::resources::ForgeRewriteRequest {
-                memory_bytes: 1_024 * 1_024,
-                scratch_bytes: 1_024 * 1_024,
+                envelope,
+                memory_bytes: usize::try_from(envelope.memory_bytes().expect("resident total"))
+                    .expect("platform resident total"),
+                scratch_bytes: envelope.scratch_bytes().expect("scratch total"),
                 reader_permits: 1,
             },
             root.path(),
@@ -2379,15 +2699,22 @@ mod tests {
             attempt.runtime().uses_memory_pool(&attempt.memory_pool()),
             "the attempt runtime must execute on the exact leased pool"
         );
+        assert_eq!(
+            attempt.runtime().output_allowance_bytes,
+            usize::try_from(envelope.encoder_buffer_bytes + envelope.upload_chunk_bytes)
+                .expect("platform output allowance")
+        );
 
         let held = forge.snapshot().expect("held snapshot");
         assert_eq!(
             held.elastic_memory_used_bytes,
-            baseline.elastic_memory_used_bytes + 1_024 * 1_024
+            baseline.elastic_memory_used_bytes
+                + usize::try_from(envelope.memory_bytes().expect("resident total"))
+                    .expect("platform resident total")
         );
         assert_eq!(
             held.scratch_used_bytes,
-            baseline.scratch_used_bytes + 1_024 * 1_024
+            baseline.scratch_used_bytes + envelope.scratch_bytes().expect("scratch total")
         );
 
         drop(attempt);
@@ -2404,6 +2731,96 @@ mod tests {
                 .is_none(),
             "the attempt must remove its owned spill child"
         );
+    }
+
+    /// Runtime configuration consumes the exact persisted execution terms.
+    #[test]
+    fn runtime_uses_exact_sort_merge_encoder_upload_and_decoded_terms() {
+        let root = tempfile::tempdir().expect("spill root");
+        let runtime = ForgeRewriteRuntime::new_attempt(
+            Arc::new(GreedyMemoryPool::new(4096)),
+            root.path(),
+            Uuid::nil(),
+            Uuid::now_v7(),
+            ForgeAttemptEnvelope {
+                spill_limit_bytes: 1024,
+                sort_spill_limit_bytes: 600,
+                output_allowance_bytes: 300,
+                decoded_batch_bytes: 101,
+                sort_merge_reservation_bytes: 102,
+                encoder_flush_bytes: 103,
+                upload_chunk_bytes: 104,
+            },
+        )
+        .expect("runtime");
+
+        assert_eq!(runtime.sort_merge_reservation_bytes, 102);
+        assert_eq!(runtime.encoder_flush_bytes, 103);
+        assert_eq!(runtime.upload_chunk_bytes, 104);
+        assert_eq!(runtime.decoded_batch_bytes, 101);
+        assert_eq!(
+            runtime.spill_limit_bytes - runtime.output_scratch_limit_bytes,
+            600
+        );
+        assert_eq!(runtime.output_scratch_limit_bytes, 424);
+    }
+
+    /// Attempt finalization is idempotent and poisons when a pipeline handle survives.
+    #[test]
+    fn rewrite_resource_release_is_idempotent_and_reports_poisoning() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            2 * 1024 * 1024 * 1024,
+            4 * 1024 * 1024,
+            [crate::resources::BifrostRole::Forge],
+        );
+        let forge = roles.forge().expect("Forge capability");
+        let root = tempfile::tempdir().expect("spill root");
+        let envelope = crate::forge::ForgeEnvelopeSizer::size(
+            1,
+            1,
+            1,
+            ForgeCapacity {
+                max_files: 1,
+                max_bytes: u64::MAX,
+                max_parallelism: 1,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_spill_bytes: 4 * 1024 * 1024,
+                max_large_task_bytes: u64::MAX,
+            },
+        )
+        .expect("envelope");
+        let request = ForgeRewriteRequest {
+            envelope,
+            memory_bytes: usize::try_from(envelope.memory_bytes().expect("resident total"))
+                .expect("platform total"),
+            scratch_bytes: envelope.scratch_bytes().expect("scratch total"),
+            reader_permits: envelope.reader_permits,
+        };
+        let mut attempt = ForgeAttemptResources::acquire(
+            &forge,
+            request,
+            root.path(),
+            Uuid::nil(),
+            Uuid::now_v7(),
+        )
+        .expect("attempt");
+        let surviving = Arc::clone(
+            attempt
+                .runtime
+                .as_ref()
+                .expect("active attempt retains runtime"),
+        );
+
+        assert_eq!(
+            attempt.finish(),
+            crate::resources::ForgeResourceReleaseResult::Poisoned
+        );
+        assert_eq!(
+            attempt.finish(),
+            crate::resources::ForgeResourceReleaseResult::Poisoned
+        );
+        drop(surviving);
+        assert!(forge.snapshot().is_err(), "poisoning must fail closed");
     }
 
     /// Returns ceilings wide enough to admit the parity fixture's exact demand.
@@ -2495,8 +2912,21 @@ mod tests {
     #[test]
     fn rewrite_runtime_rejects_zero_spill_limit() {
         let root = tempfile::tempdir().expect("test spill root must be created");
-        let result =
-            ForgeRewriteRuntime::new(Arc::new(GreedyMemoryPool::new(1_024)), root.path(), 0);
+        let result = ForgeRewriteRuntime::new_attempt(
+            Arc::new(GreedyMemoryPool::new(1_024)),
+            root.path(),
+            Uuid::nil(),
+            Uuid::nil(),
+            ForgeAttemptEnvelope {
+                spill_limit_bytes: 0,
+                sort_spill_limit_bytes: 0,
+                output_allowance_bytes: 2,
+                decoded_batch_bytes: 1,
+                sort_merge_reservation_bytes: 1,
+                encoder_flush_bytes: 1,
+                upload_chunk_bytes: 1,
+            },
+        );
         assert!(matches!(result, Err(ForgeError::InvalidConfig { .. })));
     }
 
@@ -2508,9 +2938,22 @@ mod tests {
         let unrelated = root.path().join("scribe-wal");
         std::fs::create_dir(&stale).expect("stale Forge child must be created");
         std::fs::create_dir(&unrelated).expect("unrelated child must be created");
-        let runtime =
-            ForgeRewriteRuntime::new(Arc::new(GreedyMemoryPool::new(1_024)), root.path(), 1_024)
-                .expect("bounded rewrite runtime must be created");
+        let runtime = ForgeRewriteRuntime::new_attempt(
+            Arc::new(GreedyMemoryPool::new(1_024)),
+            root.path(),
+            Uuid::nil(),
+            Uuid::nil(),
+            ForgeAttemptEnvelope {
+                spill_limit_bytes: 1_024,
+                sort_spill_limit_bytes: 512,
+                output_allowance_bytes: 2,
+                decoded_batch_bytes: 1,
+                sort_merge_reservation_bytes: 1,
+                encoder_flush_bytes: 1,
+                upload_chunk_bytes: 1,
+            },
+        )
+        .expect("bounded rewrite runtime must be created");
         let active = runtime.spill_path().to_path_buf();
         assert!(stale.exists());
         assert!(unrelated.exists());
@@ -2527,11 +2970,17 @@ mod tests {
         let runtime = ForgeRewriteRuntime::new_attempt(
             Arc::new(GreedyMemoryPool::new(1024)),
             root.path(),
-            1024,
-            640,
             Uuid::nil(),
             Uuid::now_v7(),
-            128,
+            ForgeAttemptEnvelope {
+                spill_limit_bytes: 1024,
+                sort_spill_limit_bytes: 640,
+                output_allowance_bytes: 128,
+                decoded_batch_bytes: 32,
+                sort_merge_reservation_bytes: 32,
+                encoder_flush_bytes: 32,
+                upload_chunk_bytes: 32,
+            },
         )
         .expect("disjoint scratch envelope");
 
@@ -2554,11 +3003,17 @@ mod tests {
         let runtime = ForgeRewriteRuntime::new_attempt(
             Arc::new(GreedyMemoryPool::new(1024)),
             root.path(),
-            1024,
-            640,
             Uuid::nil(),
             Uuid::now_v7(),
-            128,
+            ForgeAttemptEnvelope {
+                spill_limit_bytes: 1024,
+                sort_spill_limit_bytes: 640,
+                output_allowance_bytes: 128,
+                decoded_batch_bytes: 32,
+                sort_merge_reservation_bytes: 32,
+                encoder_flush_bytes: 32,
+                upload_chunk_bytes: 32,
+            },
         )
         .expect("disjoint scratch envelope");
         let reservation = runtime.reserve_output_scratch().expect("output scratch");
@@ -2630,7 +3085,7 @@ mod tests {
         let waiter =
             datafusion::execution::memory_pool::MemoryConsumer::new("waiter").register(&pool);
         let wait = tokio::spawn(async move {
-            reserve_decoded_batch_slot(&waiter).await;
+            reserve_decoded_batch_slot(&waiter, DECODED_BATCH_TARGET_BYTES).await;
             waiter
         });
         tokio::task::yield_now().await;
@@ -2651,7 +3106,7 @@ mod tests {
 
     /// Scratch-backed encoding rotates by bytes and leaves a readable footer.
     #[test]
-    fn streaming_writer_rotates_and_seals_valid_parquet() {
+    fn scaled_footer_refusal_precedes_data_page_read() {
         let root = tempfile::tempdir().expect("output scratch");
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Int64, false).with_metadata(HashMap::from([(
@@ -2676,7 +3131,7 @@ mod tests {
         .expect("batch");
         let mut state = RewriteBatchState::with_reservation(None, None, root.path().to_path_buf());
         state
-            .write_batch(&schema, &iceberg_schema, &batch)
+            .write_batch(&schema, &iceberg_schema, &batch, ROW_GROUP_FLUSH_BYTES)
             .expect("scratch encode");
         assert!(state.should_rotate(1), "encoded bytes cross byte target");
         let (writer, path) = state.take_writer().expect("active writer");

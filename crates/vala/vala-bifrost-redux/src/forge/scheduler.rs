@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::error::ForgeError;
-use super::metrics::ForgeLeaseResult;
+use super::metrics::{ForgeHintPersistenceResult, ForgeLeaseResult};
 use super::{Forge, ForgeScheduler, ForgeTickOutcome};
 use crate::maintenance::StagingFileCommitted;
 
@@ -140,7 +140,7 @@ impl Forge {
                     Some(hint) => {
                         let result = tokio::select! {
                             () = shutdown.cancelled() => return Ok(()),
-                            result = scheduler.record_hint(hint) => result,
+                            result = self.persist_hint_with_telemetry(&scheduler, hint) => result,
                         };
                         if let Err(error) = result {
                             tracing::error!(error = %error, "Forge planning hint persistence failed");
@@ -166,6 +166,40 @@ impl Forge {
                 },
             }
         }
+    }
+
+    /// Persist one advisory hint while recording its single completed causal outcome.
+    ///
+    /// Cancellation is owned by the caller's `select!`; a dropped future records no
+    /// completed counter, duration, or span result. Failures are returned after their
+    /// bounded telemetry is recorded so the supervisor can log and continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the production scheduler error when durable demand persistence fails.
+    async fn persist_hint_with_telemetry(
+        &self,
+        scheduler: &ForgeScheduler<'_>,
+        hint: StagingFileCommitted,
+    ) -> Result<(), ForgeError> {
+        let started = Instant::now();
+        let span = tracing::info_span!(
+            "bifrost.forge.hint.persist",
+            result = tracing::field::Empty,
+            role = "server",
+        );
+        let result =
+            tracing::Instrument::instrument(scheduler.record_hint(hint), span.clone()).await;
+        let outcome = if result.is_ok() {
+            ForgeHintPersistenceResult::Succeeded
+        } else {
+            ForgeHintPersistenceResult::Failed
+        };
+        span.record("result", outcome.as_str());
+        self.core
+            .telemetry
+            .record_hint_persistence(outcome, started.elapsed());
+        result
     }
 
     /// Runs and records one periodic or explicitly triggered planning pass.

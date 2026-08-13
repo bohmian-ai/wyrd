@@ -287,11 +287,9 @@ pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
         &self,
         operator: &opendal::Operator,
         path: &str,
+        chunk_bytes: usize,
     ) -> opendal::Result<opendal::Writer> {
-        operator
-            .writer_with(path)
-            .chunk(super::rewrite::UPLOAD_CHUNK_BYTES)
-            .await
+        operator.writer_with(path).chunk(chunk_bytes).await
     }
 
     /// Writes one already-bounded chunk to an open rewrite output.
@@ -713,16 +711,25 @@ impl Forge {
                     .collect::<Vec<_>>();
                 input_terms.sort_by(|left, right| left.0.cmp(&right.0));
                 let (inputs, input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
-                let envelope = super::planner::ForgeTaskEnvelope::for_rewrite(
+                let envelope = super::planner::ForgeEnvelopeSizer::size(
                     total_bytes,
+                    inputs.len(),
                     self.core.config.max_concurrent_reads,
                     capacity,
-                );
+                )?;
                 candidates.push(ForgePlanCandidate {
                     strategy: ForgeTaskStrategy::StagingFold,
                     parallelism: envelope.reader_permits,
-                    memory_bytes: envelope.memory_bytes(),
-                    spill_bytes: envelope.scratch_bytes,
+                    memory_bytes: envelope.memory_bytes().map_err(|error| {
+                        ForgeError::Invariant {
+                            detail: error.to_string(),
+                        }
+                    })?,
+                    spill_bytes: envelope.scratch_bytes().map_err(|error| {
+                        ForgeError::Invariant {
+                            detail: error.to_string(),
+                        }
+                    })?,
                     inputs,
                     input_bytes,
                     bytes: total_bytes,

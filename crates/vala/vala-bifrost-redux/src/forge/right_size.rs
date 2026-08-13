@@ -136,6 +136,20 @@ impl ForgeRightSizePolicy {
         self.target_file_size_bytes
     }
 
+    /// Return the inclusive lower healthy bound for test-support inspection.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn minimum_file_size_bytes_for_test(&self) -> u64 {
+        self.minimum_file_size_bytes
+    }
+
+    /// Return the inclusive upper healthy bound for test-support inspection.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn maximum_file_size_bytes_for_test(&self) -> u64 {
+        self.maximum_file_size_bytes
+    }
+
     /// Return the schema identity carried by the current table metadata.
     pub(crate) const fn schema_id(&self) -> i32 {
         self.schema_id
@@ -361,6 +375,27 @@ impl IcebergCandidateFile {
     #[must_use]
     pub fn sort_key_for_test(&self) -> (i32, NaiveDate, DateTime<Utc>, DateTime<Utc>, &str) {
         self.sort_key()
+    }
+}
+
+/// Builds one deterministic candidate for neighboring planner unit tests.
+#[cfg(test)]
+pub(crate) fn candidate_file_for_test(path: &str, bytes: u64) -> IcebergCandidateFile {
+    IcebergCandidateFile {
+        catalog_path: path.to_owned(),
+        object_path: path.to_owned(),
+        file_size_bytes: bytes,
+        record_count: 1,
+        schema_id: 1,
+        partition_spec_id: 1,
+        partition_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed date is valid"),
+        sort_order_id: Some(1),
+        writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
+        min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
+        max_event_time: DateTime::from_timestamp(2, 0).expect("fixed timestamp is valid"),
+        source_snapshot_id: 1,
+        data_sequence_number: Some(1),
+        file_sequence_number: Some(1),
     }
 }
 

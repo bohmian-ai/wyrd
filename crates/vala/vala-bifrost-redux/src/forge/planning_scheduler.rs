@@ -12,7 +12,9 @@ use num_traits::ToPrimitive;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::SqlError;
+use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
+use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ForgePlanningDemand, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
@@ -22,6 +24,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use super::Forge;
+use super::binpack::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
 use super::metrics::{ForgeDemandTransitionResult, ForgeTaskMetricStrategy};
@@ -722,7 +725,8 @@ impl<'forge> ForgeScheduler<'forge> {
         // tick's single planned slot ahead of compaction. Retention eligibility
         // is part of the due predicate so a successful no-op expiry cannot
         // create an endless successor-demand loop ahead of compaction.
-        let maintenance_due = self.maintenance_due(&table, demand)?;
+        let maintenance_due = self.maintenance_due(&table, demand)?
+            || self.open_rewrite_requires_reconciliation(&binding).await?;
         if maintenance_due && let Some(candidate) = self.maintenance_candidate(&table).await? {
             candidates.insert(0, candidate);
         }
@@ -780,6 +784,42 @@ impl<'forge> ForgeScheduler<'forge> {
             self.forge.core.config.maintenance_trigger_interval,
             self.forge.core.config.snapshot_retention,
         ))
+    }
+
+    /// Reports whether one table has retained rewrite evidence requiring a worker pass.
+    ///
+    /// Open rewrite state is correctness work, not a periodic trigger. It must
+    /// therefore enqueue maintenance even when snapshot retention is not due;
+    /// otherwise a crash after Prepared can remain stranded indefinitely.
+    ///
+    /// # Errors
+    /// Returns identity or SQL errors while validating and reading the bounded
+    /// operation-state projection.
+    async fn open_rewrite_requires_reconciliation(
+        &self,
+        binding: &crate::catalog::TenantTableBinding,
+    ) -> Result<bool, ForgeError> {
+        let resource = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day: chrono::NaiveDate::MIN,
+        }
+        .audit_resource();
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
+            .map_err(ForgeError::Sql)?;
+        let mut conn = self
+            .forge
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = operations
+            .list_open(&mut conn, 1)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        Ok(!page.operations.is_empty() || page.overflowed)
     }
 
     /// Builds one bounded lifecycle task from the current manifest list.
@@ -847,21 +887,30 @@ impl<'forge> ForgeScheduler<'forge> {
         // applies), wedging deep-history tables. The full manifest window still
         // drives `inputs`, so successive expiries retire bounded slices and the
         // plan hash advances as history shrinks.
-        let envelope = super::planner::ForgeTaskEnvelope::for_rewrite(
+        let envelope = super::planner::ForgeEnvelopeSizer::size(
             estimate,
+            inputs.len(),
             inputs
                 .len()
                 .min(self.forge.core.config.max_concurrent_reads),
             self.capacity,
-        );
+        )?;
         Ok(Some(ForgePlanCandidate {
             strategy: ForgeTaskStrategy::SnapshotExpiry,
             inputs,
             input_bytes,
             bytes: estimate,
             parallelism: envelope.reader_permits,
-            memory_bytes: envelope.memory_bytes(),
-            spill_bytes: envelope.scratch_bytes,
+            memory_bytes: envelope
+                .memory_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            spill_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
             parameters: serde_json::json!({
                 "kind":"maintenance",
                 "trigger_commit_count": table.metadata().snapshots().count()

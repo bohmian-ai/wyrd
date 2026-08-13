@@ -2,7 +2,8 @@
 
 use sha2::{Digest, Sha256};
 use vala_sql::row_types::forge_tasks::{
-    FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy,
+    FORGE_ENVELOPE_VERSION, FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEnvelope, ForgeTaskEstimates,
+    ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy,
 };
 
 use super::ForgeConfig;
@@ -102,73 +103,100 @@ pub struct ForgePlanCandidate {
     pub parameters: serde_json::Value,
 }
 
-/// Complete streaming-shape resource envelope persisted for one Forge task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ForgeTaskEnvelope {
-    /// Memory reserved for concurrently decoded input batches.
-    pub(crate) decoded_input_bytes: u64,
-    /// Disposable scratch available to `DataFusion` sort spill.
-    pub(crate) sort_spill_bytes: u64,
-    /// Fixed Parquet encoder working set.
-    pub(crate) encoder_buffer_bytes: u64,
-    /// Fixed bounded upload buffer.
-    pub(crate) upload_chunk_bytes: u64,
-    /// Aggregate attempt scratch, including spill and pending output files.
-    pub(crate) scratch_bytes: u64,
-    /// Concurrent source readers acquired with the envelope.
-    pub(crate) reader_permits: u16,
-}
+/// Deterministic owner of Forge's capacity-scaled executable envelope policy.
+pub struct ForgeEnvelopeSizer;
 
-impl ForgeTaskEnvelope {
-    /// Sizes a rewrite from concurrent streaming terms and live capacity.
+impl ForgeEnvelopeSizer {
+    /// Builds the largest supported resident quantum and exact scratch siblings.
     ///
-    /// Total input bytes size disposable scratch only. Resident terms are
-    /// proportionally bounded by the governor ceiling so small topologies can
-    /// reduce readers and buffers without deriving memory from input volume.
-    #[must_use]
-    pub(crate) fn for_rewrite(
+    /// # Errors
+    /// Returns a typed capacity refusal when no complete envelope fits and an
+    /// invariant error when checked arithmetic cannot represent the terms.
+    pub fn size(
         total_input_bytes: u64,
+        file_count: usize,
         max_concurrent_reads: usize,
         capacity: ForgeCapacity,
-    ) -> Self {
-        let budget = capacity.max_memory_bytes.max(1);
-        let upload = (super::rewrite::UPLOAD_CHUNK_BYTES as u64).min((budget / 8).max(1));
-        let encoder =
-            (super::rewrite::ENCODER_BUFFER_ALLOWANCE_BYTES as u64).min((budget / 4).max(1));
-        let decoded_budget = budget.saturating_sub(upload).saturating_sub(encoder).max(1);
-        let target_per_reader = (2 * super::rewrite::DECODED_BATCH_TARGET_BYTES) as u64;
-        let capacity_readers =
-            usize::try_from((decoded_budget / target_per_reader).max(1)).unwrap_or(usize::MAX);
-        let reader_permits = u16::try_from(max_concurrent_reads.max(1).min(capacity_readers))
-            .unwrap_or(u16::MAX)
-            .min(capacity.max_parallelism)
-            .max(1);
-        let decoded_input_bytes = u64::from(reader_permits)
-            .saturating_mul(target_per_reader)
-            .min(decoded_budget);
-        let scratch_term = total_input_bytes
-            .max(super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES.saturating_mul(16))
-            .min((capacity.max_spill_bytes / 2).max(1));
-        let sort_spill_bytes = scratch_term;
-        Self {
-            decoded_input_bytes,
-            sort_spill_bytes,
-            encoder_buffer_bytes: encoder,
-            upload_chunk_bytes: upload,
-            scratch_bytes: scratch_term
-                .saturating_add(scratch_term)
-                .max(1)
-                .min(capacity.max_spill_bytes),
-            reader_permits,
+    ) -> Result<ForgeTaskEnvelope, ForgeError> {
+        const MIB: u64 = 1024 * 1024;
+        if file_count == 0 || max_concurrent_reads == 0 || capacity.max_spill_bytes < 2 * MIB {
+            return Err(ForgeError::Capacity {
+                detail: "Forge topology cannot supply a complete resource envelope".to_owned(),
+            });
         }
-    }
-
-    /// Returns resident memory, excluding disposable scratch.
-    #[must_use]
-    pub(crate) const fn memory_bytes(self) -> u64 {
-        self.decoded_input_bytes
-            .saturating_add(self.encoder_buffer_bytes)
-            .saturating_add(self.upload_chunk_bytes)
+        let scratch_term = total_input_bytes
+            .max(
+                super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES
+                    .checked_mul(16)
+                    .ok_or_else(|| ForgeError::Invariant {
+                        detail: "Forge scratch floor overflows".to_owned(),
+                    })?,
+            )
+            .min(capacity.max_spill_bytes / 2);
+        if scratch_term < MIB || (file_count == 1 && total_input_bytes > scratch_term) {
+            return Err(ForgeError::Capacity {
+                detail: "Forge input cannot fit one bounded scratch sibling".to_owned(),
+            });
+        }
+        for decoded_batch_bytes in [32 * MIB, 16 * MIB, 8 * MIB, 4 * MIB, 2 * MIB, MIB] {
+            let encoder_buffer_bytes =
+                decoded_batch_bytes
+                    .checked_mul(2)
+                    .ok_or_else(|| ForgeError::Invariant {
+                        detail: "Forge encoder term overflows".to_owned(),
+                    })?;
+            let upload_chunk_bytes = (8 * MIB).min(decoded_batch_bytes);
+            let sort_merge_reservation_bytes = (10 * MIB).min(decoded_batch_bytes);
+            let sort_working_bytes = decoded_batch_bytes
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(sort_merge_reservation_bytes))
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "Forge sort term overflows".to_owned(),
+                })?;
+            let fixed = sort_working_bytes
+                .checked_add(encoder_buffer_bytes)
+                .and_then(|value| value.checked_add(upload_chunk_bytes))
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "Forge fixed resident terms overflow".to_owned(),
+                })?;
+            if fixed >= capacity.max_memory_bytes {
+                continue;
+            }
+            let available_readers = (capacity.max_memory_bytes - fixed) / decoded_batch_bytes;
+            let readers = available_readers
+                .min(u64::from(capacity.max_parallelism))
+                .min(u64::try_from(max_concurrent_reads).unwrap_or(u64::MAX))
+                .min(u64::try_from(file_count).unwrap_or(u64::MAX));
+            if readers == 0 {
+                continue;
+            }
+            let reader_permits = u16::try_from(readers).map_err(|_| ForgeError::Invariant {
+                detail: "Forge reader count exceeds u16".to_owned(),
+            })?;
+            let envelope = ForgeTaskEnvelope {
+                version: FORGE_ENVELOPE_VERSION,
+                reader_permits,
+                decoded_batch_bytes,
+                decoded_input_bytes: readers.checked_mul(decoded_batch_bytes).ok_or_else(|| {
+                    ForgeError::Invariant {
+                        detail: "Forge decoded term overflows".to_owned(),
+                    }
+                })?,
+                sort_working_bytes,
+                sort_merge_reservation_bytes,
+                encoder_buffer_bytes,
+                upload_chunk_bytes,
+                sort_spill_bytes: scratch_term,
+                output_scratch_bytes: scratch_term,
+            };
+            envelope.validate().map_err(|error| ForgeError::Invariant {
+                detail: error.to_string(),
+            })?;
+            return Ok(envelope);
+        }
+        Err(ForgeError::Capacity {
+            detail: "Forge resident capacity cannot fit the minimum quantum".to_owned(),
+        })
     }
 }
 
@@ -214,15 +242,24 @@ impl ForgePlanCandidate {
             .ok_or_else(|| ForgeError::Invariant {
                 detail: "Forge group bytes overflow".to_owned(),
             })?;
-        let envelope = ForgeTaskEnvelope::for_rewrite(bytes, max_concurrent_reads, capacity);
+        let envelope =
+            ForgeEnvelopeSizer::size(bytes, inputs.len(), max_concurrent_reads, capacity)?;
         Ok(Self {
             strategy: ForgeTaskStrategy::SmallFiles,
             parallelism: envelope
                 .reader_permits
                 .min(u16::try_from(group.files().len()).unwrap_or(u16::MAX))
                 .max(1),
-            memory_bytes: envelope.memory_bytes(),
-            spill_bytes: envelope.scratch_bytes,
+            memory_bytes: envelope
+                .memory_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            spill_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
             inputs,
             input_bytes,
             bytes,
@@ -337,9 +374,13 @@ impl ForgePlanner {
                 detail: "Forge candidate paths and input byte terms must align".to_owned(),
             });
         }
+        let group_byte_ceiling = self
+            .capacity
+            .max_bytes
+            .min(self.capacity.max_spill_bytes / 2);
         if candidate.inputs.len() <= 1
             || (candidate.inputs.len() <= self.capacity.max_files as usize
-                && candidate.bytes <= self.capacity.max_bytes)
+                && candidate.bytes <= group_byte_ceiling)
         {
             return Ok(vec![candidate.clone()]);
         }
@@ -350,7 +391,7 @@ impl ForgePlanner {
             let mut bytes = 0_u64;
             while end < candidate.inputs.len()
                 && end - start < self.capacity.max_files as usize
-                && bytes.saturating_add(candidate.input_bytes[end]) <= self.capacity.max_bytes
+                && bytes.saturating_add(candidate.input_bytes[end]) <= group_byte_ceiling
             {
                 bytes = bytes.saturating_add(candidate.input_bytes[end]);
                 end += 1;
@@ -359,19 +400,28 @@ impl ForgePlanner {
                 end += 1;
                 bytes = candidate.input_bytes[start];
             }
-            let envelope = ForgeTaskEnvelope::for_rewrite(
+            let envelope = ForgeEnvelopeSizer::size(
                 bytes,
+                end - start,
                 usize::from(candidate.parallelism).min(end - start),
                 self.capacity,
-            );
+            )?;
             groups.push(ForgePlanCandidate {
                 strategy: candidate.strategy,
                 inputs: candidate.inputs[start..end].to_vec(),
                 input_bytes: candidate.input_bytes[start..end].to_vec(),
                 bytes,
                 parallelism: envelope.reader_permits,
-                memory_bytes: envelope.memory_bytes(),
-                spill_bytes: envelope.scratch_bytes,
+                memory_bytes: envelope
+                    .memory_bytes()
+                    .map_err(|error| ForgeError::Invariant {
+                        detail: error.to_string(),
+                    })?,
+                spill_bytes: envelope
+                    .scratch_bytes()
+                    .map_err(|error| ForgeError::Invariant {
+                        detail: error.to_string(),
+                    })?,
                 parameters: candidate.parameters.clone(),
             });
             start = end;
@@ -480,6 +530,12 @@ impl ForgePlanner {
                 memory_bytes: candidate.memory_bytes,
                 spill_bytes: candidate.spill_bytes,
                 large_ceiling_bytes: self.capacity.max_large_task_bytes,
+                envelope: Some(ForgeEnvelopeSizer::size(
+                    candidate.bytes,
+                    candidate.inputs.len(),
+                    usize::from(candidate.parallelism),
+                    self.capacity,
+                )?),
             },
             capacity: capacity_outcome,
         })
@@ -490,14 +546,119 @@ impl ForgePlanner {
 mod tests {
     use super::*;
 
+    /// The sizer chooses the largest batch quantum before maximizing readers.
+    #[test]
+    fn envelope_sizer_selects_largest_batch_then_readers() {
+        let mib = 1024 * 1024;
+        for (memory, expected_batch, expected_readers) in [
+            (64 * mib, 8 * mib, 2),
+            (128 * mib, 16 * mib, 2),
+            (256 * mib, 32 * mib, 3),
+        ] {
+            let envelope = ForgeEnvelopeSizer::size(
+                1,
+                4,
+                4,
+                ForgeCapacity {
+                    max_files: 4,
+                    max_bytes: u64::MAX,
+                    max_parallelism: 4,
+                    max_memory_bytes: memory,
+                    max_spill_bytes: 1024 * mib,
+                    max_large_task_bytes: u64::MAX,
+                },
+            )
+            .expect("supported envelope");
+            assert_eq!(envelope.decoded_batch_bytes, expected_batch);
+            assert_eq!(envelope.reader_permits, expected_readers);
+            assert_eq!(
+                envelope.decoded_input_bytes,
+                u64::from(expected_readers) * expected_batch
+            );
+            assert!(envelope.memory_bytes().expect("resident total") <= memory);
+        }
+    }
+
+    /// The sizer refuses before allocation when even its one-MiB quantum cannot fit.
+    #[test]
+    fn envelope_rejects_when_minimum_quantum_cannot_fit() {
+        let mib = 1024 * 1024;
+        let result = ForgeEnvelopeSizer::size(
+            1,
+            1,
+            1,
+            ForgeCapacity {
+                max_files: 1,
+                max_bytes: u64::MAX,
+                max_parallelism: 1,
+                max_memory_bytes: 6 * mib,
+                max_spill_bytes: 2 * mib,
+                max_large_task_bytes: u64::MAX,
+            },
+        );
+
+        assert!(matches!(result, Err(ForgeError::Capacity { .. })));
+    }
+
+    /// Scratch siblings are equal, capacity-bounded, and refuse incomplete topology.
+    #[test]
+    fn envelope_scratch_terms_are_capacity_bounded() {
+        let mib = 1024 * 1024;
+        let capacity = ForgeCapacity {
+            max_files: 4,
+            max_bytes: u64::MAX,
+            max_parallelism: 4,
+            max_memory_bytes: 256 * mib,
+            max_spill_bytes: 1024 * mib,
+            max_large_task_bytes: u64::MAX,
+        };
+        let envelope = ForgeEnvelopeSizer::size(1, 4, 4, capacity).expect("bounded scratch");
+        assert_eq!(envelope.sort_spill_bytes, 512 * mib);
+        assert_eq!(envelope.output_scratch_bytes, 512 * mib);
+        assert_eq!(envelope.scratch_bytes().expect("scratch total"), 1024 * mib);
+        assert!(
+            ForgeEnvelopeSizer::size(
+                1,
+                1,
+                1,
+                ForgeCapacity {
+                    max_spill_bytes: 2 * mib - 1,
+                    ..capacity
+                }
+            )
+            .is_err()
+        );
+        assert!(ForgeEnvelopeSizer::size(513 * mib, 1, 1, capacity).is_err());
+
+        let input_bytes = vec![400 * mib, 400 * mib];
+        let candidate = ForgePlanCandidate {
+            strategy: ForgeTaskStrategy::SmallFiles,
+            inputs: vec!["a.parquet".to_owned(), "b.parquet".to_owned()],
+            input_bytes,
+            bytes: 800 * mib,
+            parallelism: envelope.reader_permits,
+            memory_bytes: envelope.memory_bytes().expect("resident total"),
+            spill_bytes: envelope.scratch_bytes().expect("scratch total"),
+            parameters: serde_json::json!({}),
+        };
+        let planned = ForgePlanner::new(capacity)
+            .plan_table(&ForgeTableSnapshot {
+                snapshot_id: 1,
+                candidates: vec![candidate],
+            })
+            .expect("scratch-bound input splits");
+        assert_eq!(planned.len(), 2);
+        assert!(planned.iter().all(|task| task.estimates.bytes == 400 * mib));
+    }
+
     /// Returns capacity with independently testable ceilings.
     fn capacity() -> ForgeCapacity {
         ForgeCapacity {
             max_files: 4,
             max_bytes: 100,
             max_parallelism: 2,
-            max_memory_bytes: 80,
-            max_spill_bytes: 60,
+            max_memory_bytes: 128 * 1024 * 1024,
+            max_spill_bytes: 2 * 1024 * 1024 * 1024,
             max_large_task_bytes: 200,
         }
     }
@@ -510,8 +671,8 @@ mod tests {
             input_bytes: vec![50],
             bytes: 50,
             parallelism: 1,
-            memory_bytes: 40,
-            spill_bytes: 30,
+            memory_bytes: 100 * 1024 * 1024,
+            spill_bytes: 1024 * 1024 * 1024,
             parameters: serde_json::json!({"target":64}),
         }
     }
@@ -523,8 +684,8 @@ mod tests {
         for mutate in [
             |c: &mut ForgePlanCandidate| c.bytes = 201,
             |c: &mut ForgePlanCandidate| c.parallelism = 3,
-            |c: &mut ForgePlanCandidate| c.memory_bytes = 81,
-            |c: &mut ForgePlanCandidate| c.spill_bytes = 61,
+            |c: &mut ForgePlanCandidate| c.memory_bytes = 129 * 1024 * 1024,
+            |c: &mut ForgePlanCandidate| c.spill_bytes = 2 * 1024 * 1024 * 1024 + 1,
         ] {
             let mut value = candidate();
             mutate(&mut value);
@@ -578,15 +739,15 @@ mod tests {
         };
         let input_bytes = vec![64 * 1024 * 1024; 51];
         let bytes = input_bytes.iter().sum();
-        let envelope = ForgeTaskEnvelope::for_rewrite(bytes, 4, capacity);
+        let envelope = ForgeEnvelopeSizer::size(bytes, 51, 4, capacity).expect("51-file envelope");
         let candidate = ForgePlanCandidate {
             strategy: ForgeTaskStrategy::SmallFiles,
             inputs: (0..51).map(|index| format!("{index:02}.parquet")).collect(),
             input_bytes,
             bytes,
             parallelism: envelope.reader_permits,
-            memory_bytes: envelope.memory_bytes(),
-            spill_bytes: envelope.scratch_bytes,
+            memory_bytes: envelope.memory_bytes().expect("resident total"),
+            spill_bytes: envelope.scratch_bytes().expect("scratch total"),
             parameters: serde_json::json!({"kind":"live_rewrite"}),
         };
         let first = ForgePlanner::new(capacity)
@@ -661,9 +822,13 @@ mod tests {
         };
         let candidate = ForgePlanCandidate::from_live_group(&group, 8, capacity)
             .expect("constrained live group candidate");
-        let envelope = ForgeTaskEnvelope::for_rewrite(candidate.bytes, 8, capacity);
+        let envelope = ForgeEnvelopeSizer::size(candidate.bytes, 8, 8, capacity)
+            .expect("constrained envelope");
         assert_eq!(candidate.parallelism, envelope.reader_permits);
-        assert_eq!(candidate.memory_bytes, envelope.memory_bytes());
+        assert_eq!(
+            candidate.memory_bytes,
+            envelope.memory_bytes().expect("resident total")
+        );
     }
 
     /// Configuration conversion copies every field and rejects invalid relationships.

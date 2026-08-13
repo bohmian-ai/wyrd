@@ -373,8 +373,77 @@ pub(super) struct ForgeRewriteVolume {
     pub(super) output_bytes: u64,
 }
 
+/// Closed outcomes for one completed durable hint-persistence attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ForgeHintPersistenceResult {
+    /// The hint was committed as durable planning demand.
+    Succeeded,
+    /// Durable demand persistence returned an error.
+    Failed,
+}
+
+impl ForgeHintPersistenceResult {
+    /// Every result registered in the fixed-cardinality persistence inventory.
+    const ALL: [Self; 2] = [Self::Succeeded, Self::Failed];
+
+    /// Return the stable metric and span label for this outcome.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Closed outcomes for one completed planning-demand transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ForgeDemandTransitionResult {
+    /// Candidate-free discovery acknowledged the exact demand generation.
+    Drained,
+    /// Successful task completion atomically created successor demand.
+    Continued,
+    /// A concurrent producer advanced the demand before acknowledgement.
+    GenerationChanged,
+    /// A completed transition returned an error while retaining recoverable work.
+    Failed,
+}
+
+impl ForgeDemandTransitionResult {
+    /// Every fixed-cardinality transition result registered at owner creation.
+    const ALL: [Self; 4] = [
+        Self::Drained,
+        Self::Continued,
+        Self::GenerationChanged,
+        Self::Failed,
+    ];
+
+    /// Return the stable metric label for this transition result.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::Continued => "continued",
+            Self::GenerationChanged => "generation_changed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Registered Forge metric handles retained by one Forge owner.
 pub struct ForgeTelemetry {
+    /// Worker settlement outcomes by the six durable failure classes.
+    failure_classes: BTreeMap<super::error::ForgeFailureClass, Counter>,
+    /// Current durable quarantine state for this worker process.
+    quarantine_state: Gauge,
+    /// Completed planning-demand transitions by closed result.
+    demand_transitions: BTreeMap<ForgeDemandTransitionResult, Counter>,
+    /// Candidate file counts observed at the current-snapshot planning boundary.
+    discovered_candidate_files: BTreeMap<ForgeTaskMetricStrategy, Histogram>,
+    /// Candidate bytes observed at the current-snapshot planning boundary.
+    discovered_candidate_bytes: BTreeMap<ForgeTaskMetricStrategy, Histogram>,
+    /// Completed hint-persistence counters by closed result.
+    hint_persistence: BTreeMap<ForgeHintPersistenceResult, Counter>,
+    /// Completed hint-persistence durations by closed result.
+    hint_persistence_seconds: BTreeMap<ForgeHintPersistenceResult, Histogram>,
     /// Complete scheduler-owned oldest-backlog publication.
     oldest_backlog: Gauge,
     /// Complete scheduler-owned fairness-lag publication.
@@ -414,6 +483,68 @@ impl ForgeTelemetry {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            failure_classes: [
+                super::error::ForgeFailureClass::DataRefusal,
+                super::error::ForgeFailureClass::TransientObjectStore,
+                super::error::ForgeFailureClass::TransientCoordination,
+                super::error::ForgeFailureClass::StorageHealth,
+                super::error::ForgeFailureClass::CapacityRefused,
+                super::error::ForgeFailureClass::InternalInvariant,
+            ]
+            .into_iter()
+            .map(|class| {
+                (
+                    class,
+                    metrics::counter!(
+                        "bifrost_forge_task_failures_total",
+                        "failure_class" => class.as_str()
+                    ),
+                )
+            })
+            .collect(),
+            quarantine_state: metrics::gauge!("bifrost_forge_worker_quarantined"),
+            demand_transitions: ForgeDemandTransitionResult::ALL
+                .into_iter()
+                .map(|result| {
+                    (
+                        result,
+                        metrics::counter!(
+                            "bifrost_forge_demand_transitions_total",
+                            "result" => result.as_str()
+                        ),
+                    )
+                })
+                .collect(),
+            discovered_candidate_files: strategy_histograms(
+                "bifrost_forge_discovered_candidate_files",
+            ),
+            discovered_candidate_bytes: strategy_histograms(
+                "bifrost_forge_discovered_candidate_bytes",
+            ),
+            hint_persistence: ForgeHintPersistenceResult::ALL
+                .into_iter()
+                .map(|result| {
+                    (
+                        result,
+                        metrics::counter!(
+                            "bifrost_forge_hint_persistence_total",
+                            "result" => result.as_str()
+                        ),
+                    )
+                })
+                .collect(),
+            hint_persistence_seconds: ForgeHintPersistenceResult::ALL
+                .into_iter()
+                .map(|result| {
+                    (
+                        result,
+                        metrics::histogram!(
+                            "bifrost_forge_hint_persistence_seconds",
+                            "result" => result.as_str()
+                        ),
+                    )
+                })
+                .collect(),
             oldest_backlog: metrics::gauge!("bifrost_forge_oldest_backlog_seconds"),
             fairness_lag: metrics::gauge!("bifrost_forge_fairness_lag_tasks"),
             complete_gauge_publications: metrics::counter!(
@@ -433,6 +564,32 @@ impl ForgeTelemetry {
             cleanup_duration: cleanup_histograms(),
             scheduler_duration: metrics::histogram!("bifrost_forge_scheduler_duration_seconds"),
         }
+    }
+
+    /// Record one completed durable hint-persistence attempt.
+    pub(super) fn record_hint_persistence(
+        &self,
+        result: ForgeHintPersistenceResult,
+        elapsed: Duration,
+    ) {
+        self.hint_persistence[&result].increment(1);
+        self.hint_persistence_seconds[&result].record(elapsed.as_secs_f64());
+    }
+
+    /// Record one completed planning-demand transition.
+    pub(super) fn record_demand_transition(&self, result: ForgeDemandTransitionResult) {
+        self.demand_transitions[&result].increment(1);
+    }
+
+    /// Record one deterministic candidate at the production discovery boundary.
+    pub(super) fn record_discovered_candidate(
+        &self,
+        strategy: ForgeTaskMetricStrategy,
+        files: usize,
+        bytes: u64,
+    ) {
+        self.discovered_candidate_files[&strategy].record(files.to_f64().unwrap_or(f64::MAX));
+        self.discovered_candidate_bytes[&strategy].record(bytes.to_f64().unwrap_or(f64::MAX));
     }
 
     /// Record one finished scheduler pass through the production metric owner.
@@ -566,6 +723,17 @@ impl ForgeTelemetry {
         self.rewrite_input_bytes[&source].increment(input_bytes);
         self.rewrite_output_files[&source].increment(output_files as u64);
         self.rewrite_output_bytes[&source].increment(output_bytes);
+    }
+
+    /// Records one closed durable failure classification at settlement.
+    pub(super) fn record_failure_class(&self, class: super::error::ForgeFailureClass) {
+        self.failure_classes[&class].increment(1);
+    }
+
+    /// Publishes whether the local worker is durably quarantined.
+    pub(super) fn record_quarantine_state(&self, quarantined: bool) {
+        self.quarantine_state
+            .set(if quarantined { 1.0 } else { 0.0 });
     }
 }
 
@@ -714,8 +882,8 @@ mod tests {
 
     #[cfg(test)]
     use super::{
-        ForgeCleanupKind, ForgeConflictKind, ForgeMetricSource, ForgeTaskMetricStrategy,
-        ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
+        ForgeCleanupKind, ForgeConflictKind, ForgeHintPersistenceResult, ForgeMetricSource,
+        ForgeTaskMetricStrategy, ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
     };
     #[cfg(test)]
     use crate::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
@@ -969,6 +1137,41 @@ mod tests {
                 reservation.try_grow(4096).expect("Forge memory reserve");
             });
         });
+    }
+
+    /// Hint persistence exposes one counter and duration observation per outcome.
+    #[test]
+    fn forge_hint_persistence_records_success_and_failure() {
+        let recorder = BenchmarkRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let telemetry = ForgeTelemetry::new();
+            telemetry.record_hint_persistence(
+                ForgeHintPersistenceResult::Succeeded,
+                Duration::from_millis(2),
+            );
+            telemetry.record_hint_persistence(
+                ForgeHintPersistenceResult::Failed,
+                Duration::from_millis(3),
+            );
+        });
+        let snapshot = recorder.snapshot();
+        for result in ["succeeded", "failed"] {
+            assert_eq!(
+                snapshot.counters.get(&format!(
+                    "bifrost_forge_hint_persistence_total{{result=\"{result}\"}}"
+                )),
+                Some(&1)
+            );
+            assert_eq!(
+                snapshot
+                    .histograms
+                    .get(&format!(
+                        "bifrost_forge_hint_persistence_seconds{{result=\"{result}\"}}"
+                    ))
+                    .map(|values| values.count),
+                Some(1)
+            );
+        }
     }
 
     /// Maps every durable Forge strategy and task state without a string fallback.

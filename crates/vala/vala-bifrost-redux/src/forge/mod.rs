@@ -39,13 +39,15 @@ pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore, ForgeTickOutc
 pub use error::ForgeError;
 pub use metrics::ForgeTelemetry;
 pub use planner::{
-    ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
-    PlannedForgeTask,
+    ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
+    ForgeTableSnapshot, PlannedForgeTask,
 };
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 pub use rewrite::ForgeRewriteRuntime;
 #[cfg(feature = "test-support")]
 pub use rewrite::deterministic_output_path_for_test;
+#[cfg(feature = "test-support")]
+pub use rewrite::{reset_scratch_peak_for_test, scratch_peak_for_test};
 pub use scheduler::ForgeSchedulerTrigger;
 pub use worker::{
     ForgeLifecycleEvent, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,

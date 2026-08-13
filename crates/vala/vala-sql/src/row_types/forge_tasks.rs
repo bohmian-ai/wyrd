@@ -11,6 +11,144 @@ use crate::SqlError;
 /// Current version of persisted task plans and evidence.
 pub const FORGE_TASK_PAYLOAD_VERSION: u16 = 1;
 
+/// Current version of the executable Forge resource envelope.
+pub const FORGE_ENVELOPE_VERSION: u16 = 1;
+
+/// Exact durable resource terms consumed by one Forge rewrite attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeTaskEnvelope {
+    /// Envelope schema version.
+    pub version: u16,
+    /// Exact number of source-reader permits.
+    pub reader_permits: u16,
+    /// Resident bytes reserved by each decoder.
+    pub decoded_batch_bytes: u64,
+    /// Aggregate resident decoder reservation.
+    pub decoded_input_bytes: u64,
+    /// Resident memory reserved by sorting, including merge reservation.
+    pub sort_working_bytes: u64,
+    /// Explicit DataFusion sort-spill merge reservation.
+    pub sort_merge_reservation_bytes: u64,
+    /// Resident Parquet encoder reservation.
+    pub encoder_buffer_bytes: u64,
+    /// Resident bounded-upload chunk reservation.
+    pub upload_chunk_bytes: u64,
+    /// Scratch bytes reserved for sort spill.
+    pub sort_spill_bytes: u64,
+    /// Scratch bytes reserved for pending output.
+    pub output_scratch_bytes: u64,
+}
+
+impl ForgeTaskEnvelope {
+    /// Validates the executable envelope and returns its resident total.
+    ///
+    /// # Errors
+    /// Returns a conflict for caller-supplied malformed or overflowing terms.
+    pub fn memory_bytes(self) -> Result<u64, SqlError> {
+        self.validate()?;
+        self.decoded_input_bytes
+            .checked_add(self.sort_working_bytes)
+            .and_then(|value| value.checked_add(self.encoder_buffer_bytes))
+            .and_then(|value| value.checked_add(self.upload_chunk_bytes))
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "Forge envelope resident total overflows".to_owned(),
+            })
+    }
+
+    /// Validates the executable envelope and returns its scratch total.
+    ///
+    /// # Errors
+    /// Returns a conflict for caller-supplied malformed or overflowing terms.
+    pub fn scratch_bytes(self) -> Result<u64, SqlError> {
+        self.validate()?;
+        self.sort_spill_bytes
+            .checked_add(self.output_scratch_bytes)
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "Forge envelope scratch total overflows".to_owned(),
+            })
+    }
+
+    /// Validates version, positivity, and the two derived resident invariants.
+    ///
+    /// # Errors
+    /// Returns a conflict when the envelope cannot be executed exactly as stored.
+    pub fn validate(self) -> Result<(), SqlError> {
+        let decoded = u64::from(self.reader_permits).checked_mul(self.decoded_batch_bytes);
+        let sort = self
+            .decoded_batch_bytes
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(self.sort_merge_reservation_bytes));
+        if self.version != FORGE_ENVELOPE_VERSION
+            || self.reader_permits == 0
+            || self.decoded_batch_bytes == 0
+            || self.decoded_input_bytes == 0
+            || self.sort_working_bytes == 0
+            || self.sort_merge_reservation_bytes == 0
+            || self.encoder_buffer_bytes == 0
+            || self.upload_chunk_bytes == 0
+            || self.sort_spill_bytes == 0
+            || self.output_scratch_bytes == 0
+            || decoded != Some(self.decoded_input_bytes)
+            || sort != Some(self.sort_working_bytes)
+        {
+            return Err(SqlError::Conflict {
+                detail: "Forge task envelope is malformed".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Closed durable class driving Forge settlement policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ForgeFailureClass {
+    /// Deterministic source data refusal.
+    DataRefusal,
+    /// Retryable remote object-store or catalog transport failure.
+    TransientObjectStore,
+    /// Retryable SQL, lease, fence, or reconciliation failure.
+    TransientCoordination,
+    /// Retryable local scratch-volume health failure.
+    StorageHealth,
+    /// Local admission or execution-envelope refusal.
+    CapacityRefused,
+    /// Non-retryable internal invariant failure.
+    InternalInvariant,
+}
+
+impl ForgeFailureClass {
+    /// Returns the stable SQL and telemetry spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DataRefusal => "data_refusal",
+            Self::TransientObjectStore => "transient_object_store",
+            Self::TransientCoordination => "transient_coordination",
+            Self::StorageHealth => "storage_health",
+            Self::CapacityRefused => "capacity_refused",
+            Self::InternalInvariant => "internal_invariant",
+        }
+    }
+
+    /// Decodes one persisted class without accepting unknown values.
+    ///
+    /// # Errors
+    /// Returns an invariant violation for malformed persisted state.
+    pub(crate) fn from_sql(value: &str) -> Result<Self, SqlError> {
+        match value {
+            "data_refusal" => Ok(Self::DataRefusal),
+            "transient_object_store" => Ok(Self::TransientObjectStore),
+            "transient_coordination" => Ok(Self::TransientCoordination),
+            "storage_health" => Ok(Self::StorageHealth),
+            "capacity_refused" => Ok(Self::CapacityRefused),
+            "internal_invariant" => Ok(Self::InternalInvariant),
+            _ => Err(SqlError::InvariantViolation {
+                detail: format!("unknown Forge failure class {value}"),
+            }),
+        }
+    }
+}
+
 /// Closed origin of a coalesced Forge planning request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgePlanningDemandSource {
@@ -837,6 +975,8 @@ pub struct ForgeTaskEstimates {
     pub spill_bytes: u64,
     /// Large-lane ceiling bytes.
     pub large_ceiling_bytes: u64,
+    /// Exact executable terms, or `None` for a pre-envelope legacy row.
+    pub envelope: Option<ForgeTaskEnvelope>,
 }
 
 impl ForgeTaskEstimates {
@@ -860,6 +1000,18 @@ impl ForgeTaskEstimates {
                 detail: "Forge task estimates must be positive and fit PostgreSQL bigint"
                     .to_owned(),
             });
+        }
+        if let Some(envelope) = self.envelope {
+            envelope.validate()?;
+            if envelope.reader_permits != self.parallelism
+                || envelope.memory_bytes()? != self.memory_bytes
+                || envelope.scratch_bytes()? != self.spill_bytes
+            {
+                return Err(SqlError::Conflict {
+                    detail: "Forge aggregate estimates do not match the executable envelope"
+                        .to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -1071,6 +1223,15 @@ fn safe_object_path(value: &str) -> bool {
 }
 
 /// Private SQL decoder for the canonical Forge task projection.
+fn sql_u64(value: Option<i64>, field: &str) -> Result<u64, SqlError> {
+    value
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: format!("invalid Forge envelope field {field}"),
+        })
+}
+
+/// Private SQL decoder for the canonical Forge task projection.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct ForgeTaskSqlRow {
     task_id: Uuid,
@@ -1088,6 +1249,15 @@ pub(crate) struct ForgeTaskSqlRow {
     estimated_memory_bytes: i64,
     estimated_spill_bytes: i64,
     large_task_ceiling_bytes: i64,
+    envelope_version: i16,
+    decoded_batch_bytes: Option<i64>,
+    decoded_input_bytes: Option<i64>,
+    sort_working_bytes: Option<i64>,
+    sort_merge_reservation_bytes: Option<i64>,
+    encoder_buffer_bytes: Option<i64>,
+    upload_chunk_bytes: Option<i64>,
+    sort_spill_bytes: Option<i64>,
+    output_scratch_bytes: Option<i64>,
     state: String,
     attempt_id: Option<Uuid>,
     claimed_by: Option<Uuid>,
@@ -1242,6 +1412,33 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
                 });
             }
         };
+        let envelope = match row.envelope_version {
+            0 => None,
+            1 => Some(ForgeTaskEnvelope {
+                version: FORGE_ENVELOPE_VERSION,
+                reader_permits: u16::try_from(row.estimated_parallelism).map_err(|_| {
+                    SqlError::InvariantViolation {
+                        detail: "invalid envelope reader permits".to_owned(),
+                    }
+                })?,
+                decoded_batch_bytes: sql_u64(row.decoded_batch_bytes, "decoded_batch_bytes")?,
+                decoded_input_bytes: sql_u64(row.decoded_input_bytes, "decoded_input_bytes")?,
+                sort_working_bytes: sql_u64(row.sort_working_bytes, "sort_working_bytes")?,
+                sort_merge_reservation_bytes: sql_u64(
+                    row.sort_merge_reservation_bytes,
+                    "sort_merge_reservation_bytes",
+                )?,
+                encoder_buffer_bytes: sql_u64(row.encoder_buffer_bytes, "encoder_buffer_bytes")?,
+                upload_chunk_bytes: sql_u64(row.upload_chunk_bytes, "upload_chunk_bytes")?,
+                sort_spill_bytes: sql_u64(row.sort_spill_bytes, "sort_spill_bytes")?,
+                output_scratch_bytes: sql_u64(row.output_scratch_bytes, "output_scratch_bytes")?,
+            }),
+            _ => {
+                return Err(SqlError::InvariantViolation {
+                    detail: "unknown Forge envelope version".to_owned(),
+                });
+            }
+        };
         let estimates = ForgeTaskEstimates {
             files: u32::try_from(row.estimated_files).map_err(|_| {
                 SqlError::InvariantViolation {
@@ -1273,6 +1470,7 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
                     detail: "invalid large ceiling".to_owned(),
                 }
             })?,
+            envelope,
         };
         estimates
             .validate()
@@ -1283,16 +1481,10 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
             u32::try_from(row.attempt_count).map_err(|_| SqlError::InvariantViolation {
                 detail: "invalid Forge attempt count".to_owned(),
             })?;
-        if row.failure_class.as_deref().is_some_and(|class| {
-            !matches!(
-                class,
-                "data_refusal" | "transient_object_store" | "storage_health" | "capacity_refused"
-            )
-        }) {
-            return Err(SqlError::InvariantViolation {
-                detail: "unknown Forge failure class".to_owned(),
-            });
-        }
+        row.failure_class
+            .as_deref()
+            .map(ForgeFailureClass::from_sql)
+            .transpose()?;
         Ok(Self {
             task_id: row.task_id,
             data_tenant_id,

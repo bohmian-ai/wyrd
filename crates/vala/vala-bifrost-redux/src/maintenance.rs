@@ -54,6 +54,12 @@ pub enum MaintenanceChannelError {
 pub struct StagingFilePublisher {
     /// Tokio sender whose capacity bounds retained wake-up signals.
     sender: tokio::sync::mpsc::Sender<StagingFileCommitted>,
+    /// Canonical accepted-publication counter.
+    accepted: metrics::Counter,
+    /// Canonical bounded-channel rejection counter.
+    full: metrics::Counter,
+    /// Canonical closed-channel rejection counter.
+    closed: metrics::Counter,
 }
 
 /// Receiver for local staging-file wake-ups consumed by Forge.
@@ -68,15 +74,16 @@ impl StagingFilePublisher {
     #[must_use]
     pub fn try_publish(&self, event: StagingFileCommitted) -> StagingPublishOutcome {
         match self.sender.try_send(event) {
-            Ok(()) => StagingPublishOutcome::Published,
+            Ok(()) => {
+                self.accepted.increment(1);
+                StagingPublishOutcome::Published
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!("bifrost_staging_hint_dropped_total", "reason" => "full")
-                    .increment(1);
+                self.full.increment(1);
                 StagingPublishOutcome::DroppedFull
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                metrics::counter!("bifrost_staging_hint_dropped_total", "reason" => "closed")
-                    .increment(1);
+                self.closed.increment(1);
                 StagingPublishOutcome::DroppedClosed
             }
         }
@@ -137,7 +144,12 @@ pub fn staging_file_channel(
     }
     let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
     Ok((
-        StagingFilePublisher { sender },
+        StagingFilePublisher {
+            sender,
+            accepted: metrics::counter!("bifrost_forge_hints_total", "result" => "accepted"),
+            full: metrics::counter!("bifrost_forge_hints_total", "result" => "full"),
+            closed: metrics::counter!("bifrost_forge_hints_total", "result" => "closed"),
+        },
         StagingFileInbox { receiver },
     ))
 }
@@ -180,6 +192,51 @@ mod tests {
         assert_eq!(
             publisher.try_publish(StagingFileCommitted::new(binding, day)),
             StagingPublishOutcome::DroppedClosed
+        );
+    }
+
+    /// Every publication attempt advances exactly one canonical Forge hint outcome.
+    #[test]
+    fn staging_hint_outcomes_record_one_canonical_result() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let (publisher, mut inbox) = staging_file_channel(1).expect("channel");
+            let tenant = DataTenantId::new_v7();
+            let binding = TenantTableBinding::resolve((
+                tenant,
+                TableRef::new(BifrostNamespace::Traces, "spans"),
+            ))
+            .expect("binding");
+            let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+            assert_eq!(
+                publisher.try_publish(StagingFileCommitted::new(binding.clone(), day)),
+                StagingPublishOutcome::Published
+            );
+            assert_eq!(
+                publisher.try_publish(StagingFileCommitted::new(binding.clone(), day)),
+                StagingPublishOutcome::DroppedFull
+            );
+            let _ = inbox.try_recv().expect("queued signal");
+            drop(inbox);
+            assert_eq!(
+                publisher.try_publish(StagingFileCommitted::new(binding, day)),
+                StagingPublishOutcome::DroppedClosed
+            );
+        });
+        let snapshot = recorder.snapshot();
+        for result in ["accepted", "full", "closed"] {
+            assert_eq!(
+                snapshot
+                    .counters
+                    .get(&format!("bifrost_forge_hints_total{{result=\"{result}\"}}")),
+                Some(&1)
+            );
+        }
+        assert!(
+            snapshot
+                .counters
+                .keys()
+                .all(|key| !key.starts_with("bifrost_staging_hint_dropped_total"))
         );
     }
 }

@@ -1,30 +1,68 @@
 //! Typed failures produced by Forge scheduling and maintenance workflows.
 
 use thiserror::Error;
+pub use vala_sql::row_types::forge_tasks::ForgeFailureClass;
 
-/// Closed durable class driving Forge retry, quarantine, and terminal policy.
+/// Boundary at which a capacity refusal occurred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForgeFailureClass {
-    /// Deterministic input shape cannot safely execute.
-    DataRefusal,
-    /// Remote object or catalog storage may recover after backoff.
-    TransientObjectStore,
-    /// Pod-local scratch health is unsafe and requires quarantine.
-    StorageHealth,
-    /// The live governor cannot currently fit the persisted envelope.
-    CapacityRefused,
+pub enum ForgeCapacityFailurePhase {
+    /// Live root capacity was occupied before the attempt began.
+    Admission,
+    /// An admitted attempt exhausted one persisted envelope term.
+    Execution,
 }
 
-impl ForgeFailureClass {
-    /// Returns the closed SQL and telemetry spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::DataRefusal => "data_refusal",
-            Self::TransientObjectStore => "transient_object_store",
-            Self::StorageHealth => "storage_health",
-            Self::CapacityRefused => "capacity_refused",
-        }
+#[cfg(test)]
+mod tests {
+    use super::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
+
+    /// Typed execution errors map to the six durable failure classes without text parsing.
+    #[test]
+    fn failure_mapping_is_exhaustive_and_capacity_phase_aware() {
+        assert_eq!(
+            ForgeError::DataRefusal {
+                detail: "footer".to_owned()
+            }
+            .failure_class(),
+            ForgeFailureClass::DataRefusal
+        );
+        assert_eq!(
+            ForgeError::ScratchIo {
+                kind: std::io::ErrorKind::PermissionDenied,
+                detail: "scratch".to_owned(),
+            }
+            .failure_class(),
+            ForgeFailureClass::StorageHealth
+        );
+        assert_eq!(
+            ForgeError::Capacity {
+                detail: "envelope".to_owned()
+            }
+            .failure_class(),
+            ForgeFailureClass::CapacityRefused
+        );
+        assert_eq!(
+            ForgeError::Capacity {
+                detail: "occupied".to_owned()
+            }
+            .capacity_failure_phase(),
+            Some(ForgeCapacityFailurePhase::Admission)
+        );
+        assert_eq!(
+            ForgeError::ExecutionEnvelopeExceeded {
+                resource: "memory",
+                detail: "pool".to_owned()
+            }
+            .capacity_failure_phase(),
+            Some(ForgeCapacityFailurePhase::Execution)
+        );
+        assert_eq!(
+            ForgeError::Timeout {
+                operation: "catalog"
+            }
+            .failure_class(),
+            ForgeFailureClass::TransientObjectStore
+        );
     }
 }
 
@@ -37,6 +75,14 @@ pub enum ForgeError {
     /// Pod-local elastic memory or scratch is temporarily occupied.
     #[error("Forge resources are temporarily unavailable: {detail}")]
     Capacity { detail: String },
+    /// An admitted rewrite exhausted one exact persisted execution term.
+    #[error("Forge execution envelope exceeded for {resource}: {detail}")]
+    ExecutionEnvelopeExceeded {
+        /// Closed resource label identifying the exhausted term family.
+        resource: &'static str,
+        /// Bounded diagnostic detail from the typed refusal boundary.
+        detail: String,
+    },
     /// A lease acquisition, renewal, fence, or release query failed.
     #[error("Forge lease query failed: {0}")]
     Lease(#[source] vala_sql::SqlError),
@@ -130,32 +176,46 @@ pub enum ForgeError {
 impl ForgeError {
     /// Classifies one execution failure without parsing diagnostic strings.
     #[must_use]
-    pub const fn failure_class(&self) -> ForgeFailureClass {
+    pub fn failure_class(&self) -> ForgeFailureClass {
         match self {
             Self::DataRefusal { .. } => ForgeFailureClass::DataRefusal,
             Self::ScratchIo { .. } => ForgeFailureClass::StorageHealth,
-            Self::Capacity { .. } => ForgeFailureClass::CapacityRefused,
+            Self::Capacity { .. }
+            | Self::ExecutionEnvelopeExceeded { .. }
+            | Self::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
+            | Self::SpillLimitExceeded { .. } => ForgeFailureClass::CapacityRefused,
             Self::ObjectStore(_)
             | Self::ObjectList(_)
             | Self::ObjectDelete(_)
             | Self::Catalog(_)
             | Self::Timeout { .. }
-            | Self::Lease(_)
-            | Self::Sql(_)
             | Self::SnapshotExpiry { .. }
             | Self::LiveSet { .. }
-            | Self::Parquet { .. }
-            | Self::Schema { .. }
-            | Self::Group { .. }
+            | Self::Parquet { .. } => ForgeFailureClass::TransientObjectStore,
+            Self::Lease(_)
+            | Self::Sql(_)
             | Self::FenceLost { .. }
-            | Self::Reconciliation { .. }
-            | Self::Shutdown
-            | Self::ShutdownRetained
+            | Self::Reconciliation { .. } => ForgeFailureClass::TransientCoordination,
+            Self::Schema { .. }
+            | Self::Group { .. }
             | Self::Invariant { .. }
             | Self::InvalidConfig { .. }
             | Self::AlreadyRunning
             | Self::DataFusion(_)
-            | Self::SpillLimitExceeded { .. } => ForgeFailureClass::TransientObjectStore,
+            | Self::Shutdown
+            | Self::ShutdownRetained => ForgeFailureClass::InternalInvariant,
+        }
+    }
+
+    /// Returns the capacity phase for typed capacity failures.
+    #[must_use]
+    pub const fn capacity_failure_phase(&self) -> Option<ForgeCapacityFailurePhase> {
+        match self {
+            Self::Capacity { .. } => Some(ForgeCapacityFailurePhase::Admission),
+            Self::ExecutionEnvelopeExceeded { .. }
+            | Self::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
+            | Self::SpillLimitExceeded { .. } => Some(ForgeCapacityFailurePhase::Execution),
+            _ => None,
         }
     }
 }

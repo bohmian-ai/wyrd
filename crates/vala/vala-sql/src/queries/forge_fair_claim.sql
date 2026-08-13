@@ -31,7 +31,8 @@ WITH cursor AS MATERIALIZED (
             AND active.state IN ('claimed', 'running', 'prepared')
       )
       AND (
-          (t.lane = 'ordinary' AND t.estimated_files <= $5 AND t.estimated_bytes <= $6)
+          t.envelope_version = 0
+          OR (t.lane = 'ordinary' AND t.estimated_files <= $5 AND t.estimated_bytes <= $6)
           OR (
               t.lane = 'large_singleton'
               AND t.estimated_files <= $5
@@ -45,9 +46,11 @@ WITH cursor AS MATERIALIZED (
               )
           )
       )
-      AND t.estimated_parallelism <= $7
-      AND t.estimated_memory_bytes <= $8
-      AND t.estimated_spill_bytes <= $9
+      AND (t.envelope_version = 0 OR (
+          t.estimated_parallelism <= $7
+          AND t.estimated_memory_bytes <= $8
+          AND t.estimated_spill_bytes <= $9
+      ))
 ), eligible_tenants AS MATERIALIZED (
     SELECT t.data_tenant_id
     FROM claimable t
@@ -92,7 +95,10 @@ SELECT c.execution_tenant_id,
        t.table_name, t.strategy, t.lane, t.base_snapshot_id, t.plan,
        t.estimated_files, t.estimated_bytes, t.estimated_parallelism,
        t.estimated_memory_bytes, t.estimated_spill_bytes,
-       t.large_task_ceiling_bytes, t.state, t.attempt_id, t.claimed_by,
+       t.large_task_ceiling_bytes, t.envelope_version, t.decoded_batch_bytes,
+       t.decoded_input_bytes, t.sort_working_bytes, t.sort_merge_reservation_bytes,
+       t.encoder_buffer_bytes, t.upload_chunk_bytes, t.sort_spill_bytes,
+       t.output_scratch_bytes, t.state, t.attempt_id, t.claimed_by,
        t.claim_expires_at, t.watermark_snapshot_id,
        t.watermark_timestamp_ms, t.evidence, t.attempt_count, t.failure_class,
        t.next_eligible_at, t.failed_volume_identity, t.ready_at, t.created_at,

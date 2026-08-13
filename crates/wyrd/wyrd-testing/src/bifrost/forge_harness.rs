@@ -1210,6 +1210,33 @@ impl ForgeFixture {
         .expect("validated Forge fixture config")
     }
 
+    /// Builds a supervised Forge worker against an explicit scratch root.
+    ///
+    /// This read-only configuration seam lets gated journeys exercise real
+    /// filesystem health failures without adding production fault injection.
+    #[must_use]
+    pub fn context_with_worker_supervision_and_spill_root(
+        &self,
+        config: ForgeConfig,
+        completion_observer: ForgeWorkerCompletionObserver,
+        scheduler_trigger: ForgeSchedulerTrigger,
+        spill_root: &std::path::Path,
+    ) -> Arc<Forge> {
+        self.build_forge_with_publisher_and_memory_probe_and_supervision_at(
+            config,
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.object_store),
+            None,
+            ForgeFixtureSupervision {
+                completion_observer: Some(completion_observer),
+                scheduler_trigger: Some(scheduler_trigger),
+            },
+            Some(spill_root),
+        )
+        .map(|(forge, _publisher, _probe)| forge)
+        .expect("validated Forge fixture spill-root config")
+    }
+
     /// Build a production-shaped Forge together with its paired local hint
     /// publisher for scheduler journey tests.
     #[must_use]
@@ -1391,12 +1418,36 @@ impl ForgeFixture {
         memory_limit_bytes: Option<usize>,
         supervision: ForgeFixtureSupervision,
     ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
+        self.build_forge_with_publisher_and_memory_probe_and_supervision_at(
+            config,
+            catalog,
+            object_store,
+            memory_limit_bytes,
+            supervision,
+            None,
+        )
+    }
+
+    /// Constructs Forge with an optional caller-owned scratch root.
+    fn build_forge_with_publisher_and_memory_probe_and_supervision_at(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        memory_limit_bytes: Option<usize>,
+        supervision: ForgeFixtureSupervision,
+        spill_root: Option<&std::path::Path>,
+    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
         let (publisher, inbox) =
             staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
-        let runtime_root = self
-            .spill_root
-            .path()
-            .join(format!("forge-pod-{}", uuid::Uuid::now_v7()));
+        let runtime_root = spill_root.map_or_else(
+            || {
+                self.spill_root
+                    .path()
+                    .join(format!("forge-pod-{}", uuid::Uuid::now_v7()))
+            },
+            std::path::Path::to_path_buf,
+        );
         let runtime_resources = forge_runtime_resources(
             &runtime_root,
             memory_limit_bytes.unwrap_or(10 * 1024 * 1024 * 1024),
@@ -2009,10 +2060,27 @@ mod worker_lifecycle_tests {
         );
         let resources = forge.resources_for_test();
         let plan = resources.snapshot().expect("plan snapshot").plan;
+        let blocker_envelope = vala_bifrost_redux::forge::ForgeEnvelopeSizer::size(
+            1,
+            1,
+            1,
+            vala_bifrost_redux::forge::ForgeCapacity {
+                max_files: 1,
+                max_bytes: u64::MAX,
+                max_parallelism: 1,
+                max_memory_bytes: u64::try_from(plan.elastic_memory_bytes)
+                    .expect("blocker memory capacity"),
+                max_spill_bytes: plan.scratch_limit_bytes,
+                max_large_task_bytes: u64::MAX,
+            },
+        )
+        .expect("blocker envelope");
         let blocker = resources
             .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: blocker_envelope,
                 memory_bytes: plan.elastic_memory_bytes,
                 scratch_bytes: plan.scratch_limit_bytes,
+                reader_permits: 1,
             })
             .expect("the test owner occupies all Forge capacity");
         let worker = ForgeWorker::new(

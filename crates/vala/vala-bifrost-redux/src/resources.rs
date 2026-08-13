@@ -11,6 +11,8 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
+use std::sync::LazyLock;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -516,12 +518,23 @@ impl OracleResources {
 /// themselves the requested demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeRewriteRequest {
+    /// Authoritative persisted per-term envelope.
+    pub envelope: vala_sql::row_types::forge_tasks::ForgeTaskEnvelope,
     /// Exact rewrite working-memory demand in bytes.
     pub memory_bytes: usize,
     /// Exact disposable spill demand in bytes.
     pub scratch_bytes: u64,
     /// Concurrent input readers reserved before any source object is opened.
     pub reader_permits: u16,
+}
+
+/// Closed result of finalizing one exact Forge rewrite lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeResourceReleaseResult {
+    /// Every leased counter returned to the root governor exactly once.
+    Released,
+    /// Accounting was made fail-closed and the leased counters were retained.
+    Poisoned,
 }
 
 /// Sole issuer of Forge rewrite leases against the shared process root.
@@ -978,7 +991,7 @@ impl BifrostResourceGovernor {
             reader_permits: usize::from(reader_permits),
             memory_pool: bounded_memory_pool(memory_bytes),
             governor: self.clone(),
-            released: false,
+            release_result: None,
         })
     }
 
@@ -1149,7 +1162,8 @@ pub struct ForgeRewriteResources {
     /// Operation-local pool nested inside this exact root lease.
     memory_pool: Arc<dyn MemoryPool>,
     governor: BifrostResourceGovernor,
-    released: bool,
+    /// First terminal release result, retained for idempotent finalization.
+    release_result: Option<ForgeResourceReleaseResult>,
 }
 
 impl ForgeRewriteResources {
@@ -1164,31 +1178,59 @@ impl ForgeRewriteResources {
     pub fn scratch_bytes(&self) -> u64 {
         self.scratch_bytes
     }
+
+    /// Explicitly releases the complete lease exactly once.
+    ///
+    /// # Errors
+    /// Returns a poisoned-accounting error when counters cannot be returned atomically.
+    pub(crate) fn release(&mut self) -> Result<ForgeResourceReleaseResult, BifrostResourceError> {
+        if let Some(result) = self.release_result {
+            return Ok(result);
+        }
+        let mut state = match self.governor.lock_state() {
+            Ok(state) => state,
+            Err(error) => {
+                self.release_result = Some(ForgeResourceReleaseResult::Poisoned);
+                return Err(error);
+            }
+        };
+        if state.elastic_memory_used_bytes < self.memory_bytes
+            || state.scratch_used_bytes < self.scratch_bytes
+            || state.forge_reader_permits_used < self.reader_permits
+        {
+            self.release_result = Some(ForgeResourceReleaseResult::Poisoned);
+            return Err(BifrostResourceGovernor::poison_locked(
+                &mut state,
+                "Forge release underflow",
+            ));
+        }
+        state.elastic_memory_used_bytes -= self.memory_bytes;
+        state.scratch_used_bytes -= self.scratch_bytes;
+        state.forge_reader_permits_used -= self.reader_permits;
+        self.release_result = Some(ForgeResourceReleaseResult::Released);
+        Ok(ForgeResourceReleaseResult::Released)
+    }
+
+    /// Poisons the governor while deliberately retaining all leased counters.
+    pub(crate) fn poison_without_release(&mut self) -> ForgeResourceReleaseResult {
+        if let Some(result) = self.release_result {
+            return result;
+        }
+        self.governor
+            .poison("Forge runtime survived its attempt resource owner");
+        self.release_result = Some(ForgeResourceReleaseResult::Poisoned);
+        ForgeResourceReleaseResult::Poisoned
+    }
 }
 
 impl Drop for ForgeRewriteResources {
     /// Releases both Forge counters exactly once and poisons on underflow.
     fn drop(&mut self) {
-        if self.released {
+        if self.release_result.is_some() {
             return;
         }
-        match self.governor.lock_state() {
-            Ok(mut state)
-                if state.elastic_memory_used_bytes >= self.memory_bytes
-                    && state.scratch_used_bytes >= self.scratch_bytes
-                    && state.forge_reader_permits_used >= self.reader_permits =>
-            {
-                state.elastic_memory_used_bytes -= self.memory_bytes;
-                state.scratch_used_bytes -= self.scratch_bytes;
-                state.forge_reader_permits_used -= self.reader_permits;
-                self.released = true;
-            }
-            Ok(mut state) => {
-                let error =
-                    BifrostResourceGovernor::poison_locked(&mut state, "Forge release underflow");
-                tracing::error!(%error, "Forge resource cleanup failed");
-            }
-            Err(error) => tracing::error!(%error, "Forge resource cleanup failed"),
+        if let Err(error) = self.release() {
+            tracing::error!(%error, "Forge resource cleanup failed");
         }
     }
 }
@@ -1248,11 +1290,23 @@ pub(crate) fn bounded_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
 
 #[cfg(any(test, feature = "test-support"))]
 static TEST_MEMORY_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Named reservation peaks observed by production pool callbacks in serialized tests.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_MEMORY_CONSUMER_PEAKS: LazyLock<Mutex<std::collections::BTreeMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
 
 /// Resets the process-wide peak observation used by serialized Forge tests.
+///
+/// # Panics
+///
+/// Panics when another test poisoned the shared observation ledger lock.
 #[cfg(feature = "test-support")]
 pub fn reset_memory_peak_for_test() {
     TEST_MEMORY_PEAK_BYTES.store(0, Ordering::Release);
+    TEST_MEMORY_CONSUMER_PEAKS
+        .lock()
+        .expect("test memory peak ledger lock remains available")
+        .clear();
 }
 
 /// Returns the largest leased-pool reservation observed since the last reset.
@@ -1260,6 +1314,24 @@ pub fn reset_memory_peak_for_test() {
 #[must_use]
 pub fn memory_peak_for_test() -> usize {
     TEST_MEMORY_PEAK_BYTES.load(Ordering::Acquire)
+}
+
+/// Returns the largest reservation observed for consumer names containing `fragment`.
+///
+/// # Panics
+///
+/// Panics when another test poisoned the shared observation ledger lock.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn memory_consumer_peak_for_test(fragment: &str) -> usize {
+    TEST_MEMORY_CONSUMER_PEAKS
+        .lock()
+        .expect("test memory peak ledger lock remains available")
+        .iter()
+        .filter(|(name, _)| name.contains(fragment))
+        .map(|(_, peak)| *peak)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Test-only wrapper that records peak reservations without changing admission.
@@ -1278,8 +1350,14 @@ impl PeakTrackingMemoryPool {
     }
 
     /// Records the current reservation after a successful growth operation.
-    fn observe(&self) {
+    fn observe(&self, reservation: &MemoryReservation) {
         TEST_MEMORY_PEAK_BYTES.fetch_max(self.inner.reserved(), Ordering::AcqRel);
+        TEST_MEMORY_CONSUMER_PEAKS
+            .lock()
+            .expect("test memory peak ledger lock remains available")
+            .entry(reservation.consumer().name().to_owned())
+            .and_modify(|peak| *peak = (*peak).max(reservation.size()))
+            .or_insert_with(|| reservation.size());
     }
 }
 
@@ -1298,7 +1376,7 @@ impl MemoryPool for PeakTrackingMemoryPool {
     /// Delegates infallible growth and records the resulting peak.
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.inner.grow(reservation, additional);
-        self.observe();
+        self.observe(reservation);
     }
 
     /// Delegates release exactly to the production pool.
@@ -1313,7 +1391,7 @@ impl MemoryPool for PeakTrackingMemoryPool {
         additional: usize,
     ) -> datafusion::error::Result<()> {
         self.inner.try_grow(reservation, additional)?;
-        self.observe();
+        self.observe(reservation);
         Ok(())
     }
 
@@ -1494,6 +1572,22 @@ fn parse_cpuset(value: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use datafusion::execution::memory_pool::MemoryConsumer;
+
+    /// Returns a valid envelope for resource-ledger tests that do not execute it.
+    fn envelope() -> vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+        vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+            version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
+            reader_permits: 1,
+            decoded_batch_bytes: MIB as u64,
+            decoded_input_bytes: MIB as u64,
+            sort_working_bytes: 3 * MIB as u64,
+            sort_merge_reservation_bytes: MIB as u64,
+            encoder_buffer_bytes: 2 * MIB as u64,
+            upload_chunk_bytes: MIB as u64,
+            sort_spill_bytes: MIB as u64,
+            output_scratch_bytes: MIB as u64,
+        }
+    }
 
     fn policy(roles: &[BifrostRole]) -> BifrostResourcePolicy {
         BifrostResourcePolicy {
@@ -1837,6 +1931,7 @@ mod tests {
 
         let lease = forge
             .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: envelope(),
                 memory_bytes: 64 * MIB,
                 scratch_bytes: 64 * MIB as u64,
                 reader_permits: 1,
@@ -1911,6 +2006,7 @@ mod tests {
         assert!(
             forge
                 .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: envelope(),
                     memory_bytes: plan.elastic_memory_bytes + 1,
                     scratch_bytes: 1,
                     reader_permits: 1,
@@ -1923,6 +2019,7 @@ mod tests {
         assert!(
             forge
                 .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: envelope(),
                     memory_bytes: 1,
                     scratch_bytes: plan.scratch_limit_bytes + 1,
                     reader_permits: 1,
@@ -1935,6 +2032,7 @@ mod tests {
         assert!(
             forge
                 .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: envelope(),
                     memory_bytes: 1,
                     scratch_bytes: 1,
                     reader_permits: u16::try_from(plan.effective_cpu + 1).unwrap_or(u16::MAX),
@@ -1957,6 +2055,7 @@ mod tests {
         let permits = u16::try_from(roles.plan().effective_cpu).unwrap_or(u16::MAX);
         let lease = forge
             .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: envelope(),
                 memory_bytes: 1,
                 scratch_bytes: 1,
                 reader_permits: permits,
@@ -1967,6 +2066,7 @@ mod tests {
         assert!(
             forge
                 .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: envelope(),
                     memory_bytes: 1,
                     scratch_bytes: 1,
                     reader_permits: 1,
@@ -2028,6 +2128,7 @@ mod tests {
         let baseline = forge.snapshot().expect("baseline");
         let lease = forge
             .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: envelope(),
                 memory_bytes: 128 * MIB,
                 scratch_bytes: 64 * MIB as u64,
                 reader_permits: 1,

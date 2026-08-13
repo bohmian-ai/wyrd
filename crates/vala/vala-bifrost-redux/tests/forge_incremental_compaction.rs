@@ -89,6 +89,16 @@ mod pg_tests {
         output_put_released: AtomicBool,
         /// Counts successful rewrite output notifications.
         output_put_calls: AtomicUsize,
+        /// Counts bounded chunks accepted by output writers.
+        output_chunks: AtomicUsize,
+        /// Counts output writer openings across successful and aborted uploads.
+        output_writer_opens: AtomicUsize,
+        /// Counts multipart aborts after injected chunk failures.
+        output_writer_aborts: AtomicUsize,
+        /// Largest chunk supplied to an output writer.
+        largest_output_chunk: AtomicUsize,
+        /// One-shot chunk failure used to prove abort and same-attempt retry.
+        fail_next_output_chunk: AtomicBool,
         /// Per-path cleanup delete attempts observed through the production store seam.
         delete_attempts: Mutex<HashMap<String, usize>>,
         /// Entries per orphan-listing page, or `0` to keep the single-page default.
@@ -142,6 +152,11 @@ mod pg_tests {
             self.output_put_calls.load(Ordering::Acquire)
         }
 
+        /// Arms one failure on the next output chunk.
+        fn fail_next_output_chunk(&self) {
+            self.fail_next_output_chunk.store(true, Ordering::Release);
+        }
+
         /// Returns the exact number of delete attempts observed for one object path.
         fn delete_attempts_for(&self, path: &str) -> usize {
             self.delete_attempts
@@ -173,6 +188,40 @@ mod pg_tests {
 
     #[async_trait::async_trait]
     impl ForgeObjectStore for InstrumentedStore {
+        /// Opens the production chunked writer while recording retry attempts.
+        async fn output_writer(
+            &self,
+            operator: &opendal::Operator,
+            path: &str,
+        ) -> opendal::Result<opendal::Writer> {
+            self.output_writer_opens.fetch_add(1, Ordering::AcqRel);
+            operator.writer_with(path).chunk(8 * 1024 * 1024).await
+        }
+
+        /// Records bounded chunks and optionally injects one retryable failure.
+        async fn write_output_chunk(
+            &self,
+            writer: &mut opendal::Writer,
+            chunk: bytes::Bytes,
+        ) -> opendal::Result<()> {
+            self.output_chunks.fetch_add(1, Ordering::AcqRel);
+            self.largest_output_chunk
+                .fetch_max(chunk.len(), Ordering::AcqRel);
+            if self.fail_next_output_chunk.swap(false, Ordering::AcqRel) {
+                return Err(opendal::Error::new(
+                    opendal::ErrorKind::Unexpected,
+                    "injected Forge output chunk failure",
+                ));
+            }
+            writer.write(chunk).await
+        }
+
+        /// Records and delegates abort of one incomplete output writer.
+        async fn abort_output_writer(&self, writer: &mut opendal::Writer) -> opendal::Result<()> {
+            self.output_writer_aborts.fetch_add(1, Ordering::AcqRel);
+            writer.abort().await
+        }
+
         /// Reject whole-object reads so the rewrite cannot hide an unbounded path.
         async fn read(&self, path: &str) -> opendal::Result<Buffer> {
             if std::path::Path::new(path)
@@ -555,6 +604,11 @@ mod pg_tests {
                 output_put_release: tokio::sync::Notify::new(),
                 output_put_released: AtomicBool::new(false),
                 output_put_calls: AtomicUsize::new(0),
+                output_chunks: AtomicUsize::new(0),
+                output_writer_opens: AtomicUsize::new(0),
+                output_writer_aborts: AtomicUsize::new(0),
+                largest_output_chunk: AtomicUsize::new(0),
+                fail_next_output_chunk: AtomicBool::new(false),
                 delete_attempts: Mutex::new(HashMap::new()),
                 list_page_entries: AtomicUsize::new(0),
             });
@@ -2269,6 +2323,7 @@ mod pg_tests {
                 max_files_per_tick: 32,
                 max_bins_per_tick: 32,
                 max_concurrent_reads: 2,
+                max_memory_bytes: 256 * 1024 * 1024,
                 ..ForgeConfig::default()
             },
             false,
@@ -2285,11 +2340,25 @@ mod pg_tests {
         // Thirty-two 100k-row files make the sort exceed the bounded 16 MiB
         // pool while exactly consuming the benchmark-shaped shared file budget.
         fixture.seed_files(32, true).await;
+        vala_bifrost_redux::resources::reset_memory_peak_for_test();
         let outcome = fixture.schedule_and_execute().await;
         assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
+        assert!(
+            fixture.reads.output_chunks.load(Ordering::Acquire) > 1,
+            "a multi-output rewrite must traverse the bounded chunk seam"
+        );
+        assert!(
+            fixture.reads.largest_output_chunk.load(Ordering::Acquire) <= 8 * 1024 * 1024,
+            "no upload write may exceed UPLOAD_CHUNK_BYTES"
+        );
+        let peak_memory = vala_bifrost_redux::resources::memory_peak_for_test();
+        assert!(
+            peak_memory <= 256 * 1024 * 1024,
+            "leased-pool peak must remain independent of total output: {peak_memory}"
+        );
         let (output_files, output_rows) = committed_output_totals(&fixture).await;
         assert!(output_files >= 2, "rotation must commit multiple outputs");
         assert_eq!(
@@ -2297,6 +2366,122 @@ mod pg_tests {
             "rewrite must conserve every input row"
         );
         assert_staging_transition_parity(&fixture).await;
+    }
+
+    /// A failed output chunk aborts and retries the sealed file in one attempt.
+    #[tokio::test]
+    async fn streaming_output_chunk_failure_retries_without_duplicate_publication() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_files_per_bin: 4,
+                max_files_per_tick: 4,
+                max_bins_per_tick: 4,
+                max_concurrent_reads: 1,
+                max_memory_bytes: 256 * 1024 * 1024,
+                spill_limit_bytes: 1024 * 1024 * 1024,
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            fixture_snapshot(),
+        )
+        .await;
+        fixture.seed_files(2, true).await;
+        fixture.reads.fail_next_output_chunk();
+        let snapshots_before = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("table before retry")
+            .metadata()
+            .snapshots()
+            .count();
+
+        let outcome = fixture.schedule_and_execute().await;
+
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
+        assert_eq!(
+            fixture.reads.output_writer_aborts.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            fixture.reads.output_writer_opens.load(Ordering::Acquire),
+            fixture.reads.output_put_calls() + 1,
+            "the one aborted writer is reopened without duplicating a successful output"
+        );
+        assert!(
+            fixture.reads.output_chunks.load(Ordering::Acquire) >= 2,
+            "the injected failure must be followed by a same-attempt retry"
+        );
+        let (output_files, output_rows) = committed_output_totals(&fixture).await;
+        assert!(output_files > 0, "the retry publishes its output set");
+        assert_eq!(output_rows, 200_000, "the retry must conserve all rows");
+        let snapshots_after = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("table after retry")
+            .metadata()
+            .snapshots()
+            .count();
+        assert_eq!(
+            snapshots_after,
+            snapshots_before + 1,
+            "one task attempt must produce exactly one Iceberg publication"
+        );
+        assert_staging_transition_parity(&fixture).await;
+    }
+
+    /// One output larger than the upload bound reaches the store as many chunks.
+    #[tokio::test]
+    async fn streaming_output_uses_multiple_bounded_chunks() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_files_per_bin: 64,
+                max_files_per_tick: 64,
+                max_bins_per_tick: 64,
+                max_concurrent_reads: 2,
+                max_memory_bytes: 512 * 1024 * 1024,
+                spill_limit_bytes: 2 * 1024 * 1024 * 1024,
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            fixture_snapshot(),
+        )
+        .await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("chunking table");
+        fixture
+            .set_live_target_file_size(&table, 768 * 1024 * 1024)
+            .await;
+        fixture.seed_files(64, true).await;
+        vala_bifrost_redux::resources::reset_memory_peak_for_test();
+
+        let outcome = fixture.schedule_and_execute().await;
+
+        assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
+        assert_eq!(fixture.reads.output_put_calls(), 1);
+        assert!(
+            fixture.reads.output_chunks.load(Ordering::Acquire) > 1,
+            "one output above 8 MiB must use multiple writes"
+        );
+        assert!(fixture.reads.largest_output_chunk.load(Ordering::Acquire) <= 8 * 1024 * 1024);
+        let peak_memory = vala_bifrost_redux::resources::memory_peak_for_test();
+        assert!(
+            peak_memory <= 512 * 1024 * 1024,
+            "decoded, encoder, upload, and sort consumers must stay within the lease: {peak_memory}"
+        );
+        assert!(
+            peak_memory < 768 * 1024 * 1024,
+            "peak governed memory must remain below the configured output target"
+        );
+        let (output_files, output_rows) = committed_output_totals(&fixture).await;
+        assert_eq!(output_files, 1);
+        assert_eq!(output_rows, 6_400_000);
     }
 
     /// Periodic expiry and orphan collection write exact state/audit parity.

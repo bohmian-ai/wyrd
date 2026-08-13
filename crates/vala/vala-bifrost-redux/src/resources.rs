@@ -10,11 +10,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{
-    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
+    GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+    TrackConsumersPool,
 };
 use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
@@ -25,6 +28,8 @@ const MIB: usize = 1024 * 1024;
 pub const MIN_UNMANAGED_RESERVE_BYTES: usize = 256 * MIB;
 /// Protected memory floor for each enabled stateful serving role.
 pub const ROLE_MEMORY_FLOOR_BYTES: usize = 256 * MIB;
+/// Minimum elastic memory required for one executable Forge rewrite.
+pub const FORGE_MEMORY_FLOOR_BYTES: usize = 64 * MIB;
 /// Filesystem free space that disposable query spill never consumes.
 pub const MIN_SCRATCH_FREE_BYTES: u64 = 256 * MIB as u64;
 /// Memory represented by one Oracle execution partition.
@@ -614,6 +619,15 @@ impl BifrostResourceGovernor {
                 detail: format!("managed memory {managed_memory_bytes} cannot cover enabled role floors {protected}"),
             }
         })?;
+        if policy.roles.contains(&BifrostRole::Forge)
+            && elastic_memory_bytes < FORGE_MEMORY_FLOOR_BYTES
+        {
+            return Err(BifrostResourceError::InvalidPlan {
+                detail: format!(
+                    "Forge requires at least {FORGE_MEMORY_FLOOR_BYTES} elastic memory bytes; only {elastic_memory_bytes} are available"
+                ),
+            });
+        }
         let configured_scratch = policy
             .scratch_limit_bytes
             .map_or(snapshot.scratch_capacity_bytes, |limit| {
@@ -1195,10 +1209,98 @@ pub fn oracle_target_partitions(
 /// a zero-byte envelope.
 #[must_use]
 pub(crate) fn bounded_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
-    Arc::new(TrackConsumersPool::new(
+    let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(
         GreedyMemoryPool::new(limit_bytes.max(1)),
         NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
-    ))
+    ));
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        Arc::new(PeakTrackingMemoryPool::new(pool))
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    pool
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_MEMORY_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Resets the process-wide peak observation used by serialized Forge tests.
+#[cfg(feature = "test-support")]
+pub fn reset_memory_peak_for_test() {
+    TEST_MEMORY_PEAK_BYTES.store(0, Ordering::Release);
+}
+
+/// Returns the largest leased-pool reservation observed since the last reset.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn memory_peak_for_test() -> usize {
+    TEST_MEMORY_PEAK_BYTES.load(Ordering::Acquire)
+}
+
+/// Test-only wrapper that records peak reservations without changing admission.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+struct PeakTrackingMemoryPool {
+    /// Production finite pool receiving every accounting operation unchanged.
+    inner: Arc<dyn MemoryPool>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PeakTrackingMemoryPool {
+    /// Wraps one production pool for observation only.
+    fn new(inner: Arc<dyn MemoryPool>) -> Self {
+        Self { inner }
+    }
+
+    /// Records the current reservation after a successful growth operation.
+    fn observe(&self) {
+        TEST_MEMORY_PEAK_BYTES.fetch_max(self.inner.reserved(), Ordering::AcqRel);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl MemoryPool for PeakTrackingMemoryPool {
+    /// Delegates consumer registration without changing ordering.
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    /// Delegates consumer removal without changing accounting.
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    /// Delegates infallible growth and records the resulting peak.
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+        self.observe();
+    }
+
+    /// Delegates release exactly to the production pool.
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    /// Delegates fallible growth and records only successful reservations.
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.inner.try_grow(reservation, additional)?;
+        self.observe();
+        Ok(())
+    }
+
+    /// Returns the production pool's live reservation.
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    /// Returns the production pool's unchanged finite-memory contract.
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
 }
 
 fn cap_positive(
@@ -1434,6 +1536,22 @@ mod tests {
             scratch_error,
             Err(BifrostResourceError::InvalidPlan { .. })
         ));
+    }
+
+    /// Full mixed composition rejects memory below Forge's executable floor.
+    #[test]
+    fn mixed_forge_requires_one_rewrite_working_set() {
+        let error = BifrostRuntimeResources::from_snapshot(
+            snapshot(832 * MIB - 1),
+            policy(&[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]),
+        )
+        .expect_err("mixed Forge must retain one executable rewrite grant");
+        assert!(matches!(error, BifrostResourceError::InvalidPlan { .. }));
+        BifrostRuntimeResources::from_snapshot(
+            snapshot(832 * MIB),
+            policy(&[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]),
+        )
+        .expect("exact mixed Forge memory floor must compose");
     }
 
     /// Enabled roles alone receive protected floors and elastic arithmetic is exact.

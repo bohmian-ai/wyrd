@@ -190,6 +190,8 @@ impl Forge {
             &self.core.resources,
             request,
             &self.core.rewrite_spill_root,
+            Uuid::nil(),
+            Uuid::now_v7(),
         )?;
         let rewrite = resources.pipeline(&self.core.rewrite);
         Ok(self

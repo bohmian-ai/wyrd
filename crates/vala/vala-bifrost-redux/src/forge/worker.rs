@@ -4,6 +4,7 @@
 //! processes. `PostgreSQL` claims assign compute, while the table-scoped
 //! [`ForgeLease`] remains the only publication fence.
 
+use std::path::Path;
 use std::str::FromStr;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::AtomicBool;
@@ -31,7 +32,7 @@ use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-use super::error::ForgeError;
+use super::error::{ForgeError, ForgeFailureClass};
 use super::expire::{PendingExpiryTerminal, derive_recovered_files, table_resource_for_key};
 use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
@@ -40,8 +41,8 @@ use super::live_replace::{
 };
 use super::maintenance::{ForgeMaintenance, ForgeMaintenanceResult};
 use super::metrics::{
-    ForgeCleanupKind, ForgeConflictKind, ForgeLeaseResult, ForgeMetricStage,
-    ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
+    ForgeCleanupKind, ForgeConflictKind, ForgeDemandTransitionResult, ForgeLeaseResult,
+    ForgeMetricStage, ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
 use super::path::catalog_path_to_object_key;
 use super::rewrite::ForgeRewritePipeline;
@@ -744,6 +745,37 @@ impl ForgeWorkerConfig {
     }
 }
 
+/// Stable pod-local scratch-volume identity used for quarantine deferral.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScratchVolumeIdentity(String);
+
+impl ScratchVolumeIdentity {
+    /// Derives identity from the canonical root and Unix device number.
+    ///
+    /// # Errors
+    /// Returns typed scratch IO when canonicalization or metadata inspection fails.
+    fn from_root(root: &Path) -> Result<Self, ForgeError> {
+        use std::os::unix::fs::MetadataExt;
+        let canonical = root.canonicalize().map_err(|error| ForgeError::ScratchIo {
+            kind: error.kind(),
+            detail: format!("canonicalize {}: {error}", root.display()),
+        })?;
+        let metadata = canonical
+            .metadata()
+            .map_err(|error| ForgeError::ScratchIo {
+                kind: error.kind(),
+                detail: format!("inspect {}: {error}", canonical.display()),
+            })?;
+        Ok(Self(format!("{}:{}", canonical.display(), metadata.dev())))
+    }
+
+    /// Returns the durable closed identity spelling.
+    #[must_use]
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Claim-driven Forge executor shared by embedded and dedicated topologies.
 #[derive(Clone)]
 pub struct ForgeWorker {
@@ -822,6 +854,19 @@ impl ForgeWorker {
     ///
     /// Returns a slot panic or an unexpected slot-level configuration failure.
     pub async fn run(self, shutdown: CancellationToken) -> Result<(), ForgeError> {
+        let volume = self.scratch_volume_identity()?;
+        if let Err(error) = self.probe_scratch() {
+            self.tasks
+                .quarantine_worker(self.owner, volume.as_str())
+                .await
+                .map_err(ForgeError::Sql)?;
+            tracing::error!(worker=%self.owner, error=%error, "Forge worker quarantined by startup scratch probe");
+            return Ok(());
+        }
+        self.tasks
+            .register_healthy_worker(self.owner, volume.as_str())
+            .await
+            .map_err(ForgeError::Sql)?;
         let mut slots = JoinSet::new();
         for index in 0..self.config.worker_concurrency {
             let worker = self.clone();
@@ -842,10 +887,44 @@ impl ForgeWorker {
         Ok(())
     }
 
+    /// Returns the stable identity of this worker's configured scratch volume.
+    ///
+    /// # Errors
+    /// Returns typed scratch IO when the root cannot be canonicalized or inspected.
+    fn scratch_volume_identity(&self) -> Result<ScratchVolumeIdentity, ForgeError> {
+        ScratchVolumeIdentity::from_root(&self.forge.core.rewrite_spill_root)
+    }
+
+    /// Probes scratch writability through create, fsync, and exact-file delete.
+    ///
+    /// # Errors
+    /// Returns typed scratch IO for any local filesystem failure.
+    fn probe_scratch(&self) -> Result<(), ForgeError> {
+        let path = self
+            .forge
+            .core
+            .rewrite_spill_root
+            .join(format!("forge-probe-{}", self.owner));
+        let file = std::fs::File::create(&path).map_err(|error| ForgeError::ScratchIo {
+            kind: error.kind(),
+            detail: format!("create {}: {error}", path.display()),
+        })?;
+        file.sync_all().map_err(|error| ForgeError::ScratchIo {
+            kind: error.kind(),
+            detail: format!("fsync {}: {error}", path.display()),
+        })?;
+        drop(file);
+        std::fs::remove_file(&path).map_err(|error| ForgeError::ScratchIo {
+            kind: error.kind(),
+            detail: format!("delete {}: {error}", path.display()),
+        })
+    }
+
     /// Claims and executes work serially for one bounded pool slot.
     ///
-    /// This slot owns the single in-execution release seam for cooperative
-    /// shutdown. Two windows drain a just-claimed task to `retryable` through
+    /// This slot owns pre-execution release, while [`Self::execute_claim`] owns
+    /// in-execution settlement before terminal telemetry. Two windows drain a
+    /// just-claimed task to `retryable` through
     /// [`Self::release_cancelled_claim`] so a clean shutdown drives
     /// `forge_active_claims` to zero: the pre-execution window, when shutdown is
     /// observed after a claim is taken but before execution begins; and the
@@ -854,7 +933,8 @@ impl ForgeWorker {
     /// durable side effect. Both cases performed no durable work, so a successor
     /// reclaims the released task losslessly. A post-effect cancellation instead
     /// returns [`ForgeError::ShutdownRetained`] and is retained here for
-    /// evidence-based and lease-expiry recovery, never released.
+    /// evidence-based and lease-expiry recovery, never released. Settling
+    /// before telemetry ensures the task span reflects authoritative SQL state.
     ///
     /// # Errors
     ///
@@ -918,10 +998,6 @@ impl ForgeWorker {
                 continue;
             };
             let task_id = claim.task_id;
-            // Capture the attempt generation before `execute_claim` consumes the
-            // claim, so the post-execution release arm below can address the
-            // exact owner+attempt row without re-fetching it.
-            let attempt_id = claim.attempt_id;
             if let Some(observer) = &self.completion_observer {
                 observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
                     task_id,
@@ -948,12 +1024,8 @@ impl ForgeWorker {
             self.record_attempt(result.as_ref().err());
             #[cfg(feature = "test-support")]
             self.pause_after_attempt_for_test().await;
-            match result {
-                Ok(()) => self.record_completion(task_id, strategy),
-                Err(error) => {
-                    self.settle_cancelled_claim(task_id, attempt_id, &error)
-                        .await;
-                }
+            if result.is_ok() {
+                self.record_completion(task_id, strategy);
             }
         }
     }
@@ -1147,10 +1219,11 @@ impl ForgeWorker {
     /// settlement to a failed [`Self::execute_claim`] result.
     ///
     /// This is the one owner of the in-execution release decision for the whole
-    /// claim lifecycle (`run_slot` is its only production caller): the baseline
+    /// claim lifecycle (`execute_claim` is its production caller): the baseline
     /// per-checkpoint release inside `execute_fenced` was migrated here so a
-    /// checkpoint only classifies the cancellation and the slot alone decides
-    /// retain-vs-release. A pre-effect [`ForgeError::Shutdown`] fired before any
+    /// checkpoint only classifies the cancellation and the claim owner decides
+    /// retain-vs-release before recording terminal telemetry. A pre-effect
+    /// [`ForgeError::Shutdown`] fired before any
     /// durable side effect, so the claim drains through the single
     /// [`Self::release_cancelled_claim`] seam; its SQL guard matches only
     /// `claimed`/`running` rows for this owner and attempt, so a claim that has
@@ -1308,6 +1381,11 @@ impl ForgeWorker {
         )
         .await;
         let elapsed = started.elapsed();
+        if let Err(error) = &result
+            && let Err(settlement) = self.settle_execution_failure(task, attempt, error).await
+        {
+            tracing::error!(task_id=%task.task_id, error=%settlement, "Forge failure settlement failed; claim retained for expiry recovery");
+        }
         self.record_task_execution_telemetry(task, &task_span, elapsed)
             .await;
         self.forge
@@ -1761,6 +1839,7 @@ impl ForgeWorker {
     fn acquire_rewrite_resources(
         &self,
         claim: &ForgeTaskClaim,
+        attempt: Uuid,
     ) -> Result<super::rewrite::ForgeAttemptResources, ForgeError> {
         let request =
             crate::resources::ForgeRewriteRequest::from_claim(&claim.estimates, self.capacity)?;
@@ -1768,6 +1847,8 @@ impl ForgeWorker {
             &self.forge.core.resources,
             request,
             &self.forge.core.rewrite_spill_root,
+            claim.task_id,
+            attempt,
         )
     }
 
@@ -1780,7 +1861,7 @@ impl ForgeWorker {
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        let resources = self.acquire_rewrite_resources(claim)?;
+        let resources = self.acquire_rewrite_resources(claim, attempt)?;
         let rewrite = resources.pipeline(&self.forge.core.rewrite);
         let table = self.forge.load_table(&binding.table_ident()).await?;
         let base_matches = Self::base_snapshot_matches(&table, claim.base_snapshot_id);
@@ -2845,7 +2926,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .terminal(
+            .terminal_and_request_replan(
                 &mut terminal,
                 ForgeTaskTransition {
                     task_id: claim.task_id,
@@ -2854,6 +2935,7 @@ impl ForgeWorker {
                     expected: ForgeTaskState::Prepared,
                     next: ForgeTaskState::Succeeded,
                 },
+                &claim.table_ref,
                 &task_event(
                     claim.task_id,
                     ForgeTaskState::Succeeded,
@@ -2864,8 +2946,11 @@ impl ForgeWorker {
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
         terminal.commit().await.map_err(ForgeError::Sql)?;
-        self.request_replan(claim.data_tenant_id, &claim.table_ref)
-            .await
+        self.forge
+            .core
+            .telemetry
+            .record_demand_transition(ForgeDemandTransitionResult::Continued);
+        Ok(())
     }
 
     /// Persists only the terminal transition for already-verified Prepared work.
@@ -2889,7 +2974,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .terminal(
+            .terminal_and_request_replan(
                 &mut terminal,
                 ForgeTaskTransition {
                     task_id,
@@ -2898,6 +2983,7 @@ impl ForgeWorker {
                     expected: ForgeTaskState::Prepared,
                     next: ForgeTaskState::Succeeded,
                 },
+                table_ref,
                 &task_event(
                     task_id,
                     ForgeTaskState::Succeeded,
@@ -2908,7 +2994,11 @@ impl ForgeWorker {
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
         terminal.commit().await.map_err(ForgeError::Sql)?;
-        self.request_replan(tenant, table_ref).await
+        self.forge
+            .core
+            .telemetry
+            .record_demand_transition(ForgeDemandTransitionResult::Continued);
+        Ok(())
     }
 
     /// Terminally audits a malformed or unsupported claim before external effects.
@@ -2946,6 +3036,100 @@ impl ForgeWorker {
         conn.commit().await.map_err(ForgeError::Sql)?;
         self.request_replan(claim.data_tenant_id, &claim.table_ref)
             .await
+    }
+
+    /// Applies the closed bounded-retry policy at the audited worker boundary.
+    ///
+    /// # Errors
+    /// Returns SQL or audit errors; failure retains the fenced claim for reclaim.
+    async fn settle_execution_failure(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        error: &ForgeError,
+    ) -> Result<(), ForgeError> {
+        const ATTEMPT_BOUND: u32 = 5;
+        match error {
+            ForgeError::Shutdown | ForgeError::Capacity { .. } => {
+                self.release_cancelled_claim(claim.task_id, attempt).await
+            }
+            ForgeError::ShutdownRetained => Ok(()),
+            _ => {
+                let class = error.failure_class();
+                let volume = if class == ForgeFailureClass::StorageHealth {
+                    let volume = self.scratch_volume_identity()?;
+                    self.tasks
+                        .quarantine_worker(self.owner, volume.as_str())
+                        .await
+                        .map_err(ForgeError::Sql)?;
+                    Some(volume)
+                } else {
+                    None
+                };
+                let attempts = self
+                    .tasks
+                    .attempt_count(claim.task_id)
+                    .await
+                    .map_err(ForgeError::Sql)?;
+                if class == ForgeFailureClass::DataRefusal
+                    || attempts.saturating_add(1) >= ATTEMPT_BOUND
+                {
+                    self.terminal_failure(claim, attempt, class, error.to_string())
+                        .await
+                } else {
+                    self.tasks
+                        .retry_failure(
+                            claim.task_id,
+                            attempt,
+                            self.owner,
+                            class.as_str(),
+                            volume.as_ref().map(ScratchVolumeIdentity::as_str),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(ForgeError::Sql)
+                }
+            }
+        }
+    }
+
+    /// Persists a typed terminal failure and audit record in one transaction.
+    ///
+    /// # Errors
+    /// Returns tenant, qualification, transition, audit, or commit failures.
+    async fn terminal_failure(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        class: ForgeFailureClass,
+        detail: String,
+    ) -> Result<(), ForgeError> {
+        let mut conn = self
+            .forge
+            .core
+            .vala
+            .tenant_conn(claim.data_tenant_id)
+            .await
+            .map_err(ForgeError::Sql)?;
+        self.tasks
+            .qualify_terminal_failure(&mut conn, claim.task_id, class.as_str(), None)
+            .await
+            .map_err(ForgeError::Sql)?;
+        self.tasks
+            .terminal(
+                &mut conn,
+                ForgeTaskTransition {
+                    task_id: claim.task_id,
+                    attempt_id: attempt,
+                    owner: self.owner,
+                    expected: ForgeTaskState::Running,
+                    next: ForgeTaskState::Failed,
+                },
+                &task_event(claim.task_id, ForgeTaskState::Failed, &detail),
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)
     }
 
     /// Atomically cancels a superseded claim and creates its successor demand.
@@ -3034,15 +3218,27 @@ impl ForgeWorker {
         limits: ForgeClaimLimits,
         reserved_maintenance: bool,
     ) -> Result<Option<ForgeTaskClaim>, vala_sql::SqlError> {
+        let volume = self.scratch_volume_identity().map_err(|error| {
+            vala_sql::SqlError::InvariantViolation {
+                detail: error.to_string(),
+            }
+        })?;
         if reserved_maintenance
             && let Some(claim) = self
                 .tasks
-                .claim_fair(self.owner, limits, Some(MAINTENANCE_STRATEGIES))
+                .claim_fair_for_volume(
+                    self.owner,
+                    limits,
+                    Some(MAINTENANCE_STRATEGIES),
+                    Some(volume.as_str()),
+                )
                 .await?
         {
             return Ok(Some(claim));
         }
-        self.tasks.claim_fair(self.owner, limits, None).await
+        self.tasks
+            .claim_fair_for_volume(self.owner, limits, None, Some(volume.as_str()))
+            .await
     }
 
     /// Builds the positive atomic claim limits from Forge capacity.

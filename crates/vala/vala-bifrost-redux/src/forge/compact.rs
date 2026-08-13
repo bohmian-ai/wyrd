@@ -278,6 +278,48 @@ pub type ForgeObjectPages = BoxStream<'static, opendal::Result<Vec<Entry>>>;
 /// directly for producer writes.
 #[async_trait]
 pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
+    /// Opens the bounded streaming writer used for one rewritten output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when multipart or streaming upload cannot start.
+    async fn output_writer(
+        &self,
+        operator: &opendal::Operator,
+        path: &str,
+    ) -> opendal::Result<opendal::Writer> {
+        operator
+            .writer_with(path)
+            .chunk(super::rewrite::UPLOAD_CHUNK_BYTES)
+            .await
+    }
+
+    /// Writes one already-bounded chunk to an open rewrite output.
+    ///
+    /// This narrow continuation of [`Self::output_writer`] lets integration
+    /// stores observe and fail individual chunks without replacing production
+    /// upload behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when the chunk cannot be accepted.
+    async fn write_output_chunk(
+        &self,
+        writer: &mut opendal::Writer,
+        chunk: bytes::Bytes,
+    ) -> opendal::Result<()> {
+        writer.write(chunk).await
+    }
+
+    /// Aborts an incomplete rewrite output after a chunk failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error when multipart cleanup cannot be confirmed.
+    async fn abort_output_writer(&self, writer: &mut opendal::Writer) -> opendal::Result<()> {
+        writer.abort().await
+    }
+
     /// Pause or fail a rewrite immediately before its lease fence is checked.
     ///
     /// Production implementations return successfully. Test implementations
@@ -652,6 +694,7 @@ impl Forge {
             });
         }
         let policy = self.table_right_size_policy(binding).await?;
+        let capacity = super::planner::ForgeCapacity::try_from(&self.core.config)?;
         let mut candidates = Vec::new();
         for (day, files) in grouped {
             for bin in plan_staging_bins(
@@ -668,11 +711,16 @@ impl Forge {
                     .map(|file| file.path)
                     .collect::<Vec<_>>();
                 inputs.sort();
+                let envelope = super::planner::ForgeTaskEnvelope::for_rewrite(
+                    total_bytes,
+                    self.core.config.max_concurrent_reads,
+                    capacity,
+                );
                 candidates.push(ForgePlanCandidate {
                     strategy: ForgeTaskStrategy::StagingFold,
-                    parallelism: 1,
-                    memory_bytes: total_bytes,
-                    spill_bytes: total_bytes,
+                    parallelism: envelope.reader_permits,
+                    memory_bytes: envelope.memory_bytes(),
+                    spill_bytes: envelope.scratch_bytes,
                     inputs,
                     bytes: total_bytes,
                     parameters: serde_json::json!({"kind":"staging_fold"}),
@@ -1354,7 +1402,7 @@ impl Forge {
                 span.record("result", "failed");
                 if Self::is_retryable(&error)
                     && let Some(recovered) = self
-                        .recover_uncertain_staging_commit(binding, task_identity)
+                        .recover_uncertain_staging_commit(binding, operation_id)
                         .await?
                 {
                     recovered
@@ -1417,8 +1465,8 @@ impl Forge {
 
     /// Reload an accepted staging commit after its catalog response was uncertain.
     ///
-    /// Recovery accepts only the current snapshot tagged with both the exact
-    /// durable task and attempt identities.
+    /// Recovery accepts any retained snapshot tagged with the deterministic
+    /// operation identity, so a later metadata commit cannot trigger replay.
     ///
     /// # Errors
     ///
@@ -1426,27 +1474,34 @@ impl Forge {
     async fn recover_uncertain_staging_commit(
         &self,
         binding: &TenantTableBinding,
-        task_identity: Option<(Uuid, Uuid)>,
+        operation_id: Uuid,
     ) -> Result<Option<iceberg::table::Table>, ForgeError> {
-        let Some((task_id, attempt_id)) = task_identity else {
-            return Ok(None);
-        };
         let recovered = self.load_table(&binding.table_ident()).await?;
-        let matches = recovered
-            .metadata()
-            .current_snapshot()
-            .is_some_and(|snapshot| {
-                snapshot
-                    .summary()
-                    .additional_properties
-                    .get("forge.task_id")
-                    == Some(&task_id.to_string())
-                    && snapshot
-                        .summary()
-                        .additional_properties
-                        .get("forge.task_attempt")
-                        == Some(&attempt_id.to_string())
+        let max = self
+            .core
+            .config
+            .max_retained_snapshots_per_table
+            .checked_add(1)
+            .ok_or_else(|| ForgeError::InvalidConfig {
+                detail: "Forge retained snapshot recovery bound overflowed".to_owned(),
+            })?;
+        let snapshots = recovered.metadata().snapshots().collect::<Vec<_>>();
+        if snapshots.len() > max {
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "retained Forge snapshot search has {} snapshots above limit {max}",
+                    snapshots.len()
+                ),
             });
+        }
+        let operation = operation_id.to_string();
+        let matches = snapshots.into_iter().any(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get("forge.operation_id")
+                == Some(&operation)
+        });
         Ok(matches.then_some(recovered))
     }
 

@@ -1,6 +1,6 @@
 ---
 name: wyrd-review
-description: Review Wyrd implementations against approved wyrd-plan plans and task packets, living-task execution updates, architecture, ownership, contracts, repository rules, tests, and verification evidence. Use standalone after or during wyrd-implement, as the static task and final-plan reviewer controlled by $wyrd-implement-plan, or as the repository integration policy loaded by terminal review-and-plan branch reviews. Binding modes return static findings and evidence to their root orchestrator without writing another artifact, running verification, or routing work.
+description: Review Wyrd implementations against approved wyrd-plan plans and task packets, living-task execution updates, architecture, ownership, contracts, repository rules, tests, and verification evidence. Use standalone after or during wyrd-implement, as the mandatory static task reviewer invoked by $wyrd-implement-plan after every implementation-finished task, or as the repository integration policy loaded by terminal review-and-plan branch reviews. Binding modes return static findings and evidence to their root controller without writing another artifact, running verification, or routing work.
 ---
 
 # Wyrd Review
@@ -23,13 +23,22 @@ reviewed plan/task. Writing the durable review is the only default mutation.
 
 ## Plan-execution binding mode
 
-When `$wyrd-implement-plan` dispatches this skill for one task or the final
-integrated plan, this mode overrides conflicting standalone instructions:
+Every implementation-finished task under `$wyrd-implement-plan` must invoke
+this skill explicitly. No generic or terminal review substitutes for this task
+gate. Use a fresh independent Opus/low `wyrd-reviewer` for the first review;
+the same reviewer may perform focused re-review of its findings.
 
-- Review the orchestrator-provided task delta from the last accepted commit,
-  or the complete execution-baseline-through-branch delta for final review.
-- Read the canonical plan, active tasks, implementation reports, recorded
-  verification evidence, and applicable repository authorities completely.
+When `$wyrd-implement-plan` invokes this skill for a task, this mode overrides
+conflicting standalone instructions:
+
+- Review the root-provided complete tracked and untracked task delta from the
+  last accepted commit through the current working tree.
+- Read the canonical plan, active task, canonical completion evidence,
+  recorded verification evidence, and applicable repository authorities.
+- Derive scope before reading completion or verification evidence. Treat that
+  evidence as untrusted claims and locators.
+- Inspect both the task delta and cumulative current owners, callers,
+  consumers, contracts, generated surfaces, and tests affected by the task.
 - Perform static source, contract, caller, consumer, manifest, generated
   surface, and test analysis. Audit recorded verification semantically.
 - Do not run tests, builds, lints, formatters, generators, migrations,
@@ -40,27 +49,33 @@ integrated plan, this mode overrides conflicting standalone instructions:
 - **Cite every matrix row.** Each row must carry a concrete `path:line`
   pointing into the reviewed delta, plus a source-derived explanation of how
   the invariant is enforced and which exact assertion fails on regression. A
-  row backed only by a test name, a passing count, the implementation report,
-  task status, or a restated requirement is uncited. The orchestrator rejects
+  row backed only by a test name, a passing count, completion evidence, task
+  status, or a restated requirement is uncited. The root rejects
   any `APPROVE` containing an uncited row, so an uncited matrix wastes the
   review pass rather than completing it.
 - Use only these verdicts:
-  - `APPROVE`: implementation and proof satisfy the reviewed task or plan.
+  - `APPROVE`: implementation and proof satisfy the reviewed task.
   - `RESUME_IMPLEMENTATION`: reversible implementation or evidence work
     remains.
-  - `ORCHESTRATOR_DECISION_REQUIRED`: a material plan, product, security,
-    contract, migration, dependency, ownership, or acceptance decision must be
-    resolved by the plan orchestrator.
+  - `ROOT_DECISION_REQUIRED`: a material plan, product, security, contract,
+    migration, dependency, ownership, or acceptance decision must be resolved
+    by the root implementer.
   - `REVIEW_BLOCKED`: the review target or mandatory evidence cannot be
     resolved well enough for static review.
-- Do not write `review.md`, modify source or plan artifacts, assign task
-  status, invoke another skill, create a remediation plan, or communicate with
-  the user.
+- Do not write `review.md`, modify source, tests, plan, task, evidence, or Git
+  state, assign task status, invoke another skill, create a remediation plan,
+  run verification, commit, or communicate with the user.
+
+For every finding, provide the violated requirement and invariant, current
+source condition, affected owners and consumers, observable impact and
+required outcome, exact regression assertion required for closure, and any
+material uncertainty. Return diagnostics, not a remediation packet; the root
+validates and fixes confirmed findings directly.
 
 For first review, operate as a fresh independent agent. For focused re-review,
 verify prior findings first and inspect affected seams without reopening
-accepted decisions absent new evidence. The `$wyrd-implement-plan`
-orchestrator is the only controller, writer, committer, and router.
+accepted decisions absent new evidence. The `$wyrd-implement-plan` root is the
+only controller, writer, committer, decision owner, and router.
 
 ## Terminal integration-binding mode
 
@@ -98,7 +113,7 @@ classification, the durable artifact, and canonical planning.
    claimed, and read them completely.
 
    Do not run the plan validator. Structural validation is the caller's job:
-   in a binding mode the orchestrator validates during preflight and passes the
+   in a binding mode the root validates before implementation and passes the
    result down; standalone, read the artifacts and judge them directly. Running
    it here would contradict this skill's own prohibition on executing
    repository tooling.
@@ -107,8 +122,8 @@ classification, the durable artifact, and canonical planning.
    or legacy review; `Complete` is the normal completion-review state; review
    a `Blocked` task only to validate its blocker claim. A `Planned` task is not
    eligible for implementation-conformance approval.
-4. Read `$wyrd-implement` completion evidence and living-task execution updates
-   when present. Treat them as claims to verify, not proof by themselves.
+4. Read canonical completion evidence and living-task execution updates when
+   present. Treat them as claims to verify, not proof by themselves.
 5. Read the owning manifests, relevant `mise.toml` tasks, tests, generated
    sources, and nearest implementation patterns needed to judge the change.
 6. Resolve the applicable execution skill from the task and write set. Use
@@ -182,7 +197,7 @@ Classify every difference between the task recipe and repository reality:
 |---|---|
 | Local mechanic | Accept when behavior, ownership, and proof remain intact |
 | Bounded correction | Validate its evidence; do not call it an unapproved deviation |
-| Material deviation | Standalone: require replanning. Plan-execution binding: return `ORCHESTRATOR_DECISION_REQUIRED` |
+| Material deviation | Standalone: require replanning. Plan-execution binding: return `ROOT_DECISION_REQUIRED` |
 
 Expected private paths, helpers, and fixture layouts are guidance rather than a
 strict whitelist. Public/wire/generated/persisted contracts, migrations,

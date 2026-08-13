@@ -5,8 +5,8 @@ recovery, and verification failures.
 
 In `$wyrd-implement-plan` or terminal integration-binding mode, audit only
 recorded evidence and source-visible command/test definitions. Do not execute
-commands or perform independent verification; the controlling orchestrator
-owns any required rerun.
+commands or perform independent verification; the controlling root implementer
+or terminal review orchestrator owns any required rerun.
 
 ## Evidence hierarchy
 

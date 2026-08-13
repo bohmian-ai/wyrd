@@ -64,10 +64,9 @@ Private file lists and helper names become material only when the plan
 explicitly makes their exact shape normative for a stated safety or ownership
 reason.
 
-In `$wyrd-implement-plan` binding mode, return
-`ORCHESTRATOR_DECISION_REQUIRED` instead of `REPLAN_REQUIRED`. The plan
-orchestrator owns the material decision, canonical revision, advisory plan
-review, and resumed implementation.
+In `$wyrd-implement-plan` binding mode, return `ROOT_DECISION_REQUIRED` instead
+of `REPLAN_REQUIRED`. The root implementer owns the material decision,
+canonical revision, advisory plan review, implementation, and verification.
 
 ## Finding classifications
 

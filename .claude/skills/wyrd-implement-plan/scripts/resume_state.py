@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Reconstruct Wyrd plan-controller state from durable artifacts alone.
+"""Reconstruct Wyrd root-execution state from durable artifacts alone.
 
-The controller keeps no ledger: the canonical plan, task packets, commit
+The root keeps no ledger: the canonical plan, task packets, commit
 history, and current diff are the only authority, and conversation history is
 explicitly not. That makes resume possible across a session boundary but easy
 to get subtly wrong when re-derived by hand. This script performs the
-reconstruction deterministically so a resuming controller reads state instead
+reconstruction deterministically so a resuming root reads state instead
 of inferring it.
 
 It is read-only. It never edits a task, creates a commit, or touches the
@@ -60,7 +60,7 @@ def git(worktree: Path, *arguments: str) -> str:
 
 
 def read_task(path: Path) -> dict[str, object]:
-    """Parse the durable metadata a controller needs from one task packet.
+    """Parse the durable metadata a root session needs from one task packet.
 
     # Errors
 
@@ -96,13 +96,12 @@ def read_task(path: Path) -> dict[str, object]:
     }
 
 
-def controller_state(task: dict[str, object], has_changes: bool) -> str:
-    """Map a canonical task status plus diff evidence to a controller state.
+def execution_state(task: dict[str, object], has_changes: bool) -> str:
+    """Map a canonical task status plus diff evidence to a root execution state.
 
-    The canonical statuses collapse several controller states: `Ready` covers
-    IMPLEMENTING, REVIEWING, and REMEDIATING alike. Uncommitted changes in the
-    worktree distinguish a task already under way from one not yet dispatched,
-    which is the difference between resuming an implementor and starting one.
+    The canonical statuses collapse several execution states: `Ready` covers
+    implementation, review, and remediation alike. Uncommitted changes in the
+    worktree distinguish a task already under way from one not yet started.
     """
 
     status = task["status"]
@@ -112,17 +111,17 @@ def controller_state(task: dict[str, object], has_changes: bool) -> str:
         return "EXTERNAL_BLOCKED"
     if status == "Planned":
         return "NOT_READY"
-    return "IMPLEMENTING" if has_changes else "READY"
+    return "ROOT_IMPLEMENTING" if has_changes else "READY"
 
 
 def reconstruct(arguments: argparse.Namespace) -> dict[str, object]:
-    """Rebuild controller state from the plan directory and execution worktree.
+    """Rebuild root execution state from the plan directory and worktree.
 
     # Errors
 
     Raises `ResumeError` when the plan directory, plan file, tasks directory, or
     a referenced task packet cannot be read, or when git cannot resolve the
-    worktree. A partial reconstruction is never returned; the controller must
+    worktree. A partial reconstruction is never returned; the root must
     surface the failure rather than resume on a guess.
     """
 
@@ -157,7 +156,7 @@ def reconstruct(arguments: argparse.Namespace) -> dict[str, object]:
     for task in tasks:
         if task["status"] != "Complete":
             active = dict(task)
-            active["controllerState"] = controller_state(task, dirty)
+            active["executionState"] = execution_state(task, dirty)
             active["dependenciesAccepted"] = all(
                 dependency in accepted for dependency in task["dependsOn"]
             )
@@ -173,10 +172,8 @@ def reconstruct(arguments: argparse.Namespace) -> dict[str, object]:
         "tasks": tasks,
         "activeTask": active,
         "complete": active is None,
-        # Prior agents never survive a session boundary. Any implementor or
-        # reviewer from the previous run is gone; the controller respawns from
-        # these durable artifacts rather than trying to reattach.
-        "priorAgentsAssumedDead": True,
+        # Reviewer identities are execution cache rather than durable state.
+        "priorReviewersAssumedDead": True,
     }
 
 
@@ -189,7 +186,7 @@ def main() -> int:
     """
 
     parser = argparse.ArgumentParser(
-        description="Reconstruct Wyrd controller state from durable artifacts."
+        description="Reconstruct Wyrd root execution state from durable artifacts."
     )
     parser.add_argument("--plan-dir", required=True)
     parser.add_argument("--worktree", required=True)

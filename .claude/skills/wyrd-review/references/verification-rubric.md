@@ -45,8 +45,8 @@ e.g. `8/8 enforced, 8/8 regression-asserted, 0 asserted-only`.
 
 `APPROVE` is permitted only when every axis passes for every criterion. Any
 axis `FAIL` on any row routes the row to `RESUME_IMPLEMENTATION` (bounded
-source/test/evidence work) or `ORCHESTRATOR_DECISION_REQUIRED` /
-`REPLAN_REQUIRED` (a material gap), per the verdict rules in the review skill.
+source/test/evidence work) or `ROOT_DECISION_REQUIRED` / `REPLAN_REQUIRED` (a
+material gap), per the verdict rules in the review skill.
 
 ## Filling the matrix
 

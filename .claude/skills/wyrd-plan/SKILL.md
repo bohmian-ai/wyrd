@@ -213,11 +213,6 @@ Load both format references and confirm:
 - task dependencies leave coherent repository states;
 - required independent review passed for risk-gated changes.
 
-Use the global `plan-readiness-reviewer` for that independent gate. Supply the
-canonical plan directory and request a plan gate. The reviewer discovers Wyrd
-authority from `AGENTS.md`, the artifact, and current repository evidence; do
-not make its approval depend on loading this planning skill as review policy.
-
 Run the structural validator for materialized plans:
 
 ```bash

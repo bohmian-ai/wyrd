@@ -203,6 +203,12 @@ for authority.
 
 ## Audit and emit artifacts
 
+For persisted artifacts, require the caller to supply absolute `REPO_ROOT` and
+`PLAN_PATH`. Never discover a destination plan or task by searching the
+filesystem. Record the current checkout as `Repository origin` in canonical
+`host/owner/repository` form and `Repository revision` as `git rev-parse HEAD`.
+Use those same two values in every task packet.
+
 Load both format references and confirm:
 
 - every requirement maps to implementation and objective proof;
@@ -217,13 +223,13 @@ Run the structural validator for materialized plans:
 
 ```bash
 python .claude/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
-  .dev/plan/<slug>
+  "$(dirname "$PLAN_PATH")"
 ```
 
 The validator proves structure, not semantic readiness.
 
 In non-mutating contexts, return one `<proposed_plan>` block with complete
 artifact markers. When authorized, save the plan under
-`.dev/plan/<slug>/implementation-plan.md` and each task under `tasks/`.
+`$PLAN_PATH` and each task under `$(dirname "$PLAN_PATH")/tasks/`.
 Use `Approved` only after readiness and required review; use `Ready` only for
 tasks in an approved plan that passed executable preflight and cold rehearsal.

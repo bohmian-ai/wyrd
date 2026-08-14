@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the canonical Wyrd plan and task content schemas."""
+"""Validate the canonical plan and task content schemas."""
 
 from __future__ import annotations
 
@@ -53,83 +53,122 @@ TASK_HEADINGS = (
 
 PLAN_METADATA = (
     "Status",
-    "Repository",
-    "Planner",
-    "Implementation models",
+    "Repository origin",
+    "Repository revision",
+    "REPO_ROOT",
+    "PLAN_PATH",
     "Created",
     "Last updated",
     "Plan version",
     "Evidence snapshot",
     "Review",
-    "Execution skill",
 )
 
 TASK_METADATA = (
     "Status",
+    "Repository origin",
+    "Repository revision",
+    "REPO_ROOT",
+    "PLAN_PATH",
+    "TASK_PATH",
     "Plan",
     "Milestone",
     "Requirements",
     "Decisions",
     "Depends on",
-    "Assigned model",
-    "Execution skill",
 )
 
 PLAN_METADATA_VALUES = {
     "Status": re.compile(r"Draft|Review Required|Approved"),
-    "Repository": re.compile(r"wyrd"),
-    "Planner": re.compile(r"Sol"),
-    "Implementation models": re.compile(
-        r"(?:Luna|Terra|Sol)(?:, (?:Luna|Terra|Sol)){0,2}"
+    "Repository origin": re.compile(
+        r"[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"
     ),
+    "Repository revision": re.compile(r"[0-9a-f]{7,40}"),
+    "REPO_ROOT": re.compile(r"\$REPO_ROOT"),
+    "PLAN_PATH": re.compile(r"\$PLAN_PATH"),
     "Plan version": re.compile(r"[1-9][0-9]*"),
-    "Evidence snapshot": re.compile(r".+ at [0-9a-f]{7,40}; .+"),
-    "Review": re.compile(r"not required|required|\.dev/review/[^/]+/review\.md"),
-    "Execution skill": re.compile(
-        r"\$wyrd-implement|\$wyrd-ui|\$wyrd-implement \+ \$wyrd-ui"
-    ),
+    "Evidence snapshot": re.compile(r"\S.+"),
+    "Review": re.compile(r"not required|required|reviews/.+\.md"),
 }
 
 TASK_METADATA_VALUES = {
     "Status": re.compile(r"Planned|Ready|Complete|Blocked"),
-    "Plan": re.compile(r"\.dev/plan/[a-z0-9][a-z0-9-]*/implementation-plan\.md"),
-    "Milestone": re.compile(r"None|M[1-9][0-9]*"),
+    "Repository origin": re.compile(
+        r"[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"
+    ),
+    "Repository revision": re.compile(r"[0-9a-f]{7,40}"),
+    "REPO_ROOT": re.compile(r"\$REPO_ROOT"),
+    "PLAN_PATH": re.compile(r"\$PLAN_PATH"),
+    "TASK_PATH": re.compile(r"\$TASK_PATH"),
+    "Plan": re.compile(r"\.\./plan\.md"),
+    "Milestone": re.compile(r"None|M[1-9][0-9A-Za-z-]*"),
     "Requirements": re.compile(r"R[1-9][0-9]*(?:(?:,\s*|\s*[-–]\s*)R?[1-9][0-9]*)*"),
     "Decisions": re.compile(r"None|D[1-9][0-9]*(?:(?:,\s*|\s*[-–]\s*)D?[1-9][0-9]*)*"),
-    "Depends on": re.compile(r"None|T[1-9][0-9]*(?:,\s*T[1-9][0-9]*)*"),
-    "Assigned model": re.compile(r"Luna|Terra|Sol"),
-    "Execution skill": re.compile(
-        r"\$wyrd-implement|\$wyrd-ui|\$wyrd-implement \+ \$wyrd-ui"
-    ),
+    "Depends on": re.compile(r"None|(?=.*\bT[1-9]).+"),
 }
 
 PLAN_METADATA_EXAMPLE = {
     "Status": "Approved",
-    "Repository": "wyrd",
-    "Planner": "Sol",
-    "Implementation models": "Terra, Luna",
+    "Repository origin": "github.com/example/project",
+    "Repository revision": "0123456789abcdef0123456789abcdef01234567",
+    "REPO_ROOT": "$REPO_ROOT",
+    "PLAN_PATH": "$PLAN_PATH",
     "Created": "2026-07-29",
     "Last updated": "2026-07-29",
     "Plan version": "1",
     "Evidence snapshot": "example at 0123456789ab; clean target paths",
     "Review": "not required",
-    "Execution skill": "$wyrd-implement",
 }
 
 TASK_METADATA_EXAMPLE = {
     "Status": "Ready",
-    "Plan": ".dev/plan/example/implementation-plan.md",
+    "Repository origin": "github.com/example/project",
+    "Repository revision": "0123456789abcdef0123456789abcdef01234567",
+    "REPO_ROOT": "$REPO_ROOT",
+    "PLAN_PATH": "$PLAN_PATH",
+    "TASK_PATH": "$TASK_PATH",
+    "Plan": "../plan.md",
     "Milestone": "M1",
     "Requirements": "R1",
     "Decisions": "D1",
     "Depends on": "None",
-    "Assigned model": "Terra",
-    "Execution skill": "$wyrd-implement",
 }
 
 
 class ValidationError(Exception):
     """Represent one or more plan-schema validation failures."""
+
+
+PLAN_FILE = re.compile(r"(?:[a-z0-9][a-z0-9-]*)/(?:active|archive)/(?:[a-z0-9][a-z0-9-]*)/plan\.md$")
+TASK_FILE = re.compile(r"(?:[a-z0-9][a-z0-9-]*)/(?:active|archive)/(?:[a-z0-9][a-z0-9-]*)/tasks/[0-9][0-9A-Za-z.-]*-[a-z0-9][a-z0-9-]*\.md$")
+REVIEW_FILE = re.compile(r"(?:[a-z0-9][a-z0-9-]*)/(?:active|archive)/(?:[a-z0-9][a-z0-9-]*)/reviews/[a-z0-9][a-z0-9-]*\.md$")
+
+
+def valid_repository_artifact(path: str) -> bool:
+    """Return whether a repository-relative file has an allowed artifact path."""
+    return any(pattern.fullmatch(path) for pattern in (PLAN_FILE, TASK_FILE, REVIEW_FILE))
+
+
+def validate_repository(root: Path) -> list[str]:
+    """Validate exact artifact placement and every immediate plan directory."""
+    errors: list[str] = []
+    owners = sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() and ((path / "active").is_dir() or (path / "archive").is_dir())
+    )
+    for owner in owners:
+        for path in sorted(owner.rglob("*")):
+            if path.is_file() and not valid_repository_artifact(
+                path.relative_to(root).as_posix()
+            ):
+                errors.append(f"{path}: invalid shared-plan artifact path")
+        for state in ("active", "archive"):
+            state_root = owner / state
+            if state_root.is_dir():
+                for plan in sorted(path for path in state_root.iterdir() if path.is_dir()):
+                    errors.extend(validate_plan_directory(plan))
+    return errors
 
 
 def _metadata(text: str, first_heading_offset: int) -> dict[str, str]:
@@ -175,7 +214,14 @@ def _validate_document(
     except ValidationError as error:
         return [f"{path}: {error}"]
 
-    if tuple(headings) != expected_headings:
+    normalized_headings = tuple(headings)
+    if expected_headings == TASK_HEADINGS:
+        while (
+            len(normalized_headings) > len(expected_headings)
+            and normalized_headings[-1] == "Completion evidence"
+        ):
+            normalized_headings = normalized_headings[:-1]
+    if normalized_headings != expected_headings:
         errors.append(
             f"{path}: level-two headings must be exactly, in order: "
             + " | ".join(expected_headings)
@@ -190,14 +236,6 @@ def _validate_document(
         value = metadata.get(key)
         if value and pattern.fullmatch(value) is None:
             errors.append(f"{path}: invalid `{key}: {value}`")
-
-    implementation_models = metadata.get("Implementation models")
-    if implementation_models:
-        selected_models = implementation_models.split(", ")
-        if len(selected_models) != len(set(selected_models)):
-            errors.append(
-                f"{path}: `Implementation models` must not contain duplicates"
-            )
 
     for key in ("Created", "Last updated"):
         value = metadata.get(key)
@@ -239,11 +277,11 @@ def validate_plan_directory(plan_dir: Path) -> list[str]:
     """Validate one canonical plan directory and all of its task packets."""
 
     errors: list[str] = []
-    plan_path = plan_dir / "implementation-plan.md"
+    plan_path = plan_dir / "plan.md"
     task_dir = plan_dir / "tasks"
 
     if not plan_path.is_file():
-        errors.append(f"{plan_dir}: missing `implementation-plan.md`")
+        errors.append(f"{plan_dir}: missing `plan.md`")
         return errors
 
     errors.extend(
@@ -255,16 +293,14 @@ def validate_plan_directory(plan_dir: Path) -> list[str]:
         )
     )
 
-    task_paths = sorted(task_dir.glob("[0-9][0-9]-*.md")) if task_dir.is_dir() else []
+    task_paths = sorted(task_dir.glob("[0-9][0-9]*-*.md")) if task_dir.is_dir() else []
     if not task_paths:
-        errors.append(f"{plan_dir}: expected at least one `tasks/NN-<slug>.md`")
+        errors.append(f"{plan_dir}: expected at least one `tasks/<id>-<slug>.md`")
         return errors
 
     plan_text = plan_path.read_text(encoding="utf-8")
-    plan_status = _metadata(
-        plan_text,
-        _sections(plan_text)[2],
-    ).get("Status")
+    plan_metadata = _metadata(plan_text, _sections(plan_text)[2])
+    plan_status = plan_metadata.get("Status")
 
     for task_path in task_paths:
         errors.extend(
@@ -282,10 +318,16 @@ def validate_plan_directory(plan_dir: Path) -> list[str]:
             )
 
         task_text = task_path.read_text(encoding="utf-8")
-        task_status = _metadata(
+        task_metadata = _metadata(
             task_text,
             _sections(task_text)[2],
-        ).get("Status")
+        )
+        task_status = task_metadata.get("Status")
+        for key in ("Repository origin", "Repository revision"):
+            if task_metadata.get(key) != plan_metadata.get(key):
+                errors.append(
+                    f"{task_path}: `{key}` must match {plan_path}"
+                )
         if task_status == "Ready" and plan_status != "Approved":
             errors.append(
                 f"{task_path}: task cannot be `Ready` while plan status is "
@@ -306,9 +348,7 @@ def _valid_plan_text() -> str:
     bodies[
         "Architecture and design decisions"
     ] = "### D1: Use the existing owner\n\nKeep ownership unchanged."
-    bodies[
-        "Task inventory"
-    ] = "| Task | Packet |\n|---|---|\n| T1 | `tasks/01-example.md` |"
+    bodies["Task inventory"] = "| Task | Packet |\n|---|---|\n| T1 | `tasks/01-example.md` |"
     bodies[
         "Risks, migration, and rollout"
     ] = "Not applicable: the example has no durable or deployment change."
@@ -364,7 +404,7 @@ def self_test() -> int:
         plan_dir = Path(temporary)
         task_dir = plan_dir / "tasks"
         task_dir.mkdir()
-        (plan_dir / "implementation-plan.md").write_text(
+        (plan_dir / "plan.md").write_text(
             _valid_plan_text(),
             encoding="utf-8",
         )
@@ -389,92 +429,7 @@ def self_test() -> int:
                 return 1
         task_path.write_text(ready_task, encoding="utf-8")
 
-        plan_path = plan_dir / "implementation-plan.md"
-
-        for execution_skill in (
-            "$wyrd-implement",
-            "$wyrd-ui",
-            "$wyrd-implement + $wyrd-ui",
-        ):
-            plan_with_skill = _replace_metadata(
-                plan_path.read_text(encoding="utf-8"),
-                "Execution skill",
-                "$wyrd-implement",
-                execution_skill,
-            )
-            task_with_skill = _replace_metadata(
-                task_path.read_text(encoding="utf-8"),
-                "Execution skill",
-                "$wyrd-implement",
-                execution_skill,
-            )
-            plan_path.write_text(plan_with_skill, encoding="utf-8")
-            task_path.write_text(task_with_skill, encoding="utf-8")
-            if validate_plan_directory(plan_dir):
-                print(
-                    f"self-test failed: `{execution_skill}` was rejected",
-                    file=sys.stderr,
-                )
-                return 1
-            plan_path.write_text(_valid_plan_text(), encoding="utf-8")
-            task_path.write_text(_valid_task_text(), encoding="utf-8")
-
-        for implementation_models in (
-            "Luna",
-            "Terra",
-            "Sol",
-            "Terra, Luna",
-            "Terra, Sol",
-            "Luna, Sol",
-            "Terra, Luna, Sol",
-            "Luna, Terra, Sol",
-            "Sol, Terra",
-        ):
-            plan_with_models = _replace_metadata(
-                plan_path.read_text(encoding="utf-8"),
-                "Implementation models",
-                "Terra, Luna",
-                implementation_models,
-            )
-            plan_path.write_text(plan_with_models, encoding="utf-8")
-            if validate_plan_directory(plan_dir):
-                print(
-                    f"self-test failed: `{implementation_models}` was rejected",
-                    file=sys.stderr,
-                )
-                return 1
-            plan_path.write_text(_valid_plan_text(), encoding="utf-8")
-
-        duplicate_models = _replace_metadata(
-            plan_path.read_text(encoding="utf-8"),
-            "Implementation models",
-            "Terra, Luna",
-            "Terra, Terra",
-        )
-        plan_path.write_text(duplicate_models, encoding="utf-8")
-        if not validate_plan_directory(plan_dir):
-            print(
-                "self-test failed: duplicate implementation models were accepted",
-                file=sys.stderr,
-            )
-            return 1
-        plan_path.write_text(_valid_plan_text(), encoding="utf-8")
-
-        for assigned_model in ("Luna", "Terra", "Sol"):
-            task_with_model = _replace_metadata(
-                task_path.read_text(encoding="utf-8"),
-                "Assigned model",
-                "Terra",
-                assigned_model,
-            )
-            task_path.write_text(task_with_model, encoding="utf-8")
-            if validate_plan_directory(plan_dir):
-                print(
-                    f"self-test failed: `{assigned_model}` task was rejected",
-                    file=sys.stderr,
-                )
-                return 1
-            task_path.write_text(_valid_task_text(), encoding="utf-8")
+        plan_path = plan_dir / "plan.md"
 
         references = Path(__file__).resolve().parent.parent / "references"
         plan_path.write_text(
@@ -482,7 +437,7 @@ def self_test() -> int:
             encoding="utf-8",
         )
         task_path.unlink()
-        published_task_path = task_dir / "01-hydration-conflict.md"
+        published_task_path = task_dir / "01-example.md"
         published_task_path.write_text(
             _published_example(
                 references / "task-packet-format.md",
@@ -502,6 +457,8 @@ def self_test() -> int:
         task_path.write_text(_valid_task_text(), encoding="utf-8")
 
         for key, current in PLAN_METADATA_EXAMPLE.items():
+            if key == "Evidence snapshot":
+                continue
             original = plan_path.read_text(encoding="utf-8")
             plan_path.write_text(
                 _replace_metadata(original, key, current, "invalid"),
@@ -530,6 +487,21 @@ def self_test() -> int:
             task_path.write_text(original, encoding="utf-8")
 
         original = task_path.read_text(encoding="utf-8")
+        mismatched_revision = _replace_metadata(
+            original,
+            "Repository revision",
+            TASK_METADATA_EXAMPLE["Repository revision"],
+            "abcdef0",
+        )
+        task_path.write_text(mismatched_revision, encoding="utf-8")
+        if not validate_plan_directory(plan_dir):
+            print(
+                "self-test failed: task repository revision mismatch was accepted",
+                file=sys.stderr,
+            )
+            return 1
+        task_path.write_text(original, encoding="utf-8")
+
         invalid_heading = original.replace(
             "## Required tests\n\nContent.\n\n",
             "",
@@ -554,6 +526,13 @@ def self_test() -> int:
             )
             return 1
 
+    if valid_repository_artifact("wyrd/active/example/tasks/HANDOFF.md"):
+        print("self-test failed: non-numbered task artifact was accepted", file=sys.stderr)
+        return 1
+    if valid_repository_artifact("wyrd/misc/example/plan.md"):
+        print("self-test failed: plan outside active/archive was accepted", file=sys.stderr)
+        return 1
+
     print("self-test passed")
     return 0
 
@@ -564,10 +543,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("plan_dir", nargs="?", type=Path)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--repository-root", type=Path)
     arguments = parser.parse_args()
 
     if arguments.self_test:
         return self_test()
+    if arguments.repository_root is not None:
+        errors = validate_repository(arguments.repository_root)
+        if errors:
+            for error in errors:
+                print(error, file=sys.stderr)
+            return 1
+        print(f"valid shared plan repository: {arguments.repository_root}")
+        return 0
     if arguments.plan_dir is None:
         parser.error("plan_dir is required unless --self-test is used")
 
@@ -577,7 +565,7 @@ def main() -> int:
             print(error, file=sys.stderr)
         return 1
 
-    print(f"valid Wyrd plan artifacts: {arguments.plan_dir}")
+    print(f"valid plan artifacts: {arguments.plan_dir}")
     return 0
 
 

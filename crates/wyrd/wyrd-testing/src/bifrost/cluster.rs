@@ -732,6 +732,8 @@ pub struct WyrdTestCluster {
     forge_interval: Duration,
     /// Per-node public-request lifetime cancelled by abrupt process termination.
     abrupt_request_lifetimes: BTreeMap<NodeId, CancellationToken>,
+    /// Exact attempt identities returned by production panic reclaim and awaiting clock advance.
+    reclaimed_panic_attempts: BTreeMap<uuid::Uuid, uuid::Uuid>,
 }
 
 /// Lifetime owner for temporary or caller-declared local cluster storage.
@@ -1746,6 +1748,7 @@ impl WyrdTestCluster {
             forge_config: options.config.clone(),
             forge_interval: options.interval,
             abrupt_request_lifetimes,
+            reclaimed_panic_attempts: BTreeMap::new(),
         };
         let node_ids = cluster.nodes.keys().copied().collect::<Vec<_>>();
         let delayed = delay_last_node.then(|| node_ids.last().copied()).flatten();
@@ -2162,10 +2165,15 @@ impl WyrdTestCluster {
     /// consumed attempt, has no failure class, and its last reclaimed attempt
     /// matches `expected_attempt` in the caller's retained evidence.
     pub async fn advance_reclaimed_panic_task_for_test(
-        &self,
+        &mut self,
         task_id: uuid::Uuid,
         expected_attempt: uuid::Uuid,
     ) -> Result<(), ClusterError> {
+        if self.reclaimed_panic_attempts.get(&task_id) != Some(&expected_attempt) {
+            return Err(ClusterError::Resource(format!(
+                "panic recovery attempt {expected_attempt} is not the exact reclaimed evidence for task {task_id}"
+            )));
+        }
         let row: (String, i32, Option<String>, bool, bool) = sqlx::query_as(
             "SELECT state,attempt_count,failure_class,attempt_id IS NULL,claimed_by IS NULL FROM vala.forge_tasks WHERE task_id=$1",
         )
@@ -2173,7 +2181,7 @@ impl WyrdTestCluster {
         .fetch_one(self.fixture.operator_pool().pool())
         .await
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        if row != ("retryable".to_owned(), 1, None, true, true) {
+        if !is_exact_reclaimed_panic_row(&row) {
             return Err(ClusterError::Resource(format!(
                 "panic recovery row {task_id} is not exact reclaimed state for attempt {expected_attempt}: {row:?}"
             )));
@@ -2191,7 +2199,63 @@ impl WyrdTestCluster {
                 "panic recovery eligibility update lost exact row {task_id} from attempt {expected_attempt}"
             )));
         }
+        self.reclaimed_panic_attempts.remove(&task_id);
         Ok(())
+    }
+
+    /// Retain the exact panic-owned attempt observed before restarting its node.
+    ///
+    /// The subsequent eligibility seam accepts only this pair after production
+    /// reclaim has cleared the durable ownership columns.
+    pub fn retain_panic_attempt_for_test(&mut self, task_id: uuid::Uuid, attempt_id: uuid::Uuid) {
+        self.reclaimed_panic_attempts.insert(task_id, attempt_id);
+    }
+
+    /// Return the canonical audit-outbox row count for panic-clock assertions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixture or SQL error when the privileged assertion connection
+    /// cannot read the canonical outbox.
+    pub async fn audit_outbox_count_for_test(&self) -> Result<i64, ClusterError> {
+        let pool = self
+            .fixture
+            .superuser_pool()
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))
+    }
+
+    /// Reclaim expired Forge attempts through production and retain their exact evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node is stopped, reclaim fails, or duplicate
+    /// evidence for one task disagrees with the production result.
+    pub async fn reclaim_expired_forge_attempts_for_test(
+        &mut self,
+        node_id: NodeId,
+        cap: u32,
+    ) -> Result<Vec<(uuid::Uuid, uuid::Uuid)>, ClusterError> {
+        let reclaimed = self
+            .server_by_node(node_id)
+            .ok_or_else(|| {
+                ClusterError::Resource(format!("node {} is stopped", node_id.as_uuid()))
+            })?
+            .reclaim_expired_forge_attempts_for_test(cap)
+            .await
+            .map_err(ClusterError::Server)?;
+        for (task_id, attempt_id) in &reclaimed {
+            if self.reclaimed_panic_attempts.get(task_id) != Some(attempt_id) {
+                return Err(ClusterError::Resource(format!(
+                    "panic reclaim returned untracked attempt {attempt_id} for task {task_id}"
+                )));
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// Restart one stopped node against the same Postgres, storage, WAL, and spill roots.
@@ -2451,6 +2515,11 @@ impl WyrdTestCluster {
             }),
         }
     }
+}
+
+/// Return whether a durable row is the sole shape eligible for panic clock advance.
+fn is_exact_reclaimed_panic_row(row: &(String, i32, Option<String>, bool, bool)) -> bool {
+    row == &("retryable".to_owned(), 1, None, true, true)
 }
 
 /// Return whether a node carries the complete public Server component roster.
@@ -2791,5 +2860,30 @@ mod tests {
         assert_eq!(sample.family, "oracle_query_duration_seconds");
         assert_eq!(sample.labels["class"], "interactive");
         assert_eq!(sample.labels["outcome"], "success");
+    }
+
+    /// Panic recovery clock admission accepts only the exact reclaimed row shape.
+    #[test]
+    fn panic_recovery_clock_requires_exact_reclaimed_row() {
+        let exact = ("retryable".to_owned(), 1, None, true, true);
+        assert!(is_exact_reclaimed_panic_row(&exact));
+        for rejected in [
+            ("running".to_owned(), 1, None, false, false),
+            ("claimed".to_owned(), 1, None, false, false),
+            (
+                "retryable".to_owned(),
+                1,
+                Some("storage_health".to_owned()),
+                true,
+                true,
+            ),
+            ("retryable".to_owned(), 0, None, true, true),
+            ("retryable".to_owned(), 2, None, true, true),
+            ("retryable".to_owned(), 1, None, false, true),
+            ("retryable".to_owned(), 1, None, true, false),
+            ("failed".to_owned(), 1, None, true, true),
+        ] {
+            assert!(!is_exact_reclaimed_panic_row(&rejected));
+        }
     }
 }

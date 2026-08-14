@@ -53,6 +53,10 @@ pub struct ForgeScheduleOutcome {
     pub unclaimable_tasks: usize,
     /// Maximum-minus-minimum admitted task count across this complete pass's tenants.
     pub fairness_lag_tasks: usize,
+    /// Candidate input files observed across the complete acknowledged pass.
+    pub compaction_debt_files: u64,
+    /// Candidate input bytes observed across the complete acknowledged pass.
+    pub compaction_debt_bytes: u64,
     /// Whether the bounded page or any demand remained incomplete.
     pub incomplete: bool,
 }
@@ -68,6 +72,10 @@ struct DemandPlanningResult {
     unschedulable: usize,
     /// Whether the exact observed demand generation was acknowledged.
     acknowledged: bool,
+    /// Candidate input files represented by this exact demand generation.
+    compaction_debt_files: u64,
+    /// Candidate input bytes represented by this exact demand generation.
+    compaction_debt_bytes: u64,
 }
 
 /// Concrete owner of fenced durable Forge planning and demand convergence.
@@ -410,6 +418,12 @@ impl<'forge> ForgeScheduler<'forge> {
                             .saturating_add(planned.tasks_not_inserted);
                         outcome.unschedulable =
                             outcome.unschedulable.saturating_add(planned.unschedulable);
+                        outcome.compaction_debt_files = outcome
+                            .compaction_debt_files
+                            .saturating_add(planned.compaction_debt_files);
+                        outcome.compaction_debt_bytes = outcome
+                            .compaction_debt_bytes
+                            .saturating_add(planned.compaction_debt_bytes);
                         outcome.demands_acknowledged = outcome
                             .demands_acknowledged
                             .saturating_add(usize::from(planned.acknowledged));
@@ -562,6 +576,22 @@ impl<'forge> ForgeScheduler<'forge> {
         fence: i64,
     ) -> Result<DemandPlanningResult, ForgeError> {
         let snapshot = self.discover_snapshot(demand).await?;
+        let compaction_debt_files = snapshot
+            .candidates
+            .iter()
+            .try_fold(0_u64, |total, candidate| {
+                total.checked_add(u64::try_from(candidate.inputs.len()).unwrap_or(u64::MAX))
+            })
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge candidate file debt exceeds u64".to_owned(),
+            })?;
+        let compaction_debt_bytes = snapshot
+            .candidates
+            .iter()
+            .try_fold(0_u64, |total, candidate| total.checked_add(candidate.bytes))
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge candidate byte debt exceeds u64".to_owned(),
+            })?;
         for candidate in &snapshot.candidates {
             self.forge.core.telemetry.record_discovered_candidate(
                 ForgeTaskMetricStrategy::try_from(candidate.strategy).map_err(|strategy| {
@@ -626,6 +656,8 @@ impl<'forge> ForgeScheduler<'forge> {
                 .saturating_sub(usize::try_from(inserted).unwrap_or(usize::MAX)),
             unschedulable: unschedulable.len(),
             acknowledged: true,
+            compaction_debt_files,
+            compaction_debt_bytes,
         };
         if result.acknowledged && result.tasks_enqueued == 0 {
             self.forge
@@ -995,6 +1027,10 @@ impl<'forge> ForgeScheduler<'forge> {
                 .core
                 .telemetry
                 .record_planning_status(Duration::from_secs_f64(age), outcome.fairness_lag_tasks);
+            self.forge.core.telemetry.record_compaction_debt(
+                outcome.compaction_debt_files,
+                outcome.compaction_debt_bytes,
+            );
         } else {
             outcome.incomplete = true;
         }

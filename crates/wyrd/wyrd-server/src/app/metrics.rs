@@ -54,6 +54,8 @@ pub const BIFROST_FORGE_TASK_DURATION_SECONDS: &str = "bifrost_forge_task_durati
 pub const BIFROST_FORGE_CLEANUP_DURATION_SECONDS: &str = "bifrost_forge_cleanup_duration_seconds";
 /// Production-facing Forge spill metric.
 pub const BIFROST_FORGE_TASK_SPILL_BYTES: &str = "bifrost_forge_task_spill_bytes";
+/// Production-facing Forge attempt resource-envelope observation metric.
+pub const BIFROST_FORGE_ATTEMPT_RESOURCE_BYTES: &str = "bifrost_forge_attempt_resource_bytes";
 
 /// Gate request latency observed at the public write/query boundary.
 pub const BIFROST_GATE_REQUEST_DURATION_SECONDS: &str = "bifrost_gate_request_duration_seconds";
@@ -286,6 +288,11 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
     builder
         .set_buckets_for_metric(
             Matcher::Full(BIFROST_FORGE_TASK_SPILL_BYTES.to_owned()),
+            FORGE_SPILL_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(BIFROST_FORGE_ATTEMPT_RESOURCE_BYTES.to_owned()),
             FORGE_SPILL_BUCKETS,
         )
         .map_err(MetricsError::Buckets)?

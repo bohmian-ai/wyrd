@@ -1365,12 +1365,16 @@ fn plan_staging_bins(
             let IcebergRewriteGroup { files, reason } = group;
             files
                 .chunks(max_files)
-                .filter(|chunk| reason != IcebergRewriteReason::Undersized || chunk.len() >= 2)
+                .filter(|chunk| {
+                    reason != IcebergRewriteReason::Undersized
+                        || chunk.len() >= 2
+                        || partition_day < current_day
+                })
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    groups
+    let mut bins = groups
         .into_iter()
         .filter_map(|group| {
             let files = group
@@ -1382,7 +1386,16 @@ fn plan_staging_bins(
                 files,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if partition_day < current_day && !by_path.is_empty() {
+        let mut remaining = by_path.into_values().collect::<Vec<_>>();
+        remaining.sort_by(|left, right| left.path.cmp(&right.path));
+        bins.extend(remaining.chunks(max_files).map(|files| RewriteBin {
+            total_bytes: files.iter().map(|file| file.size).sum(),
+            files: files.to_vec(),
+        }));
+    }
+    bins
 }
 
 /// Borrowed authority and exact payload for one durable staging-fold task.
@@ -2716,5 +2729,32 @@ mod tests {
         assert_eq!(outcome.staging_pending_files, 0);
         assert!(!outcome.pending_work);
         assert!(outcome.is_converged());
+    }
+
+    /// A closed partition publishes its final staging singleton instead of stranding debt.
+    #[test]
+    fn closed_partition_staging_singleton_is_actionable() {
+        let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
+        let tail = CandidateFile {
+            id: Uuid::from_u128(1),
+            path: "closed-tail".to_owned(),
+            size: 20,
+            min_event_time: timestamp,
+            max_event_time: timestamp,
+        };
+
+        let bins = plan_staging_bins(
+            &policy,
+            &[tail],
+            256,
+            day,
+            day.succ_opt().expect("next day"),
+        );
+
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].files.len(), 1);
+        assert_eq!(bins[0].total_bytes, 20);
     }
 }

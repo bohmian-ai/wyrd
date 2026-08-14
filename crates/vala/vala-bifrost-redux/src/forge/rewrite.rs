@@ -43,11 +43,19 @@ struct ForgeAttemptMemoryPool {
     inner: Arc<dyn MemoryPool>,
     /// Limits and live counters for decoded, sort, and output ownership.
     terms: [(usize, AtomicU64); 3],
+    /// Largest aggregate reservation observed after successful growth.
+    peak_bytes: Arc<AtomicU64>,
 }
 
 impl ForgeAttemptMemoryPool {
     /// Wraps the aggregate lease with decoded, sort, and output ceilings.
-    fn new(inner: Arc<dyn MemoryPool>, decoded: usize, sort: usize, output: usize) -> Self {
+    fn new(
+        inner: Arc<dyn MemoryPool>,
+        decoded: usize,
+        sort: usize,
+        output: usize,
+        peak_bytes: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             inner,
             terms: [
@@ -55,7 +63,16 @@ impl ForgeAttemptMemoryPool {
                 (sort, AtomicU64::new(0)),
                 (output, AtomicU64::new(0)),
             ],
+            peak_bytes,
         }
+    }
+
+    /// Retains the largest aggregate reservation after successful pool growth.
+    fn observe_peak(&self) {
+        self.peak_bytes.fetch_max(
+            u64::try_from(self.inner.reserved()).unwrap_or(u64::MAX),
+            Ordering::AcqRel,
+        );
     }
 
     /// Returns the persisted term family for one known consumer.
@@ -111,6 +128,7 @@ impl MemoryPool for ForgeAttemptMemoryPool {
         self.claim_term(reservation, additional)
             .expect("infallible Forge growth remains within its persisted term");
         self.inner.grow(reservation, additional);
+        self.observe_peak();
     }
 
     /// Releases aggregate and named ownership together.
@@ -137,6 +155,7 @@ impl MemoryPool for ForgeAttemptMemoryPool {
             }
             return Err(error);
         }
+        self.observe_peak();
         Ok(())
     }
 
@@ -164,6 +183,12 @@ pub(crate) struct ForgeAttemptResources {
     lease: Option<crate::resources::ForgeRewriteResources>,
     /// First finalization result retained for idempotent explicit and drop paths.
     release_result: Option<crate::resources::ForgeResourceReleaseResult>,
+    /// Attempt-local resident peak shared with the leased pool wrapper.
+    peak_memory_bytes: Arc<AtomicU64>,
+    /// Persisted and acquired totals recorded once at finalization.
+    observation: super::metrics::ForgeResourceObservation,
+    /// Fixed-cardinality metric owner receiving the final lifecycle event.
+    telemetry: Arc<super::metrics::ForgeTelemetry>,
 }
 
 impl ForgeAttemptResources {
@@ -181,6 +206,7 @@ impl ForgeAttemptResources {
         pod_spill_root: &Path,
         task_id: Uuid,
         attempt_id: Uuid,
+        telemetry: Arc<super::metrics::ForgeTelemetry>,
     ) -> Result<Self, ForgeError> {
         let lease =
             resources
@@ -212,11 +238,13 @@ impl ForgeAttemptResources {
         .map_err(|_| ForgeError::Capacity {
             detail: "Forge output allowance exceeds this platform".to_owned(),
         })?;
+        let peak_memory_bytes = Arc::new(AtomicU64::new(0));
         let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
             lease.memory_pool(),
             decoded_batch_bytes,
             sort_working_bytes,
             output_allowance,
+            Arc::clone(&peak_memory_bytes),
         ));
         let sort_spill_bytes = request.envelope.sort_spill_bytes;
         let runtime = ForgeRewriteRuntime::new_attempt(
@@ -255,6 +283,16 @@ impl ForgeAttemptResources {
             runtime: Some(Arc::new(runtime)),
             lease: Some(lease),
             release_result: None,
+            peak_memory_bytes,
+            observation: super::metrics::ForgeResourceObservation {
+                planned_memory: u64::try_from(request.memory_bytes).unwrap_or(u64::MAX),
+                acquired_memory: u64::try_from(request.memory_bytes).unwrap_or(u64::MAX),
+                peak_memory: 0,
+                planned_scratch: request.scratch_bytes,
+                acquired_scratch: request.scratch_bytes,
+                peak_scratch: 0,
+            },
+            telemetry,
         })
     }
 
@@ -297,6 +335,8 @@ impl ForgeAttemptResources {
             .runtime
             .take()
             .expect("invariant: unfinished attempt retains its runtime");
+        self.observation.peak_memory = self.peak_memory_bytes.load(Ordering::Acquire);
+        self.observation.peak_scratch = runtime.scratch_peak_bytes();
         let surviving_handle = Arc::strong_count(&runtime) != 1;
         drop(runtime);
         let mut lease = self
@@ -311,6 +351,8 @@ impl ForgeAttemptResources {
         } else {
             crate::resources::ForgeResourceReleaseResult::Released
         };
+        self.telemetry.record_attempt_resources(self.observation);
+        self.telemetry.record_attempt_release(result);
         self.release_result = Some(result);
         result
     }
@@ -714,6 +756,8 @@ struct RewriteBatchState {
     _output_scratch: Option<OutputScratchReservation>,
     /// Physical byte ceiling enforced before every scratch-file write.
     output_scratch_limit_bytes: u64,
+    /// Attempt-local conservative scratch peak shared with the resource owner.
+    scratch_peak_bytes: Option<Arc<AtomicU64>>,
     /// Per-output NaN counts keyed by Iceberg field ID.
     nan_value_counts: NanValueCountVisitor,
 }
@@ -735,6 +779,9 @@ impl RewriteBatchState {
         let output_scratch_limit_bytes = output_scratch
             .as_ref()
             .map_or(u64::MAX, |value| value.bytes);
+        let scratch_peak_bytes = output_scratch
+            .as_ref()
+            .map(|value| Arc::clone(&value.peak_bytes));
         Self {
             writer: None,
             scratch_dir,
@@ -748,6 +795,7 @@ impl RewriteBatchState {
             _output_reservation: reservation,
             _output_scratch: output_scratch,
             output_scratch_limit_bytes,
+            scratch_peak_bytes,
             nan_value_counts: NanValueCountVisitor::new(),
         }
     }
@@ -882,6 +930,12 @@ impl RewriteBatchState {
     /// Retain the largest runtime spill observation seen between batches.
     fn observe_spill(&mut self, spill_bytes: u64) {
         self.peak_spill_bytes = self.peak_spill_bytes.max(spill_bytes);
+        if let Some(peak) = &self.scratch_peak_bytes {
+            peak.fetch_max(
+                spill_bytes.saturating_add(self.output_scratch_limit_bytes),
+                Ordering::AcqRel,
+            );
+        }
         #[cfg(feature = "test-support")]
         TEST_SCRATCH_PEAK_BYTES.fetch_max(
             spill_bytes.saturating_add(self.output_scratch_limit_bytes),
@@ -2400,6 +2454,8 @@ struct OutputScratchReservation {
     used_bytes: Arc<AtomicU64>,
     /// Exact bytes returned when rewrite state terminates.
     bytes: u64,
+    /// Conservative aggregate scratch peak shared with the attempt owner.
+    peak_bytes: Arc<AtomicU64>,
 }
 
 impl Drop for OutputScratchReservation {
@@ -2422,6 +2478,8 @@ pub struct ForgeRewriteRuntime {
     output_scratch_limit_bytes: u64,
     /// Attempt-local sibling counter for pending encoded output files.
     output_scratch_used_bytes: Arc<AtomicU64>,
+    /// Largest bounded sort-spill plus pending-output ownership observation.
+    scratch_peak_bytes: Arc<AtomicU64>,
     /// Fixed encoder/upload reservation derived from the acquired envelope.
     output_allowance_bytes: usize,
     /// Exact bytes reserved before polling each decoded stream.
@@ -2526,6 +2584,7 @@ impl ForgeRewriteRuntime {
             spill_limit_bytes,
             output_scratch_limit_bytes: spill_limit_bytes - sort_spill_limit_bytes,
             output_scratch_used_bytes: Arc::new(AtomicU64::new(0)),
+            scratch_peak_bytes: Arc::new(AtomicU64::new(0)),
             output_allowance_bytes,
             decoded_batch_bytes,
             sort_merge_reservation_bytes,
@@ -2559,9 +2618,12 @@ impl ForgeRewriteRuntime {
                     self.output_scratch_limit_bytes
                 ),
             })?;
+        self.scratch_peak_bytes
+            .fetch_max(self.output_scratch_limit_bytes, Ordering::AcqRel);
         Ok(OutputScratchReservation {
             used_bytes: Arc::clone(&self.output_scratch_used_bytes),
             bytes: self.output_scratch_limit_bytes,
+            peak_bytes: Arc::clone(&self.scratch_peak_bytes),
         })
     }
 
@@ -2569,6 +2631,18 @@ impl ForgeRewriteRuntime {
     #[must_use]
     pub fn spill_limit_bytes(&self) -> u64 {
         self.spill_limit_bytes
+    }
+
+    /// Returns the conservative attempt scratch peak used at final settlement.
+    ///
+    /// The runtime updates this value when it reserves pending output and after
+    /// each bounded sort-spill observation, so it is the conservative checked
+    /// sum of those concurrently possible siblings capped by the lease.
+    #[must_use]
+    fn scratch_peak_bytes(&self) -> u64 {
+        self.scratch_peak_bytes
+            .load(Ordering::Acquire)
+            .min(self.spill_limit_bytes)
     }
 
     /// Returns the disjoint sort and output scratch ownership for diagnostics.
@@ -2614,6 +2688,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use wyrd_bench::BenchmarkRecorder;
 
     use super::*;
 
@@ -2687,7 +2762,7 @@ mod tests {
             },
         )
         .expect("test envelope");
-        let attempt = ForgeAttemptResources::acquire(
+        let mut attempt = ForgeAttemptResources::acquire(
             &forge,
             crate::resources::ForgeRewriteRequest {
                 envelope,
@@ -2699,6 +2774,7 @@ mod tests {
             root.path(),
             Uuid::nil(),
             Uuid::now_v7(),
+            Arc::new(crate::forge::ForgeTelemetry::new()),
         )
         .expect("attempt resources");
         assert!(
@@ -2710,6 +2786,17 @@ mod tests {
             usize::try_from(envelope.encoder_buffer_bytes + envelope.upload_chunk_bytes)
                 .expect("platform output allowance")
         );
+        let reservation =
+            MemoryConsumer::new("forge-rewrite-output-peak-proof").register(&attempt.memory_pool());
+        reservation
+            .try_grow(4096)
+            .expect("attempt-local output reservation");
+        assert_eq!(
+            attempt.peak_memory_bytes.load(Ordering::Acquire),
+            4096,
+            "the production pool wrapper must retain the exact attempt peak"
+        );
+        reservation.free();
 
         let held = forge.snapshot().expect("held snapshot");
         assert_eq!(
@@ -2723,6 +2810,10 @@ mod tests {
             baseline.scratch_used_bytes + envelope.scratch_bytes().expect("scratch total")
         );
 
+        assert_eq!(
+            attempt.finish(),
+            crate::resources::ForgeResourceReleaseResult::Released
+        );
         drop(attempt);
         let after = forge.snapshot().expect("restored snapshot");
         assert_eq!(
@@ -2773,60 +2864,98 @@ mod tests {
 
     /// Attempt finalization is idempotent and poisons when a pipeline handle survives.
     #[test]
-    fn rewrite_resource_release_is_idempotent_and_reports_poisoning() {
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            2 * 1024 * 1024 * 1024,
-            4 * 1024 * 1024,
-            [crate::resources::BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let root = tempfile::tempdir().expect("spill root");
-        let envelope = crate::forge::ForgeEnvelopeSizer::size(
-            1,
-            1,
-            1,
-            ForgeCapacity {
-                max_files: 1,
-                max_bytes: u64::MAX,
-                max_parallelism: 1,
-                max_memory_bytes: 64 * 1024 * 1024,
-                max_spill_bytes: 4 * 1024 * 1024,
-                max_large_task_bytes: u64::MAX,
-            },
-        )
-        .expect("envelope");
-        let request = ForgeRewriteRequest {
-            envelope,
-            memory_bytes: usize::try_from(envelope.memory_bytes().expect("resident total"))
-                .expect("platform total"),
-            scratch_bytes: envelope.scratch_bytes().expect("scratch total"),
-            reader_permits: envelope.reader_permits,
-        };
-        let mut attempt = ForgeAttemptResources::acquire(
-            &forge,
-            request,
-            root.path(),
-            Uuid::nil(),
-            Uuid::now_v7(),
-        )
-        .expect("attempt");
-        let surviving = Arc::clone(
-            attempt
-                .runtime
-                .as_ref()
-                .expect("active attempt retains runtime"),
-        );
+    fn panicking_attempt_finalizes_or_poisons_before_worker_exit() {
+        let recorder = BenchmarkRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+                2 * 1024 * 1024 * 1024,
+                4 * 1024 * 1024,
+                [crate::resources::BifrostRole::Forge],
+            );
+            let forge = roles.forge().expect("Forge capability");
+            let root = tempfile::tempdir().expect("spill root");
+            let envelope = crate::forge::ForgeEnvelopeSizer::size(
+                1,
+                1,
+                1,
+                ForgeCapacity {
+                    max_files: 1,
+                    max_bytes: u64::MAX,
+                    max_parallelism: 1,
+                    max_memory_bytes: 64 * 1024 * 1024,
+                    max_spill_bytes: 4 * 1024 * 1024,
+                    max_large_task_bytes: u64::MAX,
+                },
+            )
+            .expect("envelope");
+            let request = ForgeRewriteRequest {
+                envelope,
+                memory_bytes: usize::try_from(envelope.memory_bytes().expect("resident total"))
+                    .expect("platform total"),
+                scratch_bytes: envelope.scratch_bytes().expect("scratch total"),
+                reader_permits: envelope.reader_permits,
+            };
+            let mut attempt = ForgeAttemptResources::acquire(
+                &forge,
+                request,
+                root.path(),
+                Uuid::nil(),
+                Uuid::now_v7(),
+                Arc::new(crate::forge::ForgeTelemetry::new()),
+            )
+            .expect("attempt");
+            let memory =
+                MemoryConsumer::new("forge-panic-finalizer-peak").register(&attempt.memory_pool());
+            memory.try_grow(1).expect("reserve one resident byte");
+            memory.free();
+            drop(
+                attempt
+                    .runtime()
+                    .reserve_output_scratch()
+                    .expect("reserve output scratch peak"),
+            );
+            let surviving = Arc::clone(
+                attempt
+                    .runtime
+                    .as_ref()
+                    .expect("active attempt retains runtime"),
+            );
 
+            assert_eq!(
+                attempt.finish(),
+                crate::resources::ForgeResourceReleaseResult::Poisoned
+            );
+            assert_eq!(
+                attempt.finish(),
+                crate::resources::ForgeResourceReleaseResult::Poisoned
+            );
+            drop(surviving);
+            assert!(forge.snapshot().is_err(), "poisoning must fail closed");
+        });
+        let snapshot = recorder.snapshot();
+        for resource in ["memory", "scratch"] {
+            let poisoned = snapshot
+                .counters
+                .iter()
+                .filter(|(name, _)| {
+                    name.starts_with("bifrost_forge_attempt_resource_releases_total{")
+                        && name.contains(&format!("resource=\"{resource}\""))
+                        && name.contains("result=\"poisoned\"")
+                })
+                .map(|(_, count)| *count)
+                .sum::<u64>();
+            assert_eq!(poisoned, 1, "{resource} poison records exactly once");
+        }
         assert_eq!(
-            attempt.finish(),
-            crate::resources::ForgeResourceReleaseResult::Poisoned
+            snapshot
+                .histograms
+                .iter()
+                .filter(|(name, _)| { name.starts_with("bifrost_forge_attempt_resource_bytes{") })
+                .map(|(_, histogram)| histogram.count)
+                .sum::<u64>(),
+            6,
+            "one finalization records three observations for both resources"
         );
-        assert_eq!(
-            attempt.finish(),
-            crate::resources::ForgeResourceReleaseResult::Poisoned
-        );
-        drop(surviving);
-        assert!(forge.snapshot().is_err(), "poisoning must fail closed");
     }
 
     /// Returns ceilings wide enough to admit the parity fixture's exact demand.

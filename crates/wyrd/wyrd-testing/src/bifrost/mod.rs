@@ -48,5 +48,6 @@ pub use query_fixture::{SeededBifrostQuery, seed_query_fixture};
 pub use telemetry::{
     BifrostQueryTelemetryReport, BifrostTelemetryCapture, BifrostTelemetryCheckpoint,
     BifrostTelemetryReportError, ForgeCausalDiagnosis, ForgeCausalTelemetryReport,
-    ForgeDiscoveredCandidateTelemetry, ForgeMaintenanceTelemetryReport,
+    ForgeDiscoveredCandidateTelemetry, ForgeMaintenanceTelemetryReport, ForgeTelemetryFailureClass,
+    ForgeTelemetryResource,
 };

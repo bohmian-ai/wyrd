@@ -192,6 +192,7 @@ impl Forge {
             &self.core.rewrite_spill_root,
             Uuid::nil(),
             Uuid::now_v7(),
+            Arc::clone(&self.core.telemetry),
         )?;
         let rewrite = resources.pipeline(&self.core.rewrite);
         Ok(self

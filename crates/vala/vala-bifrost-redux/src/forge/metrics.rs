@@ -373,6 +373,114 @@ pub(super) struct ForgeRewriteVolume {
     pub(super) output_bytes: u64,
 }
 
+/// Closed resource kinds owned by one Forge rewrite attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ForgeAttemptResource {
+    /// Resident memory granted through the attempt-local `DataFusion` pool.
+    Memory,
+    /// Disposable sort and pending-output scratch granted to the attempt.
+    Scratch,
+}
+
+impl ForgeAttemptResource {
+    /// Every resource label registered for attempt lifecycle telemetry.
+    const ALL: [Self; 2] = [Self::Memory, Self::Scratch];
+
+    /// Returns the stable metric label for this resource.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Scratch => "scratch",
+        }
+    }
+}
+
+/// Closed observation points for a Forge attempt resource envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ForgeResourceObservationKind {
+    /// The authoritative resource amount persisted by planning.
+    Planned,
+    /// The exact resource amount granted atomically by the root governor.
+    Acquired,
+    /// The largest conservative resource ownership observed during execution.
+    Peak,
+}
+
+impl ForgeResourceObservationKind {
+    /// Every observation label registered for attempt resource telemetry.
+    const ALL: [Self; 3] = [Self::Planned, Self::Acquired, Self::Peak];
+
+    /// Returns the stable metric label for this observation point.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Acquired => "acquired",
+            Self::Peak => "peak",
+        }
+    }
+}
+
+/// Exact resource lifecycle observation emitted once during attempt finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForgeResourceObservation {
+    /// Persisted resident-memory request.
+    pub(crate) planned_memory: u64,
+    /// Exact resident-memory grant.
+    pub(crate) acquired_memory: u64,
+    /// Largest attempt-local resident reservation.
+    pub(crate) peak_memory: u64,
+    /// Persisted aggregate scratch request.
+    pub(crate) planned_scratch: u64,
+    /// Exact aggregate scratch grant.
+    pub(crate) acquired_scratch: u64,
+    /// Conservative bounded peak of sort spill plus pending-output ownership.
+    pub(crate) peak_scratch: u64,
+}
+
+/// Closed execution phase for a typed Forge capacity refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ForgeCapacityRefusalPhase {
+    /// Live root capacity was unavailable before execution or input IO.
+    Admission,
+    /// An admitted attempt exhausted one persisted execution term.
+    Execution,
+}
+
+impl ForgeCapacityRefusalPhase {
+    /// Every refusal phase registered in the fixed metric inventory.
+    const ALL: [Self; 2] = [Self::Admission, Self::Execution];
+
+    /// Returns the stable metric label for this refusal phase.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Execution => "execution",
+        }
+    }
+}
+
+/// Closed durable progress effects emitted when a Forge task succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ForgeProgressEffect {
+    /// The task changed durable table state or completed non-expiry work.
+    Changed,
+    /// Snapshot-expiry maintenance honestly acknowledged a no-op trigger.
+    AcknowledgedNoop,
+}
+
+impl ForgeProgressEffect {
+    /// Every durable progress effect registered in the metric inventory.
+    const ALL: [Self; 2] = [Self::Changed, Self::AcknowledgedNoop];
+
+    /// Returns the stable metric label for this progress effect.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::AcknowledgedNoop => "acknowledged_noop",
+        }
+    }
+}
+
 /// Closed outcomes for one completed durable hint-persistence attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ForgeHintPersistenceResult {
@@ -432,6 +540,25 @@ impl ForgeDemandTransitionResult {
 pub struct ForgeTelemetry {
     /// Worker settlement outcomes by the six durable failure classes.
     failure_classes: BTreeMap<super::error::ForgeFailureClass, Counter>,
+    /// Planned, acquired, and peak byte observations by closed resource kind.
+    attempt_resource_bytes:
+        BTreeMap<(ForgeAttemptResource, ForgeResourceObservationKind), Histogram>,
+    /// Exactly-once resource finalization outcomes by resource and result.
+    attempt_resource_releases: BTreeMap<(ForgeAttemptResource, &'static str), Counter>,
+    /// Execution-envelope failures by the resource whose persisted term was exhausted.
+    execution_envelope_failures: BTreeMap<ForgeAttemptResource, Counter>,
+    /// Audited legacy-envelope settlement outcomes.
+    legacy_envelopes_superseded: BTreeMap<&'static str, Counter>,
+    /// Retried durable failures by closed failure class.
+    retries: BTreeMap<super::error::ForgeFailureClass, Counter>,
+    /// Terminally poisoned work by closed failure class.
+    terminal_poisons: BTreeMap<super::error::ForgeFailureClass, Counter>,
+    /// Capacity refusals split between admission and execution.
+    capacity_refusals: BTreeMap<ForgeCapacityRefusalPhase, Counter>,
+    /// Current durable compaction debt by files and bytes.
+    compaction_debt: BTreeMap<&'static str, Gauge>,
+    /// Successful task progress effects by closed outcome.
+    progress_effects: BTreeMap<ForgeProgressEffect, Counter>,
     /// Current durable quarantine state for this worker process.
     quarantine_state: Gauge,
     /// Completed planning-demand transitions by closed result.
@@ -502,6 +629,67 @@ impl ForgeTelemetry {
                 )
             })
             .collect(),
+            attempt_resource_bytes: attempt_resource_histograms(),
+            attempt_resource_releases: attempt_resource_release_counters(),
+            execution_envelope_failures: ForgeAttemptResource::ALL
+                .into_iter()
+                .map(|resource| {
+                    (
+                        resource,
+                        metrics::counter!(
+                            "bifrost_forge_execution_envelope_failures_total",
+                            "resource" => resource.as_str()
+                        ),
+                    )
+                })
+                .collect(),
+            legacy_envelopes_superseded: ["replanned", "failed"]
+                .into_iter()
+                .map(|result| {
+                    (
+                        result,
+                        metrics::counter!(
+                            "bifrost_forge_legacy_envelopes_superseded_total",
+                            "result" => result
+                        ),
+                    )
+                })
+                .collect(),
+            retries: failure_class_counters("bifrost_forge_retries_total"),
+            terminal_poisons: failure_class_counters("bifrost_forge_terminal_poisons_total"),
+            capacity_refusals: ForgeCapacityRefusalPhase::ALL
+                .into_iter()
+                .map(|phase| {
+                    (
+                        phase,
+                        metrics::counter!(
+                            "bifrost_forge_capacity_refusals_total",
+                            "phase" => phase.as_str()
+                        ),
+                    )
+                })
+                .collect(),
+            compaction_debt: ["files", "bytes"]
+                .into_iter()
+                .map(|unit| {
+                    (
+                        unit,
+                        metrics::gauge!("bifrost_forge_compaction_debt", "unit" => unit),
+                    )
+                })
+                .collect(),
+            progress_effects: ForgeProgressEffect::ALL
+                .into_iter()
+                .map(|effect| {
+                    (
+                        effect,
+                        metrics::counter!(
+                            "bifrost_forge_progress_effects_total",
+                            "effect" => effect.as_str()
+                        ),
+                    )
+                })
+                .collect(),
             quarantine_state: metrics::gauge!("bifrost_forge_worker_quarantined"),
             demand_transitions: ForgeDemandTransitionResult::ALL
                 .into_iter()
@@ -730,11 +918,155 @@ impl ForgeTelemetry {
         self.failure_classes[&class].increment(1);
     }
 
+    /// Records one complete attempt resource envelope at its sole finalizer.
+    pub(crate) fn record_attempt_resources(&self, observation: ForgeResourceObservation) {
+        for (resource, planned, acquired, peak) in [
+            (
+                ForgeAttemptResource::Memory,
+                observation.planned_memory,
+                observation.acquired_memory,
+                observation.peak_memory,
+            ),
+            (
+                ForgeAttemptResource::Scratch,
+                observation.planned_scratch,
+                observation.acquired_scratch,
+                observation.peak_scratch,
+            ),
+        ] {
+            for (kind, bytes) in [
+                (ForgeResourceObservationKind::Planned, planned),
+                (ForgeResourceObservationKind::Acquired, acquired),
+                (ForgeResourceObservationKind::Peak, peak),
+            ] {
+                self.attempt_resource_bytes[&(resource, kind)]
+                    .record(bytes.to_f64().unwrap_or(f64::MAX));
+            }
+        }
+    }
+
+    /// Records the exactly-once release result for both resources in one lease.
+    pub(crate) fn record_attempt_release(
+        &self,
+        result: crate::resources::ForgeResourceReleaseResult,
+    ) {
+        let result = match result {
+            crate::resources::ForgeResourceReleaseResult::Released => "released",
+            crate::resources::ForgeResourceReleaseResult::Poisoned => "poisoned",
+        };
+        for resource in ForgeAttemptResource::ALL {
+            self.attempt_resource_releases[&(resource, result)].increment(1);
+        }
+    }
+
+    /// Records one typed capacity refusal at its actual phase boundary.
+    pub(super) fn record_capacity_refusal(&self, phase: ForgeCapacityRefusalPhase) {
+        self.capacity_refusals[&phase].increment(1);
+    }
+
+    /// Records an admitted execution term exhausting its persisted envelope.
+    pub(super) fn record_execution_envelope_failure(&self, resource: ForgeAttemptResource) {
+        self.execution_envelope_failures[&resource].increment(1);
+    }
+
+    /// Records whether audited legacy settlement created replacement demand.
+    pub(super) fn record_legacy_supersession(&self, replanned: bool) {
+        self.legacy_envelopes_superseded[if replanned { "replanned" } else { "failed" }]
+            .increment(1);
+    }
+
+    /// Records one retry selected by the closed durable settlement policy.
+    pub(super) fn record_retry(&self, class: super::error::ForgeFailureClass) {
+        self.retries[&class].increment(1);
+    }
+
+    /// Records one terminal failure selected by the closed durable settlement policy.
+    pub(super) fn record_terminal_poison(&self, class: super::error::ForgeFailureClass) {
+        self.terminal_poisons[&class].increment(1);
+    }
+
+    /// Publishes the complete current compaction debt snapshot.
+    pub(super) fn record_compaction_debt(&self, files: u64, bytes: u64) {
+        self.compaction_debt["files"].set(files.to_f64().unwrap_or(f64::MAX));
+        self.compaction_debt["bytes"].set(bytes.to_f64().unwrap_or(f64::MAX));
+    }
+
+    /// Records one successful durable progress effect.
+    pub(super) fn record_progress_effect(&self, effect: ForgeProgressEffect) {
+        self.progress_effects[&effect].increment(1);
+    }
+
     /// Publishes whether the local worker is durably quarantined.
     pub(super) fn record_quarantine_state(&self, quarantined: bool) {
         self.quarantine_state
             .set(if quarantined { 1.0 } else { 0.0 });
     }
+}
+
+/// Registers resource observations for every resource and lifecycle point.
+fn attempt_resource_histograms()
+-> BTreeMap<(ForgeAttemptResource, ForgeResourceObservationKind), Histogram> {
+    let mut histograms = BTreeMap::new();
+    for resource in ForgeAttemptResource::ALL {
+        for observation in ForgeResourceObservationKind::ALL {
+            histograms.insert(
+                (resource, observation),
+                metrics::histogram!(
+                    "bifrost_forge_attempt_resource_bytes",
+                    "resource" => resource.as_str(),
+                    "observation" => observation.as_str()
+                ),
+            );
+        }
+    }
+    histograms
+}
+
+/// Registers exactly-once release counters for every resource and result.
+fn attempt_resource_release_counters() -> BTreeMap<(ForgeAttemptResource, &'static str), Counter> {
+    let mut counters = BTreeMap::new();
+    for resource in ForgeAttemptResource::ALL {
+        for result in [
+            crate::resources::ForgeResourceReleaseResult::Released,
+            crate::resources::ForgeResourceReleaseResult::Poisoned,
+        ] {
+            let label = match result {
+                crate::resources::ForgeResourceReleaseResult::Released => "released",
+                crate::resources::ForgeResourceReleaseResult::Poisoned => "poisoned",
+            };
+            counters.insert(
+                (resource, label),
+                metrics::counter!(
+                    "bifrost_forge_attempt_resource_releases_total",
+                    "resource" => resource.as_str(),
+                    "result" => label
+                ),
+            );
+        }
+    }
+    counters
+}
+
+/// Registers one counter for each durable failure class without string fallback.
+fn failure_class_counters(
+    name: &'static str,
+) -> BTreeMap<super::error::ForgeFailureClass, Counter> {
+    [
+        super::error::ForgeFailureClass::DataRefusal,
+        super::error::ForgeFailureClass::TransientObjectStore,
+        super::error::ForgeFailureClass::TransientCoordination,
+        super::error::ForgeFailureClass::StorageHealth,
+        super::error::ForgeFailureClass::CapacityRefused,
+        super::error::ForgeFailureClass::InternalInvariant,
+    ]
+    .into_iter()
+    .map(|class| {
+        (
+            class,
+            metrics::counter!(name, "failure_class" => class.as_str()),
+        )
+    })
+    .collect()
 }
 
 impl Default for ForgeTelemetry {
@@ -882,8 +1214,10 @@ mod tests {
 
     #[cfg(test)]
     use super::{
-        ForgeCleanupKind, ForgeConflictKind, ForgeHintPersistenceResult, ForgeMetricSource,
-        ForgeTaskMetricStrategy, ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
+        ForgeAttemptResource, ForgeCapacityRefusalPhase, ForgeCleanupKind, ForgeConflictKind,
+        ForgeHintPersistenceResult, ForgeMetricSource, ForgeProgressEffect,
+        ForgeResourceObservation, ForgeResourceObservationKind, ForgeTaskMetricStrategy,
+        ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
     };
     #[cfg(test)]
     use crate::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
@@ -1067,6 +1401,39 @@ mod tests {
                 telemetry.record_cleanup(kind, Duration::ZERO);
             }
             telemetry.record_planning_status(Duration::from_secs(1), 1);
+            telemetry.record_attempt_resources(ForgeResourceObservation {
+                planned_memory: 64,
+                acquired_memory: 64,
+                peak_memory: 32,
+                planned_scratch: 128,
+                acquired_scratch: 128,
+                peak_scratch: 96,
+            });
+            telemetry
+                .record_attempt_release(crate::resources::ForgeResourceReleaseResult::Released);
+            telemetry
+                .record_attempt_release(crate::resources::ForgeResourceReleaseResult::Poisoned);
+            for resource in ForgeAttemptResource::ALL {
+                telemetry.record_execution_envelope_failure(resource);
+            }
+            telemetry.record_legacy_supersession(true);
+            telemetry.record_legacy_supersession(false);
+            for class in [
+                super::super::error::ForgeFailureClass::DataRefusal,
+                super::super::error::ForgeFailureClass::TransientObjectStore,
+                super::super::error::ForgeFailureClass::TransientCoordination,
+                super::super::error::ForgeFailureClass::StorageHealth,
+                super::super::error::ForgeFailureClass::CapacityRefused,
+                super::super::error::ForgeFailureClass::InternalInvariant,
+            ] {
+                telemetry.record_retry(class);
+                telemetry.record_terminal_poison(class);
+            }
+            telemetry.record_capacity_refusal(ForgeCapacityRefusalPhase::Admission);
+            telemetry.record_capacity_refusal(ForgeCapacityRefusalPhase::Execution);
+            telemetry.record_compaction_debt(7, 4096);
+            telemetry.record_progress_effect(ForgeProgressEffect::Changed);
+            telemetry.record_progress_effect(ForgeProgressEffect::AcknowledgedNoop);
             let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
             let pool: Arc<dyn MemoryPool> = Arc::new(BifrostDataFusionMemoryPool::new(governor));
             let reservation = MemoryConsumer::new("forge-owner-proof").register(&pool);
@@ -1093,6 +1460,16 @@ mod tests {
                 .keys()
                 .filter(|name| name.starts_with("bifrost_forge_conflicts_total{"))
                 .count();
+            let resource_observations = snapshot
+                .histograms
+                .keys()
+                .filter(|name| name.starts_with("bifrost_forge_attempt_resource_bytes{"))
+                .count();
+            let resource_releases = snapshot
+                .counters
+                .keys()
+                .filter(|name| name.starts_with("bifrost_forge_attempt_resource_releases_total{"))
+                .count();
             assert_eq!(
                 task_durations,
                 ForgeTaskMetricStrategy::ALL.len() * ForgeTaskTerminalResult::ALL.len()
@@ -1100,6 +1477,11 @@ mod tests {
             assert_eq!(spills, ForgeTaskMetricStrategy::ALL.len());
             assert_eq!(cleanups, ForgeCleanupKind::ALL.len());
             assert_eq!(conflicts, ForgeConflictKind::ALL.len());
+            assert_eq!(
+                resource_observations,
+                ForgeAttemptResource::ALL.len() * ForgeResourceObservationKind::ALL.len()
+            );
+            assert_eq!(resource_releases, ForgeAttemptResource::ALL.len() * 2);
 
             assert_owner_transition(
                 &recorder,

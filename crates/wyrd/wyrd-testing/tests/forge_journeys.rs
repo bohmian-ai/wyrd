@@ -39,7 +39,8 @@ use wyrd_spec::vala::api::{
 use wyrd_testing::bifrost::forge_harness::seed_forge_group;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, BifrostTopology, ForgeCausalDiagnosis, ForgeCausalTelemetryReport,
-    WyrdTestCluster, shared_process_telemetry_for_test,
+    ForgeTelemetryFailureClass, ForgeTelemetryResource, WyrdTestCluster,
+    shared_process_telemetry_for_test,
 };
 use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -879,6 +880,14 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
         .expect("inspect post-compaction Forge table");
     let rewrite = WyrdTestServer::compare_forge_rewrite_for_test(&before, &after, &planned_inputs)
         .expect("exact Forge replacement comparison");
+    let final_passes = server.completed_forge_scheduler_passes_for_test();
+    cluster.request_forge_scheduler_pass_for_test();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        server.wait_for_forge_scheduler_passes_for_test(final_passes + 1),
+    )
+    .await
+    .expect("final zero-debt scheduler observation");
     let delta = cluster
         .telemetry()
         .delta_since(&checkpoint)
@@ -913,6 +922,28 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
     );
     assert_eq!(report.capacity_refusals, 0);
     assert_eq!(report.internal_invariant_failures, 0);
+    assert_eq!(report.admission_capacity_refusals, 0);
+    assert_eq!(report.execution_capacity_refusals, 0);
+    assert!(
+        report
+            .execution_envelope_failures
+            .iter()
+            .all(|failure| failure.count == 0)
+    );
+    assert!(report.changed_progress_effects > 0);
+    assert_eq!(report.compaction_debt_files, 0);
+    assert_eq!(report.compaction_debt_bytes, 0);
+    assert!(report.attempt_resources.iter().all(|resource| {
+        resource.planned_bytes > 0.0
+            && resource.acquired_bytes == resource.planned_bytes
+            && resource.peak_bytes <= resource.acquired_bytes
+    }));
+    assert!(
+        report
+            .resource_releases
+            .iter()
+            .all(|release| { release.released > 0 && release.poisoned == 0 })
+    );
     cluster
         .shutdown()
         .await
@@ -1073,6 +1104,59 @@ async fn advance_transient_forge_retries(
         .commit()
         .await
         .expect("commit Forge-local retry clock step");
+}
+
+/// Advances one exact, durably classified transient Forge retry in the journey.
+///
+/// The guarded update repeats every classification and ownership predicate at
+/// the mutation boundary. `mature_same_volume` is reserved for convergence
+/// fixtures that intentionally cross the production same-volume fallback age;
+/// takeover proofs leave that bound intact.
+async fn advance_transient_forge_retry(
+    server: &WyrdTestServer,
+    task_id: uuid::Uuid,
+    expected_class: &str,
+    mature_same_volume: bool,
+) {
+    assert!(
+        matches!(
+            expected_class,
+            "transient_object_store" | "transient_coordination" | "storage_health"
+        ),
+        "journey retry helper accepts only closed transient classes"
+    );
+    let pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("Forge retry operator pool");
+    let updated = if mature_same_volume {
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp()-interval '15 minutes' \
+             WHERE task_id=$1 AND state='retryable' AND failure_class=$2 \
+             AND attempt_id IS NULL AND claimed_by IS NULL",
+        )
+        .bind(task_id)
+        .bind(expected_class)
+        .execute(pool.pool())
+        .await
+    } else {
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp() \
+             WHERE task_id=$1 AND state='retryable' AND failure_class=$2 \
+             AND attempt_id IS NULL AND claimed_by IS NULL",
+        )
+        .bind(task_id)
+        .bind(expected_class)
+        .execute(pool.pool())
+        .await
+    }
+    .expect("advance exact classified Forge retry")
+    .rows_affected();
+    assert_eq!(
+        updated, 1,
+        "exact Forge retry row must remain unclaimed and retain class {expected_class}"
+    );
 }
 
 /// Emits the complete causal diagnosis before failing a stalled convergence transition.
@@ -1240,11 +1324,7 @@ async fn unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over() {
             true
         )
     );
-    sqlx::query("UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp(),ready_at=statement_timestamp() WHERE task_id=$1")
-        .bind(task_id)
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("advance first backoff");
+    advance_transient_forge_retry(&server, task_id, "storage_health", false).await;
     let peer = ForgeWorker::new(
         Arc::clone(&bad_forge),
         ForgeWorkerConfig::default(),
@@ -1331,6 +1411,29 @@ async fn unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over() {
     assert_eq!(report.capacity_refusals, 0);
     assert!(report.quarantined_workers >= 1);
     assert!(report.rewrite_input_files >= 1 && report.rewrite_output_files >= 1);
+    assert_eq!(
+        report
+            .retries
+            .iter()
+            .find(|row| row.failure_class == ForgeTelemetryFailureClass::StorageHealth)
+            .expect("storage-health retry telemetry row")
+            .count,
+        1
+    );
+    assert!(report.attempt_resources.iter().all(|resource| {
+        matches!(
+            resource.resource,
+            ForgeTelemetryResource::Memory | ForgeTelemetryResource::Scratch
+        ) && resource.planned_bytes > 0.0
+            && resource.acquired_bytes == resource.planned_bytes
+            && resource.peak_bytes <= resource.acquired_bytes
+    }));
+    assert!(
+        report
+            .resource_releases
+            .iter()
+            .all(|release| { release.released > 0 && release.poisoned == 0 })
+    );
     server.shutdown().await.expect("takeover server shutdown");
 }
 
@@ -1392,23 +1495,26 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
         .expect("panic-retained durable attempt");
         assert_eq!(retained.2, "running");
         assert_eq!(retained.3, 0);
+        cluster.retain_panic_attempt_for_test(retained.0, retained.1);
         tokio::time::sleep(Duration::from_secs(5)).await;
         cluster
             .restart_node(node)
             .await
             .expect("fresh server restart");
-        let restarted = cluster.server_by_node(node).expect("restarted server");
-        let reclaimed = restarted
-            .reclaim_expired_forge_attempts_for_test(1)
+        let reclaimed = cluster
+            .reclaim_expired_forge_attempts_for_test(node, 1)
             .await
             .expect("production attempt reclaim");
         if !reclaimed.is_empty() {
             assert_eq!(reclaimed, vec![(retained.0, retained.1)]);
         }
-        cluster
-            .advance_reclaimed_panic_task_for_test(retained.0, retained.1)
-            .await
-            .expect("exact panic eligibility advance");
+        panic_recovery_clock_requires_exact_reclaimed_row(
+            &mut cluster,
+            fixture.operator_pool.pool(),
+            retained.0,
+            retained.1,
+        )
+        .await;
         let observer = cluster
             .forge_completion_observer()
             .expect("panic recovery completion observer");
@@ -1452,6 +1558,105 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
         assert_eq!(resources.forge_reader_permits_used, 0);
         cluster.shutdown().await.expect("panic recovery shutdown");
     }
+}
+
+/// Proves the panic-recovery clock seam rejects every ineligible durable shape.
+///
+/// The fixture mutates only the isolated reclaimed task to arrange each negative
+/// case, snapshots the full row excluding the two eligibility timestamps, and
+/// restores the exact production-reclaimed shape before the accepted call.
+///
+/// # Panics
+///
+/// Panics when a rejected shape changes any column, the accepted call changes a
+/// non-eligibility column, audit count changes, or retained evidence is reusable.
+async fn panic_recovery_clock_requires_exact_reclaimed_row(
+    cluster: &mut WyrdTestCluster,
+    pool: &sqlx::PgPool,
+    task_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+) {
+    let durable = async || {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(t)-'ready_at'-'next_eligible_at' FROM vala.forge_tasks t WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(pool)
+        .await
+        .expect("panic clock durable row")
+    };
+    let wrong_attempt_before = durable().await;
+    assert!(
+        cluster
+            .advance_reclaimed_panic_task_for_test(task_id, uuid::Uuid::now_v7())
+            .await
+            .is_err()
+    );
+    assert_eq!(durable().await, wrong_attempt_before);
+
+    for statement in [
+        "UPDATE vala.forge_tasks SET state='claimed',attempt_id=gen_random_uuid(),claimed_by=gen_random_uuid(),claim_expires_at=statement_timestamp()+interval '1 minute',watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL WHERE task_id=$1",
+        "UPDATE vala.forge_tasks SET state='running',attempt_id=gen_random_uuid(),claimed_by=gen_random_uuid(),claim_expires_at=statement_timestamp()+interval '1 minute',watermark_snapshot_id=0,watermark_timestamp_ms=0,failure_class=NULL WHERE task_id=$1",
+        "UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class='storage_health' WHERE task_id=$1",
+        "UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL,attempt_count=2 WHERE task_id=$1",
+        "UPDATE vala.forge_tasks SET state='ready',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL,attempt_count=0 WHERE task_id=$1",
+    ] {
+        sqlx::query(statement)
+            .bind(task_id)
+            .execute(pool)
+            .await
+            .expect("arrange rejected panic clock row");
+        let before = durable().await;
+        assert!(
+            cluster
+                .advance_reclaimed_panic_task_for_test(task_id, attempt_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(durable().await, before, "rejected clock step is immutable");
+    }
+    sqlx::query(
+        "UPDATE vala.forge_tasks SET state='retryable',attempt_count=1,failure_class=NULL,attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .expect("restore exact reclaimed panic row");
+    let audit_before = cluster
+        .audit_outbox_count_for_test()
+        .await
+        .expect("panic clock audit baseline");
+    let durable_before = durable().await;
+    let eligibility_before: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT ready_at,next_eligible_at FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(pool)
+            .await
+            .expect("panic clock eligibility baseline");
+    cluster
+        .advance_reclaimed_panic_task_for_test(task_id, attempt_id)
+        .await
+        .expect("exact panic eligibility advance");
+    assert_eq!(durable().await, durable_before);
+    let eligibility_after: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT ready_at,next_eligible_at FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(pool)
+            .await
+            .expect("panic clock eligibility result");
+    assert_ne!(eligibility_after, eligibility_before);
+    let audit_after = cluster
+        .audit_outbox_count_for_test()
+        .await
+        .expect("panic clock audit result");
+    assert_eq!(audit_after, audit_before);
+    assert!(
+        cluster
+            .advance_reclaimed_panic_task_for_test(task_id, attempt_id)
+            .await
+            .is_err(),
+        "reclaimed attempt evidence is single-use"
+    );
 }
 
 /// Runs real orphan collection and proves an aged, unreferenced object is deleted.

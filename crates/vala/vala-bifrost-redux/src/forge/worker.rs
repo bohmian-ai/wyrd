@@ -32,7 +32,7 @@ use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-use super::error::{ForgeError, ForgeFailureClass};
+use super::error::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
 use super::expire::{PendingExpiryTerminal, derive_recovered_files, table_resource_for_key};
 use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
@@ -41,8 +41,9 @@ use super::live_replace::{
 };
 use super::maintenance::{ForgeMaintenance, ForgeMaintenanceResult};
 use super::metrics::{
-    ForgeCleanupKind, ForgeConflictKind, ForgeDemandTransitionResult, ForgeLeaseResult,
-    ForgeMetricStage, ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
+    ForgeAttemptResource, ForgeCapacityRefusalPhase, ForgeCleanupKind, ForgeConflictKind,
+    ForgeDemandTransitionResult, ForgeLeaseResult, ForgeMetricStage, ForgeProgressEffect,
+    ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
 use super::path::catalog_path_to_object_key;
 use super::rewrite::ForgeRewritePipeline;
@@ -1302,7 +1303,12 @@ impl ForgeWorker {
             });
         }
         if task.estimates.envelope.is_none() {
-            return self.cancel_superseded(task).await;
+            let result = self.cancel_superseded(task).await;
+            self.forge
+                .core
+                .telemetry
+                .record_legacy_supersession(result.is_ok());
+            return result;
         }
         let binding = task_table_binding(
             task.data_tenant_id,
@@ -1858,6 +1864,7 @@ impl ForgeWorker {
             &self.forge.core.rewrite_spill_root,
             claim.task_id,
             attempt,
+            Arc::clone(&self.forge.core.telemetry),
         )
     }
 
@@ -2951,6 +2958,13 @@ impl ForgeWorker {
             .tenant_conn(claim.data_tenant_id)
             .await
             .map_err(ForgeError::Sql)?;
+        let progress_effect = task_progress_effect(
+            &claim.strategy,
+            claim.base_snapshot_id,
+            &claim.plan.parameters,
+            evidence.committed_snapshot_id != Some(claim.base_snapshot_id)
+                || evidence.deleted_candidate_count > 0,
+        );
         self.tasks
             .terminal_and_request_replan(
                 &mut terminal,
@@ -2962,13 +2976,7 @@ impl ForgeWorker {
                     next: ForgeTaskState::Succeeded,
                 },
                 &claim.table_ref,
-                task_progress_effect(
-                    &claim.strategy,
-                    claim.base_snapshot_id,
-                    &claim.plan.parameters,
-                    evidence.committed_snapshot_id != Some(claim.base_snapshot_id)
-                        || evidence.deleted_candidate_count > 0,
-                ),
+                progress_effect,
                 &task_event(
                     claim.task_id,
                     ForgeTaskState::Succeeded,
@@ -2983,6 +2991,13 @@ impl ForgeWorker {
             .core
             .telemetry
             .record_demand_transition(ForgeDemandTransitionResult::Continued);
+        self.forge.core.telemetry.record_progress_effect(
+            if matches!(progress_effect, TaskProgressEffect::Progressed) {
+                ForgeProgressEffect::Changed
+            } else {
+                ForgeProgressEffect::AcknowledgedNoop
+            },
+        );
         Ok(())
     }
 
@@ -3033,6 +3048,13 @@ impl ForgeWorker {
             .core
             .telemetry
             .record_demand_transition(ForgeDemandTransitionResult::Continued);
+        self.forge.core.telemetry.record_progress_effect(
+            if matches!(progress_effect, TaskProgressEffect::Progressed) {
+                ForgeProgressEffect::Changed
+            } else {
+                ForgeProgressEffect::AcknowledgedNoop
+            },
+        );
         Ok(())
     }
 
@@ -3086,12 +3108,31 @@ impl ForgeWorker {
         match error {
             ForgeError::Shutdown => self.release_cancelled_claim(claim.task_id, attempt).await,
             ForgeError::Capacity { .. } => {
-                self.record_capacity_refusal(claim.task_id, attempt).await
+                self.record_capacity_refusal(claim.task_id, attempt).await?;
+                self.forge
+                    .core
+                    .telemetry
+                    .record_capacity_refusal(ForgeCapacityRefusalPhase::Admission);
+                Ok(())
             }
             ForgeError::ShutdownRetained => Ok(()),
             _ => {
                 let class = error.failure_class();
                 self.forge.core.telemetry.record_failure_class(class);
+                let execution_envelope_resource = if error.capacity_failure_phase()
+                    == Some(ForgeCapacityFailurePhase::Execution)
+                {
+                    Some(match error {
+                        ForgeError::ExecutionEnvelopeExceeded {
+                            resource: "scratch",
+                            ..
+                        }
+                        | ForgeError::SpillLimitExceeded { .. } => ForgeAttemptResource::Scratch,
+                        _ => ForgeAttemptResource::Memory,
+                    })
+                } else {
+                    None
+                };
                 let volume = if class == ForgeFailureClass::StorageHealth {
                     let volume = self.scratch_volume_identity()?;
                     self.tasks
@@ -3116,7 +3157,8 @@ impl ForgeWorker {
                         volume.as_ref().map(ScratchVolumeIdentity::as_str),
                         error.to_string(),
                     )
-                    .await
+                    .await?;
+                    self.forge.core.telemetry.record_terminal_poison(class);
                 } else {
                     self.tasks
                         .retry_failure(
@@ -3128,8 +3170,20 @@ impl ForgeWorker {
                         )
                         .await
                         .map(|_| ())
-                        .map_err(ForgeError::Sql)
+                        .map_err(ForgeError::Sql)?;
+                    self.forge.core.telemetry.record_retry(class);
                 }
+                if let Some(resource) = execution_envelope_resource {
+                    self.forge
+                        .core
+                        .telemetry
+                        .record_capacity_refusal(ForgeCapacityRefusalPhase::Execution);
+                    self.forge
+                        .core
+                        .telemetry
+                        .record_execution_envelope_failure(resource);
+                }
+                Ok(())
             }
         }
     }

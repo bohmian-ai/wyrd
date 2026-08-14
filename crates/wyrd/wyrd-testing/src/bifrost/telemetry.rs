@@ -2554,6 +2554,74 @@ pub struct ForgeDiscoveredCandidateTelemetry {
     pub bytes_sum: f64,
 }
 
+/// Closed Forge attempt resource projected from production metric labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum ForgeTelemetryResource {
+    /// Resident memory owned through the attempt-local pool.
+    Memory,
+    /// Disposable sort and pending-output scratch.
+    Scratch,
+}
+
+/// Planned, acquired, and peak observations for one Forge attempt resource.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ForgeAttemptResourceTelemetry {
+    /// Closed resource represented by this row.
+    pub resource: ForgeTelemetryResource,
+    /// Sum of authoritative planned bytes in the capture window.
+    pub planned_bytes: f64,
+    /// Sum of exact acquired bytes in the capture window.
+    pub acquired_bytes: f64,
+    /// Sum of conservative observed peak bytes in the capture window.
+    pub peak_bytes: f64,
+}
+
+/// Exactly-once release counts for one Forge attempt resource.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ForgeResourceReleaseTelemetry {
+    /// Closed resource represented by this row.
+    pub resource: ForgeTelemetryResource,
+    /// Attempts whose exact lease returned successfully.
+    pub released: u64,
+    /// Attempts whose untrusted lease remained charged after poison.
+    pub poisoned: u64,
+}
+
+/// One exact counter projected for a closed Forge attempt resource.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ForgeResourceCountTelemetry {
+    /// Closed resource represented by this row.
+    pub resource: ForgeTelemetryResource,
+    /// Exact counter delta for this resource.
+    pub count: u64,
+}
+
+/// Closed durable Forge failure class projected from production labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum ForgeTelemetryFailureClass {
+    /// Deterministic unsafe or incompatible input data.
+    DataRefusal,
+    /// Retryable object-store or catalog transport failure.
+    TransientObjectStore,
+    /// Retryable SQL, lease, fence, or coordination failure.
+    TransientCoordination,
+    /// Unhealthy local scratch volume requiring quarantine.
+    StorageHealth,
+    /// Root admission or persisted execution-envelope refusal.
+    CapacityRefused,
+    /// Internal configuration, schema, or runtime invariant failure.
+    InternalInvariant,
+}
+
+/// One failure-class counter projected from a closed Forge family.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ForgeFailureClassTelemetry {
+    /// Closed durable failure class.
+    pub failure_class: ForgeTelemetryFailureClass,
+    /// Exact counter delta for this class.
+    pub count: u64,
+}
+
 /// Closed Forge span name retained by causal diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ForgeCausalSpanName {
@@ -2621,6 +2689,32 @@ pub struct ForgeCausalTelemetryReport {
     pub capacity_refusals: u64,
     /// Durable worker settlements classified as invariant failures.
     pub internal_invariant_failures: u64,
+    /// Planned, acquired, and peak observations for memory and scratch.
+    pub attempt_resources: Vec<ForgeAttemptResourceTelemetry>,
+    /// Released and poisoned finalization counts for memory and scratch.
+    pub resource_releases: Vec<ForgeResourceReleaseTelemetry>,
+    /// Execution-envelope failures split by memory and scratch.
+    pub execution_envelope_failures: Vec<ForgeResourceCountTelemetry>,
+    /// Legacy envelopes auditedly superseded and replanned.
+    pub legacy_envelopes_replanned: u64,
+    /// Legacy envelope supersession attempts that failed transactionally.
+    pub legacy_envelope_supersession_failures: u64,
+    /// Retry selections across the complete six-class failure inventory.
+    pub retries: Vec<ForgeFailureClassTelemetry>,
+    /// Terminal poison selections across the complete six-class inventory.
+    pub terminal_poisons: Vec<ForgeFailureClassTelemetry>,
+    /// Capacity refusals before execution or input IO.
+    pub admission_capacity_refusals: u64,
+    /// Persisted execution-envelope capacity failures.
+    pub execution_capacity_refusals: u64,
+    /// Current complete-pass compaction debt measured in candidate files.
+    pub compaction_debt_files: u64,
+    /// Current complete-pass compaction debt measured in candidate bytes.
+    pub compaction_debt_bytes: u64,
+    /// Successful tasks that changed durable state.
+    pub changed_progress_effects: u64,
+    /// Snapshot-expiry tasks that honestly acknowledged no durable change.
+    pub acknowledged_noop_progress_effects: u64,
     /// Maximum observed number of quarantined local workers in this process.
     pub quarantined_workers: u64,
     /// Maximum observed durable planning backlog.
@@ -2872,6 +2966,25 @@ impl<'a> ForgeCausalReportBuilder<'a> {
                 "scheduler counters and succeeded span disagree",
             ));
         }
+        let attempt_resources = causal_attempt_resources(self.delta)?;
+        for observation in &attempt_resources {
+            if observation.acquired_bytes != observation.planned_bytes
+                || observation.peak_bytes > observation.acquired_bytes
+            {
+                return Err(causal_binding(
+                    "Forge attempt resource telemetry violates peak <= acquired == planned",
+                ));
+            }
+        }
+        let resource_releases = causal_resource_releases(self.delta)?;
+        if resource_releases.len() != 2
+            || resource_releases[0].released != resource_releases[1].released
+            || resource_releases[0].poisoned != resource_releases[1].poisoned
+        {
+            return Err(causal_binding(
+                "Forge memory and scratch release outcomes disagree",
+            ));
+        }
         Ok(ForgeCausalTelemetryReport {
             accepted_hints,
             full_hints: causal_count(
@@ -2937,6 +3050,59 @@ impl<'a> ForgeCausalReportBuilder<'a> {
                 self.delta,
                 "bifrost_forge_task_failures_total",
                 &[("failure_class", "internal_invariant")],
+            )?,
+            attempt_resources,
+            resource_releases,
+            execution_envelope_failures: causal_resource_counts(
+                self.delta,
+                "bifrost_forge_execution_envelope_failures_total",
+            )?,
+            legacy_envelopes_replanned: causal_count(
+                self.delta,
+                "bifrost_forge_legacy_envelopes_superseded_total",
+                &[("result", "replanned")],
+            )?,
+            legacy_envelope_supersession_failures: causal_count(
+                self.delta,
+                "bifrost_forge_legacy_envelopes_superseded_total",
+                &[("result", "failed")],
+            )?,
+            retries: causal_failure_class_counts(self.delta, "bifrost_forge_retries_total")?,
+            terminal_poisons: causal_failure_class_counts(
+                self.delta,
+                "bifrost_forge_terminal_poisons_total",
+            )?,
+            admission_capacity_refusals: causal_count(
+                self.delta,
+                "bifrost_forge_capacity_refusals_total",
+                &[("phase", "admission")],
+            )?,
+            execution_capacity_refusals: causal_count(
+                self.delta,
+                "bifrost_forge_capacity_refusals_total",
+                &[("phase", "execution")],
+            )?,
+            compaction_debt_files: causal_labeled_gauge_count(
+                self.delta,
+                "bifrost_forge_compaction_debt",
+                "unit",
+                "files",
+            )?,
+            compaction_debt_bytes: causal_labeled_gauge_count(
+                self.delta,
+                "bifrost_forge_compaction_debt",
+                "unit",
+                "bytes",
+            )?,
+            changed_progress_effects: causal_count(
+                self.delta,
+                "bifrost_forge_progress_effects_total",
+                &[("effect", "changed")],
+            )?,
+            acknowledged_noop_progress_effects: causal_count(
+                self.delta,
+                "bifrost_forge_progress_effects_total",
+                &[("effect", "acknowledged_noop")],
             )?,
             quarantined_workers: causal_gauge_count(
                 self.delta,
@@ -3009,6 +3175,15 @@ fn validate_causal_metric_contract(
         "bifrost_forge_scheduling_total",
         "bifrost_forge_demand_transitions_total",
         "bifrost_forge_task_failures_total",
+        "bifrost_forge_attempt_resource_bytes",
+        "bifrost_forge_attempt_resource_releases_total",
+        "bifrost_forge_execution_envelope_failures_total",
+        "bifrost_forge_legacy_envelopes_superseded_total",
+        "bifrost_forge_retries_total",
+        "bifrost_forge_terminal_poisons_total",
+        "bifrost_forge_capacity_refusals_total",
+        "bifrost_forge_compaction_debt",
+        "bifrost_forge_progress_effects_total",
         "bifrost_forge_worker_quarantined",
         "bifrost_forge_discovered_candidate_files",
         "bifrost_forge_discovered_candidate_bytes",
@@ -3076,6 +3251,48 @@ fn validate_causal_metric_contract(
                     ],
                 )],
             ),
+            "bifrost_forge_attempt_resource_bytes" => (
+                &["resource", "observation", "le"],
+                &[
+                    ("resource", &["memory", "scratch"]),
+                    ("observation", &["planned", "acquired", "peak"]),
+                ],
+            ),
+            "bifrost_forge_attempt_resource_releases_total" => (
+                &["resource", "result"],
+                &[
+                    ("resource", &["memory", "scratch"]),
+                    ("result", &["released", "poisoned"]),
+                ],
+            ),
+            "bifrost_forge_execution_envelope_failures_total" => {
+                (&["resource"], &[("resource", &["memory", "scratch"])])
+            }
+            "bifrost_forge_legacy_envelopes_superseded_total" => {
+                (&["result"], &[("result", &["replanned", "failed"])])
+            }
+            "bifrost_forge_retries_total" | "bifrost_forge_terminal_poisons_total" => (
+                &["failure_class"],
+                &[(
+                    "failure_class",
+                    &[
+                        "data_refusal",
+                        "transient_object_store",
+                        "transient_coordination",
+                        "storage_health",
+                        "capacity_refused",
+                        "internal_invariant",
+                    ],
+                )],
+            ),
+            "bifrost_forge_capacity_refusals_total" => {
+                (&["phase"], &[("phase", &["admission", "execution"])])
+            }
+            "bifrost_forge_compaction_debt" => (&["unit"], &[("unit", &["files", "bytes"])]),
+            "bifrost_forge_progress_effects_total" => (
+                &["effect"],
+                &[("effect", &["changed", "acknowledged_noop"])],
+            ),
             "bifrost_forge_worker_quarantined" => (&[], &[]),
             "bifrost_forge_discovered_candidate_files"
             | "bifrost_forge_discovered_candidate_bytes" => (
@@ -3140,6 +3357,160 @@ fn validate_causal_metric_contract(
         validate_sample_labels(sample, allowed, categorical)?;
     }
     Ok(())
+}
+
+/// Project planned, acquired, and peak bytes for both closed attempt resources.
+///
+/// # Errors
+///
+/// Returns a typed report error when a required histogram sum is invalid.
+fn causal_attempt_resources(
+    delta: &BifrostTelemetryDelta,
+) -> Result<Vec<ForgeAttemptResourceTelemetry>, BifrostTelemetryReportError> {
+    [
+        (ForgeTelemetryResource::Memory, "memory"),
+        (ForgeTelemetryResource::Scratch, "scratch"),
+    ]
+    .into_iter()
+    .map(|(resource, label)| {
+        Ok(ForgeAttemptResourceTelemetry {
+            resource,
+            planned_bytes: causal_histogram_sum(
+                delta,
+                "bifrost_forge_attempt_resource_bytes",
+                &[("resource", label), ("observation", "planned")],
+            )?,
+            acquired_bytes: causal_histogram_sum(
+                delta,
+                "bifrost_forge_attempt_resource_bytes",
+                &[("resource", label), ("observation", "acquired")],
+            )?,
+            peak_bytes: causal_histogram_sum(
+                delta,
+                "bifrost_forge_attempt_resource_bytes",
+                &[("resource", label), ("observation", "peak")],
+            )?,
+        })
+    })
+    .collect()
+}
+
+/// Project exactly-once release outcomes for both attempt resources.
+///
+/// # Errors
+///
+/// Returns a typed report error when a release counter is not an exact `u64`.
+fn causal_resource_releases(
+    delta: &BifrostTelemetryDelta,
+) -> Result<Vec<ForgeResourceReleaseTelemetry>, BifrostTelemetryReportError> {
+    [
+        (ForgeTelemetryResource::Memory, "memory"),
+        (ForgeTelemetryResource::Scratch, "scratch"),
+    ]
+    .into_iter()
+    .map(|(resource, label)| {
+        Ok(ForgeResourceReleaseTelemetry {
+            resource,
+            released: causal_count(
+                delta,
+                "bifrost_forge_attempt_resource_releases_total",
+                &[("resource", label), ("result", "released")],
+            )?,
+            poisoned: causal_count(
+                delta,
+                "bifrost_forge_attempt_resource_releases_total",
+                &[("resource", label), ("result", "poisoned")],
+            )?,
+        })
+    })
+    .collect()
+}
+
+/// Project one exact resource counter family in stable resource order.
+///
+/// # Errors
+///
+/// Returns a typed report error when a counter is not an exact `u64`.
+fn causal_resource_counts(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+) -> Result<Vec<ForgeResourceCountTelemetry>, BifrostTelemetryReportError> {
+    [
+        (ForgeTelemetryResource::Memory, "memory"),
+        (ForgeTelemetryResource::Scratch, "scratch"),
+    ]
+    .into_iter()
+    .map(|(resource, label)| {
+        Ok(ForgeResourceCountTelemetry {
+            resource,
+            count: causal_count(delta, family, &[("resource", label)])?,
+        })
+    })
+    .collect()
+}
+
+/// Project one six-class failure counter family in stable class order.
+///
+/// # Errors
+///
+/// Returns a typed report error when a counter is not an exact `u64`.
+fn causal_failure_class_counts(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+) -> Result<Vec<ForgeFailureClassTelemetry>, BifrostTelemetryReportError> {
+    [
+        (ForgeTelemetryFailureClass::DataRefusal, "data_refusal"),
+        (
+            ForgeTelemetryFailureClass::TransientObjectStore,
+            "transient_object_store",
+        ),
+        (
+            ForgeTelemetryFailureClass::TransientCoordination,
+            "transient_coordination",
+        ),
+        (ForgeTelemetryFailureClass::StorageHealth, "storage_health"),
+        (
+            ForgeTelemetryFailureClass::CapacityRefused,
+            "capacity_refused",
+        ),
+        (
+            ForgeTelemetryFailureClass::InternalInvariant,
+            "internal_invariant",
+        ),
+    ]
+    .into_iter()
+    .map(|(failure_class, label)| {
+        Ok(ForgeFailureClassTelemetry {
+            failure_class,
+            count: causal_count(delta, family, &[("failure_class", label)])?,
+        })
+    })
+    .collect()
+}
+
+/// Return one labeled final gauge value as an exact count.
+///
+/// # Errors
+///
+/// Returns a typed report error when the labeled gauge is absent or invalid.
+fn causal_labeled_gauge_count(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+    key: &str,
+    value: &str,
+) -> Result<u64, BifrostTelemetryReportError> {
+    let observed = delta
+        .gauge_final
+        .iter()
+        .filter(|sample| {
+            sample.family == family && sample.labels.get(key).map(String::as_str) == Some(value)
+        })
+        .map(|sample| sample.value)
+        .reduce(f64::max)
+        .ok_or_else(|| BifrostTelemetryReportError::MissingSeries {
+            family: family.to_owned(),
+        })?;
+    checked_causal_u64(observed, family)
 }
 
 /// Return one exact non-negative integer counter or histogram count.
@@ -3878,10 +4249,54 @@ fn validate_forge_label_contract(
                     &[
                         "data_refusal",
                         "transient_object_store",
+                        "transient_coordination",
                         "storage_health",
                         "capacity_refused",
+                        "internal_invariant",
                     ],
                 )],
+            ),
+            "bifrost_forge_attempt_resource_bytes" => (
+                &["resource", "observation", "le"],
+                &[
+                    ("resource", &["memory", "scratch"]),
+                    ("observation", &["planned", "acquired", "peak"]),
+                ],
+            ),
+            "bifrost_forge_attempt_resource_releases_total" => (
+                &["resource", "result"],
+                &[
+                    ("resource", &["memory", "scratch"]),
+                    ("result", &["released", "poisoned"]),
+                ],
+            ),
+            "bifrost_forge_execution_envelope_failures_total" => {
+                (&["resource"], &[("resource", &["memory", "scratch"])])
+            }
+            "bifrost_forge_legacy_envelopes_superseded_total" => {
+                (&["result"], &[("result", &["replanned", "failed"])])
+            }
+            "bifrost_forge_retries_total" | "bifrost_forge_terminal_poisons_total" => (
+                &["failure_class"],
+                &[(
+                    "failure_class",
+                    &[
+                        "data_refusal",
+                        "transient_object_store",
+                        "transient_coordination",
+                        "storage_health",
+                        "capacity_refused",
+                        "internal_invariant",
+                    ],
+                )],
+            ),
+            "bifrost_forge_capacity_refusals_total" => {
+                (&["phase"], &[("phase", &["admission", "execution"])])
+            }
+            "bifrost_forge_compaction_debt" => (&["unit"], &[("unit", &["files", "bytes"])]),
+            "bifrost_forge_progress_effects_total" => (
+                &["effect"],
+                &[("effect", &["changed", "acknowledged_noop"])],
             ),
             "bifrost_memory_reserved_bytes" => (&["consumer"], &[]),
             "bifrost_memory_reservations_total" => (
@@ -6737,8 +7152,23 @@ mod tests {
             demand_transition_failures: 0,
             data_refusals: 0,
             transient_object_store_failures: 0,
+            transient_coordination_failures: 0,
             storage_health_failures: 0,
             capacity_refusals: 0,
+            internal_invariant_failures: 0,
+            attempt_resources: Vec::new(),
+            resource_releases: Vec::new(),
+            execution_envelope_failures: Vec::new(),
+            legacy_envelopes_replanned: 0,
+            legacy_envelope_supersession_failures: 0,
+            retries: Vec::new(),
+            terminal_poisons: Vec::new(),
+            admission_capacity_refusals: 0,
+            execution_capacity_refusals: 0,
+            compaction_debt_files: 0,
+            compaction_debt_bytes: 0,
+            changed_progress_effects: 0,
+            acknowledged_noop_progress_effects: 0,
             quarantined_workers: 0,
             planning_backlog: 1,
             oldest_demand_seconds: 0.1,

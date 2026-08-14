@@ -15,7 +15,6 @@ use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use num_traits::ToPrimitive;
 
 use crate::contracts::ScribeError;
-use crate::scribe::admission::MAX_REQUEST_BYTES;
 
 #[cfg(test)]
 static CGROUP_CURRENT_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -36,19 +35,109 @@ const MIN_CHILD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHILD_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MIN_BUCKET_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BUCKET_BYTES: usize = 512 * 1024 * 1024;
+/// Complete conservative owner shared by both T4 Parquet producer paths.
+pub(crate) const PARQUET_PRODUCER_OWNER_BYTES: usize = 256 * 1024 * 1024;
+/// Exact encoded-footer child held from before writer creation through inspection.
+pub(crate) const PARQUET_FOOTER_CHILD_BYTES: usize = 8 * 1024 * 1024;
 const SHARD_ACCOUNTING_COUNT: usize = 16;
 /// Number of bounded lifecycle memory categories.
 pub const MEMORY_CATEGORY_COUNT: usize = 8;
 
-/// Returns the workspace persistence must reserve to encode one generation.
+/// Returns the checked delta needed beside an admitted generation.
 ///
-/// The reservation covers a sort copy, Parquet output, and the fixed eight
-/// mebibytes of encoder overhead.
-#[must_use]
-pub(crate) fn persistence_workspace_bytes(arrow_bytes: usize) -> usize {
-    arrow_bytes
-        .saturating_mul(2)
-        .saturating_add(8 * 1024 * 1024)
+/// The immutable charge is transferred conceptually into the complete 256 MiB
+/// producer owner and is never charged a second time.
+///
+/// Only the current generation's checked immutable ownership contributes to
+/// the complete producer owner. A single generation larger than that owner is
+/// refused before encoder construction because it cannot fit the fixed floor.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::IngestBusy`] when `generation_bytes` exceeds the
+/// complete conservative producer owner.
+pub(crate) fn parquet_producer_delta(generation_bytes: usize) -> Result<usize, ScribeError> {
+    if generation_bytes > PARQUET_PRODUCER_OWNER_BYTES {
+        return Err(ScribeError::IngestBusy {
+            table: "memory".to_owned(),
+        });
+    }
+    Ok(PARQUET_PRODUCER_OWNER_BYTES.saturating_sub(generation_bytes))
+}
+
+/// Move-only encoded-footer child split from the complete producer owner.
+///
+/// Carrying this token into the CPU lane proves the exact eight-mebibyte
+/// allowance remains charged from before encoder construction until every
+/// sealed footer has been inspected. Dropping it restores those bytes to the
+/// remaining producer reservation without changing aggregate accounting.
+#[derive(Debug)]
+pub(crate) struct EncodedFooterReservation {
+    /// Exact checked memory reservation backing the footer child.
+    reservation: Option<MemoryReservation>,
+}
+
+impl EncodedFooterReservation {
+    /// Splits the exact footer child from an already-admitted producer owner.
+    ///
+    /// # Errors
+    /// Returns an internal error when the producer owner cannot supply the
+    /// exact eight-mebibyte child.
+    pub(crate) fn split_from(owner: &mut MemoryReservation) -> Result<Self, ScribeError> {
+        Ok(Self {
+            reservation: Some(owner.split(PARQUET_FOOTER_CHILD_BYTES)?),
+        })
+    }
+
+    /// Transfers the footer child from the complete producer ownership tuple.
+    ///
+    /// The checked delta supplies the child when it owns at least eight MiB.
+    /// Larger immutable generations already carry that memory, so the token
+    /// records a category transition without double charging the governor.
+    ///
+    /// # Errors
+    /// Returns an internal error only when neither reservation nor immutable
+    /// ownership can cover the exact footer child.
+    pub(crate) fn transfer_from(
+        owner: &mut MemoryReservation,
+        immutable_bytes: usize,
+    ) -> Result<Self, ScribeError> {
+        if owner.bytes() >= PARQUET_FOOTER_CHILD_BYTES {
+            return Self::split_from(owner);
+        }
+        if immutable_bytes >= PARQUET_FOOTER_CHILD_BYTES {
+            return Ok(Self { reservation: None });
+        }
+        Err(ScribeError::Internal {
+            detail: "complete producer owner cannot supply its encoded-footer child".to_owned(),
+        })
+    }
+
+    /// Returns the exact bytes retained by this child.
+    #[must_use]
+    pub(crate) fn bytes(&self) -> usize {
+        self.reservation
+            .as_ref()
+            .map_or(PARQUET_FOOTER_CHILD_BYTES, MemoryReservation::bytes)
+    }
+
+    /// Constructs an isolated exact footer child for pure encoder tests.
+    ///
+    /// # Panics
+    /// Panics only if the fixed test governor cannot admit its exact footer
+    /// child, which would mean the production memory invariant regressed.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let governor = BifrostMemoryGovernor::new(512 * 1024 * 1024)
+            .expect("footer test governor must satisfy the production floor");
+        let reservation = governor
+            .scribe_budget()
+            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_FOOTER_CHILD_BYTES)
+            .expect("footer test child must fit the production floor");
+        Self {
+            reservation: Some(reservation),
+        }
+    }
 }
 
 /// Target size for one active bucket (`S / 4`) within the fixed bucket bounds.
@@ -69,7 +158,7 @@ fn active_bucket_target_for(scribe_limit: usize) -> usize {
 /// without a [`ScribeMemoryBudget`] handle (D75 formula unchanged).
 #[must_use]
 fn persistence_headroom_for(scribe_limit: usize) -> usize {
-    persistence_workspace_bytes(active_bucket_target_for(scribe_limit).max(2 * MAX_REQUEST_BYTES))
+    PARQUET_PRODUCER_OWNER_BYTES.min(scribe_limit)
 }
 
 /// Child-budget ceiling available to ingress reservations, from `scribe_limit`.
@@ -1798,8 +1887,15 @@ impl ScribeMemoryBudget {
                 .as_ref()
                 .map(|resources| resources.try_acquire_scribe(delta))
                 .transpose()
-                .map_err(|error| ScribeError::Internal {
-                    detail: error.to_string(),
+                .map_err(|error| match error {
+                    crate::resources::BifrostResourceError::Poisoned { .. } => {
+                        ScribeError::Internal {
+                            detail: error.to_string(),
+                        }
+                    }
+                    _ => ScribeError::IngestBusy {
+                        table: "memory".to_owned(),
+                    },
                 })?;
             self.parent.inner.categories[category as usize]
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -3133,6 +3229,98 @@ fn read_meminfo_limit() -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// Immutable transfer plus its checked delta is exactly one 256 MiB owner.
+    #[test]
+    fn parquet_producer_owner_transfers_without_double_charge() {
+        for immutable in [1, 8 * 1024 * 1024, 64 * 1024 * 1024] {
+            let delta = parquet_producer_delta(immutable).expect("bounded generation");
+            assert_eq!(immutable + delta, PARQUET_PRODUCER_OWNER_BYTES);
+            assert!(
+                delta
+                    >= usize::try_from(crate::parquet::memory::MAX_FOOTER_ENCODED_BYTES)
+                        .expect("footer ceiling fits address space")
+            );
+        }
+        assert_eq!(
+            parquet_producer_delta(PARQUET_PRODUCER_OWNER_BYTES).expect("bounded generation"),
+            0
+        );
+        assert!(parquet_producer_delta(PARQUET_PRODUCER_OWNER_BYTES + 1).is_err());
+
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
+            512 * 1024 * 1024,
+            Some(256 * 1024 * 1024),
+            Some(256 * 1024 * 1024),
+        )
+        .expect("producer test governor");
+        let budget = governor.scribe_budget();
+        let baseline = budget.snapshot().total_bytes();
+        let mut owner = budget
+            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_PRODUCER_OWNER_BYTES)
+            .expect("complete producer owner");
+        let footer = EncodedFooterReservation::split_from(&mut owner).expect("exact footer child");
+        assert_eq!(footer.bytes(), PARQUET_FOOTER_CHILD_BYTES);
+        assert_eq!(
+            owner.bytes(),
+            PARQUET_PRODUCER_OWNER_BYTES - PARQUET_FOOTER_CHILD_BYTES
+        );
+        assert_eq!(
+            budget.snapshot().total_bytes(),
+            PARQUET_PRODUCER_OWNER_BYTES
+        );
+        drop(footer);
+        drop(owner);
+        assert_eq!(budget.snapshot().total_bytes(), baseline);
+
+        let mut exact = budget
+            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_FOOTER_CHILD_BYTES)
+            .expect("exact footer allowance");
+        let exact_child = EncodedFooterReservation::split_from(&mut exact)
+            .expect("exact footer allowance splits");
+        assert_eq!(exact.bytes(), 0);
+        drop(exact_child);
+        drop(exact);
+        let mut one_over = budget
+            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_FOOTER_CHILD_BYTES)
+            .expect("one-over refusal owner");
+        assert!(one_over.split(PARQUET_FOOTER_CHILD_BYTES + 1).is_err());
+        drop(one_over);
+        assert_eq!(budget.snapshot().total_bytes(), baseline);
+    }
+
+    /// Unrelated Scribe ownership cannot satisfy another generation's producer floor.
+    #[test]
+    fn parquet_producer_delta_does_not_alias_concurrent_ownership() {
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
+            512 * 1024 * 1024,
+            Some(PARQUET_PRODUCER_OWNER_BYTES),
+            Some(PARQUET_PRODUCER_OWNER_BYTES),
+        )
+        .expect("producer concurrency governor");
+        let budget = governor.scribe_budget();
+        let unrelated = budget
+            .try_reserve(MemoryCategory::Active, 64 * 1024 * 1024)
+            .expect("unrelated active owner");
+        let generation = budget
+            .try_reserve(MemoryCategory::Immutable, 64 * 1024 * 1024)
+            .expect("current immutable owner");
+        let delta = parquet_producer_delta(generation.bytes()).expect("bounded generation");
+        assert!(
+            budget
+                .try_reserve_maintenance(MemoryCategory::Persistence, delta)
+                .is_err(),
+            "unrelated ownership must force refusal instead of funding this producer"
+        );
+        drop(unrelated);
+        let producer = budget
+            .try_reserve_maintenance(MemoryCategory::Persistence, delta)
+            .expect("generation-specific delta fits after unrelated release");
+        assert_eq!(
+            generation.bytes() + producer.bytes(),
+            PARQUET_PRODUCER_OWNER_BYTES
+        );
+    }
+
     #[test]
     fn derives_scribe_budget_from_pod_budget() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
@@ -3150,12 +3338,12 @@ mod tests {
         // For each (scribe_limit, oracle_limit, expected_ingress_ceiling) triple.
         // oracle_limit must fit in the parent alongside scribe_limit.
         for (scribe_limit, oracle_limit, expected_ceiling) in [
-            (256 * 1024 * 1024, 256 * 1024 * 1024, 120 * 1024 * 1024),
-            (1024 * 1024 * 1024, 256 * 1024 * 1024, 504 * 1024 * 1024),
+            (256 * 1024 * 1024, 256 * 1024 * 1024, 64 * 1024 * 1024),
+            (1024 * 1024 * 1024, 256 * 1024 * 1024, 768 * 1024 * 1024),
             (
                 8 * 1024 * 1024 * 1024,
                 256 * 1024 * 1024,
-                7_160 * 1024 * 1024,
+                7_936 * 1024 * 1024,
             ),
         ] {
             let pod_limit = if scribe_limit == 8 * 1024 * 1024 * 1024 {
@@ -3171,14 +3359,12 @@ mod tests {
             )
             .expect("production Scribe budget");
             let budget = governor.scribe_budget();
-            let expected = limit.saturating_sub(persistence_workspace_bytes(
-                budget
-                    .active_bucket_target_bytes()
-                    .max(2 * MAX_REQUEST_BYTES),
-            ));
+            let expected = limit
+                .saturating_sub(PARQUET_PRODUCER_OWNER_BYTES)
+                .max(limit / 4);
             assert_eq!(budget.ingress_limit_bytes(), expected);
             assert_eq!(budget.ingress_limit_bytes(), expected_ceiling);
-            assert!(expected > limit / 4);
+            assert!(expected >= limit / 4);
         }
 
         let mut governor =
@@ -3193,7 +3379,12 @@ mod tests {
     /// Proves ingress cannot consume the workspace needed by an admitted generation.
     #[test]
     fn ingress_reservation_respects_derived_ceiling() {
-        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let governor = BifrostMemoryGovernor::new_with_child_limits(
+            1024 * 1024 * 1024,
+            Some(768 * 1024 * 1024),
+            Some(256 * 1024 * 1024),
+        )
+        .expect("valid production role limits");
         let budget = governor.scribe_budget();
         let ingress = budget
             .try_reserve_ingress(MemoryCategory::Raw, budget.ingress_limit_bytes())

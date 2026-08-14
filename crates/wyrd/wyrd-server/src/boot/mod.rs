@@ -600,7 +600,7 @@ async fn build_bifrost_parts_from_boot(
         std::fs::create_dir_all(&wal_dir).map_err(|error| {
             ServerBootError::Scribe(format!("WAL directory creation failed: {error}"))
         })?;
-        let (wal_volume, _scribe_output_volume) = bifrost_resources
+        let (wal_volume, scribe_output_volume) = bifrost_resources
             .scribe()
             .and_then(|resources| resources.volume_capabilities())
             .ok_or_else(|| {
@@ -683,7 +683,8 @@ async fn build_bifrost_parts_from_boot(
                     ServerBootError::Scribe(
                         "Scribe publication requires the platform operator pool".to_owned(),
                     )
-                })?),
+                })?)
+                .with_output_scratch(scribe_output_volume),
             ),
             memory_budget: Some(
                 bifrost_memory

@@ -23,9 +23,11 @@ use crate::scribe::execution_lanes::{
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
-use crate::scribe::memory::{MemoryCategory, ScribeMemoryBudget, persistence_workspace_bytes};
+use crate::scribe::memory::{
+    MemoryCategory, MemoryReservation, ScribeMemoryBudget, parquet_producer_delta,
+};
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::parquet_writer::ParquetEncoded;
+use crate::scribe::parquet_writer::{BoundedParquetArtifactSet, ParquetEncoded};
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
@@ -73,6 +75,7 @@ fn emit_compression_telemetry(arrow_bytes: usize, file_size: usize) {
 pub struct PersistenceFaults {
     object_write: Arc<std::sync::atomic::AtomicBool>,
     sql_commit: Arc<std::sync::atomic::AtomicBool>,
+    post_commit_client_error: Arc<std::sync::atomic::AtomicBool>,
     manifest_publication: Arc<std::sync::atomic::AtomicBool>,
     object_write_delay_ms: Arc<AtomicU64>,
     object_write_delays_ms: Arc<Mutex<Vec<u64>>>,
@@ -91,6 +94,11 @@ impl PersistenceFaults {
     /// Fail the next SQL commit after the file-list/audit transaction is staged.
     pub fn fail_next_sql_commit(&self) {
         self.sql_commit.store(true, Ordering::Release);
+    }
+
+    /// Return an error after the next publication COMMIT actually succeeds.
+    pub fn fail_next_post_commit_response(&self) {
+        self.post_commit_client_error.store(true, Ordering::Release);
     }
 
     /// Fail the next manifest publication after the SQL transaction commits.
@@ -166,6 +174,10 @@ impl PersistenceFaults {
 
     fn take_sql_commit(&self) -> bool {
         self.sql_commit.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_post_commit_client_error(&self) -> bool {
+        self.post_commit_client_error.swap(false, Ordering::AcqRel)
     }
 
     fn take_manifest_publication(&self) -> bool {
@@ -332,6 +344,8 @@ pub struct ScribePersistenceConfig {
     pub queue_items: usize,
     /// Number of asynchronous persistence workers.
     pub workers: usize,
+    /// Generation-scoped output scratch capability required before encoding.
+    pub output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
     /// Concrete test-tier fault points; production uses the default no-fault value.
     #[cfg(any(test, feature = "test-support"))]
     pub faults: PersistenceFaults,
@@ -356,6 +370,7 @@ impl ScribePersistenceConfig {
             operator_pool: None,
             queue_items: queue_items.max(1),
             workers: workers.max(1),
+            output_scratch: None,
             #[cfg(any(test, feature = "test-support"))]
             faults: PersistenceFaults::default(),
         }
@@ -365,6 +380,13 @@ impl ScribePersistenceConfig {
     #[must_use]
     pub fn with_operator_pool(mut self, operator_pool: vala_sql::OperatorPool) -> Self {
         self.operator_pool = Some(operator_pool);
+        self
+    }
+
+    /// Installs the generation-owned output scratch authority.
+    #[must_use]
+    pub fn with_output_scratch(mut self, output_scratch: crate::resources::ScratchVolume) -> Self {
+        self.output_scratch = Some(Arc::new(output_scratch));
         self
     }
 
@@ -410,6 +432,44 @@ pub struct PersistenceRuntime {
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Lock-independent abort handles for every spawned persistence worker.
     abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Generation-owned output scratch authority shared by direct and queued producers.
+    output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
+    /// Operator-backed owner for caller-commit ambiguity reconciliation.
+    reconciler: Option<ScribePublicationReconciler>,
+    /// Unbounded ownership-transfer seam for already-admitted ambiguous attempts.
+    reconciliation_sender: Option<mpsc::UnboundedSender<ScribeReconciliationJob>>,
+}
+
+/// Runtime-owned ambiguous caller publication and optional completion waiter.
+enum ScribeReconciliationJob {
+    /// Caller-owned seal attempt transferred after an ambiguous COMMIT result.
+    Caller {
+        /// Complete move-only attempt retained across SQL retries.
+        attempt: super::seal::ScribeCommitAttempt,
+        /// Caller notification; dropping the receiver does not cancel reconciliation.
+        completion: oneshot::Sender<Result<(), String>>,
+    },
+    /// Automatic persistence publication retained independently of its worker future.
+    Persistence {
+        /// Complete worker dependencies needed for manifest completion.
+        worker: PersistenceWorker,
+        /// Immutable generation whose WAL authority remains retained.
+        generation: Arc<ImmutableGeneration>,
+        /// Tenant/table identity used for the post-commit wake-up.
+        binding: TenantTableBinding,
+        /// Whether replay must defer manifest advancement.
+        defer_manifest_advance: bool,
+        /// Exact deterministic rows retried without reconstruction.
+        rows: Vec<file_list_writer::FileListArtifactInsert>,
+        /// Exact audit transition paired with the artifact set.
+        events: Vec<AuditEvent>,
+        /// Complete local scratch and remote artifact identity owner.
+        artifacts: BoundedParquetArtifactSet,
+        /// Checked producer workspace retained through reconciliation.
+        parquet_owner: MemoryReservation,
+        /// Worker notification; dropping the receiver does not cancel reconciliation.
+        completion: oneshot::Sender<Result<FileListCommitKey, ScribeError>>,
+    },
 }
 
 impl std::fmt::Debug for PersistenceRuntime {
@@ -444,6 +504,9 @@ impl PersistenceRuntime {
             failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
+            output_scratch: None,
+            reconciler: None,
+            reconciliation_sender: None,
         }
     }
 
@@ -456,6 +519,16 @@ impl PersistenceRuntime {
     ) -> Arc<Self> {
         let (sender, receiver) = mpsc::channel::<Box<PersistenceJob>>(config.queue_items);
         register_idle_persistence_queue();
+        let output_scratch = config.output_scratch.clone();
+        let reconciler = config.operator_pool.as_ref().map(|pool| {
+            ScribePublicationReconciler::new(
+                pool.clone(),
+                context.actor_stream,
+                #[cfg(any(test, feature = "test-support"))]
+                config.faults.clone(),
+            )
+        });
+        let (reconciliation_sender, mut reconciliation_receiver) = mpsc::unbounded_channel();
         let runtime_state = Arc::new(Self {
             sender: Arc::new(Mutex::new(Some(sender))),
             queued: Arc::new(AtomicUsize::new(0)),
@@ -464,15 +537,72 @@ impl PersistenceRuntime {
             failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
+            output_scratch: output_scratch.clone(),
+            reconciler,
+            reconciliation_sender: Some(reconciliation_sender),
         });
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
         let worker = Arc::new(PersistenceWorker::new(
-            config.postgres,
             config.operator_pool,
             Arc::clone(&runtime_state.failures),
             context,
+            output_scratch,
+            runtime_state
+                .reconciliation_sender
+                .as_ref()
+                .expect("started persistence runtime owns reconciliation sender")
+                .clone(),
         ));
         let mut tasks = Vec::with_capacity(config.workers);
+        if let Some(reconciler) = runtime_state.reconciler.clone() {
+            let task = runtime.spawn(async move {
+                while let Some(job) = reconciliation_receiver.recv().await {
+                    match job {
+                        ScribeReconciliationJob::Caller {
+                            attempt,
+                            completion,
+                        } => {
+                            let result = attempt
+                                .reconcile(&reconciler)
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = completion.send(result);
+                        }
+                        ScribeReconciliationJob::Persistence {
+                            worker,
+                            generation,
+                            binding,
+                            defer_manifest_advance,
+                            rows,
+                            events,
+                            artifacts,
+                            parquet_owner,
+                            completion,
+                        } => {
+                            let result = worker
+                                .reconcile_persistence(
+                                    &reconciler,
+                                    &generation,
+                                    &binding,
+                                    defer_manifest_advance,
+                                    &rows,
+                                    &events,
+                                    artifacts,
+                                    parquet_owner,
+                                )
+                                .await;
+                            let _ = completion.send(result);
+                        }
+                    }
+                }
+            });
+            let abort_handle = task.abort_handle();
+            match runtime_state.abort_handles.lock() {
+                Ok(mut handles) => handles.push(abort_handle),
+                Err(poisoned) => poisoned.into_inner().push(abort_handle),
+            }
+            tasks.push(task);
+        }
         for _ in 0..config.workers {
             let receiver = Arc::clone(&receiver);
             let worker = Arc::clone(&worker);
@@ -641,6 +771,44 @@ impl PersistenceRuntime {
     pub fn queue_bytes(&self) -> usize {
         self.queued_bytes.load(Ordering::Acquire)
     }
+
+    /// Returns the generation scratch authority used by caller-owned seals.
+    #[must_use]
+    pub(crate) fn output_scratch(&self) -> Option<Arc<crate::resources::ScratchVolume>> {
+        self.output_scratch.clone()
+    }
+
+    /// Returns the concrete operator-backed publication reconciler.
+    #[must_use]
+    pub(crate) fn publication_reconciler(&self) -> Option<ScribePublicationReconciler> {
+        self.reconciler.clone()
+    }
+
+    /// Transfers one ambiguous caller attempt into the independent retry owner.
+    ///
+    /// # Errors
+    /// Returns the attempt when shutdown has removed the reconciliation owner.
+    pub(crate) fn submit_reconciliation(
+        &self,
+        attempt: super::seal::ScribeCommitAttempt,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, super::seal::ScribeCommitAttempt> {
+        let Some(sender) = &self.reconciliation_sender else {
+            return Err(attempt);
+        };
+        let (completion, receiver) = oneshot::channel();
+        sender
+            .send(ScribeReconciliationJob::Caller {
+                attempt,
+                completion,
+            })
+            .map_err(|error| match error.0 {
+                ScribeReconciliationJob::Caller { attempt, .. } => attempt,
+                ScribeReconciliationJob::Persistence { .. } => {
+                    unreachable!("caller submission cannot return a persistence job")
+                }
+            })?;
+        Ok(receiver)
+    }
 }
 
 /// Owns the dependencies and durable workflow for one persistence worker.
@@ -649,9 +817,8 @@ impl PersistenceRuntime {
 /// retry-fault, and manifest-ordering state behind this concrete owner. The
 /// manifest mutex serializes publication while independent workers may encode
 /// and upload different generations.
+#[derive(Clone)]
 struct PersistenceWorker {
-    /// Vala Postgres handle used for tenant-scoped file-list transactions.
-    postgres: Arc<ValaPostgres>,
     /// Audited operator pool for atomically fenced publication.
     operator_pool: Option<vala_sql::OperatorPool>,
     /// Shared durable failure ledger consumed by startup recovery.
@@ -670,23 +837,97 @@ struct PersistenceWorker {
     memory: ScribeMemoryBudget,
     /// Optional local wake-up publisher used after confirmed file-list commits.
     staging_file_publisher: Option<StagingFilePublisher>,
+    /// Generation-owned scratch authority required before writer creation.
+    output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
+    /// Runtime-owned queue shielding ambiguous publication from worker cancellation.
+    reconciliation_sender: mpsc::UnboundedSender<ScribeReconciliationJob>,
     /// Test-only fault points for deterministic persistence-path coverage.
     #[cfg(any(test, feature = "test-support"))]
     faults: PersistenceFaults,
     /// Serializes manifest publication after SQL commit.
-    manifest_guard: tokio::sync::Mutex<()>,
+    manifest_guard: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Closed publication classification controlling cleanup and WAL authority.
+#[derive(Debug)]
+pub enum ScribePublicationOutcome {
+    /// The complete artifact set and audit transition committed or replayed exactly.
+    Committed(file_list_writer::FileListArtifactSetOutcome),
+    /// Failure occurred before the first COMMIT attempt and exact uploads may be removed.
+    KnownNotCommitted(ScribeError),
+    /// A COMMIT-capable transaction returned an error and all authority must be retained.
+    UnknownCommitOutcome(ScribeError),
+}
+
+/// Concrete owner that retries the identical fenced full-set transaction.
+#[derive(Clone)]
+pub struct ScribePublicationReconciler {
+    /// Existing audited operator capability used for every retry.
+    operator_pool: vala_sql::OperatorPool,
+    /// Replacement actor whose membership fence authorizes publication.
+    actor_stream: StreamIdentity,
+    /// Deterministic post-COMMIT response fault used by integration proofs.
+    #[cfg(any(test, feature = "test-support"))]
+    faults: PersistenceFaults,
+}
+
+impl ScribePublicationReconciler {
+    /// Constructs the sole publication reconciler for one persistence worker.
+    #[must_use]
+    fn new(
+        operator_pool: vala_sql::OperatorPool,
+        actor_stream: StreamIdentity,
+        #[cfg(any(test, feature = "test-support"))] faults: PersistenceFaults,
+    ) -> Self {
+        Self {
+            operator_pool,
+            actor_stream,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        }
+    }
+
+    /// Attempts or reconciles one exact full-set publication.
+    ///
+    /// Any error is conservatively unknown because the SQL owner crosses the
+    /// COMMIT boundary internally; callers retain objects and WAL authority.
+    pub(crate) async fn publish(
+        &self,
+        rows: &[file_list_writer::FileListArtifactInsert],
+        events: &[AuditEvent],
+    ) -> ScribePublicationOutcome {
+        match file_list_writer::insert_artifact_set_and_audit_fenced(
+            &self.operator_pool,
+            self.actor_stream,
+            rows,
+            events,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                #[cfg(any(test, feature = "test-support"))]
+                if self.faults.take_post_commit_client_error() {
+                    return ScribePublicationOutcome::UnknownCommitOutcome(ScribeError::Internal {
+                        detail: "test client lost the committed publication response".to_owned(),
+                    });
+                }
+                ScribePublicationOutcome::Committed(outcome)
+            }
+            Err(error) => ScribePublicationOutcome::UnknownCommitOutcome(ScribeError::from(error)),
+        }
+    }
 }
 
 impl PersistenceWorker {
     /// Builds a persistence worker from its complete durable dependencies.
     fn new(
-        postgres: Arc<ValaPostgres>,
         operator_pool: Option<vala_sql::OperatorPool>,
         failures: Arc<Mutex<Vec<String>>>,
         context: PersistenceRuntimeContext,
+        output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
+        reconciliation_sender: mpsc::UnboundedSender<ScribeReconciliationJob>,
     ) -> Self {
         Self {
-            postgres,
             operator_pool,
             failures,
             actor_stream: context.actor_stream,
@@ -696,9 +937,11 @@ impl PersistenceWorker {
             wal_io: context.wal_io,
             memory: context.memory,
             staging_file_publisher: context.staging_file_publisher,
+            output_scratch,
+            reconciliation_sender,
             #[cfg(any(test, feature = "test-support"))]
             faults: context.faults,
-            manifest_guard: tokio::sync::Mutex::new(()),
+            manifest_guard: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -731,21 +974,30 @@ impl PersistenceWorker {
             wal_lsn_max = generation.wal_lsn_max.as_u64(),
             "persisting immutable Scribe generation"
         );
-        let workspace_bytes = persistence_workspace_bytes(generation.arrow_bytes);
-        let result = match self
-            .memory
-            .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
-        {
+        let generation_owned_bytes = generation.arrow_bytes;
+        let reservation =
+            parquet_producer_delta(generation_owned_bytes).and_then(|workspace_bytes| {
+                self.memory
+                    .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
+            });
+        let result = match reservation {
             Ok(mut reservation) => {
                 // Attribution-only: the exact originating shard is unavailable
                 // here; `generation.shard_id` carries the recorded lane but
                 // the memory-accounting shard is approximate under batch-spread
                 // routing and does not affect correctness.
                 reservation.attach_shard(self.memory.shard_accounting(), generation.shard_id);
+                let mut parquet_owner = Some(reservation);
                 let result = self
-                    .persist_once(&generation, &job.binding, job.defer_manifest_advance)
+                    .persist_once(
+                        &generation,
+                        &job.binding,
+                        job.defer_manifest_advance,
+                        &mut parquet_owner,
+                        generation_owned_bytes,
+                    )
                     .await;
-                drop(reservation);
+                drop(parquet_owner);
                 result
             }
             Err(error) => Err(error),
@@ -872,6 +1124,9 @@ impl PersistenceWorker {
         &self,
         frozen: &FrozenMemtable,
         binding: &TenantTableBinding,
+        scratch_dir: &std::path::Path,
+        object_base: &str,
+        footer_reservation: crate::scribe::memory::EncodedFooterReservation,
     ) -> Result<ParquetEncoded, ScribeError> {
         let parquet_started = std::time::Instant::now();
         let encoded = match self
@@ -880,6 +1135,9 @@ impl PersistenceWorker {
                 frozen: Box::new(frozen.clone()),
                 binding: binding.clone(),
                 tenant: binding.tenant,
+                scratch_dir: scratch_dir.to_path_buf(),
+                object_base: object_base.to_owned(),
+                footer_reservation,
             })
             .await?
         {
@@ -922,25 +1180,81 @@ impl PersistenceWorker {
     /// immutable generation remains retained by its shard for reconciliation.
     async fn persist_once(
         &self,
-        generation: &ImmutableGeneration,
+        generation: &Arc<ImmutableGeneration>,
         binding: &TenantTableBinding,
         defer_manifest_advance: bool,
+        parquet_owner: &mut Option<MemoryReservation>,
+        generation_owned_bytes: usize,
     ) -> Result<FileListCommitKey, ScribeError> {
         let generation_id = generation.generation_id.0;
         let frozen = generation.frozen_snapshot();
+        let reconciler = ScribePublicationReconciler::new(
+            self.operator_pool
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "writer-v2 publication requires the operator reconciler capability"
+                        .to_owned(),
+                })?
+                .clone(),
+            self.actor_stream,
+            #[cfg(any(test, feature = "test-support"))]
+            self.faults.clone(),
+        );
+        let scratch_capability =
+            self.output_scratch
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "Scribe output scratch is unavailable before encoding".to_owned(),
+                })?;
+        let scratch = scratch_capability
+            .create_scribe_generation(
+                &generation.stream.node_id.to_string(),
+                generation_id,
+                256 * 1024 * 1024,
+            )
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("Scribe output scratch admission failed: {error}"),
+            })?;
+        let object_base = deterministic_object_base(
+            binding,
+            &generation.seal_key,
+            &generation.stream.node_id.to_string(),
+            generation.shard_id,
+            generation_id,
+            generation.wal_lsn_min.as_u64(),
+            generation.wal_lsn_max.as_u64(),
+        )?;
         tracing::debug!(generation_id, stage = "encode", "persist stage start");
-        let mut encoded = self.encode_parquet_stage(&frozen, binding).await?;
+        let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
+            parquet_owner
+                .as_mut()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "automatic producer reservation was transferred before encoding"
+                        .to_owned(),
+                })?,
+            generation_owned_bytes,
+        )?;
+        let mut encoded = self
+            .encode_parquet_stage(
+                &frozen,
+                binding,
+                scratch.path(),
+                &object_base,
+                footer_reservation,
+            )
+            .await?;
+        encoded.artifacts.attach_scratch(scratch)?;
         let source_node_id = generation.stream.node_id.to_string();
-        let path = object_path(binding, &generation.seal_key, &source_node_id)?;
-        let file_size = encoded.bytes.len();
+        let file_size = encoded
+            .artifacts
+            .iter()
+            .try_fold(0_usize, |sum, artifact| {
+                sum.checked_add(usize::try_from(artifact.file_size).ok()?)
+            })
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "writer-v2 artifact-set size overflows".to_owned(),
+            })?;
         emit_compression_telemetry(generation.arrow_bytes, file_size);
-        let row_encoded = ParquetEncoded {
-            bytes: Vec::new(),
-            row_group_stats: encoded.row_group_stats.clone(),
-            partition_day: encoded.partition_day,
-            audit_events: Vec::new(),
-            append_metas: encoded.append_metas.clone(),
-        };
         #[cfg(any(test, feature = "test-support"))]
         let _object_write_guard = self.faults.begin_object_write().await;
         #[cfg(any(test, feature = "test-support"))]
@@ -951,18 +1265,23 @@ impl PersistenceWorker {
         }
         tracing::debug!(generation_id, stage = "object_put", "persist stage start");
         let put_started = std::time::Instant::now();
-        let path = self
-            .put_object(&path, std::mem::take(&mut encoded.bytes))
-            .await?;
+        let mut uploaded = Vec::with_capacity(encoded.artifacts.len());
+        for artifact in &encoded.artifacts {
+            match self.put_artifact(artifact).await {
+                Ok(()) => uploaded.push(artifact.object_identity.clone()),
+                Err(error) => {
+                    self.cleanup_uploaded(&uploaded).await;
+                    return Err(error);
+                }
+            }
+        }
         record_persist_stage("put", put_started);
-        let row = file_list_writer::build_insert(
+        let rows = file_list_writer::build_artifact_inserts(
             &frozen,
-            &row_encoded,
+            &encoded,
             binding,
             &source_node_id,
             generation.stream.writer_epoch.as_i64(),
-            &path,
-            Some(file_size),
         )?;
         #[cfg(any(test, feature = "test-support"))]
         let fail_before_commit = self.faults.take_sql_commit();
@@ -970,14 +1289,55 @@ impl PersistenceWorker {
         let fail_before_commit = false;
         tracing::debug!(generation_id, stage = "sql_commit", "persist stage start");
         let commit_started = std::time::Instant::now();
-        let outcome = self
-            .publish_row(
-                binding.tenant,
-                &row,
-                &encoded.audit_events,
-                fail_before_commit,
-            )
-            .await?;
+        if fail_before_commit {
+            self.cleanup_uploaded(&uploaded).await;
+            return Err(ScribeError::Internal {
+                detail: "test SQL failure before the first COMMIT attempt".to_owned(),
+            });
+        }
+        let outcome = match reconciler.publish(&rows, &encoded.audit_events).await {
+            ScribePublicationOutcome::Committed(outcome) => outcome,
+            ScribePublicationOutcome::UnknownCommitOutcome(_error) => {
+                let retained_owner = parquet_owner.take().ok_or_else(|| ScribeError::Internal {
+                    detail: "automatic producer reservation is unavailable for reconciliation"
+                        .to_owned(),
+                })?;
+                let (completion, receiver) = oneshot::channel();
+                if let Err(error) =
+                    self.reconciliation_sender
+                        .send(ScribeReconciliationJob::Persistence {
+                            worker: self.clone(),
+                            generation: Arc::clone(generation),
+                            binding: binding.clone(),
+                            defer_manifest_advance,
+                            rows,
+                            events: encoded.audit_events,
+                            artifacts: encoded.artifacts,
+                            parquet_owner: retained_owner,
+                            completion,
+                        })
+                {
+                    if let ScribeReconciliationJob::Persistence {
+                        artifacts,
+                        parquet_owner,
+                        ..
+                    } = error.0
+                    {
+                        artifacts.retain_for_reconciliation();
+                        std::mem::forget(parquet_owner);
+                    }
+                    self.memory.poison();
+                    return Err(ScribeError::Internal {
+                        detail: "automatic reconciliation owner is unavailable after COMMIT"
+                            .to_owned(),
+                    });
+                }
+                return receiver.await.map_err(|_| ScribeError::Internal {
+                    detail: "automatic reconciliation owner exited without a result".to_owned(),
+                })?;
+            }
+            ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
+        };
         record_persist_stage("sql_commit", commit_started);
         if let Some(publisher) = &self.staging_file_publisher {
             let event = crate::maintenance::StagingFileCommitted::new(
@@ -992,10 +1352,57 @@ impl PersistenceWorker {
                 generation_id,
                 "replay defers manifest advance until reader exit"
             );
+            encoded.artifacts.cleanup()?;
             return Ok(outcome.commit_key);
         }
         self.advance_manifest(generation).await?;
+        encoded.artifacts.cleanup()?;
         tracing::debug!(generation_id, "persist stages complete");
+        Ok(outcome.commit_key)
+    }
+
+    /// Reconciles one automatic publication under runtime ownership.
+    ///
+    /// The job retains exact rows, audit events, artifacts, immutable/WAL
+    /// identity, and producer memory while retrying the fenced transaction.
+    /// Caller or worker cancellation cannot interrupt this owner. Once the
+    /// complete set is inserted or replay-validated, it advances the manifest
+    /// exactly once unless replay explicitly deferred that step, publishes the
+    /// local wake-up, and releases scratch and producer memory.
+    ///
+    /// # Errors
+    /// Returns when manifest advancement or exact scratch cleanup fails after
+    /// durable publication. SQL errors remain inside the bounded retry loop.
+    async fn reconcile_persistence(
+        &self,
+        reconciler: &ScribePublicationReconciler,
+        generation: &ImmutableGeneration,
+        binding: &TenantTableBinding,
+        defer_manifest_advance: bool,
+        rows: &[file_list_writer::FileListArtifactInsert],
+        events: &[AuditEvent],
+        artifacts: BoundedParquetArtifactSet,
+        parquet_owner: MemoryReservation,
+    ) -> Result<FileListCommitKey, ScribeError> {
+        let outcome = loop {
+            if let ScribePublicationOutcome::Committed(outcome) =
+                reconciler.publish(rows, events).await
+            {
+                break outcome;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        if let Some(publisher) = &self.staging_file_publisher {
+            let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
+                binding.clone(),
+                generation.seal_key.day.as_naive_date(),
+            ));
+        }
+        if !defer_manifest_advance {
+            self.advance_manifest(generation).await?;
+        }
+        artifacts.cleanup()?;
+        drop(parquet_owner);
         Ok(outcome.commit_key)
     }
 
@@ -1043,59 +1450,6 @@ impl PersistenceWorker {
         }
         Ok(())
     }
-
-    /// Publishes file-list and audit state through the configured SQL authority.
-    ///
-    /// Production uses the operator-fenced transaction; isolated owner tests
-    /// may retain the tenant transaction fallback.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError`] when fence validation, insertion, audit append,
-    /// or transaction commit fails.
-    async fn publish_row(
-        &self,
-        tenant: wyrd_spec::DataTenantId,
-        row: &file_list_writer::FileListInsert<'_>,
-        audit_events: &[AuditEvent],
-        fail_before_commit: bool,
-    ) -> Result<file_list_writer::FileListInsertOutcome, ScribeError> {
-        if let Some(operator_pool) = &self.operator_pool {
-            #[cfg(any(test, feature = "test-support"))]
-            if fail_before_commit {
-                return file_list_writer::insert_and_audit_fenced_with_commit_failure(
-                    operator_pool,
-                    self.actor_stream,
-                    row,
-                    audit_events,
-                )
-                .await
-                .map_err(ScribeError::from);
-            }
-            return file_list_writer::insert_and_audit_fenced(
-                operator_pool,
-                self.actor_stream,
-                row,
-                audit_events,
-            )
-            .await
-            .map_err(ScribeError::from);
-        }
-        let mut conn = self
-            .postgres
-            .tenant_conn(tenant)
-            .await
-            .map_err(ScribeError::from)?;
-        let outcome = file_list_writer::insert_and_audit(&mut conn, row, audit_events)
-            .await
-            .map_err(ScribeError::from)?;
-        if fail_before_commit {
-            return Err(ScribeError::Internal {
-                detail: "test SQL commit failure".to_owned(),
-            });
-        }
-        conn.commit().await.map_err(ScribeError::from)?;
-        Ok(outcome)
-    }
 }
 
 /// Terminalizes one automatic visibility span from persistence and shard outcomes.
@@ -1130,25 +1484,23 @@ async fn finish_visibility_publication(
 /// # Errors
 ///
 /// Returns [`ScribeError`] when the node identity or derived pod identifier is invalid.
-fn object_path(
+fn deterministic_object_base(
     binding: &TenantTableBinding,
     seal_key: &SealKey,
     node_id: &str,
+    shard_id: usize,
+    generation: u64,
+    wal_lsn_min: u64,
+    wal_lsn_max: u64,
 ) -> Result<String, ScribeError> {
     let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
         detail: format!("node_id is not a valid UUID: {error}"),
     })?;
-    let pod_id =
-        wyrd_spec::ids::PodId::new(format!("pod-{}", node_uuid.simple())).map_err(|error| {
-            ScribeError::Internal {
-                detail: format!("derived node PodId is invalid: {error}"),
-            }
-        })?;
     Ok(format!(
-        "{}/day={}/{}",
+        "{}/day={}/scribe-{}-{shard_id}-{generation}-{wal_lsn_min}-{wal_lsn_max}",
         binding.object_prefix,
         seal_key.day,
-        crate::scribe::filename::seal_filename(&pod_id)
+        node_uuid.simple()
     ))
 }
 
@@ -1166,17 +1518,57 @@ impl PersistenceWorker {
     ///
     /// Cancellation stops the current attempt; a later retry may safely reuse
     /// the same object path.
-    async fn put_object(&self, path: &str, bytes: Vec<u8>) -> Result<String, ScribeError> {
-        let bytes = Bytes::from(bytes);
+    async fn put_artifact(
+        &self,
+        artifact: &crate::scribe::parquet_writer::BoundedParquetArtifact,
+    ) -> Result<(), ScribeError> {
         let mut last_error = None;
         for attempt in 0..5_u32 {
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                self.operator.write(path, bytes.clone()),
-            )
-            .await
-            {
-                Ok(Ok(_)) => return Ok(path.to_owned()),
+            let upload = async {
+                use tokio::io::AsyncReadExt;
+
+                let mut source = tokio::fs::File::open(&artifact.scratch_path)
+                    .await
+                    .map_err(|error| {
+                        opendal::Error::new(
+                            opendal::ErrorKind::Unexpected,
+                            "open writer-v2 scratch artifact",
+                        )
+                        .set_source(error)
+                    })?;
+                let mut writer = self
+                    .operator
+                    .writer_with(&artifact.object_identity)
+                    .chunk(8 * 1024 * 1024)
+                    .await?;
+                let mut chunk = vec![0_u8; 8 * 1024 * 1024];
+                let mut uploaded = 0_u64;
+                loop {
+                    let read = source.read(&mut chunk).await.map_err(|error| {
+                        opendal::Error::new(
+                            opendal::ErrorKind::Unexpected,
+                            "read writer-v2 scratch artifact",
+                        )
+                        .set_source(error)
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    writer.write(Bytes::copy_from_slice(&chunk[..read])).await?;
+                    uploaded = uploaded.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                }
+                let metadata = writer.close().await?;
+                if uploaded != artifact.file_size || metadata.content_length() != artifact.file_size
+                {
+                    return Err(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "writer-v2 upload length mismatch",
+                    ));
+                }
+                Ok(())
+            };
+            match tokio::time::timeout(Duration::from_secs(30), upload).await {
+                Ok(Ok(())) => return Ok(()),
                 Ok(Err(error)) => {
                     let retryable = matches!(error.kind(), opendal::ErrorKind::RateLimited)
                         || (matches!(error.kind(), opendal::ErrorKind::Unexpected)
@@ -1201,6 +1593,15 @@ impl PersistenceWorker {
             detail: "object-store PUT failed without an error".to_owned(),
         }))
     }
+
+    /// Deletes only positively known uploaded identities before any COMMIT attempt.
+    async fn cleanup_uploaded(&self, paths: &[String]) {
+        for path in paths {
+            if let Err(error) = self.operator.delete(path).await {
+                tracing::warn!(%error, path, "writer-v2 exact uploaded cleanup failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1223,6 +1624,9 @@ mod tests {
             failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
+            output_scratch: None,
+            reconciler: None,
+            reconciliation_sender: None,
         }
     }
 
@@ -1352,6 +1756,7 @@ mod tests {
     }
 
     /// Real minimal persistence owner and dependencies retained for one queue transition.
+    #[cfg(feature = "test-support")]
     struct IdlePersistenceFixture {
         /// Runtime under causal telemetry test.
         runtime: Arc<PersistenceRuntime>,
@@ -1367,6 +1772,7 @@ mod tests {
         _wal_root: tempfile::TempDir,
     }
 
+    #[cfg(feature = "test-support")]
     impl IdlePersistenceFixture {
         /// Starts one real persistence runtime before it accepts work.
         async fn start() -> Self {
@@ -1523,6 +1929,7 @@ mod tests {
 
     /// Persistence queue state is observable as zero before the runtime accepts work.
     #[tokio::test(flavor = "current_thread")]
+    #[cfg(feature = "test-support")]
     async fn persistence_runtime_registers_idle_queue_gauges() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -1572,6 +1979,7 @@ mod tests {
     /// - `bifrost_scribe_persistence_encoded_bytes_total` counter is
     ///   incremented by a positive amount (the Parquet-encoded size).
     #[tokio::test(flavor = "current_thread")]
+    #[cfg(feature = "test-support")]
     async fn persist_once_emits_compression_telemetry() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         let _guard = metrics::set_default_local_recorder(&recorder);

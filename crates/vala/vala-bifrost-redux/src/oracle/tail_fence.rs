@@ -969,6 +969,8 @@ mod tests {
             namespace: "vala.bifrost".to_owned(),
             table_name: "events".to_owned(),
             file_path: "events/sealed.parquet".to_owned(),
+            file_ordinal: 0,
+            file_checksum: None,
             file_size: 1,
             row_count: 1,
             partition_day: chrono::NaiveDate::from_ymd_opt(2026, 8, 12).expect("valid event day"),

@@ -2620,7 +2620,7 @@ mod tests {
         assert!(over_bound.validate().is_err());
     }
 
-    /// The staging seam consumes the right-size policy's selected groups.
+    /// Closed staging debt keeps a healthy singleton actionable beside policy groups.
     #[test]
     fn staging_planner_maps_policy_groups_without_healthy_fillers() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
@@ -2644,7 +2644,7 @@ mod tests {
             day,
             day.succ_opt().expect("next day"),
         );
-        assert_eq!(bins.len(), 1);
+        assert_eq!(bins.len(), 2);
         assert_eq!(
             bins[0]
                 .files
@@ -2653,6 +2653,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["small-a", "small-b"]
         );
+        assert_eq!(bins[1].files[0].path, "healthy");
     }
 
     /// Forge transition writers cannot bypass the operation-state owner.
@@ -2678,8 +2679,7 @@ mod tests {
         }
     }
 
-    /// A bounded undersized group never leaves a singleton remainder for a
-    /// worthless one-to-one rewrite.
+    /// A closed partition retains a bounded singleton remainder as staging debt.
     #[test]
     fn staging_planner_discards_undersized_singleton_remainder() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
@@ -2699,9 +2699,11 @@ mod tests {
             day,
             day.succ_opt().expect("next day"),
         );
-        assert_eq!(bins.len(), 1);
+        assert_eq!(bins.len(), 2);
         assert_eq!(bins[0].files.len(), 2);
         assert_eq!(bins[0].total_bytes, 40);
+        assert_eq!(bins[1].files.len(), 1);
+        assert_eq!(bins[1].files[0].path, "small-c");
     }
 
     /// An accepted open-partition tail creates no actionable bin or pending work.

@@ -883,6 +883,10 @@ pub(crate) enum ScribePersistenceCpuOp {
         frozen: Box<FrozenMemtable>,
         binding: TenantTableBinding,
         tenant: wyrd_spec::ids::DataTenantId,
+        scratch_dir: std::path::PathBuf,
+        object_base: String,
+        /// Exact pre-writer footer child retained through sealed inspection.
+        footer_reservation: crate::scribe::memory::EncodedFooterReservation,
     },
     RestoreReplay {
         replayed: Box<ReplayedSealKey>,
@@ -1022,8 +1026,18 @@ impl ScribePersistenceCpuPool {
                     frozen,
                     binding,
                     tenant,
-                } => encode_batch(&frozen, &binding, tenant)
-                    .map(ScribePersistenceCpuResult::ParquetEncoded),
+                    scratch_dir,
+                    object_base,
+                    footer_reservation,
+                } => encode_batch(
+                    &frozen,
+                    &binding,
+                    tenant,
+                    &scratch_dir,
+                    &object_base,
+                    footer_reservation,
+                )
+                .map(ScribePersistenceCpuResult::ParquetEncoded),
                 ScribePersistenceCpuOp::RestoreReplay { replayed } => {
                     let frozen = crate::scribe::memtable::Memtable::decode_replayed(&replayed)?;
                     Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))

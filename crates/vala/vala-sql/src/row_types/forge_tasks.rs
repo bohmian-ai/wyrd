@@ -12,7 +12,7 @@ use crate::SqlError;
 pub const FORGE_TASK_PAYLOAD_VERSION: u16 = 1;
 
 /// Current version of the executable Forge resource envelope.
-pub const FORGE_ENVELOPE_VERSION: u16 = 1;
+pub const FORGE_ENVELOPE_VERSION: u16 = 2;
 
 /// Exact durable resource terms consumed by one Forge rewrite attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,10 @@ pub struct ForgeTaskEnvelope {
     pub encoder_buffer_bytes: u64,
     /// Resident bounded-upload chunk reservation.
     pub upload_chunk_bytes: u64,
+    /// Encoded footer bytes retained from writer creation through metadata validation.
+    pub footer_encoded_bytes: u64,
+    /// Decoder workspace joined only after execution children are released.
+    pub footer_decode_workspace_bytes: u64,
     /// Scratch bytes reserved for sort spill.
     pub sort_spill_bytes: u64,
     /// Scratch bytes reserved for pending output.
@@ -46,13 +50,22 @@ impl ForgeTaskEnvelope {
     /// Returns a conflict for caller-supplied malformed or overflowing terms.
     pub fn memory_bytes(self) -> Result<u64, SqlError> {
         self.validate()?;
-        self.decoded_input_bytes
+        let execution = self
+            .decoded_input_bytes
             .checked_add(self.sort_working_bytes)
             .and_then(|value| value.checked_add(self.encoder_buffer_bytes))
             .and_then(|value| value.checked_add(self.upload_chunk_bytes))
+            .and_then(|value| value.checked_add(self.footer_encoded_bytes))
             .ok_or_else(|| SqlError::Conflict {
                 detail: "Forge envelope resident total overflows".to_owned(),
-            })
+            })?;
+        let metadata = self
+            .footer_encoded_bytes
+            .checked_add(self.footer_decode_workspace_bytes)
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "Forge envelope metadata total overflows".to_owned(),
+            })?;
+        Ok(execution.max(metadata))
     }
 
     /// Validates the executable envelope and returns its scratch total.
@@ -86,6 +99,8 @@ impl ForgeTaskEnvelope {
             || self.sort_merge_reservation_bytes == 0
             || self.encoder_buffer_bytes == 0
             || self.upload_chunk_bytes == 0
+            || self.footer_encoded_bytes == 0
+            || self.footer_decode_workspace_bytes == 0
             || self.sort_spill_bytes == 0
             || self.output_scratch_bytes == 0
             || decoded != Some(self.decoded_input_bytes)
@@ -1256,6 +1271,8 @@ pub(crate) struct ForgeTaskSqlRow {
     sort_merge_reservation_bytes: Option<i64>,
     encoder_buffer_bytes: Option<i64>,
     upload_chunk_bytes: Option<i64>,
+    footer_encoded_bytes: Option<i64>,
+    footer_decode_workspace_bytes: Option<i64>,
     sort_spill_bytes: Option<i64>,
     output_scratch_bytes: Option<i64>,
     state: String,
@@ -1413,9 +1430,9 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
             }
         };
         let envelope = match row.envelope_version {
-            0 => None,
-            1 => Some(ForgeTaskEnvelope {
-                version: FORGE_ENVELOPE_VERSION,
+            0 | 1 => None,
+            2 => Some(ForgeTaskEnvelope {
+                version: 2,
                 reader_permits: u16::try_from(row.estimated_parallelism).map_err(|_| {
                     SqlError::InvariantViolation {
                         detail: "invalid envelope reader permits".to_owned(),
@@ -1430,6 +1447,11 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
                 )?,
                 encoder_buffer_bytes: sql_u64(row.encoder_buffer_bytes, "encoder_buffer_bytes")?,
                 upload_chunk_bytes: sql_u64(row.upload_chunk_bytes, "upload_chunk_bytes")?,
+                footer_encoded_bytes: sql_u64(row.footer_encoded_bytes, "footer_encoded_bytes")?,
+                footer_decode_workspace_bytes: sql_u64(
+                    row.footer_decode_workspace_bytes,
+                    "footer_decode_workspace_bytes",
+                )?,
                 sort_spill_bytes: sql_u64(row.sort_spill_bytes, "sort_spill_bytes")?,
                 output_scratch_bytes: sql_u64(row.output_scratch_bytes, "output_scratch_bytes")?,
             }),

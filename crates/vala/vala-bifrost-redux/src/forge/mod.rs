@@ -47,6 +47,8 @@ pub use rewrite::ForgeRewriteRuntime;
 #[cfg(feature = "test-support")]
 pub use rewrite::deterministic_output_path_for_test;
 #[cfg(feature = "test-support")]
+pub use rewrite::{data_page_reads_for_test, reset_data_page_reads_for_test};
+#[cfg(feature = "test-support")]
 pub use rewrite::{reset_scratch_peak_for_test, scratch_peak_for_test};
 pub use scheduler::ForgeSchedulerTrigger;
 pub use worker::{

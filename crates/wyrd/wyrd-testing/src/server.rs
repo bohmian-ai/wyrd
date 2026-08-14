@@ -34,8 +34,8 @@ use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::resources::{
-    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
-    SystemResourceSnapshot,
+    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
+    ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -2778,7 +2778,7 @@ impl WyrdTestServerBuilder {
                 BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
             })
             .collect();
-        let spill_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
+        let spill_root = if !self.bifrost_roles.is_empty() {
             Some(
                 self.oracle_spill_root.clone().unwrap_or(Arc::new(
                     tempfile::tempdir()
@@ -2791,6 +2791,36 @@ impl WyrdTestServerBuilder {
         let scratch_root = spill_root
             .as_ref()
             .map_or_else(std::path::PathBuf::new, |root| root.path().to_owned());
+        let scribe_wal_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Scribe) {
+            Some(
+                self.scribe_wal_root.clone().unwrap_or(Arc::new(
+                    tempfile::tempdir()
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                )),
+            )
+        } else {
+            self.scribe_wal_root.clone()
+        };
+        let volume_roots = if self.bifrost_roles.is_empty() {
+            None
+        } else {
+            let wal_root = scribe_wal_root
+                .as_ref()
+                .map_or_else(|| scratch_root.join("wal"), |root| root.path().to_owned());
+            let scribe_output = scratch_root.join("scribe-output");
+            let forge_scratch = scratch_root.join("forge");
+            let oracle_scratch = scratch_root.join("oracle");
+            for root in [&wal_root, &scribe_output, &forge_scratch, &oracle_scratch] {
+                std::fs::create_dir_all(root)
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            }
+            Some(BifrostVolumeRoots {
+                wal: wal_root,
+                scribe_output_scratch: scribe_output,
+                forge_scratch,
+                oracle_scratch,
+            })
+        };
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
             memory_limit_bytes: 1024 * 1024 * 1024,
             effective_cpu: 4,
@@ -2808,7 +2838,7 @@ impl WyrdTestServerBuilder {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 scratch_root,
-                volume_roots: None,
+                volume_roots,
             },
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -2870,16 +2900,6 @@ impl WyrdTestServerBuilder {
             None
         };
         let node_id = self.node_id.unwrap_or_else(|| NodeId::new(Uuid::now_v7()));
-        let scribe_wal_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Scribe) {
-            Some(
-                self.scribe_wal_root.unwrap_or(Arc::new(
-                    tempfile::tempdir()
-                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-                )),
-            )
-        } else {
-            self.scribe_wal_root
-        };
         let scribe_registration = if scribe_wal_root.is_some() {
             let registry = Arc::new(if let Some(timing) = self.role_timing {
                 ClusterRegistry::new_with_role_timing(postgres.vala().clone(), node_id, timing)
@@ -2938,6 +2958,18 @@ impl WyrdTestServerBuilder {
                                 postgres
                                     .operator_pool()
                                     .expect("test operator pool configured"),
+                            )
+                            .with_output_scratch(
+                                bifrost_resources
+                                    .scribe()
+                                    .and_then(|resources| resources.volume_capabilities())
+                                    .map(|(_, scratch)| scratch)
+                                    .ok_or_else(|| {
+                                        WyrdTestServerError::Start(
+                                            "test Scribe output scratch capability is unavailable"
+                                                .to_owned(),
+                                        )
+                                    })?,
                             ),
                         ),
                         memory_budget: Some(bifrost_memory.scribe_budget()),
@@ -2965,6 +2997,18 @@ impl WyrdTestServerBuilder {
                                 postgres
                                     .operator_pool()
                                     .expect("test operator pool configured"),
+                            )
+                            .with_output_scratch(
+                                bifrost_resources
+                                    .scribe()
+                                    .and_then(|resources| resources.volume_capabilities())
+                                    .map(|(_, scratch)| scratch)
+                                    .ok_or_else(|| {
+                                        WyrdTestServerError::Start(
+                                            "test Scribe output scratch capability is unavailable"
+                                                .to_owned(),
+                                        )
+                                    })?,
                             ),
                         ),
                         memory_budget: Some(bifrost_memory.scribe_budget()),

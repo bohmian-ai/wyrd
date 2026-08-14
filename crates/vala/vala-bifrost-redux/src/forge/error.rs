@@ -98,6 +98,14 @@ pub enum ForgeError {
     /// Deterministic source metadata proves the input cannot fit the decoded allowance.
     #[error("Forge refused unsafe input data: {detail}")]
     DataRefusal { detail: String },
+    /// A sealed output row group must be deterministically bisected and retried.
+    #[error("Forge encoded row group {row_group} exceeded 32 MiB for {rows} rows")]
+    EncodedRowGroupOverflow {
+        /// Zero-based row-group position in the attempted physical file.
+        row_group: usize,
+        /// Rows in the offending logical slice.
+        rows: usize,
+    },
     /// Attempt-local scratch IO failed with its typed operating-system category.
     #[error("Forge scratch IO failed ({kind:?}): {detail}")]
     ScratchIo {
@@ -178,7 +186,9 @@ impl ForgeError {
     #[must_use]
     pub fn failure_class(&self) -> ForgeFailureClass {
         match self {
-            Self::DataRefusal { .. } => ForgeFailureClass::DataRefusal,
+            Self::DataRefusal { .. } | Self::EncodedRowGroupOverflow { .. } => {
+                ForgeFailureClass::DataRefusal
+            }
             Self::ScratchIo { .. } => ForgeFailureClass::StorageHealth,
             Self::Capacity { .. }
             | Self::ExecutionEnvelopeExceeded { .. }

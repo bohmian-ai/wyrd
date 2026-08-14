@@ -11,7 +11,7 @@ mod pg_tests {
 
     use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use chrono::DateTime;
+    use chrono::{DateTime, Utc};
     use opendal::services::Memory;
     use sqlx::types::Uuid;
     use std::sync::Arc;
@@ -19,15 +19,32 @@ mod pg_tests {
     use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
-    use vala_bifrost_redux::scribe::ScribeImpl;
-    use vala_bifrost_redux::scribe::seal::PostCommitBatch;
+    use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
+    use vala_bifrost_redux::scribe::seal::ScribeCommitAttempt;
+    use vala_bifrost_redux::scribe::{ScribeImpl, ScribePublicationEvent};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
 
+    /// Starts the roomy production seal fixture used by non-capacity journeys.
     async fn setup() -> (PgFixture, DataTenantId, ScribeImpl, Arc<opendal::Operator>) {
+        setup_with_faults_at_memory_limit(PersistenceFaults::default(), 1152 * 1024 * 1024).await
+    }
+
+    /// Starts the production seal fixture with caller-selected persistence faults.
+    async fn setup_with_faults(
+        faults: PersistenceFaults,
+    ) -> (PgFixture, DataTenantId, ScribeImpl, Arc<opendal::Operator>) {
+        setup_with_faults_at_memory_limit(faults, 1152 * 1024 * 1024).await
+    }
+
+    /// Starts the production seal fixture with explicit faults and memory capacity.
+    async fn setup_with_faults_at_memory_limit(
+        faults: PersistenceFaults,
+        memory_limit_bytes: usize,
+    ) -> (PgFixture, DataTenantId, ScribeImpl, Arc<opendal::Operator>) {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
         fixture
@@ -45,6 +62,13 @@ mod pg_tests {
         );
 
         let temp_dir = tempfile::tempdir().expect("temp WAL dir");
+        let scratch_dir = tempfile::tempdir().expect("temp scratch dir");
+        let scribe_output = scratch_dir.path().join("scribe-output");
+        let forge_scratch = scratch_dir.path().join("forge");
+        let oracle_scratch = scratch_dir.path().join("oracle");
+        for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
+            std::fs::create_dir(root).expect("test volume root");
+        }
         let mut node_id_bytes = *Uuid::now_v7().as_bytes();
         // The current seal filename seam accepts a PodId string while
         // file_list stores the same value as UUID; use a UUID whose first
@@ -61,25 +85,94 @@ mod pg_tests {
             .expect("WAL writer"),
         );
 
-        // Leak temp_dir to keep WAL files for test lifetime
+        let runtime_resources =
+            vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+                vala_bifrost_redux::resources::SystemResourceSnapshot {
+                    memory_limit_bytes,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: 1024 * 1024 * 1024,
+                    scratch_available_bytes: 1024 * 1024 * 1024,
+                    memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                    cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                },
+                vala_bifrost_redux::resources::BifrostResourcePolicy {
+                    roles: std::collections::BTreeSet::from([
+                        vala_bifrost_redux::resources::BifrostRole::Scribe,
+                    ]),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: None,
+                    effective_cpu: None,
+                    scratch_root: scratch_dir.path().to_owned(),
+                    volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
+                        wal: temp_dir.path().to_owned(),
+                        scribe_output_scratch: scribe_output,
+                        forge_scratch,
+                        oracle_scratch,
+                    }),
+                },
+            )
+            .expect("test Bifrost resources");
+        let resources = runtime_resources
+            .compose_roles()
+            .expect("test role resources");
+        let scribe_resources = resources.scribe().expect("test Scribe resources");
+        let (_, output_scratch) = scribe_resources
+            .volume_capabilities()
+            .expect("test Scribe volumes");
+
+        // Leak directories to keep WAL and scratch files for test lifetime.
         std::mem::forget(temp_dir);
+        std::mem::forget(scratch_dir);
 
         let writer_epoch = 1;
-        let scribe = ScribeImpl::new_for_embedded_with_deps(
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query(
+            "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now()) ON CONFLICT (data_tenant_id,node_id,role) DO UPDATE SET fencing_token=EXCLUDED.fencing_token,heartbeat_at=now()",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(node_id)
+        .bind(writer_epoch)
+        .execute(&pool)
+        .await
+        .expect("register Scribe publication fence");
+        let scribe = ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
             Arc::clone(&operator),
             wal,
             &node_id.to_string(),
             writer_epoch,
+            vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
+                admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+                coordination_runtime: tokio::runtime::Handle::current(),
+                persistence: Some(
+                    vala_bifrost_redux::scribe::ScribePersistenceConfig::new(
+                        Arc::new(fixture.vala_postgres().clone()),
+                        16,
+                        1,
+                    )
+                    .with_operator_pool(fixture.operator_pool().clone())
+                    .with_output_scratch(output_scratch)
+                    .with_test_faults(faults),
+                ),
+                memory_budget: Some(scribe_resources.memory_governor().scribe_budget()),
+                staging_file_publisher: None,
+            },
         );
 
         (fixture, tenant, scribe, operator)
     }
 
-    async fn complete_post_commit(scribe: &ScribeImpl, batch: PostCommitBatch) {
+    async fn complete_post_commit(
+        scribe: &ScribeImpl,
+        batch: Vec<ScribeCommitAttempt>,
+        commit_result: &Result<(), vala_sql::SqlError>,
+    ) {
         scribe
-            .complete_post_commit(batch)
+            .settle_commit_attempts(batch, commit_result)
             .await
             .expect("post_commit");
+        assert!(commit_result.is_ok(), "fixture transaction must commit");
     }
 
     fn make_batch(row_count: usize, base_time_micros: i64) -> RecordBatch {
@@ -126,13 +219,145 @@ mod pg_tests {
         TableRef::new(BifrostNamespace::Bifrost, "events")
     }
 
+    /// A lost COMMIT response transfers ownership and reconciles without duplication.
     #[tokio::test]
-    async fn pg_scribe_append_seal_file_list() {
-        let (fixture, tenant, scribe, _operator) = setup().await;
+    async fn caller_commit_error_reconciles_exact_set_and_retires_once() {
+        let faults = PersistenceFaults::default();
+        faults.fail_next_post_commit_response();
+        let (fixture, tenant, scribe, operator) = setup_with_faults(faults).await;
+        let day = Utc::now().date_naive();
+        let batch = make_batch(
+            32,
+            day.and_hms_opt(12, 0, 0)
+                .expect("current day accepts noon")
+                .and_utc()
+                .timestamp_micros(),
+        );
+        scribe
+            .append(ScribeAppend {
+                principal: principal_for_tenant(tenant),
+                table: events_table(),
+                schema_fingerprint: schema_fingerprint(&batch),
+                rows: batch,
+                request_id: RequestId::now_v7(),
+                batch_id: Uuid::now_v7(),
+                measured_wire_bytes: 0,
+            })
+            .await
+            .expect("append before ambiguous seal");
+        let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let attempts = scribe.force_seal(&mut conn).await.expect("force seal");
+        conn.commit().await.expect("server committed transaction");
+        let client_error = Err(vala_sql::SqlError::InvariantViolation {
+            detail: "test client lost COMMIT response".to_owned(),
+        });
+        scribe
+            .settle_commit_attempts(attempts, &client_error)
+            .await
+            .expect("runtime-owned reconciliation");
+
+        let file_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND table_name='events'",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("file-list count");
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1")
+                .bind(tenant.as_uuid())
+                .fetch_one(&fixture.superuser_pool().await.expect("superuser pool"))
+                .await
+                .expect("audit count");
+        assert_eq!(file_count, 1);
+        assert_eq!(audit_count, 1);
+        let objects = operator
+            .list(&format!("tenants/{tenant}/"))
+            .await
+            .expect("list exact tenant objects");
+        assert_eq!(objects.len(), 1);
+    }
+
+    /// Cancelling the caller after COMMIT polling leaves reconciliation owned.
+    #[tokio::test]
+    async fn cancelled_commit_settlement_continues_under_runtime_owner() {
+        let faults = PersistenceFaults::default();
+        faults.fail_next_post_commit_response();
+        let (fixture, tenant, scribe, _operator) = setup_with_faults(faults).await;
+        let scribe = Arc::new(scribe);
+        let day = Utc::now().date_naive();
+        let batch = make_batch(
+            32,
+            day.and_hms_opt(12, 0, 0)
+                .expect("current day accepts noon")
+                .and_utc()
+                .timestamp_micros(),
+        );
+        scribe
+            .append(ScribeAppend {
+                principal: principal_for_tenant(tenant),
+                table: events_table(),
+                schema_fingerprint: schema_fingerprint(&batch),
+                rows: batch,
+                request_id: RequestId::now_v7(),
+                batch_id: Uuid::now_v7(),
+                measured_wire_bytes: 0,
+            })
+            .await
+            .expect("append before cancellation");
+        let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let attempts = scribe.force_seal(&mut conn).await.expect("force seal");
+        conn.commit().await.expect("server commit");
+        let observer = scribe.publication_observer_for_test();
+        let settlement_owner = Arc::clone(&scribe);
+        let settlement = tokio::spawn(async move {
+            settlement_owner
+                .settle_commit_attempts(
+                    attempts,
+                    &Err(vala_sql::SqlError::InvariantViolation {
+                        detail: "test client lost COMMIT response".to_owned(),
+                    }),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        settlement.abort();
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observer.wait_for(|event| matches!(event, ScribePublicationEvent::Published { .. })),
+        )
+        .await
+        .expect("runtime reconciliation survives caller cancellation");
+        assert!(matches!(
+            published,
+            ScribePublicationEvent::Published { .. }
+        ));
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$1")
+                .bind(tenant.as_uuid())
+                .fetch_one(&fixture.superuser_pool().await.expect("superuser pool"))
+                .await
+                .expect("audit count");
+        assert_eq!(audit_count, 1);
+    }
+
+    /// Proves the caller-owned seal driver emits writer-v2 at the 832 MiB floor.
+    #[tokio::test]
+    async fn scribe_seal_driver_writer_v2_is_bounded_at_exact_floor() {
+        let (fixture, tenant, scribe, operator) =
+            setup_with_faults_at_memory_limit(PersistenceFaults::default(), 832 * 1024 * 1024)
+                .await;
         let binding = TenantTableBinding::resolve((tenant, events_table())).expect("binding");
         // 1. Append 50k rows to trigger seal predicate
-        let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
-            .unwrap()
+        let expected_day = Utc::now().date_naive();
+        let base_time = expected_day
+            .and_hms_opt(12, 0, 0)
+            .expect("current day accepts noon")
+            .and_utc()
             .timestamp_micros();
         let batch = make_batch(50_000, base_time);
         let principal = principal_for_tenant(tenant);
@@ -155,8 +380,19 @@ mod pg_tests {
             .await
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
-        conn.commit().await.expect("commit");
-        complete_post_commit(&scribe, post_commit).await;
+        assert_eq!(
+            scribe.memory_snapshot().scribe_total_bytes,
+            (256 - 8) * 1024 * 1024,
+            "the complete owner releases its exact footer child after inspection"
+        );
+        let commit_result = conn.commit().await;
+        complete_post_commit(&scribe, post_commit, &commit_result).await;
+        assert_eq!(
+            scribe.memory_snapshot().categories
+                [vala_bifrost_redux::scribe::memory::MemoryCategory::Persistence as usize],
+            0,
+            "committed settlement releases the complete producer delta"
+        );
 
         // 3. Verify file_list row and its organization-qualified object identity
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
@@ -180,11 +416,14 @@ mod pg_tests {
             i64,                   // writer_epoch
             DateTime<chrono::Utc>, // min_event_time
             DateTime<chrono::Utc>, // max_event_time
+            i16,                   // file_ordinal
+            Option<String>,        // file_checksum
         )> = sqlx::query_as(
             r"
             SELECT id, data_tenant_id, namespace, table_name, file_path, row_count, file_size,
                    partition_day::text, wal_lsn_min, wal_lsn_max,
-                   node_id, writer_epoch, min_event_time, max_event_time
+                   node_id, writer_epoch, min_event_time, max_event_time,
+                   file_ordinal, file_checksum
             FROM vala.file_list
             WHERE namespace = 'vala.bifrost' AND table_name = 'events'
             ",
@@ -209,6 +448,8 @@ mod pg_tests {
             writer_epoch,
             min_event_time,
             max_event_time,
+            file_ordinal,
+            file_checksum,
         ) = &rows[0];
 
         assert_ne!(*id, Uuid::nil(), "id should be non-nil UUID");
@@ -225,24 +466,58 @@ mod pg_tests {
         );
         assert_eq!(*row_count, 50_000);
         assert!(*file_size > 0, "file_size should be positive");
-        assert_eq!(partition_day, "2026-07-14");
+        assert_eq!(partition_day, &expected_day.to_string());
         assert!(*wal_lsn_min >= 0, "wal_lsn_min should be non-negative");
         assert!(*wal_lsn_max >= 0, "wal_lsn_max should be non-negative");
         assert!(*wal_lsn_min <= *wal_lsn_max, "LSN range should be valid");
         assert_ne!(*node_id, Uuid::nil(), "node_id should be non-nil");
         assert_eq!(*writer_epoch, 1);
+        assert_eq!(*file_ordinal, 0);
+        let checksum = file_checksum.as_deref().expect("writer-v2 checksum");
+        assert_eq!(checksum.len(), 64);
+        assert!(checksum.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(
             *min_event_time <= *max_event_time,
             "event time range should be valid"
         );
+        let bytes = operator
+            .read(file_path)
+            .await
+            .expect("read sealed writer-v2 object")
+            .to_bytes();
+        assert_eq!(
+            u64::try_from(bytes.len()).expect("object length fits u64"),
+            u64::try_from(*file_size).expect("positive file size fits u64")
+        );
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes)
+            .expect("standard Parquet decoder accepts writer-v2 output");
+        let decoded_schema =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                .expect("standard Arrow decoder accepts writer-v2 output")
+                .schema()
+                .clone();
+        vala_bifrost_redux::parquet::BifrostParquetMemoryEnvelope::from_footer(
+            metadata.file_metadata(),
+            decoded_schema.as_ref(),
+            file_path,
+        )
+        .expect("all nine writer-v2 fields round-trip");
+        vala_bifrost_redux::parquet::memory::validate_writer_v2_structure(&metadata)
+            .expect("sealed output respects all structural caps");
+        let trailer = bytes
+            .get(bytes.len().saturating_sub(8)..bytes.len().saturating_sub(4))
+            .expect("Parquet trailer");
+        let footer_bytes = u64::from(u32::from_le_bytes(
+            trailer.try_into().expect("four-byte footer length"),
+        ));
+        assert!(footer_bytes <= 8 * 1024 * 1024);
     }
 
     #[tokio::test]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
         let (fixture, tenant, scribe, _operator) = setup().await;
-        let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
-            .unwrap()
-            .timestamp_micros();
+        let base_time = Utc::now().timestamp_micros();
         for i in 0..3 {
             let batch = make_batch(1000, base_time + (i * 1_000_000));
             let mut principal = principal_for_tenant(tenant);
@@ -264,8 +539,8 @@ mod pg_tests {
             .await
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
-        conn.commit().await.expect("commit");
-        complete_post_commit(&scribe, post_commit).await;
+        let commit_result = conn.commit().await;
+        complete_post_commit(&scribe, post_commit, &commit_result).await;
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
@@ -345,12 +620,17 @@ mod pg_tests {
     async fn pg_scribe_cross_day_batch_produces_two_files() {
         let (fixture, tenant, scribe, operator) = setup().await;
 
-        // Create a batch spanning two days: 60 rows on 2026-07-14, 40 rows on 2026-07-15
-        let day1_time = DateTime::parse_from_rfc3339("2026-07-14T23:59:50Z")
-            .unwrap()
+        let day1 = Utc::now().date_naive();
+        let day2 = day1.succ_opt().expect("current date has a successor");
+        let day1_time = day1
+            .and_hms_opt(23, 59, 50)
+            .expect("current day accepts boundary time")
+            .and_utc()
             .timestamp_micros();
-        let day2_time = DateTime::parse_from_rfc3339("2026-07-15T00:00:10Z")
-            .unwrap()
+        let day2_time = day2
+            .and_hms_opt(0, 0, 10)
+            .expect("next day accepts boundary time")
+            .and_utc()
             .timestamp_micros();
 
         let schema = Arc::new(Schema::new(vec![
@@ -407,8 +687,8 @@ mod pg_tests {
             .await
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
-        conn.commit().await.expect("commit");
-        complete_post_commit(&scribe, post_commit).await;
+        let commit_result = conn.commit().await;
+        complete_post_commit(&scribe, post_commit, &commit_result).await;
 
         // Verify two file_list rows with distinct partition_day
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
@@ -428,14 +708,14 @@ mod pg_tests {
         .expect("file_list query");
 
         assert_eq!(rows.len(), 2, "expected two file_list rows (one per day)");
-        assert_eq!(rows[0].0, "2026-07-14");
+        assert_eq!(rows[0].0, day1.to_string());
         assert_eq!(rows[0].1, 60, "first day should have 60 rows");
         assert_eq!(rows[0].2.matches("day=").count(), 1);
-        assert!(rows[0].2.contains("day=2026-07-14/"));
-        assert_eq!(rows[1].0, "2026-07-15");
+        assert!(rows[0].2.contains(&format!("day={day1}/")));
+        assert_eq!(rows[1].0, day2.to_string());
         assert_eq!(rows[1].1, 40, "second day should have 40 rows");
         assert_eq!(rows[1].2.matches("day=").count(), 1);
-        assert!(rows[1].2.contains("day=2026-07-15/"));
+        assert!(rows[1].2.contains(&format!("day={day2}/")));
         let objects = operator
             .list_with("")
             .recursive(true)
@@ -450,12 +730,7 @@ mod pg_tests {
     #[tokio::test]
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
         let (fixture, tenant, scribe, _operator) = setup().await;
-        let batch = make_batch(
-            2,
-            DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
-                .expect("time")
-                .timestamp_micros(),
-        );
+        let batch = make_batch(2, Utc::now().timestamp_micros());
         scribe
             .append(ScribeAppend {
                 principal: principal_for_tenant(tenant),
@@ -476,7 +751,7 @@ mod pg_tests {
         let post_commit = scribe.force_seal(&mut conn).await.expect("force seal");
         drop(conn);
         scribe
-            .abort_post_commit(post_commit)
+            .abort_commit_attempts(post_commit)
             .await
             .expect("abort seal");
 

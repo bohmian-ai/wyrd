@@ -11,7 +11,6 @@ use vala_bifrost_redux::scribe::execution_lanes::{
 };
 use vala_bifrost_redux::scribe::memtable::MemtableStats;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
-use vala_bifrost_redux::scribe::seal::PostCommitBatch;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -180,6 +179,27 @@ impl BifrostHarness {
                         64,
                         2,
                     )
+                    .with_operator_pool(server.state().postgres.operator_pool().ok_or_else(
+                        || {
+                            HarnessError::Configuration(
+                                "Bifrost test server has no operator pool".to_owned(),
+                            )
+                        },
+                    )?)
+                    .with_output_scratch(
+                        server
+                            .state()
+                            .bifrost_resources
+                            .as_ref()
+                            .and_then(|resources| resources.scribe())
+                            .and_then(|resources| resources.volume_capabilities())
+                            .map(|(_, scratch)| scratch)
+                            .ok_or_else(|| {
+                                HarnessError::Configuration(
+                                    "Bifrost test server has no Scribe output scratch".to_owned(),
+                                )
+                            })?,
+                    )
                     .with_test_faults(persistence_faults.clone()),
                 ),
                 memory_budget: Some(memory_governor.scribe_budget()),
@@ -241,25 +261,22 @@ impl BifrostHarness {
     pub async fn force_seal_all(&self) -> Result<(), HarnessError> {
         for tenant in self.tenants.iter().copied() {
             let mut conn = self.tenant_conn(tenant).await?;
-            let mut commits: Vec<(&ScribeImpl, PostCommitBatch)> =
-                Vec::with_capacity(self.scribes.len());
+            let mut commits = Vec::with_capacity(self.scribes.len());
             for scribe in &self.scribes {
                 match scribe.force_seal(&mut conn).await {
                     Ok(batch) => commits.push((scribe.as_ref(), batch)),
                     Err(error) => {
                         for (completed_scribe, batch) in commits {
-                            let _ = completed_scribe.abort_post_commit(batch).await;
+                            let _ = completed_scribe.abort_commit_attempts(batch).await;
                         }
                         return Err(HarnessError::Scribe(error.to_string()));
                     }
                 }
             }
-            conn.commit()
-                .await
-                .map_err(|error| HarnessError::Database(error.to_string()))?;
+            let commit_result = conn.commit().await;
             for (scribe, batch) in commits {
                 scribe
-                    .complete_post_commit(batch)
+                    .settle_commit_attempts(batch, &commit_result)
                     .await
                     .map_err(|error| HarnessError::Scribe(error.to_string()))?;
             }

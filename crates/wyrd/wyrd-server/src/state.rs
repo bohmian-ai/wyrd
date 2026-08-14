@@ -1101,13 +1101,12 @@ impl AppState {
                 detail: "Scribe is not configured".to_owned(),
             });
         };
-        let post_commit = runtime.scribe().force_seal(&mut conn).await?;
-        conn.commit().await.map_err(|error| {
-            vala_bifrost_redux::contracts::ScribeError::Internal {
-                detail: error.to_string(),
-            }
-        })?;
-        runtime.scribe().complete_post_commit(post_commit).await
+        let attempts = runtime.scribe().force_seal(&mut conn).await?;
+        let commit_result = conn.commit().await;
+        runtime
+            .scribe()
+            .settle_commit_attempts(attempts, &commit_result)
+            .await
     }
 
     /// Trip the Scribe WAL breaker for a deterministic test-tier probe.

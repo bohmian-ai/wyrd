@@ -76,6 +76,9 @@ mod pg_tests {
             ("wal_lsn_min", "bigint", "NO"),
             ("wal_lsn_max", "bigint", "NO"),
             ("created_at", "timestamp with time zone", "NO"),
+            ("publication_operation_id", "uuid", "YES"),
+            ("file_ordinal", "smallint", "NO"),
+            ("file_checksum", "text", "YES"),
         ];
 
         assert_eq!(
@@ -231,7 +234,7 @@ mod pg_tests {
             assert!(
                 db_err
                     .constraint()
-                    .is_some_and(|c| c.contains("file_list_stream_range_uniq")),
+                    .is_some_and(|c| c.contains("file_list_stream_range_ordinal_uniq")),
                 "constraint name matches unique index"
             );
         }

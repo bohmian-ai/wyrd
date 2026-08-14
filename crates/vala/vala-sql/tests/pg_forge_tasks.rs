@@ -30,7 +30,10 @@ mod pg_tests {
         (fixture, admin)
     }
 
-    /// Builds one valid enqueue request with caller-selected identity and lane.
+    /// Builds one valid, already-eligible enqueue request with caller-selected identity and lane.
+    ///
+    /// The one-second margin keeps host and container clocks from making an
+    /// immediate claim nondeterministically observe a future `ready_at`.
     ///
     /// # Panics
     /// Panics when the fixed test identity is invalid.
@@ -52,9 +55,9 @@ mod pg_tests {
                 files: 1,
                 bytes: 100,
                 parallelism: 1,
-                memory_bytes: 100,
+                memory_bytes: 40 * 1024 * 1024,
                 spill_bytes: 100,
-                large_ceiling_bytes: 1000,
+                large_ceiling_bytes: 64 * 1024 * 1024,
                 envelope: Some(vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
                     version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
                     reader_permits: 1,
@@ -64,11 +67,13 @@ mod pg_tests {
                     sort_merge_reservation_bytes: 10,
                     encoder_buffer_bytes: 40,
                     upload_chunk_bytes: 20,
+                    footer_encoded_bytes: 8 * 1024 * 1024,
+                    footer_decode_workspace_bytes: 32 * 1024 * 1024,
                     sort_spill_bytes: 50,
                     output_scratch_bytes: 50,
                 }),
             },
-            ready_at: Utc::now(),
+            ready_at: Utc::now() - Duration::seconds(1),
         }
     }
 
@@ -114,15 +119,15 @@ mod pg_tests {
             max_files: 10,
             max_bytes: 1_000,
             max_parallelism: 4,
-            max_memory_bytes: 1_000,
+            max_memory_bytes: 128 * 1024 * 1024,
             max_spill_bytes: 1_000,
             max_large_task_bytes: 2_000,
         }
     }
 
-    /// Version-one envelope terms survive enqueue and fair-claim decoding exactly.
+    /// Version-two envelope terms survive enqueue and fair-claim decoding exactly.
     #[tokio::test]
-    async fn forge_envelope_v1_round_trips_and_aggregates_match() {
+    async fn forge_envelope_v2_round_trips_and_aggregates_match() {
         let (fixture, _admin) = setup().await;
         let tasks = ForgeTasks::new(fixture.operator_pool().clone());
         let expected = task(
@@ -148,7 +153,7 @@ mod pg_tests {
         );
         assert_eq!(claim.estimates.spill_bytes, expected.estimates.spill_bytes);
         assert_eq!(claim.estimates.envelope, expected.estimates.envelope);
-        let envelope = claim.estimates.envelope.expect("version-one envelope");
+        let envelope = claim.estimates.envelope.expect("version-two envelope");
         assert_eq!(
             envelope.memory_bytes().expect("resident total"),
             claim.estimates.memory_bytes
@@ -218,7 +223,7 @@ mod pg_tests {
     async fn make_legacy(admin: &PgPool, task_id: Uuid, oversized: bool) {
         let estimate = if oversized { 100_000_i64 } else { 100_i64 };
         sqlx::query(
-            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=$2, estimated_parallelism=1, estimated_memory_bytes=$2, estimated_spill_bytes=$2, large_task_ceiling_bytes=$2 WHERE task_id=$1",
+            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=$2, estimated_parallelism=1, estimated_memory_bytes=$2, estimated_spill_bytes=$2, large_task_ceiling_bytes=$2 WHERE task_id=$1",
         )
         .bind(task_id)
         .bind(estimate)
@@ -235,13 +240,18 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let fitting = task(tenant, "envelope-fit", ForgeTaskLane::Ordinary, 201);
         let mut oversized = task(tenant, "envelope-over", ForgeTaskLane::Ordinary, 202);
-        oversized.estimates.memory_bytes = 1_001;
         oversized
             .estimates
             .envelope
             .as_mut()
-            .expect("version-one test envelope")
-            .encoder_buffer_bytes = 941;
+            .expect("version-two test envelope")
+            .encoder_buffer_bytes = 128 * 1024 * 1024;
+        oversized.estimates.memory_bytes = oversized
+            .estimates
+            .envelope
+            .expect("version-two test envelope")
+            .memory_bytes()
+            .expect("oversized resident total");
         tasks.enqueue(&fitting).await.expect("fitting envelope");
         tasks.enqueue(&oversized).await.expect("oversized envelope");
         let fitting_id = tasks.task_id_for_plan(&fitting).await.expect("fitting id");

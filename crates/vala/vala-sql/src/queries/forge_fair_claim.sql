@@ -31,7 +31,7 @@ WITH cursor AS MATERIALIZED (
             AND active.state IN ('claimed', 'running', 'prepared')
       )
       AND (
-          t.envelope_version = 0
+          t.envelope_version IN (0, 1)
           OR (t.lane = 'ordinary' AND t.estimated_files <= $5 AND t.estimated_bytes <= $6)
           OR (
               t.lane = 'large_singleton'
@@ -46,7 +46,7 @@ WITH cursor AS MATERIALIZED (
               )
           )
       )
-      AND (t.envelope_version = 0 OR (
+      AND (t.envelope_version IN (0, 1) OR (
           t.estimated_parallelism <= $7
           AND t.estimated_memory_bytes <= $8
           AND t.estimated_spill_bytes <= $9
@@ -97,7 +97,8 @@ SELECT c.execution_tenant_id,
        t.estimated_memory_bytes, t.estimated_spill_bytes,
        t.large_task_ceiling_bytes, t.envelope_version, t.decoded_batch_bytes,
        t.decoded_input_bytes, t.sort_working_bytes, t.sort_merge_reservation_bytes,
-       t.encoder_buffer_bytes, t.upload_chunk_bytes, t.sort_spill_bytes,
+       t.encoder_buffer_bytes, t.upload_chunk_bytes, t.footer_encoded_bytes,
+       t.footer_decode_workspace_bytes, t.sort_spill_bytes,
        t.output_scratch_bytes, t.state, t.attempt_id, t.claimed_by,
        t.claim_expires_at, t.watermark_snapshot_id,
        t.watermark_timestamp_ms, t.evidence, t.attempt_count, t.failure_class,

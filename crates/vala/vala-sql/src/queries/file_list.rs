@@ -68,7 +68,7 @@ impl HotFileCatalog {
         pinned_operation: Option<uuid::Uuid>,
     ) -> Result<HotFileCut, SqlError> {
         let rows = sqlx::query_as::<_, HotFileRow>(
-            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, partition_day, compacted, committed_snapshot_id, publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_day, created_at, id",
+            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, partition_day, compacted, committed_snapshot_id, publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_day, created_at, file_ordinal, id",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(&self.namespace)
@@ -169,6 +169,8 @@ mod tests {
             namespace: "vala.bifrost".to_owned(),
             table_name: "events".to_owned(),
             file_path: "events/a.parquet".to_owned(),
+            file_ordinal: 0,
+            file_checksum: None,
             file_size: 1,
             row_count: 1,
             partition_day: chrono::NaiveDate::from_ymd_opt(2026, 8, 12).expect("valid day"),

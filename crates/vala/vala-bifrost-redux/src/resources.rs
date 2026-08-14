@@ -19,9 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use datafusion::error::DataFusionError;
+#[cfg(any(test, feature = "test-support"))]
+use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::memory_pool::{
-    GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
-    TrackConsumersPool,
+    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
 };
 use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
@@ -1206,19 +1207,7 @@ impl BifrostRuntimeResources {
     /// construction of the root-backed Scribe compatibility ledger fails.
     pub fn detect(policy: BifrostResourcePolicy) -> Result<Self, BifrostResourceError> {
         let snapshot = detect_snapshot(&policy.scratch_root, policy.memory_limit_bytes)?;
-        let roots = policy.volume_roots.clone();
-        let configured_limit = policy
-            .scratch_limit_bytes
-            .unwrap_or(snapshot.scratch_capacity_bytes);
-        let mut runtime = Self::from_snapshot(snapshot, policy)?;
-        if let Some(roots) = roots {
-            runtime.volumes = Some(BifrostVolumeGovernor::register(
-                roots,
-                configured_limit,
-                runtime.health(),
-            )?);
-        }
-        Ok(runtime)
+        Self::from_snapshot(snapshot, policy)
     }
 
     /// Constructs the shared role graph from a complete resource observation.
@@ -1235,6 +1224,10 @@ impl BifrostRuntimeResources {
         snapshot: SystemResourceSnapshot,
         policy: BifrostResourcePolicy,
     ) -> Result<Self, BifrostResourceError> {
+        let roots = policy.volume_roots.clone();
+        let configured_limit = policy
+            .scratch_limit_bytes
+            .unwrap_or(snapshot.scratch_capacity_bytes);
         let root = BifrostResourceGovernor::from_snapshot(snapshot, policy)?;
         let scribe_memory = (root.is_enabled(BifrostRole::Scribe)
             || root.is_enabled(BifrostRole::Oracle))
@@ -1245,11 +1238,16 @@ impl BifrostRuntimeResources {
                 })
         })
         .transpose()?;
+        let volumes = roots
+            .map(|roots| {
+                BifrostVolumeGovernor::register(roots, configured_limit, root.inner.health.clone())
+            })
+            .transpose()?;
         Ok(Self {
             governor: root,
             scribe_memory,
             transport: crate::gate::limits::BifrostTransportAdmission::default(),
-            volumes: None,
+            volumes,
         })
     }
 
@@ -2906,6 +2904,8 @@ mod tests {
             sort_merge_reservation_bytes: MIB as u64,
             encoder_buffer_bytes: 2 * MIB as u64,
             upload_chunk_bytes: MIB as u64,
+            footer_encoded_bytes: 8 * MIB as u64,
+            footer_decode_workspace_bytes: 32 * MIB as u64,
             sort_spill_bytes: MIB as u64,
             output_scratch_bytes: MIB as u64,
         }
@@ -3700,9 +3700,10 @@ mod tests {
 
     /// Live detection reaches the same checked constructor as an injection.
     ///
-    /// `detect` may legitimately fail on a constrained CI host, so this asserts
-    /// the delegation contract: whatever detection resolves, the result is a
-    /// plan produced by the one policy stage, never a detection-specific path.
+    /// `detect` may legitimately fail on a constrained CI host. Scratch free
+    /// space is sampled independently and may change between observations, so
+    /// this compares every deterministic plan field while validating both
+    /// scratch results through the shared checked constructor.
     #[test]
     fn live_detection_delegates_to_checked_snapshot_construction() {
         let root = tempfile::tempdir().expect("scratch root");
@@ -3716,13 +3717,35 @@ mod tests {
                 assert_eq!(runtime.sources().scratch, ResourceSource::Filesystem);
                 let detected = detect_snapshot(&policy.scratch_root, policy.memory_limit_bytes)
                     .expect("detection succeeded once already");
+                let replayed = BifrostRuntimeResources::from_snapshot(detected, policy)
+                    .expect("the injected path accepts the detected observation");
+                let live_plan = runtime.plan();
+                let replayed_plan = replayed.plan();
                 assert_eq!(
-                    BifrostRuntimeResources::from_snapshot(detected, policy)
-                        .expect("the injected path accepts the detected observation")
-                        .plan(),
-                    runtime.plan(),
-                    "detection must resolve through the same checked constructor"
+                    (
+                        replayed_plan.memory_limit_bytes,
+                        replayed_plan.effective_cpu,
+                        replayed_plan.unmanaged_reserve_bytes,
+                        replayed_plan.managed_memory_bytes,
+                        replayed_plan.scribe_floor_bytes,
+                        replayed_plan.oracle_floor_bytes,
+                        replayed_plan.forge_floor_bytes,
+                        replayed_plan.elastic_memory_bytes,
+                    ),
+                    (
+                        live_plan.memory_limit_bytes,
+                        live_plan.effective_cpu,
+                        live_plan.unmanaged_reserve_bytes,
+                        live_plan.managed_memory_bytes,
+                        live_plan.scribe_floor_bytes,
+                        live_plan.oracle_floor_bytes,
+                        live_plan.forge_floor_bytes,
+                        live_plan.elastic_memory_bytes,
+                    ),
+                    "detection must resolve deterministic fields through one constructor"
                 );
+                assert!(live_plan.scratch_limit_bytes > 0);
+                assert!(replayed_plan.scratch_limit_bytes > 0);
             }
             Err(error) => assert!(
                 matches!(
@@ -3758,14 +3781,9 @@ mod tests {
                 reader_permits: 1,
             })
             .expect("Forge lease");
-        assert_eq!(
-            oracle
-                .snapshot()
-                .expect("Oracle observes the shared root")
-                .elastic_memory_used_bytes,
-            64 * MIB,
-            "a Forge lease must be visible through every sibling capability"
-        );
+        let occupied = oracle.snapshot().expect("Oracle observes the shared root");
+        assert_eq!(occupied.forge_memory_used_bytes, 64 * MIB);
+        assert_eq!(occupied.elastic_memory_used_bytes, 0);
         drop(lease);
         assert_eq!(
             oracle
@@ -3828,7 +3846,7 @@ mod tests {
             forge
                 .try_acquire_rewrite(ForgeRewriteRequest {
                     envelope: envelope(),
-                    memory_bytes: plan.elastic_memory_bytes + 1,
+                    memory_bytes: plan.forge_floor_bytes + plan.elastic_memory_bytes + 1,
                     scratch_bytes: 1,
                     reader_permits: 1,
                 })
@@ -3998,13 +4016,21 @@ mod tests {
         let query = governor
             .try_acquire_oracle(OracleResourceRequest { local_ratio: 0.0 })
             .expect("Oracle owns only its floor and shared elastic memory");
-        assert_eq!(query.memory_bytes, plan.oracle_floor_bytes + 212 * MIB);
+        assert_eq!(
+            query.memory_bytes,
+            plan.oracle_floor_bytes + plan.elastic_memory_bytes
+                - with_scribe.elastic_memory_used_bytes
+        );
         assert!(governor.try_acquire_forge(1, 1, 1).is_err());
         assert_eq!(governor.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         drop(query);
         drop(scribe_owner);
         let forge = governor
-            .try_acquire_forge(plan.elastic_memory_bytes, plan.scratch_limit_bytes, 1)
+            .try_acquire_forge(
+                plan.forge_floor_bytes + plan.elastic_memory_bytes,
+                plan.scratch_limit_bytes,
+                1,
+            )
             .expect("Forge may own all elastic resources after Oracle releases");
         assert_eq!(governor.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         drop(forge);

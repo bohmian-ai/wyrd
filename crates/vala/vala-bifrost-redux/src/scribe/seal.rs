@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use opendal::{ErrorKind, Operator};
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 use vala_sql::TenantConn;
-use wyrd_spec::ids::PodId;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
@@ -15,11 +15,77 @@ use crate::scribe::execution_lanes::{
 };
 use crate::scribe::file_list_writer;
 use crate::scribe::file_list_writer::FileListCommitKey;
-use crate::scribe::filename::seal_filename;
+use crate::scribe::memory::{MemoryCategory, MemoryReservation, parquet_producer_delta};
 use crate::scribe::memtable::{FrozenMemtable, Memtable};
+use crate::scribe::parquet_writer::BoundedParquetArtifactSet;
 use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::WalLsn;
+
+/// Cancellation-safe owner for objects uploaded before the caller's COMMIT boundary.
+///
+/// Until disarmed, dropping the owner schedules deletion of every exact path
+/// already uploaded. This covers cancellation between members and while the
+/// caller-owned SQL transaction is still known not committed.
+struct PreCommitUploads {
+    /// Object store containing the deterministic generation members.
+    operator: Arc<Operator>,
+    /// Exact successfully uploaded identities in ordinal order.
+    paths: Vec<String>,
+    /// False only after ownership transfers into [`ScribeCommitAttempt`].
+    armed: bool,
+}
+
+impl PreCommitUploads {
+    /// Creates an armed owner before the first object mutation.
+    fn new(operator: Arc<Operator>, capacity: usize) -> Self {
+        Self {
+            operator,
+            paths: Vec::with_capacity(capacity),
+            armed: true,
+        }
+    }
+
+    /// Records one completed deterministic upload.
+    fn record(&mut self, path: String) {
+        self.paths.push(path);
+    }
+
+    /// Deletes every completed member after a positively pre-COMMIT failure.
+    async fn cleanup(&mut self) {
+        for path in self.paths.drain(..) {
+            if let Err(error) = self.operator.delete(&path).await {
+                tracing::error!(path, %error, "failed to clean known-uncommitted Scribe object");
+            }
+        }
+        self.armed = false;
+    }
+
+    /// Transfers remote-object ownership to the returned commit attempt.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreCommitUploads {
+    /// Schedules exact cleanup when cancellation interrupts a known-uncommitted stage.
+    fn drop(&mut self) {
+        if !self.armed || self.paths.is_empty() {
+            return;
+        }
+        let operator = Arc::clone(&self.operator);
+        let paths = std::mem::take(&mut self.paths);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for path in paths {
+                    if let Err(error) = operator.delete(&path).await {
+                        tracing::error!(path, %error, "failed to clean cancelled Scribe upload");
+                    }
+                }
+            });
+        }
+    }
+}
 
 /// Capability returned by `pre_commit` and consumed after the SQL transaction commits.
 ///
@@ -122,6 +188,7 @@ mod tests {
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::file_list_writer::FileListCommitKey;
+    use crate::scribe::parquet_writer::{BoundedParquetArtifact, BoundedParquetArtifactSet};
     use crate::scribe::seal::{PostCommitBatch, PostCommitToken};
     use crate::scribe::seal_key::{EventDay, SealKey};
     use crate::scribe::wal::WalLsn;
@@ -129,6 +196,50 @@ mod tests {
     use wyrd_spec::DataTenantId;
 
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
+
+    /// Cancellation cleanup deletes only completed pre-COMMIT member identities.
+    #[tokio::test]
+    async fn partial_upload_owner_cleans_exact_completed_members_on_drop() {
+        let operator = Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("memory operator")
+                .finish(),
+        );
+        let first = "tenant/generation/artifact-00000.parquet";
+        let second = "tenant/generation/artifact-00001.parquet";
+        let unrelated = "tenant/other/artifact.parquet";
+        operator
+            .write(first, bytes::Bytes::from_static(b"first"))
+            .await
+            .expect("first upload");
+        operator
+            .write(second, bytes::Bytes::from_static(b"partial"))
+            .await
+            .expect("second partial upload");
+        operator
+            .write(unrelated, bytes::Bytes::from_static(b"unrelated"))
+            .await
+            .expect("unrelated upload");
+        let mut uploads = super::PreCommitUploads::new(Arc::clone(&operator), 2);
+        uploads.record(first.to_owned());
+        uploads.record(second.to_owned());
+        drop(uploads);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while operator.exists(first).await.expect("first existence")
+                || operator.exists(second).await.expect("second existence")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation cleanup");
+        assert!(
+            operator
+                .exists(unrelated)
+                .await
+                .expect("unrelated existence")
+        );
+    }
 
     /// Force-seal conversion exposes only the post-commit capability batch.
     #[test]
@@ -223,6 +334,61 @@ mod tests {
             "failed"
         ));
     }
+
+    /// Dropping an unsettled COMMIT attempt retains evidence and poisons Scribe.
+    #[test]
+    fn dropped_unsettled_scribe_commit_attempt_fail_stops_owner() {
+        let governor = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
+            .expect("test memory governor");
+        let memory = governor.scribe_budget();
+        let tenant = DataTenantId::new_v7();
+        let seal_key = SealKey::new(
+            tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "events"),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 8, 14).expect("date")),
+        );
+        let token = PostCommitToken {
+            seal_id: 12,
+            seal_key,
+            shard_id: 0,
+            file_list_key: FileListCommitKey {
+                data_tenant_id: tenant,
+                namespace: "vala.bifrost".to_owned(),
+                table_name: "events".to_owned(),
+                node_id: uuid::Uuid::nil(),
+                writer_epoch: 1,
+                wal_lsn_min: 1,
+                wal_lsn_max: 1,
+            },
+            file_list_row_id: uuid::Uuid::nil(),
+            batch_ids: Vec::new(),
+            wal_lsn_min: WalLsn::new(1),
+            wal_lsn_max: WalLsn::new(1),
+            memtable_bytes: 0,
+            visibility: super::VisibilityPublishGuard::new(),
+        };
+        let artifacts = BoundedParquetArtifactSet::encoded(vec![BoundedParquetArtifact {
+            ordinal: 0,
+            scratch_path: std::path::PathBuf::from("unused-test-artifact"),
+            object_identity: "s3://bucket/object-00000.parquet".to_owned(),
+            file_size: 1,
+            checksum: "0".repeat(64),
+            row_count: 1,
+            row_group_stats: Vec::new(),
+        }])
+        .expect("nonempty artifact set");
+        drop(super::ScribeCommitAttempt {
+            token: Some(token),
+            rows: Vec::new(),
+            audit_events: Vec::new(),
+            artifacts: Some(artifacts),
+            memory: Some(memory.clone()),
+            parquet_owner: None,
+            completion: None,
+            settled: false,
+        });
+        assert!(memory.is_poisoned());
+    }
 }
 
 /// A set of post-commit capabilities produced by one force-seal call.
@@ -235,15 +401,170 @@ impl From<PostCommitToken> for PostCommitBatch {
     }
 }
 
-/// Handle returned by `pre_commit` to be completed after the caller commits.
+/// Move-only authority returned before the caller resolves its SQL COMMIT.
 #[derive(Debug)]
-pub struct SealCommit {
+pub struct ScribeCommitAttempt {
     /// Post-commit lifecycle capability.
-    pub token: PostCommitToken,
-    /// Canonical binding used by the seal.
-    pub binding: TenantTableBinding,
-    /// Object-store path written during pre-commit.
-    pub parquet_path: String,
+    pub(crate) token: Option<PostCommitToken>,
+    /// Exact rows used for idempotent full-set reconciliation.
+    pub(crate) rows: Vec<file_list_writer::FileListArtifactInsert>,
+    /// Exact audit transition paired with the generation publication.
+    pub(crate) audit_events: Vec<wyrd_spec::vala::api::AuditEvent>,
+    /// Uploaded object identities and generation scratch authority.
+    pub(crate) artifacts: Option<BoundedParquetArtifactSet>,
+    /// Shared Scribe owner poisoned if the attempt is abandoned unsettled.
+    pub(crate) memory: Option<crate::scribe::memory::ScribeMemoryBudget>,
+    /// Checked delta completing the immutable charge into one 256 MiB owner.
+    pub(crate) parquet_owner: Option<MemoryReservation>,
+    /// Production owner that completes immutable retirement after reconciliation.
+    pub(crate) completion: Option<ScribeCommitCompletion>,
+    /// Explicit terminal marker suppressing fail-stop drop behavior.
+    pub(crate) settled: bool,
+}
+
+/// Dependencies required to complete one reconciled caller-owned publication.
+#[derive(Debug, Clone)]
+pub(crate) struct ScribeCommitCompletion {
+    /// Fixed shard runtime that owns immutable generation retirement.
+    pub(crate) shards: Arc<crate::scribe::shards::ScribeShardRuntime>,
+    /// Optional local Forge wake-up emitted after retirement.
+    pub(crate) staging_file_publisher: Option<crate::maintenance::StagingFilePublisher>,
+    /// Test-tier lifecycle observer preserved across asynchronous reconciliation.
+    #[cfg(feature = "test-support")]
+    pub(crate) publication_observer: super::ScribePublicationObserver,
+}
+
+impl ScribeCommitCompletion {
+    /// Completes the exact immutable generation after durable publication.
+    ///
+    /// # Errors
+    /// Returns a Scribe error when binding resolution or shard retirement fails.
+    async fn complete(&self, mut token: PostCommitToken) -> Result<(), ScribeError> {
+        let binding =
+            TenantTableBinding::resolve((token.seal_key.tenant, token.seal_key.table.clone()))
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+        self.shards
+            .complete_post_commit(
+                token.seal_id,
+                token.shard_id,
+                &token.seal_key,
+                token.memtable_bytes,
+                token.file_list_key.clone(),
+            )
+            .await?;
+        #[cfg(feature = "test-support")]
+        self.publication_observer
+            .record(super::ScribePublicationEvent::Published {
+                seal_id: token.seal_id,
+                file_list_row_id: token.file_list_row_id,
+                batch_ids: token.batch_ids.clone(),
+                table: token.seal_key.table.fqn(),
+            });
+        if let Some(publisher) = &self.staging_file_publisher {
+            let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
+                binding,
+                token.seal_key.day.as_naive_date(),
+            ));
+        }
+        token.visibility.succeed();
+        Ok(())
+    }
+}
+
+impl ScribeCommitAttempt {
+    /// Attaches the production immutable-retirement owner before COMMIT polling.
+    pub(crate) fn attach_completion(&mut self, completion: ScribeCommitCompletion) {
+        self.completion = Some(completion);
+    }
+
+    /// Reconciles an ambiguous COMMIT until exact publication is observed.
+    ///
+    /// The runtime owns this future independently of the caller. Cancellation
+    /// of the caller therefore cannot drop objects, scratch, or WAL authority.
+    ///
+    /// # Errors
+    /// Returns only after durable publication succeeds but immutable retirement
+    /// or exact scratch cleanup fails. SQL errors are retried with bounded delay.
+    pub(crate) async fn reconcile(
+        mut self,
+        reconciler: &crate::scribe::persistence::ScribePublicationReconciler,
+    ) -> Result<(), ScribeError> {
+        loop {
+            if matches!(
+                reconciler.publish(&self.rows, &self.audit_events).await,
+                crate::scribe::persistence::ScribePublicationOutcome::Committed(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let completion = self
+            .completion
+            .take()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "ambiguous Scribe attempt lacks its completion owner".to_owned(),
+            })?;
+        let (token, artifacts, parquet_owner) = self.take_terminal();
+        completion.complete(token).await?;
+        artifacts.cleanup()?;
+        drop(parquet_owner);
+        Ok(())
+    }
+    /// Returns the pending post-commit token for test-support telemetry.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn token(&self) -> Option<&PostCommitToken> {
+        self.token.as_ref()
+    }
+
+    /// Marks the attempt terminal and extracts all move-owned capabilities.
+    ///
+    /// # Panics
+    /// Panics only when an internal caller settles the same move-only attempt
+    /// twice, which is prevented by consuming `self` at the public seam.
+    pub(crate) fn take_terminal(
+        mut self,
+    ) -> (
+        PostCommitToken,
+        BoundedParquetArtifactSet,
+        MemoryReservation,
+    ) {
+        self.settled = true;
+        let token = self
+            .token
+            .take()
+            .expect("unsettled Scribe commit attempt owns its token");
+        let artifacts = self
+            .artifacts
+            .take()
+            .expect("unsettled Scribe commit attempt owns its artifacts");
+        let parquet_owner = self
+            .parquet_owner
+            .take()
+            .expect("unsettled Scribe commit attempt owns its Parquet reservation");
+        (token, artifacts, parquet_owner)
+    }
+}
+
+impl Drop for ScribeCommitAttempt {
+    /// Retains ambiguous evidence and fail-stops Scribe if settlement is skipped.
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(artifacts) = self.artifacts.take() {
+            artifacts.retain_for_reconciliation();
+        }
+        if let Some(memory) = &self.memory {
+            memory.poison();
+        }
+        if let Some(token) = &mut self.token {
+            token.visibility.fail();
+        }
+        tracing::error!("unsettled Scribe COMMIT attempt retained and poisoned its owner");
+    }
 }
 
 /// Seal state machine for one seal-key.
@@ -253,13 +574,17 @@ pub struct SealCommit {
 pub struct SealDriver {
     operator: Arc<Operator>,
     persistence_cpu: ScribePersistenceCpuPool,
+    /// Generation-owned output scratch authority required before encoding.
+    output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
+    /// Shared Scribe owner fail-stopped by an abandoned COMMIT attempt.
+    memory: Option<crate::scribe::memory::ScribeMemoryBudget>,
 }
 
 impl SealDriver {
     /// Construct a new `SealDriver` with the given opendal operator.
     #[must_use]
     pub fn new(operator: Arc<Operator>) -> Self {
-        Self::new_with_lane(operator, ScribePersistenceCpuPool::new(1))
+        Self::new_with_lane(operator, ScribePersistenceCpuPool::new(1), None, None)
     }
 
     /// Construct a seal driver using the boot-owned persistence CPU lane.
@@ -267,10 +592,14 @@ impl SealDriver {
     pub(crate) fn new_with_lane(
         operator: Arc<Operator>,
         persistence_cpu: ScribePersistenceCpuPool,
+        output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
+        memory: Option<crate::scribe::memory::ScribeMemoryBudget>,
     ) -> Self {
         Self {
             operator,
             persistence_cpu,
+            output_scratch,
+            memory,
         }
     }
 
@@ -289,7 +618,7 @@ impl SealDriver {
         conn: &mut TenantConn<'_>,
         node_id: &str,
         writer_epoch: i64,
-    ) -> Result<SealCommit, ScribeError> {
+    ) -> Result<ScribeCommitAttempt, ScribeError> {
         info!("seal stage: Freeze");
         let freeze_started = std::time::Instant::now();
         let frozen = memtable.freeze(seal_key)?;
@@ -314,7 +643,7 @@ impl SealDriver {
         conn: &mut TenantConn<'_>,
         node_id: &str,
         writer_epoch: i64,
-    ) -> Result<SealCommit, ScribeError> {
+    ) -> Result<ScribeCommitAttempt, ScribeError> {
         let mut visibility = VisibilityPublishGuard::new();
         binding
             .validate_authenticated_tenant(conn.data_tenant_id())
@@ -329,53 +658,117 @@ impl SealDriver {
                 ),
             });
         }
+        let memory = self.memory.as_ref().ok_or_else(|| ScribeError::Internal {
+            detail: "Scribe writer-v2 memory owner is unavailable before encoding".to_owned(),
+        })?;
+        let mut parquet_owner = memory.try_reserve_maintenance(
+            MemoryCategory::Persistence,
+            parquet_producer_delta(frozen.arrow_bytes)?,
+        )?;
 
         // 2. WriteParquet on the boot-owned persistence CPU lane.
         info!("seal stage: WriteParquet");
         let parquet_started = std::time::Instant::now();
-        let encoded = self
-            .encode_parquet(frozen, binding, seal_key.tenant)
+        let output_scratch = self
+            .output_scratch
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "Scribe output scratch is unavailable before seal encoding".to_owned(),
+            })?;
+        let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
+            detail: format!("node_id is not a valid UUID: {error}"),
+        })?;
+        let scratch = output_scratch
+            .create_scribe_generation(
+                &node_uuid.simple().to_string(),
+                frozen.seal_id,
+                256 * 1024 * 1024,
+            )
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("Scribe seal scratch admission failed: {error}"),
+            })?;
+        let object_base = format!(
+            "{}/day={}/scribe-{}-{}",
+            binding.object_prefix,
+            seal_key.day,
+            node_uuid.simple(),
+            frozen.seal_id
+        );
+        let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
+            &mut parquet_owner,
+            frozen.arrow_bytes,
+        )?;
+        let mut encoded = self
+            .encode_parquet(
+                frozen,
+                binding,
+                seal_key.tenant,
+                scratch.path(),
+                &object_base,
+                footer_reservation,
+            )
             .await?;
+        encoded.artifacts.attach_scratch(scratch)?;
+        let encoded_bytes = encoded
+            .artifacts
+            .iter()
+            .try_fold(0_usize, |sum, artifact| {
+                sum.checked_add(usize::try_from(artifact.file_size).ok()?)
+            })
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "Scribe seal artifact-set size overflows".to_owned(),
+            })?;
         Self::record(
             "parquet_encode",
             parquet_started.elapsed(),
             frozen.row_count(),
-            encoded.bytes.len(),
+            encoded_bytes,
         );
 
         // 3. PutObject
         info!("seal stage: PutObject");
         let put_started = std::time::Instant::now();
-        let parquet_path = self
-            .put_object(binding, seal_key, &encoded, node_id)
-            .await?;
+        let mut uploads =
+            PreCommitUploads::new(Arc::clone(&self.operator), encoded.artifacts.len());
+        if let Err(error) = self.put_artifacts(&encoded, &mut uploads).await {
+            uploads.cleanup().await;
+            return Err(error);
+        }
         Self::record(
             "object_store_put",
             put_started.elapsed(),
             frozen.row_count(),
-            encoded.bytes.len(),
+            encoded_bytes,
         );
 
         // 4. AtomicPgTx
         info!("seal stage: AtomicPgTx");
         let pg_started = std::time::Instant::now();
-        let row = file_list_writer::build_insert(
+        let rows = file_list_writer::build_artifact_inserts(
             frozen,
             &encoded,
             binding,
             node_id,
             writer_epoch,
-            &parquet_path,
-            None,
         )?;
-        let insert_outcome = file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
-            .await
-            .map_err(ScribeError::from)?;
+        let insert_outcome = match file_list_writer::insert_artifact_set_and_audit(
+            conn,
+            &rows,
+            &encoded.audit_events,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                uploads.cleanup().await;
+                return Err(ScribeError::from(error));
+            }
+        };
         Self::record(
             "file_list_transaction",
             pg_started.elapsed(),
             frozen.row_count(),
-            encoded.bytes.len(),
+            encoded_bytes,
         );
 
         let wal_lsn_min = encoded
@@ -392,14 +785,15 @@ impl SealDriver {
             .unwrap_or_else(|| WalLsn::new(0));
 
         visibility.arm_cancellation();
-        Ok(SealCommit {
-            token: PostCommitToken {
+        uploads.disarm();
+        Ok(ScribeCommitAttempt {
+            token: Some(PostCommitToken {
                 seal_id: frozen.seal_id,
                 seal_key: seal_key.clone(),
                 // Carry the recorded shard lane through to post-commit routing.
                 shard_id: frozen.shard_id,
                 file_list_key: insert_outcome.commit_key,
-                file_list_row_id: insert_outcome.id,
+                file_list_row_id: rows[0].id,
                 batch_ids: frozen
                     .metas
                     .iter()
@@ -409,9 +803,14 @@ impl SealDriver {
                 wal_lsn_max,
                 memtable_bytes: frozen.arrow_bytes,
                 visibility,
-            },
-            binding: binding.clone(),
-            parquet_path,
+            }),
+            rows,
+            audit_events: encoded.audit_events,
+            artifacts: Some(encoded.artifacts),
+            memory: self.memory.clone(),
+            parquet_owner: Some(parquet_owner),
+            completion: None,
+            settled: false,
         })
     }
 
@@ -420,6 +819,9 @@ impl SealDriver {
         frozen: &FrozenMemtable,
         binding: &TenantTableBinding,
         tenant: wyrd_spec::ids::DataTenantId,
+        scratch_dir: &std::path::Path,
+        object_base: &str,
+        footer_reservation: crate::scribe::memory::EncodedFooterReservation,
     ) -> Result<ParquetEncoded, ScribeError> {
         match self
             .persistence_cpu
@@ -427,6 +829,9 @@ impl SealDriver {
                 frozen: Box::new(frozen.clone()),
                 binding: binding.clone(),
                 tenant,
+                scratch_dir: scratch_dir.to_path_buf(),
+                object_base: object_base.to_owned(),
+                footer_reservation,
             })
             .await?
         {
@@ -449,97 +854,80 @@ impl SealDriver {
             .increment(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
-    /// PUT the Parquet object to storage with retry on transient failures.
+    /// Streams every ordered artifact to storage with bounded chunks and retries.
     ///
     /// # Errors
     /// Returns [`ScribeError::ObjectStorePutFailed`] on non-transient failures.
-    async fn put_object(
+    async fn put_artifacts(
         &self,
-        binding: &TenantTableBinding,
-        seal_key: &SealKey,
         encoded: &ParquetEncoded,
-        node_id: &str,
-    ) -> Result<String, ScribeError> {
-        let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
-            detail: format!("node_id is not a valid UUID: {error}"),
-        })?;
-        let pod_id = PodId::new(format!("pod-{}", node_uuid.simple())).map_err(|error| {
-            ScribeError::Internal {
-                detail: format!("derived node PodId is invalid: {error}"),
-            }
-        })?;
-        let filename = seal_filename(&pod_id);
-        let path = format!(
-            "{}/day={}/{}",
-            binding.object_prefix, seal_key.day, filename
-        );
+        uploads: &mut PreCommitUploads,
+    ) -> Result<(), ScribeError> {
+        for artifact in &encoded.artifacts {
+            let mut terminal = None;
+            for attempt in 0..5_u32 {
+                let upload = async {
+                    use tokio::io::AsyncReadExt;
 
-        // Retry policy: base 100 ms, cap 5 s, 5 attempts max, jitter enabled
-        let mut attempt = 0;
-        let max_attempts = 5;
-        let base_delay_ms = 100;
-        let max_delay_ms = 5000;
-
-        loop {
-            attempt += 1;
-
-            // Wrap the write in a 30-second timeout
-            let write_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(30),
-                self.operator.write(&path, encoded.bytes.clone()),
-            )
-            .await;
-
-            match write_result {
-                Ok(Ok(_)) => {
-                    info!(path = %path, bytes = encoded.bytes.len(), "Parquet PUT succeeded");
-                    return Ok(path);
-                }
-                Ok(Err(e)) => {
-                    // Classify error for retry
-                    let is_fail_fast = matches!(
-                        e.kind(),
-                        ErrorKind::NotFound
-                            | ErrorKind::PermissionDenied
-                            | ErrorKind::ConditionNotMatch
-                            | ErrorKind::ConfigInvalid
-                    );
-
-                    let is_retriable = matches!(e.kind(), ErrorKind::RateLimited)
-                        || (matches!(e.kind(), ErrorKind::Unexpected) && e.is_temporary());
-
-                    if is_fail_fast || (!is_retriable) || attempt >= max_attempts {
-                        return Err(ScribeError::ObjectStorePutFailed(e));
+                    let mut source = tokio::fs::File::open(&artifact.scratch_path)
+                        .await
+                        .map_err(|error| {
+                            opendal::Error::new(ErrorKind::Unexpected, "open Scribe scratch")
+                                .set_source(error)
+                        })?;
+                    let mut writer = self
+                        .operator
+                        .writer_with(&artifact.object_identity)
+                        .chunk(8 * 1024 * 1024)
+                        .await?;
+                    let mut chunk = vec![0_u8; 8 * 1024 * 1024];
+                    let mut uploaded = 0_u64;
+                    loop {
+                        let read = source.read(&mut chunk).await.map_err(|error| {
+                            opendal::Error::new(ErrorKind::Unexpected, "read Scribe scratch")
+                                .set_source(error)
+                        })?;
+                        if read == 0 {
+                            break;
+                        }
+                        writer.write(Bytes::copy_from_slice(&chunk[..read])).await?;
+                        uploaded = uploaded.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
                     }
-
-                    // Exponential backoff with jitter
-                    let delay_ms = (base_delay_ms * 2_u64.pow(attempt - 1)).min(max_delay_ms);
-                    let jitter = rand::random::<u64>() % (delay_ms / 10 + 1);
-                    let actual_delay_ms = delay_ms + jitter;
-
-                    warn!(
-                    attempt = attempt,
-                    delay_ms = actual_delay_ms,
-                    error = %e,
-                    "transient object store error, retrying"
-                    );
-
-                    tokio::time::sleep(tokio::time::Duration::from_millis(actual_delay_ms)).await;
-                }
-                Err(_) => {
-                    // Timeout - treat as transient
-                    if attempt >= max_attempts {
-                        return Err(ScribeError::ObjectStorePutFailed(opendal::Error::new(
+                    let metadata = writer.close().await?;
+                    if uploaded != artifact.file_size
+                        || metadata.content_length() != artifact.file_size
+                    {
+                        return Err(opendal::Error::new(
                             ErrorKind::Unexpected,
-                            "write timeout after 30s",
-                        )));
+                            "Scribe artifact upload length mismatch",
+                        ));
                     }
-                    warn!(attempt = attempt, "object store write timeout, retrying");
-                    let delay_ms = (base_delay_ms * 2_u64.pow(attempt - 1)).min(max_delay_ms);
-                    let jitter = rand::random::<u64>() % (delay_ms / 10 + 1);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms + jitter)).await;
+                    Ok(())
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(30), upload).await {
+                    Ok(Ok(())) => {
+                        terminal = None;
+                        break;
+                    }
+                    Ok(Err(error)) => terminal = Some(ScribeError::ObjectStorePutFailed(error)),
+                    Err(_) => {
+                        terminal = Some(ScribeError::ObjectStorePutFailed(opendal::Error::new(
+                            ErrorKind::Unexpected,
+                            "Scribe artifact upload timed out",
+                        )))
+                    }
+                }
+                if attempt < 4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * 2_u64.pow(attempt)))
+                        .await;
                 }
             }
+            if let Some(error) = terminal {
+                return Err(error);
+            }
+            uploads.record(artifact.object_identity.clone());
+            info!(path = %artifact.object_identity, bytes = artifact.file_size, "Parquet PUT succeeded");
         }
+        Ok(())
     }
 }

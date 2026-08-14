@@ -1,5 +1,6 @@
 //! `file_list` writer — atomic INSERT + audit fan-out per CONTRACTS §11.
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vala_sql::OperatorPool;
 use vala_sql::{SqlError, TenantConn};
@@ -24,6 +25,8 @@ pub struct FileListConflictKey {
     pub wal_lsn_min: i64,
     /// Inclusive upper WAL LSN.
     pub wal_lsn_max: i64,
+    /// Zero-based artifact position within the generation.
+    pub file_ordinal: i16,
 }
 
 /// The full identity that must match when a conflict key is replayed.
@@ -54,6 +57,145 @@ pub struct FileListInsertOutcome {
     pub commit_key: FileListCommitKey,
     /// Whether the unique replay key already existed.
     pub replayed: bool,
+}
+
+/// Production-only writer-v2 file-list row with explicit artifact identity.
+#[derive(Debug, Clone)]
+pub struct FileListArtifactInsert {
+    /// Durable row identity derived once for this publication attempt.
+    pub id: Uuid,
+    /// Tenant owning the complete generation.
+    pub data_tenant_id: DataTenantId,
+    /// Logical namespace stored in `vala.file_list`.
+    pub namespace: String,
+    /// Logical table name stored in `vala.file_list`.
+    pub table_name: String,
+    /// Deterministic object identity stamped in the Parquet footer.
+    pub file_path: String,
+    /// Exact sealed artifact size.
+    pub file_size: i64,
+    /// Rows represented by this artifact.
+    pub row_count: i64,
+    /// Minimum event timestamp for this artifact.
+    pub min_event_time: chrono::DateTime<chrono::Utc>,
+    /// Maximum event timestamp for this artifact.
+    pub max_event_time: chrono::DateTime<chrono::Utc>,
+    /// Partition day inherited from the generation seal key.
+    pub partition_day: chrono::NaiveDate,
+    /// Producing Scribe node.
+    pub node_id: Uuid,
+    /// Producing writer epoch.
+    pub writer_epoch: i64,
+    /// Inclusive lower WAL LSN.
+    pub wal_lsn_min: i64,
+    /// Inclusive upper WAL LSN.
+    pub wal_lsn_max: i64,
+    /// Contiguous zero-based artifact ordinal.
+    pub file_ordinal: i16,
+    /// Exact lowercase SHA-256 checksum.
+    pub file_checksum: String,
+}
+
+/// Complete identity returned by an atomic writer-v2 set publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileListArtifactSetOutcome {
+    /// Existing generation-scoped commit identity.
+    pub commit_key: FileListCommitKey,
+    /// Positive artifact count validated in the transaction.
+    pub artifact_count: u16,
+    /// SHA-256 digest of ordered ordinal/path/size/checksum identities.
+    pub artifact_set_digest: String,
+    /// Whether every row already existed and matched exactly.
+    pub replayed: bool,
+}
+
+/// Builds the ordered writer-v2 SQL rows for one sealed artifact set.
+///
+/// # Errors
+/// Returns a Scribe invariant error for an empty/noncontiguous set, malformed
+/// checksum, identity mismatch, or values outside PostgreSQL integer domains.
+pub fn build_artifact_inserts(
+    frozen: &FrozenMemtable,
+    encoded: &ParquetEncoded,
+    binding: &TenantTableBinding,
+    node_id: &str,
+    writer_epoch: i64,
+) -> Result<Vec<FileListArtifactInsert>, ScribeError> {
+    if encoded.artifacts.is_empty()
+        || binding.tenant != frozen.seal_key.tenant
+        || binding.table_ref != frozen.seal_key.table
+    {
+        return Err(ScribeError::Internal {
+            detail: "writer-v2 artifact set does not match its frozen generation".to_owned(),
+        });
+    }
+    let node_id = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
+        detail: format!("invalid writer-v2 node identity: {error}"),
+    })?;
+    let (wal_lsn_min, wal_lsn_max) = extract_lsn_range(encoded)?;
+    encoded
+        .artifacts
+        .iter()
+        .enumerate()
+        .map(|(expected, artifact)| {
+            if usize::from(artifact.ordinal) != expected
+                || artifact.checksum.len() != 64
+                || !artifact
+                    .checksum
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(ScribeError::Internal {
+                    detail: "writer-v2 artifact identity is malformed or noncontiguous".to_owned(),
+                });
+            }
+            let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+            let min_event_time = artifact
+                .row_group_stats
+                .iter()
+                .filter_map(|stats| stats.min_event_time)
+                .min()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_micros)
+                .unwrap_or(epoch);
+            let max_event_time = artifact
+                .row_group_stats
+                .iter()
+                .filter_map(|stats| stats.max_event_time)
+                .max()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_micros)
+                .unwrap_or(epoch);
+            Ok(FileListArtifactInsert {
+                id: Uuid::now_v7(),
+                data_tenant_id: binding.tenant,
+                namespace: binding.logical_namespace.clone(),
+                table_name: binding.table_name.clone(),
+                file_path: artifact.object_identity.clone(),
+                file_size: i64::try_from(artifact.file_size).map_err(|_| {
+                    ScribeError::Internal {
+                        detail: "writer-v2 file size exceeds bigint".to_owned(),
+                    }
+                })?,
+                row_count: i64::try_from(artifact.row_count).map_err(|_| {
+                    ScribeError::Internal {
+                        detail: "writer-v2 row count exceeds bigint".to_owned(),
+                    }
+                })?,
+                min_event_time,
+                max_event_time,
+                partition_day: encoded.partition_day.as_naive_date(),
+                node_id,
+                writer_epoch,
+                wal_lsn_min,
+                wal_lsn_max,
+                file_ordinal: i16::try_from(artifact.ordinal).map_err(|_| {
+                    ScribeError::Internal {
+                        detail: "writer-v2 ordinal exceeds smallint".to_owned(),
+                    }
+                })?,
+                file_checksum: artifact.checksum.clone(),
+            })
+        })
+        .collect()
 }
 
 /// File-list INSERT row matching the `vala.file_list` columns.
@@ -97,6 +239,7 @@ impl FileListInsert<'_> {
             writer_epoch: self.writer_epoch,
             wal_lsn_min: self.wal_lsn_min,
             wal_lsn_max: self.wal_lsn_max,
+            file_ordinal: 0,
         }
     }
 }
@@ -184,12 +327,20 @@ pub fn build_insert<'a>(
     let row_count = i64::try_from(frozen.row_count()).map_err(|_| ScribeError::Internal {
         detail: "row_count exceeds i64::MAX (invariant violation)".to_string(),
     })?;
-    let file_size =
-        i64::try_from(file_size_override.unwrap_or(encoded.bytes.len())).map_err(|_| {
-            ScribeError::Internal {
-                detail: "file_size exceeds i64::MAX (invariant violation)".to_string(),
-            }
+    let encoded_size = encoded
+        .artifacts
+        .iter()
+        .try_fold(0_usize, |sum, artifact| {
+            sum.checked_add(usize::try_from(artifact.file_size).ok()?)
+        })
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "writer-v2 artifact-set size overflows".to_owned(),
         })?;
+    let file_size = i64::try_from(file_size_override.unwrap_or(encoded_size)).map_err(|_| {
+        ScribeError::Internal {
+            detail: "file_size exceeds i64::MAX (invariant violation)".to_string(),
+        }
+    })?;
 
     let node_uuid = Uuid::parse_str(node_id).map_err(|e| ScribeError::Internal {
         detail: format!("invalid node_id UUID: {e}"),
@@ -228,6 +379,7 @@ async fn validate_replay(
     AND writer_epoch = $2
     AND wal_lsn_min = $3
     AND wal_lsn_max = $4
+    AND file_ordinal = $5
   FOR UPDATE
  ",
     )
@@ -235,6 +387,7 @@ async fn validate_replay(
     .bind(conflict.writer_epoch)
     .bind(conflict.wal_lsn_min)
     .bind(conflict.wal_lsn_max)
+    .bind(conflict.file_ordinal)
     .fetch_optional(&mut **conn.transaction())
     .await?;
 
@@ -306,6 +459,162 @@ pub async fn insert_and_audit_fenced(
     .await
 }
 
+/// Atomically publishes a complete writer-v2 artifact set under one actor fence.
+///
+/// Either every contiguous row plus the generation's audit fan-out commits, or
+/// none do. Replays succeed only when every ordered identity matches exactly.
+///
+/// # Errors
+/// Returns a SQL invariant error for an empty/noncontiguous/mixed replay set,
+/// a stale actor fence, identity mismatch, audit failure, or commit failure.
+pub async fn insert_artifact_set_and_audit_fenced(
+    operator_pool: &OperatorPool,
+    actor: StreamIdentity,
+    rows: &[FileListArtifactInsert],
+    events: &[AuditEvent],
+) -> Result<FileListArtifactSetOutcome, SqlError> {
+    let first = rows.first().ok_or_else(|| SqlError::InvariantViolation {
+        detail: "writer-v2 publication set is empty".to_owned(),
+    })?;
+    if rows.iter().enumerate().any(|(ordinal, row)| {
+        usize::try_from(row.file_ordinal).ok() != Some(ordinal)
+            || row.data_tenant_id != first.data_tenant_id
+            || row.node_id != first.node_id
+            || row.writer_epoch != first.writer_epoch
+            || row.wal_lsn_min != first.wal_lsn_min
+            || row.wal_lsn_max != first.wal_lsn_max
+            || !valid_artifact_identity(row)
+    }) {
+        return Err(SqlError::InvariantViolation {
+            detail: "writer-v2 publication set is noncontiguous or crosses generations".to_owned(),
+        });
+    }
+    let mut transaction = operator_pool.begin().await.map_err(SqlError::from)?;
+    let actor_live: bool =
+        sqlx::query_scalar("SELECT vala.assert_scribe_publication_fence($1, $2, $3)")
+            .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+            .bind(actor.node_id.as_uuid())
+            .bind(actor.writer_epoch.as_i64())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(SqlError::from)?;
+    if !actor_live {
+        return Err(SqlError::InvariantViolation {
+            detail: format!("Scribe publication fence lost for actor {actor}"),
+        });
+    }
+    let mut inserted = 0_u64;
+    for row in rows {
+        inserted += sqlx::query(
+            "INSERT INTO vala.file_list \
+             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
+             ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal) DO NOTHING",
+        )
+        .bind(row.id)
+        .bind(row.data_tenant_id.as_uuid())
+        .bind(&row.namespace)
+        .bind(&row.table_name)
+        .bind(&row.file_path)
+        .bind(row.file_size)
+        .bind(row.row_count)
+        .bind(row.min_event_time)
+        .bind(row.max_event_time)
+        .bind(row.partition_day)
+        .bind(row.node_id)
+        .bind(row.writer_epoch)
+        .bind(row.wal_lsn_min)
+        .bind(row.wal_lsn_max)
+        .bind(row.file_ordinal)
+        .bind(&row.file_checksum)
+        .execute(&mut *transaction)
+        .await
+        .map_err(SqlError::from)?
+        .rows_affected();
+    }
+    if inserted != 0 && inserted != u64::try_from(rows.len()).unwrap_or(u64::MAX) {
+        return Err(SqlError::InvariantViolation {
+            detail: "writer-v2 publication observed a partial replay set".to_owned(),
+        });
+    }
+    let existing: Vec<(
+        i16,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::NaiveDate,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,file_checksum FROM vala.file_list \
+         WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 AND wal_lsn_min=$4 AND wal_lsn_max=$5 \
+         ORDER BY file_ordinal FOR UPDATE",
+    )
+    .bind(first.data_tenant_id.as_uuid())
+    .bind(first.node_id)
+    .bind(first.writer_epoch)
+    .bind(first.wal_lsn_min)
+    .bind(first.wal_lsn_max)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(SqlError::from)?;
+    if existing.len() != rows.len()
+        || existing.iter().zip(rows).any(|(actual, expected)| {
+            actual.0 != expected.file_ordinal
+                || actual.1 != expected.namespace
+                || actual.2 != expected.table_name
+                || actual.3 != expected.file_path
+                || actual.4 != expected.file_size
+                || actual.5 != expected.row_count
+                || actual.6 != expected.min_event_time
+                || actual.7 != expected.max_event_time
+                || actual.8 != expected.partition_day
+                || actual.9.as_deref() != Some(expected.file_checksum.as_str())
+        })
+    {
+        return Err(SqlError::InvariantViolation {
+            detail: "writer-v2 replay identity does not match the complete artifact set".to_owned(),
+        });
+    }
+    if inserted > 0 {
+        let mut audit = vala_sql::queries::audit_outbox::OperatorAudit::new(
+            first.data_tenant_id,
+            &mut transaction,
+        );
+        for event in events {
+            audit.append(event).await?;
+        }
+    }
+    let mut digest = Sha256::new();
+    for row in rows {
+        digest.update(row.file_ordinal.to_be_bytes());
+        digest.update((row.file_path.len() as u64).to_be_bytes());
+        digest.update(row.file_path.as_bytes());
+        digest.update(row.file_size.to_be_bytes());
+        digest.update(row.file_checksum.as_bytes());
+    }
+    transaction.commit().await.map_err(SqlError::from)?;
+    Ok(FileListArtifactSetOutcome {
+        commit_key: FileListCommitKey {
+            data_tenant_id: first.data_tenant_id,
+            namespace: first.namespace.clone(),
+            table_name: first.table_name.clone(),
+            node_id: first.node_id,
+            writer_epoch: first.writer_epoch,
+            wal_lsn_min: first.wal_lsn_min,
+            wal_lsn_max: first.wal_lsn_max,
+        },
+        artifact_count: u16::try_from(rows.len()).map_err(|_| SqlError::InvariantViolation {
+            detail: "writer-v2 artifact count exceeds u16".to_owned(),
+        })?,
+        artifact_set_digest: hex::encode(digest.finalize()),
+        replayed: inserted == 0,
+    })
+}
+
 /// Deterministic test barrier reached while the publication transaction owns its fence lock.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
@@ -366,22 +675,6 @@ pub async fn insert_and_audit_fenced_with_barrier(
     barrier: &PublicationFenceBarrier,
 ) -> Result<FileListInsertOutcome, SqlError> {
     insert_and_audit_fenced_inner(operator_pool, actor, row, events, false, Some(barrier)).await
-}
-
-/// Inject a rollback immediately before the fenced publication commit.
-///
-/// # Errors
-///
-/// Always returns the injected commit error after validating and staging the
-/// transaction, or an earlier fence, replay, audit, or SQL error.
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) async fn insert_and_audit_fenced_with_commit_failure(
-    operator_pool: &OperatorPool,
-    actor: StreamIdentity,
-    row: &FileListInsert<'_>,
-    events: &[AuditEvent],
-) -> Result<FileListInsertOutcome, SqlError> {
-    insert_and_audit_fenced_inner(operator_pool, actor, row, events, true, None).await
 }
 
 /// Own the one atomic fenced publication transaction and optional test rollback.
@@ -454,7 +747,7 @@ async fn insert_file(
  id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,
  min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max)
  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
- ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) DO NOTHING",
+ ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal) DO NOTHING",
     )
     .bind(row.id)
     .bind(row.data_tenant_id.as_uuid())
@@ -484,7 +777,7 @@ async fn validate_replay_transaction(
     let existing: Option<(Uuid, Uuid, String, String)> = sqlx::query_as(
         "SELECT id,data_tenant_id,namespace,table_name FROM vala.file_list \
          WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 \
-         AND wal_lsn_min=$4 AND wal_lsn_max=$5 FOR UPDATE",
+         AND wal_lsn_min=$4 AND wal_lsn_max=$5 AND file_ordinal=0 FOR UPDATE",
     )
     .bind(row.data_tenant_id.as_uuid())
     .bind(row.node_id)
@@ -571,7 +864,7 @@ pub async fn insert_and_audit(
  $13,
  $14
  )
- ON CONFLICT (data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) DO NOTHING
+ ON CONFLICT (data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, file_ordinal) DO NOTHING
  ",
     )
     .bind(row.id)
@@ -605,4 +898,153 @@ pub async fn insert_and_audit(
         commit_key,
         replayed: false,
     })
+}
+
+/// Stages a complete writer-v2 artifact set in one caller-owned tenant transaction.
+///
+/// The caller owns the eventual COMMIT result. This method performs no commit
+/// and therefore cannot classify the outcome as known or unknown.
+///
+/// # Errors
+/// Returns a tenant, contiguity, replay-identity, audit, or SQL error without
+/// leaving any mutation outside the caller's transaction.
+pub async fn insert_artifact_set_and_audit(
+    conn: &mut TenantConn<'_>,
+    rows: &[FileListArtifactInsert],
+    events: &[AuditEvent],
+) -> Result<FileListArtifactSetOutcome, SqlError> {
+    let first = rows.first().ok_or_else(|| SqlError::InvariantViolation {
+        detail: "writer-v2 tenant publication set is empty".to_owned(),
+    })?;
+    if first.data_tenant_id != conn.data_tenant_id()
+        || rows.iter().enumerate().any(|(ordinal, row)| {
+            usize::try_from(row.file_ordinal).ok() != Some(ordinal)
+                || row.data_tenant_id != first.data_tenant_id
+                || row.node_id != first.node_id
+                || row.writer_epoch != first.writer_epoch
+                || row.wal_lsn_min != first.wal_lsn_min
+                || row.wal_lsn_max != first.wal_lsn_max
+                || !valid_artifact_identity(row)
+        })
+    {
+        return Err(SqlError::InvariantViolation {
+            detail: "writer-v2 tenant publication set crosses identity boundaries".to_owned(),
+        });
+    }
+    let mut inserted = 0_u64;
+    for row in rows {
+        inserted += sqlx::query(
+            "INSERT INTO vala.file_list \
+             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
+             ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal) DO NOTHING",
+        )
+        .bind(row.id)
+        .bind(row.data_tenant_id.as_uuid())
+        .bind(&row.namespace)
+        .bind(&row.table_name)
+        .bind(&row.file_path)
+        .bind(row.file_size)
+        .bind(row.row_count)
+        .bind(row.min_event_time)
+        .bind(row.max_event_time)
+        .bind(row.partition_day)
+        .bind(row.node_id)
+        .bind(row.writer_epoch)
+        .bind(row.wal_lsn_min)
+        .bind(row.wal_lsn_max)
+        .bind(row.file_ordinal)
+        .bind(&row.file_checksum)
+        .execute(&mut **conn.transaction())
+        .await?
+        .rows_affected();
+    }
+    if inserted != 0 && inserted != u64::try_from(rows.len()).unwrap_or(u64::MAX) {
+        return Err(SqlError::InvariantViolation {
+            detail: "writer-v2 tenant publication observed a partial replay set".to_owned(),
+        });
+    }
+    let existing: Vec<(
+        i16,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::NaiveDate,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,file_checksum FROM vala.file_list \
+         WHERE data_tenant_id=wyrd.current_tenant() AND node_id=$1 AND writer_epoch=$2 AND wal_lsn_min=$3 AND wal_lsn_max=$4 \
+         ORDER BY file_ordinal FOR UPDATE",
+    )
+    .bind(first.node_id)
+    .bind(first.writer_epoch)
+    .bind(first.wal_lsn_min)
+    .bind(first.wal_lsn_max)
+    .fetch_all(&mut **conn.transaction())
+    .await?;
+    if existing.len() != rows.len()
+        || existing.iter().zip(rows).any(|(actual, expected)| {
+            actual.0 != expected.file_ordinal
+                || actual.1 != expected.namespace
+                || actual.2 != expected.table_name
+                || actual.3 != expected.file_path
+                || actual.4 != expected.file_size
+                || actual.5 != expected.row_count
+                || actual.6 != expected.min_event_time
+                || actual.7 != expected.max_event_time
+                || actual.8 != expected.partition_day
+                || actual.9.as_deref() != Some(expected.file_checksum.as_str())
+        })
+    {
+        return Err(SqlError::InvariantViolation {
+            detail: "writer-v2 tenant replay identity does not match the complete set".to_owned(),
+        });
+    }
+    if inserted > 0 {
+        for event in events {
+            vala_sql::queries::audit_outbox::append_audit(conn, event).await?;
+        }
+    }
+    let mut digest = Sha256::new();
+    for row in rows {
+        digest.update(row.file_ordinal.to_be_bytes());
+        digest.update((row.file_path.len() as u64).to_be_bytes());
+        digest.update(row.file_path.as_bytes());
+        digest.update(row.file_size.to_be_bytes());
+        digest.update(row.file_checksum.as_bytes());
+    }
+    Ok(FileListArtifactSetOutcome {
+        commit_key: FileListCommitKey {
+            data_tenant_id: first.data_tenant_id,
+            namespace: first.namespace.clone(),
+            table_name: first.table_name.clone(),
+            node_id: first.node_id,
+            writer_epoch: first.writer_epoch,
+            wal_lsn_min: first.wal_lsn_min,
+            wal_lsn_max: first.wal_lsn_max,
+        },
+        artifact_count: u16::try_from(rows.len()).map_err(|_| SqlError::InvariantViolation {
+            detail: "writer-v2 artifact count exceeds u16".to_owned(),
+        })?,
+        artifact_set_digest: hex::encode(digest.finalize()),
+        replayed: inserted == 0,
+    })
+}
+
+/// Validates one writer-v2 object's nonempty physical and checksum identity.
+fn valid_artifact_identity(row: &FileListArtifactInsert) -> bool {
+    row.file_size > 0
+        && row.row_count > 0
+        && !row.namespace.is_empty()
+        && !row.table_name.is_empty()
+        && !row.file_path.is_empty()
+        && row.file_checksum.len() == 64
+        && row
+            .file_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }

@@ -23,7 +23,7 @@ use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
-use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
+use vala_bifrost_redux::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -50,6 +50,8 @@ struct PersistenceFixture {
     /// Receiver retained so post-commit hints remain observable until assertions finish.
     hint_inbox: vala_bifrost_redux::maintenance::StagingFileInbox,
     wal_root: TempDir,
+    /// Physical root retained for generation-owned Scribe output scratch.
+    scratch_root: TempDir,
     _warehouse: Option<TempDir>,
     tenant: DataTenantId,
     /// Aggregate decoded Arrow ownership represented by the seeded replay WAL.
@@ -57,6 +59,25 @@ struct PersistenceFixture {
 }
 
 impl PersistenceFixture {
+    /// Registers the exact Scribe stream fence consumed by writer-v2 publication.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the repository-managed Postgres fixture cannot expose its
+    /// operator connection or persist the requested stream epoch.
+    async fn register_scribe_fence(database: &PgFixture, node_id: uuid::Uuid, epoch: i64) {
+        let pool = database.superuser_pool().await.expect("superuser pool");
+        sqlx::query(
+            "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now()) ON CONFLICT (data_tenant_id,node_id,role) DO UPDATE SET fencing_token=EXCLUDED.fencing_token,heartbeat_at=now()",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(node_id)
+        .bind(epoch)
+        .execute(&pool)
+        .await
+        .expect("register Scribe publication fence");
+    }
+
     /// Starts the standard persistence fixture with the production-derived governor.
     ///
     /// # Panics
@@ -79,7 +100,7 @@ impl PersistenceFixture {
     ///
     /// Panics when any Postgres, object-store, WAL, execution-lane, persistence,
     /// channel, or Scribe fixture dependency cannot be constructed.
-    async fn start_with_memory(memory: BifrostMemoryGovernor) -> Self {
+    async fn start_with_memory(requested_memory: BifrostMemoryGovernor) -> Self {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
         let operator = Arc::new(
@@ -88,7 +109,53 @@ impl PersistenceFixture {
                 .finish(),
         );
         let wal_root = tempfile::tempdir().expect("WAL directory");
+        let scratch_root = tempfile::tempdir().expect("scratch directory");
+        let scribe_output = scratch_root.path().join("scribe-output");
+        let forge_scratch = scratch_root.path().join("forge");
+        let oracle_scratch = scratch_root.path().join("oracle");
+        for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
+            std::fs::create_dir(root).expect("test volume root");
+        }
+        let requested_snapshot = requested_memory.snapshot();
+        let runtime_resources =
+            vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+                vala_bifrost_redux::resources::SystemResourceSnapshot {
+                    memory_limit_bytes: requested_snapshot.pod_limit_bytes,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+                    memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                    cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                },
+                vala_bifrost_redux::resources::BifrostResourcePolicy {
+                    roles: std::collections::BTreeSet::from([
+                        vala_bifrost_redux::resources::BifrostRole::Scribe,
+                        vala_bifrost_redux::resources::BifrostRole::Oracle,
+                    ]),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: None,
+                    effective_cpu: None,
+                    scratch_root: scratch_root.path().to_owned(),
+                    volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
+                        wal: wal_root.path().to_owned(),
+                        scribe_output_scratch: scribe_output,
+                        forge_scratch,
+                        oracle_scratch,
+                    }),
+                },
+            )
+            .expect("test Bifrost resources");
+        let resources = runtime_resources
+            .compose_roles()
+            .expect("test role resources");
+        let scribe_resources = resources.scribe().expect("test Scribe resources");
+        let memory = scribe_resources.memory_governor();
+        let (_, output_scratch) = scribe_resources
+            .volume_capabilities()
+            .expect("test Scribe volumes");
         let node_id = uuid::Uuid::now_v7();
+        Self::register_scribe_fence(&database, node_id, 1).await;
         let wal = Arc::new(
             WalWriter::new(
                 wal_root.path(),
@@ -102,6 +169,8 @@ impl PersistenceFixture {
         let (staging_file_publisher, hint_inbox) = staging_file_channel(16).expect("hint channel");
         let persistence =
             ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 16, 2)
+                .with_operator_pool(database.operator_pool().clone())
+                .with_output_scratch(output_scratch)
                 .with_test_faults(faults.clone());
         let admission = vala_bifrost_redux::scribe::admission::AdmissionConfig::default();
         let lane_config = ScribeLaneConfig {
@@ -134,59 +203,11 @@ impl PersistenceFixture {
             faults,
             hint_inbox,
             wal_root,
+            scratch_root,
             _warehouse: None,
             tenant,
             replay_decoded_bytes: 0,
         }
-    }
-
-    /// Derives the measured-wire remainder that places a projected append at `target`.
-    ///
-    /// The calibration traverses the production projection path because managed
-    /// columns make admitted Arrow ownership larger than the source batch. Its
-    /// expected oversize rejection occurs before WAL or memtable mutation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the source batch is already at the target, calibration does
-    /// not return the decoded-size ceiling, or projected ownership reaches the
-    /// target without room for a measured-wire remainder.
-    async fn calibrate_exact_wire_bytes(
-        &self,
-        rows: &RecordBatch,
-        schema: &Schema,
-        table_name: &str,
-        target: usize,
-    ) -> usize {
-        let source_bytes = rows.get_array_memory_size();
-        assert!(source_bytes < target);
-        let calibration_wire_bytes = target - source_bytes;
-        let calibration = self
-            .scribe
-            .append(ScribeAppend {
-                principal: principal(self.tenant),
-                table: table(table_name),
-                schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema),
-                request_id: RequestId::now_v7(),
-                batch_id: uuid::Uuid::now_v7(),
-                measured_wire_bytes: calibration_wire_bytes,
-                rows: rows.clone(),
-            })
-            .await
-            .expect_err("managed projection makes the source-sized calibration oversized");
-        let ScribeError::DecodedPayloadTooLarge {
-            bytes: calibrated_bytes,
-            limit,
-        } = calibration
-        else {
-            panic!("calibration must return the decoded-size ceiling");
-        };
-        assert_eq!(limit, target);
-        let decoded_bytes = calibrated_bytes - calibration_wire_bytes;
-        assert!(decoded_bytes < target);
-        let measured_wire_bytes = target - decoded_bytes;
-        assert_eq!(decoded_bytes + measured_wire_bytes, target);
-        measured_wire_bytes
     }
 
     async fn stop(self) {
@@ -246,7 +267,53 @@ impl PersistenceFixture {
         .expect("Redux catalog");
         register_replay_tables(&catalog, table_names, tenant).await;
         let wal_root = tempfile::tempdir().expect("WAL directory");
+        let scratch_root = tempfile::tempdir().expect("scratch directory");
+        let scribe_output = scratch_root.path().join("scribe-output");
+        let forge_scratch = scratch_root.path().join("forge");
+        let oracle_scratch = scratch_root.path().join("oracle");
+        for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
+            std::fs::create_dir(root).expect("test volume root");
+        }
+        let requested_snapshot = memory.snapshot();
+        let runtime_resources =
+            vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+                vala_bifrost_redux::resources::SystemResourceSnapshot {
+                    memory_limit_bytes: requested_snapshot.pod_limit_bytes,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+                    memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                    cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                },
+                vala_bifrost_redux::resources::BifrostResourcePolicy {
+                    roles: std::collections::BTreeSet::from([
+                        vala_bifrost_redux::resources::BifrostRole::Scribe,
+                        vala_bifrost_redux::resources::BifrostRole::Oracle,
+                    ]),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: None,
+                    effective_cpu: None,
+                    scratch_root: scratch_root.path().to_owned(),
+                    volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
+                        wal: wal_root.path().to_owned(),
+                        scribe_output_scratch: scribe_output,
+                        forge_scratch,
+                        oracle_scratch,
+                    }),
+                },
+            )
+            .expect("test Bifrost resources");
+        let resources = runtime_resources
+            .compose_roles()
+            .expect("test role resources");
+        let scribe_resources = resources.scribe().expect("test Scribe resources");
+        let memory = scribe_resources.memory_governor();
+        let (_, output_scratch) = scribe_resources
+            .volume_capabilities()
+            .expect("test Scribe volumes");
         let node_id = uuid::Uuid::now_v7();
+        Self::register_scribe_fence(&database, node_id, 1).await;
         let wal = Arc::new(
             WalWriter::new(
                 wal_root.path(),
@@ -269,6 +336,7 @@ impl PersistenceFixture {
             .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .await;
         drop(wal);
+        Self::register_scribe_fence(&database, node_id, 2).await;
 
         let faults = PersistenceFaults::default();
         let (staging_file_publisher, hint_inbox) = staging_file_channel(16).expect("hint channel");
@@ -278,6 +346,8 @@ impl PersistenceFixture {
         faults.set_object_write_delays_for_test(object_write_delays);
         let persistence =
             ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 16, 2)
+                .with_operator_pool(database.operator_pool().clone())
+                .with_output_scratch(output_scratch)
                 .with_test_faults(faults.clone());
         let wal = Arc::new(
             WalWriter::new(
@@ -315,6 +385,7 @@ impl PersistenceFixture {
             faults,
             hint_inbox,
             wal_root,
+            scratch_root,
             _warehouse: Some(warehouse),
             tenant,
             replay_decoded_bytes,
@@ -631,9 +702,10 @@ async fn wait_for_state(fixture: &PersistenceFixture, pending: usize) {
         }
         assert!(
             Instant::now() < deadline,
-            "persistence state did not converge: pending={}, queue={}",
+            "persistence state did not converge: pending={}, queue={}, last_error={:?}",
             stats.pending_generations,
-            fixture.scribe.persistence_queue_depth_for_test()
+            fixture.scribe.persistence_queue_depth_for_test(),
+            fixture.faults.last_error_for_test()
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -849,7 +921,7 @@ async fn failed_front_generation_blocks_later_same_key_generation() {
 }
 
 #[tokio::test]
-async fn failed_generation_retries_with_fresh_object_id() {
+async fn failed_generation_reuses_deterministic_object_id() {
     let fixture = PersistenceFixture::start().await;
     fixture.faults.fail_next_sql_commit();
     append_one(&fixture, "fresh_retry_events", 1).await;
@@ -865,13 +937,12 @@ async fn failed_generation_retries_with_fresh_object_id() {
         "SQL failure must roll back rows"
     );
     assert_eq!(fixture.scribe.wal_bytes_on_disk(), wal_before);
-    assert_eq!(object_paths(&fixture).await.len(), 1);
+    assert_eq!(object_paths(&fixture).await.len(), 0);
 
     retry_and_wait(&fixture).await;
     let paths = object_paths(&fixture).await;
     assert_eq!(rows(&fixture).await.len(), 1);
-    assert_eq!(paths.len(), 2, "retry must use a fresh object identifier");
-    assert_ne!(paths[0], paths[1]);
+    assert_eq!(paths.len(), 1, "retry reuses the exact generation identity");
     fixture.stop().await;
 }
 
@@ -911,6 +982,113 @@ async fn confirmed_commit_publishes_hint() {
         hint_outcome(&mut fixture),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
+    fixture.stop().await;
+}
+
+/// A lost automatic COMMIT response transfers the exact generation into the
+/// runtime reconciler and completes without duplicate rows, audit, or objects.
+#[tokio::test]
+async fn automatic_commit_ambiguity_reconciles_exactly_once() {
+    let mut fixture = PersistenceFixture::start().await;
+    fixture.faults.fail_next_post_commit_response();
+    append_one(&fixture, "automatic_ambiguous_commit_events", 1).await;
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("ambiguous automatic flush");
+    wait_for_state(&fixture, 0).await;
+
+    assert_eq!(
+        rows_for_table(&fixture, "automatic_ambiguous_commit_events")
+            .await
+            .len(),
+        1,
+        "fenced retry validates the already-committed row"
+    );
+    assert_eq!(audit_count(&fixture).await, 1);
+    assert_eq!(object_paths(&fixture).await.len(), 1);
+    assert!(hint_outcome(&mut fixture).is_ok());
+    assert!(matches!(
+        hint_outcome(&mut fixture),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    fixture.stop().await;
+}
+
+/// Proves the automatic persistence producer emits writer-v2 at the 832 MiB floor.
+#[tokio::test]
+async fn scribe_persistence_writer_v2_is_bounded_at_exact_floor() {
+    let fixture = PersistenceFixture::start_with_memory(
+        BifrostMemoryGovernor::new(832 * 1024 * 1024).expect("exact-floor governor"),
+    )
+    .await;
+    append_one(&fixture, "exact_floor_events", 1).await;
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("exact-floor flush");
+    wait_for_state(&fixture, 0).await;
+
+    let mut conn = fixture
+        .database
+        .tenant_conn_for(fixture.tenant)
+        .await
+        .expect("exact-floor tenant connection");
+    let (path, file_size, ordinal, checksum): (String, i64, i16, Option<String>) =
+        sqlx::query_as(
+            "SELECT file_path,file_size,file_ordinal,file_checksum FROM vala.file_list WHERE data_tenant_id=wyrd.current_tenant() AND table_name='exact_floor_events'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("exact-floor file-list row");
+    assert_eq!(ordinal, 0);
+    let checksum = checksum.expect("writer-v2 checksum");
+    assert_eq!(checksum.len(), 64);
+    assert!(checksum.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let bytes = fixture
+        .operator
+        .read(&path)
+        .await
+        .expect("exact-floor writer-v2 object")
+        .to_bytes();
+    assert_eq!(
+        i64::try_from(bytes.len()).expect("object size fits i64"),
+        file_size
+    );
+    let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes)
+        .expect("standard Parquet decoder accepts persistence output");
+    vala_bifrost_redux::parquet::memory::validate_writer_v2_structure(&metadata)
+        .expect("persistence output respects structural caps");
+    let writer_fields = metadata
+        .file_metadata()
+        .key_value_metadata()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.key.starts_with("wyrd.bifrost."))
+        .count();
+    assert_eq!(
+        writer_fields, 9,
+        "writer-v2 publishes the closed metadata set"
+    );
+    let scratch = fixture.scratch_root.path().join("scribe-output");
+    assert_eq!(
+        std::fs::read_dir(scratch)
+            .expect("Scribe scratch root")
+            .count(),
+        0,
+        "known committed publication cleans its exact generation scratch"
+    );
+    let (scribe_peak, bifrost_peak) = fixture.memory.peak_totals_for_test();
+    assert_eq!(scribe_peak, 256 * 1024 * 1024);
+    assert_eq!(bifrost_peak, 256 * 1024 * 1024);
+    assert_eq!(
+        fixture.scribe.memory_snapshot().categories[MemoryCategory::Persistence as usize],
+        0
+    );
+    drop(conn);
     fixture.stop().await;
 }
 
@@ -981,7 +1159,7 @@ async fn manifest_failure_retains_retryable_front() {
     wait_for_state(&fixture, 1).await;
     assert_eq!(
         rows(&fixture).await.len(),
-        2,
+        1,
         "SQL commits before manifest failure"
     );
     assert_eq!(audit_count(&fixture).await, 1);
@@ -1216,10 +1394,11 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
         }
         Err(error) => error,
     };
-    let ScribeError::IngestBusy { table } = error else {
-        panic!("replay refusal must retain its structural capacity error");
-    };
-    assert_eq!(table, "memory");
+    match &error {
+        ScribeError::IngestBusy { table } => assert_eq!(table, "memory"),
+        ScribeError::Internal { detail } => assert_eq!(detail, "ingest busy for table: memory"),
+        _ => panic!("replay refusal must retain its structural capacity error: {error:?}"),
+    }
     assert_eq!(
         memory.snapshot().scribe_total_bytes,
         baseline.scribe_total_bytes
@@ -1352,25 +1531,20 @@ async fn persistence_headroom_survives_oracle_range_overlap() {
         Arc::clone(&schema),
         vec![
             Arc::new(
-                TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
+                TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros(); 4])
                     .with_timezone("UTC"),
             ),
             Arc::new(arrow::array::StringArray::from(vec![
-                "x".repeat(59 * 1024 * 1024),
+                "x".repeat(
+                    (20 * 1024 * 1024) / 4
+                );
+                4
             ])),
         ],
     )
     .expect("near-target persistence batch");
-    let target_bytes = fixture.memory.scribe_budget().active_bucket_target_bytes();
     let request_id = RequestId::now_v7();
-    let measured_wire_bytes = fixture
-        .calibrate_exact_wire_bytes(
-            &rows,
-            schema.as_ref(),
-            "persistence_range_overlap",
-            target_bytes,
-        )
-        .await;
+    let measured_wire_bytes = vala_bifrost_redux::scribe::admission::MAX_REQUEST_BYTES;
     fixture
         .scribe
         .append(ScribeAppend {
@@ -1424,15 +1598,14 @@ async fn persistence_headroom_survives_oracle_range_overlap() {
 #[tokio::test]
 async fn native_caller_event_time_lands_on_two_partition_days() {
     let fixture = PersistenceFixture::start().await;
-    // 2026-07-14T12:00:00Z and 2026-07-16T12:00:00Z: two distinct partition days.
-    let first_day_micros = chrono::NaiveDate::from_ymd_opt(2026, 7, 14)
-        .expect("valid day")
+    let first_day = chrono::Utc::now().date_naive();
+    let second_day = first_day.succ_opt().expect("current date has a successor");
+    let first_day_micros = first_day
         .and_hms_opt(12, 0, 0)
         .expect("valid time")
         .and_utc()
         .timestamp_micros();
-    let second_day_micros = chrono::NaiveDate::from_ymd_opt(2026, 7, 16)
-        .expect("valid day")
+    let second_day_micros = second_day
         .and_hms_opt(12, 0, 0)
         .expect("valid time")
         .and_utc()
@@ -1483,7 +1656,7 @@ async fn native_caller_event_time_lands_on_two_partition_days() {
     days.sort();
     days.dedup();
     assert_eq!(days.len(), 2, "partition days must be distinct: {days:?}");
-    assert!(days.iter().any(|day| day.contains("2026-07-14")));
-    assert!(days.iter().any(|day| day.contains("2026-07-16")));
+    assert!(days.iter().any(|day| day.contains(&first_day.to_string())));
+    assert!(days.iter().any(|day| day.contains(&second_day.to_string())));
     fixture.stop().await;
 }

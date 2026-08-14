@@ -13,7 +13,7 @@ mod pg_tests {
         FixedSizeBinaryBuilder, Int32Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field};
     use iceberg::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, NullOrder,
         PrimitiveType, SortDirection, StatisticsFile, Struct, TableMetadata, Transform, Type,
@@ -42,7 +42,6 @@ mod pg_tests {
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use vala_bifrost_redux::schema::with_managed_columns;
     use vala_sql::OperatorPool;
     use vala_sql::queries::forge_operations::ForgeOperations;
     use vala_sql::queries::forge_tasks::ForgeTasks;
@@ -881,27 +880,20 @@ mod pg_tests {
                         sort_merge_reservation_bytes: 10 * 1024 * 1024,
                         encoder_buffer_bytes: 32 * 1024 * 1024,
                         upload_chunk_bytes: 8 * 1024 * 1024,
+                        footer_encoded_bytes: 8 * 1024 * 1024,
+                        footer_decode_workspace_bytes: 32 * 1024 * 1024,
                         sort_spill_bytes: 512 * 1024 * 1024,
                         output_scratch_bytes: 512 * 1024 * 1024,
                     }),
                     files: 1,
                     bytes: 1,
                     parallelism: 1,
-                    memory_bytes: 98 * 1024 * 1024,
+                    memory_bytes: 106 * 1024 * 1024,
                     spill_bytes: 1024 * 1024 * 1024,
                     large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },
                 ready_at: chrono::Utc::now() - chrono::Duration::seconds(1),
             }
-        }
-
-        /// Return the stable three-column staging schema.
-        fn schema() -> Schema {
-            Schema::new(with_managed_columns(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )]))
         }
 
         /// Seed Parquet objects and durable file-list rows, optionally aged.
@@ -941,7 +933,32 @@ mod pg_tests {
             count: usize,
             aged: bool,
         ) {
-            let schema = Self::schema();
+            self.seed_files_for_binding_contract(binding, start, count, aged, true)
+                .await;
+        }
+
+        /// Seeds legacy unmarked inputs through the same physical fixture path.
+        async fn seed_unmarked_files(&self, count: usize, aged: bool) {
+            self.seed_files_for_binding_contract(&self.binding, 0, count, aged, false)
+                .await;
+        }
+
+        /// Seeds physical inputs with caller-selected writer-v2 footer stamping.
+        async fn seed_files_for_binding_contract(
+            &self,
+            binding: &TenantTableBinding,
+            start: i64,
+            count: usize,
+            aged: bool,
+            writer_v2: bool,
+        ) {
+            let table = self
+                .catalog
+                .load_table(&binding.table_ident())
+                .await
+                .expect("registered fixture table");
+            let schema = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
+                .expect("registered Arrow schema");
             let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day");
             let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
                 .expect("time")
@@ -975,7 +992,7 @@ mod pg_tests {
                                     .map(|row| base + index + row)
                                     .collect::<Vec<_>>(),
                             )
-                            .with_timezone("UTC"),
+                            .with_timezone("+00:00"),
                         ),
                         Arc::new(
                             TimestampMicrosecondArray::from(
@@ -983,7 +1000,7 @@ mod pg_tests {
                                     .map(|row| base + index + row)
                                     .collect::<Vec<_>>(),
                             )
-                            .with_timezone("UTC"),
+                            .with_timezone("+00:00"),
                         ),
                         Arc::new(batch_ids.finish()),
                         Arc::new(Int32Array::from_iter_values(
@@ -997,12 +1014,29 @@ mod pg_tests {
                     ],
                 )
                 .expect("batch");
+                let path = format!("{}/input-{index}.parquet", binding.object_prefix);
+                let metadata = if writer_v2 {
+                    vala_bifrost_redux::parquet::BifrostParquetMemoryEnvelope::metadata_for_batch(
+                        &batch, &path,
+                    )
+                    .expect("writer-v2 metadata")
+                } else {
+                    Vec::new()
+                };
                 let mut bytes = Vec::new();
-                let mut writer =
-                    ArrowWriter::try_new(&mut bytes, batch.schema(), None).expect("writer");
+                let mut writer = ArrowWriter::try_new(
+                    &mut bytes,
+                    batch.schema(),
+                    Some(
+                        vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata(
+                            batch.num_rows(),
+                            metadata,
+                        ),
+                    ),
+                )
+                .expect("writer");
                 writer.write(&batch).expect("write");
                 writer.close().expect("close");
-                let path = format!("{}/input-{index}.parquet", binding.object_prefix);
                 self.staging
                     .write(&path, Buffer::from(bytes))
                     .await
@@ -2362,8 +2396,8 @@ mod pg_tests {
         vala_bifrost_redux::forge::reset_scratch_peak_for_test();
         let outcome = fixture.schedule_and_execute().await;
         assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
-        let envelope: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,sort_spill_bytes,output_scratch_bytes,estimated_memory_bytes FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at DESC LIMIT 1",
+        let envelope: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,sort_spill_bytes,output_scratch_bytes,estimated_memory_bytes,footer_encoded_bytes FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at DESC LIMIT 1",
         )
         .bind(fixture.tenant.as_uuid())
         .fetch_one(fixture.operator_pool.pool())
@@ -2392,7 +2426,7 @@ mod pg_tests {
         assert_eq!(envelope.2, 2 * envelope.0 + envelope.3);
         assert_eq!(
             envelope.8,
-            envelope.1 + envelope.2 + envelope.4 + envelope.5
+            envelope.1 + envelope.2 + envelope.4 + envelope.5 + envelope.9
         );
         assert!(
             vala_bifrost_redux::resources::memory_consumer_peak_for_test(
@@ -2526,7 +2560,10 @@ mod pg_tests {
         let outcome = fixture.schedule_and_execute().await;
 
         assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
-        assert_eq!(fixture.reads.output_put_calls(), 1);
+        assert!(
+            fixture.reads.output_put_calls() > 1,
+            "a target above the physical cap must rotate under one operation"
+        );
         assert!(
             fixture.reads.output_chunks.load(Ordering::Acquire) > 1,
             "one output above 8 MiB must use multiple writes"
@@ -2542,7 +2579,12 @@ mod pg_tests {
             "peak governed memory must remain below the configured output target"
         );
         let (output_files, output_rows) = committed_output_totals(&fixture).await;
-        assert_eq!(output_files, 1);
+        assert!(output_files > 1);
+        assert_eq!(
+            output_files,
+            fixture.reads.output_put_calls(),
+            "every capped physical output is committed under the one operation"
+        );
         assert_eq!(output_rows, 6_400_000);
     }
 
@@ -4972,7 +5014,7 @@ mod pg_tests {
         let decoded = 16_i64 * 1024 * 1024;
         let merge = 1024_i64 * 1024;
         let updated = sqlx::query(
-            "UPDATE vala.forge_tasks SET decoded_batch_bytes=$2,decoded_input_bytes=$2,estimated_parallelism=1,sort_merge_reservation_bytes=$3,sort_working_bytes=2*$2+$3,sort_spill_bytes=1,estimated_memory_bytes=3*$2+$3+encoder_buffer_bytes+upload_chunk_bytes,estimated_spill_bytes=1+output_scratch_bytes WHERE data_tenant_id=$1 AND state='ready'",
+            "UPDATE vala.forge_tasks SET decoded_batch_bytes=$2,decoded_input_bytes=$2,estimated_parallelism=1,sort_merge_reservation_bytes=$3,sort_working_bytes=2*$2+$3,sort_spill_bytes=1,estimated_memory_bytes=3*$2+$3+encoder_buffer_bytes+upload_chunk_bytes+footer_encoded_bytes,estimated_spill_bytes=1+output_scratch_bytes WHERE data_tenant_id=$1 AND state='ready'",
         )
         .bind(fixture.tenant.as_uuid())
         .bind(decoded)
@@ -5038,6 +5080,41 @@ mod pg_tests {
         assert_eq!(released.forge_reader_permits_used, 0);
     }
 
+    /// Unmarked sources refuse after footer reads and before the first data page.
+    #[tokio::test]
+    async fn unmarked_source_refuses_before_first_data_page_range() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), false, 0, fixture_snapshot()).await;
+        fixture.seed_unmarked_files(2, true).await;
+        vala_bifrost_redux::forge::reset_data_page_reads_for_test();
+        let stop = CancellationToken::new();
+        let outcome = ForgeScheduler::with_owner_for_test(&fixture.forge, fixture.scheduler_owner)
+            .expect("fixture scheduler")
+            .schedule_once(&stop)
+            .await
+            .expect("unmarked planning pass");
+        assert_eq!(outcome.tasks_enqueued, 1);
+        let claim = fixture
+            .worker
+            .claim_for_test()
+            .await
+            .expect("unmarked claim query")
+            .expect("unmarked claim");
+        let error = fixture
+            .worker
+            .execute_claim(claim, &stop)
+            .await
+            .expect_err("unmarked source must refuse");
+        assert!(matches!(error, ForgeError::DataRefusal { .. }));
+        assert!(fixture.reads.ranged_reads.load(Ordering::Acquire) > 0);
+        assert_eq!(
+            vala_bifrost_redux::forge::data_page_reads_for_test(),
+            0,
+            "footer identity refusal must precede every data-page request"
+        );
+        assert_eq!(fixture.reads.output_put_calls(), 0);
+    }
+
     /// A claimed legacy task is auditedly superseded and replanned before input IO.
     #[tokio::test]
     async fn legacy_task_is_auditedly_superseded_and_replanned_before_io() {
@@ -5051,7 +5128,7 @@ mod pg_tests {
             .expect("planning pass");
         assert_eq!(planned.tasks_enqueued, 1);
         sqlx::query(
-            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=9223372036854775807, estimated_parallelism=1, estimated_memory_bytes=9223372036854775807, estimated_spill_bytes=9223372036854775807, large_task_ceiling_bytes=9223372036854775807 WHERE data_tenant_id=$1 AND state='ready'",
+            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=9223372036854775807, estimated_parallelism=1, estimated_memory_bytes=9223372036854775807, estimated_spill_bytes=9223372036854775807, large_task_ceiling_bytes=9223372036854775807 WHERE data_tenant_id=$1 AND state='ready'",
         )
         .bind(fixture.tenant.as_uuid())
         .execute(fixture.operator_pool.pool())
@@ -5136,13 +5213,15 @@ mod pg_tests {
                         sort_merge_reservation_bytes: 10 * 1024 * 1024,
                         encoder_buffer_bytes: 32 * 1024 * 1024,
                         upload_chunk_bytes: 8 * 1024 * 1024,
+                        footer_encoded_bytes: 8 * 1024 * 1024,
+                        footer_decode_workspace_bytes: 32 * 1024 * 1024,
                         sort_spill_bytes: 512 * 1024 * 1024,
                         output_scratch_bytes: 512 * 1024 * 1024,
                     }),
                     files: 2,
                     bytes: 200,
                     parallelism: 1,
-                    memory_bytes: 98 * 1024 * 1024,
+                    memory_bytes: 106 * 1024 * 1024,
                     spill_bytes: 1024 * 1024 * 1024,
                     large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },

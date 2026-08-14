@@ -13,8 +13,9 @@ mod pg_tests {
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::scribe::ScribeImpl;
     use vala_bifrost_redux::scribe::file_list_writer::{
-        FileListInsert, FileListInsertOutcome, PublicationFenceBarrier, insert_and_audit,
-        insert_and_audit_fenced, insert_and_audit_fenced_with_barrier,
+        FileListArtifactInsert, FileListInsert, FileListInsertOutcome, PublicationFenceBarrier,
+        insert_and_audit, insert_and_audit_fenced, insert_and_audit_fenced_with_barrier,
+        insert_artifact_set_and_audit,
     };
     use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
     use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
@@ -131,6 +132,33 @@ mod pg_tests {
         }
     }
 
+    /// Builds one deterministic writer-v2 artifact row for atomic-set tests.
+    fn artifact_row(
+        binding: &TenantTableBinding,
+        node_id: Uuid,
+        ordinal: i16,
+    ) -> FileListArtifactInsert {
+        let event_time = DateTime::<Utc>::from_timestamp(0, 0).expect("epoch");
+        FileListArtifactInsert {
+            id: Uuid::now_v7(),
+            data_tenant_id: binding.tenant,
+            namespace: binding.logical_namespace.clone(),
+            table_name: binding.table_name.clone(),
+            file_path: format!("{}/artifact-{ordinal:05}.parquet", binding.object_prefix),
+            file_size: 128 + i64::from(ordinal),
+            row_count: 1,
+            min_event_time: event_time,
+            max_event_time: event_time,
+            partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("date"),
+            node_id,
+            writer_epoch: 7,
+            wal_lsn_min: 10,
+            wal_lsn_max: 20,
+            file_ordinal: ordinal,
+            file_checksum: format!("{:064x}", ordinal + 1),
+        }
+    }
+
     fn audit_event() -> AuditEvent {
         AuditEvent {
             request_id: RequestId::now_v7(),
@@ -242,7 +270,10 @@ mod pg_tests {
         );
         assert!(watermark_predicate.is_none());
 
-        for index_name in ["file_list_tenant_idx", "file_list_stream_range_uniq"] {
+        for index_name in [
+            "file_list_tenant_idx",
+            "file_list_stream_range_ordinal_uniq",
+        ] {
             let exists: (bool,) = sqlx::query_as(
                 "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'vala' AND indexname = $1)",
             )
@@ -866,6 +897,64 @@ mod pg_tests {
         .await
         .expect("serialized publication state");
         assert_eq!(counts, (1, 1, 5));
+    }
+
+    /// Writer-v2 publication is contiguous, atomic, and validates full replay identity.
+    #[tokio::test]
+    async fn writer_v2_artifact_set_is_atomic_and_replay_exact() {
+        let (fixture, tenant, _) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
+        let node_id = Uuid::now_v7();
+        let rows = vec![
+            artifact_row(&binding, node_id, 0),
+            artifact_row(&binding, node_id, 1),
+        ];
+        let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let first = insert_artifact_set_and_audit(&mut conn, &rows, &[audit_event()])
+            .await
+            .expect("complete artifact set");
+        conn.commit().await.expect("artifact commit");
+        assert_eq!(first.artifact_count, 2);
+
+        let mut replay = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("replay connection");
+        let replayed = insert_artifact_set_and_audit(&mut replay, &rows, &[audit_event()])
+            .await
+            .expect("exact full-set replay");
+        replay.commit().await.expect("replay commit");
+        assert!(replayed.replayed);
+        assert_eq!(replayed.commit_key, first.commit_key);
+        assert_eq!(replayed.artifact_count, first.artifact_count);
+        assert_eq!(replayed.artifact_set_digest, first.artifact_set_digest);
+
+        let mut wrong_identity = rows
+            .iter()
+            .map(|row| artifact_row(&binding, node_id, row.file_ordinal))
+            .collect::<Vec<_>>();
+        wrong_identity[1].table_name = "other".to_owned();
+        let mut mismatch = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("mismatch connection");
+        assert!(
+            insert_artifact_set_and_audit(&mut mismatch, &wrong_identity, &[])
+                .await
+                .is_err(),
+            "replay must compare the complete artifact identity"
+        );
+
+        let noncontiguous = vec![artifact_row(&binding, Uuid::now_v7(), 1)];
+        let mut invalid = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("invalid connection");
+        assert!(
+            insert_artifact_set_and_audit(&mut invalid, &noncontiguous, &[])
+                .await
+                .is_err(),
+            "publication must reject a missing ordinal zero before mutation"
+        );
     }
 
     #[test]

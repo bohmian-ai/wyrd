@@ -5,7 +5,8 @@
 //! `(data_tenant_id, wyrd_event_time)` and takes its partition day from the
 //! seal-key (never from row min/max).
 
-use std::io::Cursor;
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{Array, StringArray};
@@ -17,22 +18,28 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
+use sha2::{Digest, Sha256};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
-use crate::parquet::writer_properties::bifrost_writer_properties;
+use crate::parquet::memory::{
+    BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, MAX_FILE_BYTES,
+    MAX_LOGICAL_ROW_GROUP_BYTES, validate_writer_v2_structure,
+};
+use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
+use crate::resources::ScribeGenerationScratch;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::seal_key::EventDay;
 use crate::scribe::wal::ScribeAppendMeta;
 
 /// Result of encoding a frozen memtable to Parquet.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ParquetEncoded {
-    /// Parquet file bytes (ready for object-store PUT).
-    pub bytes: Vec<u8>,
+    /// Nonempty ordered scratch-backed artifacts ready for chunked upload.
+    pub artifacts: BoundedParquetArtifactSet,
     /// Row group statistics.
     pub row_group_stats: Vec<RowGroupStats>,
     /// Partition day (from seal-key, not row min/max).
@@ -41,6 +48,171 @@ pub struct ParquetEncoded {
     pub audit_events: Vec<AuditEvent>,
     /// `ScribeAppendMeta` list threaded forward for 's `file_list` INSERT.
     pub append_metas: Vec<ScribeAppendMeta>,
+}
+
+/// Move-owned nonempty artifact set and its generation scratch authority.
+#[derive(Debug)]
+pub struct BoundedParquetArtifactSet {
+    /// Contiguous writer-v2 artifacts in publication order.
+    artifacts: Vec<BoundedParquetArtifact>,
+    /// Exact generation directory whose charge follows the artifacts.
+    scratch: Option<ScribeGenerationScratch>,
+}
+
+impl BoundedParquetArtifactSet {
+    /// Creates an encoded set before the caller transfers its scratch owner.
+    ///
+    /// # Errors
+    /// Returns an internal error when the encoder produced no artifacts or
+    /// noncontiguous ordinals.
+    pub(crate) fn encoded(artifacts: Vec<BoundedParquetArtifact>) -> Result<Self, ScribeError> {
+        if artifacts.is_empty()
+            || artifacts
+                .iter()
+                .enumerate()
+                .any(|(ordinal, artifact)| usize::from(artifact.ordinal) != ordinal)
+        {
+            return Err(ScribeError::Internal {
+                detail: "writer-v2 artifact set must be nonempty and contiguous".to_owned(),
+            });
+        }
+        Ok(Self {
+            artifacts,
+            scratch: None,
+        })
+    }
+
+    /// Transfers the exact generation scratch capability into the sealed set.
+    ///
+    /// # Errors
+    /// Returns an internal error if scratch authority was already attached.
+    pub(crate) fn attach_scratch(
+        &mut self,
+        scratch: ScribeGenerationScratch,
+    ) -> Result<(), ScribeError> {
+        if self.scratch.replace(scratch).is_some() {
+            return Err(ScribeError::Internal {
+                detail: "writer-v2 artifact set already owns scratch".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the ordered sealed artifacts without exposing scratch ownership.
+    #[must_use]
+    pub fn as_slice(&self) -> &[BoundedParquetArtifact] {
+        &self.artifacts
+    }
+
+    /// Cleans the exact generation prefix after a positively known terminal.
+    ///
+    /// # Errors
+    /// Returns an internal error when the bounded scratch cleanup protocol
+    /// exhausts its retries and poisons shared volume health.
+    pub(crate) fn cleanup(mut self) -> Result<(), ScribeError> {
+        let Some(scratch) = self.scratch.take() else {
+            return Ok(());
+        };
+        scratch.cleanup().map_err(|error| ScribeError::Internal {
+            detail: format!("writer-v2 scratch cleanup failed: {error}"),
+        })
+    }
+
+    /// Retains scratch and its charge after an unresolved commit outcome.
+    ///
+    /// Startup reconciliation owns removal of the exact namespace. Forgetting
+    /// the local scratch owner prevents its ordinary cancellation cleanup from
+    /// deleting evidence that may already be catalog-visible.
+    pub(crate) fn retain_for_reconciliation(mut self) {
+        if let Some(scratch) = self.scratch.take() {
+            std::mem::forget(scratch);
+        }
+    }
+}
+
+impl std::ops::Deref for BoundedParquetArtifactSet {
+    type Target = [BoundedParquetArtifact];
+
+    /// Exposes ordered read-only artifact facts to upload and publication code.
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a BoundedParquetArtifactSet {
+    type Item = &'a BoundedParquetArtifact;
+    type IntoIter = std::slice::Iter<'a, BoundedParquetArtifact>;
+
+    /// Iterates sealed artifacts in their durable ordinal order.
+    fn into_iter(self) -> Self::IntoIter {
+        self.artifacts.iter()
+    }
+}
+
+/// One sealed writer-v2 object retained on generation-owned scratch.
+#[derive(Debug, Clone)]
+pub struct BoundedParquetArtifact {
+    /// Contiguous zero-based position within the generation.
+    pub ordinal: u16,
+    /// Exact scratch file read only through bounded chunks.
+    pub scratch_path: PathBuf,
+    /// Deterministic committed object identity stamped into the footer.
+    pub object_identity: String,
+    /// Exact sealed file size.
+    pub file_size: u64,
+    /// Lowercase SHA-256 checksum over the sealed bytes.
+    pub checksum: String,
+    /// Rows represented by this physical artifact.
+    pub row_count: usize,
+    /// Footer-derived row-group statistics.
+    pub row_group_stats: Vec<RowGroupStats>,
+}
+
+/// File sink that refuses before crossing the 128 MiB physical ceiling.
+struct CappedScratchWriter {
+    inner: BufWriter<std::fs::File>,
+    written: u64,
+}
+
+impl CappedScratchWriter {
+    /// Wraps one newly created generation-owned file.
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            inner: BufWriter::new(file),
+            written: 0,
+        }
+    }
+}
+
+impl Write for CappedScratchWriter {
+    /// Writes only complete buffers that fit the closed physical ceiling.
+    ///
+    /// # Errors
+    /// Returns `StorageFull` before mutation when the buffer would cross the cap,
+    /// or propagates the underlying scratch-file error.
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let requested = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+        if self.written.saturating_add(requested) > MAX_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "Scribe writer-v2 artifact exceeds 128 MiB",
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written = self
+            .written
+            .checked_add(u64::try_from(written).unwrap_or(u64::MAX))
+            .ok_or_else(|| std::io::Error::other("Scribe scratch byte count overflows"))?;
+        Ok(written)
+    }
+
+    /// Flushes admitted bytes to the generation-owned file.
+    ///
+    /// # Errors
+    /// Propagates the underlying scratch-file flush error.
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Statistics for a single row group.
@@ -54,7 +226,7 @@ pub struct RowGroupStats {
     pub max_event_time: Option<i64>,
 }
 
-/// Encode a frozen memtable snapshot to Parquet bytes after stamping its tenant.
+/// Encode a frozen memtable snapshot to ordered scratch-backed Parquet artifacts.
 ///
 /// Returns encoded bytes, row-group stats, `partition_day` (from seal-key), and the paired
 /// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for 's seal
@@ -63,11 +235,18 @@ pub struct RowGroupStats {
 /// # Errors
 /// Returns [`ScribeError::Internal`] when the binding, tenant column, tenant
 /// values, sort keys, or Parquet encoding is invalid.
-pub fn encode_batch(
+pub(crate) fn encode_batch(
     frozen: &FrozenMemtable,
     binding: &TenantTableBinding,
     seal_tenant: DataTenantId,
+    scratch_dir: &Path,
+    object_base: &str,
+    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
 ) -> Result<ParquetEncoded, ScribeError> {
+    debug_assert_eq!(
+        footer_reservation.bytes(),
+        crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
+    );
     if binding.tenant != seal_tenant || binding.tenant != frozen.seal_key.tenant {
         return Err(ScribeError::Internal {
             detail: format!(
@@ -96,35 +275,99 @@ pub fn encode_batch(
     let stamped_batch = stamp_tenant(&encoder_batch, seal_tenant)?;
     let sorted_batch = sort_batch(&stamped_batch)?;
 
-    // 2. Write to Parquet in-memory using bifrost_writer_properties
-    let mut buf = Cursor::new(Vec::new());
-    let props = bifrost_writer_properties(sorted_batch.num_rows());
-
-    {
-        let mut writer = ArrowWriter::try_new(&mut buf, sorted_batch.schema(), Some(props))
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("failed to create Parquet writer: {e}"),
-            })?;
-
-        writer
-            .write(&sorted_batch)
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("failed to write Parquet batch: {e}"),
-            })?;
-
-        writer.close().map_err(|e| ScribeError::Internal {
-            detail: format!("failed to close Parquet writer: {e}"),
+    let slices =
+        BifrostArrowLogicalSizer::slice(&sorted_batch).map_err(|detail| ScribeError::Internal {
+            detail: format!("writer-v2 logical slicing refused: {detail}"),
         })?;
+    if slices.is_empty() {
+        return Err(ScribeError::Internal {
+            detail: "writer-v2 cannot publish an empty artifact set".to_owned(),
+        });
     }
-
-    let bytes = buf.into_inner();
-
-    // 3. Extract row-group stats (for verification only; derives file-level min/max)
-    let row_group_stats = extract_row_group_stats(&bytes)?;
+    let mut pending: std::collections::VecDeque<_> = slices.into();
+    let mut artifacts = Vec::with_capacity(pending.len());
+    let mut row_group_stats = Vec::with_capacity(pending.len());
+    while let Some(slice) = pending.pop_front() {
+        let ordinal = u16::try_from(artifacts.len()).map_err(|_| ScribeError::Internal {
+            detail: "writer-v2 artifact ordinal exceeds u16".to_owned(),
+        })?;
+        let object_identity = format!("{object_base}-{ordinal:05}.parquet");
+        let artifact_batch = sorted_batch.slice(slice.offset, slice.len);
+        let metadata =
+            BifrostParquetMemoryEnvelope::metadata_for_batch(&artifact_batch, &object_identity)
+                .map_err(|detail| ScribeError::Internal { detail })?;
+        let scratch_path = scratch_dir.join(format!("artifact-{ordinal:05}.parquet"));
+        let file = std::fs::File::create(&scratch_path).map_err(|error| ScribeError::Internal {
+            detail: format!("create writer-v2 scratch artifact: {error}"),
+        })?;
+        let mut writer = ArrowWriter::try_new(
+            CappedScratchWriter::new(file),
+            artifact_batch.schema(),
+            Some(bifrost_writer_properties_with_metadata(
+                artifact_batch.num_rows(),
+                metadata,
+            )),
+        )
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("create writer-v2 Parquet encoder: {error}"),
+        })?;
+        writer
+            .write(&artifact_batch)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("write writer-v2 Parquet row group: {error}"),
+            })?;
+        writer.close().map_err(|error| ScribeError::Internal {
+            detail: format!("seal writer-v2 Parquet artifact: {error}"),
+        })?;
+        let file_size = std::fs::metadata(&scratch_path)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("stat writer-v2 scratch artifact: {error}"),
+            })?
+            .len();
+        if file_size == 0 || file_size > MAX_FILE_BYTES {
+            return Err(ScribeError::Internal {
+                detail: "writer-v2 sealed artifact violates its file ceiling".to_owned(),
+            });
+        }
+        let inspection = inspect_sealed_artifact(
+            &scratch_path,
+            artifact_batch.schema().as_ref(),
+            &object_identity,
+        )?;
+        let stats = match inspection {
+            SealedArtifactInspection::Accepted(stats) => stats,
+            SealedArtifactInspection::OversizedRowGroup => {
+                std::fs::remove_file(&scratch_path).map_err(|error| ScribeError::Internal {
+                    detail: format!("remove oversized writer-v2 scratch artifact: {error}"),
+                })?;
+                if slice.len == 1 {
+                    return Err(ScribeError::Internal {
+                        detail: "one-row writer-v2 artifact exceeds the encoded 32 MiB ceiling"
+                            .to_owned(),
+                    });
+                }
+                let (left, right) = BifrostArrowLogicalSizer::bisect(&sorted_batch, slice)
+                    .map_err(|detail| ScribeError::Internal { detail })?;
+                pending.push_front(right);
+                pending.push_front(left);
+                continue;
+            }
+        };
+        row_group_stats.extend(stats.iter().cloned());
+        artifacts.push(BoundedParquetArtifact {
+            ordinal,
+            scratch_path: scratch_path.clone(),
+            object_identity,
+            file_size,
+            checksum: checksum_file(&scratch_path)?,
+            row_count: artifact_batch.num_rows(),
+            row_group_stats: stats,
+        });
+    }
 
     // 4. Return encoded result with partition_day from seal-key (not row min/max)
     Ok(ParquetEncoded {
-        bytes,
+        artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
         row_group_stats,
         partition_day: frozen.seal_key.day,
         audit_events: frozen.events.clone(),
@@ -245,23 +488,128 @@ fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, ScribeError> {
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] if Parquet metadata parsing fails.
-fn extract_row_group_stats(bytes: &[u8]) -> Result<Vec<RowGroupStats>, ScribeError> {
+enum SealedArtifactInspection {
+    /// The footer satisfies every writer-v2 bound and carries these statistics.
+    Accepted(Vec<RowGroupStats>),
+    /// At least one encoded row group exceeds the 32 MiB ceiling.
+    OversizedRowGroup,
+}
+
+/// Inspects one sealed artifact and distinguishes the sole retryable overflow.
+///
+/// # Errors
+/// Returns an internal persistence error for malformed metadata, envelope, or
+/// structural limits other than the encoded row-group ceiling.
+fn inspect_sealed_artifact(
+    path: &Path,
+    expected_schema: &Schema,
+    expected_object_identity: &str,
+) -> Result<SealedArtifactInspection, ScribeError> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    let reader = SerializedFileReader::new(bytes::Bytes::from(bytes.to_vec())).map_err(|e| {
-        ScribeError::Internal {
-            detail: format!("failed to parse Parquet metadata: {e}"),
-        }
+    let mut file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
+        detail: format!("open sealed writer-v2 artifact: {error}"),
+    })?;
+    let file_bytes = file
+        .metadata()
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("stat sealed writer-v2 artifact: {error}"),
+        })?
+        .len();
+    if file_bytes < 8 {
+        return Err(ScribeError::Internal {
+            detail: "sealed writer-v2 artifact is shorter than its trailer".to_owned(),
+        });
+    }
+    let mut trailer = [0_u8; 8];
+    file.seek(std::io::SeekFrom::Start(file_bytes - 8))
+        .and_then(|_| file.read_exact(&mut trailer))
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("read sealed writer-v2 trailer: {error}"),
+        })?;
+    if &trailer[4..] != b"PAR1" {
+        return Err(ScribeError::Internal {
+            detail: "sealed writer-v2 trailer magic is invalid".to_owned(),
+        });
+    }
+    let footer_bytes = u64::from(u32::from_le_bytes(
+        trailer[..4]
+            .try_into()
+            .expect("four-byte Scribe footer length is exact"),
+    ));
+    crate::parquet::memory::validate_encoded_footer_bytes(footer_bytes)
+        .map_err(|detail| ScribeError::Internal { detail })?;
+    let footer_start = file_bytes
+        .checked_sub(8)
+        .and_then(|end| end.checked_sub(footer_bytes))
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "sealed writer-v2 footer extends before the file start".to_owned(),
+        })?;
+    let mut encoded_footer =
+        vec![
+            0_u8;
+            usize::try_from(footer_bytes).map_err(|_| ScribeError::Internal {
+                detail: "sealed writer-v2 footer exceeds address space".to_owned(),
+            })?
+        ];
+    file.seek(std::io::SeekFrom::Start(footer_start))
+        .and_then(|_| file.read_exact(&mut encoded_footer))
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("read sealed writer-v2 footer preflight bytes: {error}"),
+        })?;
+    crate::parquet::footer_preflight::preflight_compact_thrift(&encoded_footer)
+        .map_err(|detail| ScribeError::Internal { detail })?;
+    file.rewind().map_err(|error| ScribeError::Internal {
+        detail: format!("rewind sealed writer-v2 artifact: {error}"),
+    })?;
+    let reader = SerializedFileReader::new(file).map_err(|e| ScribeError::Internal {
+        detail: format!("failed to parse Parquet metadata: {e}"),
     })?;
 
     let metadata = reader.metadata();
+    BifrostParquetMemoryEnvelope::from_footer(
+        metadata.file_metadata(),
+        expected_schema,
+        expected_object_identity,
+    )
+    .map_err(|detail| ScribeError::Internal { detail })?;
+    if metadata.row_groups().iter().any(|group| {
+        u64::try_from(group.compressed_size()).unwrap_or(u64::MAX) > MAX_LOGICAL_ROW_GROUP_BYTES
+    }) {
+        return Ok(SealedArtifactInspection::OversizedRowGroup);
+    }
+    validate_writer_v2_structure(metadata).map_err(|detail| ScribeError::Internal { detail })?;
     let mut stats = Vec::new();
 
     for rg in metadata.row_groups() {
         stats.push(extract_row_group_time_range(rg)?);
     }
 
-    Ok(stats)
+    Ok(SealedArtifactInspection::Accepted(stats))
+}
+
+/// Computes the required object checksum without retaining the file in memory.
+///
+/// # Errors
+/// Returns an internal persistence error when the sealed artifact cannot be read.
+fn checksum_file(path: &Path) -> Result<String, ScribeError> {
+    let file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
+        detail: format!("open writer-v2 artifact for checksum: {error}"),
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("read writer-v2 artifact for checksum: {error}"),
+            })?;
+        if read == 0 {
+            return Ok(hex::encode(hasher.finalize()));
+        }
+        hasher.update(&chunk[..read]);
+    }
 }
 
 /// Extract min/max event time from a single row group.
@@ -373,6 +721,25 @@ mod tests {
         }
     }
 
+    /// Encodes through a real scratch directory and retains it for assertions.
+    fn encode_for_test(
+        frozen: &FrozenMemtable,
+        binding: &TenantTableBinding,
+        tenant: DataTenantId,
+    ) -> (tempfile::TempDir, ParquetEncoded) {
+        let scratch = tempfile::tempdir().expect("test scratch");
+        let encoded = encode_batch(
+            frozen,
+            binding,
+            tenant,
+            scratch.path(),
+            "s3://bucket/table/day=2026-07-14/scribe-test-0",
+            crate::scribe::memory::EncodedFooterReservation::for_test(),
+        )
+        .expect("writer-v2 encode");
+        (scratch, encoded)
+    }
+
     #[test]
     fn parquet_writer_partition_day_matches_seal_key() {
         // Regression test for C2: partition_day = seal_key.event_day, not row min/max
@@ -389,7 +756,7 @@ mod tests {
         let binding =
             TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
                 .unwrap();
-        let encoded = encode_batch(&frozen, &binding, frozen.seal_key.tenant).unwrap();
+        let (_scratch, encoded) = encode_for_test(&frozen, &binding, frozen.seal_key.tenant);
         assert_eq!(encoded.partition_day.as_date(), &seal_day);
     }
 
@@ -414,11 +781,11 @@ mod tests {
         let binding =
             TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
                 .unwrap();
-        let encoded = encode_batch(&frozen, &binding, frozen.seal_key.tenant).unwrap();
+        let (_scratch, encoded) = encode_for_test(&frozen, &binding, frozen.seal_key.tenant);
 
         // Re-read and verify sorted order
-        let bytes_copy = bytes::Bytes::from(encoded.bytes);
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_copy).unwrap();
+        let file = std::fs::File::open(&encoded.artifacts[0].scratch_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         let mut reader = builder.build().unwrap();
         let batch = reader.next().unwrap().unwrap();
 
@@ -464,9 +831,12 @@ mod tests {
         let binding =
             TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
                 .unwrap();
-        let encoded = encode_batch(&frozen, &binding, frozen.seal_key.tenant).unwrap();
+        let (_scratch, encoded) = encode_for_test(&frozen, &binding, frozen.seal_key.tenant);
 
-        let reader = SerializedFileReader::new(bytes::Bytes::from(encoded.bytes)).unwrap();
+        let reader = SerializedFileReader::new(
+            std::fs::File::open(&encoded.artifacts[0].scratch_path).unwrap(),
+        )
+        .unwrap();
         let metadata = reader.metadata();
 
         // Verify page index (offset index) is present
@@ -539,12 +909,11 @@ mod tests {
             frozen_with_envelopes.seal_key.table.clone(),
         ))
         .unwrap();
-        let encoded = encode_batch(
+        let (_scratch, encoded) = encode_for_test(
             &frozen_with_envelopes,
             &binding,
             frozen_with_envelopes.seal_key.tenant,
-        )
-        .unwrap();
+        );
 
         assert_eq!(encoded.audit_events.len(), 1);
         assert_eq!(encoded.append_metas.len(), 1);
@@ -622,7 +991,16 @@ mod tests {
         };
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
 
-        let error = encode_batch(&frozen, &binding, tenant).unwrap_err();
+        let scratch = tempfile::tempdir().unwrap();
+        let error = encode_batch(
+            &frozen,
+            &binding,
+            tenant,
+            scratch.path(),
+            "object",
+            crate::scribe::memory::EncodedFooterReservation::for_test(),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, ScribeError::Internal { detail } if detail.contains(DATA_TENANT_ID))
         );
@@ -643,7 +1021,16 @@ mod tests {
         let binding =
             TenantTableBinding::resolve((expected, frozen.seal_key.table.clone())).unwrap();
 
-        let error = encode_batch(&frozen, &binding, expected).unwrap_err();
+        let scratch = tempfile::tempdir().unwrap();
+        let error = encode_batch(
+            &frozen,
+            &binding,
+            expected,
+            scratch.path(),
+            "object",
+            crate::scribe::memory::EncodedFooterReservation::for_test(),
+        )
+        .unwrap_err();
         assert!(matches!(error, ScribeError::Internal { detail }
             if detail.contains("row 1")
                 && detail.contains(&expected.to_string())
@@ -663,7 +1050,16 @@ mod tests {
         let binding =
             TenantTableBinding::resolve((binding_tenant, frozen.seal_key.table.clone())).unwrap();
 
-        let error = encode_batch(&frozen, &binding, seal_tenant).unwrap_err();
+        let scratch = tempfile::tempdir().unwrap();
+        let error = encode_batch(
+            &frozen,
+            &binding,
+            seal_tenant,
+            scratch.path(),
+            "object",
+            crate::scribe::memory::EncodedFooterReservation::for_test(),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, ScribeError::Internal { detail } if detail.contains("binding mismatch"))
         );

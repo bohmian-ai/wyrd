@@ -454,6 +454,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
     /// Build a complete candidate so equality proves every manifest identity field.
     fn candidate(path: &str, day: NaiveDate, schema_id: i32) -> IcebergCandidateFile {
@@ -515,11 +516,16 @@ mod tests {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy is valid");
         let yesterday = today.pred_opt().expect("fixed day has predecessor");
         let tomorrow = today.succ_opt().expect("fixed day has successor");
+        let current = |path: &str, day| {
+            let mut file = candidate(path, day, 1);
+            file.writer_recipe_version = Some(BIFROST_WRITER_RECIPE_VERSION.to_owned());
+            file
+        };
 
         assert_eq!(
             plan_candidates(
                 &policy,
-                vec![candidate("a", yesterday, 1), candidate("b", yesterday, 1)],
+                vec![current("a", yesterday), current("b", yesterday)],
                 1,
                 today
             )
@@ -527,25 +533,27 @@ mod tests {
             .len(),
             1
         );
-        assert!(
+        assert_eq!(
             plan_candidates(
                 &policy,
-                vec![candidate("a", today, 1), candidate("b", today, 1)],
+                vec![current("a", today), current("b", today)],
                 1,
                 today
             )
             .groups
-            .is_empty()
+            .len(),
+            0
         );
-        assert!(
+        assert_eq!(
             plan_candidates(
                 &policy,
-                vec![candidate("a", tomorrow, 1), candidate("b", tomorrow, 1)],
+                vec![current("a", tomorrow), current("b", tomorrow)],
                 1,
                 today
             )
             .groups
-            .is_empty()
+            .len(),
+            0
         );
     }
 

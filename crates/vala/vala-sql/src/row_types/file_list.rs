@@ -16,6 +16,10 @@ pub struct HotFileRow {
     pub table_name: String,
     /// Canonical object-store path.
     pub file_path: String,
+    /// Zero-based position within the producing generation's artifact set.
+    pub file_ordinal: i16,
+    /// Lowercase SHA-256 object checksum for writer-v2 rows.
+    pub file_checksum: Option<String>,
     /// Encoded file size.
     pub file_size: i64,
     /// Number of rows in the file.

@@ -119,6 +119,8 @@ impl ForgeEnvelopeSizer {
         capacity: ForgeCapacity,
     ) -> Result<ForgeTaskEnvelope, ForgeError> {
         const MIB: u64 = 1024 * 1024;
+        const FOOTER_ENCODED_BYTES: u64 = 8 * MIB;
+        const FOOTER_DECODE_WORKSPACE_BYTES: u64 = 32 * MIB;
         if file_count == 0 || max_concurrent_reads == 0 || capacity.max_spill_bytes < 2 * MIB {
             return Err(ForgeError::Capacity {
                 detail: "Forge topology cannot supply a complete resource envelope".to_owned(),
@@ -156,6 +158,7 @@ impl ForgeEnvelopeSizer {
             let fixed = sort_working_bytes
                 .checked_add(encoder_buffer_bytes)
                 .and_then(|value| value.checked_add(upload_chunk_bytes))
+                .and_then(|value| value.checked_add(FOOTER_ENCODED_BYTES))
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "Forge fixed resident terms overflow".to_owned(),
                 })?;
@@ -186,6 +189,8 @@ impl ForgeEnvelopeSizer {
                 sort_merge_reservation_bytes,
                 encoder_buffer_bytes,
                 upload_chunk_bytes,
+                footer_encoded_bytes: FOOTER_ENCODED_BYTES,
+                footer_decode_workspace_bytes: FOOTER_DECODE_WORKSPACE_BYTES,
                 sort_spill_bytes: scratch_term,
                 output_scratch_bytes: scratch_term,
             };
@@ -551,7 +556,7 @@ mod tests {
     fn envelope_sizer_selects_largest_batch_then_readers() {
         let mib = 1024 * 1024;
         for (memory, expected_batch, expected_readers) in [
-            (64 * mib, 8 * mib, 2),
+            (64 * mib, 8 * mib, 1),
             (128 * mib, 16 * mib, 2),
             (256 * mib, 32 * mib, 3),
         ] {

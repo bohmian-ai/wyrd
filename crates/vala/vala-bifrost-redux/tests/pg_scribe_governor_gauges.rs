@@ -14,7 +14,7 @@ mod pg_tests {
 
     use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use chrono::DateTime;
+    use chrono::Utc;
     use opendal::services::Memory;
     use sqlx::types::Uuid;
     use std::sync::Arc;
@@ -172,9 +172,7 @@ mod pg_tests {
     #[tokio::test]
     async fn governor_gauges_move_during_pg_ingest() {
         let (_fixture, tenant, scribe, resources) = setup().await;
-        let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
-            .expect("time")
-            .timestamp_micros();
+        let base_time = Utc::now().timestamp_micros();
         // A modest batch stays resident in the writable memtable (no size seal),
         // so the ingress reservation and memtable bytes remain charged when the
         // age-scan tick reads them.

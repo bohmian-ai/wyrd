@@ -1,13 +1,14 @@
 //! Uniform Parquet writer properties for Bifrost data files.
 
 use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
 /// Complete version marker for the Bifrost physical Parquet writer recipe.
-pub(crate) const BIFROST_WRITER_RECIPE_VERSION: &str = "bifrost-writer-v1";
+pub(crate) const BIFROST_WRITER_RECIPE_VERSION: &str = "bifrost-writer-v2";
 
-const MAX_ROW_GROUP_ROWS: usize = 131_072;
+use super::memory::MAX_ROW_GROUP_ROWS;
 const BLOOM_FPP: f64 = 0.01;
 const BLOOM_COLUMNS: [&str; 5] = [
     "data_tenant_id",
@@ -40,6 +41,18 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 /// # Panics
 /// Never panics — ZSTD level 3 is always valid.
 pub fn bifrost_writer_properties(row_count: usize) -> WriterProperties {
+    bifrost_writer_properties_with_metadata(row_count, Vec::new())
+}
+
+/// Parquet properties carrying the exact writer-v2 footer metadata.
+///
+/// The caller must construct metadata through the common memory-contract
+/// owner so producer paths cannot invent alternate field spellings.
+#[must_use]
+pub fn bifrost_writer_properties_with_metadata(
+    row_count: usize,
+    metadata: Vec<KeyValue>,
+) -> WriterProperties {
     let bloom_ndv = bloom_filter_ndv(row_count);
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
@@ -53,6 +66,10 @@ pub fn bifrost_writer_properties(row_count: usize) -> WriterProperties {
         )
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_offset_index_disabled(false);
+
+    if !metadata.is_empty() {
+        builder = builder.set_key_value_metadata(Some(metadata));
+    }
 
     for column in BLOOM_COLUMNS {
         let path = ColumnPath::from(column);

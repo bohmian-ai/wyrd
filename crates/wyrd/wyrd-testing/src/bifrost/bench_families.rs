@@ -2908,11 +2908,14 @@ async fn offer_writes_paced(
 /// Pure unit tests for the runner's fixture-independent report assembly logic.
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     /// Build an empty capture delta whose process sample reads back as zero.
     fn empty_delta() -> BifrostTelemetryDelta {
         BifrostTelemetryDelta {
+            families: BTreeSet::new(),
             metrics: Vec::new(),
             gauge_maxima: Vec::new(),
             gauge_final: Vec::new(),

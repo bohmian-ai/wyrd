@@ -1127,10 +1127,17 @@ pub(crate) enum ScribeWalIoOp {
 /// Results produced by [`ScribeWalIoPool`].
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoResult {
-    WalWritten { result: WalAppendResult },
+    WalWritten {
+        result: WalAppendResult,
+    },
     WalSynced,
     Completed,
-    ReplayStreamCompleted { restored: usize },
+    ReplayStreamCompleted {
+        /// Number of restored immutable generations.
+        restored: usize,
+        /// WAL references retained until the replay reader releases this worker.
+        retirements: Vec<crate::scribe::shards::ReplayRetirement>,
+    },
 }
 
 /// Bounded filesystem lane for WAL append, sync, replay support, and retirement.
@@ -1377,6 +1384,7 @@ fn execute_wal_io(
             memory,
         } => {
             let mut restored = 0_usize;
+            let mut retirements = Vec::new();
             crate::scribe::replay::replay_wal_directory_stream_accounted(
                 path,
                 Some(recovery_stream),
@@ -1401,17 +1409,25 @@ fn execute_wal_io(
                             .map_err(|_| ScribeError::Internal {
                                 detail: "replay owner dropped its command channel".to_owned(),
                             })?;
-                        receiver
-                            .blocking_recv()
-                            .map_err(|_| ScribeError::Internal {
-                                detail: "replay owner dropped its completion response".to_owned(),
-                            })??;
+                        if let Some(retirement) =
+                            receiver
+                                .blocking_recv()
+                                .map_err(|_| ScribeError::Internal {
+                                    detail: "replay owner dropped its completion response"
+                                        .to_owned(),
+                                })??
+                        {
+                            retirements.push(retirement);
+                        }
                         restored = restored.saturating_add(1);
                     }
                     Ok(())
                 },
             )?;
-            Ok(ScribeWalIoResult::ReplayStreamCompleted { restored })
+            Ok(ScribeWalIoResult::ReplayStreamCompleted {
+                restored,
+                retirements,
+            })
         }
         ScribeWalIoOp::RetireWal { wal, segments } => {
             wal.retire_segments(&segments)?;

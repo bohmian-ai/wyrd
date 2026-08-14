@@ -52,6 +52,8 @@ struct PersistenceFixture {
     wal_root: TempDir,
     _warehouse: Option<TempDir>,
     tenant: DataTenantId,
+    /// Aggregate decoded Arrow ownership represented by the seeded replay WAL.
+    replay_decoded_bytes: usize,
 }
 
 impl PersistenceFixture {
@@ -134,6 +136,7 @@ impl PersistenceFixture {
             wal_root,
             _warehouse: None,
             tenant,
+            replay_decoded_bytes: 0,
         }
     }
 
@@ -203,16 +206,26 @@ impl PersistenceFixture {
                 Duration::from_millis(1),
                 Duration::from_millis(1),
             ],
+            BifrostMemoryGovernor::new_with_test_scribe_limit(
+                9 * 1024 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+            )
+            .expect("replay memory governor"),
+            2,
+            50_000,
         )
         .await
         .expect("replay")
     }
 
-    async fn start_after_wal_restart_with_keys(
+    async fn start_after_wal_restart_with_keys<T: AsRef<str>>(
         fail_replay_write: bool,
-        table_names: &[&str],
+        table_names: &[T],
         generations: i64,
         object_write_delays: &[Duration],
+        memory: BifrostMemoryGovernor,
+        wal_io_threads: usize,
+        rows_per_generation: usize,
     ) -> Result<Self, ScribeError> {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
@@ -243,7 +256,6 @@ impl PersistenceFixture {
             )
             .expect("WAL writer"),
         );
-        let memory = BifrostMemoryGovernor::new(8 * 1024 * 1024 * 1024).expect("memory governor");
         let admission = vala_bifrost_redux::scribe::admission::AdmissionConfig {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             scribe_memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
@@ -251,7 +263,8 @@ impl PersistenceFixture {
         };
         let first = first_replay_scribe(operator.clone(), wal.clone(), node_id, admission, &memory);
         first.replay_wal_async().await.expect("empty WAL replay");
-        write_replay_records(&wal, table_names, generations, tenant);
+        let replay_decoded_bytes =
+            write_replay_records(&wal, table_names, generations, tenant, rows_per_generation);
         first
             .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .await;
@@ -278,7 +291,7 @@ impl PersistenceFixture {
         let pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::new_with_capacity(1, 256),
             ScribePersistenceCpuPool::new_with_capacity(2, 64),
-            ScribeWalIoPool::new_with_capacity(2, 256),
+            ScribeWalIoPool::new_with_capacity(wal_io_threads, 256),
         );
         let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
             operator: Arc::clone(&operator),
@@ -291,7 +304,9 @@ impl PersistenceFixture {
             memory_budget: Some(memory.scribe_budget()),
             staging_file_publisher: Some(staging_file_publisher),
         }));
-        scribe.replay_wal_async().await?;
+        if let Err(error) = scribe.replay_wal_async().await {
+            return Err(Self::assert_failed_replay(&database, tenant, &scribe, error).await);
+        }
         Ok(Self {
             database,
             operator,
@@ -302,7 +317,41 @@ impl PersistenceFixture {
             wal_root,
             _warehouse: Some(warehouse),
             tenant,
+            replay_decoded_bytes,
         })
+    }
+
+    /// Verifies the fail-closed startup state before returning its exact error.
+    ///
+    /// The helper shuts down the failed owner, then proves no replay generation
+    /// became visible after the terminal failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when failed replay became ready, Postgres inspection fails, or
+    /// any file-list publication survived the failed startup.
+    async fn assert_failed_replay(
+        database: &PgFixture,
+        tenant: DataTenantId,
+        scribe: &Arc<ScribeImpl>,
+        error: ScribeError,
+    ) -> ScribeError {
+        assert!(!scribe.is_ready(), "failed replay must remain unready");
+        scribe
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
+        let mut conn = database
+            .tenant_conn_for(tenant)
+            .await
+            .expect("failed-replay tenant connection");
+        let published: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vala.file_list WHERE data_tenant_id = $1")
+                .bind(tenant.as_uuid())
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("failed-replay publication count");
+        assert_eq!(published, 0, "failed replay must not publish later state");
+        error
     }
 }
 
@@ -331,12 +380,13 @@ fn first_replay_scribe(
     }))
 }
 
-async fn register_replay_tables(
+async fn register_replay_tables<T: AsRef<str>>(
     catalog: &BifrostCatalog,
-    table_names: &[&str],
+    table_names: &[T],
     tenant: DataTenantId,
 ) {
     for table_name in table_names {
+        let table_name = table_name.as_ref();
         catalog
             .create_table(CreateTableRequest {
                 table: table(table_name),
@@ -351,17 +401,22 @@ async fn register_replay_tables(
     }
 }
 
-fn write_replay_records(
+fn write_replay_records<T: AsRef<str>>(
     wal: &WalWriter,
-    table_names: &[&str],
+    table_names: &[T],
     generations: i64,
     tenant: DataTenantId,
-) {
+    rows_per_generation: usize,
+) -> usize {
+    let mut decoded_bytes = 0_usize;
     for table_name in table_names {
+        let table_name = table_name.as_ref();
         for value in 1_i64..=generations {
             let batch_id = *uuid::Uuid::now_v7().as_bytes();
             let request_id = RequestId::now_v7();
-            let data = managed_batch_bytes(value, tenant, batch_id, &request_id);
+            let (data, batch_bytes) =
+                managed_batch_bytes(value, tenant, batch_id, &request_id, rows_per_generation);
+            decoded_bytes = decoded_bytes.saturating_add(batch_bytes);
             let audit = encode_audit_event(&audit_event("bifrost.append", request_id))
                 .expect("audit encoding");
             let key = vala_bifrost_redux::scribe::seal_key::SealKey::new(
@@ -375,6 +430,7 @@ fn write_replay_records(
                 .expect("raw WAL append");
         }
     }
+    decoded_bytes
 }
 
 fn table(name: &str) -> TableRef {
@@ -436,8 +492,8 @@ fn managed_batch_bytes(
     tenant: DataTenantId,
     batch_id: [u8; 16],
     request_id: &RequestId,
-) -> Vec<u8> {
-    let row_count = 50_000;
+    row_count: usize,
+) -> (Vec<u8>, usize) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("value_1", DataType::Int64, false),
         Field::new("value_2", DataType::Int64, false),
@@ -497,11 +553,12 @@ fn managed_batch_bytes(
         ],
     )
     .expect("managed persistence batch");
+    let decoded_bytes = batch.get_array_memory_size();
     let mut bytes = Vec::new();
     let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("IPC writer");
     writer.write(&batch).expect("IPC batch");
     writer.finish().expect("IPC finish");
-    bytes
+    (bytes, decoded_bytes)
 }
 
 async fn append_one(fixture: &PersistenceFixture, table_name: &str, value: i64) {
@@ -924,7 +981,7 @@ async fn manifest_failure_retains_retryable_front() {
     wait_for_state(&fixture, 1).await;
     assert_eq!(
         rows(&fixture).await.len(),
-        1,
+        2,
         "SQL commits before manifest failure"
     );
     assert_eq!(audit_count(&fixture).await, 1);
@@ -1072,6 +1129,13 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
             Duration::from_millis(1),
             Duration::from_millis(1),
         ],
+        BifrostMemoryGovernor::new_with_test_scribe_limit(
+            9 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        )
+        .expect("replay memory governor"),
+        2,
+        25_000,
     )
     .await
     {
@@ -1088,13 +1152,98 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
     );
 }
 
+/// Replay applies publication-driven backpressure when aggregate WAL ownership exceeds memory.
 #[tokio::test]
-async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
+async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
+    let memory =
+        BifrostMemoryGovernor::new_with_test_scribe_limit(1024 * 1024 * 1024, 256 * 1024 * 1024)
+            .expect("bounded replay governor");
+    let baseline = memory.snapshot();
+    let tables = (1..=160)
+        .map(|index| format!("bounded_replay_{index}"))
+        .collect::<Vec<_>>();
+    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
+        false,
+        &tables,
+        1,
+        &[Duration::from_millis(1)],
+        memory,
+        1,
+        10_000,
+    )
+    .await
+    .expect("bounded replay completes with one WAL worker");
+    assert!(
+        fixture.replay_decoded_bytes > baseline.scribe_limit_bytes,
+        "aggregate decoded WAL ownership {} must exceed the Scribe ceiling {}",
+        fixture.replay_decoded_bytes,
+        baseline.scribe_limit_bytes,
+    );
+    assert!(fixture.scribe.is_ready());
+    for table_name in &tables {
+        assert_eq!(rows_for_table(&fixture, table_name).await.len(), 1);
+    }
+    let restored = fixture.memory.snapshot();
+    let (scribe_peak, bifrost_peak) = fixture.memory.peak_totals_for_test();
+    assert!(scribe_peak <= restored.scribe_limit_bytes);
+    assert!(bifrost_peak <= restored.bifrost_limit_bytes);
+    assert_eq!(restored.scribe_total_bytes, baseline.scribe_total_bytes);
+    assert_eq!(restored.bifrost_total_bytes, baseline.bifrost_total_bytes);
+    fixture.stop().await;
+}
+
+/// One indivisible replay generation fails closed without advancing readiness.
+#[tokio::test]
+async fn replay_indivisible_generation_over_ceiling_stays_unready() {
+    let memory =
+        BifrostMemoryGovernor::new_with_test_scribe_limit(1024 * 1024 * 1024, 256 * 1024 * 1024)
+            .expect("bounded replay governor");
+    let baseline = memory.snapshot();
+    let error = match PersistenceFixture::start_after_wal_restart_with_keys(
+        false,
+        &["oversized_replay", "later_replay"],
+        1,
+        &[Duration::from_millis(1)],
+        memory.clone(),
+        1,
+        100_000,
+    )
+    .await
+    {
+        Ok(fixture) => {
+            fixture.stop().await;
+            panic!("an indivisible generation above the remaining ceiling must fail");
+        }
+        Err(error) => error,
+    };
+    let ScribeError::IngestBusy { table } = error else {
+        panic!("replay refusal must retain its structural capacity error");
+    };
+    assert_eq!(table, "memory");
+    assert_eq!(
+        memory.snapshot().scribe_total_bytes,
+        baseline.scribe_total_bytes
+    );
+    assert_eq!(
+        memory.snapshot().bifrost_total_bytes,
+        baseline.bifrost_total_bytes
+    );
+}
+
+#[tokio::test]
+async fn replayed_distinct_keys_publish_in_replay_order_and_fifo() {
     let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
         false,
         &["restart_key_a", "restart_key_b"],
         2,
         &[Duration::from_millis(100)],
+        BifrostMemoryGovernor::new_with_test_scribe_limit(
+            9 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        )
+        .expect("replay memory governor"),
+        2,
+        50_000,
     )
     .await
     .expect("replay");
@@ -1108,15 +1257,18 @@ async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
         }
         assert!(
             Instant::now() < deadline,
-            "cross-key replay stalled: {:?}",
-            fixture.faults.last_error_for_test()
+            "cross-key replay stalled: error={:?} rows_a={} rows_b={} objects={:?}",
+            fixture.faults.last_error_for_test(),
+            rows_for_table(&fixture, "restart_key_a").await.len(),
+            rows_for_table(&fixture, "restart_key_b").await.len(),
+            object_paths(&fixture).await,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(fixture.faults.max_concurrent_object_writes_for_test() >= 2);
-    // Distinct seal keys publish concurrently (asserted above), yet within each
-    // key the two generations must still form an ordered chain of disjoint
-    // WAL-LSN ranges — per-stream FIFO independent of cross-key publish timing.
+    assert_eq!(fixture.faults.max_concurrent_object_writes_for_test(), 1);
+    // Replay deliberately waits for each exact generation's publication and
+    // retirement before advancing. Within each key the generations therefore
+    // form an ordered chain of disjoint WAL-LSN ranges.
     for table_name in ["restart_key_a", "restart_key_b"] {
         assert_wal_lsn_chain(&rows_for_table(&fixture, table_name).await, 2);
     }

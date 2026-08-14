@@ -160,9 +160,12 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             .ok_or_else(|| ScribeError::Internal {
                 detail: "replay accumulator disappeared after insertion".to_owned(),
             })?;
-        if accumulator.append(segment_path, &record)?
-            && let Some(chunk) = accumulator.take_chunk()?
-        {
+        accumulator.append(segment_path, &record)?;
+        // A WAL record is the indivisible replay unit. Hand it off immediately
+        // so partial accumulators from other shard streams cannot retain decode
+        // reservations while publication owns immutable and encoding workspace.
+        // The existing synchronous callback supplies the required backpressure.
+        if let Some(chunk) = accumulator.take_chunk()? {
             emit(chunk)?;
         }
         Ok(())
@@ -255,13 +258,17 @@ impl<'a> ReplayAccumulator<'a> {
         })
     }
 
-    /// Decode and append one record, returning whether the batch reached its
-    /// accounted memory bound.
+    /// Decodes and appends one indivisible WAL record to the current handoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when decode accounting, the WAL record shape,
+    /// audit decoding, or Arrow row inspection fails.
     fn append(
         &mut self,
         segment_path: std::path::PathBuf,
         record: &crate::scribe::wal::WalRecord,
-    ) -> Result<bool, ScribeError> {
+    ) -> Result<(), ScribeError> {
         let record_memory_bytes = record
             .payload
             .len()
@@ -285,7 +292,7 @@ impl<'a> ReplayAccumulator<'a> {
         let seal_key_path = seal_key.as_path_components();
         if !self.seen_slices.insert(append_slice_id.clone()) {
             self.resize_memory(previous_memory)?;
-            return Ok(false);
+            return Ok(());
         }
         if self
             .sealed_lsn_map
@@ -293,7 +300,7 @@ impl<'a> ReplayAccumulator<'a> {
             .is_some_and(|sealed_lsn| record.lsn <= *sealed_lsn)
         {
             self.resize_memory(previous_memory)?;
-            return Ok(false);
+            return Ok(());
         }
         let audit_event = decode_audit_event(&decoded.audit)?;
         let shard_id = self.shard_id;
@@ -324,7 +331,7 @@ impl<'a> ReplayAccumulator<'a> {
             schema_fingerprint: decoded.schema_fingerprint,
         });
         self.memory_bytes = self.memory_bytes.saturating_add(record_memory_bytes);
-        Ok(self.memory_bytes >= REPLAY_BATCH_MEMORY_BYTES)
+        Ok(())
     }
 
     /// Move the current batch into a handoff and start a fresh reservation.

@@ -19,9 +19,10 @@ use chrono::NaiveDate;
 use futures_util::future::ready;
 use futures_util::stream::{self, BoxStream};
 use iceberg::spec::DataFile;
+use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::{Buffer, Entry, Metadata};
-use sqlx::Row;
+use sqlx::{Row, postgres::PgRow};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
@@ -556,6 +557,192 @@ impl ForgeTickOutcome {
     }
 }
 
+/// One decoded SQL row used to reconstruct an interrupted staging projection.
+struct InterruptedStagingRow {
+    /// Candidate file data needed by exact reset and retry.
+    file: CandidateFile,
+    /// Partition day that must agree across the exact set.
+    partition_day: NaiveDate,
+    /// Whether the prepared projection marked this input compacted.
+    compacted: bool,
+    /// Prepared operation identity stamped on the input.
+    operation_id: Option<Uuid>,
+}
+
+impl InterruptedStagingRow {
+    /// Decodes one catalog row without applying cross-row invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed group or reconciliation error for malformed SQL values.
+    fn decode(row: &PgRow) -> Result<Self, ForgeError> {
+        let size = row
+            .try_get::<i64, _>("file_size")
+            .map_err(|error| ForgeError::Group {
+                detail: error.to_string(),
+            })?;
+        Ok(Self {
+            file: CandidateFile {
+                id: row.try_get("id").map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?,
+                path: row
+                    .try_get("file_path")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?,
+                size: u64::try_from(size).map_err(|_| ForgeError::Group {
+                    detail: "interrupted staging file size is negative".to_owned(),
+                })?,
+                min_event_time: row.try_get("min_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+                max_event_time: row.try_get("max_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+            },
+            partition_day: row.try_get("partition_day").map_err(|error| {
+                ForgeError::Reconciliation {
+                    detail: error.to_string(),
+                }
+            })?,
+            compacted: row
+                .try_get("compacted")
+                .map_err(|error| ForgeError::Reconciliation {
+                    detail: error.to_string(),
+                })?,
+            operation_id: row.try_get("publication_operation_id").map_err(|error| {
+                ForgeError::Reconciliation {
+                    detail: error.to_string(),
+                }
+            })?,
+        })
+    }
+}
+
+/// Exact invariant-bearing projection left between SQL prepare and acknowledgement.
+struct InterruptedStagingTask {
+    /// Tenant/table/day identity shared by all prepared inputs.
+    key: ForgeGroupKey,
+    /// Ordered files and checked byte total needed for a later retry.
+    bin: RewriteBin,
+    /// One prepared operation identity shared by all inputs.
+    operation_id: Uuid,
+}
+
+impl InterruptedStagingTask {
+    /// Reconstructs one exact interrupted projection from decoded SQL rows.
+    ///
+    /// A complete uncompacted set is ordinary work and returns `None`. Mixed
+    /// day, compacted, or operation state fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns group or reconciliation errors for malformed or inconsistent rows.
+    fn decode(
+        binding: &TenantTableBinding,
+        expected_files: usize,
+        rows: Vec<PgRow>,
+    ) -> Result<Option<Self>, ForgeError> {
+        if rows.len() != expected_files || rows.is_empty() {
+            return Ok(None);
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| InterruptedStagingRow::decode(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first = &rows[0];
+        if rows
+            .iter()
+            .any(|row| row.partition_day != first.partition_day)
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "interrupted staging task crosses a partition day".to_owned(),
+            });
+        }
+        if rows.iter().any(|row| row.compacted != first.compacted) {
+            return Err(ForgeError::Reconciliation {
+                detail: "interrupted staging task has mixed compacted state".to_owned(),
+            });
+        }
+        if rows
+            .iter()
+            .any(|row| row.operation_id != first.operation_id)
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "interrupted staging task has mixed operation identity".to_owned(),
+            });
+        }
+        if !first.compacted {
+            return Ok(None);
+        }
+        let partition_day = first.partition_day;
+        let operation_id = first
+            .operation_id
+            .ok_or_else(|| ForgeError::Reconciliation {
+                detail: "interrupted staging task lost its operation identity".to_owned(),
+            })?;
+        let files = rows.into_iter().map(|row| row.file).collect::<Vec<_>>();
+        let total_bytes = files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size)
+                .ok_or_else(|| ForgeError::Group {
+                    detail: "interrupted staging task byte total overflows".to_owned(),
+                })
+        })?;
+        Ok(Some(Self {
+            key: ForgeGroupKey {
+                tenant: binding.tenant,
+                table_ref: binding.table_ref.clone(),
+                partition_day,
+            },
+            bin: RewriteBin { files, total_bytes },
+            operation_id,
+        }))
+    }
+
+    /// Validates that the operation ledger describes this exact projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns reconciliation failure when the prepared detail names another operation.
+    fn validate_prepared_detail(&self, detail: &AuditDetail) -> Result<(), ForgeError> {
+        if matches!(
+            detail,
+            AuditDetail::ForgeCompaction { operation_id, .. } if *operation_id == self.operation_id
+        ) {
+            return Ok(());
+        }
+        Err(ForgeError::Reconciliation {
+            detail: "interrupted staging task operation identity changed".to_owned(),
+        })
+    }
+
+    /// Finds the snapshot committed by this exact operation, when present.
+    #[must_use]
+    fn committed_snapshot_id(&self, table: &Table) -> Option<i64> {
+        let operation_id = self.operation_id.to_string();
+        table.metadata().snapshots().find_map(|snapshot| {
+            (snapshot
+                .summary()
+                .additional_properties
+                .get("forge.operation_id")
+                == Some(&operation_id))
+            .then_some(snapshot.snapshot_id())
+        })
+    }
+
+    /// Returns the exact input row identities owned by this projection.
+    #[must_use]
+    fn input_file_ids(&self) -> Vec<Uuid> {
+        self.bin.files.iter().map(|file| file.id).collect()
+    }
+}
+
 /// Reconcile prepared compaction audits for one tenant/table before new work.
 ///
 /// A prepared operation is marked committed when its output is still live in
@@ -895,6 +1082,76 @@ impl Forge {
         Ok((key, RewriteBin { files, total_bytes }))
     }
 
+    /// Recovers an interrupted staging publication before an exact-task replay.
+    ///
+    /// A process panic can leave every planned input compacted under the
+    /// deterministic operation identity while the task remains `running`. If
+    /// Iceberg contains that identity, this stamps the recovered snapshot. If
+    /// it does not, this resets only that exact prepared projection so the same
+    /// durable task can rewrite it. Ordinary uncompacted tasks are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, malformed-set, ambiguous-operation, fence, catalog, or
+    /// exact reset/stamp failures. Mixed compacted state fails closed.
+    pub(super) async fn recover_interrupted_staging_task(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        inputs: &[String],
+        table: &Table,
+    ) -> Result<Option<Table>, ForgeError> {
+        let Some(interrupted) = self.load_interrupted_staging_task(binding, inputs).await? else {
+            return Ok(None);
+        };
+        let input_paths = inputs.iter().cloned().collect::<BTreeSet<_>>();
+        let detail = self
+            .prepared_staging_detail(binding.tenant, &interrupted.key, &input_paths)
+            .await?;
+        interrupted.validate_prepared_detail(&detail)?;
+        if let Some(snapshot_id) = interrupted.committed_snapshot_id(table) {
+            self.stamp_recovered_staging_task(lease, binding, inputs, snapshot_id)
+                .await?;
+            return Ok(Some(table.clone()));
+        }
+        self.reset_reconciled(
+            lease,
+            &interrupted.key,
+            &interrupted.input_file_ids(),
+            &detail,
+        )
+        .await?;
+        tracing::info!(operation_id=%interrupted.operation_id, prepared_detail=?detail, "reset interrupted pre-commit Forge staging projection");
+        Ok(None)
+    }
+
+    /// Loads the exact persisted projection that may have survived an interrupted staging task.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, group, or reconciliation errors when the persisted rows
+    /// cannot be read or do not form one unambiguous interrupted projection.
+    async fn load_interrupted_staging_task(
+        &self,
+        binding: &TenantTableBinding,
+        inputs: &[String],
+    ) -> Result<Option<InterruptedStagingTask>, ForgeError> {
+        let rows = sqlx::query(
+            r"SELECT id,file_path,file_size,min_event_time,max_event_time,partition_day,compacted,publication_operation_id
+                 FROM vala.file_list
+                WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND file_path=ANY($4)
+                ORDER BY partition_day,min_event_time,max_event_time,id",
+        )
+        .bind(binding.tenant.as_uuid())
+        .bind(&binding.logical_namespace)
+        .bind(&binding.table_name)
+        .bind(inputs)
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        InterruptedStagingTask::decode(binding, inputs.len(), rows)
+    }
+
     /// Finalizes the exact staging projection after task-tagged commit recovery.
     ///
     /// The persisted task input paths remain authoritative. Recovery accepts
@@ -1198,7 +1455,9 @@ impl Forge {
             task_identity,
             stop,
         } = request;
-        let operation_id = operation_id(key, bin);
+        let operation_generation =
+            task_identity.map_or(attempt_generation.as_uuid(), |(_, attempt_id)| attempt_id);
+        let operation_id = operation_id(key, bin, operation_generation);
         let table = self.load_table(&binding.table_ident()).await?;
         let source_files = bin
             .files
@@ -1825,15 +2084,10 @@ impl Forge {
 
     /// Reset a recovered compaction whose output was never committed.
     ///
-    /// Gated to `test-support` because its sole consumer is the
-    /// `reset_reconciled_for_test` wrapper; the production recovery path never
-    /// resets reconciled input files.
-    ///
     /// # Errors
     ///
     /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
     /// error. Dropping the caller-owned transaction rolls back every mutation.
-    #[cfg(feature = "test-support")]
     async fn reset_reconciled(
         &self,
         lease: &mut ForgeLease,
@@ -2110,11 +2364,12 @@ fn forge_detail(
 }
 
 /// Derive a stable operation ID from the group and ordered input identity.
-fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin) -> Uuid {
+fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin, generation: Uuid) -> Uuid {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(key.audit_resource());
     hasher.update(key.partition_day.to_string());
+    hasher.update(generation.as_bytes());
     for file in &bin.files {
         hasher.update(file.id.as_bytes());
         hasher.update(file.path.as_bytes());

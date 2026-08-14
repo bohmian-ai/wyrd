@@ -10,6 +10,9 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use wyrd_telemetry::{CapturedSpan, TestTraceCapture};
 
 use crate::bifrost::BifrostTopology;
+#[cfg(test)]
+use crate::server::ForgeDataFileInspection;
+use crate::server::{ForgeRewriteComparison, ForgeWorkflowInspection};
 
 /// Exact Prometheus sample kind retained across family normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1289,6 +1292,8 @@ pub(crate) struct ProcessWindow {
 /// Captured production telemetry emitted during one observation window.
 #[derive(Debug, Clone)]
 pub struct BifrostTelemetryDelta {
+    /// Production family inventory declared by the closing Prometheus scrape.
+    pub(crate) families: BTreeSet<String>,
     /// Counter and histogram deltas from the one production render handle.
     pub metrics: Vec<BifrostMetricSample>,
     /// Gauge maxima observed by the production capture while the window ran.
@@ -1570,6 +1575,7 @@ impl BifrostTelemetryCapture {
             }
         }
         Ok(BifrostTelemetryDelta {
+            families: current_types.keys().cloned().collect(),
             metrics,
             gauge_maxima,
             gauge_final,
@@ -2447,6 +2453,1088 @@ pub struct ForgeRoleTopologyReport {
     pub starts: u64,
 }
 
+/// Earliest production transition that did not complete in one Forge workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ForgeCausalDiagnosis {
+    /// No staging publication entered the Forge hint channel.
+    NoAcceptedHint,
+    /// A hint entered the channel but no durable demand was recorded.
+    AcceptedHintNotPersisted,
+    /// Durable demand exists but no durable task was planned.
+    PersistedDemandNotPlanned,
+    /// A ready task exists but no worker claimed or completed it.
+    ReadyTaskNotClaimed,
+    /// The durable attempt or production terminal metric reports failure.
+    AttemptFailedOrRetryable,
+    /// A commit completed without authoritative evidence that file debt fell.
+    CommitDidNotReduceFileDebt,
+    /// The production workflow committed a replacement with lower file debt.
+    Converged,
+}
+
+/// Closed task strategy projected from production Forge metric labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum ForgeTelemetryStrategy {
+    /// Fold staged WAL generations into Iceberg.
+    StagingFold,
+    /// Rewrite current-snapshot small files.
+    SmallFiles,
+    /// Expire old Iceberg snapshots.
+    SnapshotExpiry,
+}
+
+/// Closed terminal task result projected from production Forge metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum ForgeTelemetryTaskResult {
+    /// The attempt completed successfully.
+    Succeeded,
+    /// The attempt remains eligible for retry.
+    Retryable,
+    /// The attempt failed permanently.
+    Failed,
+    /// The attempt was cancelled before completion.
+    Cancelled,
+    /// Production capacity cannot schedule the attempt.
+    Unschedulable,
+}
+
+/// Closed Forge maintenance stage projected from production metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum ForgeTelemetryStage {
+    /// Reconcile staged audit operations.
+    ReconcileStaging,
+    /// Reconcile Iceberg replacement operations.
+    ReconcileIceberg,
+    /// Publish staged files into Iceberg.
+    StagingFold,
+    /// Discover current-snapshot rewrite groups.
+    ManifestDiscovery,
+    /// Rewrite an Iceberg data-file group.
+    IcebergRewrite,
+    /// Expire retained snapshots.
+    SnapshotExpiry,
+    /// Remove proven orphan objects.
+    OrphanGc,
+}
+
+/// One nonzero terminal task histogram projected into exact count and duration.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ForgeTerminalTaskTelemetry {
+    /// Production task strategy.
+    pub strategy: ForgeTelemetryStrategy,
+    /// Production terminal result.
+    pub result: ForgeTelemetryTaskResult,
+    /// Exact completed histogram observation count.
+    pub count: u64,
+    /// Sum of completed attempt durations in seconds.
+    pub duration_seconds_sum: f64,
+}
+
+/// One nonzero stage failure with its corresponding production duration total.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ForgeStageFailureTelemetry {
+    /// Production maintenance stage.
+    pub stage: ForgeTelemetryStage,
+    /// Exact failed-operation counter delta.
+    pub count: u64,
+    /// Sum of all observed stage durations in seconds.
+    pub duration_seconds_sum: f64,
+}
+
+/// Aggregated current-snapshot candidate observations for one closed strategy.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ForgeDiscoveredCandidateTelemetry {
+    /// Production candidate strategy.
+    pub strategy: ForgeTelemetryStrategy,
+    /// Number of candidate observations in the telemetry window.
+    pub count: u64,
+    /// Sum of files across the observed candidates.
+    pub files_sum: f64,
+    /// Sum of logical candidate bytes across the observed candidates.
+    pub bytes_sum: f64,
+}
+
+/// Closed Forge span name retained by causal diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ForgeCausalSpanName {
+    /// Hint persistence boundary.
+    HintPersist,
+    /// Scheduler-pass boundary.
+    SchedulerPass,
+    /// Worker task execution boundary.
+    TaskExecute,
+    /// Iceberg catalog commit boundary.
+    CatalogCommit,
+    /// Snapshot or object cleanup boundary.
+    Cleanup,
+}
+
+/// Validated bounded projection of one captured production Forge span.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ForgeCausalSpan {
+    /// Closed instrumentation name.
+    pub name: ForgeCausalSpanName,
+    /// Span-specific closed terminal result.
+    pub result: String,
+    /// Closed runtime role.
+    pub role: String,
+    /// Scrubbed durable task UUID when permitted by the span schema.
+    pub task_id: Option<String>,
+    /// Scrubbed durable attempt UUID when permitted by the span schema.
+    pub attempt_id: Option<String>,
+}
+
+/// Causal Forge report mapped only from one production telemetry window.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ForgeCausalTelemetryReport {
+    /// Hints accepted by the bounded publication channel.
+    pub accepted_hints: u64,
+    /// Hints refused because the bounded channel was full.
+    pub full_hints: u64,
+    /// Hints refused because the receiver was closed.
+    pub closed_hints: u64,
+    /// Hints durably persisted as planning demand.
+    pub persisted_hints: u64,
+    /// Completed hint persistence failures.
+    pub failed_hint_persistence: u64,
+    /// Scheduler passes that exhausted their current work page.
+    pub scheduler_complete: u64,
+    /// Scheduler passes bounded before exhausting their work page.
+    pub scheduler_incomplete: u64,
+    /// Candidate-free demand acknowledgements.
+    pub demands_drained: u64,
+    /// Successful task terminals that atomically requested successor planning.
+    pub demands_continued: u64,
+    /// Demand acknowledgement attempts fenced by a newer generation.
+    pub demand_generations_changed: u64,
+    /// Completed demand-transition failures.
+    pub demand_transition_failures: u64,
+    /// Durable worker settlements classified as deterministic data refusals.
+    pub data_refusals: u64,
+    /// Durable worker settlements classified as transient object-store faults.
+    pub transient_object_store_failures: u64,
+    /// Durable worker settlements classified as transient coordination faults.
+    pub transient_coordination_failures: u64,
+    /// Durable worker settlements classified as local storage-health faults.
+    pub storage_health_failures: u64,
+    /// Non-consuming worker settlements classified as capacity refusals.
+    pub capacity_refusals: u64,
+    /// Durable worker settlements classified as invariant failures.
+    pub internal_invariant_failures: u64,
+    /// Maximum observed number of quarantined local workers in this process.
+    pub quarantined_workers: u64,
+    /// Maximum observed durable planning backlog.
+    pub planning_backlog: u64,
+    /// Maximum observed age of the oldest demand, in seconds.
+    pub oldest_demand_seconds: f64,
+    /// Nonzero candidate observations in stable strategy order.
+    pub discovered_candidates: Vec<ForgeDiscoveredCandidateTelemetry>,
+    /// Nonzero terminal task observations in stable label order.
+    pub terminal_tasks: Vec<ForgeTerminalTaskTelemetry>,
+    /// Nonzero stage failures in stable stage order.
+    pub stage_failures: Vec<ForgeStageFailureTelemetry>,
+    /// Rewrite input-file counter delta across both production sources.
+    pub rewrite_input_files: u64,
+    /// Rewrite input-byte counter delta across both production sources.
+    pub rewrite_input_bytes: u64,
+    /// Rewrite output-file counter delta across both production sources.
+    pub rewrite_output_files: u64,
+    /// Rewrite output-byte counter delta across both production sources.
+    pub rewrite_output_bytes: u64,
+    /// Total bounded production conflict counter delta.
+    pub conflicts: u64,
+    /// Validated Forge spans in capture order.
+    pub spans: Vec<ForgeCausalSpan>,
+}
+
+impl ForgeCausalTelemetryReport {
+    /// Build a causal report from one production exporter and tracing window.
+    ///
+    /// This validates telemetry-internal inventory, values, span schemas, and
+    /// ordering only. Durable SQL and Iceberg facts are intentionally consumed
+    /// later by [`Self::diagnose`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed report error for a missing family, open label, invalid
+    /// numeric value, malformed span, or impossible telemetry ordering.
+    pub fn from_production_delta(
+        delta: &BifrostTelemetryDelta,
+    ) -> Result<Self, BifrostTelemetryReportError> {
+        ForgeCausalReportBuilder::new(delta).build()
+    }
+
+    /// Corroborate telemetry against authoritative durable Forge state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostTelemetryReportError::InvalidBinding`] when captured
+    /// telemetry and SQL/Iceberg state cannot describe the same workflow.
+    pub fn diagnose(
+        &self,
+        workflow: &ForgeWorkflowInspection,
+        rewrite: Option<&ForgeRewriteComparison>,
+    ) -> Result<ForgeCausalDiagnosis, BifrostTelemetryReportError> {
+        let scheduler_span = self
+            .spans
+            .iter()
+            .any(|span| span.name == ForgeCausalSpanName::SchedulerPass);
+        let task_span = self
+            .spans
+            .iter()
+            .any(|span| span.name == ForgeCausalSpanName::TaskExecute);
+        let commit_span = self.spans.iter().any(|span| {
+            span.name == ForgeCausalSpanName::CatalogCommit && span.result == "succeeded"
+        });
+        let has_task = !workflow.tasks.is_empty();
+        let unschedulable_count = workflow
+            .tasks
+            .iter()
+            .filter(|(_, state)| state == "unschedulable")
+            .count() as u64;
+        let unschedulable_metric = self
+            .terminal_tasks
+            .iter()
+            .filter(|task| task.result == ForgeTelemetryTaskResult::Unschedulable)
+            .map(|task| task.count)
+            .sum::<u64>();
+        let executed_state = workflow.tasks.iter().any(|(_, state)| {
+            matches!(
+                state.as_str(),
+                "claimed"
+                    | "running"
+                    | "prepared"
+                    | "succeeded"
+                    | "retryable"
+                    | "failed"
+                    | "cancelled"
+            )
+        });
+        let succeeded_state = workflow.tasks.iter().any(|(_, state)| state == "succeeded");
+        if has_task && !scheduler_span {
+            return Err(causal_binding("durable task has no scheduler-pass span"));
+        }
+        if task_span && !has_task {
+            return Err(causal_binding("task execution span has no durable task"));
+        }
+        if unschedulable_count != unschedulable_metric {
+            return Err(causal_binding(
+                "durable unschedulable tasks and terminal telemetry disagree",
+            ));
+        }
+        if unschedulable_count > 0 {
+            if task_span || workflow.has_demand || self.demands_continued > 0 {
+                return Err(causal_binding(
+                    "terminally blocked unschedulable work has execution or successor evidence",
+                ));
+            }
+            return Ok(ForgeCausalDiagnosis::AttemptFailedOrRetryable);
+        }
+        if executed_state && !task_span {
+            return Err(causal_binding("executed durable task has no task span"));
+        }
+        if commit_span && !succeeded_state {
+            return Err(causal_binding(
+                "catalog commit has no succeeded durable task",
+            ));
+        }
+        if succeeded_state && !commit_span {
+            return Err(causal_binding(
+                "succeeded durable task has no catalog commit",
+            ));
+        }
+        if succeeded_state && self.demands_continued == 0 {
+            return Err(causal_binding(
+                "succeeded durable task has no continued demand transition",
+            ));
+        }
+        if rewrite.is_some() && !(succeeded_state && commit_span) {
+            return Err(causal_binding(
+                "rewrite comparison has no committed durable task",
+            ));
+        }
+
+        if self.accepted_hints == 0 {
+            return Ok(ForgeCausalDiagnosis::NoAcceptedHint);
+        }
+        if self.persisted_hints == 0 {
+            return Ok(ForgeCausalDiagnosis::AcceptedHintNotPersisted);
+        }
+        if workflow.has_demand && !has_task {
+            return Ok(ForgeCausalDiagnosis::PersistedDemandNotPlanned);
+        }
+        let ready = workflow.tasks.iter().any(|(_, state)| state == "ready");
+        let completed_attempt = task_span || self.terminal_tasks.iter().any(|task| task.count > 0);
+        if ready
+            && workflow.active_claims == 0
+            && workflow.active_attempts == 0
+            && !completed_attempt
+        {
+            return Ok(ForgeCausalDiagnosis::ReadyTaskNotClaimed);
+        }
+        let failed_state = workflow
+            .tasks
+            .iter()
+            .any(|(_, state)| matches!(state.as_str(), "retryable" | "failed"));
+        let failed_metric = self.terminal_tasks.iter().any(|task| {
+            matches!(
+                task.result,
+                ForgeTelemetryTaskResult::Retryable | ForgeTelemetryTaskResult::Failed
+            ) && task.count > 0
+        });
+        if failed_state || failed_metric {
+            return Ok(ForgeCausalDiagnosis::AttemptFailedOrRetryable);
+        }
+        if succeeded_state || commit_span {
+            return match rewrite {
+                Some(comparison)
+                    if !comparison.input_files.is_empty()
+                        && !comparison.output_files.is_empty()
+                        && comparison.output_files.len() < comparison.input_files.len()
+                        && workflow.active_claims == 0
+                        && workflow.active_attempts == 0 =>
+                {
+                    Ok(ForgeCausalDiagnosis::Converged)
+                }
+                _ => Ok(ForgeCausalDiagnosis::CommitDidNotReduceFileDebt),
+            };
+        }
+        Ok(ForgeCausalDiagnosis::PersistedDemandNotPlanned)
+    }
+}
+
+/// Stateful mapper that enforces the causal report's closed production schema.
+struct ForgeCausalReportBuilder<'a> {
+    /// Single production telemetry window being projected.
+    delta: &'a BifrostTelemetryDelta,
+}
+
+impl<'a> ForgeCausalReportBuilder<'a> {
+    /// Bind a builder to one immutable telemetry window.
+    fn new(delta: &'a BifrostTelemetryDelta) -> Self {
+        Self { delta }
+    }
+
+    /// Validate and project the complete causal report.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed report error when any metric or span violates the closed
+    /// production contract.
+    fn build(&self) -> Result<ForgeCausalTelemetryReport, BifrostTelemetryReportError> {
+        validate_causal_metric_contract(self.delta)?;
+        let spans = causal_spans(self.delta)?;
+        validate_causal_span_order(&spans)?;
+        let accepted_hints = causal_count(
+            self.delta,
+            "bifrost_forge_hints_total",
+            &[("result", "accepted")],
+        )?;
+        let persisted_hints = causal_count(
+            self.delta,
+            "bifrost_forge_hint_persistence_total",
+            &[("result", "succeeded")],
+        )?;
+        let failed_hint_persistence = causal_count(
+            self.delta,
+            "bifrost_forge_hint_persistence_total",
+            &[("result", "failed")],
+        )?;
+        let persistence_spans = spans
+            .iter()
+            .filter(|span| span.name == ForgeCausalSpanName::HintPersist)
+            .count() as u64;
+        if persisted_hints + failed_hint_persistence != persistence_spans {
+            return Err(causal_binding(
+                "hint persistence metrics and spans disagree",
+            ));
+        }
+        if persisted_hints + failed_hint_persistence > accepted_hints {
+            return Err(causal_binding(
+                "completed persistence exceeds accepted hints",
+            ));
+        }
+        let scheduler_complete = causal_count(
+            self.delta,
+            "bifrost_forge_scheduling_total",
+            &[("result", "complete")],
+        )?;
+        let scheduler_incomplete = causal_count(
+            self.delta,
+            "bifrost_forge_scheduling_total",
+            &[("result", "incomplete")],
+        )?;
+        let succeeded_scheduler = spans.iter().any(|span| {
+            span.name == ForgeCausalSpanName::SchedulerPass && span.result == "succeeded"
+        });
+        if (scheduler_complete + scheduler_incomplete > 0) != succeeded_scheduler {
+            return Err(causal_binding(
+                "scheduler counters and succeeded span disagree",
+            ));
+        }
+        Ok(ForgeCausalTelemetryReport {
+            accepted_hints,
+            full_hints: causal_count(
+                self.delta,
+                "bifrost_forge_hints_total",
+                &[("result", "full")],
+            )?,
+            closed_hints: causal_count(
+                self.delta,
+                "bifrost_forge_hints_total",
+                &[("result", "closed")],
+            )?,
+            persisted_hints,
+            failed_hint_persistence,
+            scheduler_complete,
+            scheduler_incomplete,
+            demands_drained: causal_count(
+                self.delta,
+                "bifrost_forge_demand_transitions_total",
+                &[("result", "drained")],
+            )?,
+            demands_continued: causal_count(
+                self.delta,
+                "bifrost_forge_demand_transitions_total",
+                &[("result", "continued")],
+            )?,
+            demand_generations_changed: causal_count(
+                self.delta,
+                "bifrost_forge_demand_transitions_total",
+                &[("result", "generation_changed")],
+            )?,
+            demand_transition_failures: causal_count(
+                self.delta,
+                "bifrost_forge_demand_transitions_total",
+                &[("result", "failed")],
+            )?,
+            data_refusals: causal_count(
+                self.delta,
+                "bifrost_forge_task_failures_total",
+                &[("failure_class", "data_refusal")],
+            )?,
+            transient_object_store_failures: causal_count(
+                self.delta,
+                "bifrost_forge_task_failures_total",
+                &[("failure_class", "transient_object_store")],
+            )?,
+            transient_coordination_failures: causal_count(
+                self.delta,
+                "bifrost_forge_task_failures_total",
+                &[("failure_class", "transient_coordination")],
+            )?,
+            storage_health_failures: causal_count(
+                self.delta,
+                "bifrost_forge_task_failures_total",
+                &[("failure_class", "storage_health")],
+            )?,
+            capacity_refusals: causal_count(
+                self.delta,
+                "bifrost_forge_task_failures_total",
+                &[("failure_class", "capacity_refused")],
+            )?,
+            internal_invariant_failures: causal_count(
+                self.delta,
+                "bifrost_forge_task_failures_total",
+                &[("failure_class", "internal_invariant")],
+            )?,
+            quarantined_workers: causal_gauge_count(
+                self.delta,
+                "bifrost_forge_worker_quarantined",
+            )?,
+            planning_backlog: causal_gauge_count(self.delta, "bifrost_forge_planning_backlog")?,
+            oldest_demand_seconds: causal_gauge(
+                self.delta,
+                "bifrost_forge_oldest_backlog_seconds",
+            )?,
+            discovered_candidates: causal_discovered_candidates(self.delta)?,
+            terminal_tasks: causal_terminal_tasks(self.delta)?,
+            stage_failures: causal_stage_failures(self.delta)?,
+            rewrite_input_files: causal_source_total(
+                self.delta,
+                "bifrost_forge_rewrite_input_files_total",
+            )?,
+            rewrite_input_bytes: causal_source_total(
+                self.delta,
+                "bifrost_forge_rewrite_input_bytes_total",
+            )?,
+            rewrite_output_files: causal_source_total(
+                self.delta,
+                "bifrost_forge_rewrite_output_files_total",
+            )?,
+            rewrite_output_bytes: causal_source_total(
+                self.delta,
+                "bifrost_forge_rewrite_output_bytes_total",
+            )?,
+            conflicts: ["lease_contention", "fence_lost", "snapshot_changed"]
+                .into_iter()
+                .try_fold(0_u64, |total, kind| {
+                    causal_count(
+                        self.delta,
+                        "bifrost_forge_conflicts_total",
+                        &[("kind", kind)],
+                    )
+                    .and_then(|value| {
+                        total
+                            .checked_add(value)
+                            .ok_or_else(|| causal_binding("conflict count overflow"))
+                    })
+                })?,
+            spans,
+        })
+    }
+}
+
+/// Construct the stable private binding error used by causal corroboration.
+fn causal_binding(detail: &str) -> BifrostTelemetryReportError {
+    BifrostTelemetryReportError::InvalidBinding {
+        id: "forge_causal_workflow".to_owned(),
+        detail: detail.to_owned(),
+    }
+}
+
+/// Validate labels, kinds, and finite non-negative values for causal families.
+///
+/// # Errors
+///
+/// Returns a typed report error when a required family is absent or any sample
+/// violates its closed schema.
+fn validate_causal_metric_contract(
+    delta: &BifrostTelemetryDelta,
+) -> Result<(), BifrostTelemetryReportError> {
+    let required = [
+        "bifrost_forge_hints_total",
+        "bifrost_forge_hint_persistence_total",
+        "bifrost_forge_hint_persistence_seconds",
+        "bifrost_forge_scheduling_total",
+        "bifrost_forge_demand_transitions_total",
+        "bifrost_forge_task_failures_total",
+        "bifrost_forge_worker_quarantined",
+        "bifrost_forge_discovered_candidate_files",
+        "bifrost_forge_discovered_candidate_bytes",
+        "bifrost_forge_planning_demand_total",
+        "bifrost_forge_planning_backlog",
+        "bifrost_forge_oldest_backlog_seconds",
+        "bifrost_forge_task_duration_seconds",
+        "bifrost_forge_stage_failures_total",
+        "bifrost_forge_stage_seconds",
+        "bifrost_forge_rewrite_input_files_total",
+        "bifrost_forge_rewrite_input_bytes_total",
+        "bifrost_forge_rewrite_output_files_total",
+        "bifrost_forge_rewrite_output_bytes_total",
+        "bifrost_forge_conflicts_total",
+    ];
+    for family in required {
+        if !delta.families.contains(family) {
+            return Err(BifrostTelemetryReportError::MissingSeries {
+                family: family.to_owned(),
+            });
+        }
+    }
+    for sample in delta
+        .metrics
+        .iter()
+        .chain(&delta.gauge_maxima)
+        .chain(&delta.gauge_final)
+    {
+        if !required.contains(&sample.family.as_str()) {
+            continue;
+        }
+        if !sample.value.is_finite() || sample.value < 0.0 {
+            return Err(causal_binding(
+                "causal metric value is negative or non-finite",
+            ));
+        }
+        let (allowed, categorical): (&[&str], &[(&str, &[&str])]) = match sample.family.as_str() {
+            "bifrost_forge_hints_total" => {
+                (&["result"], &[("result", &["accepted", "full", "closed"])])
+            }
+            "bifrost_forge_hint_persistence_total" | "bifrost_forge_hint_persistence_seconds" => {
+                (&["result", "le"], &[("result", &["succeeded", "failed"])])
+            }
+            "bifrost_forge_scheduling_total" => {
+                (&["result"], &[("result", &["complete", "incomplete"])])
+            }
+            "bifrost_forge_demand_transitions_total" => (
+                &["result"],
+                &[(
+                    ("result"),
+                    &["drained", "continued", "generation_changed", "failed"],
+                )],
+            ),
+            "bifrost_forge_task_failures_total" => (
+                &["failure_class"],
+                &[(
+                    "failure_class",
+                    &[
+                        "data_refusal",
+                        "transient_object_store",
+                        "transient_coordination",
+                        "storage_health",
+                        "capacity_refused",
+                        "internal_invariant",
+                    ],
+                )],
+            ),
+            "bifrost_forge_worker_quarantined" => (&[], &[]),
+            "bifrost_forge_discovered_candidate_files"
+            | "bifrost_forge_discovered_candidate_bytes" => (
+                &["strategy", "le"],
+                &[(
+                    "strategy",
+                    &["staging_fold", "small_files", "snapshot_expiry"],
+                )],
+            ),
+            "bifrost_forge_planning_demand_total" => {
+                (&["source"], &[("source", &["hint", "roster_repair"])])
+            }
+            "bifrost_forge_task_duration_seconds" => (
+                &["strategy", "result", "le"],
+                &[
+                    (
+                        "strategy",
+                        &["staging_fold", "small_files", "snapshot_expiry"],
+                    ),
+                    (
+                        "result",
+                        &[
+                            "succeeded",
+                            "retryable",
+                            "failed",
+                            "cancelled",
+                            "unschedulable",
+                        ],
+                    ),
+                ],
+            ),
+            "bifrost_forge_stage_failures_total" | "bifrost_forge_stage_seconds" => (
+                &["stage", "le"],
+                &[(
+                    "stage",
+                    &[
+                        "reconcile_staging",
+                        "reconcile_iceberg",
+                        "staging_fold",
+                        "manifest_discovery",
+                        "iceberg_rewrite",
+                        "snapshot_expiry",
+                        "orphan_gc",
+                    ],
+                )],
+            ),
+            "bifrost_forge_rewrite_input_files_total"
+            | "bifrost_forge_rewrite_input_bytes_total"
+            | "bifrost_forge_rewrite_output_files_total"
+            | "bifrost_forge_rewrite_output_bytes_total" => {
+                (&["source"], &[("source", &["staging", "iceberg"])])
+            }
+            "bifrost_forge_conflicts_total" => (
+                &["kind"],
+                &[(
+                    "kind",
+                    &["lease_contention", "fence_lost", "snapshot_changed"],
+                )],
+            ),
+            _ => (&[], &[]),
+        };
+        validate_sample_labels(sample, allowed, categorical)?;
+    }
+    Ok(())
+}
+
+/// Return one exact non-negative integer counter or histogram count.
+///
+/// # Errors
+///
+/// Returns a typed report error when the series is absent, non-integral, or
+/// outside `u64`.
+fn causal_count(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+    labels: &[(&str, &str)],
+) -> Result<u64, BifrostTelemetryReportError> {
+    let value = delta
+        .metrics
+        .iter()
+        .filter(|sample| {
+            sample.family == family
+                && sample.kind != BifrostMetricKind::HistogramBucket
+                && sample.kind != BifrostMetricKind::HistogramSum
+                && labels
+                    .iter()
+                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
+        })
+        .map(|sample| sample.value)
+        .sum::<f64>();
+    checked_causal_u64(value, family)
+}
+
+/// Convert one exact telemetry count to `u64`.
+///
+/// # Errors
+///
+/// Returns a typed binding error for a negative, non-finite, fractional, or
+/// overflowing value.
+fn checked_causal_u64(value: f64, family: &str) -> Result<u64, BifrostTelemetryReportError> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+        return Err(causal_binding(&format!("{family} is not an exact u64")));
+    }
+    Ok(value as u64)
+}
+
+/// Return the maximum production gauge as an exact count.
+///
+/// # Errors
+///
+/// Returns a typed report error when the gauge is absent or not an exact count.
+fn causal_gauge_count(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+) -> Result<u64, BifrostTelemetryReportError> {
+    checked_causal_u64(causal_gauge(delta, family)?, family)
+}
+
+/// Return the maximum finite non-negative production gauge.
+///
+/// # Errors
+///
+/// Returns a typed report error when the required gauge is absent or invalid.
+fn causal_gauge(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+) -> Result<f64, BifrostTelemetryReportError> {
+    let value = delta
+        .gauge_maxima
+        .iter()
+        .filter(|sample| sample.family == family)
+        .map(|sample| sample.value)
+        .reduce(f64::max)
+        .ok_or_else(|| BifrostTelemetryReportError::MissingSeries {
+            family: family.to_owned(),
+        })?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(causal_binding("causal gauge is negative or non-finite"));
+    }
+    Ok(value)
+}
+
+/// Sum one source-labeled production counter across its closed inventory.
+///
+/// # Errors
+///
+/// Returns a typed report error when either source series is malformed or the
+/// sum overflows.
+fn causal_source_total(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+) -> Result<u64, BifrostTelemetryReportError> {
+    ["staging", "iceberg"]
+        .into_iter()
+        .try_fold(0_u64, |total, source| {
+            causal_count(delta, family, &[("source", source)]).and_then(|value| {
+                total
+                    .checked_add(value)
+                    .ok_or_else(|| causal_binding("rewrite counter overflow"))
+            })
+        })
+}
+
+/// Project nonzero task terminal histograms in stable label order.
+///
+/// # Errors
+///
+/// Returns a typed report error for malformed histogram count or sum samples.
+fn causal_terminal_tasks(
+    delta: &BifrostTelemetryDelta,
+) -> Result<Vec<ForgeTerminalTaskTelemetry>, BifrostTelemetryReportError> {
+    let strategies = [
+        ("staging_fold", ForgeTelemetryStrategy::StagingFold),
+        ("small_files", ForgeTelemetryStrategy::SmallFiles),
+        ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
+    ];
+    let results = [
+        ("succeeded", ForgeTelemetryTaskResult::Succeeded),
+        ("retryable", ForgeTelemetryTaskResult::Retryable),
+        ("failed", ForgeTelemetryTaskResult::Failed),
+        ("cancelled", ForgeTelemetryTaskResult::Cancelled),
+        ("unschedulable", ForgeTelemetryTaskResult::Unschedulable),
+    ];
+    let mut rows = Vec::new();
+    for (strategy_label, strategy) in strategies {
+        for (result_label, result) in results {
+            let labels = [("strategy", strategy_label), ("result", result_label)];
+            let count = causal_count(delta, "bifrost_forge_task_duration_seconds", &labels)?;
+            if count > 0 {
+                rows.push(ForgeTerminalTaskTelemetry {
+                    strategy,
+                    result,
+                    count,
+                    duration_seconds_sum: causal_histogram_sum(
+                        delta,
+                        "bifrost_forge_task_duration_seconds",
+                        &labels,
+                    )?,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Project nonzero candidate discovery histograms in stable strategy order.
+///
+/// # Errors
+///
+/// Returns a typed report error for malformed histogram count or sum samples.
+fn causal_discovered_candidates(
+    delta: &BifrostTelemetryDelta,
+) -> Result<Vec<ForgeDiscoveredCandidateTelemetry>, BifrostTelemetryReportError> {
+    let strategies = [
+        ("staging_fold", ForgeTelemetryStrategy::StagingFold),
+        ("small_files", ForgeTelemetryStrategy::SmallFiles),
+        ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
+    ];
+    let mut rows = Vec::new();
+    for (label, strategy) in strategies {
+        let labels = [("strategy", label)];
+        let files_count = causal_count(delta, "bifrost_forge_discovered_candidate_files", &labels)?;
+        let bytes_count = causal_count(delta, "bifrost_forge_discovered_candidate_bytes", &labels)?;
+        if files_count != bytes_count {
+            return Err(causal_binding(
+                "candidate file and byte observation counts disagree",
+            ));
+        }
+        if files_count > 0 {
+            rows.push(ForgeDiscoveredCandidateTelemetry {
+                strategy,
+                count: files_count,
+                files_sum: causal_histogram_sum(
+                    delta,
+                    "bifrost_forge_discovered_candidate_files",
+                    &labels,
+                )?,
+                bytes_sum: causal_histogram_sum(
+                    delta,
+                    "bifrost_forge_discovered_candidate_bytes",
+                    &labels,
+                )?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Project nonzero stage failure counters in stable stage order.
+///
+/// # Errors
+///
+/// Returns a typed report error for malformed failure or duration samples.
+fn causal_stage_failures(
+    delta: &BifrostTelemetryDelta,
+) -> Result<Vec<ForgeStageFailureTelemetry>, BifrostTelemetryReportError> {
+    let stages = [
+        ("reconcile_staging", ForgeTelemetryStage::ReconcileStaging),
+        ("reconcile_iceberg", ForgeTelemetryStage::ReconcileIceberg),
+        ("staging_fold", ForgeTelemetryStage::StagingFold),
+        ("manifest_discovery", ForgeTelemetryStage::ManifestDiscovery),
+        ("iceberg_rewrite", ForgeTelemetryStage::IcebergRewrite),
+        ("snapshot_expiry", ForgeTelemetryStage::SnapshotExpiry),
+        ("orphan_gc", ForgeTelemetryStage::OrphanGc),
+    ];
+    let mut rows = Vec::new();
+    for (label, stage) in stages {
+        let labels = [("stage", label)];
+        let count = causal_count(delta, "bifrost_forge_stage_failures_total", &labels)?;
+        if count > 0 {
+            rows.push(ForgeStageFailureTelemetry {
+                stage,
+                count,
+                duration_seconds_sum: causal_histogram_sum(
+                    delta,
+                    "bifrost_forge_stage_seconds",
+                    &labels,
+                )?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Return a finite non-negative histogram sum for exact labels.
+///
+/// # Errors
+///
+/// Returns a typed report error when the sum is absent or numerically invalid.
+fn causal_histogram_sum(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+    labels: &[(&str, &str)],
+) -> Result<f64, BifrostTelemetryReportError> {
+    let value = delta
+        .metrics
+        .iter()
+        .filter(|sample| {
+            sample.family == family
+                && sample.kind == BifrostMetricKind::HistogramSum
+                && labels
+                    .iter()
+                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
+        })
+        .map(|sample| sample.value)
+        .sum::<f64>();
+    if !value.is_finite() || value < 0.0 {
+        return Err(causal_binding("histogram sum is negative or non-finite"));
+    }
+    Ok(value)
+}
+
+/// Validate and project captured Forge spans without changing capture order.
+///
+/// # Errors
+///
+/// Returns a typed span error for an unknown name, attribute, closed value, or
+/// malformed UUID.
+fn causal_spans(
+    delta: &BifrostTelemetryDelta,
+) -> Result<Vec<ForgeCausalSpan>, BifrostTelemetryReportError> {
+    let mut projected = Vec::new();
+    for span in &delta.spans {
+        let (name, expected, results, roles, ids) = match span.name.as_str() {
+            "bifrost.forge.hint.persist" => (
+                ForgeCausalSpanName::HintPersist,
+                &["result", "role"][..],
+                &["succeeded", "failed"][..],
+                &["server"][..],
+                false,
+            ),
+            "bifrost.forge.scheduler.pass" => (
+                ForgeCausalSpanName::SchedulerPass,
+                &["result", "role"][..],
+                &["succeeded", "failed", "standby"][..],
+                &["server"][..],
+                false,
+            ),
+            "bifrost.forge.task.execute" => (
+                ForgeCausalSpanName::TaskExecute,
+                &["attempt_id", "result", "role", "strategy", "task_id"][..],
+                &[
+                    "succeeded",
+                    "retryable",
+                    "failed",
+                    "cancelled",
+                    "unschedulable",
+                ][..],
+                &["forge_worker"][..],
+                true,
+            ),
+            "bifrost.forge.catalog.commit" => (
+                ForgeCausalSpanName::CatalogCommit,
+                &["attempt_id", "result", "role", "strategy", "task_id"][..],
+                &["succeeded", "failed", "timed_out", "cancelled"][..],
+                &["forge_worker"][..],
+                true,
+            ),
+            "bifrost.forge.cleanup" => (
+                ForgeCausalSpanName::Cleanup,
+                &[
+                    "attempt_id",
+                    "kind",
+                    "result",
+                    "role",
+                    "strategy",
+                    "task_id",
+                ][..],
+                &["succeeded", "failed"][..],
+                &["forge_worker"][..],
+                true,
+            ),
+            name if name.starts_with("bifrost.forge.") => {
+                return Err(BifrostTelemetryReportError::InvalidSpan {
+                    span: name.to_owned(),
+                    detail: "unexpected Forge instrumentation name".to_owned(),
+                });
+            }
+            _ => continue,
+        };
+        validate_span_attribute_set(span, expected)?;
+        validate_closed_span_attribute(span, "result", results)?;
+        validate_closed_span_attribute(span, "role", roles)?;
+        if matches!(
+            name,
+            ForgeCausalSpanName::TaskExecute | ForgeCausalSpanName::CatalogCommit
+        ) {
+            validate_closed_span_attribute(
+                span,
+                "strategy",
+                if name == ForgeCausalSpanName::CatalogCommit {
+                    &["staging_fold", "small_files"]
+                } else {
+                    &["staging_fold", "small_files", "snapshot_expiry"]
+                },
+            )?;
+        } else if name == ForgeCausalSpanName::Cleanup {
+            validate_closed_span_attribute(span, "strategy", &["snapshot_expiry"])?;
+            validate_closed_span_attribute(span, "kind", &["expired"])?;
+        }
+        let (task_id, attempt_id) = if ids {
+            validate_span_uuid(span, "task_id")?;
+            validate_span_uuid(span, "attempt_id")?;
+            (
+                span.attributes.get("task_id").cloned(),
+                span.attributes.get("attempt_id").cloned(),
+            )
+        } else {
+            (None, None)
+        };
+        projected.push(ForgeCausalSpan {
+            name,
+            result: span.attributes["result"].clone(),
+            role: span.attributes["role"].clone(),
+            task_id,
+            attempt_id,
+        });
+    }
+    Ok(projected)
+}
+
+/// Enforce causal prerequisites among captured production Forge spans.
+///
+/// Exporters may deliver concurrently completed spans in a different vector
+/// order than their start times, so causality is proven by the presence of the
+/// required upstream span rather than the capture vector position.
+///
+/// # Errors
+///
+/// Returns a typed binding error when a downstream span appears before its
+/// required upstream production transition.
+fn validate_causal_span_order(
+    spans: &[ForgeCausalSpan],
+) -> Result<(), BifrostTelemetryReportError> {
+    let scheduler_seen = spans
+        .iter()
+        .any(|span| span.name == ForgeCausalSpanName::SchedulerPass);
+    let succeeded_task_seen = spans
+        .iter()
+        .any(|span| span.name == ForgeCausalSpanName::TaskExecute && span.result == "succeeded");
+    for span in spans {
+        match span.name {
+            ForgeCausalSpanName::TaskExecute => {
+                if !scheduler_seen {
+                    return Err(causal_binding("task span has no scheduler span"));
+                }
+            }
+            ForgeCausalSpanName::CatalogCommit if !succeeded_task_seen => {
+                return Err(causal_binding("catalog commit has no succeeded task span"));
+            }
+            ForgeCausalSpanName::HintPersist
+            | ForgeCausalSpanName::SchedulerPass
+            | ForgeCausalSpanName::CatalogCommit
+            | ForgeCausalSpanName::Cleanup => {}
+        }
+    }
+    Ok(())
+}
+
 impl ForgeMaintenanceTelemetryReport {
     /// Map every Forge-only R13 field from one production exporter window.
     ///
@@ -2550,7 +3638,17 @@ fn validate_forge_span_contract(
                     "strategy",
                     &["staging_fold", "small_files", "snapshot_expiry"],
                 )?;
-                validate_closed_span_attribute(span, "result", &["succeeded", "failed"])?;
+                validate_closed_span_attribute(
+                    span,
+                    "result",
+                    &[
+                        "succeeded",
+                        "retryable",
+                        "failed",
+                        "cancelled",
+                        "unschedulable",
+                    ],
+                )?;
                 validate_closed_span_attribute(span, "role", &["forge_worker"])?;
                 validate_span_uuid(span, "task_id")?;
                 validate_span_uuid(span, "attempt_id")?;
@@ -2631,12 +3729,16 @@ fn validate_span_attribute_set(
     let expected = expected.iter().copied().collect::<BTreeSet<_>>();
     let provider = [
         "busy_ns",
+        "code.file.path",
         "code.filepath",
+        "code.line.number",
         "code.lineno",
+        "code.module.name",
         "code.namespace",
         "idle_ns",
         "thread.id",
         "thread.name",
+        "target",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -2767,7 +3869,20 @@ fn validate_forge_label_contract(
             ),
             "bifrost_forge_oldest_backlog_seconds"
             | "bifrost_forge_fairness_lag_tasks"
-            | "bifrost_forge_complete_gauge_publications_total" => (&[], &[]),
+            | "bifrost_forge_complete_gauge_publications_total"
+            | "bifrost_forge_worker_quarantined" => (&[], &[]),
+            "bifrost_forge_task_failures_total" => (
+                &["failure_class"],
+                &[(
+                    "failure_class",
+                    &[
+                        "data_refusal",
+                        "transient_object_store",
+                        "storage_health",
+                        "capacity_refused",
+                    ],
+                )],
+            ),
             "bifrost_memory_reserved_bytes" => (&["consumer"], &[]),
             "bifrost_memory_reservations_total" => (
                 &["consumer", "outcome"],
@@ -3596,6 +4711,7 @@ mod tests {
             });
         }
         let delta = BifrostTelemetryDelta {
+            families: BTreeSet::new(),
             metrics,
             gauge_maxima: Vec::new(),
             gauge_final: Vec::new(),
@@ -3618,6 +4734,7 @@ mod tests {
     fn histogram_window_rejects_invalid_bucket_shapes() {
         let family = "test_duration_seconds";
         let make = |buckets: &[(&str, f64)], count: f64| BifrostTelemetryDelta {
+            families: BTreeSet::new(),
             metrics: buckets
                 .iter()
                 .map(|(le, value)| BifrostMetricSample {
@@ -4910,6 +6027,7 @@ mod tests {
     /// Build one complete exact binding fixture from independent emitter contracts.
     fn canonical_binding_delta() -> BifrostTelemetryDelta {
         let mut delta = BifrostTelemetryDelta {
+            families: BTreeSet::new(),
             metrics: Vec::new(),
             gauge_maxima: Vec::new(),
             gauge_final: Vec::new(),
@@ -4980,6 +6098,7 @@ mod tests {
     /// Construct one complete three-worker production delta without a fixture value path.
     fn complete_delta() -> BifrostTelemetryDelta {
         BifrostTelemetryDelta {
+            families: BTreeSet::new(),
             metrics: vec![
                 sample(
                     "bifrost_forge_rewrite_output_bytes_total",
@@ -5437,5 +6556,228 @@ mod tests {
             Err(BifrostTelemetryReportError::InvalidSpan { span, .. })
                 if span == "bifrost.forge.scheduler.pass"
         ));
+    }
+
+    /// Prove causal diagnosis uses earliest-transition precedence and rejects
+    /// every telemetry-to-durable binding mismatch.
+    #[test]
+    fn forge_causal_report_classifies_each_transition() {
+        let report = causal_report_fixture();
+        let empty = ForgeWorkflowInspection {
+            has_demand: false,
+            tasks: Vec::new(),
+            active_claims: 0,
+            active_attempts: 0,
+            uncompacted_staging_files: 0,
+        };
+        let mut no_hint = report.clone();
+        no_hint.accepted_hints = 0;
+        no_hint.persisted_hints = 0;
+        no_hint.spans.clear();
+        assert_eq!(
+            no_hint.diagnose(&empty, None).expect("no-hint diagnosis"),
+            ForgeCausalDiagnosis::NoAcceptedHint
+        );
+        let mut not_persisted = no_hint.clone();
+        not_persisted.accepted_hints = 1;
+        assert_eq!(
+            not_persisted
+                .diagnose(&empty, None)
+                .expect("not-persisted diagnosis"),
+            ForgeCausalDiagnosis::AcceptedHintNotPersisted
+        );
+        let demand = ForgeWorkflowInspection {
+            has_demand: true,
+            ..empty.clone()
+        };
+        assert_eq!(
+            report
+                .diagnose(&demand, None)
+                .expect("unplanned demand diagnosis"),
+            ForgeCausalDiagnosis::PersistedDemandNotPlanned
+        );
+        let ready = ForgeWorkflowInspection {
+            has_demand: false,
+            tasks: vec![("small_files".to_owned(), "ready".to_owned())],
+            active_claims: 0,
+            active_attempts: 0,
+            uncompacted_staging_files: 0,
+        };
+        assert_eq!(
+            report
+                .diagnose(&ready, None)
+                .expect("unclaimed task diagnosis"),
+            ForgeCausalDiagnosis::ReadyTaskNotClaimed
+        );
+        let failed = ForgeWorkflowInspection {
+            tasks: vec![("small_files".to_owned(), "failed".to_owned())],
+            ..ready.clone()
+        };
+        let mut executed = report.clone();
+        executed.spans.push(causal_span(
+            ForgeCausalSpanName::TaskExecute,
+            "failed",
+            "forge_worker",
+        ));
+        assert_eq!(
+            executed
+                .diagnose(&failed, None)
+                .expect("failed attempt diagnosis"),
+            ForgeCausalDiagnosis::AttemptFailedOrRetryable
+        );
+        let succeeded = ForgeWorkflowInspection {
+            tasks: vec![("small_files".to_owned(), "succeeded".to_owned())],
+            ..ready
+        };
+        let mut committed = report.clone();
+        committed.demands_continued = 1;
+        committed.spans.push(causal_span(
+            ForgeCausalSpanName::TaskExecute,
+            "succeeded",
+            "forge_worker",
+        ));
+        committed.spans.push(causal_span(
+            ForgeCausalSpanName::CatalogCommit,
+            "succeeded",
+            "forge_worker",
+        ));
+        assert_eq!(
+            committed
+                .diagnose(&succeeded, None)
+                .expect("unproven commit diagnosis"),
+            ForgeCausalDiagnosis::CommitDidNotReduceFileDebt
+        );
+        let rewrite = ForgeRewriteComparison {
+            input_files: vec![
+                ForgeDataFileInspection {
+                    path: "a".to_owned(),
+                    bytes: 1,
+                },
+                ForgeDataFileInspection {
+                    path: "b".to_owned(),
+                    bytes: 1,
+                },
+            ],
+            input_bytes: 2,
+            output_files: vec![ForgeDataFileInspection {
+                path: "c".to_owned(),
+                bytes: 2,
+            }],
+            output_bytes: 2,
+        };
+        assert_eq!(
+            committed
+                .diagnose(&succeeded, Some(&rewrite))
+                .expect("converged diagnosis"),
+            ForgeCausalDiagnosis::Converged
+        );
+        let unschedulable = ForgeWorkflowInspection {
+            tasks: vec![("staging_fold".to_owned(), "unschedulable".to_owned())],
+            ..empty.clone()
+        };
+        let mut blocked = report.clone();
+        blocked.terminal_tasks.push(ForgeTerminalTaskTelemetry {
+            strategy: ForgeTelemetryStrategy::StagingFold,
+            result: ForgeTelemetryTaskResult::Unschedulable,
+            count: 1,
+            duration_seconds_sum: 0.1,
+        });
+        assert_eq!(
+            blocked
+                .diagnose(&unschedulable, None)
+                .expect("terminally blocked diagnosis"),
+            ForgeCausalDiagnosis::AttemptFailedOrRetryable
+        );
+
+        let durable_without_scheduler = ForgeWorkflowInspection {
+            tasks: vec![("small_files".to_owned(), "ready".to_owned())],
+            ..empty.clone()
+        };
+        let mut no_scheduler = report.clone();
+        no_scheduler.spans.clear();
+        assert!(matches!(
+            no_scheduler.diagnose(&durable_without_scheduler, None),
+            Err(BifrostTelemetryReportError::InvalidBinding { .. })
+        ));
+        assert!(matches!(
+            executed.diagnose(&empty, None),
+            Err(BifrostTelemetryReportError::InvalidBinding { .. })
+        ));
+        assert!(matches!(
+            report.diagnose(&failed, None),
+            Err(BifrostTelemetryReportError::InvalidBinding { .. })
+        ));
+        assert!(matches!(
+            committed.diagnose(&empty, None),
+            Err(BifrostTelemetryReportError::InvalidBinding { .. })
+        ));
+        assert!(matches!(
+            executed.diagnose(&succeeded, None),
+            Err(BifrostTelemetryReportError::InvalidBinding { .. })
+        ));
+        assert!(matches!(
+            committed.diagnose(&empty, Some(&rewrite)),
+            Err(BifrostTelemetryReportError::InvalidBinding { .. })
+        ));
+    }
+
+    /// Construct a valid persisted-demand report before any durable task exists.
+    fn causal_report_fixture() -> ForgeCausalTelemetryReport {
+        ForgeCausalTelemetryReport {
+            accepted_hints: 1,
+            full_hints: 0,
+            closed_hints: 0,
+            persisted_hints: 1,
+            failed_hint_persistence: 0,
+            scheduler_complete: 1,
+            scheduler_incomplete: 0,
+            demands_drained: 0,
+            demands_continued: 0,
+            demand_generations_changed: 0,
+            demand_transition_failures: 0,
+            data_refusals: 0,
+            transient_object_store_failures: 0,
+            storage_health_failures: 0,
+            capacity_refusals: 0,
+            quarantined_workers: 0,
+            planning_backlog: 1,
+            oldest_demand_seconds: 0.1,
+            discovered_candidates: Vec::new(),
+            terminal_tasks: Vec::new(),
+            stage_failures: Vec::new(),
+            rewrite_input_files: 0,
+            rewrite_input_bytes: 0,
+            rewrite_output_files: 0,
+            rewrite_output_bytes: 0,
+            conflicts: 0,
+            spans: vec![causal_span(
+                ForgeCausalSpanName::SchedulerPass,
+                "succeeded",
+                "server",
+            )],
+        }
+    }
+
+    /// Construct one already-validated causal span for diagnosis-only tests.
+    fn causal_span(name: ForgeCausalSpanName, result: &str, role: &str) -> ForgeCausalSpan {
+        ForgeCausalSpan {
+            name,
+            result: result.to_owned(),
+            role: role.to_owned(),
+            task_id: matches!(
+                name,
+                ForgeCausalSpanName::TaskExecute
+                    | ForgeCausalSpanName::CatalogCommit
+                    | ForgeCausalSpanName::Cleanup
+            )
+            .then(|| "00000000-0000-0000-0000-000000000001".to_owned()),
+            attempt_id: matches!(
+                name,
+                ForgeCausalSpanName::TaskExecute
+                    | ForgeCausalSpanName::CatalogCommit
+                    | ForgeCausalSpanName::Cleanup
+            )
+            .then(|| "00000000-0000-0000-0000-000000000002".to_owned()),
+        }
     }
 }

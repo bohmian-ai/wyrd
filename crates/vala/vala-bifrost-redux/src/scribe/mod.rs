@@ -2103,10 +2103,48 @@ impl ScribeImpl {
         let result = match result {
             Ok(crate::scribe::execution_lanes::ScribeWalIoResult::ReplayStreamCompleted {
                 restored,
+                retirements,
             }) => {
-                if let Some(persistence) = &self.persistence {
-                    persistence.drain_result().await?;
-                    self.shards.drain().await;
+                for retirement in retirements {
+                    let manifest_path = crate::scribe::replay::stream_directory(
+                        self.wal.base_dir(),
+                        retirement.stream,
+                    )
+                    .join("manifest");
+                    let result = self
+                        .wal_io
+                        .submit(
+                            crate::scribe::execution_lanes::ScribeWalIoOp::AdvanceManifest {
+                                path: manifest_path,
+                                stream: retirement.stream,
+                                seal_key: retirement.seal_key,
+                                sealed_lsn: retirement.sealed_lsn,
+                            },
+                        )
+                        .await?;
+                    if !matches!(
+                        result,
+                        crate::scribe::execution_lanes::ScribeWalIoResult::Completed
+                    ) {
+                        return Err(ScribeError::Internal {
+                            detail: "WAL IO lane returned the wrong manifest result".to_owned(),
+                        });
+                    }
+                    let result = self
+                        .wal_io
+                        .submit(crate::scribe::execution_lanes::ScribeWalIoOp::RetireWal {
+                            wal: retirement.wal,
+                            segments: retirement.segments,
+                        })
+                        .await?;
+                    if !matches!(
+                        result,
+                        crate::scribe::execution_lanes::ScribeWalIoResult::Completed
+                    ) {
+                        return Err(ScribeError::Internal {
+                            detail: "WAL IO lane returned the wrong retirement result".to_owned(),
+                        });
+                    }
                 }
                 self.memtable_stats()?;
                 tracing::info!(restored, stream = %self.stream, "Scribe WAL recovery completed");
@@ -2115,7 +2153,20 @@ impl ScribeImpl {
             Ok(_) => Err(ScribeError::Internal {
                 detail: "WAL IO lane returned the wrong replay result".to_owned(),
             }),
-            Err(error) => Err(error),
+            Err(error) => {
+                let memory = self.memory.snapshot();
+                tracing::error!(
+                    stage = "replay_stream",
+                    purpose = "scribe_replay",
+                    error = %error,
+                    scribe_current_bytes = memory.scribe_total_bytes,
+                    scribe_limit_bytes = memory.scribe_limit_bytes,
+                    bifrost_current_bytes = memory.bifrost_total_bytes,
+                    bifrost_limit_bytes = memory.bifrost_limit_bytes,
+                    "Scribe WAL recovery failed"
+                );
+                Err(error)
+            }
         };
         if result.is_ok() {
             self.recovery_ready.store(true, Ordering::Release);

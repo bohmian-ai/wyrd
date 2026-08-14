@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
@@ -315,6 +315,12 @@ pub struct CommitUncertaintyCatalog {
 pub(crate) struct CommitUncertaintyControls {
     /// Counts all delegated commit attempts across process-local wrappers.
     update_attempts: AtomicUsize,
+    /// One-shot panic mode at the real catalog commit boundary.
+    panic_mode: AtomicU8,
+    /// Records that an armed catalog panic reached its production boundary.
+    panic_reached: AtomicBool,
+    /// Wakes the journey waiting for the armed catalog panic.
+    panic_ready: tokio::sync::Notify,
     /// Arms one injected retryable response after a durable commit.
     fail_after_next_commit: AtomicBool,
     /// Refuses later commits after a simulated lost response.
@@ -426,6 +432,9 @@ impl CommitUncertaintyControls {
     pub(crate) fn new() -> Self {
         Self {
             update_attempts: AtomicUsize::new(0),
+            panic_mode: AtomicU8::new(0),
+            panic_reached: AtomicBool::new(false),
+            panic_ready: tokio::sync::Notify::new(),
             fail_after_next_commit: AtomicBool::new(false),
             uncertainty_active: AtomicBool::new(false),
             pause_after_commit: AtomicBool::new(false),
@@ -448,6 +457,30 @@ impl CommitUncertaintyControls {
 }
 
 impl CommitUncertaintyCatalog {
+    /// Panic once immediately before the next delegated catalog commit.
+    pub fn panic_before_next_commit(&self) {
+        self.controls.panic_reached.store(false, Ordering::Release);
+        self.controls.panic_mode.store(1, Ordering::Release);
+    }
+
+    /// Panic once after the next delegated catalog commit succeeds.
+    pub fn panic_after_next_commit(&self) {
+        self.controls.panic_reached.store(false, Ordering::Release);
+        self.controls.panic_mode.store(2, Ordering::Release);
+    }
+
+    /// Disarm any catalog panic that has not yet fired.
+    pub fn disarm_panic(&self) {
+        self.controls.panic_mode.store(0, Ordering::Release);
+    }
+
+    /// Wait until an armed panic reaches the real catalog boundary.
+    pub async fn wait_for_panic(&self) {
+        while !self.controls.panic_reached.load(Ordering::Acquire) {
+            self.controls.panic_ready.notified().await;
+        }
+    }
+
     /// Make the next successful catalog update appear retryably uncertain.
     pub fn fail_after_next_commit(&self) {
         self.controls
@@ -652,6 +685,16 @@ impl Catalog for CommitUncertaintyCatalog {
 
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
         self.controls.update_attempts.fetch_add(1, Ordering::AcqRel);
+        if self
+            .controls
+            .panic_mode
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.controls.panic_reached.store(true, Ordering::Release);
+            self.controls.panic_ready.notify_waiters();
+            panic!("injected Forge panic immediately before catalog commit");
+        }
         if self.controls.uncertainty_active.load(Ordering::Acquire) {
             return Err(IcebergError::new(
                 IcebergErrorKind::Unexpected,
@@ -700,6 +743,16 @@ impl Catalog for CommitUncertaintyCatalog {
             None
         };
         let table = self.inner.update_table(commit).await?;
+        if self
+            .controls
+            .panic_mode
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.controls.panic_reached.store(true, Ordering::Release);
+            self.controls.panic_ready.notify_waiters();
+            panic!("injected Forge panic after catalog commit before acknowledgement");
+        }
         let removed_snapshot = snapshots_before.is_some_and(|before| {
             let after = table
                 .metadata()

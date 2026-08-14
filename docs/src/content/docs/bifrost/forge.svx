@@ -19,6 +19,10 @@ owns query assembly, and Forge owns maintenance after Scribe has sealed a file.
 Forge is the only Bifrost component that commits the maintenance Iceberg
 transactions described here.
 
+> Operator note: the former `bifrost_staging_hint_dropped_total` counter is
+> replaced by `bifrost_forge_hints_total{result}`. Dashboards and alerts must
+> select the closed `result` label instead of querying the retired family.
+
 ## Where Forge fits in Bifrost
 
 <WyrdBifrostSystem />

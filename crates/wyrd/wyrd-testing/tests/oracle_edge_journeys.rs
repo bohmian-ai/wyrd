@@ -24,6 +24,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::cluster::RoleTiming;
+use vala_bifrost_redux::forge::ForgeLifecycleEvent;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
     MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
@@ -33,6 +34,7 @@ use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_au
 use vala_sdk::{
     BifrostGrpcTransport, CollectedQueryLimits, IngestTransport, QueryClient, ValaSdkError,
 };
+use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -46,8 +48,10 @@ use wyrd_spec::vala::api::{
     FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning, VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_testing::Bootstrap;
-use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_testing::bifrost::{
+    BifrostClusterSpec, ForgeCausalDiagnosis, ForgeCausalTelemetryReport, WyrdTestCluster,
+};
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
@@ -65,6 +69,11 @@ use wyrd_tonic::wyrd::v1::{QueryTracesRequest, QueryWindow};
 
 type JourneyError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Rows carried by each public ingest request in the spill journeys.
+const SPILL_INGEST_BATCH_ROWS: usize = 5_000;
+/// Public ingest batches durably sealed together during fixture preparation.
+const SPILL_BATCHES_PER_SEAL: usize = 10;
+
 /// Builds a complete pod observation for production resource-policy journeys.
 ///
 /// The fixture states only process-visible inputs. The Bifrost runtime derives
@@ -78,13 +87,20 @@ fn spill_system_resources(scratch_bytes: u64) -> SystemResourceSnapshot {
         .checked_add(MIN_SCRATCH_FREE_BYTES)
         .expect("fixed spill observation fits u64");
     SystemResourceSnapshot {
-        memory_limit_bytes: 768 << 20,
+        memory_limit_bytes: 832 << 20,
         effective_cpu: 4,
         scratch_capacity_bytes: observed_scratch,
         scratch_available_bytes: observed_scratch,
         memory_source: ResourceSource::Injected,
         cpu_source: ResourceSource::Injected,
     }
+}
+
+/// Builds a bounded Forge-convergence observation that can decode one Scribe row group.
+fn forge_convergence_system_resources() -> SystemResourceSnapshot {
+    let mut snapshot = spill_system_resources(1 << 30);
+    snapshot.memory_limit_bytes = 2 << 30;
+    snapshot
 }
 
 /// Asserts the production-derived mixed-role plan before costly fixture ingest.
@@ -100,12 +116,12 @@ fn assert_spill_resource_plan(server: &wyrd_testing::WyrdTestServer, scratch_byt
         .as_ref()
         .expect("server owns global Bifrost resources");
     let plan = resources.plan();
-    assert_eq!(plan.memory_limit_bytes, 768 << 20);
+    assert_eq!(plan.memory_limit_bytes, 832 << 20);
     assert_eq!(plan.unmanaged_reserve_bytes, 256 << 20);
-    assert_eq!(plan.managed_memory_bytes, 512 << 20);
+    assert_eq!(plan.managed_memory_bytes, 576 << 20);
     assert_eq!(plan.scribe_floor_bytes, 256 << 20);
     assert_eq!(plan.oracle_floor_bytes, 256 << 20);
-    assert_eq!(plan.elastic_memory_bytes, 0);
+    assert_eq!(plan.elastic_memory_bytes, 64 << 20);
     assert_eq!(plan.scratch_limit_bytes, scratch_bytes);
     assert_eq!(plan.effective_cpu, 4);
     assert_eq!(resources.sources().memory, ResourceSource::Injected);
@@ -1008,6 +1024,302 @@ async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
     cluster.shutdown().await.expect("spill success shutdown");
 }
 
+/// Real Forge workers replace the fixture's small files before an ordered read.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_forge_small_files_converge_before_ordered_read() {
+    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+        BifrostClusterSpec::one_mixed().with_system_resources(forge_convergence_system_resources()),
+    )
+    .await
+    .expect("Forge convergence cluster");
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .expect("Forge causal telemetry checkpoint");
+    let server = cluster.server(0).expect("Forge convergence server");
+    let table = prepare_spill_table(&cluster, server, "forge_small_files", 1_000_000)
+        .await
+        .expect("Forge convergence fixture");
+    let reader = client(server, "forge-small-files-reader")
+        .await
+        .expect("Forge convergence reader");
+    assert_eq!(
+        strict_unordered_summary(&reader, &format!("vala.bifrost.{table}"))
+            .await
+            .expect("pre-Forge exact dataset"),
+        (1_000_000, 256_000_000)
+    );
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("close the fixture's event-day partition");
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("Forge completion observer");
+    for transition in 1..=64 {
+        let workflow = server
+            .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+            .await
+            .expect("inspect staging-fold convergence");
+        if workflow.uncompacted_staging_files == 0 {
+            break;
+        }
+        advance_forge_retry_for_journey(server, cluster.data_tenant_id(), &table).await;
+        let expected_attempts = observer.attempts().saturating_add(1);
+        let completed_passes = server.completed_forge_scheduler_passes_for_test();
+        cluster.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            server.wait_for_forge_scheduler_passes_for_test(completed_passes + 1),
+        )
+        .await
+        .expect("production staging scheduler pass completes");
+        let transition_result = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            observer.wait_for_attempts_at_least(expected_attempts),
+        )
+        .await;
+        if transition_result.is_err() {
+            let delta = cluster
+                .telemetry()
+                .delta_since(&checkpoint)
+                .expect("stalled Forge continuation telemetry delta");
+            let report = ForgeCausalTelemetryReport::from_production_delta(&delta);
+            let workflow = server
+                .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+                .await
+                .expect("inspect stalled Forge continuation");
+            let diagnosis = report
+                .as_ref()
+                .map_err(ToString::to_string)
+                .and_then(|report| {
+                    report
+                        .diagnose(&workflow, None)
+                        .map_err(|error| error.to_string())
+                });
+            panic!(
+                "Forge continuation did not complete: transition={transition} diagnosis={diagnosis:?} telemetry={report:?} workflow={workflow:?}"
+            );
+        }
+    }
+    assert_eq!(
+        server
+            .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+            .await
+            .expect("inspect staging-fold terminal state")
+            .uncompacted_staging_files,
+        0,
+        "bounded production continuation must drain staging debt"
+    );
+    let before = server
+        .inspect_forge_table_for_test(cluster.data_tenant_id(), &table)
+        .await
+        .expect("pre-compaction table inspection");
+    assert!(before.data_file_count() > 1);
+    assert!(before.total_data_file_bytes().expect("pre-Forge bytes") > 0);
+    let forge_baseline = server
+        .state()
+        .forge()
+        .expect("Forge composition")
+        .resources_for_test()
+        .snapshot()
+        .expect("Forge resource baseline");
+    for _ in 0..64 {
+        if observer
+            .completed_strategies()
+            .contains(&ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles))
+        {
+            break;
+        }
+        advance_forge_retry_for_journey(server, cluster.data_tenant_id(), &table).await;
+        let completed_passes = server.completed_forge_scheduler_passes_for_test();
+        cluster.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            server.wait_for_forge_scheduler_passes_for_test(completed_passes + 1),
+        )
+        .await
+        .expect("production rewrite scheduler pass completes");
+        let expected_completions = observer.completed().saturating_add(1);
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            observer.wait_for_at_least(expected_completions),
+        )
+        .await
+        .is_err()
+        {
+            let delta = cluster
+                .telemetry()
+                .delta_since(&checkpoint)
+                .expect("stalled rewrite telemetry delta");
+            let report = ForgeCausalTelemetryReport::from_production_delta(&delta);
+            let workflow = server
+                .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+                .await
+                .expect("inspect stalled production rewrite");
+            let diagnosis = report
+                .as_ref()
+                .map_err(ToString::to_string)
+                .and_then(|report| {
+                    report
+                        .diagnose(&workflow, None)
+                        .map_err(|error| error.to_string())
+                });
+            panic!(
+                "production maintenance task did not complete: diagnosis={diagnosis:?} telemetry={report:?} workflow={workflow:?} table={before:?}"
+            );
+        }
+    }
+    assert!(
+        observer.completed_strategies().iter().any(|strategy| {
+            *strategy == ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles)
+        }),
+        "bounded production continuation must reach the SmallFiles rewrite"
+    );
+    let events = observer.lifecycle_events();
+    let planned_inputs = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ForgeLifecycleEvent::Planned {
+                table: observed,
+                inputs,
+                ..
+            } if observed == &table => Some(inputs.clone()),
+            _ => None,
+        })
+        .expect("table-scoped planned inputs");
+    let after = server
+        .inspect_forge_table_for_test(cluster.data_tenant_id(), &table)
+        .await
+        .expect("post-Forge table inspection");
+    let rewrite = wyrd_testing::WyrdTestServer::compare_forge_rewrite_for_test(
+        &before,
+        &after,
+        &planned_inputs,
+    )
+    .expect("exact Forge replacement comparison");
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .expect("converged Forge production telemetry delta");
+    let report = ForgeCausalTelemetryReport::from_production_delta(&delta)
+        .expect("converged Forge causal telemetry report");
+    let workflow = server
+        .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+        .await
+        .expect("converged Forge durable workflow");
+    assert_eq!(
+        report
+            .diagnose(&workflow, Some(&rewrite))
+            .expect("Forge telemetry matches converged durable state"),
+        ForgeCausalDiagnosis::Converged
+    );
+    assert!(after.data_file_count() < before.data_file_count());
+    assert_eq!(rewrite.input_files.len(), planned_inputs.len());
+    assert!(!rewrite.output_files.is_empty());
+    assert!(rewrite.input_bytes > 0 && rewrite.output_bytes > 0);
+    assert!(
+        rewrite
+            .output_files
+            .iter()
+            .all(|file| file.bytes <= after.maximum_healthy_file_bytes)
+    );
+    assert!(
+        rewrite.output_files.len() == 1
+            || rewrite
+                .output_files
+                .iter()
+                .all(|file| file.bytes >= after.minimum_healthy_file_bytes)
+    );
+    assert_eq!(after.active_claims, 0);
+    assert_eq!(after.active_attempts, 0);
+    assert_eq!(
+        server
+            .state()
+            .forge()
+            .expect("Forge composition after rewrite")
+            .resources_for_test()
+            .snapshot()
+            .expect("Forge resources after rewrite"),
+        forge_baseline
+    );
+    assert_eq!(
+        strict_spill_summary(&reader, &format!("vala.bifrost.{table}"))
+            .await
+            .expect("post-Forge ordered exact dataset"),
+        (1_000_000, 256_000_000)
+    );
+    cluster
+        .shutdown()
+        .await
+        .expect("Forge convergence shutdown");
+}
+
+/// Advances only a durably settled retry so the gated journey need not sleep through backoff.
+///
+/// The production worker has already consumed and classified the failed attempt;
+/// this test-only clock step preserves that durable taxonomy while keeping the
+/// convergence proof bounded.
+///
+/// # Panics
+///
+/// Panics when the test database cannot update the exact tenant-table retry row.
+async fn advance_forge_retry_for_journey(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+) {
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("Forge journey operator pool");
+    let pool = operator_pool.pool();
+    let mut transaction = pool.begin().await.expect("begin Forge retry clock step");
+    let retries = sqlx::query_as::<_, (uuid::Uuid, Option<String>)>(
+        "SELECT task_id,failure_class FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND state='retryable' FOR UPDATE",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_all(&mut *transaction)
+    .await
+    .expect("load durable Forge retry classification");
+    for (task_id, failure_class) in &retries {
+        assert!(
+            matches!(
+                failure_class.as_deref(),
+                Some("transient_object_store" | "transient_coordination" | "storage_health")
+            ),
+            "task {task_id} must have a permitted durable transient class before clock advancement; observed {failure_class:?}"
+        );
+    }
+    let task_ids = retries
+        .into_iter()
+        .map(|(task_id, _)| task_id)
+        .collect::<Vec<_>>();
+    if !task_ids.is_empty() {
+        let updated = sqlx::query(
+            "UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp()-interval '15 minutes' WHERE task_id=ANY($1) AND state='retryable'",
+        )
+        .bind(&task_ids)
+        .execute(&mut *transaction)
+        .await
+        .expect("advance durable Forge retry eligibility")
+        .rows_affected();
+        assert_eq!(
+            updated,
+            u64::try_from(task_ids.len()).expect("retry fixture count fits u64"),
+            "locked retry set must remain exact through eligibility advancement"
+        );
+    }
+    transaction
+        .commit()
+        .await
+        .expect("commit Forge retry clock step");
+}
+
 /// A production disk-ceiling refusal remains a typed public 429, cleans all
 /// partial ownership, and leaves a smaller durable query usable.
 #[tokio::test]
@@ -1192,7 +1504,18 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
     .await
     .expect("spill pod-loss reader");
     let query_table = format!("vala.bifrost.{table}");
-    let query = tokio::spawn(async move { strict_spill_summary(&reader, &query_table).await });
+    let request_lifetime = cluster
+        .abrupt_request_lifetime(query_node)
+        .expect("spill pod-loss request lifetime");
+    let query = tokio::spawn(async move {
+        tokio::select! {
+            result = strict_spill_summary(&reader, &query_table) => result,
+            () = request_lifetime.cancelled() => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "bound test process terminated during public query",
+            ).into()),
+        }
+    });
     let executing = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if query.is_finished() {
@@ -1218,33 +1541,18 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
     })
     .await
     .expect("runtime inspection identifies the executing Oracle");
-    let memory_governor = cluster
-        .server_by_node(executing)
-        .expect("executing Oracle server")
-        .state()
-        .bifrost_memory
-        .as_ref()
-        .expect("executing Oracle memory governor")
-        .clone();
-    cluster
-        .stop_node(executing)
+    let roots = cluster
+        .terminate_node_abruptly_for_test(executing)
         .await
-        .expect("executing Oracle stops");
-    let _terminal = tokio::time::timeout(std::time::Duration::from_secs(30), query)
+        .expect("executing Oracle terminates abruptly");
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(30), query)
         .await
         .expect("pod-loss spill query terminates")
         .expect("pod-loss spill task joins");
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            let memory = memory_governor.snapshot();
-            if memory.bifrost_total_bytes == 0 && memory.oracle_total_bytes == 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("stopped Oracle releases admitted memory before restart");
+    assert!(
+        terminal.is_err(),
+        "abrupt pod loss must fail the unfinished query"
+    );
     cluster
         .seed_oracle_spill_restart_fixture(executing)
         .expect("seed stopped-node crash residue");
@@ -1255,9 +1563,9 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
         (true, true)
     );
     cluster
-        .restart_node(executing)
+        .restart_terminated_node_at_new_address(executing, roots)
         .await
-        .expect("stopped Oracle restarts");
+        .expect("terminated Oracle restarts from retained roots");
     cluster
         .refresh_oracle_snapshots()
         .await
@@ -3297,8 +3605,8 @@ fn metric_label_value_is_closed(label: &str, value: &str) -> bool {
     }
 }
 
-/// Builds one deterministic sealed table large enough to force the configured
-/// production reconciliation sort through its disk spill path.
+/// Builds one deterministic sealed table large enough to exercise native
+/// ordered-query spill through the production DataFusion path.
 ///
 /// # Errors
 ///
@@ -3312,6 +3620,7 @@ async fn prepare_spill_table(
     let table = unique_table(prefix);
     register_table(server, cluster.data_tenant_id(), &table).await?;
     let writer = client(server, &format!("{prefix}-writer")).await?;
+    let transport = BifrostGrpcTransport::connect(&writer).await?;
     let scribe_baseline = server
         .state()
         .bifrost_memory
@@ -3319,9 +3628,9 @@ async fn prepare_spill_table(
         .ok_or("spill fixture lacks memory governor")?
         .snapshot()
         .scribe_total_bytes;
-    for start in (0..row_count).step_by(5_000) {
-        let end = (start + 5_000).min(row_count);
-        let chunk = u64::try_from(start / 5_000)?;
+    for start in (0..row_count).step_by(SPILL_INGEST_BATCH_ROWS) {
+        let end = (start + SPILL_INGEST_BATCH_ROWS).min(row_count);
+        let chunk = u64::try_from(start / SPILL_INGEST_BATCH_ROWS)?;
         let batch_id = uuid::Uuid::new_v7(uuid::Timestamp::from_unix_time(
             2_000_000_000_u64.saturating_sub(chunk),
             0,
@@ -3331,18 +3640,47 @@ async fn prepare_spill_table(
         let ids = (start..end)
             .map(i64::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        BifrostGrpcTransport::connect(&writer)
-            .await?
+        transport
             .insert_batch(
                 &format!("vala.bifrost.{table}"),
                 batch_id.into_bytes(),
                 spill_ipc(&ids),
             )
             .await?;
-        server.flush_bifrost().await?;
-        wait_scribe_memory_restored(server, scribe_baseline).await?;
+        let batches_ingested = end.div_ceil(SPILL_INGEST_BATCH_ROWS);
+        if batches_ingested.is_multiple_of(SPILL_BATCHES_PER_SEAL) || end == row_count {
+            server.flush_bifrost().await?;
+            wait_scribe_memory_restored(server, scribe_baseline).await?;
+            assert_scribe_fixture_peaks_bounded(server)?;
+        }
     }
     Ok(table)
+}
+
+/// Verifies fixture ingestion never crossed either production memory ceiling.
+///
+/// # Errors
+///
+/// Returns an inspection error or a diagnostic mismatch when the monotonic
+/// Scribe-child or Bifrost-parent peak exceeds its production-derived limit.
+fn assert_scribe_fixture_peaks_bounded(
+    server: &wyrd_testing::WyrdTestServer,
+) -> Result<(), JourneyError> {
+    let governor = server
+        .state()
+        .bifrost_memory
+        .as_ref()
+        .ok_or("spill fixture lacks memory governor")?;
+    let snapshot = governor.snapshot();
+    let (scribe_peak, bifrost_peak) = governor.peak_totals_for_test();
+    if scribe_peak > snapshot.scribe_limit_bytes || bifrost_peak > snapshot.bifrost_limit_bytes {
+        return Err(format!(
+            "spill fixture exceeded production memory: scribe_peak={scribe_peak} scribe_limit={} bifrost_peak={bifrost_peak} bifrost_limit={}",
+            snapshot.scribe_limit_bytes, snapshot.bifrost_limit_bytes
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Waits cooperatively for a completed flush to release its Scribe generation

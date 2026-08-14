@@ -551,6 +551,12 @@ pub(crate) struct RewriteRequest<'a> {
 pub(crate) struct ForgeAttemptGeneration(Uuid);
 
 impl ForgeAttemptGeneration {
+    /// Returns the durable generation used for operation ancestry.
+    #[must_use]
+    pub(crate) const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
     /// Create a fresh time-ordered generation for one rewrite execution.
     ///
     /// Gated to `test-support`: its only caller is the `test-support`-gated

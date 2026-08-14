@@ -3,20 +3,33 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::{ArrayRef, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
 use opendal::Buffer;
 use secrecy::SecretString;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::forge::{
-    ForgeCapacity, ForgeEnvelopeSizer, ForgeError, ForgeLease, ForgeScheduler,
+    ForgeCapacity, ForgeConfig, ForgeEnvelopeSizer, ForgeError, ForgeLease, ForgeScheduler,
     ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::resources::{
+    MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
+};
+use vala_sdk::{BifrostGrpcTransport, IngestTransport};
 use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::row_types::forge_tasks::{
     FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeTaskEstimates, ForgeTaskLane,
     ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
+use wyrd_client::WyrdClient;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_server::config::ForgeProcessRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
@@ -24,7 +37,10 @@ use wyrd_spec::vala::api::{
     VisibilityMode,
 };
 use wyrd_testing::bifrost::forge_harness::seed_forge_group;
-use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster, shared_process_telemetry_for_test};
+use wyrd_testing::bifrost::{
+    BifrostClusterSpec, BifrostTopology, ForgeCausalDiagnosis, ForgeCausalTelemetryReport,
+    WyrdTestCluster, shared_process_telemetry_for_test,
+};
 use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 use wyrd_tonic::frame_codec::FrameDecoder;
@@ -50,6 +66,12 @@ const SPANS_PER_WRITE: usize = 6;
 
 /// Stable scheduler identity for maintenance journey fixtures.
 const MAINTENANCE_JOURNEY_SCHEDULER_OWNER: u128 = 0x0198_39f4_2b51_7000_8000_0000_0000_0005;
+
+/// Rows sent by each bounded public-ingest request in the convergence journey.
+const FORGE_CONVERGENCE_BATCH_ROWS: usize = 5_000;
+
+/// Public-ingest batches durably sealed together while creating small-file debt.
+const FORGE_CONVERGENCE_BATCHES_PER_SEAL: usize = 10;
 
 /// Sizes one journey task from the same config-clamped live governor capacity as production.
 fn journey_envelope(
@@ -299,7 +321,7 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
                 envelope: Some(envelope),
                 files: 1,
                 bytes: 1,
-                parallelism: 1,
+                parallelism: envelope.reader_permits,
                 memory_bytes: envelope.memory_bytes().expect("journey resident total"),
                 spill_bytes: envelope.scratch_bytes().expect("journey scratch total"),
                 large_ceiling_bytes: 1,
@@ -713,6 +735,723 @@ async fn sustained_ingest_does_not_starve_snapshot_expiry_journey() {
         .shutdown()
         .await
         .expect("journey sustained-ingest server shutdown");
+}
+
+/// Real Forge workers converge public small-file debt without constructing Oracle.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Bifrost journey lane"]
+async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
+    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+        BifrostClusterSpec::one_mixed().with_system_resources(forge_convergence_system_resources()),
+    )
+    .await
+    .expect("Forge-local convergence cluster");
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .expect("Forge-local causal telemetry checkpoint");
+    let server = cluster.server(0).expect("Forge-local convergence server");
+    let table = prepare_forge_convergence_table(&cluster, server, 1_000_000)
+        .await
+        .expect("Forge-local convergence fixture");
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("close the convergence fixture event-day partition");
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("Forge-local completion observer");
+
+    for transition in 1..=64 {
+        let workflow = server
+            .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+            .await
+            .expect("inspect Forge-local staging-fold convergence");
+        if workflow.uncompacted_staging_files == 0 {
+            break;
+        }
+        advance_transient_forge_retries(server, cluster.data_tenant_id(), &table).await;
+        let expected_attempts = observer.attempts().saturating_add(1);
+        let completed_passes = server.completed_forge_scheduler_passes_for_test();
+        cluster.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            server.wait_for_forge_scheduler_passes_for_test(completed_passes + 1),
+        )
+        .await
+        .expect("production staging scheduler pass completes");
+        if tokio::time::timeout(
+            Duration::from_secs(90),
+            observer.wait_for_attempts_at_least(expected_attempts),
+        )
+        .await
+        .is_err()
+        {
+            panic_with_forge_convergence_diagnosis(
+                &cluster,
+                server,
+                &checkpoint,
+                &table,
+                &format!("staging transition {transition} did not settle"),
+            )
+            .await;
+        }
+    }
+
+    let workflow = server
+        .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+        .await
+        .expect("inspect Forge-local staging terminal state");
+    assert_eq!(
+        workflow.uncompacted_staging_files, 0,
+        "production continuation must drain staging debt"
+    );
+    let before = server
+        .inspect_forge_table_for_test(cluster.data_tenant_id(), &table)
+        .await
+        .expect("inspect pre-compaction Forge table");
+    assert!(before.data_file_count() > 1);
+    let forge_baseline = server
+        .state()
+        .forge()
+        .expect("Forge composition")
+        .resources_for_test()
+        .snapshot()
+        .expect("Forge resource baseline");
+
+    for _ in 0..64 {
+        if observer
+            .completed_strategies()
+            .contains(&ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles))
+        {
+            break;
+        }
+        advance_transient_forge_retries(server, cluster.data_tenant_id(), &table).await;
+        let expected_completions = observer.completed().saturating_add(1);
+        let completed_passes = server.completed_forge_scheduler_passes_for_test();
+        cluster.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            server.wait_for_forge_scheduler_passes_for_test(completed_passes + 1),
+        )
+        .await
+        .expect("production rewrite scheduler pass completes");
+        if tokio::time::timeout(
+            Duration::from_secs(90),
+            observer.wait_for_at_least(expected_completions),
+        )
+        .await
+        .is_err()
+        {
+            panic_with_forge_convergence_diagnosis(
+                &cluster,
+                server,
+                &checkpoint,
+                &table,
+                "SmallFiles rewrite did not settle",
+            )
+            .await;
+        }
+    }
+
+    assert!(
+        observer
+            .completed_strategies()
+            .contains(&ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles)),
+        "bounded production continuation must reach SmallFiles"
+    );
+    let planned_inputs = observer
+        .lifecycle_events()
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            vala_bifrost_redux::forge::ForgeLifecycleEvent::Planned {
+                table: observed,
+                inputs,
+                ..
+            } if observed == &table => Some(inputs.clone()),
+            _ => None,
+        })
+        .expect("table-scoped planned inputs");
+    let after = server
+        .inspect_forge_table_for_test(cluster.data_tenant_id(), &table)
+        .await
+        .expect("inspect post-compaction Forge table");
+    let rewrite = WyrdTestServer::compare_forge_rewrite_for_test(&before, &after, &planned_inputs)
+        .expect("exact Forge replacement comparison");
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .expect("Forge-local production telemetry delta");
+    let report = ForgeCausalTelemetryReport::from_production_delta(&delta)
+        .expect("Forge-local causal telemetry report");
+    let workflow = server
+        .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+        .await
+        .expect("Forge-local converged workflow");
+    assert_eq!(
+        report
+            .diagnose(&workflow, Some(&rewrite))
+            .expect("telemetry matches converged durable state"),
+        ForgeCausalDiagnosis::Converged
+    );
+    assert!(after.data_file_count() < before.data_file_count());
+    assert_eq!(rewrite.input_files.len(), planned_inputs.len());
+    assert!(!rewrite.output_files.is_empty());
+    assert!(rewrite.input_bytes > 0 && rewrite.output_bytes > 0);
+    assert_eq!(after.active_claims, 0);
+    assert_eq!(after.active_attempts, 0);
+    assert_eq!(
+        server
+            .state()
+            .forge()
+            .expect("Forge composition after rewrite")
+            .resources_for_test()
+            .snapshot()
+            .expect("Forge resources after rewrite"),
+        forge_baseline
+    );
+    assert_eq!(report.capacity_refusals, 0);
+    assert_eq!(report.internal_invariant_failures, 0);
+    cluster
+        .shutdown()
+        .await
+        .expect("Forge-local convergence shutdown");
+}
+
+/// Builds the production-shaped resource observation used by Forge convergence.
+fn forge_convergence_system_resources() -> SystemResourceSnapshot {
+    let scratch = (1_u64 << 30)
+        .checked_add(MIN_SCRATCH_FREE_BYTES)
+        .expect("fixed convergence scratch observation fits u64");
+    SystemResourceSnapshot {
+        memory_limit_bytes: 2 << 30,
+        effective_cpu: 4,
+        scratch_capacity_bytes: scratch,
+        scratch_available_bytes: scratch,
+        memory_source: ResourceSource::Injected,
+        cpu_source: ResourceSource::Injected,
+    }
+}
+
+/// Creates deterministic public small-file debt through the real client and server.
+async fn prepare_forge_convergence_table(
+    cluster: &WyrdTestCluster,
+    server: &WyrdTestServer,
+    row_count: usize,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let table = format!("forge_local_{}", uuid::Uuid::now_v7().simple());
+    server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .ok_or("missing Redux catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ],
+            tenant: cluster.data_tenant_id(),
+            audit: None,
+        })
+        .await?;
+    let bootstrap = server
+        .bootstrap_service_in_tenant(cluster.data_tenant_id(), "forge-local-writer", &["admin"])
+        .await?;
+    let api_key = match bootstrap {
+        Bootstrap::Machine { api_key, .. } => api_key,
+        Bootstrap::User { .. } => return Err("machine bootstrap returned user".into()),
+    };
+    let client = WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: server.grpc_url().ok_or("missing gRPC URL")?,
+            connect_retries: 0,
+            max_message_bytes: 32 * 1024 * 1024,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: server.base_url().ok_or("missing HTTP URL")?.to_owned(),
+            ..HttpConfig::default()
+        },
+        api_key: Some(api_key),
+        ..ClientConfig::default()
+    })?;
+    let transport = BifrostGrpcTransport::connect(&client).await?;
+    for start in (0..row_count).step_by(FORGE_CONVERGENCE_BATCH_ROWS) {
+        let end = (start + FORGE_CONVERGENCE_BATCH_ROWS).min(row_count);
+        let ids = (start..end)
+            .map(i64::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        transport
+            .insert_batch(
+                &format!("vala.bifrost.{table}"),
+                uuid::Uuid::now_v7().into_bytes(),
+                forge_convergence_ipc(&ids),
+            )
+            .await?;
+        let ingested = end.div_ceil(FORGE_CONVERGENCE_BATCH_ROWS);
+        if ingested.is_multiple_of(FORGE_CONVERGENCE_BATCHES_PER_SEAL) || end == row_count {
+            server.flush_bifrost().await?;
+        }
+    }
+    Ok(table)
+}
+
+/// Encodes one bounded public-ingest batch for the convergence fixture.
+fn forge_convergence_ipc(ids: &[i64]) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(ids.to_vec())),
+        Arc::new(StringArray::from(vec!["x".repeat(256); ids.len()])),
+    ];
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+        .expect("fixed convergence arrays share a length");
+    let mut bytes = Vec::new();
+    let mut writer =
+        StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("valid convergence IPC schema");
+    writer.write(&batch).expect("bounded convergence IPC write");
+    writer.finish().expect("bounded convergence IPC finish");
+    bytes
+}
+
+/// Advances only durably classified transient Forge retries in the journey.
+async fn advance_transient_forge_retries(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+) {
+    let pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("Forge-local operator pool");
+    let mut transaction = pool
+        .pool()
+        .begin()
+        .await
+        .expect("begin Forge-local retry clock step");
+    let retries = sqlx::query_as::<_, (uuid::Uuid, Option<String>)>(
+        "SELECT task_id,failure_class FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND state='retryable' FOR UPDATE",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_all(&mut *transaction)
+    .await
+    .expect("load Forge-local retry classifications");
+    for (task_id, failure_class) in &retries {
+        assert!(
+            matches!(
+                failure_class.as_deref(),
+                Some("transient_object_store" | "transient_coordination" | "storage_health")
+            ),
+            "task {task_id} must have a permitted transient class; observed {failure_class:?}"
+        );
+    }
+    let task_ids = retries
+        .into_iter()
+        .map(|(task_id, _)| task_id)
+        .collect::<Vec<_>>();
+    if !task_ids.is_empty() {
+        let updated = sqlx::query(
+            "UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp()-interval '15 minutes' WHERE task_id=ANY($1) AND state='retryable'",
+        )
+        .bind(&task_ids)
+        .execute(&mut *transaction)
+        .await
+        .expect("advance Forge-local transient eligibility")
+        .rows_affected();
+        assert_eq!(
+            updated,
+            u64::try_from(task_ids.len()).expect("retry count fits u64")
+        );
+    }
+    transaction
+        .commit()
+        .await
+        .expect("commit Forge-local retry clock step");
+}
+
+/// Emits the complete causal diagnosis before failing a stalled convergence transition.
+async fn panic_with_forge_convergence_diagnosis(
+    cluster: &WyrdTestCluster,
+    server: &WyrdTestServer,
+    checkpoint: &wyrd_testing::bifrost::BifrostTelemetryCheckpoint,
+    table: &str,
+    reason: &str,
+) -> ! {
+    let delta = cluster
+        .telemetry()
+        .delta_since(checkpoint)
+        .expect("stalled Forge-local telemetry delta");
+    let report = ForgeCausalTelemetryReport::from_production_delta(&delta);
+    let workflow = server
+        .inspect_forge_workflow_for_test(cluster.data_tenant_id(), table)
+        .await
+        .expect("inspect stalled Forge-local workflow");
+    let diagnosis = report
+        .as_ref()
+        .map_err(ToString::to_string)
+        .and_then(|report| {
+            report
+                .diagnose(&workflow, None)
+                .map_err(|error| error.to_string())
+        });
+    panic!("{reason}: diagnosis={diagnosis:?} telemetry={report:?} workflow={workflow:?}");
+}
+
+/// A bad shared scratch volume quarantines its first worker, defers its peer,
+/// and lets a healthy-volume worker publish the exact debt once.
+#[tokio::test]
+#[ignore = "gated journey: real Postgres and filesystem scratch quarantine"]
+#[cfg(unix)]
+async fn unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over() {
+    let (server, telemetry) = start_telemetry_maintenance_server().await;
+    let fixture = seed_forge_group(&server, "journey_unhealthy_scratch_takeover").await;
+    let checkpoint = telemetry
+        .checkpoint()
+        .expect("takeover causal telemetry checkpoint");
+    sqlx::query("DELETE FROM vala.forge_tasks WHERE data_tenant_id=$1")
+        .bind(fixture.tenant.as_uuid())
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("isolate takeover task queue");
+    sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1")
+        .bind(fixture.tenant.as_uuid())
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("isolate takeover demand queue");
+    let inputs: Vec<String> = sqlx::query_scalar(
+        "SELECT file_path FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 ORDER BY file_path",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_all(fixture.operator_pool.pool())
+    .await
+    .expect("takeover inputs");
+    let envelope = journey_envelope(&fixture, 200, 2);
+    let task_id = ForgeTasks::new(fixture.operator_pool.clone())
+        .enqueue(&NewForgeTask {
+            data_tenant_id: fixture.tenant,
+            table_ref: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                &fixture.binding.logical_namespace,
+                &fixture.binding.table_name,
+            )
+            .expect("takeover identity"),
+            strategy: ForgeTaskStrategy::StagingFold,
+            lane: ForgeTaskLane::Ordinary,
+            base_snapshot_id: 0,
+            plan: ForgeTaskPlan {
+                version: FORGE_TASK_PAYLOAD_VERSION,
+                inputs,
+                parameters: serde_json::json!({"kind":"staging_fold"}),
+            },
+            plan_hash: [231; 32],
+            estimates: ForgeTaskEstimates {
+                envelope: Some(envelope),
+                files: 2,
+                bytes: 200,
+                parallelism: envelope.reader_permits,
+                memory_bytes: envelope.memory_bytes().expect("journey resident total"),
+                spill_bytes: envelope.scratch_bytes().expect("journey scratch total"),
+                large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
+            },
+            ready_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("takeover task");
+    let bad_parent = tempfile::tempdir().expect("bad scratch parent");
+    let bad_root = bad_parent.path().join("scratch");
+    std::fs::create_dir(&bad_root).expect("initial valid scratch root");
+    let telemetry_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
+    let bad_forge = fixture.context_with_worker_supervision_and_spill_root(
+        fixture.config.clone(),
+        ForgeWorkerCompletionObserver::new(),
+        telemetry_trigger.clone(),
+        &bad_root,
+    );
+    let telemetry_scheduler = ForgeScheduler::with_owner_for_test(&bad_forge, uuid::Uuid::now_v7())
+        .expect("takeover telemetry scheduler");
+    telemetry_scheduler
+        .record_hint(StagingFileCommitted::new(
+            fixture.binding.clone(),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("takeover hint day"),
+        ))
+        .await
+        .expect("takeover telemetry hint");
+    let scheduler_stop = CancellationToken::new();
+    let scheduler_task = tokio::spawn({
+        let forge = Arc::clone(&bad_forge);
+        let stop = scheduler_stop.clone();
+        async move { forge.run(stop).await }
+    });
+    telemetry_trigger.request_pass();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        telemetry_trigger.wait_for_passes_at_least(1),
+    )
+    .await
+    .expect("takeover telemetry scheduler pass bound");
+    scheduler_stop.cancel();
+    scheduler_task
+        .await
+        .expect("takeover telemetry scheduler join")
+        .expect("takeover telemetry scheduler shutdown");
+    sqlx::query("DELETE FROM vala.forge_tasks WHERE data_tenant_id=$1 AND task_id<>$2")
+        .bind(fixture.tenant.as_uuid())
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("remove telemetry-only planned task");
+    std::fs::remove_dir(&bad_root).expect("replace empty scratch directory");
+    std::fs::File::create(&bad_root).expect("replace scratch root with file");
+    let first_owner = uuid::Uuid::now_v7();
+    let first = ForgeWorker::new(
+        Arc::clone(&bad_forge),
+        ForgeWorkerConfig::default(),
+        first_owner,
+    )
+    .expect("faulted worker");
+    assert!(
+        first
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .is_err()
+    );
+    let qualified: (String, Option<String>, i32, bool) = sqlx::query_as(
+        "SELECT state,failure_class,attempt_count,EXISTS(SELECT 1 FROM vala.forge_worker_registry WHERE worker_id=$2 AND quarantined) FROM vala.forge_tasks WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .bind(first_owner)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("qualified storage failure");
+    assert_eq!(
+        qualified,
+        (
+            "retryable".to_owned(),
+            Some("storage_health".to_owned()),
+            1,
+            true
+        )
+    );
+    sqlx::query("UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp(),ready_at=statement_timestamp() WHERE task_id=$1")
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("advance first backoff");
+    let peer = ForgeWorker::new(
+        Arc::clone(&bad_forge),
+        ForgeWorkerConfig::default(),
+        uuid::Uuid::now_v7(),
+    )
+    .expect("same-volume peer");
+    let peer_claim = peer
+        .claim_next_for_test(false)
+        .await
+        .expect("peer claim query");
+    assert!(
+        peer_claim.is_none(),
+        "same-volume peer must defer before the soft fallback bound: {peer_claim:?}"
+    );
+    let healthy_root = tempfile::tempdir().expect("healthy scratch root");
+    let healthy_forge = fixture.context_with_worker_supervision_and_spill_root(
+        fixture.config.clone(),
+        ForgeWorkerCompletionObserver::new(),
+        ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7()),
+        healthy_root.path(),
+    );
+    let healthy = ForgeWorker::new(
+        healthy_forge,
+        ForgeWorkerConfig::default(),
+        uuid::Uuid::now_v7(),
+    )
+    .expect("healthy worker");
+    assert!(
+        healthy
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("healthy takeover")
+    );
+    let outcome: (String, i64) = sqlx::query_as(
+        "SELECT state,(SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$2 AND namespace=$3 AND table_name=$4 AND NOT compacted) FROM vala.forge_tasks WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("healthy takeover outcome");
+    assert_eq!(outcome, ("succeeded".to_owned(), 0));
+    let inspection = server
+        .inspect_forge_table_for_test(fixture.tenant, &fixture.binding.table_name)
+        .await
+        .expect("authoritative takeover table inspection");
+    assert!(
+        inspection
+            .tasks
+            .iter()
+            .any(|(_, state)| state == "succeeded")
+    );
+    let workflow = server
+        .inspect_forge_workflow_for_test(fixture.tenant, &fixture.binding.table_name)
+        .await
+        .expect("authoritative takeover workflow inspection");
+    assert_eq!(workflow.uncompacted_staging_files, 0);
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("takeover publication ancestry");
+    let publications = table
+        .metadata()
+        .snapshots()
+        .filter(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .contains_key("forge.operation_id")
+        })
+        .count();
+    assert_eq!(publications, 1, "one operation identity may publish once");
+    let delta = telemetry
+        .delta_since(&checkpoint)
+        .expect("takeover causal telemetry delta");
+    let report = ForgeCausalTelemetryReport::from_production_delta(&delta)
+        .expect("takeover causal telemetry report");
+    assert_eq!(report.storage_health_failures, 1);
+    assert_eq!(report.transient_object_store_failures, 0);
+    assert_eq!(report.data_refusals, 0);
+    assert_eq!(report.capacity_refusals, 0);
+    assert!(report.quarantined_workers >= 1);
+    assert!(report.rewrite_input_files >= 1 && report.rewrite_output_files >= 1);
+    server.shutdown().await.expect("takeover server shutdown");
+}
+
+/// Production supervision fails stop on Forge panics and restart recovers one publication.
+#[tokio::test]
+#[ignore = "gated journey: real supervised server panic and lease-expiry recovery"]
+async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
+    for after_commit in [false, true] {
+        let config = ForgeConfig {
+            lease_ttl: Duration::from_secs(4),
+            iceberg_total_retry_timeout: Duration::from_secs(1),
+            catalog_request_timeout: Duration::from_secs(1),
+            uncertainty_margin: Duration::from_secs(1),
+            uncertainty_bound: Duration::from_secs(1),
+            ..ForgeConfig::default()
+        };
+        let mut cluster =
+            WyrdTestCluster::start_with_embedded_forge_panic_recovery_for_test(config)
+                .await
+                .expect("panic recovery cluster");
+        let node = cluster.configured_node_ids()[0];
+        let server = cluster.server_by_node(node).expect("panic recovery server");
+        let table_name = if after_commit {
+            "forge_panic_after_commit"
+        } else {
+            "forge_panic_before_commit"
+        };
+        let fixture = seed_forge_group(server, table_name).await;
+        let control = cluster
+            .commit_uncertainty_catalog()
+            .expect("panic catalog control");
+        if after_commit {
+            control.panic_after_next_commit();
+        } else {
+            control.panic_before_next_commit();
+        }
+        let completed_passes = server.completed_forge_scheduler_passes_for_test();
+        cluster.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(Duration::from_secs(30), control.wait_for_panic())
+            .await
+            .expect("production catalog panic reached");
+        let terminal = cluster
+            .await_node_terminal_failure_for_test(node, Duration::from_secs(30))
+            .await
+            .expect("production supervisor terminal failure");
+        assert!(
+            terminal.contains("InternalInvariant") || terminal.contains("Forge"),
+            "unexpected terminal supervisor result: {terminal}"
+        );
+        assert!(completed_passes <= 1);
+        control.disarm_panic();
+        let retained: (uuid::Uuid, uuid::Uuid, String, i32) = sqlx::query_as(
+            "SELECT task_id,attempt_id,state,attempt_count FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND state IN ('claimed','running') ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("panic-retained durable attempt");
+        assert_eq!(retained.2, "running");
+        assert_eq!(retained.3, 0);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        cluster
+            .restart_node(node)
+            .await
+            .expect("fresh server restart");
+        let restarted = cluster.server_by_node(node).expect("restarted server");
+        let reclaimed = restarted
+            .reclaim_expired_forge_attempts_for_test(1)
+            .await
+            .expect("production attempt reclaim");
+        if !reclaimed.is_empty() {
+            assert_eq!(reclaimed, vec![(retained.0, retained.1)]);
+        }
+        cluster
+            .advance_reclaimed_panic_task_for_test(retained.0, retained.1)
+            .await
+            .expect("exact panic eligibility advance");
+        let observer = cluster
+            .forge_completion_observer()
+            .expect("panic recovery completion observer");
+        cluster.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(Duration::from_secs(90), observer.wait_for_at_least(1))
+            .await
+            .expect("restarted production worker settles retained debt");
+        let restarted = cluster
+            .server_by_node(node)
+            .expect("settled restart server");
+        let workflow = restarted
+            .inspect_forge_workflow_for_test(fixture.tenant, &fixture.binding.table_name)
+            .await
+            .expect("panic recovery workflow");
+        assert_eq!(workflow.uncompacted_staging_files, 0);
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("panic recovery table");
+        let publications = table
+            .metadata()
+            .snapshots()
+            .filter(|snapshot| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .contains_key("forge.operation_id")
+            })
+            .count();
+        assert_eq!(publications, 1, "one operation identity may publish once");
+        let resources = restarted
+            .state()
+            .forge()
+            .expect("restarted Forge")
+            .resources_for_test()
+            .snapshot()
+            .expect("panic recovery resource snapshot");
+        assert_eq!(resources.elastic_memory_used_bytes, 0);
+        assert_eq!(resources.scratch_used_bytes, 0);
+        assert_eq!(resources.forge_reader_permits_used, 0);
+        cluster.shutdown().await.expect("panic recovery shutdown");
+    }
 }
 
 /// Runs real orphan collection and proves an aged, unreferenced object is deleted.

@@ -120,6 +120,9 @@ cargo test --locked -p wyrd-testing --test journeys -- production_recorder_expos
 cargo test --locked -p wyrd-testing --test journeys -- public_write_compact_read_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- public_multitenant_write_compact_read_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- distributed_write_compact_read_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test journeys -- unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test journeys -- pg_bifrost_forge_small_files_converges_without_query_dependency --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test journeys -- supervised_forge_panic_fails_stop_and_recovers_exactly_once --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- public_ack_restart_read_exact_once_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test otlp -- bifrost_ingest_runtime_journey --test-threads=1
 cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_published_journey --ignored --test-threads=1

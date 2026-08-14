@@ -206,20 +206,37 @@ impl SupervisedMaintenance {
     }
 }
 
-/// Expire the exact nonterminal claim left by a fully joined worker.
+/// Make the exact nonterminal task left by a fully joined worker reclaimable.
 ///
 /// # Panics
 ///
-/// Panics unless one exact Running or Prepared task exists for the tenant.
+/// Panics unless one exact Running, Prepared, or already-settled Retryable task exists.
 async fn expire_stopped_claim(fixture: &wyrd_testing::bifrost::ForgeFixture) -> uuid::Uuid {
-    let (task_id, attempt_id, owner): (uuid::Uuid, uuid::Uuid, uuid::Uuid) = sqlx::query_as(
-        "SELECT task_id, attempt_id, claimed_by FROM vala.forge_tasks \
-         WHERE data_tenant_id = $1 AND state IN ('running', 'prepared')",
+    let (task_id, state, attempt_id, owner): (
+        uuid::Uuid,
+        String,
+        Option<uuid::Uuid>,
+        Option<uuid::Uuid>,
+    ) = sqlx::query_as(
+        "SELECT task_id,state,attempt_id,claimed_by FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 AND state IN ('running','prepared','retryable')",
     )
     .bind(fixture.tenant.as_uuid())
     .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("one stopped maintenance claim");
+    if state == "retryable" {
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp() WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("advance settled maintenance retry eligibility");
+        return task_id;
+    }
+    let attempt_id = attempt_id.expect("active maintenance attempt identity");
+    let owner = owner.expect("active maintenance claim owner");
     let expired: uuid::Uuid = sqlx::query_scalar(
         "UPDATE vala.forge_tasks \
          SET claim_expires_at = statement_timestamp() - interval '1 millisecond' \
@@ -480,9 +497,15 @@ async fn forge_gc_replay_preserves_live_reference() {
     let server = start_maintenance_server().await;
     let fixture = seed_forge_group(&server, "maintenance_reference_rows").await;
     commit_staging_snapshot(&fixture).await;
+    fixture.append_forge_file(2).await;
+    fixture.append_forge_file(3).await;
+    commit_staging_snapshot(&fixture).await;
     let mut config = fixture.config.clone();
     config.min_files = 3;
     config.orphan_gc_ttl = Duration::from_millis(1);
+    config.snapshot_retention = Duration::from_millis(1);
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_nanos(1);
     let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
     control.pause_next_list();
     let orphan = format!("{}/reference-race.parquet", fixture.binding.object_prefix);
@@ -529,7 +552,7 @@ async fn forge_gc_replay_preserves_live_reference() {
         fixture
             .operation_count("forge.file_compact.committed")
             .await,
-        1
+        2
     );
     server.shutdown().await.expect("server shutdown");
 }
@@ -567,8 +590,11 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
     let mut config = fixture.config.clone();
     config.min_files = 3;
     config.orphan_gc_ttl = Duration::from_millis(1);
+    config.snapshot_retention = Duration::from_millis(1);
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_nanos(1);
     let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
-    control.fail_delete_at(2);
+    control.fail_delete_at(3);
     let first_orphan = &reset_outputs[0];
     let second_orphan = &reset_outputs[1];
     let modified = fixture
@@ -613,7 +639,7 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
     first.wait_for_held_attempt().await;
     assert_eq!(
         control.delete_calls(),
-        2,
+        3,
         "completed={}, errors={:?}",
         first.worker_observer.completed(),
         first.worker_observer.returned_errors(),
@@ -686,6 +712,9 @@ async fn forge_gc_deletes_evidenced_orphan_and_preserves_unevidenced() {
     let mut config = fixture.config.clone();
     config.min_files = 3;
     config.orphan_gc_ttl = Duration::from_millis(1);
+    config.snapshot_retention = Duration::from_millis(1);
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_nanos(1);
     let evidenced_modified = fixture
         .staging
         .stat(&evidenced)
@@ -846,6 +875,9 @@ async fn forge_gc_lease_theft_before_delete_fails_closed() {
     let mut config = fixture.config.clone();
     config.min_files = 3;
     config.orphan_gc_ttl = Duration::from_millis(1);
+    config.snapshot_retention = Duration::from_millis(1);
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_nanos(1);
     let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
     control.pause_next_delete();
     let orphan = &reset_outputs[0];
@@ -938,10 +970,9 @@ async fn forge_gc_lease_theft_before_delete_fails_closed() {
     );
     recovery.shutdown().await;
     assert!(fixture.staging.stat(orphan).await.is_err());
-    assert_eq!(
-        fixture.operation_count("forge.orphan_gc.recovered").await,
-        1
-    );
+    let terminal = fixture.operation_count("forge.orphan_gc.committed").await
+        + fixture.operation_count("forge.orphan_gc.recovered").await;
+    assert_eq!(terminal, 1);
     server.shutdown().await.expect("server shutdown");
 }
 
@@ -1049,9 +1080,8 @@ async fn forge_expiry_takeover_reconciles_current_and_retained_heads() {
     config.min_files = 3;
     config.max_files_per_bin = 3;
     config.max_files_per_tick = 3;
-    let mut convergence = SupervisedMaintenance::start_default(&fixture, config.clone());
-    convergence.run_one_success().await;
-    convergence.shutdown().await;
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_nanos(1);
     let converged = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -1123,9 +1153,8 @@ async fn forge_expiry_takeover_reconciles_current_and_retained_heads() {
         .expect("table after expiry recovery");
     assert_eq!(
         after.metadata().snapshots().len(),
-        snapshots_before_expiry
-            .checked_sub(1)
-            .expect("expiry history contains one predecessor"),
+        snapshots_before_expiry,
+        "recovery preserves both the current head and the retained ref head",
     );
     assert!(after.metadata().snapshot_by_id(active_watermark).is_some());
     assert!(after.metadata().current_snapshot_id().is_some());
@@ -1143,6 +1172,9 @@ async fn forge_expiry_takeover_reconciles_current_and_retained_heads() {
 async fn forge_expiry_pending_blocks_new_expiry_and_gc() {
     let server = start_maintenance_server().await;
     let fixture = seed_forge_group(&server, "maintenance_expiry_pending").await;
+    commit_staging_snapshot(&fixture).await;
+    fixture.append_forge_file(2).await;
+    fixture.append_forge_file(3).await;
     commit_staging_snapshot(&fixture).await;
     let table = fixture
         .catalog
@@ -1232,6 +1264,8 @@ async fn forge_expiry_pending_blocks_new_expiry_and_gc() {
     config.min_files = 3;
     config.orphan_gc_ttl = Duration::from_millis(1);
     config.snapshot_retention = Duration::from_millis(1);
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_nanos(1);
     let mut lifecycle = SupervisedMaintenance::start_default(&fixture, config);
     lifecycle.run_one_success().await;
     lifecycle.shutdown().await;

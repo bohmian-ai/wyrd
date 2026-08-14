@@ -756,7 +756,10 @@ impl ForgeTasks {
         failure_class: &str,
         failed_volume_identity: Option<&str>,
     ) -> Result<u32, SqlError> {
-        if !matches!(failure_class, "transient_object_store" | "storage_health") {
+        if !matches!(
+            failure_class,
+            "transient_object_store" | "transient_coordination" | "storage_health"
+        ) {
             return Err(SqlError::Conflict {
                 detail: "retry failure class is not retryable".to_owned(),
             });

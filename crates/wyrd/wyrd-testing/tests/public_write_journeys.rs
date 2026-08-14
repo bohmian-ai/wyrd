@@ -68,6 +68,7 @@ const RR9_BASE_CONTRACTS: &[MetricLabelContract] = &[
                     "memory",
                     "spill",
                     "audit_unavailable",
+                    "membership",
                     "shutdown",
                 ],
             ),

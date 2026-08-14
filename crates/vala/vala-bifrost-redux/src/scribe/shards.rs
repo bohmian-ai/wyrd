@@ -38,6 +38,8 @@ struct PendingGeneration {
     generation: Arc<ImmutableGeneration>,
     binding: crate::catalog::TenantTableBinding,
     submitted: bool,
+    replay_response:
+        Option<tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>>,
 }
 
 type PendingGenerationsByKey =
@@ -48,6 +50,21 @@ struct RetainedGeneration {
     arrow_bytes: usize,
     wal_segments: Vec<crate::scribe::wal::WalSegmentRef>,
     wal: crate::scribe::wal::WalHandle,
+}
+
+/// WAL ownership deferred until the directory replay worker has stopped reading.
+#[derive(Debug)]
+pub(crate) struct ReplayRetirement {
+    /// WAL handle that owns the replayed generation's retained segments.
+    pub(crate) wal: WalHandle,
+    /// Exact segment references released after the replay stream completes.
+    pub(crate) segments: Vec<crate::scribe::wal::WalSegmentRef>,
+    /// Stream whose manifest advances before its retained segments retire.
+    pub(crate) stream: StreamIdentity,
+    /// Seal key receiving the durable replay watermark.
+    pub(crate) seal_key: crate::scribe::seal_key::SealKey,
+    /// Inclusive durable watermark published for this generation.
+    pub(crate) sealed_lsn: crate::scribe::wal::WalLsn,
 }
 
 /// Capacity of one shard command mailbox.
@@ -286,7 +303,7 @@ pub(crate) enum ShardCommand {
     },
     Replay {
         state: Box<crate::scribe::replay::ReplayedSealKey>,
-        response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
+        response: tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
     },
     FreezeKey {
         seal_key: crate::scribe::seal_key::SealKey,
@@ -1149,7 +1166,7 @@ impl ShardOwner {
                 let _ = visibility_result.send(result);
             }
             ShardCommand::Replay { state, response } => {
-                let _ = response.send(self.replay_state(*state).await);
+                self.replay_state(*state, response).await;
             }
             ShardCommand::FreezeKey { seal_key, response } => {
                 let _ = response.send(self.freeze_key(&seal_key));
@@ -1209,48 +1226,85 @@ impl ShardOwner {
 
     /// Reconstructs one WAL-restored generation and queues it for persistence.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when replay decoding, memory accounting, WAL
-    /// retention, or persistence submission fails.
+    /// Any replay decoding, accounting, retention, or persistence-submission
+    /// error is returned through `response`. Successful persistence-backed
+    /// replay leaves that response owned by the exact pending generation until
+    /// publication and checked immutable retirement finish.
     async fn replay_state(
         &mut self,
         replayed_state: crate::scribe::replay::ReplayedSealKey,
-    ) -> Result<(), ScribeError> {
+        response: tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
+    ) {
         let source_stream = replayed_state.stream;
         let seal_key = replayed_state.seal_key.clone();
         let segment_refs = replayed_state.wal_segments.clone();
-        let result = self
+        let result = match self
             .persistence_cpu
             .submit(
                 crate::scribe::execution_lanes::ScribePersistenceCpuOp::RestoreReplay {
                     replayed: Box::new(replayed_state),
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = response.send(Err(error));
+                return;
+            }
+        };
         let crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored(frozen) =
             result
         else {
-            return Err(ScribeError::Internal {
+            let _ = response.send(Err(ScribeError::Internal {
                 detail: "persistence CPU lane returned the wrong replay result".to_owned(),
-            });
+            }));
+            return;
         };
-        let frozen = self.memtable.insert_replayed_frozen(*frozen)?;
+        let frozen = match self.memtable.insert_replayed_frozen(*frozen) {
+            Ok(frozen) => frozen,
+            Err(error) => {
+                let _ = response.send(Err(error));
+                return;
+            }
+        };
         if let Err(error) = self.memory_ledger.reserve_immutable(frozen.arrow_bytes) {
             let _ = self.memtable.discard_pending_generation(frozen.seal_id);
-            return Err(error);
+            let _ = response.send(Err(error));
+            return;
         }
-        let owner_stats = self.memtable.stats()?;
+        let owner_stats = match self.memtable.stats() {
+            Ok(stats) => stats,
+            Err(error) => {
+                let result = self
+                    .rollback_replayed_generation(frozen.seal_id, frozen.arrow_bytes)
+                    .map_or_else(Err, |()| Err(error));
+                let _ = response.send(result);
+                return;
+            }
+        };
         self.admission
             .sync_memtable_bytes(owner_stats.writable_bytes, owner_stats.immutable_bytes);
         if self.persistence.is_none() {
-            return Ok(());
+            let _ = response.send(Ok(None));
+            return;
         }
-        let binding =
-            crate::catalog::TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
-                .map_err(|error| ScribeError::Internal {
+        let binding = match crate::catalog::TenantTableBinding::resolve((
+            seal_key.tenant,
+            seal_key.table.clone(),
+        )) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let error = ScribeError::Internal {
                     detail: error.to_string(),
-                })?;
+                };
+                let result = self
+                    .rollback_replayed_generation(frozen.seal_id, frozen.arrow_bytes)
+                    .map_or_else(Err, |()| Err(error));
+                let _ = response.send(result);
+                return;
+            }
+        };
         let generation = Arc::new(ImmutableGeneration::from_frozen(
             &frozen,
             (seal_key.tenant, seal_key.table.clone()),
@@ -1258,6 +1312,13 @@ impl ShardOwner {
             segment_refs.clone(),
             self.wal_handle.clone(),
         ));
+        if let Err(error) = self.wal_handle.retain_segments(&segment_refs) {
+            let result = self
+                .rollback_replayed_generation(frozen.seal_id, frozen.arrow_bytes)
+                .map_or_else(Err, |()| Err(error));
+            let _ = response.send(result);
+            return;
+        }
         self.pending_generations
             .entry(seal_key.clone())
             .or_default()
@@ -1265,9 +1326,34 @@ impl ShardOwner {
                 generation,
                 binding,
                 submitted: false,
+                replay_response: Some(response),
             });
-        self.wal_handle.retain_segments(&segment_refs)?;
         self.submit_front(&seal_key);
+    }
+
+    /// Rolls back a replay generation that failed after immutable admission.
+    ///
+    /// The checked ledger release precedes memtable removal, matching committed
+    /// retirement ordering. Admission mirrors the resulting memtable snapshot
+    /// only after both owners have completed their transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the immutable reservation cannot be
+    /// released exactly, the pending generation cannot be removed, or the
+    /// resulting memtable snapshot cannot be read.
+    fn rollback_replayed_generation(
+        &mut self,
+        seal_id: u64,
+        arrow_bytes: usize,
+    ) -> Result<(), ScribeError> {
+        self.memory_ledger
+            .preflight_release_immutable(arrow_bytes)?;
+        self.memory_ledger.release_immutable(arrow_bytes)?;
+        self.memtable.discard_pending_generation(seal_id)?;
+        let owner_stats = self.memtable.stats()?;
+        self.admission
+            .sync_memtable_bytes(owner_stats.writable_bytes, owner_stats.immutable_bytes);
         Ok(())
     }
 
@@ -1539,6 +1625,7 @@ impl ShardOwner {
             generation,
             binding,
             submitted: false,
+            replay_response: None,
         });
         if should_submit {
             self.submit_front(seal_key);
@@ -1572,6 +1659,7 @@ impl ShardOwner {
                 binding,
                 completion_tx: self.completion_tx.clone(),
                 completion_waiter: None,
+                defer_manifest_advance: front.replay_response.is_some(),
             })
             .is_err()
         {
@@ -1662,44 +1750,9 @@ impl ShardOwner {
             .copied()
             .collect::<Vec<_>>();
         for generation_id in generation_ids {
-            let Some(token) = (match self.memtable.plan_committed_retirement(generation_id) {
-                Ok(token) => token,
-                Err(error) => {
-                    tracing::warn!(error = %error, generation_id, "shard generation retirement failed");
-                    return Err(error);
-                }
-            }) else {
+            let Some(retained) = self.retire_committed_generation(generation_id)? else {
                 continue;
             };
-            let Some(retained) = self.retained_generations.get(&generation_id).cloned() else {
-                continue;
-            };
-            if token.arrow_bytes != retained.arrow_bytes {
-                self.memory_ledger.poison();
-                return Err(ScribeError::Internal {
-                    detail: format!("retirement bytes mismatch for generation {generation_id}"),
-                });
-            }
-            self.admission
-                .preflight_release_immutable(token.arrow_bytes)?;
-            self.memory_ledger
-                .preflight_release_immutable(token.arrow_bytes)?;
-            #[cfg(test)]
-            if self.fail_next_retirement_release {
-                self.fail_next_retirement_release = false;
-                self.memory_ledger.poison();
-                return Err(ScribeError::Internal {
-                    detail: "injected immutable retirement release failure".to_owned(),
-                });
-            }
-            self.admission.release_immutable(token.arrow_bytes)?;
-            self.memory_ledger.release_immutable(token.arrow_bytes)?;
-            if let Err(error) = self.memtable.commit_retirement(token) {
-                self.memory_ledger.poison();
-                return Err(error);
-            }
-            self.retained_generations.remove(&generation_id);
-            record_retirement(token.arrow_bytes);
             if let Err(error) = self
                 .wal_io
                 .submit(ScribeWalIoOp::RetireWal {
@@ -1712,6 +1765,55 @@ impl ShardOwner {
             }
         }
         Ok(())
+    }
+
+    /// Releases one committed generation's governed immutable and memtable ownership.
+    ///
+    /// The returned WAL ownership remains retained so the caller can choose the
+    /// safe IO boundary for segment retirement. This is required during replay,
+    /// where submitting WAL work from the sole WAL worker would self-deadlock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when retirement accounting is inconsistent,
+    /// poisoned, or cannot commit the exact planned generation transition.
+    fn retire_committed_generation(
+        &mut self,
+        generation_id: u64,
+    ) -> Result<Option<RetainedGeneration>, ScribeError> {
+        let Some(token) = self.memtable.plan_committed_retirement(generation_id)? else {
+            return Ok(None);
+        };
+        let Some(retained) = self.retained_generations.get(&generation_id).cloned() else {
+            return Ok(None);
+        };
+        if token.arrow_bytes != retained.arrow_bytes {
+            self.memory_ledger.poison();
+            return Err(ScribeError::Internal {
+                detail: format!("retirement bytes mismatch for generation {generation_id}"),
+            });
+        }
+        self.admission
+            .preflight_release_immutable(token.arrow_bytes)?;
+        self.memory_ledger
+            .preflight_release_immutable(token.arrow_bytes)?;
+        #[cfg(test)]
+        if self.fail_next_retirement_release {
+            self.fail_next_retirement_release = false;
+            self.memory_ledger.poison();
+            return Err(ScribeError::Internal {
+                detail: "injected immutable retirement release failure".to_owned(),
+            });
+        }
+        self.admission.release_immutable(token.arrow_bytes)?;
+        self.memory_ledger.release_immutable(token.arrow_bytes)?;
+        if let Err(error) = self.memtable.commit_retirement(token) {
+            self.memory_ledger.poison();
+            return Err(error);
+        }
+        self.retained_generations.remove(&generation_id);
+        record_retirement(token.arrow_bytes);
+        Ok(Some(retained))
     }
 
     /// Reconciles one persistence result with this owner's FIFO generation queue.
@@ -1743,12 +1845,14 @@ impl ShardOwner {
             let detail = error.clone();
             self.mark_front_retryable(&seal_key);
             tracing::warn!(error = %error, generation_id, "shard persistence failed; retaining immutable generation");
+            self.send_replay_error(&seal_key, &detail);
             Self::send_waiter_error(waiter, detail.clone());
             return Err(detail);
         }
         let Some(file_list_key) = completion.file_list_key.clone() else {
             let detail = "persistence completion omitted its file-list key".to_owned();
             self.mark_front_retryable(&seal_key);
+            self.send_replay_error(&seal_key, &detail);
             Self::send_waiter_error(waiter, detail.clone());
             return Err(detail);
         };
@@ -1759,6 +1863,7 @@ impl ShardOwner {
             let detail = error.to_string();
             self.mark_front_retryable(&seal_key);
             tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
+            self.send_replay_error(&seal_key, &detail);
             Self::send_waiter_error(waiter, detail.clone());
             return Err(detail);
         }
@@ -1783,6 +1888,30 @@ impl ShardOwner {
         if queue.is_empty() {
             self.pending_generations.remove(&seal_key);
         }
+        if let Some(replay_response) = front.replay_response {
+            let replay_result =
+                self.retire_committed_generation(generation_id)
+                    .and_then(|retained| {
+                        retained
+                        .map(|retained| ReplayRetirement {
+                            wal: retained.wal,
+                            segments: retained.wal_segments,
+                            stream: front.generation.stream,
+                            seal_key: front.generation.seal_key.clone(),
+                            sealed_lsn: front.generation.wal_lsn_max,
+                        })
+                        .ok_or_else(|| ScribeError::Internal {
+                            detail: format!(
+                                "replay generation {generation_id} was not eligible for retirement"
+                            ),
+                        })
+                    });
+            let detail = replay_result.as_ref().err().map(ToString::to_string);
+            let _ = replay_response.send(replay_result.map(Some));
+            if let Some(detail) = detail {
+                return Err(detail);
+            }
+        }
         if let Some(waiter) = waiter {
             let _ = waiter.send(Ok(()));
         }
@@ -1800,6 +1929,20 @@ impl ShardOwner {
             .and_then(VecDeque::front_mut)
         {
             front.submitted = false;
+        }
+    }
+
+    /// Fails and detaches the replay waiter owned by one retryable FIFO front.
+    fn send_replay_error(&mut self, seal_key: &crate::scribe::seal_key::SealKey, detail: &str) {
+        let response = self
+            .pending_generations
+            .get_mut(seal_key)
+            .and_then(VecDeque::front_mut)
+            .and_then(|front| front.replay_response.take());
+        if let Some(response) = response {
+            let _ = response.send(Err(ScribeError::Internal {
+                detail: detail.to_owned(),
+            }));
         }
     }
 
@@ -3268,6 +3411,7 @@ mod tests {
                 ))
                 .expect("binding"),
                 submitted: true,
+                replay_response: None,
             }]),
         );
         let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();

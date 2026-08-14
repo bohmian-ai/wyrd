@@ -9,6 +9,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use opendal::Operator;
 use sqlx::Row;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
@@ -729,6 +730,8 @@ pub struct WyrdTestCluster {
     forge_config: Option<ForgeConfig>,
     /// Interval used by supervised scheduler roles.
     forge_interval: Duration,
+    /// Per-node public-request lifetime cancelled by abrupt process termination.
+    abrupt_request_lifetimes: BTreeMap<NodeId, CancellationToken>,
 }
 
 /// Lifetime owner for temporary or caller-declared local cluster storage.
@@ -915,6 +918,25 @@ impl<'a> Iterator for ServerView<'a> {
 }
 
 impl WyrdTestCluster {
+    /// Returns the public-request lifetime tied to one bound test process.
+    ///
+    /// Axum connection tasks can outlive a dropped in-process listener
+    /// supervisor, unlike real process death. Public client journeys select on
+    /// this lifetime so abrupt cluster termination also ends the real request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError`] when `node_id` is unknown.
+    pub fn abrupt_request_lifetime(
+        &self,
+        node_id: NodeId,
+    ) -> Result<CancellationToken, ClusterError> {
+        self.abrupt_request_lifetimes
+            .get(&node_id)
+            .cloned()
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))
+    }
+
     /// Abruptly terminate one node while retaining its configured local roots.
     ///
     /// # Errors
@@ -936,6 +958,10 @@ impl WyrdTestCluster {
         let previous_writer_epoch = server
             .bifrost_scribe()
             .map(|scribe| scribe.writer_epoch_for_test());
+        self.abrupt_request_lifetimes
+            .get(&node_id)
+            .expect("known server slot has an abrupt request lifetime")
+            .cancel();
         server
             .terminate_abruptly_for_test()
             .await
@@ -1403,6 +1429,35 @@ impl WyrdTestCluster {
         .await
     }
 
+    /// Start one embedded `all` process with catalog-panic controls and a completion observer.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, configuration, or role-supervision error.
+    pub async fn start_with_embedded_forge_panic_recovery_for_test(
+        config: ForgeConfig,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            BifrostClusterSpec::one_mixed(),
+            Duration::ZERO,
+            None,
+            None,
+            false,
+            false,
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                    config: Some(config),
+                    inject_uncertainty: true,
+                    interval: Duration::from_secs(60),
+                },
+                ClusterResourceSource::Owned {
+                    dedicated_root: None,
+                },
+            ),
+        )
+        .await
+    }
+
     async fn start_with_dedicated_forge_workers_with_options(
         forge_config: Option<ForgeConfig>,
         forge_interval: Option<Duration>,
@@ -1665,6 +1720,11 @@ impl WyrdTestCluster {
                 },
             );
         }
+        let abrupt_request_lifetimes = nodes
+            .keys()
+            .copied()
+            .map(|node| (node, CancellationToken::new()))
+            .collect();
         let mut cluster = Self {
             servers: nodes.keys().copied().map(|node| (node, None)).collect(),
             nodes,
@@ -1685,6 +1745,7 @@ impl WyrdTestCluster {
             commit_uncertainty_catalog: commit_uncertainty_catalog.clone(),
             forge_config: options.config.clone(),
             forge_interval: options.interval,
+            abrupt_request_lifetimes,
         };
         let node_ids = cluster.nodes.keys().copied().collect::<Vec<_>>();
         let delayed = delay_last_node.then(|| node_ids.last().copied()).flatten();
@@ -2069,6 +2130,70 @@ impl WyrdTestCluster {
             .map_err(|error| ClusterError::Shutdown(error.to_string()))
     }
 
+    /// Await one node's real terminal supervisor result and retain its restart slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/stopped node, timeout, join failure, or
+    /// unexpected clean shutdown.
+    pub async fn await_node_terminal_failure_for_test(
+        &mut self,
+        node_id: NodeId,
+        deadline: Duration,
+    ) -> Result<String, ClusterError> {
+        let slot = self
+            .servers
+            .get_mut(&node_id)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
+        let server = slot.take().ok_or_else(|| {
+            ClusterError::Resource(format!("node {} is already stopped", node_id.as_uuid()))
+        })?;
+        server
+            .await_terminal_failure_for_test(deadline)
+            .await
+            .map_err(ClusterError::Server)
+    }
+
+    /// Advance only the exact unclassified row produced by panic reclaim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the row is retryable, unowned, has exactly one
+    /// consumed attempt, has no failure class, and its last reclaimed attempt
+    /// matches `expected_attempt` in the caller's retained evidence.
+    pub async fn advance_reclaimed_panic_task_for_test(
+        &self,
+        task_id: uuid::Uuid,
+        expected_attempt: uuid::Uuid,
+    ) -> Result<(), ClusterError> {
+        let row: (String, i32, Option<String>, bool, bool) = sqlx::query_as(
+            "SELECT state,attempt_count,failure_class,attempt_id IS NULL,claimed_by IS NULL FROM vala.forge_tasks WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .fetch_one(self.fixture.operator_pool().pool())
+        .await
+        .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        if row != ("retryable".to_owned(), 1, None, true, true) {
+            return Err(ClusterError::Resource(format!(
+                "panic recovery row {task_id} is not exact reclaimed state for attempt {expected_attempt}: {row:?}"
+            )));
+        }
+        let changed = sqlx::query(
+            "UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp(),ready_at=statement_timestamp() WHERE task_id=$1 AND state='retryable' AND attempt_count=1 AND failure_class IS NULL AND attempt_id IS NULL AND claimed_by IS NULL",
+        )
+        .bind(task_id)
+        .execute(self.fixture.operator_pool().pool())
+        .await
+        .map_err(|error| ClusterError::Resource(error.to_string()))?
+        .rows_affected();
+        if changed != 1 {
+            return Err(ClusterError::Resource(format!(
+                "panic recovery eligibility update lost exact row {task_id} from attempt {expected_attempt}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Restart one stopped node against the same Postgres, storage, WAL, and spill roots.
     ///
     /// # Errors
@@ -2087,6 +2212,8 @@ impl WyrdTestCluster {
         }
         let server = self.build_node(node_id).await?;
         self.servers.insert(node_id, Some(server));
+        self.abrupt_request_lifetimes
+            .insert(node_id, CancellationToken::new());
         Ok(())
     }
 

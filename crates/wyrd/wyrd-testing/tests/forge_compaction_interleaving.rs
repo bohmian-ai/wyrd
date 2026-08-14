@@ -20,6 +20,7 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::maintenance::{
     StagingFileCommitted, StagingFilePublisher, StagingPublishOutcome,
 };
+use vala_sql::queries::forge_tasks::ForgeTasks;
 use wyrd_server::ForgeProcessRole;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
@@ -352,25 +353,46 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
     (owner, token.fencing_token)
 }
 
-/// Expire the exact running claim left by a fully stopped worker process.
+/// Reclaims the exact running claim left by a fully stopped worker process.
 ///
-/// This test seam advances only the persisted claim deadline after the prior
-/// worker has joined. The successor must still use the production reclaim and
-/// claim transactions before it can execute the task under a new attempt.
+/// This test seam expires the persisted deadline after the prior worker has
+/// joined, invokes the production bounded reclaim transaction, verifies the
+/// attempt was consumed, then advances only the persisted eligibility clock.
+/// The successor still uses the production claim transaction and executes a
+/// fresh attempt, without making wall-clock sleeps part of interleaving tests.
 ///
 /// # Panics
 ///
 /// Panics unless exactly one running task owned by one durable attempt exists
 /// for the fixture tenant, or unless that exact identity changes before expiry.
 async fn expire_stopped_running_claim(fixture: &wyrd_testing::bifrost::ForgeFixture) -> uuid::Uuid {
-    let (task_id, attempt_id, owner): (uuid::Uuid, uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+    let running: Option<(uuid::Uuid, uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
         "SELECT task_id, attempt_id, claimed_by FROM vala.forge_tasks \
          WHERE data_tenant_id = $1 AND state = 'running'",
     )
     .bind(fixture.tenant.as_uuid())
-    .fetch_one(fixture.operator_pool.pool())
+    .fetch_optional(fixture.operator_pool.pool())
     .await
-    .expect("one stopped running Forge claim");
+    .expect("stopped running Forge claim query");
+    let Some((task_id, attempt_id, owner)) = running else {
+        let (task_id, eligible): (uuid::Uuid, bool) = sqlx::query_as(
+            "SELECT task_id,next_eligible_at<=statement_timestamp() FROM vala.forge_tasks WHERE data_tenant_id=$1 AND state='retryable' ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("worker-settled retryable Forge task");
+        if !eligible {
+            sqlx::query(
+                "UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp()-interval '1 millisecond',ready_at=statement_timestamp()-interval '1 millisecond' WHERE task_id=$1",
+            )
+            .bind(task_id)
+            .execute(fixture.operator_pool.pool())
+            .await
+            .expect("advance worker-settled task eligibility");
+        }
+        return task_id;
+    };
     let expired: uuid::Uuid = sqlx::query_scalar(
         "UPDATE vala.forge_tasks \
          SET claim_expires_at = statement_timestamp() - interval '1 millisecond' \
@@ -384,6 +406,31 @@ async fn expire_stopped_running_claim(fixture: &wyrd_testing::bifrost::ForgeFixt
     .await
     .expect("expire exact stopped Forge claim");
     assert_eq!(expired, task_id, "only the stopped claim may expire");
+    assert_eq!(
+        ForgeTasks::new(fixture.operator_pool.clone())
+            .reclaim_expired_attempts(1)
+            .await
+            .expect("production bounded reclaim"),
+        vec![(task_id, attempt_id)],
+        "reclaim returns the exact stopped attempt"
+    );
+    let reclaimed: (String, i32, bool) = sqlx::query_as(
+        "SELECT state,attempt_count,next_eligible_at>statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("persisted reclaimed task");
+    assert_eq!(reclaimed.0, "retryable");
+    assert!(reclaimed.1 > 0, "reclaim consumes one attempt");
+    assert!(reclaimed.2, "reclaim persists future eligibility");
+    sqlx::query(
+        "UPDATE vala.forge_tasks SET next_eligible_at=statement_timestamp()-interval '1 millisecond',ready_at=statement_timestamp()-interval '1 millisecond' WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("advance reclaimed task eligibility");
     task_id
 }
 
@@ -1218,7 +1265,7 @@ async fn fence_loss_before_reset_delete_keeps_prepared_and_protected() {
 
 #[tokio::test]
 #[ignore = "requires the Postgres-backed Forge interleaving lane"]
-/// Cancellation at the Reset delete boundary cannot append a false terminal.
+/// Shutdown at the Reset delete boundary lets the authority-owned effect finish.
 async fn cancellation_at_reset_delete_keeps_prepared_without_terminal() {
     let server = start_engine_fixture_server().await;
     let fixture = seed_forge_group(&server, "live_rewrite_reset_cancel").await;
@@ -1247,9 +1294,18 @@ async fn cancellation_at_reset_delete_keeps_prepared_without_terminal() {
         .await
         .is_err()
     {
+        let tasks: Vec<(String, String, i32, bool)> = sqlx::query_as(
+            "SELECT state,strategy,attempt_count,next_eligible_at<=statement_timestamp() FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at,task_id",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_all(fixture.operator_pool.pool())
+        .await
+        .expect("reset timeout task diagnostics");
         panic!(
-            "Reset did not delete exact prepared output {output}; deletes={:?}",
-            control.delete_paths()
+            "Reset did not delete exact prepared output {output}; deletes={:?}; tasks={tasks:?}; attempts={}; errors={:?}",
+            control.delete_paths(),
+            lifecycle.worker_observer.attempts(),
+            lifecycle.worker_observer.returned_errors(),
         );
     }
     lifecycle.worker_stop.cancel();
@@ -1263,14 +1319,14 @@ async fn cancellation_at_reset_delete_keeps_prepared_without_terminal() {
     );
     let rows = live_rewrite_state_rows(&fixture).await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].0, "prepared");
+    assert_eq!(rows[0].0, "reset");
     assert_eq!(
         fixture.operation_count("forge.iceberg_rewrite.reset").await,
-        0
+        1
     );
     assert!(
         fixture.staging.stat(&output).await.is_err(),
-        "delete may finish, but cancellation must prevent terminal state"
+        "the authority-owned reset completes its exact delete"
     );
     let retained = fixture
         .catalog
@@ -1527,6 +1583,7 @@ async fn live_replacement_uses_plan_base_not_file_addition_snapshot() {
     fixture.append_forge_file(4).await;
     fixture.append_forge_file(5).await;
     fold_staged_pair_without_live_replacement(&fixture).await;
+    restore_healthy_live_target(&fixture).await;
     let candidate_table = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -1667,7 +1724,9 @@ async fn live_replacement_lease_theft_after_catalog_acceptance_claims_no_termina
                 .await
         }
     });
-    control.wait_for_commit().await;
+    tokio::time::timeout(Duration::from_secs(30), control.wait_for_commit())
+        .await
+        .expect("replacement reached accepted catalog commit");
     let (owner, token) = steal_forge_lease(&fixture).await;
     control.reject_paused_commit();
     let error = task
@@ -1807,7 +1866,9 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
     );
     lifecycle.hold_next_attempt();
     lifecycle.schedule_once().await;
-    control.wait_for_commit().await;
+    tokio::time::timeout(Duration::from_secs(30), control.wait_for_commit())
+        .await
+        .expect("snapshot expiry reached accepted catalog commit");
     let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
     control.reject_paused_commit();
     lifecycle.wait_for_held_attempt().await;
@@ -2096,14 +2157,18 @@ async fn periodic_and_hints_serialize_without_false_terminal_audit() {
     assert!(!recovery.worker_observer.returned_errors().is_empty());
     recovery.stop_worker().await;
     recovery.shutdown().await;
-    let running_task: uuid::Uuid = sqlx::query_scalar(
-        "SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id = $1 AND state = 'running'",
+    let settled_retry: (uuid::Uuid, String, i32, Option<String>) = sqlx::query_as(
+        "SELECT task_id,state,attempt_count,failure_class FROM vala.forge_tasks WHERE data_tenant_id = $1 AND task_id = $2",
     )
     .bind(hinted.tenant.as_uuid())
+    .bind(stopped_task)
     .fetch_one(hinted.operator_pool.pool())
     .await
-    .expect("hinted successor retains one running retry attempt");
-    assert_eq!(running_task, stopped_task);
+    .expect("hinted successor settles the failed recovery attempt with bounded retry state");
+    assert_eq!(settled_retry.0, stopped_task);
+    assert_eq!(settled_retry.1, "retryable");
+    assert_eq!(settled_retry.2, 1);
+    assert_eq!(settled_retry.3.as_deref(), Some("transient_object_store"));
     assert_eq!(
         hinted.operation_count("forge.file_compact.committed").await,
         0
@@ -2401,9 +2466,11 @@ async fn forge_expiry_lease_theft_before_terminal_audit_fails_closed() {
     config.max_files_per_bin = 3;
     config.max_files_per_tick = 3;
     config.snapshot_retention = Duration::from_millis(1);
-    let mut convergence = SupervisedForge::start_default(&fixture, config.clone());
-    convergence.run_one_success().await;
-    convergence.shutdown().await;
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_nanos(1);
+    fixture.append_forge_file(4).await;
+    fixture.append_forge_file(5).await;
+    fold_staged_pair_without_live_replacement(&fixture).await;
     let table_before_expiry = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -2421,7 +2488,23 @@ async fn forge_expiry_lease_theft_before_terminal_audit_fails_closed() {
     );
     lifecycle.hold_next_attempt();
     lifecycle.schedule_once().await;
-    control.wait_for_commit().await;
+    if tokio::time::timeout(Duration::from_secs(30), control.wait_for_commit())
+        .await
+        .is_err()
+    {
+        let tasks: Vec<(String, String)> = sqlx::query_as(
+            "SELECT state,strategy FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at,task_id",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_all(fixture.operator_pool.pool())
+        .await
+        .expect("expiry timeout task diagnostics");
+        panic!(
+            "snapshot expiry did not reach accepted catalog commit; tasks={tasks:?}; attempts={}; errors={:?}",
+            lifecycle.worker_observer.attempts(),
+            lifecycle.worker_observer.returned_errors(),
+        );
+    }
     let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
     control.reject_paused_commit();
     lifecycle.wait_for_held_attempt().await;

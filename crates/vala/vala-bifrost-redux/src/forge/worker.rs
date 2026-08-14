@@ -931,16 +931,29 @@ impl ForgeWorker {
     ///
     /// # Errors
     /// Returns SQL or typed scratch errors; durable reclaim may precede cleanup.
-    async fn reclaim_expired_attempts(&self, cap: u32) -> Result<(), ForgeError> {
-        for (task_id, attempt_id) in self
+    async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
+        let reclaimed = self
             .tasks
             .reclaim_expired_attempts(cap)
             .await
-            .map_err(ForgeError::Sql)?
-        {
-            self.cleanup_attempt_scratch(task_id, attempt_id)?;
+            .map_err(ForgeError::Sql)?;
+        for (task_id, attempt_id) in &reclaimed {
+            self.cleanup_attempt_scratch(*task_id, *attempt_id)?;
         }
-        Ok(())
+        Ok(reclaimed)
+    }
+
+    /// Reclaims expired attempts through the production worker owner in tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the production SQL or exact scratch-cleanup failure.
+    #[cfg(feature = "test-support")]
+    pub async fn reclaim_expired_attempts_for_test(
+        &self,
+        cap: u32,
+    ) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
+        self.reclaim_expired_attempts(cap).await
     }
 
     /// Claims and executes work serially for one bounded pool slot.
@@ -2137,6 +2150,16 @@ impl ForgeWorker {
             stop,
             rewrite,
         } = request;
+        if matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold)
+        ) && let Some(recovered) = self
+            .forge
+            .recover_interrupted_staging_task(lease, binding, &claim.plan.inputs, &table)
+            .await?
+        {
+            return Ok(ForgeDispatchResult::Committed(recovered));
+        }
         if Self::current_snapshot_matches_task(&table, claim.task_id) {
             return Ok(ForgeDispatchResult::Committed(table));
         }

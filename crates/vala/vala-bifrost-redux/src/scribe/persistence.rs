@@ -318,6 +318,8 @@ pub(crate) struct PersistenceJob {
     pub(crate) completion_tx: mpsc::Sender<crate::scribe::shards::ShardCommand>,
     /// Optional caller waiter for explicit post-commit completion.
     pub(crate) completion_waiter: Option<oneshot::Sender<Result<(), String>>>,
+    /// Whether recovery must defer WAL-lane work until its reader releases the worker.
+    pub(crate) defer_manifest_advance: bool,
 }
 
 /// Server-provisioned persistence dependencies.
@@ -584,20 +586,6 @@ impl PersistenceRuntime {
         }
     }
 
-    /// Drains accepted jobs and returns the first durable-stage failure.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::Internal`] when any drained publication failed.
-    pub(crate) async fn drain_result(&self) -> Result<(), ScribeError> {
-        self.drain().await;
-        let failure = self
-            .failures
-            .lock()
-            .ok()
-            .and_then(|mut failures| failures.drain(..).next());
-        failure.map_or(Ok(()), |detail| Err(ScribeError::Internal { detail }))
-    }
-
     /// Aborts every retained persistence worker without touching the async join registry.
     ///
     /// The abort-handle registry is drained before cancellation so repeated
@@ -754,7 +742,9 @@ impl PersistenceWorker {
                 // the memory-accounting shard is approximate under batch-spread
                 // routing and does not affect correctness.
                 reservation.attach_shard(self.memory.shard_accounting(), generation.shard_id);
-                let result = self.persist_once(&generation, &job.binding).await;
+                let result = self
+                    .persist_once(&generation, &job.binding, job.defer_manifest_advance)
+                    .await;
                 drop(reservation);
                 result
             }
@@ -934,6 +924,7 @@ impl PersistenceWorker {
         &self,
         generation: &ImmutableGeneration,
         binding: &TenantTableBinding,
+        defer_manifest_advance: bool,
     ) -> Result<FileListCommitKey, ScribeError> {
         let generation_id = generation.generation_id.0;
         let frozen = generation.frozen_snapshot();
@@ -996,10 +987,29 @@ impl PersistenceWorker {
             let _ = publisher.try_publish(event);
         }
 
+        if defer_manifest_advance {
+            tracing::debug!(
+                generation_id,
+                "replay defers manifest advance until reader exit"
+            );
+            return Ok(outcome.commit_key);
+        }
+        self.advance_manifest(generation).await?;
+        tracing::debug!(generation_id, "persist stages complete");
+        Ok(outcome.commit_key)
+    }
+
+    /// Advances the durable replay watermark for one published generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the injected publication fault fires, WAL
+    /// IO submission fails, or the lane returns a result of the wrong kind.
+    async fn advance_manifest(&self, generation: &ImmutableGeneration) -> Result<(), ScribeError> {
+        let generation_id = generation.generation_id.0;
         let manifest_path =
             crate::scribe::replay::stream_directory(self.wal.base_dir(), generation.stream)
                 .join("manifest");
-        let lsn = generation.wal_lsn_max;
         #[cfg(any(test, feature = "test-support"))]
         if self.faults.take_manifest_publication() {
             return Err(ScribeError::Internal {
@@ -1023,7 +1033,7 @@ impl PersistenceWorker {
                 path: manifest_path,
                 stream: generation.stream,
                 seal_key: generation.seal_key.clone(),
-                sealed_lsn: lsn,
+                sealed_lsn: generation.wal_lsn_max,
             })
             .await?;
         if !matches!(result, ScribeWalIoResult::Completed) {
@@ -1031,8 +1041,7 @@ impl PersistenceWorker {
                 detail: "WAL IO lane returned the wrong manifest result".to_owned(),
             });
         }
-        tracing::debug!(generation_id, "persist stages complete");
-        Ok(outcome.commit_key)
+        Ok(())
     }
 
     /// Publishes file-list and audit state through the configured SQL authority.
@@ -1485,6 +1494,7 @@ mod tests {
                     binding,
                     completion_tx,
                     completion_waiter: None,
+                    defer_manifest_advance: false,
                 })
                 .expect("bounded persistence submission");
             let completion = completion_rx.recv().await.expect("persistence completion");

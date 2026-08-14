@@ -688,6 +688,10 @@ struct MemoryGovernorInner {
     oracle_total_bytes: AtomicUsize,
     /// Running total of all Bifrost-owned bytes (parent ceiling counter).
     bifrost_total_bytes: AtomicUsize,
+    /// Highest observed Scribe ownership, retained for recovery verification.
+    scribe_peak_bytes: AtomicUsize,
+    /// Highest observed Bifrost-parent ownership, retained for recovery verification.
+    bifrost_peak_bytes: AtomicUsize,
     /// Per-category byte counters for Scribe lifecycle phases.
     categories: [AtomicUsize; MEMORY_CATEGORY_COUNT],
     /// Cgroup hard limit read at construction for the external-pressure tripwire.
@@ -863,6 +867,8 @@ impl BifrostMemoryGovernor {
                 scribe_total_bytes: AtomicUsize::new(0),
                 oracle_total_bytes: AtomicUsize::new(0),
                 bifrost_total_bytes: AtomicUsize::new(0),
+                scribe_peak_bytes: AtomicUsize::new(0),
+                bifrost_peak_bytes: AtomicUsize::new(0),
                 cgroup_limit_bytes: read_cgroup_limit(),
                 cgroup_current: Mutex::new(None),
                 shard_bytes: Arc::new(
@@ -1102,12 +1108,37 @@ impl BifrostMemoryGovernor {
         }
     }
 
+    /// Records monotonic diagnostic peaks after a Scribe reservation commits.
+    fn record_scribe_peaks(&self) {
+        self.inner.scribe_peak_bytes.fetch_max(
+            self.inner.scribe_total_bytes.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+        self.inner.bifrost_peak_bytes.fetch_max(
+            self.inner.bifrost_total_bytes.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+    }
+
     /// Derive the Scribe-only child capability from this parent.
     #[must_use]
     pub fn scribe_budget(&self) -> ScribeMemoryBudget {
         ScribeMemoryBudget {
             parent: self.clone(),
         }
+    }
+
+    /// Returns the highest Scribe-child and Bifrost-parent totals observed.
+    ///
+    /// The counters are monotonic diagnostics updated only after a complete
+    /// reservation tuple is owned. They do not participate in admission.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn peak_totals_for_test(&self) -> (usize, usize) {
+        (
+            self.inner.scribe_peak_bytes.load(Ordering::Acquire),
+            self.inner.bifrost_peak_bytes.load(Ordering::Acquire),
+        )
     }
 
     /// Derive the Oracle-only child capability from this parent.
@@ -1665,6 +1696,7 @@ impl ScribeMemoryBudget {
         if let Some(growth) = root_growth {
             growth.commit();
         }
+        self.parent.record_scribe_peaks();
         Ok(MemoryReservation {
             governor: self.clone(),
             category,

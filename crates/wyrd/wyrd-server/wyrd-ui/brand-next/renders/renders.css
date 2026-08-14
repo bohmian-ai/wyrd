@@ -1,0 +1,1117 @@
+/* Static reproduction of the Wyrd component styles for the standalone renders.
+ *
+ * Every rule here mirrors a real scoped <style> block in src/lib/components/*.svelte,
+ * re-pointed at the brand-next tokens. It exists so the renders can be opened straight
+ * from file:// with no build step while still showing the real geometry.
+ *
+ * HARD RULE: not one hex literal in this file. Every colour is var(--token), resolved
+ * by ../theme.css. If a render needs a colour that isn't a token, the palette is wrong.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html {
+  scroll-behavior: smooth;
+}
+body {
+  margin: 0;
+}
+
+/* ── mode root ───────────────────────────────────────────────────────────────
+   Mirrors ModeProvider.svelte. `data-mode` cascades, so a nested wrapper can pin
+   a mode — that is how these pages show light and dark at once.               */
+.wy-root {
+  --fm: var(--font-mono, 'JetBrains Mono', monospace);
+  --fh: var(--font-display, 'Space Grotesk', sans-serif);
+  --fs: var(--font-serif, 'Fraunces', Georgia, serif);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans, 'Archivo', system-ui, sans-serif);
+}
+
+/* ── page furniture (renders only, not a product component) ─────────────────── */
+.pg {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 0 28px 72px;
+}
+.pg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 30px 0 16px;
+  font-family: var(--fm);
+  flex-wrap: wrap;
+}
+.pg-head .num {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--brand-strong);
+}
+.pg-head h2 {
+  font-family: var(--fh);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+.pg-head .note {
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: auto;
+  text-align: right;
+  max-width: 56ch;
+  line-height: 1.5;
+}
+.pg-sub {
+  font-family: var(--fm);
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+  max-width: 88ch;
+  margin: 0 0 18px;
+}
+hr.pg-rule {
+  border: 0;
+  border-top: 2px solid var(--border);
+  margin: 40px 0 0;
+}
+
+/* two-up light/dark comparison harness */
+.compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+@media (max-width: 1100px) {
+  .compare {
+    grid-template-columns: 1fr;
+  }
+}
+.surface {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 16px;
+  background: var(--bg);
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+}
+.surface > .mode-tag {
+  font-family: var(--fm);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+/* ── brand chrome ────────────────────────────────────────────────────────────
+   mark → lowercase "bohmian" wordmark → product pill. See DESIGN.md § Wordmark. */
+.wy-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.wy-brand img {
+  display: block;
+  border-radius: 6px;
+  flex: 0 0 auto;
+}
+.wy-wordmark {
+  font-family: var(--fs);
+  font-weight: 600;
+  font-size: 19px;
+  letter-spacing: -0.01em;
+  text-transform: lowercase;
+  color: var(--text);
+  white-space: nowrap;
+}
+/* ProductPill — components.json, status: spec */
+.wy-pill {
+  font-family: var(--fm);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border: 2px solid var(--border);
+  border-radius: 3px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+/* --brand-btn, not --brand: --brand is a dim navy panel colour in dark mode and pairs
+   with --brand-btn-ink at 1.23:1. --brand-btn is the token that guarantees a legible
+   pairing with --brand-btn-ink in BOTH modes (6.77:1 light, 6.53:1 dark). */
+.wy-pill[data-product='wyrd'] {
+  background: var(--brand-btn);
+  color: var(--brand-btn-ink);
+}
+.wy-pill[data-product='fathom'] {
+  background: var(--lime);
+  color: var(--lime-ink);
+}
+
+/* ── Shell ───────────────────────────────────────────────────────────────── */
+.wy-shell {
+  border: 3px solid var(--border);
+  border-radius: var(--r);
+  background: var(--bg);
+  overflow: hidden;
+  color: var(--text);
+  container-type: inline-size;
+}
+.shell-inner {
+  display: flex;
+}
+.shell-side {
+  flex: 0 0 212px;
+  border-right: 2px solid var(--border);
+  background: var(--surface);
+}
+.shell-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.shell-top {
+  border-bottom: 2px solid var(--border);
+  background: var(--surface);
+}
+.shell-content {
+  flex: 1;
+  min-width: 0;
+  padding: 16px;
+}
+@container (max-width: 720px) {
+  .shell-inner {
+    flex-direction: column;
+  }
+  .shell-side {
+    flex: 0 0 auto;
+    border-right: 0;
+    border-bottom: 2px solid var(--border);
+  }
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
+.wy-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 11px;
+  color: var(--text);
+}
+.wy-sidebar .brand {
+  margin-bottom: 12px;
+  padding: 0 3px;
+}
+.wy-sidebar .grp {
+  font-family: var(--fm);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 12px 5px 5px;
+}
+.wy-sidebar .item {
+  font-family: var(--fm);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 7px 9px;
+  border: 2px solid transparent;
+  border-radius: var(--r);
+  display: block;
+}
+.wy-sidebar .item:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+.wy-sidebar .item.active {
+  color: var(--text);
+  background: var(--brand-soft);
+  border-color: var(--border);
+  box-shadow: 2px 2px 0 0 var(--shadow);
+}
+.wy-sidebar .item[data-k='client'] {
+  border-left: 4px solid var(--client-bar);
+}
+.wy-sidebar .item[data-k='server'] {
+  border-left: 4px solid var(--server-bar);
+}
+.wy-sidebar .item[data-k='control'] {
+  border-left: 4px solid var(--control-bar);
+}
+
+/* ── Topbar ──────────────────────────────────────────────────────────────── */
+.wy-topbar {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 10px 14px;
+  font-family: var(--fm);
+  color: var(--text);
+  flex-wrap: wrap;
+}
+.wy-topbar .crumbs {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  min-width: 0;
+  overflow: hidden;
+}
+.wy-topbar .crumb {
+  color: var(--muted);
+}
+.wy-topbar .crumb.cur {
+  color: var(--text);
+  font-weight: 700;
+}
+.wy-topbar .sep {
+  color: var(--muted);
+}
+.wy-topbar .right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.wy-topbar .search {
+  font-family: var(--fm);
+  font-size: 11px;
+  color: var(--text);
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 5px 9px;
+  background: var(--surface-2);
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.wy-topbar .env {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text);
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 4px 9px;
+  background: var(--surface);
+  white-space: nowrap;
+}
+.wy-topbar .env i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.wy-topbar .env i[data-st='ok'] {
+  background: var(--ok);
+}
+.wy-topbar .env i[data-st='warn'] {
+  background: var(--warn);
+}
+.wy-topbar .env i[data-st='danger'] {
+  background: var(--danger);
+}
+
+/* ── Card ────────────────────────────────────────────────────────────────── */
+.wy-card {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  overflow: hidden;
+  min-width: 0;
+}
+.wy-card[data-variant='raised'] {
+  box-shadow: 6px 6px 0 0 var(--shadow);
+}
+.wy-card[data-variant='wide'] {
+  grid-column: 1 / -1;
+}
+.wy-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 11px;
+  border-bottom: 2px solid var(--border);
+  font-family: var(--fm);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.wy-card-head .v {
+  color: var(--text);
+}
+/* A card whose contents are Fathom's, not Wyrd's — the ONE place lime is allowed.
+   The band is tinted against --surface, so in dark mode it lands on a dark olive.
+   Label colour is --text (17.6:1 light / 7.0:1 dark), NOT --ink-on-fill, which is
+   near-black and falls to 2.1:1 on the dark band. The band carries the Fathom
+   identity; the label only has to be readable. */
+.wy-card[data-owner='fathom'] > .wy-card-head {
+  background: color-mix(in srgb, var(--lime) 26%, var(--surface));
+  color: var(--text);
+}
+.wy-card-body {
+  padding: 12px;
+}
+.grid2 {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+.grid2 > * {
+  min-width: 0;
+}
+@media (max-width: 900px) {
+  .grid2 {
+    grid-template-columns: 1fr;
+  }
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* ── Button ──────────────────────────────────────────────────────────────── */
+.wy-btn {
+  font-family: var(--fm);
+  font-size: 13px;
+  font-weight: 700;
+  padding: 8px 13px;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  transition:
+    transform 0.04s,
+    box-shadow 0.04s;
+}
+.wy-btn:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 5px 5px 0 0 var(--shadow);
+}
+.wy-btn:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 0 var(--shadow);
+}
+.wy-btn[data-variant='primary'] {
+  background: var(--brand-btn);
+  color: var(--brand-btn-ink);
+}
+.wy-btn[data-variant='secondary'] {
+  background: var(--lime);
+  color: var(--lime-ink);
+}
+.wy-btn[data-variant='ghost'] {
+  background: var(--surface);
+  color: var(--text);
+}
+.btn-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* ── Badge ───────────────────────────────────────────────────────────────── */
+/* Tone drives border, label, and tint from ONE custom property, and that property is
+   always a *-text token: raw --ok/--warn/--danger are fill colours and land at
+   3.01 / 2.28 / 3.94:1 as an 8.5px label on light. */
+.wy-badge {
+  --bc: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--fm);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border: 2px solid var(--bc);
+  border-radius: 4px;
+  color: var(--bc);
+  background: color-mix(in srgb, var(--bc) 12%, var(--surface));
+  white-space: nowrap;
+}
+/* Neutral carries no status, so it carries no tint — a 12% --muted wash also lands
+   at 4.46:1 in dark, which the palette's contrast contract rejects. */
+.wy-badge {
+  background: var(--surface);
+}
+.wy-badge[data-tone] {
+  background: color-mix(in srgb, var(--bc) 12%, var(--surface));
+}
+
+/* The glyph is the point, not decoration: --ok and --danger collapse to 1.11:1 under
+   deuteranopia, so a colour-only badge makes "pass" and "fail" identical for ~6% of
+   men. DriftPanel already does this via .chk .ic; Badge now matches. */
+.wy-badge[data-tone]::before {
+  font-size: 9px;
+  line-height: 1;
+}
+.wy-badge[data-tone='ok'] {
+  --bc: var(--ok-text);
+}
+.wy-badge[data-tone='ok']::before {
+  content: '✓';
+}
+.wy-badge[data-tone='warn'] {
+  --bc: var(--warn-text);
+}
+.wy-badge[data-tone='warn']::before {
+  content: '!';
+}
+.wy-badge[data-tone='danger'] {
+  --bc: var(--danger-text);
+}
+.wy-badge[data-tone='danger']::before {
+  content: '✕';
+}
+/* Fathom-authored verdict. Lime is a secondary accent, not a Fathom monopoly — the
+   pill, the card head, and the label carry Fathom identity. */
+.wy-badge[data-tone='fathom'] {
+  --bc: var(--lime-text);
+}
+.wy-badge[data-tone='fathom']::before {
+  content: '◈';
+}
+
+/* ── KpiTile ─────────────────────────────────────────────────────────────── */
+.wy-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  overflow: hidden;
+}
+.wy-kpi {
+  min-width: 0;
+  overflow: hidden;
+  padding: 11px 13px;
+  border-right: 2px solid var(--border);
+}
+.wy-kpi:last-child {
+  border-right: 0;
+}
+.wy-kpi .k {
+  font-family: var(--fm);
+  font-size: 8.5px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/* KPI numerals move to the display face (Space Grotesk 700) — see DESIGN.md § Type */
+.wy-kpi .n {
+  font-family: var(--fh);
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 0.98;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  margin-top: 5px;
+}
+.wy-kpi .n small {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.wy-kpi .d {
+  font-family: var(--fm);
+  font-size: 10px;
+  font-weight: 700;
+  margin-top: 4px;
+  color: var(--muted);
+}
+.wy-kpi .d[data-trend='up'] {
+  color: var(--ok);
+}
+.wy-kpi .d[data-trend='down'] {
+  color: var(--danger);
+}
+.wy-kpi .sp {
+  margin-top: 8px;
+}
+
+/* ── Table ───────────────────────────────────────────────────────────────── */
+.wy-tablewrap {
+  overflow-x: auto;
+}
+.wy-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-family: var(--fm);
+  font-size: 11px;
+  color: var(--text);
+}
+.wy-table th {
+  text-align: left;
+  font-size: 8.5px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+  padding: 7px 10px;
+  border-bottom: 2px solid var(--border);
+  background: var(--surface);
+  white-space: nowrap;
+}
+.wy-table th.r,
+.wy-table td.r {
+  text-align: right;
+}
+.wy-table td {
+  padding: 7px 10px;
+  border-bottom: 2px solid var(--surface-2);
+  white-space: nowrap;
+}
+.wy-table tr:last-child td {
+  border-bottom: 0;
+}
+.wy-table tbody tr:hover td {
+  background: var(--surface-2);
+}
+.wy-table tr.sel td {
+  background: var(--brand-soft);
+}
+.wy-table .id {
+  font-weight: 700;
+}
+.wy-table tr.sel .id {
+  color: var(--brand-strong);
+}
+.wy-table tr.sel .id::before {
+  content: '▸ ';
+}
+/* 3px kind left-bar — the Line */
+.op {
+  display: inline-block;
+  padding-left: 7px;
+  border-left: 3px solid var(--muted);
+}
+.op[data-k='agent'] {
+  border-left-color: var(--client-bar);
+}
+.op[data-k='llm'] {
+  border-left-color: var(--brand-strong);
+}
+.op[data-k='tool'] {
+  border-left-color: var(--server-bar);
+}
+.op[data-k='retrieval'] {
+  border-left-color: var(--control-bar);
+}
+.op[data-k='error'] {
+  border-left-color: var(--danger);
+}
+
+/* ── metric bars (EvalPanel / impact rows) ───────────────────────────────── */
+.mrow {
+  display: grid;
+  grid-template-columns: 9rem 1fr 3.2rem;
+  gap: 9px;
+  align-items: center;
+  font-family: var(--fm);
+  font-size: 10px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.mrow:last-child {
+  margin-bottom: 0;
+}
+.mrow .bar {
+  position: relative;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-radius: 2px;
+  background: var(--surface-2);
+}
+/* Threshold tick. Without it, "did this metric pass" is carried by bar hue alone —
+   and --ok/--danger collapse to 1.11:1 under deuteranopia. The tick makes pass/fail
+   a positional read (is the fill short of the rule?) that works without colour.
+   Set --thr to the threshold as a percentage: <div class="bar" style="--thr:80%">. */
+.mrow .bar[style*='--thr']::after {
+  content: '';
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  left: var(--thr);
+  width: 2px;
+  background: var(--border);
+  z-index: 1;
+}
+.mrow .bar > i {
+  border-radius: 1px 0 0 1px;
+}
+.mrow .bar i {
+  display: block;
+  height: 100%;
+  background: var(--brand-strong);
+}
+.mrow .bar i[data-tone='ok'] {
+  background: var(--ok);
+}
+.mrow .bar i[data-tone='danger'] {
+  background: var(--danger);
+}
+.mrow .bar i[data-tone='client'] {
+  background: var(--client-bar);
+}
+.mrow .v {
+  text-align: right;
+  font-weight: 700;
+}
+.mrow .v[data-tone='ok'] {
+  color: var(--ok);
+}
+.mrow .v[data-tone='danger'] {
+  color: var(--danger);
+}
+
+/* ── checks list (verification report) ───────────────────────────────────── */
+.chk {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 2px dashed var(--surface-2);
+  font-family: var(--fm);
+  font-size: 11px;
+  color: var(--text);
+}
+.chk:last-child {
+  border-bottom: 0;
+}
+.chk .ic {
+  width: 17px;
+  height: 17px;
+  border: 2px solid var(--border);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+.chk[data-r='pass'] .ic {
+  background: color-mix(in srgb, var(--ok) 18%, var(--surface));
+  color: var(--ok);
+}
+.chk[data-r='warn'] .ic {
+  background: color-mix(in srgb, var(--warn) 20%, var(--surface));
+  color: var(--warn);
+}
+.chk[data-r='fail'] .ic {
+  background: color-mix(in srgb, var(--danger) 18%, var(--surface));
+  color: var(--danger);
+}
+.chk .ev {
+  margin-left: auto;
+  color: var(--brand-strong);
+  font-size: 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* ── record / audit stream ───────────────────────────────────────────────── */
+.fb {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 0;
+  border-bottom: 2px dashed var(--surface-2);
+  font-family: var(--fm);
+  font-size: 10.5px;
+  color: var(--text);
+}
+.fb:last-child {
+  border-bottom: 0;
+}
+.fb .who {
+  color: var(--muted);
+}
+.fb .t {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 9.5px;
+}
+
+/* ── severity chip ───────────────────────────────────────────────────────── */
+.sev {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  border: 2px solid var(--border);
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+.sev[data-s='hi'] {
+  background: var(--danger);
+}
+.sev[data-s='md'] {
+  background: var(--warn);
+}
+.sev[data-s='lo'] {
+  background: var(--control-bar);
+}
+
+/* ── LineageStrip (components.json, status: spec) ────────────────────────── */
+.wy-lineage {
+  border-top: 2px solid var(--border);
+  background: var(--brand-soft);
+  padding: 11px 14px;
+  overflow-x: auto;
+}
+.wy-lineage .title {
+  font-family: var(--fm);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--brand-strong);
+  margin-bottom: 9px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.wy-lineage .chain {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: max-content;
+}
+.wy-lineage .node {
+  font-family: var(--fm);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 6px 11px;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 2px 2px 0 0 var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  white-space: nowrap;
+}
+.wy-lineage .node small {
+  font-size: 8px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.wy-lineage .node.hot {
+  border-color: var(--brand-strong);
+}
+.wy-lineage .edge {
+  width: 34px;
+  height: 2px;
+  background: var(--brand-strong);
+  position: relative;
+  flex: 0 0 auto;
+}
+.wy-lineage .edge::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: -3px;
+  border-left: 6px solid var(--brand-strong);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+
+/* ── Heatmap (CSS grid of color-mix cells, never SVG, never lime) ────────── */
+.wy-heat {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 3px;
+}
+.wy-heat i {
+  aspect-ratio: 1;
+  border-radius: 2px;
+  background: var(--surface-2);
+}
+
+/* ── CodeBlock ───────────────────────────────────────────────────────────── */
+.wy-code {
+  font-family: var(--fm);
+  font-size: 11px;
+  line-height: 1.7;
+  background: var(--surface-2);
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  color: var(--text);
+  overflow-x: auto;
+  margin: 0;
+}
+.wy-code .del {
+  color: var(--danger);
+}
+.wy-code .add {
+  color: var(--ok);
+}
+.wy-code .dim {
+  color: var(--muted);
+}
+
+/* ── Tree ────────────────────────────────────────────────────────────────── */
+.wy-tree {
+  font-family: var(--fm);
+  font-size: 11px;
+  color: var(--text);
+}
+.wy-tree .leaf {
+  padding: 5px 0 5px 9px;
+  border-left: 3px solid var(--muted);
+  margin: 4px 0 4px 12px;
+}
+.wy-tree .leaf[data-k='client'] {
+  border-left-color: var(--client-bar);
+}
+.wy-tree .leaf[data-k='server'] {
+  border-left-color: var(--server-bar);
+}
+.wy-tree .leaf[data-k='control'] {
+  border-left-color: var(--control-bar);
+}
+
+/* ── Dist (stacked plane distribution) ───────────────────────────────────── */
+.wy-dist {
+  display: flex;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.wy-dist i {
+  display: block;
+  height: 100%;
+}
+.wy-legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 9px;
+  font-family: var(--fm);
+  font-size: 9.5px;
+  color: var(--muted);
+}
+.wy-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.wy-legend i {
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--border);
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+/* Series legend: a line sample, not a block, so it can mirror the chart's dash
+   pattern. --control-bar and --brand-strong collapse to 1.22:1 under deuteranopia,
+   so p50 and p95 are only separable by their dash. */
+.wy-legend i[data-series] {
+  width: 18px;
+  height: 0;
+  border: 0;
+  border-top-width: 2.5px;
+  border-top-style: solid;
+  border-radius: 0;
+}
+.wy-legend i[data-series='p50'] {
+  border-top-color: var(--control-bar);
+}
+.wy-legend i[data-series='p95'] {
+  border-top-color: var(--brand-strong);
+  border-top-style: dashed;
+}
+.wy-legend i[data-series='p99'] {
+  border-top-color: var(--danger);
+  border-top-style: dotted;
+}
+
+/* ── Waterfall ───────────────────────────────────────────────────────────── */
+.wy-wf {
+  font-family: var(--fm);
+  font-size: 10px;
+  color: var(--text);
+}
+.wy-wf .row {
+  display: grid;
+  grid-template-columns: 11rem 1fr;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.wy-wf .track {
+  position: relative;
+  height: 14px;
+  background: var(--surface-2);
+  border-radius: 2px;
+}
+.wy-wf .span {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border: 2px solid var(--muted);
+  border-radius: 2px;
+}
+.wy-wf .span[data-k='agent'] {
+  border-color: var(--client-bar);
+  background: color-mix(in srgb, var(--client-bar) 30%, transparent);
+}
+.wy-wf .span[data-k='llm'] {
+  border-color: var(--brand-strong);
+  background: color-mix(in srgb, var(--brand-strong) 30%, transparent);
+}
+.wy-wf .span[data-k='tool'] {
+  border-color: var(--server-bar);
+  background: color-mix(in srgb, var(--server-bar) 30%, transparent);
+}
+.wy-wf .span[data-k='retrieval'] {
+  border-color: var(--control-bar);
+  background: color-mix(in srgb, var(--control-bar) 30%, transparent);
+}
+.wy-wf .span[data-k='error'] {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+/* ── Drawer / raised panel (SpanPanel, EvalPanel, DriftPanel) ────────────── */
+.wy-drawer {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+  overflow: hidden;
+  min-width: 0;
+}
+.wy-drawer > .topbar {
+  height: 4px;
+  background: var(--brand-strong);
+}
+.wy-drawer[data-kind='agent'] > .topbar {
+  background: var(--client-bar);
+}
+.wy-drawer[data-kind='tool'] > .topbar {
+  background: var(--server-bar);
+}
+.wy-drawer[data-kind='retrieval'] > .topbar {
+  background: var(--control-bar);
+}
+/* status overrides kind */
+.wy-drawer[data-status='alert'] > .topbar {
+  background: var(--danger);
+}
+.wy-drawer .dhead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 2px solid var(--border);
+  font-family: var(--fm);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+}
+.wy-drawer .dhead .x {
+  margin-left: auto;
+  color: var(--muted);
+  cursor: pointer;
+}
+.wy-drawer .dbody {
+  padding: 12px;
+}
+.wy-drawer .dfoot {
+  display: flex;
+  gap: 9px;
+  padding: 10px 12px;
+  border-top: 2px solid var(--border);
+  flex-wrap: wrap;
+}
+
+/* ── key/value list ──────────────────────────────────────────────────────── */
+.wy-kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 14px;
+  font-family: var(--fm);
+  font-size: 10.5px;
+  margin: 0;
+}
+.wy-kv dt {
+  color: var(--muted);
+  white-space: nowrap;
+}
+.wy-kv dd {
+  margin: 0;
+  color: var(--text);
+  text-align: right;
+}
+.wy-kv dd[data-tone='danger'] {
+  color: var(--danger);
+}
+
+/* ── big score ───────────────────────────────────────────────────────────── */
+.wy-score {
+  font-family: var(--fh);
+  font-size: 42px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--brand-strong);
+}
+
+/* ── mode toggle (renders only) ──────────────────────────────────────────── */
+.mode-toggle {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 99;
+  font-family: var(--fm);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 7px 12px;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  cursor: pointer;
+}

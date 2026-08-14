@@ -1,0 +1,509 @@
+{
+  "$comment": "Machine-readable component contracts for the Wyrd design system under the bohmian brand. `status: built` entries are implemented in src/lib/components and registered in src/lib/registry.ts (parity enforced by registry.test.ts); `status: spec` entries are contracted but not yet built and are deliberately excluded from that parity check. The rendered reference is ./renders/styleguide.html. A dynamic-layout/A2UI renderer consumes this file to compose UIs from standardized pieces. Infrastructure (ModeProvider, Drawer) is intentionally absent: it is composed by other components, not placed by name.",
+  "altitudes": {
+    "quiet": "workbench default — 3px hard-offset shadow, restrained accent",
+    "raised": "drilldown panels — 6px shadow + 4px kind/status top-bar",
+    "loud": "hero / landing only — 10px shadow, tricolor rail, serif display type"
+  },
+  "ownership": {
+    "$comment": "Blue is primary, lime is secondary. Fathom identity is carried by the ProductPill, the tinted card head, and the label — NOT by owning a colour. See DESIGN.md 'Never colour alone': --ok and --danger collapse to 1.11:1 under deuteranopia, so no meaning in this system may rest on hue alone.",
+    "primary": [
+      "--brand",
+      "--brand-strong",
+      "--brand-soft",
+      "--brand-btn"
+    ],
+    "secondary": [
+      "--lime",
+      "--lime-text",
+      "--lime-ink"
+    ],
+    "rule": "Bright --lime is a FILL only (1.30:1 on white). Anything that needs lime as a mark — text, a thin bar, the client plane — uses --lime-text.",
+    "redundancy": "Status carries a glyph, thresholds carry a tick, chart series carry a dash. Colour is never the sole carrier of a meaning."
+  },
+  "components": {
+    "Card": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--surface",
+        "--border",
+        "--shadow",
+        "--muted",
+        "--text",
+        "--lime",
+        "--r"
+      ],
+      "props": {
+        "variant": "quiet | raised | wide",
+        "owner": "wyrd | fathom"
+      },
+      "variants": [
+        "quiet",
+        "raised",
+        "wide"
+      ],
+      "anatomy": [
+        "head",
+        "body"
+      ],
+      "rules": [
+        "2px border always",
+        "3px shadow quiet / 6px shadow raised",
+        "5px radius",
+        "wide spans grid-column 1 / -1",
+        "owner=fathom tints the head color-mix(--lime 26%, --surface), marking the content as Fathom-authored rather than Wyrd's. Its label is --text, NOT --ink-on-fill: the band lands on a dark olive in dark mode where near-black ink falls to 2.12:1."
+      ]
+    },
+    "Button": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--border",
+        "--shadow",
+        "--surface",
+        "--text",
+        "--brand-btn",
+        "--brand-btn-ink",
+        "--lime",
+        "--lime-ink",
+        "--r"
+      ],
+      "props": {
+        "variant": "primary | secondary | ghost"
+      },
+      "variants": [
+        "primary",
+        "secondary",
+        "ghost"
+      ],
+      "anatomy": [
+        "label"
+      ],
+      "rules": [
+        "primary = brand blue fill (--brand-btn) — the one strong action on a surface",
+        "secondary = lime fill — the second voice. Fathom-authored actions (open fix PR, re-run verification) use it, but it is NOT reserved to them; any genuine secondary action may take it.",
+        "ghost = surface fill, no accent",
+        "fill is --brand-btn, never --brand: --brand is a dim navy panel colour in dark and pairs with --brand-btn-ink at 1.23:1",
+        "press interaction: hover lifts to 5px, active sinks to 1px"
+      ]
+    },
+    "Badge": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--ok-text",
+        "--warn-text",
+        "--danger-text",
+        "--lime-text",
+        "--muted",
+        "--surface"
+      ],
+      "props": {
+        "tone": "neutral | ok | warn | danger | fathom"
+      },
+      "variants": [
+        "neutral",
+        "ok",
+        "warn",
+        "danger",
+        "fathom"
+      ],
+      "anatomy": [
+        "glyph",
+        "label"
+      ],
+      "rules": [
+        "tone is a status signal, not decoration",
+        "tone drives border, label, and tint from one --bc custom property, and --bc is always a *-text token: raw --ok/--warn/--danger are fill colours and land at 3.01 / 2.28 / 3.94:1 as an 8.5px label on light",
+        "2px border in tone colour, 12% tinted fill, 4px radius",
+        "MUST render a glyph before the label — ok=✓ warn=! danger=✕ fathom=◈. --ok and --danger collapse to 1.11:1 under deuteranopia, so a colour-only badge makes pass and fail identical for ~6% of men. DriftPanel's .chk .ic already did this; Badge matches it.",
+        "neutral takes no tint: 'neutral' means no status, and a 12% --muted wash lands at 4.46:1 in dark, which the contrast contract rejects"
+      ]
+    },
+    "Table": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--surface",
+        "--border",
+        "--shadow",
+        "--muted",
+        "--text",
+        "--brand-soft",
+        "--r"
+      ],
+      "props": {},
+      "variants": [],
+      "anatomy": [
+        "thead",
+        "tbody"
+      ],
+      "rules": [
+        "header is plain surface (not gray) relying on the 2px bottom border",
+        "selection wash uses --brand-soft (tr.sel), never lime",
+        "2px row dividers, last row borderless"
+      ]
+    },
+    "KpiTile": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--muted",
+        "--text",
+        "--ok",
+        "--danger"
+      ],
+      "props": {
+        "label": "string",
+        "value": "string | number",
+        "delta": "string?",
+        "trend": "up | down | flat"
+      },
+      "variants": [
+        "up",
+        "down",
+        "flat"
+      ],
+      "anatomy": [
+        "label",
+        "value",
+        "delta",
+        "spark"
+      ],
+      "rules": [
+        "value is set in --font-display (Space Grotesk 700), not the body face",
+        "delta trend up = --ok, down = --danger",
+        "min-width:0 + overflow:hidden so wide values never blow out a grid track"
+      ]
+    },
+    "Bars": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--border",
+        "--text",
+        "--muted"
+      ],
+      "rules": [
+        "inline SVG 300x148, bar fill from a kind/line token, value + category labels"
+      ]
+    },
+    "Lines": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--control-bar",
+        "--brand-strong",
+        "--danger",
+        "--surface-2",
+        "--muted"
+      ],
+      "rules": [
+        "inline SVG 300x148, multi-series, dashed gridlines",
+        "series stroke from kind tokens: p50 --control-bar, p95 --brand-strong, p99 --danger",
+        "each series MUST carry a distinct stroke-dasharray (p50 solid, p95 '6 3', p99 '2 3') and the legend MUST mirror it as a line sample, not a block swatch. --control-bar and --brand-strong collapse to 1.22:1 under deuteranopia, so hue alone cannot separate p50 from p95."
+      ]
+    },
+    "Spark": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--ok",
+        "--danger",
+        "--brand-strong"
+      ],
+      "rules": [
+        "90x24 polyline, no fill, color = trend sentiment"
+      ]
+    },
+    "Histo": {
+      "status": "built",
+      "altitude": "raised",
+      "tokens": [
+        "--control-bar",
+        "--brand-strong",
+        "--surface"
+      ],
+      "rules": [
+        "326x116 grouped reference (control) vs current (brand blue) distribution bars"
+      ]
+    },
+    "Trend": {
+      "status": "built",
+      "altitude": "raised",
+      "tokens": [
+        "--brand-strong",
+        "--danger"
+      ],
+      "rules": [
+        "326x104 line with dashed danger threshold; points above threshold turn danger"
+      ]
+    },
+    "Heatmap": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--brand-strong",
+        "--surface-2"
+      ],
+      "rules": [
+        "CSS grid of color-mix cells, not SVG",
+        "intensity ramp uses brand blue (--brand-strong), NEVER lime — lime cannot darken on white"
+      ]
+    },
+    "Dist": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--client",
+        "--server",
+        "--control"
+      ],
+      "rules": [
+        "stacked plane distribution using the Line colors + legend"
+      ]
+    },
+    "Tree": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--client-bar",
+        "--server-bar",
+        "--control-bar",
+        "--border"
+      ],
+      "rules": [
+        "native details/summary, 3px kind left-bar on leaves, dashed nested guide"
+      ]
+    },
+    "Dropdown": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--surface",
+        "--border",
+        "--shadow",
+        "--brand-soft",
+        "--brand-strong"
+      ],
+      "rules": [
+        "2px border menu, 3px shadow, selected option brand-soft wash + brand-strong tick"
+      ]
+    },
+    "CodeBlock": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--surface-2",
+        "--border",
+        "--text",
+        "--muted",
+        "--r"
+      ],
+      "props": {
+        "code": "string",
+        "copy": "boolean?"
+      },
+      "anatomy": [
+        "pre",
+        "copy"
+      ],
+      "rules": [
+        "mono surface-2 block, 2px border, 5px radius",
+        "optional copy button via navigator.clipboard"
+      ]
+    },
+    "TraceTable": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--client-bar",
+        "--brand-strong",
+        "--server-bar",
+        "--control-bar",
+        "--ok",
+        "--warn",
+        "--danger"
+      ],
+      "rules": [
+        "op left-bar by span kind (agent=client olive, llm=brand blue, tool=server amber, retrieval=control steel); status column ok/warn/err",
+        "raw values in (durationMs/tokens/cost numbers, score 0-1, scoreTone verdict); formatted internally via lib/format.ts"
+      ]
+    },
+    "Waterfall": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--client-bar",
+        "--brand-strong",
+        "--server-bar",
+        "--control-bar",
+        "--surface",
+        "--text"
+      ],
+      "rules": [
+        "ruler + positioned span bars; bar = kind border + color-mix kind tint; error overrides to danger"
+      ]
+    },
+    "SpanPanel": {
+      "status": "built",
+      "altitude": "raised",
+      "tokens": [
+        "--brand-strong",
+        "--surface",
+        "--border",
+        "--muted"
+      ],
+      "rules": [
+        "raised drawer, top-bar = span kind color, kv attributes + event timeline + code preview",
+        "token counts are raw numbers, humanized via lib/format.ts"
+      ]
+    },
+    "EvalPanel": {
+      "status": "built",
+      "altitude": "raised",
+      "tokens": [
+        "--brand-strong",
+        "--ok",
+        "--warn",
+        "--danger",
+        "--border"
+      ],
+      "rules": [
+        "raised drawer, big score, metric bars vs threshold (ok/danger), judge rationale",
+        "each metric bar MUST draw a threshold tick (--thr as a percentage) — a 2px rule at the server-owned threshold. Without it 'did this pass' rests on bar hue alone, and --ok/--danger are 1.11:1 under deuteranopia. The tick makes it a positional read.",
+        "the threshold is policy (server-owned); the tick position and the redness are presentation (UI)"
+      ]
+    },
+    "DriftPanel": {
+      "status": "built",
+      "altitude": "raised",
+      "tokens": [
+        "--danger",
+        "--control-bar",
+        "--brand-strong"
+      ],
+      "rules": [
+        "raised drawer, top-bar turns --danger when drifted (status overrides kind), histogram + trend"
+      ]
+    },
+    "Shell": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--surface",
+        "--border",
+        "--bg"
+      ],
+      "rules": [
+        "212px sidebar + topbar + main grid; 3px outer border"
+      ]
+    },
+    "Sidebar": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--surface",
+        "--border",
+        "--brand-soft",
+        "--brand-strong"
+      ],
+      "rules": [
+        "nav groups; active item brand-soft wash + border + 2px shadow",
+        "brand slot is the bohmian mark (logo.svg) followed by the lowercase 'bohmian' wordmark in --font-serif",
+        "kind left-bars use the Line tokens and always sit beside a text label"
+      ]
+    },
+    "Topbar": {
+      "status": "built",
+      "altitude": "quiet",
+      "tokens": [
+        "--surface",
+        "--border",
+        "--surface-2",
+        "--ok"
+      ],
+      "rules": [
+        "breadcrumb + search + env pill with status dot",
+        "hosts the ProductPill immediately after the wordmark"
+      ]
+    },
+    "Hero": {
+      "status": "built",
+      "altitude": "loud",
+      "tokens": [
+        "--hero-bg",
+        "--hero-ink",
+        "--shadow",
+        "--brand-strong",
+        "--client-bar",
+        "--server-bar",
+        "--control-bar"
+      ],
+      "rules": [
+        "serif display type (--font-serif Fraunces), 3px border, 10px shadow, tricolor rail; landing only, never beside the workbench"
+      ]
+    },
+    "ProductPill": {
+      "status": "spec",
+      "altitude": "quiet",
+      "tokens": [
+        "--brand-btn",
+        "--brand-btn-ink",
+        "--lime",
+        "--lime-ink",
+        "--border",
+        "--r"
+      ],
+      "props": {
+        "product": "wyrd | fathom"
+      },
+      "variants": [
+        "wyrd",
+        "fathom"
+      ],
+      "anatomy": [
+        "label"
+      ],
+      "rules": [
+        "uppercase --font-mono, 10px, 700, .08em tracking",
+        "wyrd = --brand-btn fill + --brand-btn-ink; fathom = --lime fill + --lime-ink",
+        "the fill is --brand-btn, NOT --brand: --brand is a dim navy panel colour in dark mode and pairs with --brand-btn-ink at 1.23:1. --brand-btn holds ≥6.5:1 in both modes.",
+        "2px border, 3px radius — sits immediately after the bohmian wordmark in the Topbar",
+        "names the product layer the current surface belongs to; it is identity, never a control"
+      ]
+    },
+    "LineageStrip": {
+      "status": "spec",
+      "altitude": "quiet",
+      "tokens": [
+        "--brand-soft",
+        "--brand-strong",
+        "--surface",
+        "--border",
+        "--shadow",
+        "--muted",
+        "--r"
+      ],
+      "props": {
+        "nodes": "Array<{ label: string, kind: string, hot?: boolean }>"
+      },
+      "variants": [],
+      "anatomy": [
+        "title",
+        "chain",
+        "node",
+        "edge"
+      ],
+      "rules": [
+        "the record behind the current surface: nodes joined left-to-right by arrowed --brand-strong edges",
+        "--brand-soft band background; each node is a 2px-bordered surface tile with a 2px hard shadow",
+        "node label is --font-mono 700; the kind caption below it is uppercase --muted",
+        "hot node (the one the current view is about) takes a --brand-strong border",
+        "min-width:max-content inside overflow-x:auto — the chain scrolls, it never wraps or truncates",
+        "spans the full width at the bottom of a surface; it is context, not a primary control"
+      ]
+    }
+  }
+}

@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wyrd — Workbench surfaces</title>
+<link rel="icon" href="../app-icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&family=Space+Grotesk:wght@400;500;700&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../theme.css">
+<link rel="stylesheet" href="renders.css">
+<style>
+  .app { margin-bottom: 8px; }
+  .backlink { font-family:var(--fm); font-size:11px; color:var(--brand-strong); text-decoration:none; }
+  .backlink:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<div class="wy-root" data-mode="dark" id="root">
+<button class="mode-toggle" id="toggle">◐ light</button>
+
+<div class="pg">
+  <div class="pg-head" style="padding-top:24px">
+    <span class="num">—</span><h2>Wyrd — workbench surfaces</h2>
+    <span class="note"><a class="backlink" href="index.html">← brand index</a></span>
+  </div>
+  <p class="pg-sub">
+    Six surfaces in the real <code>Shell</code> / <code>Sidebar</code> / <code>Topbar</code> chrome,
+    using the fixtures from <code>src/routes/styleguide/+page.svelte</code>. Dark is the app default.
+    Blue is primary and lime is secondary; selection is always a <code>--brand-soft</code> wash.
+    Note the redundant channels — every status badge carries a glyph, every threshold a tick,
+    every chart series a dash — because <code>--ok</code> and <code>--danger</code> are 1.11:1
+    under deuteranopia.
+  </p>
+
+  <!-- ══════════════ 01 · CARDS REGISTRY ══════════════ -->
+  <div class="pg-head"><span class="num">01</span><h2>Registry — cards</h2>
+    <span class="note">the list users live in · quiet altitude · selection is a brand-soft wash with a ▸ marker</span></div>
+  <div class="wy-shell app">
+    <div class="shell-inner">
+      <aside class="shell-side">
+        <nav class="wy-sidebar">
+          <div class="brand"><div class="wy-brand">
+            <img src="../logo.svg" width="22" height="22" alt="">
+            <span class="wy-wordmark" style="font-size:16px">bohmian</span>
+          </div></div>
+          <div class="grp">registry</div>
+          <a class="item active" href="#">cards</a>
+          <a class="item" href="#">evals</a>
+          <a class="item" href="#">policies</a>
+          <div class="grp">observe</div>
+          <a class="item" href="#">traces</a>
+          <a class="item" href="#">drift</a>
+        </nav>
+      </aside>
+      <div class="shell-main">
+        <header class="shell-top"><div class="wy-topbar">
+          <span class="wy-pill" data-product="wyrd">WYRD</span>
+          <nav class="crumbs"><span class="crumb cur">registry / cards</span></nav>
+          <div class="right">
+            <input class="search" type="search" placeholder="⌘K  search cards…">
+            <span class="env"><i data-st="ok"></i>prod</span>
+          </div>
+        </div></header>
+        <div class="shell-content">
+          <div class="wy-kpis" style="margin-bottom:14px">
+            <div class="wy-kpi"><div class="k">Cards</div><div class="n">318</div><div class="d" data-trend="up">▲ 12 wk</div></div>
+            <div class="wy-kpi"><div class="k">Runs</div><div class="n">1,284</div><div class="d" data-trend="up">▲ 8%</div></div>
+            <div class="wy-kpi"><div class="k">p95 latency</div><div class="n">842<small>ms</small></div><div class="d" data-trend="up">▼ 3%</div></div>
+            <div class="wy-kpi"><div class="k">Error rate</div><div class="n">1.2<small>%</small></div><div class="d" data-trend="down">▲ 0.4%</div></div>
+            <div class="wy-kpi"><div class="k">Spend</div><div class="n">$42.10</div><div class="d" data-trend="down">▲ 12%</div></div>
+            <div class="wy-kpi"><div class="k">Unowned</div><div class="n">3</div><div class="d">policy/ownership</div></div>
+          </div>
+          <div class="wy-card">
+            <div class="wy-card-head"><span>Cards</span><span class="v">sorted: updated ↓</span></div>
+            <div class="wy-tablewrap"><table class="wy-table">
+              <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th class="r">Relationships</th><th class="r">Runs 24h</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr class="sel"><td class="id">payments-svc</td><td><span class="op" data-k="tool">Service</span></td><td>v12</td><td class="r">9</td><td class="r">412</td><td><span class="wy-badge" data-tone="ok">healthy</span></td></tr>
+                <tr><td class="id">churn-v3</td><td><span class="op" data-k="llm">Model</span></td><td>v3</td><td class="r">6</td><td class="r">288</td><td><span class="wy-badge" data-tone="warn">drifted</span></td></tr>
+                <tr><td class="id">fathom-wf</td><td><span class="op" data-k="agent">Workflow</span></td><td>v7</td><td class="r">11</td><td class="r">196</td><td><span class="wy-badge" data-tone="ok">healthy</span></td></tr>
+                <tr><td class="id">pii-gate</td><td><span class="op" data-k="retrieval">Policy</span></td><td>v2</td><td class="r">4</td><td class="r">—</td><td><span class="wy-badge" data-tone="ok">enforced</span></td></tr>
+                <tr><td class="id">txns-2026q2</td><td><span class="op" data-k="tool">Data</span></td><td>v1</td><td class="r">7</td><td class="r">—</td><td><span class="wy-badge">no owner</span></td></tr>
+              </tbody>
+            </table></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ 02 · CARD DETAIL + LINEAGE ══════════════ -->
+  <div class="pg-head"><span class="num">02</span><h2>Card detail — payments-svc</h2>
+    <span class="note">the LineageStrip is the record behind the surface · brand-soft band, arrowed edges, scrolls rather than wraps</span></div>
+  <div class="wy-shell app">
+    <div class="shell-inner">
+      <aside class="shell-side">
+        <nav class="wy-sidebar">
+          <div class="brand"><div class="wy-brand">
+            <img src="../logo.svg" width="22" height="22" alt="">
+            <span class="wy-wordmark" style="font-size:16px">bohmian</span>
+          </div></div>
+          <div class="grp">registry</div>
+          <a class="item active" href="#">cards</a>
+          <a class="item" href="#">evals</a>
+          <a class="item" href="#">policies</a>
+          <div class="grp">observe</div>
+          <a class="item" href="#">traces</a>
+          <a class="item" href="#">drift</a>
+        </nav>
+      </aside>
+      <div class="shell-main">
+        <header class="shell-top"><div class="wy-topbar">
+          <span class="wy-pill" data-product="wyrd">WYRD</span>
+          <nav class="crumbs"><span class="crumb">registry</span><span class="sep">/</span><span class="crumb">cards</span><span class="sep">/</span><span class="crumb cur">payments-svc</span></nav>
+          <div class="right"><span class="env"><i data-st="ok"></i>prod</span></div>
+        </div></header>
+        <div class="shell-content">
+          <div class="grid2">
+            <div class="stack">
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Spec</span><span class="v">wyrd/v1 · Service</span></div>
+                <div class="wy-card-body">
+                  <dl class="wy-kv">
+                    <dt>uid</dt><dd>card_8f31a0</dd>
+                    <dt>version</dt><dd>v12</dd>
+                    <dt>space</dt><dd>platform</dd>
+                    <dt>owner</dt><dd>team/payments</dd>
+                    <dt>updated</dt><dd>18m ago</dd>
+                  </dl>
+                </div>
+              </div>
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Relationships</span><span class="v">server-derived</span></div>
+                <div class="wy-card-body"><div class="wy-tree">
+                  <div class="leaf" data-k="client">agent/fathom-wf <span style="color:var(--muted)">· invokes</span></div>
+                  <div class="leaf" data-k="llm" style="border-left-color:var(--brand-strong)">model/churn-v3@v3 <span style="color:var(--muted)">· scores</span></div>
+                  <div class="leaf" data-k="server">data/txns-2026q2 <span style="color:var(--muted)">· reads</span></div>
+                  <div class="leaf" data-k="control">policy/pii-gate@v2 <span style="color:var(--muted)">· governed by</span></div>
+                </div></div>
+              </div>
+            </div>
+            <div class="stack">
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Plane distribution</span><span class="v">by span kind</span></div>
+                <div class="wy-card-body">
+                  <div class="wy-dist">
+                    <i style="width:44%;background:var(--client)"></i>
+                    <i style="width:34%;background:var(--server)"></i>
+                    <i style="width:22%;background:var(--control)"></i>
+                  </div>
+                  <div class="wy-legend">
+                    <span><i style="background:var(--client)"></i>client 44%</span>
+                    <span><i style="background:var(--server)"></i>server 34%</span>
+                    <span><i style="background:var(--control)"></i>control 22%</span>
+                  </div>
+                </div>
+              </div>
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Activity</span><span class="v">30d · heat ramp is brand blue</span></div>
+                <div class="wy-card-body"><div class="wy-heat" id="heat"></div></div>
+              </div>
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Actions</span></div>
+                <div class="wy-card-body"><div class="btn-row">
+                  <button class="wy-btn" data-variant="primary">Run eval</button>
+                  <button class="wy-btn" data-variant="ghost">Export</button>
+                </div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- LineageStrip -->
+        <div class="wy-lineage">
+          <div class="title"><img src="../logo.svg" width="14" height="14" style="border-radius:3px;display:block" alt="">WYRD · the record behind this card</div>
+          <div class="chain">
+            <span class="node">data/txns-2026q2<small>card</small></span>
+            <span class="edge"></span>
+            <span class="node">model/churn-v3@v3<small>card</small></span>
+            <span class="edge"></span>
+            <span class="node hot">svc/payments-svc@v12<small>card</small></span>
+            <span class="edge"></span>
+            <span class="node">eval/precision-k<small>gate</small></span>
+            <span class="edge"></span>
+            <span class="node">policy/pii-gate@v2<small>policy</small></span>
+            <span class="edge"></span>
+            <span class="node">rec_4a91c7<small>audit record</small></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ 03 · DRIFT / ANALYTICS ══════════════ -->
+  <div class="pg-head"><span class="num">03</span><h2>Observe — drift &amp; analytics</h2>
+    <span class="note">the Fathom probable-cause card renders a verdict on Wyrd's record · the percentile chart shows the dash channel · the drift panel shows threshold ticks</span></div>
+  <div class="wy-shell app">
+    <div class="shell-inner">
+      <aside class="shell-side">
+        <nav class="wy-sidebar">
+          <div class="brand"><div class="wy-brand">
+            <img src="../logo.svg" width="22" height="22" alt="">
+            <span class="wy-wordmark" style="font-size:16px">bohmian</span>
+          </div></div>
+          <div class="grp">registry</div>
+          <a class="item" href="#">cards</a>
+          <a class="item" href="#">evals</a>
+          <a class="item" href="#">policies</a>
+          <div class="grp">observe</div>
+          <a class="item" href="#">traces</a>
+          <a class="item active" href="#">drift</a>
+        </nav>
+      </aside>
+      <div class="shell-main">
+        <header class="shell-top"><div class="wy-topbar">
+          <span class="wy-pill" data-product="wyrd">WYRD</span>
+          <nav class="crumbs"><span class="crumb">observe</span><span class="sep">/</span><span class="crumb cur">drift</span></nav>
+          <div class="right"><span class="env"><i data-st="warn"></i>3 alerting</span></div>
+        </div></header>
+        <div class="shell-content">
+          <div class="wy-kpis" style="margin-bottom:14px">
+            <div class="wy-kpi"><div class="k">Monitors</div><div class="n">64</div><div class="d">across 12 systems</div></div>
+            <div class="wy-kpi"><div class="k">Drifted</div><div class="n">3</div><div class="d" data-trend="down">▲ 2 today</div></div>
+            <div class="wy-kpi"><div class="k">Spans 24h</div><div class="n">2.1<small>M</small></div><div class="d" data-trend="up">▲ 6%</div></div>
+            <div class="wy-kpi"><div class="k">Regressions</div><div class="n">2</div><div class="d">vs. baseline</div></div>
+            <div class="wy-kpi"><div class="k">Audit records</div><div class="n">1,842</div><div class="d">24h</div></div>
+            <div class="wy-kpi"><div class="k">Verified</div><div class="n">94.1<small>%</small></div><div class="d" data-trend="up">▲ 0.8</div></div>
+          </div>
+          <div class="grid2">
+            <div class="stack">
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Drift monitors</span><span class="v">3 alerting</span></div>
+                <div class="wy-tablewrap"><table class="wy-table">
+                  <thead><tr><th>Feature / signal</th><th>System</th><th>Trend</th><th class="r">Δ baseline</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr class="sel"><td class="id">request_amount</td><td>payments-svc@v12</td><td><svg class="sp" data-drift="1" width="90" height="24"></svg></td><td class="r">+2.8σ</td><td><span class="wy-badge" data-tone="warn">drifted</span></td></tr>
+                    <tr><td class="id">score_distribution</td><td>churn-v3@v3</td><td><svg class="sp" data-drift="1" width="90" height="24"></svg></td><td class="r">+1.9σ</td><td><span class="wy-badge" data-tone="warn">drifted</span></td></tr>
+                    <tr><td class="id">refusal_rate</td><td>agent/fathom-wf</td><td><svg class="sp" data-drift="1" width="90" height="24"></svg></td><td class="r">+1.6σ</td><td><span class="wy-badge" data-tone="warn">drifted</span></td></tr>
+                    <tr><td class="id">tool_error_rate</td><td>agent/fathom-wf</td><td><svg class="sp" data-drift="0" width="90" height="24"></svg></td><td class="r">+0.3σ</td><td><span class="wy-badge" data-tone="ok">stable</span></td></tr>
+                    <tr><td class="id">p95_latency</td><td>payments-svc@v12</td><td><svg class="sp" data-drift="0" width="90" height="24"></svg></td><td class="r">−0.1σ</td><td><span class="wy-badge" data-tone="ok">stable</span></td></tr>
+                  </tbody>
+                </table></div>
+              </div>
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Latency percentiles</span><span class="v">p50 · p95 · p99 · 24h</span></div>
+                <div class="wy-card-body"><svg id="lines" width="100%" viewBox="0 0 300 148" preserveAspectRatio="none" style="display:block;height:148px"></svg>
+                  <div class="wy-legend">
+                    <span><i data-series="p50"></i>p50</span>
+                    <span><i data-series="p95"></i>p95</span>
+                    <span><i data-series="p99"></i>p99</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="stack">
+              <!-- DriftPanel: raised, top-bar turns danger because status overrides kind -->
+              <div class="wy-drawer" data-kind="tool" data-status="alert">
+                <div class="topbar"></div>
+                <div class="dhead">request_amount <span class="wy-badge" data-tone="warn">drifted</span><span class="x">✕</span></div>
+                <div class="dbody">
+                  <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:12px">
+                    <span class="wy-score" style="color:var(--danger)">0.31</span>
+                    <span style="font-family:var(--fm);font-size:10px;color:var(--muted)">PSI · threshold 0.20</span>
+                  </div>
+                  <div style="font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin-bottom:7px">reference vs current</div>
+                  <svg id="histo" width="100%" viewBox="0 0 326 116" preserveAspectRatio="none" style="display:block;height:116px"></svg>
+                  <div class="wy-legend" style="margin-bottom:14px">
+                    <span><i style="background:var(--control-bar)"></i>reference</span>
+                    <span><i style="background:var(--brand-strong)"></i>current</span>
+                  </div>
+                  <div style="font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin-bottom:7px">psi over time</div>
+                  <svg id="trend" width="100%" viewBox="0 0 326 104" preserveAspectRatio="none" style="display:block;height:104px"></svg>
+                  <dl class="wy-kv" style="margin-top:12px">
+                    <dt>mean shift</dt><dd data-tone="danger">+18.4%</dd>
+                    <dt>null rate</dt><dd>0.2%</dd>
+                    <dt>samples</dt><dd>128.4k</dd>
+                    <dt>first seen</dt><dd data-tone="danger">2d ago</dd>
+                  </dl>
+                </div>
+                <div class="dfoot">
+                  <button class="wy-btn" data-variant="primary">Acknowledge</button>
+                  <button class="wy-btn" data-variant="ghost">View samples</button>
+                </div>
+              </div>
+
+              <!-- The ONE lime surface in the Wyrd workbench: Fathom's verdict -->
+              <div class="wy-card" data-owner="fathom">
+                <div class="wy-card-head"><span>◈ FATHOM · probable cause</span><span class="v">verdict on wyrd's record</span></div>
+                <div class="wy-card-body">
+                  <div style="font-family:var(--fm);font-size:11px;line-height:1.75">
+                    <b>request_amount</b> drift and the <b>refund accuracy</b> regression both trace to
+                    <span style="color:var(--brand-strong);font-weight:700">deploy prod-7</span>
+                    (churn-v3@v3) — the deploy that shipped despite finding <b>#482-F1</b>.
+                  </div>
+                  <div style="font-family:var(--fm);font-size:11px;color:var(--muted);margin-top:9px">Recommend: rollback to v2 · reopen fix PR</div>
+                  <div class="btn-row" style="margin-top:13px">
+                    <button class="wy-btn" data-variant="secondary">Open fix PR</button>
+                    <button class="wy-btn" data-variant="ghost">Evidence →</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="wy-lineage">
+          <div class="title"><img src="../logo.svg" width="14" height="14" style="border-radius:3px;display:block" alt="">WYRD · this incident, connected</div>
+          <div class="chain">
+            <span class="node">drift: request_amount<small>observation</small></span>
+            <span class="edge"></span>
+            <span class="node hot">deploy prod-7<small>status</small></span>
+            <span class="edge"></span>
+            <span class="node">model/churn-v3@v3<small>card</small></span>
+            <span class="edge"></span>
+            <span class="node">#482 · finding F1<small>review</small></span>
+            <span class="edge"></span>
+            <span class="node">audit: gate override<small>record</small></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ 04 · TRACES ══════════════ -->
+  <div class="pg-head"><span class="num">04</span><h2>Observe — traces</h2>
+    <span class="note">the densest surface · span kind is a 3px left-bar: agent olive · llm blue · tool amber · retrieval steel · error red</span></div>
+  <div class="wy-shell app">
+    <div class="shell-inner">
+      <aside class="shell-side">
+        <nav class="wy-sidebar">
+          <div class="brand"><div class="wy-brand">
+            <img src="../logo.svg" width="22" height="22" alt="">
+            <span class="wy-wordmark" style="font-size:16px">bohmian</span>
+          </div></div>
+          <div class="grp">registry</div>
+          <a class="item" href="#">cards</a>
+          <a class="item" href="#">evals</a>
+          <a class="item" href="#">policies</a>
+          <div class="grp">observe</div>
+          <a class="item active" href="#">traces</a>
+          <a class="item" href="#">drift</a>
+        </nav>
+      </aside>
+      <div class="shell-main">
+        <header class="shell-top"><div class="wy-topbar">
+          <span class="wy-pill" data-product="wyrd">WYRD</span>
+          <nav class="crumbs"><span class="crumb">observe</span><span class="sep">/</span><span class="crumb">traces</span><span class="sep">/</span><span class="crumb cur">tr_9f21</span></nav>
+          <div class="right"><span class="env"><i data-st="ok"></i>41.2k / 24h</span></div>
+        </div></header>
+        <div class="shell-content">
+          <div class="grid2">
+            <div class="stack">
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Traces</span><span class="v">sorted: duration ↓</span></div>
+                <div class="wy-tablewrap"><table class="wy-table">
+                  <thead><tr><th>Trace</th><th>Root op</th><th class="r">Spans</th><th class="r">Duration</th><th class="r">Tokens</th><th class="r">Cost</th><th class="r">Score</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr class="sel"><td class="id">tr_9f21</td><td><span class="op" data-k="agent">agent.run</span></td><td class="r">14</td><td class="r">6.90s</td><td class="r">21.4k</td><td class="r">$0.18</td><td class="r">0.62</td><td><span class="wy-badge" data-tone="danger">error</span></td></tr>
+                    <tr><td class="id">tr_8c04</td><td><span class="op" data-k="llm">llm.synthesize</span></td><td class="r">6</td><td class="r">3.20s</td><td class="r">14.2k</td><td class="r">$0.12</td><td class="r">0.91</td><td><span class="wy-badge" data-tone="ok">ok</span></td></tr>
+                    <tr><td class="id">tr_71be</td><td><span class="op" data-k="tool">tool.search</span></td><td class="r">3</td><td class="r">843ms</td><td class="r">—</td><td class="r">$0.01</td><td class="r">0.88</td><td><span class="wy-badge" data-tone="ok">ok</span></td></tr>
+                    <tr><td class="id">tr_66a2</td><td><span class="op" data-k="retrieval">catalog.search</span></td><td class="r">4</td><td class="r">640ms</td><td class="r">—</td><td class="r">$0.01</td><td class="r">0.79</td><td><span class="wy-badge" data-tone="warn">degraded</span></td></tr>
+                  </tbody>
+                </table></div>
+              </div>
+              <div class="wy-card">
+                <div class="wy-card-head"><span>Waterfall — tr_9f21</span><span class="v">6.90s total</span></div>
+                <div class="wy-card-body"><div class="wy-wf">
+                  <div class="row"><span>agent.run</span><div class="track"><i class="span" data-k="agent" style="left:0%;width:100%"></i></div></div>
+                  <div class="row"><span style="padding-left:12px">llm.synthesize</span><div class="track"><i class="span" data-k="llm" style="left:4%;width:46%"></i></div></div>
+                  <div class="row"><span style="padding-left:24px">tool.search</span><div class="track"><i class="span" data-k="tool" style="left:8%;width:12%"></i></div></div>
+                  <div class="row"><span style="padding-left:24px">catalog.search</span><div class="track"><i class="span" data-k="retrieval" style="left:22%;width:9%"></i></div></div>
+                  <div class="row"><span style="padding-left:12px">fraud.score</span><div class="track"><i class="span" data-k="error" style="left:54%;width:44%"></i></div></div>
+                </div></div>
+              </div>
+            </div>
+            <div class="stack">
+              <!-- SpanPanel: raised, top-bar = span kind (llm → brand blue) -->
+              <div class="wy-drawer" data-kind="llm">
+                <div class="topbar"></div>
+                <div class="dhead">llm.synthesize <span class="wy-badge" data-tone="ok">ok</span><span class="x">✕</span></div>
+                <div class="dbody">
+                  <dl class="wy-kv" style="margin-bottom:12px">
+                    <dt>span_id</dt><dd>sp_2c71f9</dd>
+                    <dt>kind</dt><dd>llm</dd>
+                    <dt>model</dt><dd>claude-opus-5</dd>
+                    <dt>duration</dt><dd>3.20s</dd>
+                    <dt>cost</dt><dd>$0.12</dd>
+                  </dl>
+                  <div style="font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin-bottom:7px">tokens</div>
+                  <div class="mrow"><span>input</span><div class="bar"><i style="width:64%"></i></div><span class="v">9.1k</span></div>
+                  <div class="mrow"><span>output</span><div class="bar"><i style="width:31%"></i></div><span class="v">4.4k</span></div>
+                  <div class="mrow"><span>cache read</span><div class="bar"><i style="width:48%" data-tone="ok"></i></div><span class="v">6.8k</span></div>
+                  <div style="font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin:14px 0 7px">output preview</div>
+                  <pre class="wy-code">{ "verdict": "needs_evidence",
+  "findings": [ "F1: label leakage" ] }</pre>
+                </div>
+                <div class="dfoot">
+                  <button class="wy-btn" data-variant="primary">Open in trace</button>
+                  <button class="wy-btn" data-variant="ghost">Copy span_id</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ 05 · EVALS ══════════════ -->
+  <div class="pg-head"><span class="num">05</span><h2>Registry — evals</h2>
+    <span class="note">metric bars score against a server-owned threshold · the server sends value + threshold + pass; the UI decides the colour</span></div>
+  <div class="wy-shell app">
+    <div class="shell-inner">
+      <aside class="shell-side">
+        <nav class="wy-sidebar">
+          <div class="brand"><div class="wy-brand">
+            <img src="../logo.svg" width="22" height="22" alt="">
+            <span class="wy-wordmark" style="font-size:16px">bohmian</span>
+          </div></div>
+          <div class="grp">registry</div>
+          <a class="item" href="#">cards</a>
+          <a class="item active" href="#">evals</a>
+          <a class="item" href="#">policies</a>
+          <div class="grp">observe</div>
+          <a class="item" href="#">traces</a>
+          <a class="item" href="#">drift</a>
+        </nav>
+      </aside>
+      <div class="shell-main">
+        <header class="shell-top"><div class="wy-topbar">
+          <span class="wy-pill" data-product="wyrd">WYRD</span>
+          <nav class="crumbs"><span class="crumb">registry</span><span class="sep">/</span><span class="crumb cur">evals</span></nav>
+          <div class="right"><span class="env"><i data-st="warn"></i>2 regressed</span></div>
+        </div></header>
+        <div class="shell-content">
+          <div class="grid2">
+            <div class="wy-card">
+              <div class="wy-card-head"><span>Eval runs</span><span class="v">nightly vs baseline</span></div>
+              <div class="wy-tablewrap"><table class="wy-table">
+                <thead><tr><th>Eval</th><th>Target</th><th class="r">Score</th><th class="r">Threshold</th><th class="r">Δ</th><th>Status</th></tr></thead>
+                <tbody>
+                  <tr class="sel"><td class="id">eval/precision-k</td><td>churn-v3@v3</td><td class="r">0.79</td><td class="r">0.80</td><td class="r" style="color:var(--danger)">−4.2</td><td><span class="wy-badge" data-tone="danger">regressed</span></td></tr>
+                  <tr><td class="id">eval/policy-adherence</td><td>agent/fathom-wf</td><td class="r">0.88</td><td class="r">0.90</td><td class="r" style="color:var(--danger)">−1.8</td><td><span class="wy-badge" data-tone="danger">regressed</span></td></tr>
+                  <tr><td class="id">eval/task-completion</td><td>agent/fathom-wf</td><td class="r">0.94</td><td class="r">0.90</td><td class="r" style="color:var(--ok)">+0.4</td><td><span class="wy-badge" data-tone="ok">pass</span></td></tr>
+                  <tr><td class="id">eval/tone-safety</td><td>agent/fathom-wf</td><td class="r">0.97</td><td class="r">0.95</td><td class="r" style="color:var(--ok)">+0.1</td><td><span class="wy-badge" data-tone="ok">pass</span></td></tr>
+                </tbody>
+              </table></div>
+            </div>
+            <!-- EvalPanel -->
+            <div class="wy-drawer" data-status="alert">
+              <div class="topbar"></div>
+              <div class="dhead">eval/precision-k <span class="wy-badge" data-tone="danger">fail</span><span class="x">✕</span></div>
+              <div class="dbody">
+                <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:6px">
+                  <span class="wy-score" style="color:var(--danger)">0.79</span>
+                  <span style="font-family:var(--fm);font-size:10px;color:var(--muted)">threshold 0.80 · judge: rubric-v4</span>
+                </div>
+                <div style="font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin:14px 0 8px">metrics vs threshold</div>
+                <div class="mrow"><span>precision@k</span><div class="bar" style="--thr:80%"><i style="width:79%" data-tone="danger"></i></div><span class="v" data-tone="danger">0.79</span></div>
+                <div class="mrow"><span>recall@k</span><div class="bar" style="--thr:80%"><i style="width:88%" data-tone="ok"></i></div><span class="v" data-tone="ok">0.88</span></div>
+                <div class="mrow"><span>calibration</span><div class="bar" style="--thr:80%"><i style="width:71%" data-tone="danger"></i></div><span class="v" data-tone="danger">0.71</span></div>
+                <div class="mrow"><span>coverage</span><div class="bar" style="--thr:90%"><i style="width:96%" data-tone="ok"></i></div><span class="v" data-tone="ok">0.96</span></div>
+                <div style="font-family:var(--fm);font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin:16px 0 7px">judge rationale</div>
+                <pre class="wy-code">precision@k fell below threshold on the
+tail cohort (amount &gt; p95). Calibration
+degraded in the same slice — consistent
+with a shifted <span class="dim">request_amount</span> distribution.</pre>
+              </div>
+              <div class="dfoot">
+                <button class="wy-btn" data-variant="primary">Open trace</button>
+                <button class="wy-btn" data-variant="ghost">Re-run eval</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ 06 · POLICY & AUDIT ══════════════ -->
+  <div class="pg-head"><span class="num">06</span><h2>Govern — policy &amp; audit</h2>
+    <span class="note">recorded, not remembered · every override and sign-off is an audit record, not a memory</span></div>
+  <div class="wy-shell app">
+    <div class="shell-inner">
+      <aside class="shell-side">
+        <nav class="wy-sidebar">
+          <div class="brand"><div class="wy-brand">
+            <img src="../logo.svg" width="22" height="22" alt="">
+            <span class="wy-wordmark" style="font-size:16px">bohmian</span>
+          </div></div>
+          <div class="grp">registry</div>
+          <a class="item" href="#">cards</a>
+          <a class="item" href="#">evals</a>
+          <a class="item active" href="#">policies</a>
+          <div class="grp">observe</div>
+          <a class="item" href="#">traces</a>
+          <a class="item" href="#">drift</a>
+        </nav>
+      </aside>
+      <div class="shell-main">
+        <header class="shell-top"><div class="wy-topbar">
+          <span class="wy-pill" data-product="wyrd">WYRD</span>
+          <nav class="crumbs"><span class="crumb">govern</span><span class="sep">/</span><span class="crumb cur">policy &amp; audit</span></nav>
+          <div class="right"><span class="env"><i data-st="ok"></i>1,842 records / 24h</span></div>
+        </div></header>
+        <div class="shell-content">
+          <div class="grid2">
+            <div class="wy-card">
+              <div class="wy-card-head"><span>Policies</span><span class="v">enforced at write time</span></div>
+              <div class="wy-tablewrap"><table class="wy-table">
+                <thead><tr><th>Policy</th><th>Scope</th><th class="r">Cards</th><th class="r">Violations 24h</th><th>Status</th></tr></thead>
+                <tbody>
+                  <tr class="sel"><td class="id">policy/pii-gate</td><td><span class="op" data-k="retrieval">control</span></td><td class="r">42</td><td class="r">0</td><td><span class="wy-badge" data-tone="ok">enforced</span></td></tr>
+                  <tr><td class="id">policy/ml-prod</td><td><span class="op" data-k="server">server</span></td><td class="r">18</td><td class="r">1</td><td><span class="wy-badge" data-tone="warn">1 override</span></td></tr>
+                  <tr><td class="id">policy/ownership</td><td><span class="op" data-k="retrieval">control</span></td><td class="r">318</td><td class="r">3</td><td><span class="wy-badge" data-tone="warn">3 unowned</span></td></tr>
+                  <tr><td class="id">policy/retention-90d</td><td><span class="op" data-k="server">server</span></td><td class="r">96</td><td class="r">0</td><td><span class="wy-badge" data-tone="ok">enforced</span></td></tr>
+                </tbody>
+              </table></div>
+            </div>
+            <div class="wy-card">
+              <div class="wy-card-head"><span>Audit</span><span class="v">recorded, not remembered</span></div>
+              <div class="wy-card-body">
+                <div class="fb"><span class="wy-badge" data-tone="danger">✕</span>gate override: eval/precision-k<span class="who">· rl-admin</span><span class="t">2d</span></div>
+                <div class="fb"><span class="wy-badge" data-tone="ok">✓</span>deploy approved: payments-svc@v12<span class="who">· policy/ml-prod</span><span class="t">6h</span></div>
+                <div class="fb"><span class="wy-badge" data-tone="warn">!</span>card missing owner: txns-2026q2<span class="who">· policy/ownership</span><span class="t">3h</span></div>
+                <div class="fb"><span class="wy-badge" data-tone="ok">✓</span>rollback recorded: churn-v3 v3→v2<span class="who">· prod-8</span><span class="t">12m</span></div>
+                <div class="fb"><span class="wy-badge" data-tone="ok">✓</span>policy attached: pii-gate@v2<span class="who">· platform</span><span class="t">4m</span></div>
+                <div style="font-family:var(--fm);font-size:10px;color:var(--muted);margin-top:12px">record <b style="color:var(--text)">rec_4a91c7</b> · append-only · tenant-scoped</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="wy-lineage">
+          <div class="title"><img src="../logo.svg" width="14" height="14" style="border-radius:3px;display:block" alt="">WYRD · the override, connected</div>
+          <div class="chain">
+            <span class="node">eval/precision-k<small>gate</small></span>
+            <span class="edge"></span>
+            <span class="node hot">override by rl-admin<small>audit record</small></span>
+            <span class="edge"></span>
+            <span class="node">deploy prod-7<small>status</small></span>
+            <span class="edge"></span>
+            <span class="node">model/churn-v3@v3<small>card</small></span>
+            <span class="edge"></span>
+            <span class="node">drift: request_amount<small>observation</small></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script>
+/* Mode toggle — data-mode cascades from the root, exactly as ModeProvider does. */
+const root = document.getElementById('root');
+const btn = document.getElementById('toggle');
+btn.addEventListener('click', () => {
+  const next = root.dataset.mode === 'dark' ? 'light' : 'dark';
+  root.dataset.mode = next;
+  btn.textContent = next === 'dark' ? '◐ light' : '◑ dark';
+});
+
+/* All charts are hand-written inline SVG at the real fixed viewBoxes — the workbench
+   ships no chart library, so a render that used one would be lying about the build.
+   Strokes reference CSS custom properties so they follow the mode. */
+
+/* Spark — 90x24 polyline, sentiment by trend (Spark.svelte) */
+document.querySelectorAll('svg.sp').forEach((svg, idx) => {
+  const W = 90, H = 24, N = 24, drift = svg.dataset.drift === '1';
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const pts = [];
+  for (let i = 0; i < N; i++) {
+    const base = H * 0.62 + Math.sin(i * 1.9 + idx * 1.3) * 2.4;
+    const rise = drift && i > N * 0.6 ? (i - N * 0.6) * 1.05 : 0;
+    pts.push(`${(i / (N - 1) * W).toFixed(1)},${Math.max(2, base - rise).toFixed(1)}`);
+  }
+  svg.innerHTML = `<polyline points="${pts.join(' ')}" fill="none" stroke-width="1.6"
+    stroke="${drift ? 'var(--warn)' : 'var(--muted)'}"/>`;
+});
+
+/* Lines — 300x148 multi-series with dashed gridlines (Lines.svelte) */
+(() => {
+  const svg = document.getElementById('lines');
+  const W = 300, H = 148, N = 28;
+  // Dash pattern is a REDUNDANT channel, not decoration: --control-bar and
+  // --brand-strong collapse to 1.22:1 under deuteranopia, so p50 and p95 are
+  // indistinguishable by hue alone. The legend mirrors these patterns.
+  const series = [
+    { c: 'var(--control-bar)', base: 0.74, amp: 0.035, dash: '' },
+    { c: 'var(--brand-strong)', base: 0.50, amp: 0.055, dash: '6 3' },
+    { c: 'var(--danger)', base: 0.26, amp: 0.075, dash: '2 3' },
+  ];
+  let s = '';
+  for (let g = 1; g <= 3; g++) {
+    const y = (H / 4) * g;
+    s += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="var(--surface-2)" stroke-width="1" stroke-dasharray="3 3"/>`;
+  }
+  series.forEach((se, si) => {
+    const pts = [];
+    for (let i = 0; i < N; i++) {
+      const y = H * (se.base + Math.sin(i * 0.8 + si * 2.1) * se.amp);
+      pts.push(`${(i / (N - 1) * W).toFixed(1)},${y.toFixed(1)}`);
+    }
+    s += `<polyline points="${pts.join(' ')}" fill="none" stroke="${se.c}" stroke-width="2"` +
+         `${se.dash ? ` stroke-dasharray="${se.dash}"` : ''}/>`;
+  });
+  svg.innerHTML = s;
+})();
+
+/* Histo — 326x116 paired reference vs current bars (Histo.svelte) */
+(() => {
+  const svg = document.getElementById('histo');
+  const W = 326, H = 116, N = 9, slot = W / N;
+  const ref = [0.10, 0.26, 0.52, 0.82, 1.00, 0.78, 0.46, 0.22, 0.08];
+  const cur = [0.05, 0.14, 0.32, 0.58, 0.80, 0.94, 0.86, 0.54, 0.24];
+  let s = '';
+  for (let i = 0; i < N; i++) {
+    const bw = slot * 0.36, x = i * slot + slot * 0.10;
+    const rh = ref[i] * (H - 8), ch = cur[i] * (H - 8);
+    s += `<rect x="${x.toFixed(1)}" y="${(H - rh).toFixed(1)}" width="${bw.toFixed(1)}" height="${rh.toFixed(1)}" fill="var(--control-bar)" opacity="0.55"/>`;
+    s += `<rect x="${(x + bw + 2).toFixed(1)}" y="${(H - ch).toFixed(1)}" width="${bw.toFixed(1)}" height="${ch.toFixed(1)}" fill="var(--brand-strong)"/>`;
+  }
+  svg.innerHTML = s;
+})();
+
+/* Trend — 326x104 line with a dashed danger threshold; points above it turn danger */
+(() => {
+  const svg = document.getElementById('trend');
+  const W = 326, H = 104, N = 20, thr = 0.20, max = 0.40;
+  const vals = Array.from({ length: N }, (_, i) =>
+    0.06 + (i > 11 ? (i - 11) * 0.032 : 0) + Math.sin(i * 1.7) * 0.012);
+  const y = (v) => H - (v / max) * (H - 10) - 5;
+  const pts = vals.map((v, i) => `${(i / (N - 1) * W).toFixed(1)},${y(v).toFixed(1)}`);
+  let s = `<line x1="0" y1="${y(thr).toFixed(1)}" x2="${W}" y2="${y(thr).toFixed(1)}"
+    stroke="var(--danger)" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+  s += `<polyline points="${pts.join(' ')}" fill="none" stroke="var(--brand-strong)" stroke-width="2"/>`;
+  vals.forEach((v, i) => {
+    if (v > thr) s += `<circle cx="${(i / (N - 1) * W).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.6" fill="var(--danger)"/>`;
+  });
+  svg.innerHTML = s;
+})();
+
+/* Heatmap — CSS grid of color-mix cells. The ramp is brand blue: lime cannot darken
+   on white, so it can never carry a sequential scale. */
+(() => {
+  const el = document.getElementById('heat');
+  let html = '';
+  for (let i = 0; i < 84; i++) {
+    const v = Math.max(0, Math.min(1, (Math.sin(i * 0.7) + Math.sin(i * 0.23) + 1.6) / 3.2));
+    html += `<i style="background:color-mix(in srgb, var(--brand-strong) ${Math.round(v * 92)}%, var(--surface-2))"></i>`;
+  }
+  el.innerHTML = html;
+})();
+</script>
+</body>
+</html>

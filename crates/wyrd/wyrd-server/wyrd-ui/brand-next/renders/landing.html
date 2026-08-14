@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bohmian — Verification infrastructure for Data + AI</title>
+<link rel="icon" href="../app-icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- STIX Two Text is loaded HERE ONLY. It is the marketing italic voice, not a product
+     token: the brand rule is that Fraunces italic is a defect, and the workbench has no
+     italic serif at all. See DESIGN.md § Type. -->
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&family=Space+Grotesk:wght@400;500;700&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=STIX+Two+Text:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../theme.css">
+<link rel="stylesheet" href="renders.css">
+<style>
+  /* Marketing-only italic voice. Never a product token. */
+  .it { font-family:"STIX Two Text",Georgia,serif; font-style:italic; }
+
+  .co { background:var(--bg); color:var(--text); font-family:var(--font-sans); }
+  .co-nav { display:flex; justify-content:space-between; align-items:center; gap:20px;
+            padding:22px 0 18px; border-bottom:2px solid var(--border); flex-wrap:wrap; }
+  .co-nav .links { display:flex; gap:24px; font-size:14px; color:var(--muted); flex-wrap:wrap; }
+  .co-nav .links span { cursor:pointer; }
+  .co-nav .links span:hover { color:var(--brand-strong); }
+
+  .co-hero { padding:76px 0 52px; position:relative; }
+  .co-hero .web { position:absolute; right:0; top:0; width:52%; height:100%; opacity:.7; pointer-events:none; }
+  .kicker { font-family:var(--fm); font-size:11px; letter-spacing:.24em; text-transform:uppercase;
+            color:var(--lime-text); margin-bottom:26px; }
+  .co-hero h1 { font-family:var(--fs); font-weight:450; font-optical-sizing:auto;
+                font-size:clamp(48px,8vw,104px); letter-spacing:-0.028em; line-height:0.99;
+                max-width:9.5em; margin:0; position:relative; }
+  .co-hero h1 .accent { color:var(--brand-strong); }
+  .co-rule { width:76px; height:3px; background:var(--brand-strong); margin:30px 0 22px; }
+  .co-sub { max-width:580px; font-size:16.5px; line-height:1.7; color:var(--muted); position:relative; margin:0; }
+  .co-sub b { color:var(--text); font-weight:600; }
+  .co-ctas { margin-top:34px; display:flex; gap:14px; flex-wrap:wrap; position:relative; }
+
+  .statement { padding:56px 0 18px; border-top:2px solid var(--border); }
+  .statement h2 { font-family:var(--fs); font-weight:450; letter-spacing:-0.025em; line-height:1.14;
+                  font-size:clamp(30px,4.4vw,56px); max-width:19em; margin:0; }
+  .statement h2 .f { color:var(--lime-text); }
+  .statement h2 .w { color:var(--brand-strong); }
+  .statement .sub { font-size:16px; color:var(--muted); margin-top:18px; }
+
+  .layers { display:grid; grid-template-columns:1fr 1fr; gap:22px; margin:30px 0 52px; }
+  @media (max-width:860px){ .layers { grid-template-columns:1fr; } }
+  .layer { border:2px solid var(--border); border-radius:var(--r); padding:24px 26px 22px;
+           background:var(--surface); box-shadow:6px 6px 0 0 var(--shadow); position:relative; min-width:0; }
+  .layer .avail { position:absolute; top:20px; right:20px; font-family:var(--fm); font-size:9.5px;
+                  letter-spacing:.14em; text-transform:uppercase; padding:4px 9px; border-radius:3px; border:2px solid; }
+  .layer.fathom { border-color:var(--lime-text); }
+  .layer.fathom .avail { color:var(--lime-text); border-color:var(--lime-text); }
+  .layer.wyrd { border-color:var(--brand-strong); }
+  .layer.wyrd .avail { color:var(--brand-strong); border-color:var(--brand-strong); }
+  .layer .name { font-family:var(--fs); font-weight:600; font-size:27px; }
+  .layer.fathom .name { color:var(--lime-text); }
+  .layer.wyrd .name { color:var(--brand-strong); }
+  .layer .role { font-family:var(--fm); font-size:10.5px; letter-spacing:.16em; text-transform:uppercase;
+                 color:var(--muted); margin:7px 0 14px; }
+  .layer p { font-size:14px; line-height:1.7; color:var(--muted); max-width:46ch; margin:0; }
+  .layer p b { color:var(--text); font-weight:600; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+  .chips span { font-family:var(--fm); font-size:10.5px; padding:6px 11px; border-radius:var(--r);
+                border:2px solid var(--border); background:var(--surface-2); color:var(--text); }
+  .chips .grp { font-family:var(--fm); font-size:9px; letter-spacing:.15em; text-transform:uppercase;
+                color:var(--muted); width:100%; border:0; background:none; padding:4px 0 0; }
+
+  .arch { padding:0 0 72px; }
+  .arch h2 { font-family:var(--fs); font-weight:500; font-size:clamp(26px,3.4vw,40px);
+             letter-spacing:-0.02em; margin:0 0 7px; }
+  .arch h2 .f { color:var(--lime-text); }
+  .arch h2 .w { color:var(--brand-strong); }
+  .arch .sub { font-size:15px; color:var(--muted); margin-bottom:26px; }
+  .band { border:2px solid var(--border); border-radius:var(--r); overflow:hidden; background:var(--surface); }
+  .arow { display:grid; grid-template-columns:150px 1fr; border-bottom:2px solid var(--border); }
+  .arow:last-child { border-bottom:0; }
+  @media (max-width:700px){ .arow { grid-template-columns:1fr; } }
+  .awho { padding:18px 16px; border-right:2px solid var(--border); font-family:var(--fh);
+          font-weight:700; font-size:16px; display:flex; flex-direction:column; gap:4px; justify-content:center; }
+  .awho small { font-family:var(--fm); font-size:9px; letter-spacing:.16em; text-transform:uppercase;
+                color:var(--muted); font-weight:400; }
+  .arow.fathom .awho { color:var(--lime-text); }
+  .arow.wyrd .awho { color:var(--brand-strong); }
+  .arow.you .awho { color:var(--muted); }
+  .acells { display:flex; flex-wrap:wrap; gap:9px; padding:16px; align-items:center; }
+  .acell { font-family:var(--fm); font-size:11px; padding:7px 12px; border-radius:var(--r);
+           border:2px solid var(--border); background:var(--surface-2); color:var(--text); }
+  .acell.f { border-color:var(--lime-text); color:var(--lime-text); }
+  .acell.w { border-color:var(--brand-strong); color:var(--brand-strong); }
+  .aphase { font-family:var(--fm); font-size:9px; letter-spacing:.15em; text-transform:uppercase;
+            color:var(--muted); width:100%; }
+
+  .lang { padding:0 0 80px; }
+  .lang table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  .lang th { font-family:var(--fm); font-size:10px; letter-spacing:.18em; text-transform:uppercase;
+             color:var(--muted); text-align:left; padding:10px 14px; border-bottom:2px solid var(--border); }
+  .lang td { padding:13px 14px; border-bottom:2px solid var(--surface-2); vertical-align:top; line-height:1.6; }
+  .lang td:first-child { color:var(--brand-strong); font-weight:600; width:30%; }
+  .lang td:nth-child(2) { color:var(--muted); width:28%; }
+  .lang td:last-child { color:var(--muted); }
+  .backlink { font-family:var(--fm); font-size:11px; color:var(--brand-strong); text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="wy-root co" data-mode="dark" id="root">
+<button class="mode-toggle" id="toggle">◐ light</button>
+
+<div class="pg">
+
+  <div class="co-nav">
+    <div class="wy-brand">
+      <img src="../logo.svg" width="30" height="30" alt="">
+      <span class="wy-wordmark" style="font-size:23px">bohmian</span>
+    </div>
+    <div class="links it"><span>Fathom</span><span>Wyrd</span><span>Docs</span><span>Pricing</span><span>Sign in</span></div>
+  </div>
+
+  <div class="co-hero">
+    <svg class="web" id="web" preserveAspectRatio="none"></svg>
+    <div class="kicker">Verification infrastructure for Data + AI</div>
+    <h1>Build systems that can <span class="accent">verify themselves</span>.</h1>
+    <div class="co-rule"></div>
+    <p class="co-sub"><b>bohmian verifies AI and data systems.</b> It reviews the code before it
+      ships, watches the behavior once it runs, and keeps the link between what you built and
+      what it's actually doing. Not confidence. <b>Evidence.</b></p>
+    <div class="co-ctas">
+      <button class="wy-btn" data-variant="secondary">Try Fathom</button>
+      <button class="wy-btn" data-variant="ghost">View a sample verification</button>
+    </div>
+  </div>
+
+  <div class="statement">
+    <h2><span class="f">Fathom</span> verifies before it ships. <span class="w">Wyrd</span> observes
+      while it runs, and governs across the lifecycle.</h2>
+    <div class="sub it">Two layers, one record underneath, zero changes to where your code executes.</div>
+  </div>
+
+  <div class="layers">
+    <div class="layer fathom">
+      <span class="avail">available today</span>
+      <div class="name">Fathom</div>
+      <div class="role">the intelligence · verifies</div>
+      <p><b>Catches what code review misses.</b> Your linters pass, your tests pass, and the model
+        still ships with label leakage. Fathom reviews every Data/ML pull request for the failures
+        that actually hurt: leaked labels, flawed assumptions, broken eval gates. It shows the blast
+        radius of each change, blocks the risky ones until the evidence clears, and opens the fix PR
+        itself. In production, it reads Wyrd's record and names the deploy that caused the incident.</p>
+      <div class="chips">
+        <span class="grp">verify</span>
+        <span>pull-request review</span><span>impact radius</span><span>deploy gates</span>
+        <span>fix PRs</span><span>probable cause</span>
+      </div>
+    </div>
+    <div class="layer wyrd">
+      <span class="avail">coming soon</span>
+      <div class="name">Wyrd</div>
+      <div class="role">the record · observes + governs</div>
+      <p><b>Knows what's running, and can prove it.</b> Wyrd keeps a live record of every model,
+        agent, prompt, dataset, and service you operate. Each drift signal, trace, and eval links
+        back to the exact code and version behind it, so root cause takes minutes instead of a war
+        room. Gate overrides and sign-offs are recorded, not remembered. When an auditor asks, you
+        have an answer.</p>
+      <div class="chips">
+        <span class="grp">observe</span>
+        <span>drift</span><span>otel traces</span><span>evals</span><span>observations</span>
+        <span class="grp">govern</span>
+        <span>cards</span><span>lineage</span><span>policy</span><span>audit</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="arch">
+    <h2><span class="w">Wyrd</span> sees. <span class="f">Fathom</span> judges. Your systems run.</h2>
+    <div class="sub it">You keep your runtime, your cloud, and your GitHub. bohmian keeps the receipts.</div>
+    <div class="band">
+      <div class="arow fathom">
+        <div class="awho">Fathom<small>verifies</small></div>
+        <div class="acells">
+          <span class="aphase">pre-runtime</span>
+          <span class="acell f">code review</span><span class="acell f">impact checks</span>
+          <span class="acell f">deploy verification</span><span class="acell f">fix PRs</span>
+          <span class="aphase" style="margin-top:6px">runtime</span>
+          <span class="acell f">regression verdicts</span><span class="acell f">probable cause</span>
+        </div>
+      </div>
+      <div class="arow wyrd">
+        <div class="awho">Wyrd<small>observes + governs</small></div>
+        <div class="acells">
+          <span class="aphase">observe</span>
+          <span class="acell w">drift</span><span class="acell w">otel</span>
+          <span class="acell w">evals</span><span class="acell w">observations</span>
+          <span class="aphase" style="margin-top:6px">govern</span>
+          <span class="acell w">cards</span><span class="acell w">lineage</span>
+          <span class="acell w">policy</span><span class="acell w">audit</span>
+        </div>
+      </div>
+      <div class="arow you">
+        <div class="awho">You<small>run</small></div>
+        <div class="acells">
+          <span class="acell">github</span><span class="acell">your runtime</span>
+          <span class="acell">your agents</span><span class="acell">your models</span>
+          <span class="acell">your cloud</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="lang">
+    <div class="pg-head" style="padding-left:0"><span class="num">—</span><h2>Language</h2>
+      <span class="note"><a class="backlink" href="index.html">← brand index</a></span></div>
+    <p class="pg-sub">Copy rules for every bohmian surface. The vocabulary is two layers, not three stages.</p>
+    <table>
+      <thead><tr><th>Say</th><th>Not</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>bohmian (lowercase, always)</td><td><s>Bohmian</s></td><td>including at the start of a sentence, a heading, or a title. The wordmark is typeset in Fraunces 600, never an SVG asset</td></tr>
+        <tr><td>Fathom — the intelligence that verifies</td><td><s>Verify (as a product name)</s></td><td>the name carries equity; the descriptor carries legibility. never ship Fathom naked on a buyer surface</td></tr>
+        <tr><td>Wyrd — the record that observes and governs</td><td><s>Observe, Govern (as product names)</s></td><td>observe and govern are both Wyrd. promoting them to peers flattens a real two-layer architecture into a generic lifecycle</td></tr>
+        <tr><td>two layers: judgment and record</td><td><s>three stages / three pillars</s></td><td>the lifecycle is 1 + 2, not 3. Fathom sits on top of Wyrd; column headers must never say otherwise</td></tr>
+        <tr><td>blue primary, lime secondary</td><td><s>lime belongs to Fathom</s></td><td>lime is the second voice, not a Fathom monopoly. Fathom is named by the pill, the card head, and the label — colour alone is too fragile to carry authorship</td></tr>
+        <tr><td>glyph + colour, tick + colour</td><td><s>colour alone</s></td><td>--ok and --danger are 1.11:1 under deuteranopia. pass and fail must never differ by hue only</td></tr>
+        <tr><td>verify, verified, verification</td><td><s>monitor (as the headline verb)</s></td><td>verification is the claim; observation is Wyrd's input to it</td></tr>
+        <tr><td>evidence, finding, verdict</td><td><s>insight, signal (alone)</s></td><td>every claim links to what proves it</td></tr>
+        <tr><td>connections, lineage, "the record behind this"</td><td><s>graph, knowledge graph</s></td><td>concrete relationship, not infrastructure jargon</td></tr>
+        <tr><td>recorded, not remembered</td><td><s>compliance-ready</s></td><td>show the mechanism (audit records), not the category claim</td></tr>
+        <tr><td>—</td><td><s>particle, wave, quantum, observer, any physics</s></td><td>the name carries the depth; the copy carries the proof</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</div>
+</div>
+
+<script>
+const root = document.getElementById('root');
+const btn = document.getElementById('toggle');
+btn.addEventListener('click', () => {
+  const next = root.dataset.mode === 'dark' ? 'light' : 'dark';
+  root.dataset.mode = next;
+  btn.textContent = next === 'dark' ? '◐ light' : '◑ dark';
+});
+
+/* Connection web — left = changes, middle = the system of record, right = observed
+   signals. Edges into the record are Wyrd blue; edges out to verdicts are Fathom lime.
+   No physics narrative: the name carries the depth, the copy carries the proof. */
+(() => {
+  const svg = document.getElementById('web');
+  const W = 800, H = 620;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const left = [0.10, 0.26, 0.42, 0.58, 0.74, 0.90].map((t) => [40, t * H]);
+  const mid = [0.30, 0.50, 0.70].map((t) => [W * 0.48, t * H]);
+  const right = [0.08, 0.22, 0.38, 0.54, 0.70, 0.86].map((t) => [W - 30, t * H]);
+  let s = '';
+  left.forEach(([x1, y1], i) => {
+    const [x2, y2] = mid[i % 3];
+    s += `<path d="M ${x1} ${y1} C ${x1 + 150} ${y1}, ${x2 - 150} ${y2}, ${x2} ${y2}"
+      stroke="var(--brand-strong)" stroke-width="1" fill="none" opacity="0.42"/>`;
+  });
+  right.forEach(([x2, y2], i) => {
+    const [x1, y1] = mid[(i + 1) % 3];
+    s += `<path d="M ${x1} ${y1} C ${x1 + 130} ${y1}, ${x2 - 130} ${y2}, ${x2} ${y2}"
+      stroke="var(--lime-text)" stroke-width="1" fill="none" opacity="0.4"/>`;
+  });
+  left.forEach(([x, y]) => { s += `<circle cx="${x}" cy="${y}" r="3.5" fill="var(--brand-strong)" opacity="0.85"/>`; });
+  mid.forEach(([x, y]) => { s += `<rect x="${x - 5}" y="${y - 5}" width="10" height="10" rx="2.5" fill="var(--text)"/>`; });
+  right.forEach(([x, y]) => { s += `<circle cx="${x}" cy="${y}" r="3.5" fill="var(--lime-text)" opacity="0.9"/>`; });
+  svg.innerHTML = s;
+})();
+</script>
+</body>
+</html>

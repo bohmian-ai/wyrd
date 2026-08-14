@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bohmian · Wyrd — Brand</title>
+<link rel="icon" href="../app-icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&family=Space+Grotesk:wght@400;500;700&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../theme.css">
+<link rel="stylesheet" href="renders.css">
+<style>
+  /* Page-specific layout only. Colour comes from ../theme.css, never from here. */
+  .hero-mark { display:flex; align-items:center; gap:22px; padding:44px 0 10px; flex-wrap:wrap; }
+  .hero-mark img { width:96px; height:96px; border-radius:22px; display:block; }
+  .hero-mark .wm { font-family:var(--fs); font-weight:600; font-size:56px; letter-spacing:-0.02em; line-height:1; }
+  .hero-mark .role { font-family:var(--fm); font-size:11px; letter-spacing:.22em; text-transform:uppercase; color:var(--muted); margin-top:10px; }
+  .nav-cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin:8px 0 8px; }
+  .nav-cards a { text-decoration:none; color:inherit; display:block; }
+  .nav-cards .wy-card-body h3 { font-family:var(--fh); font-size:17px; margin:0 0 6px; }
+  .nav-cards .wy-card-body p { font-family:var(--font-sans); font-size:12.5px; line-height:1.6; color:var(--muted); margin:0; }
+  .swatches { display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:10px; }
+  .sw { border:2px solid var(--border); border-radius:var(--r); overflow:hidden; background:var(--surface); }
+  .sw .chip { height:52px; border-bottom:2px solid var(--border); }
+  .sw .meta { padding:7px 9px; font-family:var(--fm); font-size:9.5px; line-height:1.5; }
+  .sw .meta b { display:block; font-size:10.5px; color:var(--text); }
+  .sw .meta code { color:var(--muted); }
+  .grp-h { font-family:var(--fm); font-size:9px; font-weight:700; letter-spacing:.16em; text-transform:uppercase; color:var(--muted); margin:20px 0 9px; }
+  .type-row { border:2px solid var(--border); border-radius:var(--r); background:var(--surface); padding:14px 16px; margin-bottom:11px; }
+  .type-row .lbl { font-family:var(--fm); font-size:9px; font-weight:700; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin-bottom:8px; }
+  .type-row .spec { font-family:var(--fm); font-size:10px; color:var(--muted); margin-top:8px; }
+  .own { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:800px){ .own { grid-template-columns:1fr; } }
+  .own .wy-card-body p { font-family:var(--font-sans); font-size:13px; line-height:1.65; color:var(--muted); margin:8px 0 0; }
+  .own .name { font-family:var(--fs); font-weight:600; font-size:26px; }
+  .own .r { font-family:var(--fm); font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin-top:5px; }
+</style>
+</head>
+<body>
+<div class="wy-root" data-mode="dark" id="root">
+<button class="mode-toggle" id="toggle">◐ light</button>
+
+<div class="pg">
+
+  <div class="hero-mark">
+    <img src="../app-icon.svg" alt="bohmian">
+    <div>
+      <div class="wm">bohmian</div>
+      <div class="role">brand system · wyrd workbench</div>
+    </div>
+  </div>
+
+  <p class="pg-sub" style="margin-top:22px">
+    Generated from <code>brand-next/palette.json</code>. Every surface on this page reads
+    <code>var(--token)</code> out of <code>../theme.css</code> — no render restates a hex,
+    so the reference cannot drift from the palette. Derived from
+    <code>.dev/assets/bohmian/bohmian-brand-mockups-v4.html</code>.
+  </p>
+
+  <div class="nav-cards">
+    <a href="styleguide.html"><div class="wy-card" data-variant="raised"><div class="wy-card-body">
+      <h3>Styleguide →</h3><p>Tokens, type, geometry, and all 26 component contracts. Light and dark side by side.</p>
+    </div></div></a>
+    <a href="workbench.html"><div class="wy-card" data-variant="raised"><div class="wy-card-body">
+      <h3>Workbench →</h3><p>The six Wyrd UI surfaces in real shell chrome: cards, card detail, drift, traces, evals, policy &amp; audit.</p>
+    </div></div></a>
+    <a href="landing.html"><div class="wy-card" data-variant="raised"><div class="wy-card-body">
+      <h3>Landing →</h3><p>The bohmian company surface. Editorial register — Fraunces display, the two-layer product map.</p>
+    </div></div></a>
+  </div>
+
+  <hr class="pg-rule">
+  <div class="pg-head"><span class="num">01</span><h2>The two layers</h2>
+    <span class="note">Blue is primary, lime is secondary. Fathom identity is carried by the pill, the card head, and the label — not by owning a colour.</span></div>
+  <div class="own">
+    <div class="wy-card"><div class="wy-card-body">
+      <div class="name" style="color:var(--brand-strong)">Wyrd</div>
+      <div class="r">the record · observes + governs</div>
+      <p>Keeps a live record of every model, agent, prompt, dataset, and service you operate.
+         Drift, traces, evals, cards, lineage, policy, audit.</p>
+      <div class="btn-row" style="margin-top:14px">
+        <span class="wy-pill" data-product="wyrd">WYRD</span>
+        <button class="wy-btn" data-variant="primary">Run eval</button>
+      </div>
+    </div></div>
+    <div class="wy-card"><div class="wy-card-body">
+      <div class="name" style="color:var(--lime-text)">Fathom</div>
+      <div class="r">the intelligence · verifies</div>
+      <p>Reviews the change before it ships, gates the deploy on evidence, opens the fix PR,
+         and renders verdicts on top of Wyrd's record.</p>
+      <div class="btn-row" style="margin-top:14px">
+        <span class="wy-pill" data-product="fathom">FATHOM</span>
+        <button class="wy-btn" data-variant="secondary">Open fix PR</button>
+      </div>
+    </div></div>
+  </div>
+
+  <hr class="pg-rule">
+  <div class="pg-head"><span class="num">01b</span><h2>Never colour alone</h2>
+    <span class="note">Five pairs collapse under deuteranomaly (~6% of men). Every meaning carries a second, non-chromatic channel.</span></div>
+  <div class="wy-card"><div class="wy-card-body">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+      <span class="wy-badge" data-tone="ok">healthy</span>
+      <span class="wy-badge" data-tone="warn">drifted</span>
+      <span class="wy-badge" data-tone="danger">regressed</span>
+      <span class="wy-badge" data-tone="fathom">verified</span>
+      <span class="wy-badge">no owner</span>
+    </div>
+    <div style="font-family:var(--fm);font-size:10.5px;color:var(--muted);line-height:1.8">
+      <div><b style="color:var(--text)">Status carries a glyph.</b> <code>--ok</code> and <code>--danger</code> simulate to <code>#898948</code> / <code>#828219</code> under deuteranopia — 1.11:1. Pass and fail are the same colour.</div>
+      <div><b style="color:var(--text)">Thresholds carry a tick.</b> A metric bar draws a 2px rule at the threshold, so pass/fail is positional.</div>
+      <div><b style="color:var(--text)">Series carry a dash.</b> <code>--control-bar</code> and <code>--brand-strong</code> are 1.22:1 — p50 and p95 need the pattern.</div>
+    </div>
+    <div style="margin-top:16px;max-width:340px">
+      <div class="mrow"><span>precision@k</span><div class="bar" style="--thr:80%"><i style="width:79%" data-tone="danger"></i></div><span class="v" data-tone="danger">0.79</span></div>
+      <div class="mrow"><span>recall@k</span><div class="bar" style="--thr:80%"><i style="width:88%" data-tone="ok"></i></div><span class="v" data-tone="ok">0.88</span></div>
+    </div>
+  </div></div>
+
+  <hr class="pg-rule">
+  <div class="pg-head"><span class="num">02</span><h2>Wordmark</h2>
+    <span class="note">Typeset, not an asset. Lowercase always — including at the start of a sentence.</span></div>
+  <div class="wy-card"><div class="wy-card-body">
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:16px">
+      <img src="../logo.svg" width="34" height="34" style="border-radius:8px;display:block" alt="">
+      <span class="wy-wordmark" style="font-size:26px">bohmian</span>
+      <span class="wy-pill" data-product="wyrd">WYRD</span>
+      <span style="font-family:var(--fm);font-size:10px;color:var(--muted);margin-left:8px">← app chrome, left to right</span>
+    </div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">
+      <div style="text-align:center"><img src="../logo.svg" width="72" height="72" style="border-radius:16px;display:block" alt="logo.svg">
+        <div style="font-family:var(--fm);font-size:9px;color:var(--muted);margin-top:7px">logo.svg</div></div>
+      <div style="text-align:center"><img src="../logo-light.svg" width="72" height="72" style="border-radius:16px;display:block" alt="logo-light.svg">
+        <div style="font-family:var(--fm);font-size:9px;color:var(--muted);margin-top:7px">logo-light.svg</div></div>
+      <div style="text-align:center"><img src="../app-icon.svg" width="72" height="72" style="display:block" alt="app-icon.svg">
+        <div style="font-family:var(--fm);font-size:9px;color:var(--muted);margin-top:7px">app-icon.svg</div></div>
+    </div>
+  </div></div>
+
+  <hr class="pg-rule">
+  <div class="pg-head"><span class="num">03</span><h2>Type</h2>
+    <span class="note">Four faces, one job each. Fraunces never enters the workbench.</span></div>
+  <div id="type"></div>
+
+  <hr class="pg-rule">
+  <div class="pg-head"><span class="num">04</span><h2>Palette</h2>
+    <span class="note">Rendered live from palette.json. Both mode columns come from the same source object.</span></div>
+  <div id="palette"><p class="pg-sub" id="pal-fallback">
+    Loading palette.json… if this text persists, the page was opened from <code>file://</code> in a
+    browser that blocks local <code>fetch</code>. Serve the folder instead:
+    <code>python3 -m http.server</code> from <code>brand-next/</code>.
+  </p></div>
+
+</div>
+</div>
+
+<script>
+/* Mode toggle — mirrors ModeProvider: data-mode cascades from the root. */
+const root = document.getElementById('root');
+const btn = document.getElementById('toggle');
+btn.addEventListener('click', () => {
+  const next = root.dataset.mode === 'dark' ? 'light' : 'dark';
+  root.dataset.mode = next;
+  btn.textContent = next === 'dark' ? '◐ light' : '◑ dark';
+});
+
+/* Type specimens — driven off the same --font-* custom properties theme.css emits. */
+const FACES = [
+  ['--font-sans',    'sans',    'body copy, prose, form labels',                 'Verification infrastructure for Data + AI', '400 / 500 / 600 / 700'],
+  ['--font-display', 'display', 'headings, KPI numerals, sidebar brand',         'Wyrd sees. Fathom judges.',                 '700 · -0.02em'],
+  ['--font-mono',    'mono',    'all data — tables, badges, IDs, code, nav',     'tr_9f21 · 4.21s · 12.4k · $42.10 · +2.8σ',  '8.5–12px · uppercase .5px'],
+  ['--font-serif',   'serif',   'loud altitude and marketing only',              'Build systems that can verify themselves.', '450 / 600 · never in the workbench'],
+];
+document.getElementById('type').innerHTML = FACES.map(([tok, name, job, sample, spec]) => `
+  <div class="type-row">
+    <div class="lbl">${name} · ${job}</div>
+    <div style="font-family:var(${tok}); font-size:${name === 'mono' ? '15' : name === 'serif' ? '30' : '26'}px; font-weight:${name === 'display' ? 700 : name === 'serif' ? 600 : 400}; letter-spacing:${name === 'serif' || name === 'display' ? '-0.02em' : 'normal'}; line-height:1.25;">${sample}</div>
+    <div class="spec"><code>${tok}</code> — ${spec}</div>
+  </div>`).join('');
+
+/* Palette — read from palette.json so this page can never disagree with the tokens. */
+fetch('../palette.json')
+  .then((r) => r.json())
+  .then((p) => {
+    const groups = {};
+    for (const [name, def] of Object.entries(p.tokens)) {
+      (groups[def.group] ||= []).push([name, def]);
+    }
+    document.getElementById('palette').innerHTML = Object.entries(groups).map(([g, items]) => `
+      <div class="grp-h">${g}</div>
+      <div class="swatches">${items.map(([name, def]) => `
+        <div class="sw">
+          <div class="chip" style="background:${def.light}"></div>
+          <div class="chip" style="background:${def.dark}; border-bottom:0"></div>
+          <div class="meta" style="border-top:2px solid var(--border)">
+            <b>${name}</b>
+            <code>${def.light} · ${def.dark}</code>
+          </div>
+        </div>`).join('')}</div>`).join('');
+  })
+  .catch(() => {
+    document.getElementById('pal-fallback').style.color = 'var(--danger)';
+  });
+</script>
+</body>
+</html>

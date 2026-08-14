@@ -1,0 +1,81 @@
+{
+  "name": "bohmian · Wyrd",
+  "description": "Canonical token source for the Wyrd design system under the bohmian brand. Edit here, then run `node brand-next/gen-theme.mjs` to regenerate theme.css. Consumed directly by agents/A2UI; the human/visual reference is DESIGN.md + ./renders/styleguide.html. Derived from .dev/assets/bohmian/bohmian-brand-mockups-v4.html (approved).",
+  "modes": ["light", "dark"],
+  "scale": {
+    "fonts": {
+      "sans": "\"Archivo\", system-ui, sans-serif",
+      "display": "\"Space Grotesk\", \"Archivo\", system-ui, sans-serif",
+      "mono": "\"JetBrains Mono\", monospace",
+      "serif": "\"Fraunces\", Georgia, serif"
+    },
+    "radius": "5px",
+    "shadow": { "sm": "3px", "md": "6px", "lg": "10px" }
+  },
+  "tokens": {
+    "--bg":            { "group": "surface", "light": "#f2f0ea", "dark": "#0b0c12", "role": "page / main background — warm paper on light, blue-cast near-black on dark" },
+    "--surface":       { "group": "surface", "light": "#ffffff", "dark": "#12141c", "role": "card / table / header surface" },
+    "--surface-2":     { "group": "surface", "light": "#eceadf", "dark": "#1a1d28", "role": "insets, hover, pills, code blocks" },
+
+    "--border":        { "group": "ink", "light": "#101014", "dark": "#252838", "role": "2px ink borders (always present, never hairline)" },
+    "--shadow":        { "group": "ink", "light": "#101014", "dark": "#1e2130", "role": "hard-offset zero-blur shadow color" },
+
+    "--text":          { "group": "text", "light": "#101014", "dark": "#e6e4da", "role": "body text — LOCKED for readability (~17:1 light, ~14:1 dark). Do not re-tune." },
+    "--muted":         { "group": "text", "light": "#6b6b76", "dark": "#84879a", "role": "labels, metadata, secondary text" },
+
+    "--brand":         { "group": "brand", "light": "#2745e8", "dark": "#1a2040", "role": "brand blue fill (button/chip), panel top-bar. Collapses onto --brand-strong in light and onto --brand-soft in dark; the tokens stay distinct because their roles differ per mode." },
+    "--brand-strong":  { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "links, selected refs, big stats, llm span kind, heat ramp" },
+    "--brand-soft":    { "group": "brand", "light": "#e9edfd", "dark": "#1a2040", "role": "selection / hover row wash, panel backgrounds" },
+    "--brand-btn":     { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "primary button fill" },
+    "--brand-btn-ink": { "group": "brand", "light": "#ffffff", "dark": "#0b0c12", "role": "text on the primary button" },
+
+    "--lime":          { "group": "acid", "light": "#c5f23c", "dark": "#c5f23c", "role": "secondary accent — the second voice after brand blue. Fathom surfaces, the client/runtime plane, and secondary emphasis. Bright lime is a FILL only; it is 1.30:1 on white and can never be text or a thin bar there." },
+    "--lime-ink":      { "group": "acid", "light": "#101014", "dark": "#101014", "role": "text on lime fills (both modes — safe because --lime is mode-invariant)" },
+    "--lime-text":     { "group": "acid", "light": "#4a7a06", "dark": "#c5f23c", "role": "lime as text or as a thin bar: raw lime on dark, darkened lime on light. 5.15:1 on white." },
+
+    "--client":        { "group": "line", "light": "#4a7a06", "dark": "#c5f23c", "role": "the Line — client/runtime plane. This IS lime, mode-split so it survives a light surface (5.15:1 on white vs 1.30:1 for raw lime)." },
+    "--client-bar":    { "group": "line", "light": "#4a7a06", "dark": "#c5f23c", "role": "client/agent kind left-bar + indicators. 2.03:1 luminance separation from --server-bar amber." },
+    "--server":        { "group": "line", "light": "#f2a23c", "dark": "#f2a23c", "role": "the Line — server/enterprise plane fill" },
+    "--server-bar":    { "group": "line", "light": "#ec8b14", "dark": "#f2a23c", "role": "server/tool kind left-bar + indicators (darkened on light)" },
+    "--control":       { "group": "line", "light": "#7cc4e8", "dark": "#6fb3d6", "role": "the Line — control/deploy plane fill" },
+    "--control-bar":   { "group": "line", "light": "#2f6f9e", "dark": "#6fb3d6", "role": "control/retrieval kind left-bar + indicators (darkened on light). Steel blue: near brand blue but never a stand-in for brand identity." },
+
+    "--ok":            { "group": "status", "light": "#2f9e44", "dark": "#7ee081", "role": "healthy / pass / success — FILL and bar use only" },
+    "--warn":          { "group": "status", "light": "#ec8b14", "dark": "#f2a23c", "role": "drift / caution / warning — FILL and bar use only" },
+    "--danger":        { "group": "status", "light": "#d2402a", "dark": "#e8615a", "role": "fail / error / removed (overrides kind) — FILL and bar use only" },
+    "--ok-text":       { "group": "status", "light": "#247b35", "dark": "#7ee081", "role": "healthy AS TEXT. Raw --ok is 3.01:1 as a badge label on light; this is the darkest hue-preserving value clearing 4.5:1. Dark mode already passes, so it is unchanged there." },
+    "--warn-text":     { "group": "status", "light": "#9c5c0d", "dark": "#f2a23c", "role": "caution AS TEXT. Raw --warn is 2.28:1 as a badge label on light. Also decouples warning text from --server-bar, which shares --warn's hex." },
+    "--danger-text":   { "group": "status", "light": "#c03a26", "dark": "#e8615a", "role": "failure AS TEXT. Raw --danger is 3.94:1 as a badge label on light." },
+
+    "--hero-bg":       { "group": "hero", "light": "#2745e8", "dark": "#1a2040", "role": "loud hero block background" },
+    "--hero-ink":      { "group": "hero", "light": "#ffffff", "dark": "#e9edfd", "role": "text on hero block" },
+    "--ink-on-fill":   { "group": "hero", "light": "#101014", "dark": "#101014", "role": "always-dark text on bright fills" },
+
+    "--r":             { "group": "geometry", "light": "5px", "dark": "5px", "role": "radius — locked at 5px (true circles only for dots/avatars)" }
+  },
+
+  "$pairs": "Contrast contract, asserted by gen-theme.mjs in BOTH modes. Every foreground/background pairing the system actually renders is declared here so a palette edit that breaks one fails the build instead of shipping. `fill` may be a token name or {mix:[a,b],pct} for a color-mix() background. `min` is the WCAG floor for the role: 4.5 for text, 3.0 for non-text UI (WCAG 1.4.11), 7.0 where we hold ourselves to AAA. The reason this exists: --ink-on-fill and --lime-ink are mode-INVARIANT, so they are only safe on a mode-invariant fill; and --brand collapses onto --brand-btn-ink in dark (1.23:1) while looking fine in light (6.77:1).",
+  "pairs": [
+    { "ink": "--text", "fill": "--bg", "min": 7.0, "role": "body text on page" },
+    { "ink": "--text", "fill": "--surface", "min": 7.0, "role": "body text on card" },
+    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "labels, metadata" },
+    { "ink": "--brand-strong", "fill": "--surface", "min": 4.5, "role": "links, big stats" },
+    { "ink": "--lime-text", "fill": "--surface", "min": 4.5, "role": "lime as text" },
+
+    { "ink": "--brand-btn-ink", "fill": "--brand-btn", "min": 4.5, "role": "primary button label" },
+    { "ink": "--lime-ink", "fill": "--lime", "min": 4.5, "role": "label on a lime fill" },
+    { "ink": "--hero-ink", "fill": "--hero-bg", "min": 4.5, "role": "hero copy" },
+    { "ink": "--text", "fill": { "mix": ["--lime", "--surface"], "pct": 0.26 }, "min": 4.5, "role": "Fathom card head label" },
+
+    { "ink": "--ok-text", "fill": { "mix": ["--ok-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "ok badge label" },
+    { "ink": "--warn-text", "fill": { "mix": ["--warn-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "warn badge label" },
+    { "ink": "--danger-text", "fill": { "mix": ["--danger-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "danger badge label" },
+    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "neutral badge label — untinted; a 12% --muted tint lands at 4.46:1 in dark, and 'neutral' means no status, so it gets no fill" },
+
+    { "ink": "--client-bar", "fill": "--surface", "min": 3.0, "role": "client kind bar (non-text)" },
+    { "ink": "--server-bar", "fill": "--surface", "min": 2.5, "role": "server kind bar (non-text) — 2.54:1, inherited; see DESIGN.md" },
+    { "ink": "--control-bar", "fill": "--surface", "min": 3.0, "role": "control kind bar (non-text)" },
+    { "ink": "--ok", "fill": "--surface", "min": 3.0, "role": "ok bar / dot (non-text)" },
+    { "ink": "--danger", "fill": "--surface", "min": 3.0, "role": "danger bar / dot (non-text)" }
+  ]
+}

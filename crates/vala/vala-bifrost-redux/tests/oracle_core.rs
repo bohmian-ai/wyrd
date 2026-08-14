@@ -124,6 +124,7 @@ fn composed_oracle_roles() -> vala_bifrost_redux::resources::BifrostRoleResource
             scratch_limit_bytes: Some(1024 * 1024 * 1024),
             effective_cpu: None,
             scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
         },
     )
     .expect("injected observation must satisfy the resource policy")
@@ -566,13 +567,17 @@ impl OracleFixture {
             Arc::new(OracleSlotManager::new(16, 16)),
             16,
         ));
-        let worker = Arc::new(OraclePeerWorker::new(
+        let worker_resources = composed_oracle_roles();
+        let worker = Arc::new(OraclePeerWorker::new_with_resources(
             self.role.key.node_id,
             self.role.fencing_token,
             Arc::new(DeterministicTestVerifier),
             Arc::new(NoopPeerSecurityAudit),
             reservations,
             SealedFragmentExecutor::new(table.file_io().clone()),
+            worker_resources
+                .oracle()
+                .expect("production-shaped worker Oracle capability"),
         ));
         let transports = OraclePeerTransportDirectory::new(
             self.role.key.node_id,
@@ -640,7 +645,9 @@ impl OracleFixture {
             memory: {
                 let roles = composed_oracle_roles();
                 OracleMemoryResources {
-                    governor: roles.memory_ledger(),
+                    governor: roles
+                        .memory_ledger()
+                        .expect("Oracle test topology must own its memory ledger"),
                     resources: roles
                         .oracle()
                         .expect("composition must issue the Oracle capability"),

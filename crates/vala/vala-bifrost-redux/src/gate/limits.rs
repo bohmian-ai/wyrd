@@ -1,5 +1,134 @@
 //! Unary batch bounds.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::resources::BifrostResourceError;
+use num_traits::ToPrimitive;
+
+/// Process-wide live encoded-body budget retained inside unmanaged memory.
+pub const BIFROST_TRANSPORT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+/// Smallest accounting unit used for transport body ownership.
+pub const BIFROST_TRANSPORT_QUANTUM_BYTES: usize = 64 * 1024;
+/// Largest individual encoded HTTP or tonic message admitted by Bifrost.
+pub const BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Byte-weighted process admission for encoded HTTP and tonic bodies.
+#[derive(Debug, Clone, Default)]
+pub struct BifrostTransportAdmission {
+    /// Exact rounded live ownership shared by every transport surface.
+    used_bytes: Arc<AtomicUsize>,
+}
+
+impl BifrostTransportAdmission {
+    /// Acquires the rounded declared or frame length before body allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Occupied`] when the message exceeds the
+    /// 32 MiB individual cap or the next aggregate ownership exceeds 64 MiB.
+    pub fn try_acquire(
+        &self,
+        declared_bytes: usize,
+    ) -> Result<BifrostTransportLease, BifrostResourceError> {
+        if declared_bytes > BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES {
+            record_transport("refused_message_limit", self.used_bytes());
+            return Err(BifrostResourceError::Occupied {
+                detail: "transport message exceeds the 32 MiB encoded-body limit".to_owned(),
+            });
+        }
+        let rounded = declared_bytes
+            .checked_add(BIFROST_TRANSPORT_QUANTUM_BYTES - 1)
+            .ok_or_else(|| BifrostResourceError::InvalidPlan {
+                detail: "transport admission arithmetic overflow".to_owned(),
+            })?
+            / BIFROST_TRANSPORT_QUANTUM_BYTES
+            * BIFROST_TRANSPORT_QUANTUM_BYTES;
+        if self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(rounded)
+                    .filter(|next| *next <= BIFROST_TRANSPORT_LIMIT_BYTES)
+            })
+            .is_err()
+        {
+            record_transport("refused_occupied", self.used_bytes());
+            return Err(BifrostResourceError::Occupied {
+                detail: "transport encoded-body budget is occupied".to_owned(),
+            });
+        }
+        record_transport("acquired", self.used_bytes());
+        Ok(BifrostTransportLease {
+            bytes: rounded,
+            admission: self.clone(),
+        })
+    }
+
+    /// Acquires a pessimistic maximum-body charge for unknown HTTP lengths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capacity refusal when a full 32 MiB body cannot fit.
+    pub fn try_acquire_unknown(&self) -> Result<BifrostTransportLease, BifrostResourceError> {
+        self.try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+    }
+
+    /// Returns exact rounded live ownership for telemetry and tests.
+    #[must_use]
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+/// Exact RAII ownership for one encoded transport body.
+#[derive(Debug)]
+pub struct BifrostTransportLease {
+    /// Rounded bytes charged before allocation.
+    bytes: usize,
+    /// Shared process admission that receives cancellation and terminal drops.
+    admission: BifrostTransportAdmission,
+}
+
+impl BifrostTransportLease {
+    /// Returns the rounded byte charge retained by this lease.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for BifrostTransportLease {
+    /// Releases exact ownership on success, error, or cancellation.
+    fn drop(&mut self) {
+        let prior = self
+            .admission
+            .used_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(
+            prior >= self.bytes,
+            "transport lease release must not underflow"
+        );
+        record_transport("released", self.admission.used_bytes());
+    }
+}
+
+/// Emits bounded transport lifecycle metrics after each atomic transition.
+fn record_transport(result: &'static str, current_bytes: usize) {
+    metrics::counter!(
+        "bifrost_resource_acquisitions_total",
+        "role" => "transport",
+        "resource" => "memory",
+        "result" => result
+    )
+    .increment(1);
+    metrics::gauge!(
+        "bifrost_resource_current_bytes",
+        "role" => "transport",
+        "resource" => "memory"
+    )
+    .set(current_bytes.to_f64().unwrap_or(f64::MAX));
+}
+
 /// Hard bounds enforced before a batch enters Scribe.
 #[derive(Clone, Debug)]
 pub struct IngestLimits {
@@ -16,5 +145,43 @@ impl Default for IngestLimits {
             max_frame_bytes: 32 * 1024 * 1024,
             max_decoding_message_size: 32 * 1024 * 1024 + 64 * 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Weighted transport admission honors exact boundaries and cancellation release.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an exact-boundary acquisition unexpectedly fails.
+    #[test]
+    fn bifrost_transport_admission_is_byte_weighted_and_exact_at_boundaries() {
+        let admission = BifrostTransportAdmission::default();
+        let first = admission
+            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .expect("first maximum body");
+        let second = admission
+            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .expect("equal aggregate boundary succeeds");
+        assert!(admission.try_acquire(1).is_err());
+        drop(first);
+        let small = (0..8)
+            .map(|_| admission.try_acquire(64 * 1024).expect("small body"))
+            .collect::<Vec<_>>();
+        assert_eq!(small.len(), 8);
+        drop(small);
+        drop(second);
+        let unknown = admission.try_acquire_unknown().expect("unknown body");
+        assert_eq!(unknown.bytes(), BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES);
+        drop(unknown);
+        assert_eq!(admission.used_bytes(), 0);
+        assert!(
+            admission
+                .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 1)
+                .is_err()
+        );
     }
 }

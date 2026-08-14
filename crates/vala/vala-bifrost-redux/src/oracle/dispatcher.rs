@@ -478,11 +478,14 @@ pub struct OraclePeerWorker {
     reservations: Arc<ReservationRegistry>,
     /// Shared immutable fragment validator and reader.
     executor: SealedFragmentExecutor,
+    /// Root Oracle capability used by every remote execution quantum.
+    resources: Option<crate::resources::OracleResources>,
 }
 
 impl OraclePeerWorker {
     /// Creates one worker runtime scoped to a single Oracle role fence.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         worker_node_id: NodeId,
         worker_fence: FencingToken,
@@ -498,6 +501,29 @@ impl OraclePeerWorker {
             security_audit,
             reservations,
             executor,
+            resources: None,
+        }
+    }
+
+    /// Creates a production worker whose remote executions acquire root memory.
+    #[must_use]
+    pub fn new_with_resources(
+        worker_node_id: NodeId,
+        worker_fence: FencingToken,
+        verifier: Arc<dyn PeerTicketVerifier>,
+        security_audit: Arc<dyn PeerSecurityAudit>,
+        reservations: Arc<ReservationRegistry>,
+        executor: SealedFragmentExecutor,
+        resources: crate::resources::OracleResources,
+    ) -> Self {
+        Self {
+            worker_node_id,
+            worker_fence,
+            verifier,
+            security_audit,
+            reservations,
+            executor,
+            resources: Some(resources),
         }
     }
 
@@ -630,6 +656,15 @@ impl OraclePeerWorker {
             }
             Err(error) => return Err(error),
         };
+        let worker_resources = match capacity {
+            WorkerCapacity::ReserveRunning => self
+                .resources
+                .as_ref()
+                .map(crate::resources::OracleResources::try_acquire_worker)
+                .transpose()
+                .map_err(|_| DispatchError::Capacity)?,
+            WorkerCapacity::LeaderAdmitted => None,
+        };
         let Ok(fragment) = SealedScanFragment::decode(&request.fragment_bytes) else {
             self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFragment)
                 .await?;
@@ -661,7 +696,7 @@ impl OraclePeerWorker {
             }
         };
         Ok(WorkerExecution {
-            stream: Box::pin(output),
+            stream: retain_worker_resources(Box::pin(output), worker_resources),
         })
     }
 
@@ -698,6 +733,87 @@ impl OraclePeerWorker {
             .append_verified_ticket_violation(tenant_id, violation)
             .await
             .map_err(|_| DispatchError::Terminal)
+    }
+}
+
+/// Retains one coarse root quantum until the remote attempt stream terminates.
+fn retain_worker_resources(
+    mut stream: WorkerAttemptStream,
+    resources: Option<crate::resources::OracleWorkerResources>,
+) -> WorkerAttemptStream {
+    Box::pin(async_stream::stream! {
+        let _resources = resources;
+        while let Some(frame) = stream.next().await {
+            yield frame;
+        }
+    })
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use crate::resources::{
+        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ORACLE_PARTITION_MEMORY_BYTES,
+        ResourceSource, SystemResourceSnapshot,
+    };
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// Production stream ownership retains and releases the advertised root quantum.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the deterministic resource topology or assertions fail.
+    #[test]
+    fn remote_worker_stream_retains_root_quantum_until_terminal_drop() {
+        let roles = BifrostRuntimeResources::from_snapshot(
+            SystemResourceSnapshot {
+                memory_limit_bytes: 576 * 1024 * 1024,
+                effective_cpu: 1,
+                scratch_capacity_bytes: 1024 * 1024 * 1024,
+                scratch_available_bytes: 1024 * 1024 * 1024,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            },
+            BifrostResourcePolicy {
+                roles: BTreeSet::from([BifrostRole::Oracle, BifrostRole::Forge]),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: None,
+                effective_cpu: None,
+                scratch_root: PathBuf::new(),
+                volume_roots: None,
+            },
+        )
+        .expect("exact Oracle/Forge topology")
+        .compose_roles()
+        .expect("role composition");
+        let oracle = roles.oracle().expect("Oracle capability");
+        let resources = oracle
+            .try_acquire_worker()
+            .expect("advertised worker quantum");
+        assert_eq!(resources.memory_bytes(), ORACLE_PARTITION_MEMORY_BYTES);
+        let stream: WorkerAttemptStream = Box::pin(futures_util::stream::pending());
+        let retained = retain_worker_resources(stream, Some(resources));
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("retained snapshot")
+                .oracle_memory_used_bytes,
+            ORACLE_PARTITION_MEMORY_BYTES
+        );
+        assert!(oracle.try_acquire_worker().is_err());
+        drop(retained);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("released snapshot")
+                .oracle_memory_used_bytes,
+            0
+        );
+        oracle
+            .try_acquire_worker()
+            .expect("capacity returns after terminal stream drop");
     }
 }
 

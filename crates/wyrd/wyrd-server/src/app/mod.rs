@@ -110,6 +110,13 @@ async fn run_forge_worker_process(
     )
     .map_err(|error| BootExit::Other(Box::new(error)))?;
     set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
+    if let Some(resources) = state.bifrost_resources.as_ref() {
+        let health = resources.health();
+        set.spawn(fallible_task(
+            TaskId::Worker("bifrost_resource_health"),
+            async move { health.wait_for_poison().await },
+        ));
+    }
 
     if config.metrics.enabled {
         let bind = config

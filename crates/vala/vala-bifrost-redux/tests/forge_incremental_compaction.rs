@@ -357,6 +357,7 @@ mod pg_tests {
             scratch_limit_bytes: Some(scratch_limit_bytes),
             effective_cpu: None,
             scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
         }
     }
 

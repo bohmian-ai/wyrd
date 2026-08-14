@@ -538,6 +538,13 @@ async fn build_bifrost_parts_from_boot(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
     let oracle_spill_root = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
+    let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
+    let forge_scratch = wal_dir.join("forge-spill");
+    for root in [&wal_dir, &scribe_output_scratch, &forge_scratch] {
+        std::fs::create_dir_all(root).map_err(|error| {
+            ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
+        })?;
+    }
     let resource_roles = roles
         .iter()
         .map(|role| match role {
@@ -553,6 +560,12 @@ async fn build_bifrost_parts_from_boot(
         scratch_limit_bytes: bifrost_config.resources.scratch_limit_bytes,
         effective_cpu: bifrost_config.resources.effective_cpu,
         scratch_root: oracle_spill_root.clone(),
+        volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
+            wal: wal_dir.clone(),
+            scribe_output_scratch,
+            forge_scratch,
+            oracle_scratch: oracle_spill_root.clone(),
+        }),
     })
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let bifrost_resources = runtime_resources
@@ -561,9 +574,10 @@ async fn build_bifrost_parts_from_boot(
     let resource_plan = bifrost_resources.plan();
     let pod_memory_limit = resource_plan.managed_memory_bytes;
     let bifrost_memory = bifrost_resources.memory_ledger();
-    let bifrost_datafusion_memory_pool = Arc::new(BifrostDataFusionMemoryPool::for_oracle(
-        bifrost_memory.clone(),
-    ));
+    let bifrost_datafusion_memory_pool = bifrost_memory
+        .clone()
+        .map(BifrostDataFusionMemoryPool::for_oracle)
+        .map(Arc::new);
     let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -586,14 +600,23 @@ async fn build_bifrost_parts_from_boot(
         std::fs::create_dir_all(&wal_dir).map_err(|error| {
             ServerBootError::Scribe(format!("WAL directory creation failed: {error}"))
         })?;
+        let (wal_volume, _scribe_output_volume) = bifrost_resources
+            .scribe()
+            .and_then(|resources| resources.volume_capabilities())
+            .ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "live Scribe role requires registered WAL volume capabilities".to_owned(),
+                )
+            })?;
         let wal = Arc::new(
-            WalWriter::new(
+            WalWriter::new_with_volume(
                 &wal_dir,
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
                 WalConfig::default()
                     .with_disk_limit(scribe_config.wal_disk_limit_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+                wal_volume,
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
@@ -662,7 +685,12 @@ async fn build_bifrost_parts_from_boot(
                     )
                 })?),
             ),
-            memory_budget: Some(bifrost_memory.scribe_budget()),
+            memory_budget: Some(
+                bifrost_memory
+                    .as_ref()
+                    .expect("enabled Scribe role must own its memory ledger")
+                    .scribe_budget(),
+            ),
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {
@@ -735,8 +763,10 @@ async fn build_bifrost_parts_from_boot(
     let mut state = AppState::new(postgres, storage, bifrost)
         .with_bifrost_node_id(ClusterNodeId::new(node_id.as_uuid()))
         .with_bifrost_redux(bifrost_redux)
-        .with_bifrost_memory_pool(bifrost_memory, bifrost_datafusion_memory_pool)
         .with_bifrost_resources(bifrost_resources);
+    if let (Some(memory), Some(pool)) = (bifrost_memory, bifrost_datafusion_memory_pool) {
+        state = state.with_bifrost_memory_pool(memory, pool);
+    }
     if let Some(forge) = forge {
         state = state.with_forge(forge);
     }
@@ -1220,10 +1250,10 @@ impl<'a> OracleRoleBuilder<'a> {
             .as_ref()
             .ok_or_else(|| ServerBootError::OraclePeer("Redux catalog is absent".to_owned()))?;
         let configured_cpu = resource_plan.effective_cpu as f64;
-        let cpu_cores = resource_plan.effective_cpu;
-        let cpu_cores = u32::try_from(cpu_cores)
-            .map_err(|_| ServerBootError::OraclePeer("CPU count exceeds u32".to_owned()))?;
-        let memory_bytes_per_slot = 256_u64 * 1024 * 1024;
+        let memory_bytes_per_slot = u64::try_from(
+            vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
+        )
+        .map_err(|_| ServerBootError::OraclePeer("worker quantum exceeds u64".to_owned()))?;
         // Derive Oracle capability sizing from the portable resource plan.
         let memory_budget = resource_plan
             .oracle_floor_bytes
@@ -1233,9 +1263,11 @@ impl<'a> OracleRoleBuilder<'a> {
             })?;
         let memory_budget_bytes = u64::try_from(memory_budget)
             .map_err(|_| ServerBootError::OraclePeer("memory budget exceeds u64".to_owned()))?;
-        let memory_slots = (memory_budget_bytes / memory_bytes_per_slot).max(1);
-        let raw_slots = u32::try_from(u64::from(cpu_cores).min(memory_slots).max(1))
-            .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
+        let raw_slots = u32::try_from(
+            vala_bifrost_redux::resources::oracle_worker_slots(resource_plan)
+                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+        )
+        .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
         let calibrated =
             crate::config::load_oracle_admission_translation(&config.bifrost.oracle, raw_slots)
                 .map_err(ServerBootError::OraclePeer)?;
@@ -1374,13 +1406,23 @@ impl<'a> OracleRoleBuilder<'a> {
             .reserve_oracle(advertise_addr, capabilities)
             .await
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
-        let worker = Arc::new(OraclePeerWorker::new(
+        let oracle_resources = state
+            .bifrost_resources
+            .as_ref()
+            .and_then(vala_bifrost_redux::resources::BifrostRoleResources::oracle)
+            .ok_or_else(|| {
+                ServerBootError::OraclePeer(
+                    "Oracle peer role requires root resource capability".to_owned(),
+                )
+            })?;
+        let worker = Arc::new(OraclePeerWorker::new_with_resources(
             node_id,
             role.fencing_token,
             verifier,
             security_audit.clone(),
             reservations,
             SealedFragmentExecutor::with_memory_governor(catalog.file_io(), memory.clone()),
+            oracle_resources,
         ));
         let peer = Arc::new(OraclePeerRuntime::new(
             Arc::clone(&worker),
@@ -2345,18 +2387,23 @@ pub(crate) mod pg_tests {
                 cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
             },
             vala_bifrost_redux::resources::BifrostResourcePolicy {
-                roles: [BifrostRole::Forge].into_iter().collect(),
+                roles: [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
+                    .into_iter()
+                    .collect(),
                 memory_limit_bytes: None,
                 unmanaged_reserve_bytes: None,
                 scratch_limit_bytes: Some(config.spill_limit_bytes),
                 effective_cpu: None,
                 scratch_root: spill.path().to_owned(),
+                volume_roots: None,
             },
         )
         .expect("test Bifrost runtime resources")
         .compose_roles()
         .expect("test Forge role composition");
-        let memory = roles.memory_ledger();
+        let memory = roles
+            .memory_ledger()
+            .expect("mixed test topology must own its memory ledger");
         let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =

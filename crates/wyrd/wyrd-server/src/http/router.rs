@@ -107,6 +107,10 @@ where
         .layer(TimeoutLayer::new(state.limits.timeout))
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,
+            state
+                .bifrost_resources
+                .as_ref()
+                .map(vala_bifrost_redux::resources::BifrostRoleResources::transport_admission),
         ));
     router
         .layer(inner_stack)

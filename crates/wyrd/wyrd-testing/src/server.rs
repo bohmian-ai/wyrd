@@ -2808,13 +2808,18 @@ impl WyrdTestServerBuilder {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 scratch_root,
+                volume_roots: None,
             },
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let bifrost_resources = runtime_resources
             .compose_roles()
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let bifrost_memory = bifrost_resources.memory_ledger();
+        let bifrost_memory = bifrost_resources.memory_ledger().ok_or_else(|| {
+            WyrdTestServerError::Start(
+                "server test topology requires Scribe or Oracle memory".to_owned(),
+            )
+        })?;
         let resource_plan = runtime_resources.plan();
         let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
@@ -3670,6 +3675,7 @@ mod production_composition_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 scratch_root,
+                volume_roots: None,
             },
         )
         .expect("independent production composition of the same observation")

@@ -59,12 +59,15 @@ fn forge_runtime_resources(
             cpu_source: ResourceSource::Injected,
         },
         BifrostResourcePolicy {
-            roles: [BifrostRole::Forge].into_iter().collect(),
+            roles: [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
+                .into_iter()
+                .collect(),
             memory_limit_bytes: None,
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
             scratch_root: scratch_root.to_owned(),
+            volume_roots: None,
         },
     )?;
     Ok(runtime)
@@ -186,7 +189,9 @@ impl StandaloneForgeFixture {
         let roles = runtime_resources
             .compose_roles()
             .map_err(|error| crate::server::WyrdTestServerError::Start(error.to_string()))?;
-        let memory = roles.memory_ledger();
+        let memory = roles
+            .memory_ledger()
+            .expect("standalone Forge fixture must own its inspection ledger");
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             ForgeObjectStoreControl::new(Arc::clone(&staging));

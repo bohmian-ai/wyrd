@@ -244,6 +244,32 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use vala_bifrost_redux::resources::{BifrostResourceHealth, BifrostResourcePoisonReason};
+
+    /// Resource poison becomes the first terminal worker result and cancels siblings.
+    #[tokio::test]
+    async fn resource_poison_triggers_bounded_terminal_supervision() {
+        let health = BifrostResourceHealth::default();
+        let poisoner = health.clone();
+        let shutdown = CancellationToken::new();
+        let sibling_shutdown = shutdown.clone();
+        let mut set = JoinSet::new();
+        set.spawn(fallible_task(
+            TaskId::Worker("bifrost_resource_health"),
+            async move { health.wait_for_poison().await },
+        ));
+        set.spawn(worker_task(TaskId::Worker("sibling"), async move {
+            sibling_shutdown.cancelled().await;
+        }));
+        poisoner.poison(BifrostResourcePoisonReason::Accounting);
+        let terminal = supervise(set, shutdown.clone(), Duration::from_millis(100)).await;
+        assert!(
+            terminal
+                .as_deref()
+                .is_some_and(|message| message.contains("bifrost_resource_health"))
+        );
+        assert!(shutdown.is_cancelled());
+    }
 
     /// Proves readiness removal precedes cancellation of an active request.
     #[tokio::test(start_paused = true)]

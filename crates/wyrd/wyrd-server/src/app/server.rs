@@ -458,6 +458,13 @@ impl BoundServer {
     pub async fn run(mut self) -> Result<(), BootExit> {
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
+        if let Some(resources) = self.state.bifrost_resources.as_ref() {
+            let health = resources.health();
+            set.spawn(fallible_task(
+                TaskId::Worker("bifrost_resource_health"),
+                async move { health.wait_for_poison().await },
+            ));
+        }
 
         // Health: publish the initial snapshot before driving it.
         publish_initial_health(&self.state.readiness, &mut self.reporter).await;

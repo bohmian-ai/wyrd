@@ -91,13 +91,16 @@ mod pg_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 scratch_root,
+                volume_roots: None,
             },
         )
         .expect("global runtime resources");
         let resources = runtime_resources
             .compose_roles()
             .expect("role composition from the one runtime owner");
-        let memory = resources.memory_ledger();
+        let memory = resources
+            .memory_ledger()
+            .expect("Scribe test topology must own its memory ledger");
         let scribe = ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
             operator,
             wal,

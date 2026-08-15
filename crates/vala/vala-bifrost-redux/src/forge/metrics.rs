@@ -1228,7 +1228,7 @@ mod tests {
         "bifrost_forge_rewrite_output_bytes_total",
         "bifrost_forge_task_duration_seconds",
         "bifrost_forge_oldest_backlog_seconds",
-        "bifrost_resource_memory_bytes",
+        "bifrost_resource_current_bytes",
         "bifrost_forge_task_spill_bytes",
         "bifrost_forge_conflicts_total",
         "bifrost_forge_fairness_lag_tasks",

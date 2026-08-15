@@ -3937,8 +3937,8 @@ impl ForgeMaintenanceTelemetryReport {
             gauge(delta, "bifrost_forge_oldest_backlog_seconds", &[])? * 1_000_000.0;
         let peak_parent_memory = gauge(
             delta,
-            "bifrost_resource_memory_bytes",
-            &[("kind", "forge_used")],
+            "bifrost_resource_current_bytes",
+            &[("role", "forge"), ("resource", "memory")],
         )?;
         let fairness_lag_tasks = gauge(delta, "bifrost_forge_fairness_lag_tasks", &[])?;
         Ok(Self {
@@ -4298,22 +4298,9 @@ fn validate_forge_label_contract(
                 &["effect"],
                 &[("effect", &["changed", "acknowledged_noop"])],
             ),
-            "bifrost_resource_memory_bytes" => (
-                &["kind"],
-                &[(
-                    "kind",
-                    &[
-                        "managed",
-                        "elastic_total",
-                        "elastic_used",
-                        "scribe_floor",
-                        "scribe_used",
-                        "oracle_floor",
-                        "oracle_used",
-                        "forge_floor",
-                        "forge_used",
-                    ],
-                )],
+            "bifrost_resource_current_bytes" => (
+                &["resource", "role"],
+                &[("resource", &["memory"]), ("role", &["forge"])],
             ),
             "bifrost_memory_reservations_total" => (
                 &["consumer", "outcome"],
@@ -4878,6 +4865,15 @@ fn validate_role_topology(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use vala_bifrost_redux::resources::{
+        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ForgeRewriteRequest,
+        MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
+    };
+    use vala_sql::row_types::forge_tasks::{FORGE_ENVELOPE_VERSION, ForgeTaskEnvelope};
+    use wyrd_server::app::metrics::install_recorder;
+
     use super::*;
 
     /// Construct one normalized production sample for mapper contract tests.
@@ -6639,8 +6635,8 @@ mod tests {
             gauge_maxima: vec![
                 sample("bifrost_forge_oldest_backlog_seconds", &[], 0.01),
                 sample(
-                    "bifrost_resource_memory_bytes",
-                    &[("kind", "forge_used")],
+                    "bifrost_resource_current_bytes",
+                    &[("role", "forge"), ("resource", "memory")],
                     1024.0,
                 ),
                 sample("bifrost_forge_fairness_lag_tasks", &[], 1.0),
@@ -6654,8 +6650,8 @@ mod tests {
             gauge_final: vec![
                 sample("bifrost_forge_oldest_backlog_seconds", &[], 0.0),
                 sample(
-                    "bifrost_resource_memory_bytes",
-                    &[("kind", "forge_used")],
+                    "bifrost_resource_current_bytes",
+                    &[("role", "forge"), ("resource", "memory")],
                     0.0,
                 ),
                 sample("bifrost_forge_fairness_lag_tasks", &[], 0.0),
@@ -6708,6 +6704,89 @@ mod tests {
         }
     }
 
+    /// Forge-only reporting consumes the root's event-driven acquire/release gauge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when production-equivalent Forge composition, real rewrite
+    /// acquisition, metric capture, or maintenance-report projection fails.
+    #[test]
+    fn forge_only_report_uses_event_driven_root_metrics() {
+        let recorder = install_recorder().expect("production Prometheus recorder");
+        let scratch_limit = 512 * 1024 * 1024_u64;
+        let runtime = BifrostRuntimeResources::from_snapshot(
+            SystemResourceSnapshot {
+                memory_limit_bytes: 1024 * 1024 * 1024,
+                effective_cpu: 4,
+                scratch_capacity_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
+                scratch_available_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            },
+            BifrostResourcePolicy {
+                roles: [BifrostRole::Forge].into_iter().collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: Some(scratch_limit),
+                effective_cpu: None,
+                scratch_root: PathBuf::new(),
+                volume_roots: None,
+            },
+        )
+        .expect("Forge-only runtime resources");
+        let forge = runtime
+            .compose_roles()
+            .expect("Forge-only role composition")
+            .forge()
+            .expect("Forge capability");
+        let owner = forge
+            .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: ForgeTaskEnvelope {
+                    version: FORGE_ENVELOPE_VERSION,
+                    reader_permits: 1,
+                    decoded_batch_bytes: 1,
+                    decoded_input_bytes: 1,
+                    sort_working_bytes: 1,
+                    sort_merge_reservation_bytes: 1,
+                    encoder_buffer_bytes: 1,
+                    upload_chunk_bytes: 1,
+                    footer_encoded_bytes: 1,
+                    footer_decode_workspace_bytes: 1,
+                    sort_spill_bytes: 1,
+                    output_scratch_bytes: 1,
+                },
+                memory_bytes: 5,
+                scratch_bytes: 2,
+                reader_permits: 1,
+            })
+            .expect("real Forge rewrite acquisition");
+        let current = || {
+            rendered_values(&recorder.render())
+                .expect("production Forge metrics parse")
+                .into_iter()
+                .find(|(name, _)| {
+                    name.starts_with("bifrost_resource_current_bytes{")
+                        && name.contains("role=\"forge\"")
+                        && name.contains("resource=\"memory\"")
+                })
+                .map(|(_, value)| value)
+                .expect("event-driven Forge root gauge")
+        };
+        let peak = current();
+        drop(owner);
+        let final_value = current();
+        assert!(peak > 0.0);
+        assert_eq!(final_value, 0.0);
+
+        let mut delta = complete_delta();
+        delta.gauge_maxima[1].value = peak;
+        delta.gauge_final[1].value = final_value;
+        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
+        let report = ForgeMaintenanceTelemetryReport::from_production_delta(&delta, &expected)
+            .expect("Forge maintenance report consumes root lifecycle metrics");
+        assert_eq!(report.peak_parent_memory, peak);
+    }
+
     /// Build deterministic process evidence for sampler-only unit fixtures.
     fn test_process_sample() -> ProcessSample {
         ProcessSample {
@@ -6736,11 +6815,11 @@ mod tests {
     /// Retains an in-window production gauge peak in one entry per series.
     #[test]
     fn gauge_maximum_accumulator_retains_transient_peak_without_tick_history() {
-        let series = "bifrost_resource_memory_bytes{kind=\"forge_used\"}";
+        let series = "bifrost_resource_current_bytes{resource=\"memory\",role=\"forge\"}";
         let mut maxima = BTreeMap::new();
         let types = BTreeMap::from([
             (
-                "bifrost_resource_memory_bytes".to_owned(),
+                "bifrost_resource_current_bytes".to_owned(),
                 PrometheusFamilyType::Gauge,
             ),
             (

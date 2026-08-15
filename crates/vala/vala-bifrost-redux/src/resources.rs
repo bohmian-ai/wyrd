@@ -4193,21 +4193,18 @@ mod tests {
     /// Panics when deterministic resource acquisition or inspection fails.
     #[test]
     fn resource_plan_oracle_worker_and_metadata_leases_share_floor_first_accounting() {
-        let governor = BifrostResourceGovernor::from_snapshot(
-            snapshot(576 * MIB),
-            policy(&[BifrostRole::Oracle, BifrostRole::Forge]),
-        )
-        .expect("Oracle and Forge exact floors must compose");
-        let oracle = OracleResources {
-            governor: governor.clone(),
-            volumes: None,
-        };
+        let roles = BifrostRuntimeResources::composed_for_test(
+            576 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Oracle, BifrostRole::Forge],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
         let worker = oracle
             .try_acquire_worker(OracleWorkerClass::Interactive)
             .expect("one worker spends only the Oracle floor");
         assert_eq!(worker.memory_bytes(), ORACLE_PARTITION_MEMORY_BYTES);
         assert_eq!(
-            governor
+            oracle
                 .snapshot()
                 .expect("worker snapshot")
                 .elastic_memory_used_bytes,
@@ -4221,7 +4218,7 @@ mod tests {
             .expect("footer slot fits the released Oracle floor");
         assert_eq!(footer.memory_bytes(), ORACLE_METADATA_MEMORY_BYTES);
         assert_eq!(
-            governor
+            oracle
                 .snapshot()
                 .expect("footer snapshot")
                 .elastic_memory_used_bytes,
@@ -4229,7 +4226,7 @@ mod tests {
         );
         drop(footer);
         assert_eq!(
-            governor
+            oracle
                 .snapshot()
                 .expect("released snapshot")
                 .oracle_memory_used_bytes,
@@ -4244,20 +4241,18 @@ mod tests {
     /// Panics when thread coordination or the exact-floor fixture fails.
     #[test]
     fn resource_plan_concurrent_oracle_acquisition_is_atomic() {
-        let governor = BifrostResourceGovernor::from_snapshot(
-            snapshot(576 * MIB),
-            policy(&[BifrostRole::Oracle, BifrostRole::Forge]),
-        )
-        .expect("Oracle and Forge exact floors");
+        let roles = BifrostRuntimeResources::composed_for_test(
+            576 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Oracle, BifrostRole::Forge],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
         let start = Arc::new(std::sync::Barrier::new(3));
         let finish = Arc::new(std::sync::Barrier::new(3));
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut joins = Vec::new();
         for _ in 0..2 {
-            let oracle = OracleResources {
-                governor: governor.clone(),
-                volumes: None,
-            };
+            let oracle = oracle.clone();
             let start = Arc::clone(&start);
             let finish = Arc::clone(&finish);
             let sender = sender.clone();
@@ -4276,7 +4271,7 @@ mod tests {
         ];
         assert_eq!(admitted.into_iter().filter(|value| *value).count(), 1);
         assert_eq!(
-            governor
+            oracle
                 .snapshot()
                 .expect("held owner")
                 .oracle_memory_used_bytes,
@@ -4287,7 +4282,7 @@ mod tests {
             join.join().expect("Oracle race thread");
         }
         assert_eq!(
-            governor
+            oracle
                 .snapshot()
                 .expect("released owners")
                 .oracle_memory_used_bytes,
@@ -4541,15 +4536,12 @@ mod tests {
     fn resource_plan_metrics_cover_closed_memory_and_volume_lifecycle() {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         metrics::with_local_recorder(&recorder, || {
-            let governor = BifrostResourceGovernor::from_snapshot(
-                snapshot(576 * MIB),
-                policy(&[BifrostRole::Oracle, BifrostRole::Forge]),
-            )
-            .expect("root plan");
-            let oracle = OracleResources {
-                governor,
-                volumes: None,
-            };
+            let roles = BifrostRuntimeResources::composed_for_test(
+                576 * MIB,
+                512 * MIB as u64,
+                [BifrostRole::Oracle, BifrostRole::Forge],
+            );
+            let oracle = roles.oracle().expect("Oracle capability");
             let owner = oracle
                 .try_acquire_worker(OracleWorkerClass::Interactive)
                 .expect("Oracle grant");
@@ -4676,9 +4668,9 @@ mod tests {
             ),
         ];
         for (roles, scribe, oracle, forge, elastic) in cases {
-            let governor = BifrostResourceGovernor::from_snapshot(snapshot(gib), policy(roles))
+            let runtime = BifrostRuntimeResources::from_snapshot(snapshot(gib), policy(roles))
                 .expect("resource plan must fit");
-            let plan = governor.plan();
+            let plan = runtime.plan();
             assert_eq!(plan.managed_memory_bytes, 768 * MIB);
             assert_eq!(plan.scribe_floor_bytes, scribe);
             assert_eq!(plan.oracle_floor_bytes, oracle);
@@ -4690,26 +4682,27 @@ mod tests {
     /// Memory and scratch ownership is one atomic Oracle grant and exact release.
     #[test]
     fn resource_grant_is_atomic_across_memory_and_scratch() {
-        let governor = BifrostResourceGovernor::from_snapshot(
-            snapshot(768 * MIB),
-            policy(&[BifrostRole::Scribe, BifrostRole::Oracle]),
-        )
-        .expect("minimum combined plan must fit");
-        let first = governor
-            .try_acquire_oracle(OracleResourceRequest { local_ratio: 0.0 })
+        let roles = BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let first = oracle
+            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
             .expect("first query owns the complete grant");
         assert!(
-            governor
-                .try_acquire_oracle(OracleResourceRequest { local_ratio: 1.0 })
+            oracle
+                .try_acquire_query(OracleResourceRequest { local_ratio: 1.0 })
                 .is_err()
         );
-        let occupied = governor.snapshot().expect("snapshot");
+        let occupied = oracle.snapshot().expect("snapshot");
         assert!(occupied.oracle_query_active);
         drop(first);
         assert_eq!(
-            governor.snapshot().expect("released snapshot"),
+            oracle.snapshot().expect("released snapshot"),
             ResourceSnapshot {
-                plan: governor.plan(),
+                plan: roles.plan(),
                 scribe_memory_used_bytes: 0,
                 oracle_memory_used_bytes: 0,
                 forge_memory_used_bytes: 0,
@@ -4749,12 +4742,12 @@ mod tests {
         injected.memory_source = ResourceSource::CgroupV2;
         injected.effective_cpu = 3;
         injected.cpu_source = ResourceSource::CgroupV1;
-        let governor =
-            BifrostResourceGovernor::from_snapshot(injected, policy(&[BifrostRole::Oracle]))
+        let runtime =
+            BifrostRuntimeResources::from_snapshot(injected, policy(&[BifrostRole::Oracle]))
                 .expect("injected portable sources must produce a plan");
-        assert_eq!(governor.sources().memory, ResourceSource::CgroupV2);
-        assert_eq!(governor.sources().cpu, ResourceSource::CgroupV1);
-        assert_eq!(governor.sources().scratch, ResourceSource::Filesystem);
+        assert_eq!(runtime.sources().memory, ResourceSource::CgroupV2);
+        assert_eq!(runtime.sources().cpu, ResourceSource::CgroupV1);
+        assert_eq!(runtime.sources().scratch, ResourceSource::Filesystem);
         assert_eq!(parse_cpuset("0-2,5"), Some(4));
         assert_eq!(parse_cpuset("4-2"), None);
     }
@@ -4765,12 +4758,12 @@ mod tests {
         let mut policy = policy(&[BifrostRole::Oracle]);
         policy.memory_limit_bytes = Some(768 * MIB);
         policy.effective_cpu = Some(2);
-        let governor = BifrostResourceGovernor::from_snapshot(snapshot(1024 * MIB), policy)
+        let runtime = BifrostRuntimeResources::from_snapshot(snapshot(1024 * MIB), policy)
             .expect("reducing overrides must be accepted");
-        assert_eq!(governor.plan().memory_limit_bytes, 768 * MIB);
-        assert_eq!(governor.plan().effective_cpu, 2);
-        assert_eq!(governor.sources().memory, ResourceSource::Override);
-        assert_eq!(governor.sources().cpu, ResourceSource::Override);
+        assert_eq!(runtime.plan().memory_limit_bytes, 768 * MIB);
+        assert_eq!(runtime.plan().effective_cpu, 2);
+        assert_eq!(runtime.sources().memory, ResourceSource::Override);
+        assert_eq!(runtime.sources().cpu, ResourceSource::Override);
     }
 
     /// Overrides cap one global plan and never create per-role silos.
@@ -4779,19 +4772,19 @@ mod tests {
         let mut policy = policy(&[BifrostRole::Scribe, BifrostRole::Oracle]);
         policy.memory_limit_bytes = Some(768 * MIB);
         policy.scratch_limit_bytes = Some(512 * MIB as u64);
-        let governor = BifrostResourceGovernor::from_snapshot(snapshot(1024 * MIB), policy)
+        let runtime = BifrostRuntimeResources::from_snapshot(snapshot(1024 * MIB), policy)
             .expect("combined minimum must fit");
-        assert_eq!(governor.plan().managed_memory_bytes, 512 * MIB);
-        assert_eq!(governor.plan().elastic_memory_bytes, 0);
-        assert_eq!(governor.plan().scratch_limit_bytes, 512 * MIB as u64);
-        assert_eq!(governor.sources().scratch, ResourceSource::Override);
+        assert_eq!(runtime.plan().managed_memory_bytes, 512 * MIB);
+        assert_eq!(runtime.plan().elastic_memory_bytes, 0);
+        assert_eq!(runtime.plan().scratch_limit_bytes, 512 * MIB as u64);
+        assert_eq!(runtime.sources().scratch, ResourceSource::Override);
     }
 
     /// Minimum process and filesystem reserves fail closed before activation.
     #[test]
     fn resource_plan_enforces_minimum_viable_process_and_disk_floors() {
         assert!(
-            BifrostResourceGovernor::from_snapshot(
+            BifrostRuntimeResources::from_snapshot(
                 snapshot(512 * MIB - 1),
                 policy(&[BifrostRole::Oracle]),
             )
@@ -4800,7 +4793,7 @@ mod tests {
         let mut insufficient_disk = snapshot(768 * MIB);
         insufficient_disk.scratch_available_bytes = MIN_SCRATCH_FREE_BYTES;
         assert!(
-            BifrostResourceGovernor::from_snapshot(
+            BifrostRuntimeResources::from_snapshot(
                 insufficient_disk,
                 policy(&[BifrostRole::Oracle]),
             )
@@ -4811,7 +4804,7 @@ mod tests {
     /// Enabled floors that exceed managed memory fail before any lease exists.
     #[test]
     fn resource_plan_rejects_floors_above_managed_memory_before_activation() {
-        let error = BifrostResourceGovernor::from_snapshot(
+        let error = BifrostRuntimeResources::from_snapshot(
             snapshot(768 * MIB - 1),
             policy(&[BifrostRole::Scribe, BifrostRole::Oracle]),
         )
@@ -4849,13 +4842,19 @@ mod tests {
     /// Forge's runtime pool remains nested in and bounded by its retained lease.
     #[test]
     fn forge_harness_pool_is_issued_by_operation_lease() {
-        let governor = BifrostResourceGovernor::from_snapshot(
-            snapshot(1024 * MIB),
-            policy(&[BifrostRole::Forge]),
-        )
-        .expect("Forge-only plan");
-        let lease = governor
-            .try_acquire_forge(128 * MIB, 64 * MIB as u64, 1)
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Forge],
+        );
+        let forge = roles.forge().expect("Forge capability");
+        let lease = forge
+            .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: envelope(),
+                memory_bytes: 128 * MIB,
+                scratch_bytes: 64 * MIB as u64,
+                reader_permits: 1,
+            })
             .expect("Forge operation lease");
         let pool = lease.memory_pool();
         let reservation = MemoryConsumer::new("forge-operation-test").register(&pool);
@@ -4865,7 +4864,7 @@ mod tests {
         assert!(reservation.try_grow(1).is_err());
         reservation.shrink(128 * MIB);
         drop(lease);
-        let released = governor.snapshot().expect("released Forge snapshot");
+        let released = forge.snapshot().expect("released Forge snapshot");
         assert_eq!(released.elastic_memory_used_bytes, 0);
         assert_eq!(released.scratch_used_bytes, 0);
     }
@@ -5326,17 +5325,16 @@ mod tests {
     /// Scribe's floor remains outside every Oracle and Forge elastic lease.
     #[test]
     fn scribe_floor_survives_oracle_and_forge_elastic_pressure() {
-        let governor = BifrostResourceGovernor::from_snapshot(
-            snapshot(1024 * MIB),
-            policy(&[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]),
-        )
-        .expect("combined role plan");
-        let plan = governor.plan();
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+        );
+        let plan = roles.plan();
         assert_eq!(plan.scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
-        let scribe = ScribeResources {
-            governor: governor.clone(),
-            volumes: None,
-        };
+        let scribe = roles.scribe().expect("Scribe capability");
+        let oracle = roles.oracle().expect("Oracle capability");
+        let forge = roles.forge().expect("Forge capability");
         let scribe_owner = scribe
             .try_acquire_memory(ScribeMemoryRequest {
                 bytes: 300 * MIB,
@@ -5345,31 +5343,41 @@ mod tests {
                 generation: None,
             })
             .expect("Scribe uses its floor and borrows elastic memory");
-        let with_scribe = governor.snapshot().expect("Scribe ownership snapshot");
+        let with_scribe = scribe.snapshot().expect("Scribe ownership snapshot");
         assert_eq!(with_scribe.scribe_memory_used_bytes, 300 * MIB);
         assert_eq!(with_scribe.elastic_memory_used_bytes, 44 * MIB);
-        let query = governor
-            .try_acquire_oracle(OracleResourceRequest { local_ratio: 0.0 })
+        let query = oracle
+            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
             .expect("Oracle owns only its floor and shared elastic memory");
         assert_eq!(
             query.memory_bytes,
             plan.oracle_floor_bytes + plan.elastic_memory_bytes
                 - with_scribe.elastic_memory_used_bytes
         );
-        assert!(governor.try_acquire_forge(1, 1, 1).is_err());
-        assert_eq!(governor.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
+        assert!(
+            forge
+                .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: envelope(),
+                    memory_bytes: 1,
+                    scratch_bytes: 1,
+                    reader_permits: 1,
+                })
+                .is_err()
+        );
+        assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         drop(query);
         drop(scribe_owner);
-        let forge = governor
-            .try_acquire_forge(
-                plan.forge_floor_bytes + plan.elastic_memory_bytes,
-                plan.scratch_limit_bytes,
-                1,
-            )
+        let forge_owner = forge
+            .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: envelope(),
+                memory_bytes: plan.forge_floor_bytes + plan.elastic_memory_bytes,
+                scratch_bytes: plan.scratch_limit_bytes,
+                reader_permits: 1,
+            })
             .expect("Forge may own all elastic resources after Oracle releases");
-        assert_eq!(governor.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
-        drop(forge);
-        let snapshot = governor.snapshot().expect("released resource snapshot");
+        assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
+        drop(forge_owner);
+        let snapshot = roles.snapshot().expect("released resource snapshot");
         assert_eq!(snapshot.elastic_memory_used_bytes, 0);
         assert_eq!(snapshot.scratch_used_bytes, 0);
     }

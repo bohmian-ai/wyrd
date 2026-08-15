@@ -1341,7 +1341,7 @@ impl ScribeImpl {
     pub fn check_age(&self, now: std::time::Instant) {
         let snapshot = self.pressure_snapshot();
         self.memory.emit_root_resource_gauges();
-        snapshot.emit_governor_gauges();
+        snapshot.emit_ingress_watermark_gauges();
         tracing::debug!(
             scribe_total = snapshot.scribe_total_bytes,
             oracle_total = snapshot.oracle_total_bytes,
@@ -1640,6 +1640,37 @@ mod pressure_config_tests {
 
 #[cfg(test)]
 mod telemetry_tests {
+    /// The steady-state age path emits only root-owned capacity metric families.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the embedded production-equivalent Scribe cannot emit its
+    /// root snapshot or when a legacy competing capacity family is observed.
+    #[tokio::test]
+    async fn root_resource_metrics_replace_legacy_capacity_families() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            super::ScribeImpl::default().check_age(std::time::Instant::now());
+        });
+        let snapshot = recorder.snapshot();
+        assert!(
+            snapshot
+                .gauges
+                .keys()
+                .any(|key| key.starts_with("bifrost_resource_memory_bytes{"))
+        );
+        assert!(
+            snapshot
+                .gauges
+                .keys()
+                .any(|key| key.starts_with("bifrost_resource_scratch_bytes{"))
+        );
+        assert!(snapshot.gauges.keys().all(|key| {
+            !key.starts_with("bifrost_memory_reserved_bytes")
+                && !key.starts_with("bifrost_memory_limit_bytes")
+        }));
+    }
+
     /// Dropping the ingress owner drains its exact active gauge without identity labels.
     #[test]
     fn ingress_telemetry_guard_cancellation_drains_active_zero() {

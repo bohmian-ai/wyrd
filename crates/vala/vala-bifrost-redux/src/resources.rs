@@ -1616,7 +1616,7 @@ impl ScribeResources {
         &self,
         request: ScribeMemoryRequest,
     ) -> Result<ScribeMemoryLease, BifrostResourceError> {
-        self.governor.try_acquire_scribe_memory(request)
+        self.governor.try_acquire_scribe_memory(request, None)
     }
 
     /// Returns the Scribe floor plus the root's shared elastic ceiling.
@@ -1653,27 +1653,17 @@ impl ScribeResources {
         category: ScribeMemoryCategory,
         bytes: usize,
     ) -> Result<ScribeMemoryLease, crate::contracts::ScribeError> {
-        let current = self
-            .governor
-            .snapshot()
-            .map_err(scribe_resource_error)?
-            .scribe_memory_used_bytes;
-        if bytes > self.ingress_limit_bytes()
-            || current
-                .checked_add(bytes)
-                .is_none_or(|next| next > self.ingress_limit_bytes())
-        {
-            return Err(crate::contracts::ScribeError::IngestBusy {
-                table: "memory".to_owned(),
-            });
-        }
-        self.try_acquire_memory(ScribeMemoryRequest {
-            bytes,
-            category,
-            shard: None,
-            generation: None,
-        })
-        .map_err(scribe_resource_error)
+        self.governor
+            .try_acquire_scribe_memory(
+                ScribeMemoryRequest {
+                    bytes,
+                    category,
+                    shard: None,
+                    generation: None,
+                },
+                Some(self.ingress_limit_bytes()),
+            )
+            .map_err(scribe_resource_error)
     }
 
     /// Reports whether one rejected request exceeded Scribe's ingress sublimit.
@@ -2291,6 +2281,7 @@ impl BifrostResourceGovernor {
     fn try_acquire_scribe_memory(
         &self,
         request: ScribeMemoryRequest,
+        ingress_limit_bytes: Option<usize>,
     ) -> Result<ScribeMemoryLease, BifrostResourceError> {
         let mut state = self.lock_state()?;
         let plan = self.plan();
@@ -2340,6 +2331,12 @@ impl BifrostResourceGovernor {
             .scribe_omitted_generation_count
             .checked_add(usize::from(request.generation.is_none()))
             .ok_or_else(accounting_overflow)?;
+        if ingress_limit_bytes.is_some_and(|limit| next > limit) {
+            record_memory_transition("scribe", "refused", state.scribe_memory_used_bytes);
+            return Err(BifrostResourceError::Occupied {
+                detail: "Scribe request exceeds the ingress sublimit".to_owned(),
+            });
+        }
         if next_elastic > plan.elastic_memory_bytes {
             record_memory_transition("scribe", "refused", state.scribe_memory_used_bytes);
             return Err(BifrostResourceError::Occupied {
@@ -2724,17 +2721,33 @@ impl ScribeMemoryLease {
         Ok(())
     }
 
-    /// Resizes this owner through one checked root transaction.
-    ///
-    /// Growth performs real floor/elastic admission and shrink returns the
-    /// exact delta. Every successful size change advances the capacity epoch
-    /// before waking waiters.
+    /// Resizes this owner without an ingress sublimit for pure ownership tests.
     ///
     /// # Errors
     ///
-    /// Returns a typed refusal without mutation when growth cannot fit, or a
-    /// poison error when the retained attribution cannot cover a shrink.
-    pub(crate) fn resize(&mut self, bytes: usize) -> Result<(), BifrostResourceError> {
+    /// Returns a typed refusal without mutation when root capacity cannot cover
+    /// growth, or a poison error when shrink accounting diverges.
+    #[cfg(test)]
+    fn resize(&mut self, bytes: usize) -> Result<(), BifrostResourceError> {
+        self.resize_with_limit(bytes, None)
+    }
+
+    /// Resizes this owner while optionally enforcing an atomic Scribe sublimit.
+    ///
+    /// Growth performs real floor/elastic admission and shrink returns the
+    /// exact delta. The optional ingress ceiling is checked under the same root
+    /// lock before any capacity or attribution mutation. Every successful size
+    /// change advances the capacity epoch before waking waiters.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation when growth exceeds the supplied
+    /// limit or root capacity, or a poison error when shrink accounting diverges.
+    fn resize_with_limit(
+        &mut self,
+        bytes: usize,
+        limit_bytes: Option<usize>,
+    ) -> Result<(), BifrostResourceError> {
         #[cfg(test)]
         if self
             .root
@@ -2753,7 +2766,7 @@ impl ScribeMemoryLease {
         }
         let mut state = self.root.lock_state()?;
         if bytes > self.bytes {
-            self.grow_locked(&mut state, bytes - self.bytes)?;
+            self.grow_locked(&mut state, bytes - self.bytes, limit_bytes)?;
         } else {
             self.shrink_locked(&mut state, self.bytes - bytes)?;
         }
@@ -2773,6 +2786,7 @@ impl ScribeMemoryLease {
         &self,
         state: &mut ResourceState,
         growth: usize,
+        limit_bytes: Option<usize>,
     ) -> Result<(), BifrostResourceError> {
         let plan = self.root.plan();
         let next_total = state
@@ -2787,6 +2801,11 @@ impl ScribeMemoryLease {
             .elastic_memory_used_bytes
             .checked_add(added_elastic)
             .ok_or_else(accounting_overflow)?;
+        if limit_bytes.is_some_and(|limit| next_total > limit) {
+            return Err(BifrostResourceError::Occupied {
+                detail: "Scribe resize exceeds the ingress sublimit".to_owned(),
+            });
+        }
         if next_elastic > plan.elastic_memory_bytes {
             return Err(BifrostResourceError::Occupied {
                 detail: "Scribe resize exceeds protected floor plus free elastic memory".to_owned(),
@@ -3036,7 +3055,17 @@ impl ScribeMemoryLease {
         &mut self,
         bytes: usize,
     ) -> Result<(), crate::contracts::ScribeError> {
-        self.resize(bytes).map_err(scribe_resource_error)
+        let ingress_limit = {
+            let plan = self.root.plan();
+            let role_limit = plan
+                .scribe_floor_bytes
+                .saturating_add(plan.elastic_memory_bytes);
+            role_limit
+                .saturating_sub(crate::scribe::memory::PARQUET_PRODUCER_OWNER_BYTES.min(role_limit))
+                .max(role_limit / 4)
+        };
+        self.resize_with_limit(bytes, Some(ingress_limit))
+            .map_err(scribe_resource_error)
     }
 
     /// Validates that this owner can release `bytes` without mutation.
@@ -4085,13 +4114,76 @@ mod tests {
             (&[BifrostRole::Scribe, BifrostRole::Oracle][..], 768 * MIB),
         ];
         for (roles, minimum) in cases {
-            BifrostResourceGovernor::from_snapshot(snapshot(minimum), policy(roles))
-                .expect("the exact constitutional topology floor must compose");
+            BifrostRuntimeResources::from_snapshot(snapshot(minimum), policy(roles))
+                .expect("the exact constitutional topology floor must compose")
+                .compose_roles()
+                .expect("exact topology roles must issue from one root");
             assert!(matches!(
-                BifrostResourceGovernor::from_snapshot(snapshot(minimum - 1), policy(roles)),
+                BifrostRuntimeResources::from_snapshot(snapshot(minimum - 1), policy(roles)),
                 Err(BifrostResourceError::InvalidPlan { .. })
             ));
         }
+    }
+
+    /// Concurrent ingress requests enforce their shared sublimit in one root transition.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the production-equivalent composition, thread coordination,
+    /// root admission, or authoritative snapshot violates the ingress ceiling.
+    #[test]
+    fn scribe_ingress_sublimit_is_atomic_under_concurrency() {
+        let roles = BifrostRuntimeResources::from_snapshot(
+            snapshot(1024 * MIB),
+            policy(&[BifrostRole::Scribe]),
+        )
+        .expect("Scribe runtime resources")
+        .compose_roles()
+        .expect("Scribe role composition");
+        let scribe = roles.scribe().expect("Scribe capability");
+        let ingress_limit = scribe.ingress_limit_bytes();
+        let request_bytes = ingress_limit / 2 + 1;
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let finish = Arc::new(std::sync::Barrier::new(3));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let scribe = scribe.clone();
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let sender = sender.clone();
+            joins.push(std::thread::spawn(move || {
+                start.wait();
+                let owner = scribe.try_reserve_ingress(ScribeMemoryCategory::Raw, request_bytes);
+                sender.send(owner.is_ok()).expect("ingress race result");
+                finish.wait();
+                drop(owner);
+            }));
+        }
+        start.wait();
+        let admitted = [
+            receiver.recv().expect("first ingress result"),
+            receiver.recv().expect("second ingress result"),
+        ];
+        assert_eq!(admitted.into_iter().filter(|value| *value).count(), 1);
+        assert!(
+            scribe
+                .snapshot()
+                .expect("authoritative ingress snapshot")
+                .scribe_memory_used_bytes
+                <= ingress_limit
+        );
+        finish.wait();
+        for join in joins {
+            join.join().expect("ingress race thread");
+        }
+        assert_eq!(
+            scribe
+                .snapshot()
+                .expect("released ingress snapshot")
+                .scribe_memory_used_bytes,
+            0
+        );
     }
 
     /// Oracle worker and metadata leases spend their floor before shared elastic memory.
@@ -4730,13 +4822,16 @@ mod tests {
     /// A complete Oracle grant owns one finite greedy pool and releases exactly.
     #[test]
     fn oracle_runtime_pool_is_issued_by_query_lease() {
-        let governor = BifrostResourceGovernor::from_snapshot(
+        let roles = BifrostRuntimeResources::from_snapshot(
             snapshot(1024 * MIB),
             policy(&[BifrostRole::Scribe, BifrostRole::Oracle]),
         )
-        .expect("combined plan");
-        let query = governor
-            .try_acquire_oracle(OracleResourceRequest { local_ratio: 0.0 })
+        .expect("combined plan")
+        .compose_roles()
+        .expect("combined role composition");
+        let oracle = roles.oracle().expect("Oracle capability");
+        let query = oracle
+            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
             .expect("complete query grant");
         assert_eq!(query.memory_bytes, 512 * MIB);
         let pool = query.memory_pool();
@@ -4748,7 +4843,7 @@ mod tests {
         reservation.shrink(query.memory_bytes);
         assert_eq!(pool.reserved(), 0);
         drop(query);
-        assert!(!governor.snapshot().expect("snapshot").oracle_query_active);
+        assert!(!roles.snapshot().expect("snapshot").oracle_query_active);
     }
 
     /// Forge's runtime pool remains nested in and bounded by its retained lease.

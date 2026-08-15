@@ -23,17 +23,45 @@ scan_tree() {
   fi
 }
 
+scan_direct_root_construction() {
+  local scan_root="$1"
+  local allowed_owner="${2:-}"
+  local violations
+  violations="$(find "$scan_root" -type f -name '*.rs' ! -path "$allowed_owner" -print0 | xargs -0 -r perl -0777 -ne '
+    s{/\*.*?\*/}{}gs;
+    s{//[^\n]*}{}g;
+    while (/\bBifrostResourceGovernor\s*::\s*from_snapshot\s*\(/g) {
+      my $prefix = substr($_, 0, $-[0]);
+      my $line = 1 + ($prefix =~ tr/\n//);
+      print "$ARGV:$line:$&\n";
+    }
+  ' 2>/dev/null || true)"
+  if [[ -n "$violations" ]]; then
+    printf 'Direct Bifrost root construction found outside its runtime owner:\n%s\n' "$violations"
+    return 1
+  fi
+}
+
 if [[ "${BIFROST_RESOURCE_GOVERNANCE_SELF_TEST:-0}" == "1" ]]; then
   fixture_dir="$(mktemp -d)"
   trap 'rm -rf "$fixture_dir"' EXIT
-  mkdir -p "$fixture_dir/negative" "$fixture_dir/positive"
+  mkdir -p "$fixture_dir/negative" "$fixture_dir/positive" "$fixture_dir/owner"
   printf '%s\n' '// BifrostMemoryGovernor was removed; MemoryLedger is historical vocabulary.' > "$fixture_dir/negative/comment.rs"
   scan_tree "$fixture_dir/negative"
+  printf '%s\n' '// BifrostResourceGovernor::from_snapshot is discussed but never called.' > "$fixture_dir/negative/root_comment.rs"
+  scan_direct_root_construction "$fixture_dir/negative"
   printf '%s\n' 'fn bypass(value: BifrostMemoryGovernor) { let _ = value.memory_ledger(); }' > "$fixture_dir/positive/bypass.rs"
   if scan_tree "$fixture_dir/positive" >/dev/null 2>&1; then
     printf 'Bifrost resource governance positive fixture was not rejected.\n'
     exit 1
   fi
+  printf '%s\n' 'fn bypass(snapshot: Snapshot, policy: Policy) { let _ = BifrostResourceGovernor::from_snapshot(snapshot, policy); }' > "$fixture_dir/positive/root.rs"
+  if scan_direct_root_construction "$fixture_dir/positive" >/dev/null 2>&1; then
+    printf 'Bifrost direct-root positive fixture was not rejected.\n'
+    exit 1
+  fi
+  printf '%s\n' 'fn construct(snapshot: Snapshot, policy: Policy) { let _ = BifrostResourceGovernor::from_snapshot(snapshot, policy); }' > "$fixture_dir/owner/resources.rs"
+  scan_direct_root_construction "$fixture_dir/owner" "$fixture_dir/owner/resources.rs"
   printf 'Bifrost resource governance fixture coverage passed.\n'
   exit 0
 fi
@@ -41,4 +69,9 @@ fi
 scan_tree "$root_dir/crates/vala/vala-bifrost-redux"
 scan_tree "$root_dir/crates/wyrd/wyrd-server"
 scan_tree "$root_dir/crates/wyrd/wyrd-testing"
+scan_direct_root_construction \
+  "$root_dir/crates/vala/vala-bifrost-redux" \
+  "$root_dir/crates/vala/vala-bifrost-redux/src/resources.rs"
+scan_direct_root_construction "$root_dir/crates/wyrd/wyrd-server"
+scan_direct_root_construction "$root_dir/crates/wyrd/wyrd-testing"
 printf 'Bifrost resource governance check passed.\n'

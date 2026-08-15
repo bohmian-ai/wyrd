@@ -283,38 +283,19 @@ impl MemorySnapshot {
         self
     }
 
-    /// Export the governor gauges that explain admission headroom (D84).
+    /// Exports the closed Scribe ingress-watermark lifecycle gauges.
     ///
     /// Emitted from the production steady-state age scanner on every tick so a
-    /// dashboard can read live per-child occupancy and the D83 ingress
-    /// watermarks without a debugger. Two closed gauge families carry a
-    /// `consumer` label over the fixed set `{scribe, oracle, parent}`:
-    /// `bifrost_memory_reserved_bytes` (bytes currently charged) and
-    /// `bifrost_memory_limit_bytes` (the ceiling each is measured against). The
-    /// `scribe`/`oracle`/`parent` values share the `bifrost_memory_reserved_bytes`
-    /// family with the Forge consumer emitted by [`record_forge_memory`], keeping
-    /// one memory-occupancy family across every Bifrost role. A third family,
-    /// `bifrost_scribe_ingress_watermark_bytes`, carries the four D83 ingress
+    /// dashboard can read the D83 ingress watermarks without a debugger.
+    /// `bifrost_scribe_ingress_watermark_bytes` carries the four D83 ingress
     /// marks under a closed `mark` label `{occupancy, limit, high_water,
     /// low_water}` — the exact numerator, denominator, and hysteresis band the
     /// pressure-seal decision keys on. No label carries tenant, table, or
     /// request identity. The snapshot should already be watermarked via
     /// [`Self::with_ingress_watermarks`]; an unwatermarked snapshot reports the
     /// two watermark marks as `0`.
-    pub fn emit_governor_gauges(self) {
+    pub fn emit_ingress_watermark_gauges(self) {
         let as_f64 = |bytes: usize| bytes.to_f64().unwrap_or(f64::MAX);
-        metrics::gauge!("bifrost_memory_reserved_bytes", "consumer" => "scribe")
-            .set(as_f64(self.scribe_total_bytes));
-        metrics::gauge!("bifrost_memory_reserved_bytes", "consumer" => "oracle")
-            .set(as_f64(self.oracle_total_bytes));
-        metrics::gauge!("bifrost_memory_reserved_bytes", "consumer" => "parent")
-            .set(as_f64(self.bifrost_total_bytes));
-        metrics::gauge!("bifrost_memory_limit_bytes", "consumer" => "scribe")
-            .set(as_f64(self.scribe_limit_bytes));
-        metrics::gauge!("bifrost_memory_limit_bytes", "consumer" => "oracle")
-            .set(as_f64(self.oracle_limit_bytes));
-        metrics::gauge!("bifrost_memory_limit_bytes", "consumer" => "parent")
-            .set(as_f64(self.bifrost_limit_bytes));
         metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "occupancy")
             .set(as_f64(self.ingress_occupancy_bytes));
         metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "limit")

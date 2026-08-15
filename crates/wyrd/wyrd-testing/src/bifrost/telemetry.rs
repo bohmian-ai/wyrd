@@ -3937,8 +3937,8 @@ impl ForgeMaintenanceTelemetryReport {
             gauge(delta, "bifrost_forge_oldest_backlog_seconds", &[])? * 1_000_000.0;
         let peak_parent_memory = gauge(
             delta,
-            "bifrost_memory_reserved_bytes",
-            &[("consumer", "forge")],
+            "bifrost_resource_memory_bytes",
+            &[("kind", "forge_used")],
         )?;
         let fairness_lag_tasks = gauge(delta, "bifrost_forge_fairness_lag_tasks", &[])?;
         Ok(Self {
@@ -4298,7 +4298,23 @@ fn validate_forge_label_contract(
                 &["effect"],
                 &[("effect", &["changed", "acknowledged_noop"])],
             ),
-            "bifrost_memory_reserved_bytes" => (&["consumer"], &[]),
+            "bifrost_resource_memory_bytes" => (
+                &["kind"],
+                &[(
+                    "kind",
+                    &[
+                        "managed",
+                        "elastic_total",
+                        "elastic_used",
+                        "scribe_floor",
+                        "scribe_used",
+                        "oracle_floor",
+                        "oracle_used",
+                        "forge_floor",
+                        "forge_used",
+                    ],
+                )],
+            ),
             "bifrost_memory_reservations_total" => (
                 &["consumer", "outcome"],
                 &[("outcome", &["accepted", "rejected"])],
@@ -6623,8 +6639,8 @@ mod tests {
             gauge_maxima: vec![
                 sample("bifrost_forge_oldest_backlog_seconds", &[], 0.01),
                 sample(
-                    "bifrost_memory_reserved_bytes",
-                    &[("consumer", "forge")],
+                    "bifrost_resource_memory_bytes",
+                    &[("kind", "forge_used")],
                     1024.0,
                 ),
                 sample("bifrost_forge_fairness_lag_tasks", &[], 1.0),
@@ -6638,8 +6654,8 @@ mod tests {
             gauge_final: vec![
                 sample("bifrost_forge_oldest_backlog_seconds", &[], 0.0),
                 sample(
-                    "bifrost_memory_reserved_bytes",
-                    &[("consumer", "forge")],
+                    "bifrost_resource_memory_bytes",
+                    &[("kind", "forge_used")],
                     0.0,
                 ),
                 sample("bifrost_forge_fairness_lag_tasks", &[], 0.0),
@@ -6720,11 +6736,11 @@ mod tests {
     /// Retains an in-window production gauge peak in one entry per series.
     #[test]
     fn gauge_maximum_accumulator_retains_transient_peak_without_tick_history() {
-        let series = "bifrost_memory_reserved_bytes{consumer=\"forge\"}";
+        let series = "bifrost_resource_memory_bytes{kind=\"forge_used\"}";
         let mut maxima = BTreeMap::new();
         let types = BTreeMap::from([
             (
-                "bifrost_memory_reserved_bytes".to_owned(),
+                "bifrost_resource_memory_bytes".to_owned(),
                 PrometheusFamilyType::Gauge,
             ),
             (

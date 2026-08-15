@@ -1228,7 +1228,7 @@ mod tests {
         "bifrost_forge_rewrite_output_bytes_total",
         "bifrost_forge_task_duration_seconds",
         "bifrost_forge_oldest_backlog_seconds",
-        "bifrost_memory_reserved_bytes",
+        "bifrost_resource_memory_bytes",
         "bifrost_forge_task_spill_bytes",
         "bifrost_forge_conflicts_total",
         "bifrost_forge_fairness_lag_tasks",
@@ -1515,13 +1515,10 @@ mod tests {
             assert_orphan_gc_operation_emission(&recorder, &telemetry);
 
             reservation.try_grow(4096).expect("Forge memory reserve");
-            assert!(
-                recorder
-                    .snapshot()
-                    .gauges
-                    .keys()
-                    .all(|family| !family.starts_with("bifrost_memory_reserved_bytes"))
-            );
+            assert!(recorder.snapshot().gauges.keys().all(|family| {
+                !family.starts_with("bifrost_memory_reserved_bytes")
+                    && !family.starts_with("bifrost_memory_limit_bytes")
+            }));
         });
     }
 

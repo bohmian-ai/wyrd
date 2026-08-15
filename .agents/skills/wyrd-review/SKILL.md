@@ -136,6 +136,12 @@ classification, the durable artifact, and canonical planning.
      .dev/plan/<slug>
    ```
 
+   Treat every validator diagnostic as an invalid packet defect. Independently
+   reject task verification that is workspace-wide, crate-family-wide,
+   aggregate, all-feature, unfiltered, or full-language even if the command is
+   executable or recorded as passing. A documented exact-lane exception is
+   valid only when that lane is itself an acceptance contract.
+
    Require an `Approved` parent plan. A `Ready` task is eligible for an active
    or legacy review; `Complete` is the normal completion-review state; review
    a `Blocked` task only to validate its blocker claim. A `Planned` task is not
@@ -258,6 +264,11 @@ command is acceptable only when it proves the same acceptance criterion,
 target, relevant features, test tier, environment behavior, negative cases,
 assertions, and consumers, and the living task records why the original recipe
 was defective.
+
+Do not demand repair of unrelated baseline failures or broad cleanup as a
+condition of task approval. Require focused proof for the affected packages,
+features, named tests or journeys, and directly affected generated or boundary
+surfaces; leave integrated gates to parent closeout.
 
 Record the meaningful adversarial probes attempted, the source evidence, and
 whether each hypothesis was disproved or became a finding. Keep this scoped to

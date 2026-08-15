@@ -139,6 +139,164 @@ class ValidationError(Exception):
     """Represent one or more plan-schema validation failures."""
 
 
+COMMAND_START = re.compile(
+    r"^(?:mise\s+(?:run|exec)|cargo\s+|pytest\s+|uv\s+run\s+pytest|"
+    r"pnpm\s+|npm\s+|npx\s+|git\s+)"
+)
+BROAD_MISE = re.compile(r"^mise run (?:lints|check|pre-pr)(?:\s|$)")
+BROAD_TEST_LANE = re.compile(
+    r"^mise run (?:test:(?:unit|shared|wyrd|skald|vala|sql|storage(?::matrix)?)|"
+    r"(?:py|python|ts|typescript):test:(?:unit|integration)|test:(?:journey|journeys|cluster|fuzz)(?::\S+)?)\b"
+)
+CANONICAL_MATRIX = re.compile(
+    r"(?:journey|cluster|fuzz)(?::|-|_)?(?:matrix|all)?",
+    re.IGNORECASE,
+)
+ESCAPE = re.compile(
+    r"(?m)^Broad verification exception:\s*`(?P<command>[^`]+)`\s*[—-]\s*Reason:\s*(?P<reason>\S.+)$"
+)
+
+
+def _commands(body: str) -> list[str]:
+    """Extract executable command lines from one task verification section."""
+
+    commands: list[str] = []
+    fenced_ranges: list[tuple[int, int]] = []
+    for match in re.finditer(r"(?ms)^```(?:bash|sh|shell|zsh)?\s*\n(.*?)^```\s*$", body):
+        fenced_ranges.append(match.span())
+        commands.extend(
+            line.strip()
+            for line in match.group(1).splitlines()
+            if COMMAND_START.match(line.strip())
+        )
+    remainder = body
+    for start, end in reversed(fenced_ranges):
+        remainder = remainder[:start] + remainder[end:]
+    commands.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"`([^`\n]+)`", remainder)
+        if COMMAND_START.match(match.group(1).strip())
+    )
+    for line in remainder.splitlines():
+        candidate = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line).strip()
+        if COMMAND_START.match(candidate) and candidate not in commands:
+            commands.append(candidate)
+    return commands
+
+
+def _cargo_has_package(command: str) -> bool:
+    """Return whether a Cargo command selects an explicit affected package."""
+
+    return re.search(r"(?:^|\s)(?:-p|--package)(?:\s+|=)\S+", command) is not None
+
+
+def _cargo_test_has_filter(command: str) -> bool:
+    """Return whether Cargo test names a test target or test-name filter."""
+
+    cargo_command = command[command.find("cargo ") :]
+    before_harness = cargo_command.split(" -- ", 1)[0]
+    tokens = before_harness.split()
+    try:
+        index = tokens.index("test") + 1
+    except ValueError:
+        return True
+    options_with_values = {
+        "-p",
+        "--package",
+        "--features",
+        "--test",
+        "--bin",
+        "--example",
+        "--manifest-path",
+        "-j",
+        "--jobs",
+    }
+    while index < len(tokens):
+        token = tokens[index]
+        if token in options_with_values:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return True
+    return False
+
+
+def _focused_verification_errors(path: Path, body: str) -> list[str]:
+    """Reject task-level commands that prove substantially unrelated surfaces."""
+
+    errors: list[str] = []
+    exceptions = {
+        match.group("command"): match.group("reason")
+        for match in ESCAPE.finditer(body)
+    }
+    commands = _commands(body)
+    if re.search(
+        r"(?mi)^Affected (?:crate|crates|package|packages|surface|surfaces):\s*\S+",
+        body,
+    ) is None:
+        errors.append(
+            f"{path}: `## Focused verification` must declare explicit affected "
+            "packages or surfaces"
+        )
+    for command in commands:
+        defect: str | None = None
+        if BROAD_MISE.search(command):
+            defect = "aggregate `mise run lints|check|pre-pr` belongs to parent closeout"
+        elif BROAD_TEST_LANE.search(command):
+            defect = "workspace, crate-family, or unfiltered language test lane belongs to parent closeout"
+        elif CANONICAL_MATRIX.search(command) and (
+            "mise run" in command or "integration" in command
+        ):
+            defect = "canonical journey/cluster/fuzz matrix belongs to parent closeout"
+        elif command.startswith("cargo ") or command.startswith("mise exec -- cargo "):
+            if re.search(r"(?:^|\s)--workspace(?:\s|$)", command):
+                defect = "task-level Cargo must not select the workspace"
+            elif re.search(r"(?:^|\s)--all-features(?:\s|$)", command):
+                defect = "task-level `--all-features` is not earned feature selection"
+            elif "cargo clippy" in command and not _cargo_has_package(command):
+                defect = "task-level Clippy must select an affected package with `-p`"
+            elif "cargo test" in command and not _cargo_has_package(command):
+                defect = "task-level Cargo test must select an affected package with `-p`"
+            elif "cargo test" in command and not _cargo_test_has_filter(command):
+                defect = "task-level Cargo test must name a test target or test-name filter"
+        elif re.search(r"(?:pytest|py:test:integration)", command) and not re.search(
+            r"(?:\.py(?:::\S+)?|\s-k\s+\S+)", command
+        ):
+            defect = "Python verification must name an affected test file/node or `-k` filter"
+        elif re.search(
+            r"(?:typescript|\bts:|pnpm.*(?:test|integration)|"
+            r"npm.*(?:test|integration))",
+            command,
+        ) and not re.search(
+            r"(?:\.test\.[cm]?[jt]s|\.spec\.[cm]?[jt]s|"
+            r"--testNamePattern|\s-t\s+\S+)",
+            command,
+        ):
+            defect = "TypeScript verification must name an affected test file or test-name filter"
+        if defect is None:
+            continue
+        reason = exceptions.get(command)
+        if reason is not None and len(reason.split()) >= 4:
+            continue
+        errors.append(
+            f"{path}: `## Focused verification` rejects `{command}`: {defect}"
+        )
+    for command, reason in exceptions.items():
+        if command not in commands:
+            errors.append(
+                f"{path}: broad verification exception must quote an executable "
+                f"command from the section: `{command}`"
+            )
+        elif len(reason.split()) < 4:
+            errors.append(
+                f"{path}: broad verification exception for `{command}` needs a "
+                "concrete reason"
+            )
+    return errors
+
+
 PLAN_FILE = re.compile(r"(?:[a-z0-9][a-z0-9-]*)/(?:active|archive)/(?:[a-z0-9][a-z0-9-]*)/plan\.md$")
 TASK_FILE = re.compile(r"(?:[a-z0-9][a-z0-9-]*)/(?:active|archive)/(?:[a-z0-9][a-z0-9-]*)/tasks/[0-9][0-9A-Za-z.-]*-[a-z0-9][a-z0-9-]*\.md$")
 REVIEW_FILE = re.compile(r"(?:[a-z0-9][a-z0-9-]*)/(?:active|archive)/(?:[a-z0-9][a-z0-9-]*)/reviews/[a-z0-9][a-z0-9-]*\.md$")
@@ -270,6 +428,11 @@ def _validate_document(
                     "`Not applicable: <reason>`"
                 )
 
+    if expected_headings == TASK_HEADINGS and "Focused verification" in bodies:
+        errors.extend(
+            _focused_verification_errors(path, bodies["Focused verification"])
+        )
+
     return errors
 
 
@@ -366,6 +529,10 @@ def _valid_task_text() -> str:
     )
     bodies = {heading: "Content." for heading in TASK_HEADINGS}
     bodies["Acceptance criteria"] = "- AC1. Observable result."
+    bodies["Focused verification"] = (
+        "Affected package: `example`.\n\n"
+        "- `mise exec -- cargo test --locked -p example exact_behavior -- --nocapture`"
+    )
     sections = "\n\n".join(
         f"## {heading}\n\n{bodies[heading]}" for heading in TASK_HEADINGS
     )
@@ -524,6 +691,68 @@ def self_test() -> int:
                 "self-test failed: unexplained `Not applicable` was accepted",
                 file=sys.stderr,
             )
+            return 1
+
+        task_path.write_text(original, encoding="utf-8")
+        invalid_commands = (
+            "mise run lints",
+            "mise run check",
+            "mise run pre-pr",
+            "mise run test:shared",
+            "mise run test:journey:matrix",
+            "mise run py:test:integration",
+            "pnpm test:integration",
+            "mise exec -- cargo test --workspace exact_behavior",
+            "mise exec -- cargo test -p example --all-features exact_behavior",
+            "mise exec -- cargo test -p example",
+            "mise exec -- cargo clippy --locked",
+        )
+        valid_command = "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture"
+        for command in invalid_commands:
+            candidate = original.replace(valid_command, command)
+            task_path.write_text(candidate, encoding="utf-8")
+            if not validate_plan_directory(plan_dir):
+                print(
+                    f"self-test failed: broad command `{command}` was accepted",
+                    file=sys.stderr,
+                )
+                return 1
+
+        valid_commands = (
+            "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture",
+            "mise exec -- cargo test --locked -p example --test api exact_behavior",
+            "uv run pytest tests/test_api.py::test_exact_behavior",
+            "pnpm vitest run tests/api.test.ts",
+            "mise exec -- cargo test --locked -p wyrd-mcp exact_tool_journey",
+            "mise run codegen:check",
+            "mise run docs:check",
+            "mise run check:client-tier",
+            "mise run fmt",
+        )
+        for command in valid_commands:
+            task_path.write_text(
+                original.replace(valid_command, command),
+                encoding="utf-8",
+            )
+            errors = validate_plan_directory(plan_dir)
+            if errors:
+                print(
+                    f"self-test failed: focused command `{command}` was rejected",
+                    file=sys.stderr,
+                )
+                for error in errors:
+                    print(error, file=sys.stderr)
+                return 1
+
+        escaped = original.replace(
+            valid_command,
+            "mise run test:journey:matrix\n\n"
+            "Broad verification exception: `mise run test:journey:matrix` — "
+            "Reason: this exact lane is the acceptance contract.",
+        )
+        task_path.write_text(escaped, encoding="utf-8")
+        if validate_plan_directory(plan_dir):
+            print("self-test failed: documented exact-lane exception was rejected", file=sys.stderr)
             return 1
 
     if valid_repository_artifact("wyrd/active/example/tasks/HANDOFF.md"):

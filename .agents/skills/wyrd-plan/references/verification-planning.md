@@ -76,14 +76,26 @@ correction in the task.
 
 Select the smallest complete dependency surface:
 
-1. narrow unit or integration tests for changed behavior;
-2. applicable crate-family or language task;
+1. named unit, integration, or journey tests for changed behavior;
+2. explicit affected Cargo packages or Python/TypeScript test files;
 3. boundary, codegen, typing, schema, migration, or docs checks caused by the
    change;
-4. format and default-feature workspace checks at a stable boundary.
+4. setup, build, formatting, and `git diff --check` where useful.
 
 Use default features or the exact optional features exercised by the task. Do
-not use `--all-features` as a generic task test option.
+not use `--all-features` as a generic task test option. Workspace checks,
+crate-family suites, aggregate gates, full Python/TypeScript integration,
+canonical journey/cluster/fuzz matrices, and unfiltered package tests belong
+only to parent closeout.
+
+The only escape is when one exact otherwise-broad lane is itself the acceptance
+contract. Quote the command in `## Focused verification` and add:
+
+```markdown
+Broad verification exception: `<exact command>` — Reason: <why this lane, rather than named tests, is the acceptance contract>.
+```
+
+Do not use the exception for convenience, baseline cleanup, or confidence.
 
 Run all Cargo-backed commands sequentially across agents sharing a checkout or
 target directory. Parallel source work must not overlap builds, tests, Clippy,
@@ -137,14 +149,14 @@ Verification surface:
 Run sequentially:
 
 1. `mise exec -- cargo test --locked -p wyrd-registry hydrate -- --nocapture --test-threads=1`
-2. `mise run test:shared`
+2. `mise exec -- cargo clippy --locked -p wyrd-registry --all-targets`
 3. `mise run fmt`
-4. `mise run check:default`
-5. `git diff --check`
+4. `git diff --check`
 
 Do not run:
 
 - `mise run check`
+- `mise run test:shared`
 - `mise run pre-pr`
 - unrelated language suites
 - concurrent Cargo commands
@@ -167,15 +179,15 @@ Required tests:
 
 Run sequentially:
 
-1. `mise run test:wyrd-sdk`
+1. `mise exec -- cargo test --locked -p wyrd-sdk --features python python_projection -- --nocapture`
 2. `mise run py:setup`
-3. `mise run py:test:unit`
-4. `mise run py:test:integration`
+3. `uv run pytest python/py-wyrd/tests/test_public_sdk.py::test_source_check_export`
+4. `uv run pytest -m integration python/py-wyrd/tests/integration/test_source_check.py::test_source_check_round_trip`
 5. `mise run py:typecheck`
 6. `mise run codegen:check`
 7. `mise run py:format`
 8. `mise run py:lints`
-9. `mise run check:default`
+9. `git diff --check`
 
 Do not run `pre-pr`; the parent plan owns integrated closeout.
 ```

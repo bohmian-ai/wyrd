@@ -110,6 +110,14 @@ Exact verification commands are recipes unless the task explicitly makes the
 exact lane, feature set, or environment normative. A defective recipe may be
 replaced with equivalent non-weaker proof.
 
+Treat a valid but overbroad task recipe as defective before execution. Do not
+run workspace, crate-family, aggregate, full-language, canonical matrix,
+unfiltered package, or generic all-feature lanes from a task packet. Replace
+them with equivalent focused proof over explicit affected packages, default or
+earned features, named tests or journeys, and affected generated or boundary
+checks; record the correction. Run an otherwise-broad lane only when the task
+documents that exact lane as the acceptance contract with a concrete reason.
+
 ## Execute the loop
 
 ### Orient
@@ -157,7 +165,8 @@ Route every failure:
 1. **Caused by the diff:** diagnose, fix, and rerun.
 2. **Small defect in touched code:** fix and report as incidental.
 3. **Defective command, filter, feature, or lane:** derive equivalent
-   non-weaker proof, update the task evidence, and rerun.
+   non-weaker focused proof without first running an overbroad recipe, update
+   the task evidence, and run the replacement.
 4. **Missing private plumbing or fixture:** add the smallest adjacent support
    inside the established owner and continue.
 5. **Missing repository-managed local setup:** inspect `mise.toml` and setup

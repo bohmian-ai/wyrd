@@ -42,6 +42,11 @@ Do not accept a unit test in place of a required integration or user journey,
 or a command that silently drops relevant features, assertions, negative
 flows, or consumers.
 
+A passing broad task command does not make the packet valid. Require named
+tests or journeys, explicit affected packages, default or earned features, and
+only affected codegen/docs/boundary checks. Classify an overbroad recipe as
+`BOUNDED_CORRECTION_REQUIRED`; do not require unrelated baseline cleanup.
+
 ## Failure routing
 
 | Evidence state | Verdict contribution |

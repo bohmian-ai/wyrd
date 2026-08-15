@@ -111,14 +111,22 @@ concurrency, cancellation, or error mapping affect correctness.
 Before marking a task `Ready`:
 
 1. Inspect every proposed `mise`, Cargo, package, or script command.
-2. Confirm the named task, package, feature, target, filter, fixture, support
+2. Require named tests or journeys, explicit affected packages, and default
+   features or exact non-default features earned by the behavior under test.
+3. Confirm the named task, package, feature, target, filter, fixture, support
    export, and repository setup exist.
-3. Run the narrow command when feasible. At minimum compile the exact target
+4. Run the narrow command when feasible. At minimum compile the exact target
    and feature selection and prove the filter selects the intended tests.
-4. Identify repository-provided services, migrations, environment, and
+5. Include only affected codegen, docs, typing, migration, or boundary checks.
+6. Identify repository-provided services, migrations, environment, and
    checked-in local test configuration required at execution time.
-5. Record unavailable external infrastructure without presenting runtime proof
+7. Record unavailable external infrastructure without presenting runtime proof
    as passed.
+
+Task packets must not contain workspace, crate-family, aggregate, full-language,
+canonical journey/cluster/fuzz matrix, or generic all-feature verification.
+Those lanes belong exclusively to parent closeout unless an exact broad lane is
+itself the acceptance contract and the packet uses the documented exception.
 
 Do not substitute a nearby command without recording the corrected command in
 the task. See `references/verification-planning.md`.
@@ -196,14 +204,15 @@ Load both format references and confirm:
 - task dependencies leave coherent repository states;
 - required independent review passed for risk-gated changes.
 
-Run the structural validator for materialized plans:
+Run the structural and focused-verification validator for materialized plans:
 
 ```bash
 python .agents/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
   "$(dirname "$PLAN_PATH")"
 ```
 
-The validator proves structure, not semantic readiness.
+The validator proves artifact structure and rejects semantically overbroad task
+commands. It does not replace executable preflight or cold rehearsal.
 
 In non-mutating contexts, return one `<proposed_plan>` block with complete
 artifact markers. When authorized, save the plan under

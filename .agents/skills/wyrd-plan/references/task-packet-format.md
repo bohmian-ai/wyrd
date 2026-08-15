@@ -118,11 +118,13 @@ Add focused coverage.
 
 ## Required features
 
-No feature change.
+Default features only; no feature change.
 
 ## Focused verification
 
-Run the focused test.
+Affected package: `example`; default features only.
+
+Run `mise exec -- cargo test --locked -p example exact_behavior -- --nocapture`.
 
 ## Commands explicitly excluded
 

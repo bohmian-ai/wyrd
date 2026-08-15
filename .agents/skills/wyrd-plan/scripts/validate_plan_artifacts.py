@@ -289,41 +289,143 @@ def _cargo_has_package(command: str) -> bool:
     return re.search(r"(?:^|\s)(?:-p|--package)(?:\s+|=)\S+", command) is not None
 
 
-def _cargo_subcommand(tokens: list[str]) -> tuple[str | None, int]:
-    """Resolve a Cargo subcommand after toolchain and supported global flags."""
+def _cargo_subcommand(tokens: list[str]) -> tuple[str | None, int, str | None]:
+    """Resolve a Cargo subcommand after supported toolchain and global options."""
 
-    value_flags = {"--color", "--config", "--manifest-path", "-Z"}
+    boolean_flags = {
+        "-V", "--version", "--list", "-v", "-vv", "-vvv", "-q", "--quiet",
+        "--locked", "--offline", "--frozen", "-h", "--help",
+    }
+    value_flags = {"--explain", "--color", "-C", "--config", "-Z"}
     index = 1
     if index < len(tokens) and tokens[index].startswith("+"):
         index += 1
     while index < len(tokens):
         token = tokens[index]
-        if token in {"test", "clippy", "check", "build"}:
-            return token, index
-        if token in value_flags:
+        aliases = {"t": "test", "c": "check", "b": "build"}
+        if token in {"test", "clippy", "check", "build"} | aliases.keys():
+            return aliases.get(token, token), index, None
+        if token in boolean_flags or re.fullmatch(r"-v+", token):
+            index += 1
+        elif token in value_flags:
+            if index + 1 >= len(tokens):
+                return None, index, f"unsupported Cargo global option layout `{token}`"
             index += 2
+        elif any(token.startswith(f"{flag}=") for flag in {"--explain", "--color", "--config"}):
+            index += 1
+        elif (
+            token.startswith("-C") and len(token) > 2
+        ) or (token.startswith("-Z") and len(token) > 2):
+            index += 1
         elif token.startswith("-"):
+            return None, index, f"unsupported Cargo global option layout `{token}`"
+        else:
+            return token, index, None
+    return None, index, None
+
+
+def _canonical_mise(tokens: list[str]) -> tuple[str, str | None]:
+    """Normalize supported mise global flags and task invocation aliases."""
+
+    boolean_flags = {
+        "-q",
+        "--quiet",
+        "--silent",
+        "--no-config",
+        "--no-env",
+        "--no-hooks",
+        "--yes",
+        "-y",
+        "--raw",
+        "--locked",
+    }
+    value_flags = {"-C", "--cd", "-E", "--env", "-j", "--jobs", "--output"}
+    index = 1
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        if option in boolean_flags or re.fullmatch(r"-v+", option):
+            index += 1
+        elif option in value_flags and index + 1 < len(tokens):
+            index += 2
+        elif any(
+            option.startswith(f"{flag}=")
+            for flag in {"--cd", "--env", "--jobs", "--output"}
+        ):
+            index += 1
+        elif option.startswith(("-C", "-E", "-j")) and len(option) > 2:
             index += 1
         else:
-            return token, index
-    return None, index
+            return shlex.join(tokens), f"unsupported mise global option layout `{option}`"
+    remaining = tokens[index:]
+    if not remaining or remaining[0] == "exec":
+        return shlex.join(tokens), None
+    if remaining[0] == "tasks":
+        if len(remaining) < 2 or remaining[1] not in {"run", "r"}:
+            return shlex.join(tokens), "unsupported `mise tasks` invocation layout"
+        remaining = remaining[1:]
+    if remaining[0] in {"run", "r"}:
+        remaining = remaining[1:]
+        task_boolean_flags = {
+            "-c", "--continue-on-error", "-f", "--force", "-n", "--dry-run",
+            "-q", "--quiet", "-r", "--raw", "-S", "--silent",
+        }
+        task_value_flags = {
+            "-C", "--cd", "-j", "--jobs", "-o", "--output", "-s", "--shell",
+            "-t", "--tool", "--affected-base", "--affected-head", "--allow-env",
+            "--allow-net",
+        }
+        while remaining and remaining[0].startswith("-"):
+            option = remaining[0]
+            if option in task_boolean_flags:
+                remaining = remaining[1:]
+            elif option in task_value_flags and len(remaining) > 1:
+                remaining = remaining[2:]
+            elif any(
+                option.startswith(f"{flag}=")
+                for flag in {
+                    "--cd", "--jobs", "--output", "--shell", "--tool",
+                    "--affected-base", "--affected-head", "--allow-env", "--allow-net",
+                }
+            ):
+                remaining = remaining[1:]
+            else:
+                return shlex.join(tokens), f"unsupported mise task option layout `{option}`"
+    if not remaining:
+        return shlex.join(tokens), "mise task invocation is missing a task name"
+    return shlex.join(["mise", "run", *remaining]), None
 
 
-def _canonical_mise(tokens: list[str]) -> str:
-    """Normalize supported mise task invocation forms to `mise run <task>`."""
+def _canonical_npx(tokens: list[str]) -> tuple[list[str], str | None]:
+    """Normalize supported NPX launcher flags before the package command."""
 
-    if len(tokens) < 2 or tokens[1] == "exec":
-        return shlex.join(tokens)
-    if tokens[1] in {"run", "r"}:
-        return shlex.join(["mise", "run", *tokens[2:]])
-    return shlex.join(["mise", "run", *tokens[1:]])
+    boolean_flags = {"--yes", "-y", "--workspaces", "--include-workspace-root"}
+    value_flags = {"--package", "-p", "--workspace", "-w"}
+    index = 1
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        if option in boolean_flags:
+            index += 1
+        elif option in value_flags and index + 1 < len(tokens):
+            index += 2
+        elif option in {"--call", "-c"} and index + 1 < len(tokens):
+            try:
+                return ["npx", *shlex.split(tokens[index + 1])], None
+            except ValueError as error:
+                return tokens, f"invalid npx `--call` payload: {error}"
+        elif any(option.startswith(f"{flag}=") for flag in {"--package", "--workspace"}):
+            index += 1
+        else:
+            return tokens, f"unsupported npx launcher option layout `{option}`"
+    return ["npx", *tokens[index:]], None
 
 
 def _cargo_test_has_filter(command: str) -> bool:
     """Return whether Cargo test names an exact positional test-name filter."""
 
     tokens = shlex.split(command.split(" -- ", 1)[0])
-    subcommand, index = _cargo_subcommand(tokens)
+    subcommand, index, error = _cargo_subcommand(tokens)
+    if error is not None:
+        return False
     if subcommand != "test":
         return True
     index += 1
@@ -366,7 +468,12 @@ def _segment_defect(command: str) -> str | None:
         return "opaque repository script requires a structured exact-lane exception"
     if executable == POSTGRES_WRAPPER:
         return "Postgres wrapper must include `--` and a focused payload"
-    canonical_command = _canonical_mise(tokens) if executable == "mise" else command
+    if executable == "mise":
+        canonical_command, mise_error = _canonical_mise(tokens)
+        if mise_error is not None:
+            return mise_error
+    else:
+        canonical_command = command
     if BROAD_MISE.search(canonical_command):
         return "aggregate `mise run lints|check|pre-pr` belongs to parent closeout"
     if BROAD_TEST_LANE.search(canonical_command):
@@ -382,7 +489,9 @@ def _segment_defect(command: str) -> str | None:
             return "task-level Cargo must not select the workspace"
         if re.search(r"(?:^|\s)--all-features(?:\s|$)", command):
             return "task-level `--all-features` is not earned feature selection"
-        subcommand, _ = _cargo_subcommand(tokens)
+        subcommand, _, cargo_error = _cargo_subcommand(tokens)
+        if cargo_error is not None:
+            return cargo_error
         if subcommand == "clippy" and not _cargo_has_package(command):
             return "task-level Clippy must select an affected package with `-p`"
         if subcommand == "test":
@@ -390,6 +499,11 @@ def _segment_defect(command: str) -> str | None:
                 return "task-level Cargo test must select an affected package with `-p`"
             if not _cargo_test_has_filter(command):
                 return "task-level Cargo test must name an exact positional test filter"
+    if executable == "npx":
+        normalized_npx, npx_error = _canonical_npx(tokens)
+        if npx_error is not None:
+            return npx_error
+        command = shlex.join(normalized_npx)
     if re.search(r"(?:pytest|py:test:integration)", command) and not re.search(
         r"(?:\.py::\S+|\s-k\s+\S+)", command
     ):
@@ -476,7 +590,9 @@ def _focused_verification_errors(
         elif owner.startswith("mise.toml:"):
             lane = owner.split(":", 1)[1]
             try:
-                normalized_exception_command = _canonical_mise(shlex.split(command))
+                normalized_exception_command, _ = _canonical_mise(
+                    shlex.split(command)
+                )
             except ValueError:
                 normalized_exception_command = command
             if re.match(
@@ -963,18 +1079,30 @@ def self_test() -> int:
             "mise run lints",
             "mise lints",
             "mise r lints",
+            "mise -q run lints",
+            "mise --quiet run lints",
+            "mise run --quiet lints",
+            "mise tasks run lints",
+            "mise tasks r lints",
             "mise run check",
             "mise run pre-pr",
             "mise run test:shared",
             "mise test:vala:integration",
+            "mise --quiet run test:vala:integration",
             "mise run test:journey:matrix",
             "mise run test:cluster:all",
             "mise run test:fuzz:matrix",
             "mise run py:test:integration",
             "pnpm test:integration",
             "npx vitest run",
+            "npx --yes vitest run",
+            "npx --package vitest vitest run",
+            "npx -c 'vitest run'",
             "mise exec -- cargo test --workspace exact_behavior",
             "cargo +stable test -p example",
+            "cargo t -p example",
+            "cargo +stable t -p example",
+            "cargo --quiet t -p example",
             "mise exec -- cargo test -p example --all-features exact_behavior",
             "mise exec -- cargo test -p example",
             "mise exec -- cargo test -p example --test api",
@@ -1039,15 +1167,24 @@ def self_test() -> int:
         valid_commands = (
             "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture",
             "cargo +stable --locked test -p example exact_behavior",
+            "cargo t -p example exact_behavior",
+            "cargo +stable --quiet t -p example exact_behavior",
             "mise exec -- cargo test --locked -p example --test api exact_behavior",
             "uv run pytest tests/test_api_journey.py::test_exact_behavior",
             "pnpm vitest run tests/api.test.ts",
             "npx vitest run tests/api.test.ts",
+            "npx --yes vitest run tests/api.test.ts",
+            "npx --package vitest vitest run tests/api.test.ts",
+            "npx -c 'vitest run tests/api.test.ts'",
             "mise exec -- cargo test --locked -p wyrd-mcp exact_tool_journey",
             "scripts/postgres/with-test-postgres.sh -- bash -lc "
             "'cargo test -p wyrd-sql --test postgres exact_round_trip'",
             "env RUST_LOG=debug command cargo test -p example exact_behavior",
             "mise run codegen:check",
+            "mise --quiet run codegen:check",
+            "mise run --quiet codegen:check",
+            "mise tasks run codegen:check",
+            "mise tasks r codegen:check",
             "mise run docs:check",
             "mise run check:client-tier",
             "mise run fmt",

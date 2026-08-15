@@ -66,8 +66,10 @@ integrated plan, this mode overrides conflicting standalone instructions:
   verification evidence, and applicable repository authorities completely.
 - Perform static source, contract, caller, consumer, manifest, generated
   surface, and test analysis. Audit recorded verification semantically.
-- Do not run tests, builds, lints, formatters, generators, migrations,
-  services, plan validators, repository gates, or independent verification.
+- Do not run project tests, builds, lints, formatters, generators, migrations,
+  services, repository gates, or any other independent verification. The sole
+  permitted execution is the narrow static plan-artifact semantic validator
+  required by **Establish the review contract** below.
 - Load the progressive references required by the affected surface.
 - Return a requirement/acceptance traceability matrix, findings, evidence
   audit, inspected surfaces, and material static-analysis limits.
@@ -129,14 +131,16 @@ classification, the durable artifact, and canonical planning.
    branch base, or working tree. Include untracked files and preserve unrelated
    user changes.
 3. Locate the canonical plan and every task in scope when plan conformance is
-   claimed. Read them completely and run:
+   claimed. Read them completely. In standalone review and plan-execution
+   binding mode, run only this narrow static plan-artifact semantic validator:
 
    ```bash
    python .agents/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
      .dev/plan/<slug>
    ```
 
-   Treat every validator diagnostic as an invalid packet defect. Independently
+   Do not run any other verifier in plan-execution binding mode. Treat every
+   validator diagnostic as an invalid packet defect. Independently
    reject task verification that is workspace-wide, crate-family-wide,
    aggregate, all-feature, unfiltered, or full-language even if the command is
    executable or recorded as passing. A documented exact-lane exception is

@@ -143,7 +143,10 @@ classification, the durable artifact, and canonical planning.
    valid only when it immediately binds the exact command to an existing task
    requirement, repository lane owner, and concrete narrowing-loss statement.
    Audit every command hidden by shell chaining, pipes, continuations,
-   environment prefixes, scripts, or shell payloads.
+   environment prefixes, scripts, or shell payloads. Normalize mise shorthand,
+   Cargo toolchain/global flags, and equivalent Vitest launchers. Reject
+   executable substitutions and opaque repository scripts without the
+   structured exception.
 
    Require an `Approved` parent plan. A `Ready` task is eligible for an active
    or legacy review; `Complete` is the normal completion-review state; review

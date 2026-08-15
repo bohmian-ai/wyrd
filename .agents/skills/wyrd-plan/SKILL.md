@@ -129,7 +129,9 @@ Those lanes belong exclusively to parent closeout unless an exact broad lane is
 itself the acceptance contract and the packet uses the structured,
 requirement-bound exception in `references/verification-planning.md`. Inspect
 every chained, piped, continued, prompted, environment-prefixed, or recursively
-wrapped shell segment; reject unauditable aliases and functions.
+wrapped shell segment; normalize supported CLI shorthand, reject executable
+substitutions and unauditable aliases/functions, and do not trust opaque
+repository scripts merely because their path is local.
 
 Do not substitute a nearby command without recording the corrected command in
 the task. See `references/verification-planning.md`.

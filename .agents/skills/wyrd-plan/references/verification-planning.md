@@ -107,8 +107,14 @@ generic boilerplate, convenience, baseline cleanup, or confidence as the loss.
 
 Shell recipes are transparent to this policy. Every command behind chaining,
 pipes, prompts, continuations, `env`/`command`, repository wrappers, and
-`bash|sh -c/-lc` is independently focused. Use explicit repository script
-paths; bare aliases and shell functions are not auditable.
+`bash|sh -c/-lc` is independently focused. The validator normalizes mise
+shorthand and Cargo toolchain/global options before classification. Executable
+substitutions, bare aliases, and shell functions are not auditable.
+
+Repository paths are not automatically trusted. The known Postgres wrapper is
+parsed through to its payload. Other scripts require the structured exception,
+whose `lane_owner` is that exact path, unless a future validator explicitly
+implements deterministic body inspection for that script.
 
 Run all Cargo-backed commands sequentially across agents sharing a checkout or
 target directory. Parallel source work must not overlap builds, tests, Clippy,

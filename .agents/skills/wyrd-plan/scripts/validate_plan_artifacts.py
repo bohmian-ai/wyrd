@@ -160,6 +160,8 @@ ESCAPE = re.compile(
 KNOWN_COMMANDS = {"cargo", "git", "mise", "npm", "npx", "pnpm", "pytest", "uv"}
 SHELLS = {"bash", "sh", "zsh"}
 WRAPPER_PATH = re.compile(r"^(?:\./|\.agents/|scripts/)[A-Za-z0-9_./-]+$")
+POSTGRES_WRAPPER = "scripts/postgres/with-test-postgres.sh"
+SUBSTITUTION = re.compile(r"\$\(|`|(?<!\w)[<>]\(")
 GENERIC_LOSS = re.compile(
     r"^(?:named tests omit acceptance proof|this exact lane is the acceptance contract)\.?$",
     re.IGNORECASE,
@@ -275,7 +277,7 @@ def _unwrap_segment(segment: str) -> tuple[list[str], str | None]:
         return [], "shell wrapper must use `-c` or `-lc` with a payload"
     if tokens[0] == "mise" and tokens[1:3] == ["exec", "--"]:
         return [shlex.join(tokens[3:])], None
-    if WRAPPER_PATH.fullmatch(tokens[0]) and "--" in tokens:
+    if tokens[0] == POSTGRES_WRAPPER and "--" in tokens:
         index = tokens.index("--")
         return [shlex.join(tokens[index + 1 :])], None
     return [shlex.join(tokens)], None
@@ -287,16 +289,44 @@ def _cargo_has_package(command: str) -> bool:
     return re.search(r"(?:^|\s)(?:-p|--package)(?:\s+|=)\S+", command) is not None
 
 
+def _cargo_subcommand(tokens: list[str]) -> tuple[str | None, int]:
+    """Resolve a Cargo subcommand after toolchain and supported global flags."""
+
+    value_flags = {"--color", "--config", "--manifest-path", "-Z"}
+    index = 1
+    if index < len(tokens) and tokens[index].startswith("+"):
+        index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"test", "clippy", "check", "build"}:
+            return token, index
+        if token in value_flags:
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            return token, index
+    return None, index
+
+
+def _canonical_mise(tokens: list[str]) -> str:
+    """Normalize supported mise task invocation forms to `mise run <task>`."""
+
+    if len(tokens) < 2 or tokens[1] == "exec":
+        return shlex.join(tokens)
+    if tokens[1] in {"run", "r"}:
+        return shlex.join(["mise", "run", *tokens[2:]])
+    return shlex.join(["mise", "run", *tokens[1:]])
+
+
 def _cargo_test_has_filter(command: str) -> bool:
     """Return whether Cargo test names an exact positional test-name filter."""
 
-    cargo_command = command[command.find("cargo ") :]
-    before_harness = cargo_command.split(" -- ", 1)[0]
-    tokens = before_harness.split()
-    try:
-        index = tokens.index("test") + 1
-    except ValueError:
+    tokens = shlex.split(command.split(" -- ", 1)[0])
+    subcommand, index = _cargo_subcommand(tokens)
+    if subcommand != "test":
         return True
+    index += 1
     options_with_values = {
         "-p",
         "--package",
@@ -332,23 +362,30 @@ def _segment_defect(command: str) -> str | None:
     executable = tokens[0]
     if executable not in KNOWN_COMMANDS and WRAPPER_PATH.fullmatch(executable) is None:
         return "unknown alias or function; use an explicit repository path or supported command"
-    if BROAD_MISE.search(command):
+    if WRAPPER_PATH.fullmatch(executable) and executable != POSTGRES_WRAPPER:
+        return "opaque repository script requires a structured exact-lane exception"
+    if executable == POSTGRES_WRAPPER:
+        return "Postgres wrapper must include `--` and a focused payload"
+    canonical_command = _canonical_mise(tokens) if executable == "mise" else command
+    if BROAD_MISE.search(canonical_command):
         return "aggregate `mise run lints|check|pre-pr` belongs to parent closeout"
-    if BROAD_TEST_LANE.search(command):
+    if BROAD_TEST_LANE.search(canonical_command):
         return (
             "workspace, crate-family, or unfiltered language test lane belongs "
             "to parent closeout"
         )
-    if executable == "mise" and len(tokens) >= 3 and CANONICAL_MATRIX.search(tokens[2]):
+    canonical_tokens = shlex.split(canonical_command)
+    if executable == "mise" and len(canonical_tokens) >= 3 and CANONICAL_MATRIX.search(canonical_tokens[2]):
         return "canonical journey/cluster/fuzz matrix belongs to parent closeout"
     if executable == "cargo":
         if re.search(r"(?:^|\s)--workspace(?:\s|$)", command):
             return "task-level Cargo must not select the workspace"
         if re.search(r"(?:^|\s)--all-features(?:\s|$)", command):
             return "task-level `--all-features` is not earned feature selection"
-        if len(tokens) > 1 and tokens[1] == "clippy" and not _cargo_has_package(command):
+        subcommand, _ = _cargo_subcommand(tokens)
+        if subcommand == "clippy" and not _cargo_has_package(command):
             return "task-level Clippy must select an affected package with `-p`"
-        if len(tokens) > 1 and tokens[1] == "test":
+        if subcommand == "test":
             if not _cargo_has_package(command):
                 return "task-level Cargo test must select an affected package with `-p`"
             if not _cargo_test_has_filter(command):
@@ -358,7 +395,8 @@ def _segment_defect(command: str) -> str | None:
     ):
         return "Python verification must name an exact test node or `-k` filter"
     if re.search(
-        r"(?:typescript|\bts:|pnpm.*(?:test|integration)|npm.*(?:test|integration)|pnpm\s+vitest)",
+        r"(?:typescript|\bts:|pnpm.*(?:test|integration)|npm.*(?:test|integration)|"
+        r"(?:pnpm|npx)\s+vitest)",
         command,
     ) and not re.search(
         r"(?:\.test\.[cm]?[jt]s|\.spec\.[cm]?[jt]s|"
@@ -376,6 +414,15 @@ def _recipe_defects(recipe: str) -> list[tuple[str, str]]:
     defects: list[tuple[str, str]] = []
     while pending:
         current = pending.pop(0)
+        substitution = SUBSTITUTION.search(current)
+        if substitution is not None:
+            defects.append(
+                (
+                    substitution.group(0),
+                    "executable substitution is unauditable in focused verification",
+                )
+            )
+            continue
         segments, split_error = _shell_segments(current)
         if split_error is not None:
             defects.append((current, f"invalid shell recipe: {split_error}"))
@@ -428,7 +475,14 @@ def _focused_verification_errors(
             )
         elif owner.startswith("mise.toml:"):
             lane = owner.split(":", 1)[1]
-            if re.match(rf"^mise run {re.escape(lane)}(?:\s|$)", command) is None:
+            try:
+                normalized_exception_command = _canonical_mise(shlex.split(command))
+            except ValueError:
+                normalized_exception_command = command
+            if re.match(
+                rf"^mise run {re.escape(lane)}(?:\s|$)",
+                normalized_exception_command,
+            ) is None:
                 errors.append(
                     f"{path}: exact-lane exception command does not match "
                     f"lane_owner `{owner}`"
@@ -479,6 +533,7 @@ def _focused_verification_errors(
                 "unknown alias or function" in defect
                 or "invalid shell" in defect
                 or "empty" in defect
+                or "substitution" in defect
                 for _, defect in defects
             ):
                 errors.append(
@@ -906,15 +961,20 @@ def self_test() -> int:
         task_path.write_text(original, encoding="utf-8")
         invalid_commands = (
             "mise run lints",
+            "mise lints",
+            "mise r lints",
             "mise run check",
             "mise run pre-pr",
             "mise run test:shared",
+            "mise test:vala:integration",
             "mise run test:journey:matrix",
             "mise run test:cluster:all",
             "mise run test:fuzz:matrix",
             "mise run py:test:integration",
             "pnpm test:integration",
+            "npx vitest run",
             "mise exec -- cargo test --workspace exact_behavior",
+            "cargo +stable test -p example",
             "mise exec -- cargo test -p example --all-features exact_behavior",
             "mise exec -- cargo test -p example",
             "mise exec -- cargo test -p example --test api",
@@ -926,6 +986,12 @@ def self_test() -> int:
             "env RUST_LOG=debug command cargo test -p example exact_behavior && lint-all",
             "bash -lc 'cargo test -p example exact_behavior && mise run lints'",
             "lint-all",
+            "scripts/checks/run-all.sh -- cargo test -p example exact_behavior",
+            "cargo test -p example $(mise run pre-pr)",
+            "cargo test -p example $(printf '%s' $(mise run pre-pr))",
+            "cargo test -p example exact_behavior <(mise run pre-pr)",
+            "cargo test -p example exact_behavior >(mise run pre-pr)",
+            "bash -lc 'cargo test -p example $(mise run pre-pr)'",
         )
         valid_command = "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture"
         for command in invalid_commands:
@@ -955,11 +1021,28 @@ def self_test() -> int:
             )
             return 1
 
+        backtick_substitution = original.replace(
+            f"- `{valid_command}`",
+            "```bash\n"
+            "$ cargo test -p example exact_behavior \"`mise run pre-pr`\"\n"
+            "```",
+        )
+        task_path.write_text(backtick_substitution, encoding="utf-8")
+        substitution_errors = validate_plan_directory(plan_dir)
+        if not any("substitution" in error for error in substitution_errors):
+            print(
+                "self-test failed: quoted backtick substitution was accepted",
+                file=sys.stderr,
+            )
+            return 1
+
         valid_commands = (
             "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture",
+            "cargo +stable --locked test -p example exact_behavior",
             "mise exec -- cargo test --locked -p example --test api exact_behavior",
             "uv run pytest tests/test_api_journey.py::test_exact_behavior",
             "pnpm vitest run tests/api.test.ts",
+            "npx vitest run tests/api.test.ts",
             "mise exec -- cargo test --locked -p wyrd-mcp exact_tool_journey",
             "scripts/postgres/with-test-postgres.sh -- bash -lc "
             "'cargo test -p wyrd-sql --test postgres exact_round_trip'",
@@ -996,6 +1079,26 @@ def self_test() -> int:
         task_path.write_text(escaped, encoding="utf-8")
         if validate_plan_directory(plan_dir):
             print("self-test failed: documented exact-lane exception was rejected", file=sys.stderr)
+            return 1
+
+        boundary_exception = original.replace(
+            f"- `{valid_command}`",
+            "Exact-lane exception:\n"
+            "- requirement: AC1\n"
+            "- lane_owner: `scripts/checks/check-client-boundary.sh`\n"
+            "- narrowing_loss: Direct package commands cannot reproduce the "
+            "boundary script's cross-manifest dependency audit.\n"
+            "`scripts/checks/check-client-boundary.sh`",
+        )
+        task_path.write_text(boundary_exception, encoding="utf-8")
+        boundary_errors = validate_plan_directory(plan_dir)
+        if boundary_errors:
+            print(
+                "self-test failed: exception-bound boundary script was rejected",
+                file=sys.stderr,
+            )
+            for error in boundary_errors:
+                print(error, file=sys.stderr)
             return 1
 
         escape_abuse = (

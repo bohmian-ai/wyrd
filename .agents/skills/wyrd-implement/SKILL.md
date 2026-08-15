@@ -120,7 +120,9 @@ immediately binds that exact command to an existing requirement, repository
 lane owner, and concrete statement of acceptance proof lost by narrowing.
 Inspect every chained, piped, continued, prompted, environment-prefixed, and
 recursively wrapped command segment before execution; unknown aliases or shell
-functions are defective recipes.
+functions, executable substitutions, and opaque repository scripts without a
+structured exception are defective recipes. Normalize equivalent mise, Cargo,
+and Vitest CLI forms before applying the policy.
 
 ## Execute the loop
 

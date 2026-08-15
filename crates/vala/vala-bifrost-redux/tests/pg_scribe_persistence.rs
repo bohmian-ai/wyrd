@@ -12,6 +12,7 @@ use arrow::ipc::writer::StreamWriter;
 use opendal::services::Memory;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use secrecy::ExposeSecret;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::{
     BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
@@ -824,6 +825,54 @@ async fn object_paths(fixture: &PersistenceFixture) -> Vec<String> {
         .collect()
 }
 
+/// Fetches the ordered catalog identity needed to prove object parity.
+async fn artifact_rows_for_table(
+    fixture: &PersistenceFixture,
+    table_name: &str,
+) -> Vec<(i64, i64, i64, String, i64, String)> {
+    let mut conn = fixture
+        .database
+        .tenant_conn_for(fixture.tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query_as(
+        "SELECT writer_epoch, wal_lsn_min, wal_lsn_max, file_path, file_size, file_checksum
+           FROM vala.file_list
+          WHERE data_tenant_id = $1 AND table_name = $2
+          ORDER BY writer_epoch, wal_lsn_min, file_ordinal",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(table_name)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("artifact catalog rows")
+}
+
+/// Proves every catalog length and SHA-256 digest matches its fetched object.
+async fn assert_catalog_object_parity(
+    fixture: &PersistenceFixture,
+    rows: &[(i64, i64, i64, String, i64, String)],
+) {
+    for (_, _, _, path, catalog_size, catalog_checksum) in rows {
+        let bytes = fixture
+            .operator
+            .read(path)
+            .await
+            .expect("catalog object remains readable")
+            .to_bytes();
+        assert_eq!(
+            i64::try_from(bytes.len()).expect("test object length fits i64"),
+            *catalog_size,
+            "catalog length must match fetched object at {path}"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&bytes)),
+            *catalog_checksum,
+            "catalog checksum must match fetched object at {path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn same_seal_key_generations_publish_in_fifo_order() {
     let fixture = PersistenceFixture::start().await;
@@ -1006,7 +1055,10 @@ async fn automatic_commit_ambiguity_reconciles_exactly_once() {
         1,
         "fenced retry validates the already-committed row"
     );
-    assert_eq!(audit_count(&fixture).await, 1);
+    let artifacts = artifact_rows_for_table(&fixture, "automatic_ambiguous_commit_events").await;
+    assert_eq!(artifacts.len(), 1, "retry preserves one artifact set");
+    assert_catalog_object_parity(&fixture, &artifacts).await;
+    assert_eq!(audit_count(&fixture).await, 1, "retry preserves one audit");
     assert_eq!(object_paths(&fixture).await.len(), 1);
     assert!(hint_outcome(&mut fixture).is_ok());
     assert!(matches!(
@@ -1252,6 +1304,49 @@ async fn replayed_generation_publishes_durably_after_restart() {
     assert_wal_lsn_chain(&rows_for_table(&fixture, "restart_publish_events").await, 3);
     assert_eq!(audit_count(&fixture).await, 3);
     assert_eq!(object_paths(&fixture).await.len(), 3);
+    fixture.stop().await;
+}
+
+/// Automatic persistence keeps old- and new-epoch objects distinct and exact.
+#[tokio::test]
+async fn automatic_scribe_artifact_identity_survives_cross_epoch_restart() {
+    let fixture = PersistenceFixture::start_after_wal_restart(false).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if fixture.scribe.persistence_queue_depth_for_test() == 0
+            && artifact_rows_for_table(&fixture, "restart_publish_events")
+                .await
+                .len()
+                == 3
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "epoch-one replay stalled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    append_one(&fixture, "restart_publish_events", 99).await;
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("epoch-two generation flush");
+    wait_for_state(&fixture, 0).await;
+
+    let rows = artifact_rows_for_table(&fixture, "restart_publish_events").await;
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.iter().filter(|row| row.0 == 1).count(), 3);
+    assert_eq!(rows.iter().filter(|row| row.0 == 2).count(), 1);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.3.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        rows.len(),
+        "cross-epoch durable paths must be distinct: {rows:?}"
+    );
+    assert_catalog_object_parity(&fixture, &rows).await;
+    assert_eq!(audit_count(&fixture).await, 4);
     fixture.stop().await;
 }
 

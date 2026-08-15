@@ -14,7 +14,82 @@ use chrono::{DateTime, NaiveDate, Utc};
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
+use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
+
+/// Durable identity shared by every producer of one Scribe artifact set.
+///
+/// The identity deliberately excludes process-local generation and seal counters.
+/// Its complete tuple matches the durable file-list conflict scope while also
+/// retaining the partition and shard needed to keep object paths inspectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScribeArtifactIdentity {
+    /// Tenant-qualified object prefix for the logical table.
+    object_prefix: String,
+    /// Event-day partition represented by the artifact set.
+    partition_day: EventDay,
+    /// Producing Scribe node without UUID punctuation.
+    node_id: String,
+    /// Producing Scribe writer epoch.
+    writer_epoch: i64,
+    /// Pod-local shard lane that produced the artifact set.
+    shard_id: usize,
+    /// Inclusive minimum WAL LSN represented by the artifact set.
+    wal_lsn_min: u64,
+    /// Inclusive maximum WAL LSN represented by the artifact set.
+    wal_lsn_max: u64,
+}
+
+impl ScribeArtifactIdentity {
+    /// Constructs the durable identity after validating its node identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when `node_id` is not a UUID or when the WAL
+    /// range is reversed.
+    pub(crate) fn new(
+        binding: &TenantTableBinding,
+        partition_day: EventDay,
+        node_id: &str,
+        writer_epoch: i64,
+        shard_id: usize,
+        wal_lsn_min: u64,
+        wal_lsn_max: u64,
+    ) -> Result<Self, ScribeError> {
+        let node_id = uuid::Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
+            detail: format!("node_id is not a valid UUID: {error}"),
+        })?;
+        if wal_lsn_min > wal_lsn_max {
+            return Err(ScribeError::Internal {
+                detail: "Scribe artifact WAL range is reversed".to_owned(),
+            });
+        }
+        Ok(Self {
+            object_prefix: binding.object_prefix.clone(),
+            partition_day,
+            node_id: node_id.simple().to_string(),
+            writer_epoch,
+            shard_id,
+            wal_lsn_min,
+            wal_lsn_max,
+        })
+    }
+
+    /// Returns the deterministic base shared by every ordinal in the set.
+    #[must_use]
+    pub(crate) fn object_base(&self) -> String {
+        format!(
+            "{}/day={}/scribe-{}-epoch-{}-shard-{}-wal-{}-{}",
+            self.object_prefix,
+            self.partition_day,
+            self.node_id,
+            self.writer_epoch,
+            self.shard_id,
+            self.wal_lsn_min,
+            self.wal_lsn_max,
+        )
+    }
+}
 
 /// Event day — the partition day extracted from `wyrd_event_time`.
 ///
@@ -180,6 +255,64 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+
+    /// Builds one tenant-qualified binding for durable identity tests.
+    fn artifact_binding() -> TenantTableBinding {
+        TenantTableBinding::resolve((
+            crate::test_support::tenant(),
+            TableRef::new(BifrostNamespace::Bifrost, "artifact_identity"),
+        ))
+        .expect("artifact identity binding")
+    }
+
+    /// Durable Scribe identity changes for every conflict-key dimension and
+    /// remains stable for an exact retry and its ordered artifact ordinals.
+    #[test]
+    fn scribe_artifact_identity_matrix_is_durable_and_retry_stable() {
+        let binding = artifact_binding();
+        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 8, 15).expect("valid day"));
+        let node = "018f7ca2-7a4d-7cc1-98a7-97fdd1f15101";
+        let identity = ScribeArtifactIdentity::new(&binding, day, node, 7, 3, 101, 109)
+            .expect("durable identity");
+        let retry = ScribeArtifactIdentity::new(&binding, day, node, 7, 3, 101, 109)
+            .expect("retry identity");
+        let base = identity.object_base();
+        assert_eq!(base, retry.object_base());
+        assert_eq!(
+            format!("{base}-{:05}.parquet", 0),
+            format!("{}-{:05}.parquet", retry.object_base(), 0)
+        );
+        assert_ne!(
+            format!("{base}-{:05}.parquet", 0),
+            format!("{base}-{:05}.parquet", 1)
+        );
+
+        for changed in [
+            ScribeArtifactIdentity::new(&binding, day, node, 8, 3, 101, 109),
+            ScribeArtifactIdentity::new(&binding, day, node, 7, 4, 101, 109),
+            ScribeArtifactIdentity::new(&binding, day, node, 7, 3, 100, 109),
+            ScribeArtifactIdentity::new(&binding, day, node, 7, 3, 101, 110),
+        ] {
+            assert_ne!(base, changed.expect("changed identity").object_base());
+        }
+    }
+
+    /// Reversed WAL ranges fail before an object path can be constructed.
+    #[test]
+    fn scribe_artifact_identity_rejects_reversed_wal_range() {
+        let binding = artifact_binding();
+        let error = ScribeArtifactIdentity::new(
+            &binding,
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 8, 15).expect("valid day")),
+            "018f7ca2-7a4d-7cc1-98a7-97fdd1f15101",
+            7,
+            3,
+            110,
+            109,
+        )
+        .expect_err("reversed range must fail");
+        assert!(matches!(error, ScribeError::Internal { .. }));
+    }
 
     #[test]
     fn event_day_from_timestamp() {

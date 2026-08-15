@@ -11,7 +11,6 @@ use bytes::Bytes;
 use num_traits::ToPrimitive;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
-use uuid::Uuid;
 use vala_sql::ValaPostgres;
 use wyrd_spec::vala::api::AuditEvent;
 
@@ -28,7 +27,7 @@ use crate::scribe::memory::{
 };
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::{BoundedParquetArtifactSet, ParquetEncoded};
-use crate::scribe::seal_key::SealKey;
+use crate::scribe::seal_key::{ScribeArtifactIdentity, SealKey};
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 
@@ -1215,15 +1214,16 @@ impl PersistenceWorker {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("Scribe output scratch admission failed: {error}"),
             })?;
-        let object_base = deterministic_object_base(
+        let object_base = ScribeArtifactIdentity::new(
             binding,
-            &generation.seal_key,
+            generation.seal_key.day,
             &generation.stream.node_id.to_string(),
+            generation.stream.writer_epoch.as_i64(),
             generation.shard_id,
-            generation_id,
             generation.wal_lsn_min.as_u64(),
             generation.wal_lsn_max.as_u64(),
-        )?;
+        )?
+        .object_base();
         tracing::debug!(generation_id, stage = "encode", "persist stage start");
         let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
             parquet_owner
@@ -1474,34 +1474,6 @@ async fn finish_visibility_publication(
         Ok(Err(_)) => visibility.fail(),
         Err(_) => visibility.cancel(),
     }
-}
-
-/// Builds the deterministic staged object path for one generation.
-///
-/// This helper remains free because it only validates and formats its inputs;
-/// it owns no persistence state or external dependency.
-///
-/// # Errors
-///
-/// Returns [`ScribeError`] when the node identity or derived pod identifier is invalid.
-fn deterministic_object_base(
-    binding: &TenantTableBinding,
-    seal_key: &SealKey,
-    node_id: &str,
-    shard_id: usize,
-    generation: u64,
-    wal_lsn_min: u64,
-    wal_lsn_max: u64,
-) -> Result<String, ScribeError> {
-    let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
-        detail: format!("node_id is not a valid UUID: {error}"),
-    })?;
-    Ok(format!(
-        "{}/day={}/scribe-{}-{shard_id}-{generation}-{wal_lsn_min}-{wal_lsn_max}",
-        binding.object_prefix,
-        seal_key.day,
-        node_uuid.simple()
-    ))
 }
 
 impl PersistenceWorker {

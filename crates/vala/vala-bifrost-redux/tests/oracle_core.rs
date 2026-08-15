@@ -728,6 +728,17 @@ impl OracleFixture {
         basename: &str,
         rows: &[(i64, DataTenantId)],
     ) -> SeededHotRows {
+        self.seed_hot_rows_at_epoch(basename, rows, 1).await
+    }
+
+    /// Writes one named hot Parquet object for a selected Scribe writer epoch.
+    #[must_use]
+    async fn seed_hot_rows_at_epoch(
+        &self,
+        basename: &str,
+        rows: &[(i64, DataTenantId)],
+        writer_epoch: i64,
+    ) -> SeededHotRows {
         validate_hot_basename(basename);
         assert!(!rows.is_empty(), "hot fixture requires rows");
         let schema = Arc::new(Schema::new(with_managed_columns(vec![Field::new(
@@ -811,7 +822,7 @@ impl OracleFixture {
                 max_event_time: Utc::now(),
                 partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("day"),
                 node_id,
-                writer_epoch: 1,
+                writer_epoch,
                 wal_lsn_min: 1,
                 wal_lsn_max: 1,
             },
@@ -1801,6 +1812,45 @@ async fn oracle_published_only_sql_semantics_matrix() {
         "read-only Oracle provider must reject DELETE"
     );
     assert_sql_matrix_classes(&fixture).await;
+    shutdown_oracle(&oracle).await;
+}
+
+/// Production Oracle consumes both cross-epoch Scribe-shaped generations.
+#[tokio::test]
+async fn oracle_reads_both_automatic_cross_epoch_artifacts() {
+    let fixture = OracleFixture::new("scribe_cross_epoch").await;
+    let first = fixture
+        .seed_hot_rows_at_epoch(
+            "scribe-018f7ca27a4d7cc198a797fdd1f15101-epoch-1-shard-0-wal-1-1-00000.parquet",
+            &[(11, fixture.tenant)],
+            1,
+        )
+        .await;
+    let second = fixture
+        .seed_hot_rows_at_epoch(
+            "scribe-018f7ca27a4d7cc198a797fdd1f15101-epoch-2-shard-0-wal-1-1-00000.parquet",
+            &[(22, fixture.tenant)],
+            2,
+        )
+        .await;
+    assert_ne!(first.file_path, second.file_path);
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            OracleConfig::default(),
+        )
+        .await;
+    let result = published_query(
+        &oracle,
+        &fixture,
+        format!("SELECT value FROM {} ORDER BY value", fixture.table.fqn()),
+    )
+    .await;
+    assert_eq!(int64_values(&result, "value"), [11, 22]);
+    assert_query_succeeded(&result);
     shutdown_oracle(&oracle).await;
 }
 

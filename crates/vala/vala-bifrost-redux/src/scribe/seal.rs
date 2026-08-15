@@ -19,7 +19,7 @@ use crate::scribe::memory::{MemoryCategory, MemoryReservation, parquet_producer_
 use crate::scribe::memtable::{FrozenMemtable, Memtable};
 use crate::scribe::parquet_writer::BoundedParquetArtifactSet;
 use crate::scribe::parquet_writer::ParquetEncoded;
-use crate::scribe::seal_key::SealKey;
+use crate::scribe::seal_key::{ScribeArtifactIdentity, SealKey};
 use crate::scribe::wal::WalLsn;
 
 /// Cancellation-safe owner for objects uploaded before the caller's COMMIT boundary.
@@ -687,13 +687,28 @@ impl SealDriver {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("Scribe seal scratch admission failed: {error}"),
             })?;
-        let object_base = format!(
-            "{}/day={}/scribe-{}-{}",
-            binding.object_prefix,
+        let wal_lsn_min = frozen
+            .metas
+            .iter()
+            .map(|meta| meta.wal_lsn_min.as_u64())
+            .min()
+            .unwrap_or(0);
+        let wal_lsn_max = frozen
+            .metas
+            .iter()
+            .map(|meta| meta.wal_lsn_max.as_u64())
+            .max()
+            .unwrap_or(0);
+        let object_base = ScribeArtifactIdentity::new(
+            binding,
             seal_key.day,
-            node_uuid.simple(),
-            frozen.seal_id
-        );
+            node_id,
+            writer_epoch,
+            frozen.shard_id,
+            wal_lsn_min,
+            wal_lsn_max,
+        )?
+        .object_base();
         let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
             &mut parquet_owner,
             frozen.arrow_bytes,

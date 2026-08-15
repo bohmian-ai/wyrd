@@ -13,6 +13,7 @@ mod pg_tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::{DateTime, Utc};
     use opendal::services::Memory;
+    use sha2::{Digest, Sha256};
     use sqlx::types::Uuid;
     use std::sync::Arc;
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
@@ -45,6 +46,16 @@ mod pg_tests {
         faults: PersistenceFaults,
         memory_limit_bytes: usize,
     ) -> (PgFixture, DataTenantId, ScribeImpl, Arc<opendal::Operator>) {
+        setup_with_faults_at_memory_limit_and_identity(faults, memory_limit_bytes, 1, None).await
+    }
+
+    /// Starts a direct-seal fixture with a caller-selected durable stream identity.
+    async fn setup_with_faults_at_memory_limit_and_identity(
+        faults: PersistenceFaults,
+        memory_limit_bytes: usize,
+        writer_epoch: i64,
+        node_id: Option<Uuid>,
+    ) -> (PgFixture, DataTenantId, ScribeImpl, Arc<opendal::Operator>) {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
         fixture
@@ -69,7 +80,7 @@ mod pg_tests {
         for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
             std::fs::create_dir(root).expect("test volume root");
         }
-        let mut node_id_bytes = *Uuid::now_v7().as_bytes();
+        let mut node_id_bytes = *node_id.unwrap_or_else(Uuid::now_v7).as_bytes();
         // The current seal filename seam accepts a PodId string while
         // file_list stores the same value as UUID; use a UUID whose first
         // hexadecimal character also satisfies the PodId grammar.
@@ -125,7 +136,6 @@ mod pg_tests {
         std::mem::forget(temp_dir);
         std::mem::forget(scratch_dir);
 
-        let writer_epoch = 1;
         let pool = fixture.superuser_pool().await.expect("superuser pool");
         sqlx::query(
             "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now()) ON CONFLICT (data_tenant_id,node_id,role) DO UPDATE SET fencing_token=EXCLUDED.fencing_token,heartbeat_at=now()",
@@ -217,6 +227,84 @@ mod pg_tests {
 
     fn events_table() -> TableRef {
         TableRef::new(BifrostNamespace::Bifrost, "events")
+    }
+
+    /// Publishes local seal zero for one selected writer epoch and returns its identity.
+    async fn publish_direct_epoch(
+        node_id: Uuid,
+        writer_epoch: i64,
+    ) -> (String, i64, String, Vec<u8>) {
+        let (fixture, tenant, scribe, operator) = setup_with_faults_at_memory_limit_and_identity(
+            PersistenceFaults::default(),
+            1152 * 1024 * 1024,
+            writer_epoch,
+            Some(node_id),
+        )
+        .await;
+        let day = Utc::now().date_naive();
+        let batch = make_batch(
+            32,
+            day.and_hms_opt(12, 0, 0)
+                .expect("current day accepts noon")
+                .and_utc()
+                .timestamp_micros(),
+        );
+        scribe
+            .append(ScribeAppend {
+                principal: principal_for_tenant(tenant),
+                table: events_table(),
+                schema_fingerprint: schema_fingerprint(&batch),
+                rows: batch,
+                request_id: RequestId::now_v7(),
+                batch_id: Uuid::from_u128(1),
+                measured_wire_bytes: 0,
+            })
+            .await
+            .expect("direct epoch append");
+        let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let attempts = scribe
+            .force_seal(&mut conn)
+            .await
+            .expect("direct epoch seal");
+        let commit = conn.commit().await;
+        complete_post_commit(&scribe, attempts, &commit).await;
+        let row: (String, i64, String) = sqlx::query_as(
+            "SELECT file_path,file_size,file_checksum FROM vala.file_list WHERE data_tenant_id=$1 AND table_name='events'",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("direct epoch catalog row");
+        let bytes = operator
+            .read(&row.0)
+            .await
+            .expect("direct epoch object")
+            .to_bytes()
+            .to_vec();
+        (row.0, row.1, row.2, bytes)
+    }
+
+    /// Direct sealing reuses local seal zero without overwriting another epoch.
+    #[tokio::test]
+    async fn direct_seal_driver_artifact_identity_is_cross_epoch_durable() {
+        let node_id = Uuid::now_v7();
+        let first = publish_direct_epoch(node_id, 1).await;
+        let second = publish_direct_epoch(node_id, 2).await;
+        assert_ne!(
+            first.0.rsplit('/').next(),
+            second.0.rsplit('/').next(),
+            "writer epoch must distinguish the durable artifact component"
+        );
+        for (path, size, checksum, bytes) in [&first, &second] {
+            assert_eq!(
+                i64::try_from(bytes.len()).expect("object size fits i64"),
+                *size,
+                "catalog length matches {path}"
+            );
+            assert_eq!(hex::encode(Sha256::digest(bytes)), *checksum);
+        }
     }
 
     /// A lost COMMIT response transfers ownership and reconciles without duplication.
@@ -464,6 +552,8 @@ mod pg_tests {
             file_path.ends_with(".parquet"),
             "file_path should end with .parquet"
         );
+        assert!(file_path.contains("-epoch-1-shard-"));
+        assert!(file_path.contains("-wal-"));
         assert_eq!(*row_count, 50_000);
         assert!(*file_size > 0, "file_size should be positive");
         assert_eq!(partition_day, &expected_day.to_string());
@@ -489,6 +579,7 @@ mod pg_tests {
             u64::try_from(bytes.len()).expect("object length fits u64"),
             u64::try_from(*file_size).expect("positive file size fits u64")
         );
+        assert_eq!(hex::encode(Sha256::digest(&bytes)), checksum);
         let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&bytes)
             .expect("standard Parquet decoder accepts writer-v2 output");

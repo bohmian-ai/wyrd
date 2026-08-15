@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::{ops::Deref, ops::DerefMut, path::PathBuf};
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -21,6 +22,10 @@ use vala_bifrost_redux::oracle::dispatcher::{
     LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTls, OraclePeerTransport,
     OraclePeerTransportDirectory, OraclePeerWorker, PEER_PROTOCOL_VERSION, ReservationRegistry,
     TonicOraclePeerTransport, WorkerExecution,
+};
+use vala_bifrost_redux::resources::{
+    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, MIN_SCRATCH_FREE_BYTES,
+    OracleQueryResources, OracleResourceRequest, ResourceSource, SystemResourceSnapshot,
 };
 
 /// Deterministic credential seam recording normal and forced bearer requests.
@@ -501,21 +506,76 @@ fn fragment(file: &NamedTempFile) -> SealedScanFragment {
     fragment
 }
 
-/// Builds one immutable dispatch context.
-fn context(leader: NodeId) -> DispatchContext {
-    DispatchContext {
-        query_id: QueryId::new(uuid::Uuid::now_v7()),
-        leader_node_id: leader,
-        leader_fence: 11,
-        tenant_id: uuid::Uuid::now_v7(),
-        query_class: QueryClass::Interactive,
-        slot_units: 1,
-        permission_digest: "permission".to_owned(),
-        attempt_bytes: 8 * 1024 * 1024,
-        attempt_memory_bytes: 1,
-        query_memory_pool: None,
-        cancellation: CancellationToken::new(),
-        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+/// Production-equivalent dispatch fixture retaining its root-owned query lease.
+struct TestDispatchContext {
+    /// Immutable peer-dispatch bindings under test.
+    context: DispatchContext,
+    /// Query owner keeping the shared pool admitted for the fixture lifetime.
+    _query: OracleQueryResources,
+}
+
+impl Deref for TestDispatchContext {
+    type Target = DispatchContext;
+
+    /// Exposes the dispatch bindings while retaining their query owner.
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl DerefMut for TestDispatchContext {
+    /// Exposes mutable dispatch bindings while retaining their query owner.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.context
+    }
+}
+
+/// Builds one immutable dispatch context from a real Oracle query capability.
+fn context(leader: NodeId) -> TestDispatchContext {
+    let scratch_bytes = 1_u64 << 30;
+    let runtime = BifrostRuntimeResources::from_snapshot(
+        SystemResourceSnapshot {
+            memory_limit_bytes: 832 << 20,
+            effective_cpu: 4,
+            scratch_capacity_bytes: scratch_bytes + MIN_SCRATCH_FREE_BYTES,
+            scratch_available_bytes: scratch_bytes + MIN_SCRATCH_FREE_BYTES,
+            memory_source: ResourceSource::Injected,
+            cpu_source: ResourceSource::Injected,
+        },
+        BifrostResourcePolicy {
+            roles: [BifrostRole::Oracle].into_iter().collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: Some(scratch_bytes),
+            effective_cpu: None,
+            scratch_root: PathBuf::new(),
+            volume_roots: None,
+        },
+    )
+    .expect("Oracle peer fixture resource plan");
+    let roles = runtime.compose_roles().expect("Oracle peer fixture roles");
+    let query = roles
+        .oracle()
+        .expect("Oracle peer fixture capability")
+        .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
+        .expect("Oracle peer fixture query owner");
+    let query_memory_pool = query.memory_pool();
+    TestDispatchContext {
+        context: DispatchContext {
+            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            leader_node_id: leader,
+            leader_fence: 11,
+            tenant_id: uuid::Uuid::now_v7(),
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            permission_digest: "permission".to_owned(),
+            attempt_bytes: 8 * 1024 * 1024,
+            attempt_memory_bytes: 1,
+            query_memory_pool,
+            cancellation: CancellationToken::new(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        },
+        _query: query,
     }
 }
 

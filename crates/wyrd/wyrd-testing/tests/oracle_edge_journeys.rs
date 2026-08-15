@@ -27,7 +27,7 @@ use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::ForgeLifecycleEvent;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
-    MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
+    MIN_SCRATCH_FREE_BYTES, ResourceSnapshot, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -73,6 +73,13 @@ type JourneyError = Box<dyn std::error::Error + Send + Sync>;
 const SPILL_INGEST_BATCH_ROWS: usize = 5_000;
 /// Public ingest batches durably sealed together during fixture preparation.
 const SPILL_BATCHES_PER_SEAL: usize = 10;
+
+/// Returns the one-root managed-memory total represented by a snapshot.
+fn managed_memory_used(snapshot: ResourceSnapshot) -> usize {
+    snapshot.scribe_memory_used_bytes
+        + snapshot.oracle_memory_used_bytes
+        + snapshot.forge_memory_used_bytes
+}
 
 /// Builds a complete pod observation for production resource-policy journeys.
 ///
@@ -733,17 +740,17 @@ async fn sample_paired_peaks(
             _ = interval.tick() => {
                 let (memory, scribe, oracle) = tokio::task::block_in_place(|| {
                     Ok::<_, wyrd_testing::WyrdTestServerError>((
-                        governor.snapshot(),
+                        governor.snapshot().expect("paired root resource snapshot"),
                         server.scribe_inspection_snapshot()?,
                         server.oracle_runtime_inspection()?,
                     ))
                 })?;
-                peaks.parent_bytes = peaks.parent_bytes.max(memory.bifrost_total_bytes);
-                peaks.parent_limit = memory.bifrost_limit_bytes;
+                peaks.parent_bytes = peaks.parent_bytes.max(managed_memory_used(memory));
+                peaks.parent_limit = memory.plan.managed_memory_bytes;
                 peaks.scribe_bytes = peaks.scribe_bytes.max(scribe.scribe_used_memory);
                 peaks.scribe_limit = scribe.scribe_memory_limit;
-                peaks.oracle_bytes = peaks.oracle_bytes.max(memory.oracle_total_bytes);
-                peaks.oracle_limit = memory.oracle_limit_bytes;
+                peaks.oracle_bytes = peaks.oracle_bytes.max(memory.oracle_memory_used_bytes);
+                peaks.oracle_limit = memory.plan.oracle_floor_bytes + memory.plan.elastic_memory_bytes;
                 peaks.oracle_admission_bytes = peaks
                     .oracle_admission_bytes
                     .max(oracle.reserved_memory_bytes);
@@ -1000,8 +1007,9 @@ async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
         .bifrost_resources
         .as_ref()
         .expect("spill success governor")
-        .snapshot();
-    let memory_baseline = (memory.bifrost_total_bytes, memory.oracle_total_bytes);
+        .snapshot()
+        .expect("spill success resource snapshot");
+    let memory_baseline = (managed_memory_used(memory), memory.oracle_memory_used_bytes);
     let checkpoint = cluster.telemetry().checkpoint().expect("spill checkpoint");
 
     assert_eq!(
@@ -1351,8 +1359,9 @@ async fn pg_bifrost_oracle_spill_disk_ceiling_is_typed_and_recovers() {
         .bifrost_resources
         .as_ref()
         .expect("spill ceiling governor")
-        .snapshot();
-    let memory_baseline = (memory.bifrost_total_bytes, memory.oracle_total_bytes);
+        .snapshot()
+        .expect("spill ceiling resource snapshot");
+    let memory_baseline = (managed_memory_used(memory), memory.oracle_memory_used_bytes);
 
     let refusal = match QueryClient::new(&reader)
         .query(&BifrostQueryRequest {
@@ -1411,8 +1420,9 @@ async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
         .bifrost_resources
         .as_ref()
         .expect("spill cancellation governor")
-        .snapshot();
-    let memory_baseline = (memory.bifrost_total_bytes, memory.oracle_total_bytes);
+        .snapshot()
+        .expect("spill cancellation resource snapshot");
+    let memory_baseline = (managed_memory_used(memory), memory.oracle_memory_used_bytes);
     let request = BifrostQueryRequest {
         sql: format!("SELECT id, value FROM vala.bifrost.{table} ORDER BY id"),
         visibility: VisibilityMode::PublishedOnly,
@@ -1596,9 +1606,10 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
         .bifrost_resources
         .as_ref()
         .expect("restarted Oracle governor")
-        .snapshot();
-    assert_eq!(memory.oracle_total_bytes, 0);
-    assert_eq!(memory.bifrost_total_bytes, 0);
+        .snapshot()
+        .expect("restarted Oracle resource snapshot");
+    assert_eq!(memory.oracle_memory_used_bytes, 0);
+    assert_eq!(managed_memory_used(memory), 0);
     let restarted_reader = client(restarted, "oracle-spill-restarted-reader")
         .await
         .expect("restarted Oracle reader");
@@ -3630,8 +3641,8 @@ async fn prepare_spill_table(
         .bifrost_resources
         .as_ref()
         .ok_or("spill fixture lacks memory governor")?
-        .snapshot()
-        .scribe_total_bytes;
+        .snapshot()?
+        .scribe_memory_used_bytes;
     for start in (0..row_count).step_by(SPILL_INGEST_BATCH_ROWS) {
         let end = (start + SPILL_INGEST_BATCH_ROWS).min(row_count);
         let chunk = u64::try_from(start / SPILL_INGEST_BATCH_ROWS)?;
@@ -3661,12 +3672,12 @@ async fn prepare_spill_table(
     Ok(table)
 }
 
-/// Verifies fixture ingestion never crossed either production memory ceiling.
+/// Verifies fixture ingestion remains within the production memory ceilings.
 ///
 /// # Errors
 ///
-/// Returns an inspection error or a diagnostic mismatch when the monotonic
-/// Scribe-child or Bifrost-parent peak exceeds its production-derived limit.
+/// Returns an inspection error or a diagnostic mismatch when current
+/// Scribe-child or Bifrost-parent ownership exceeds its production limit.
 fn assert_scribe_fixture_peaks_bounded(
     server: &wyrd_testing::WyrdTestServer,
 ) -> Result<(), JourneyError> {
@@ -3675,12 +3686,14 @@ fn assert_scribe_fixture_peaks_bounded(
         .bifrost_resources
         .as_ref()
         .ok_or("spill fixture lacks memory governor")?;
-    let snapshot = governor.snapshot();
-    let (scribe_peak, bifrost_peak) = governor.peak_totals_for_test();
-    if scribe_peak > snapshot.scribe_limit_bytes || bifrost_peak > snapshot.bifrost_limit_bytes {
+    let snapshot = governor.snapshot()?;
+    let scribe_used = snapshot.scribe_memory_used_bytes;
+    let bifrost_used = managed_memory_used(snapshot);
+    let scribe_limit = snapshot.plan.scribe_floor_bytes + snapshot.plan.elastic_memory_bytes;
+    let bifrost_limit = snapshot.plan.managed_memory_bytes;
+    if scribe_used > scribe_limit || bifrost_used > bifrost_limit {
         return Err(format!(
-            "spill fixture exceeded production memory: scribe_peak={scribe_peak} scribe_limit={} bifrost_peak={bifrost_peak} bifrost_limit={}",
-            snapshot.scribe_limit_bytes, snapshot.bifrost_limit_bytes
+            "spill fixture exceeded production memory: scribe_used={scribe_used} scribe_limit={scribe_limit} bifrost_used={bifrost_used} bifrost_limit={bifrost_limit}",
         )
         .into());
     }
@@ -3705,8 +3718,8 @@ async fn wait_scribe_memory_restored(
             .bifrost_resources
             .as_ref()
             .ok_or("spill fixture lacks memory governor")?
-            .snapshot()
-            .scribe_total_bytes;
+            .snapshot()?
+            .scribe_memory_used_bytes;
         if current == baseline {
             return Ok(());
         }
@@ -3753,11 +3766,11 @@ fn assert_oracle_runtime_restored(
         .bifrost_resources
         .as_ref()
         .ok_or("Oracle server lacks the shared memory governor")?
-        .snapshot();
-    if (memory.bifrost_total_bytes, memory.oracle_total_bytes) != memory_baseline {
+        .snapshot()?;
+    if (managed_memory_used(memory), memory.oracle_memory_used_bytes) != memory_baseline {
         return Err(format!(
             "Oracle memory did not return to baseline: baseline={memory_baseline:?} current=({},{})",
-            memory.bifrost_total_bytes, memory.oracle_total_bytes
+            managed_memory_used(memory), memory.oracle_memory_used_bytes
         )
         .into());
     }

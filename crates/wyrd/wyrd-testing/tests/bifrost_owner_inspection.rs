@@ -79,7 +79,7 @@ async fn scribe_owner_fixed_topology_and_memory_reconciliation() {
         .memory_snapshot();
     assert_eq!(
         scribe_snapshot.bifrost_limit_bytes,
-        parent_snapshot.bifrost_limit_bytes
+        parent_snapshot.plan.managed_memory_bytes
     );
 
     assert_eq!(snapshot.shard_task_count, 16);

@@ -165,7 +165,7 @@ mod pg_tests {
                     .with_output_scratch(output_scratch)
                     .with_test_faults(faults),
                 ),
-                memory_budget: Some(scribe_resources.memory_governor().scribe_budget()),
+                resources: scribe_resources,
                 staging_file_publisher: None,
             },
         );

@@ -15,7 +15,7 @@ use crate::scribe::admission::AdmissionController;
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuPool, ScribeWalIoOp, ScribeWalIoPool, ScribeWalIoResult,
 };
-use crate::scribe::memory::{MemoryCategory, MemoryLedger};
+use crate::scribe::memory::{MemoryCategory, ScribeOwnership};
 use crate::scribe::memtable::{
     BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, SealTriggerReason,
 };
@@ -396,7 +396,7 @@ struct ShardOwner {
     /// WAL handle for this fixed shard.
     wal_handle: WalHandle,
     /// Shared active/immutable memory ledger.
-    memory_ledger: MemoryLedger,
+    memory_ownership: ScribeOwnership,
     /// Snapshot published for synchronous inspection callers.
     snapshot: Arc<Mutex<ShardMemtableSnapshot>>,
     /// Pod-global count of accepted appends not yet completed.
@@ -473,7 +473,7 @@ pub(crate) struct ScribeShardStartConfig {
     /// Typed pod stream identity.
     pub(crate) stream: StreamIdentity,
     /// Shared active/immutable memory ledger.
-    pub(crate) memory_ledger: MemoryLedger,
+    pub(crate) memory_ownership: ScribeOwnership,
 }
 
 impl ScribeShardRuntime {
@@ -573,7 +573,7 @@ impl ScribeShardRuntime {
             wal_io,
             persistence,
             stream,
-            memory_ledger,
+            memory_ownership,
         } = config;
         let mut set = ScribeShardSet::<ShardCommand>::new();
         let receivers = set.take_receivers().unwrap_or_default();
@@ -617,7 +617,7 @@ impl ScribeShardRuntime {
                 completion_tx: senders[id].sender.clone(),
                 stream,
                 wal_handle,
-                memory_ledger: memory_ledger.clone(),
+                memory_ownership: memory_ownership.clone(),
                 snapshot: Arc::clone(&snapshots[id]),
                 pending: Arc::clone(&pending),
                 drained: Arc::clone(&drained),
@@ -1268,7 +1268,7 @@ impl ShardOwner {
                 return;
             }
         };
-        if let Err(error) = self.memory_ledger.reserve_immutable(frozen.arrow_bytes) {
+        if let Err(error) = self.memory_ownership.reserve_immutable(frozen.arrow_bytes) {
             let _ = self.memtable.discard_pending_generation(frozen.seal_id);
             let _ = response.send(Err(error));
             return;
@@ -1347,9 +1347,9 @@ impl ShardOwner {
         seal_id: u64,
         arrow_bytes: usize,
     ) -> Result<(), ScribeError> {
-        self.memory_ledger
+        self.memory_ownership
             .preflight_release_immutable(arrow_bytes)?;
-        self.memory_ledger.release_immutable(arrow_bytes)?;
+        self.memory_ownership.release_immutable(arrow_bytes)?;
         self.memtable.discard_pending_generation(seal_id)?;
         let owner_stats = self.memtable.stats()?;
         self.admission
@@ -1385,11 +1385,11 @@ impl ShardOwner {
         }
         self.admission
             .preflight_transfer_active_to_immutable(active_bytes)?;
-        self.memory_ledger
+        self.memory_ownership
             .preflight_move_active_to_immutable(active_bytes)?;
         let mut frozen = self.memtable.freeze(seal_key)?;
         frozen.shard_id = self.id;
-        self.memory_ledger
+        self.memory_ownership
             .move_active_to_immutable(frozen.arrow_bytes)?;
         self.admission
             .transfer_active_to_immutable(frozen.arrow_bytes)?;
@@ -1513,7 +1513,7 @@ impl ShardOwner {
                 .admission
                 .preflight_transfer_active_to_immutable(active_bytes)
                 .and_then(|()| {
-                    self.memory_ledger
+                    self.memory_ownership
                         .preflight_move_active_to_immutable(active_bytes)
                 })
             {
@@ -1528,7 +1528,7 @@ impl ShardOwner {
             if self.persistence.is_none() {
                 // No persistence target: the accounting move is the terminal
                 // legal state for this path (semantics unchanged by this task).
-                self.memory_ledger
+                self.memory_ownership
                     .move_active_to_immutable(frozen.arrow_bytes)?;
                 self.admission
                     .transfer_active_to_immutable(frozen.arrow_bytes)?;
@@ -1604,7 +1604,7 @@ impl ShardOwner {
         // Accounting move is the last fallible step; everything below is
         // infallible, so no fallible step runs between the move and the queue
         // push (AC1).
-        self.memory_ledger
+        self.memory_ownership
             .move_active_to_immutable(frozen.arrow_bytes)?;
         self.admission
             .transfer_active_to_immutable(frozen.arrow_bytes)?;
@@ -1732,7 +1732,7 @@ impl ShardOwner {
     /// A generation is eligible the moment its state is
     /// [`ImmutableState::Committed`], which is only reached after the fenced
     /// `vala.file_list` + audit transaction commits. Retirement ordering is
-    /// preserved: `admission.release_immutable` and `memory_ledger.release_immutable`
+    /// preserved: `admission.release_immutable` and `memory_ownership.release_immutable`
     /// are called before `ScribeWalIoOp::RetireWal` is submitted, so WAL
     /// segment refcounts are released last.
     ///
@@ -1788,27 +1788,27 @@ impl ShardOwner {
             return Ok(None);
         };
         if token.arrow_bytes != retained.arrow_bytes {
-            self.memory_ledger.poison();
+            self.memory_ownership.poison();
             return Err(ScribeError::Internal {
                 detail: format!("retirement bytes mismatch for generation {generation_id}"),
             });
         }
         self.admission
             .preflight_release_immutable(token.arrow_bytes)?;
-        self.memory_ledger
+        self.memory_ownership
             .preflight_release_immutable(token.arrow_bytes)?;
         #[cfg(test)]
         if self.fail_next_retirement_release {
             self.fail_next_retirement_release = false;
-            self.memory_ledger.poison();
+            self.memory_ownership.poison();
             return Err(ScribeError::Internal {
                 detail: "injected immutable retirement release failure".to_owned(),
             });
         }
         self.admission.release_immutable(token.arrow_bytes)?;
-        self.memory_ledger.release_immutable(token.arrow_bytes)?;
+        self.memory_ownership.release_immutable(token.arrow_bytes)?;
         if let Err(error) = self.memtable.commit_retirement(token) {
-            self.memory_ledger.poison();
+            self.memory_ownership.poison();
             return Err(error);
         }
         self.retained_generations.remove(&generation_id);
@@ -2207,7 +2207,9 @@ impl ShardOwner {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.preserve_primary_after_active_cleanup(
-                    error,
+                    ScribeError::Internal {
+                        detail: error.to_string(),
+                    },
                     memtable_bytes,
                     false,
                 ));
@@ -2216,7 +2218,7 @@ impl ShardOwner {
         if let Err(error) = active_memory.transfer_category(MemoryCategory::Active) {
             return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
         }
-        if let Err(error) = self.memory_ledger.absorb_active(active_memory) {
+        if let Err(error) = self.memory_ownership.absorb_active(active_memory) {
             return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
         }
         let wal_result = self
@@ -2297,7 +2299,9 @@ impl ShardOwner {
             Ok(mut value) => {
                 if let Err(error) = value.transfer_category(MemoryCategory::Active) {
                     return Err(self.preserve_primary_after_active_cleanup(
-                        error,
+                        ScribeError::Internal {
+                            detail: error.to_string(),
+                        },
                         memtable_bytes,
                         false,
                     ));
@@ -2306,13 +2310,15 @@ impl ShardOwner {
             }
             Err(error) => {
                 return Err(self.preserve_primary_after_active_cleanup(
-                    error,
+                    ScribeError::Internal {
+                        detail: error.to_string(),
+                    },
                     memtable_bytes,
                     false,
                 ));
             }
         };
-        if let Err(error) = self.memory_ledger.absorb_active(active_memory) {
+        if let Err(error) = self.memory_ownership.absorb_active(active_memory) {
             return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
         }
         Ok((
@@ -2442,11 +2448,11 @@ impl ShardOwner {
     ) -> Result<(), ScribeError> {
         self.admission.preflight_release_active(bytes)?;
         if already_absorbed {
-            self.memory_ledger.preflight_release_active(bytes)?;
+            self.memory_ownership.preflight_release_active(bytes)?;
         }
         self.admission.release_active(bytes)?;
         if already_absorbed {
-            self.memory_ledger.release_active(bytes)?;
+            self.memory_ownership.release_active(bytes)?;
         }
         Ok(())
     }
@@ -2854,13 +2860,12 @@ mod tests {
         wal: &Arc<WalWriter>,
         wal_handle: WalHandle,
         stream: StreamIdentity,
-    ) -> (ShardOwner, crate::scribe::memory::ScribeMemoryBudget) {
+    ) -> (ShardOwner, crate::resources::ScribeResources) {
         let (_command_tx, receiver) = mpsc::channel(1);
         let (_pressure_tx, pressure_receiver) = watch::channel(None);
         let (completion_tx, _completion_rx) = mpsc::channel(1);
-        let governor = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
-            .expect("memory governor");
-        let budget = governor.scribe_budget();
+        let budget =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let _ = wal;
         let owner = ShardOwner {
             id: 0,
@@ -2884,7 +2889,7 @@ mod tests {
             completion_tx,
             stream,
             wal_handle,
-            memory_ledger: MemoryLedger::new(&budget).expect("memory ledger"),
+            memory_ownership: ScribeOwnership::new(&budget).expect("memory ownership"),
             snapshot: Arc::new(Mutex::new(ShardMemtableSnapshot::default())),
             pending: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
@@ -2922,7 +2927,7 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
         owner
-            .memory_ledger
+            .memory_ownership
             .reserve_active(rotation_bytes.saturating_mul(2))
             .expect("active ledger reservation");
         owner
@@ -2974,8 +2979,8 @@ mod tests {
     ///
     /// The memtable holds one writable bucket for `key`; the ledger and
     /// admission are pre-charged with `active_seed` Active bytes so the
-    /// accounting move is observable via [`MemoryLedger::active_bytes`] /
-    /// [`MemoryLedger::immutable_bytes`] and the admission snapshot; and
+    /// accounting move is observable via [`ScribeOwnership::active_bytes`] /
+    /// [`ScribeOwnership::immutable_bytes`] and the admission snapshot; and
     /// `wal_segments` holds an entry for `key` so the segment-map lifecycle
     /// (removed only after retention success) is assertable. Returns the WAL
     /// writer and temp directory so the caller keeps them alive.
@@ -3006,7 +3011,7 @@ mod tests {
         ));
         owner.wal_segments.insert(key.clone(), HashMap::new());
         owner
-            .memory_ledger
+            .memory_ownership
             .reserve_active(active_seed)
             .expect("seed active ledger");
         owner
@@ -3026,7 +3031,7 @@ mod tests {
         u64,
         Arc<WalWriter>,
         tempfile::TempDir,
-        crate::scribe::memory::ScribeMemoryBudget,
+        crate::resources::ScribeResources,
     ) {
         let key = owner_key();
         let memtable = Memtable::new();
@@ -3054,7 +3059,7 @@ mod tests {
             owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
         owner.admission.sync_memtable_bytes(0, frozen.arrow_bytes);
         owner
-            .memory_ledger
+            .memory_ownership
             .reserve_immutable(frozen.arrow_bytes)
             .expect("immutable ledger ownership");
         owner
@@ -3062,7 +3067,7 @@ mod tests {
             .preflight_release_immutable(frozen.arrow_bytes)
             .expect("immutable admission preflight");
         owner
-            .memory_ledger
+            .memory_ownership
             .preflight_release_immutable(frozen.arrow_bytes)
             .expect("immutable ledger preflight");
         owner.retained_generations.insert(
@@ -3083,7 +3088,7 @@ mod tests {
     /// before `process_group` owns the append.
     fn prepared_append_for_group_test(
         owner: &ShardOwner,
-        budget: &crate::scribe::memory::ScribeMemoryBudget,
+        budget: &crate::resources::ScribeResources,
     ) -> PreparedAppend {
         let initial_bytes = 1024 * 1024;
         let reservation = owner
@@ -3183,8 +3188,8 @@ mod tests {
             assert!(matches!(error, ScribeError::Internal { .. }));
 
             // State A: nothing moved, segment map intact, key retry-reachable.
-            assert_eq!(owner.memory_ledger.active_bytes(), seed);
-            assert_eq!(owner.memory_ledger.immutable_bytes(), 0);
+            assert_eq!(owner.memory_ownership.active_bytes(), seed);
+            assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
             let admission = owner.admission.snapshot();
             assert_eq!(admission.active_bytes, seed);
             assert_eq!(admission.immutable_bytes, 0);
@@ -3204,8 +3209,8 @@ mod tests {
             assert!(retry.is_err(), "deterministic binding failure re-fails");
 
             // Still state A, still retry-reachable, no accounting change.
-            assert_eq!(owner.memory_ledger.active_bytes(), seed);
-            assert_eq!(owner.memory_ledger.immutable_bytes(), 0);
+            assert_eq!(owner.memory_ownership.active_bytes(), seed);
+            assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
             assert!(owner.wal_segments.contains_key(&key));
             assert!(owner.seal_retry.contains(&key));
         });
@@ -3251,8 +3256,8 @@ mod tests {
 
             // State A: no move, admission unchanged, segment map intact (AC4),
             // key retry-reachable.
-            assert_eq!(owner.memory_ledger.active_bytes(), seed);
-            assert_eq!(owner.memory_ledger.immutable_bytes(), 0);
+            assert_eq!(owner.memory_ownership.active_bytes(), seed);
+            assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
             let admission = owner.admission.snapshot();
             assert_eq!(admission.active_bytes, seed);
             assert_eq!(admission.immutable_bytes, 0);
@@ -3272,8 +3277,8 @@ mod tests {
 
             // State B: net-zero move landed, admission moved, segment map entry
             // removed after success (AC4), generation queued, mark cleared.
-            let active = owner.memory_ledger.active_bytes();
-            let immutable = owner.memory_ledger.immutable_bytes();
+            let active = owner.memory_ownership.active_bytes();
+            let immutable = owner.memory_ownership.immutable_bytes();
             assert!(immutable > 0, "bytes moved to Immutable accounting");
             assert_eq!(active + immutable, seed, "net-zero category move");
             let admission = owner.admission.snapshot();
@@ -3320,8 +3325,8 @@ mod tests {
         owner
             .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
             .expect("initial seal reaches state B");
-        let active_after = owner.memory_ledger.active_bytes();
-        let immutable_after = owner.memory_ledger.immutable_bytes();
+        let active_after = owner.memory_ownership.active_bytes();
+        let immutable_after = owner.memory_ownership.immutable_bytes();
         assert!(owner.pending_generations.contains_key(&key));
 
         // Stale mark 1: the key is already queued (state B). Stale mark 2: a
@@ -3339,8 +3344,8 @@ mod tests {
             .expect("stale marks drain as a no-op");
 
         assert!(owner.seal_retry.is_empty(), "stale marks dropped");
-        assert_eq!(owner.memory_ledger.active_bytes(), active_after);
-        assert_eq!(owner.memory_ledger.immutable_bytes(), immutable_after);
+        assert_eq!(owner.memory_ownership.active_bytes(), active_after);
+        assert_eq!(owner.memory_ownership.immutable_bytes(), immutable_after);
         assert_eq!(
             owner.pending_generations.get(&key).map(VecDeque::len),
             Some(1),
@@ -3700,7 +3705,7 @@ mod tests {
             .expect("owner A stats")
             .writable_bytes;
         owner_a
-            .memory_ledger
+            .memory_ownership
             .reserve_active(active_bytes_a)
             .expect("owner A active memory");
         owner_a
@@ -3722,7 +3727,7 @@ mod tests {
             .expect("owner B stats")
             .writable_bytes;
         owner_b
-            .memory_ledger
+            .memory_ownership
             .reserve_active(active_bytes_b)
             .expect("owner B active memory");
         owner_b
@@ -3805,7 +3810,7 @@ mod tests {
             .expect("owner A stats")
             .writable_bytes;
         owner_a
-            .memory_ledger
+            .memory_ownership
             .reserve_active(active_bytes_a)
             .expect("owner A active memory");
         owner_a
@@ -3827,7 +3832,7 @@ mod tests {
             .expect("owner B stats")
             .writable_bytes;
         owner_b
-            .memory_ledger
+            .memory_ownership
             .reserve_active(active_bytes_b)
             .expect("owner B active memory");
         owner_b
@@ -4100,8 +4105,8 @@ mod tests {
         );
         let governor_before = budget.accounting_snapshot_for_test();
         let admission_before = owner.admission.snapshot();
-        let active_ledger_before = owner.memory_ledger.active_bytes();
-        let immutable_ledger_before = owner.memory_ledger.immutable_bytes();
+        let active_ledger_before = owner.memory_ownership.active_bytes();
+        let immutable_ledger_before = owner.memory_ownership.immutable_bytes();
         let wal_bytes_before = wal.bytes_on_disk();
         let wal_files_before = wal_file_snapshot(wal_root.path()).expect("WAL file snapshot");
         let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
@@ -4115,9 +4120,9 @@ mod tests {
         assert!(owner.retained_generations.contains_key(&frozen.seal_id));
         assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
         assert_eq!(owner.admission.snapshot(), admission_before);
-        assert_eq!(owner.memory_ledger.active_bytes(), active_ledger_before);
+        assert_eq!(owner.memory_ownership.active_bytes(), active_ledger_before);
         assert_eq!(
-            owner.memory_ledger.immutable_bytes(),
+            owner.memory_ownership.immutable_bytes(),
             immutable_ledger_before
         );
         assert_eq!(wal.bytes_on_disk(), wal_bytes_before);
@@ -4150,7 +4155,7 @@ mod tests {
             .expect("token");
         let governor_before = budget.accounting_snapshot_for_test();
         let admission_before = owner.admission.snapshot();
-        let ledger_before = owner.memory_ledger.immutable_bytes();
+        let ledger_before = owner.memory_ownership.immutable_bytes();
         let wal_before = wal.bytes_on_disk();
         let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
         let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
@@ -4165,7 +4170,7 @@ mod tests {
         assert!(owner.retained_generations.contains_key(&generation_id));
         assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
         assert_eq!(owner.admission.snapshot(), admission_before);
-        assert_eq!(owner.memory_ledger.immutable_bytes(), ledger_before);
+        assert_eq!(owner.memory_ownership.immutable_bytes(), ledger_before);
         assert_eq!(wal.bytes_on_disk(), wal_before);
         assert_eq!(
             wal_file_snapshot(root.path()).expect("WAL file snapshot"),
@@ -4182,7 +4187,7 @@ mod tests {
             .expect("token remains");
         assert_eq!(token_after.seal_id, token_before.seal_id);
         assert_eq!(token_after.arrow_bytes, token_before.arrow_bytes);
-        assert!(owner.memory_ledger.is_poisoned());
+        assert!(owner.memory_ownership.is_poisoned());
     }
 
     /// Test and periodic retirement callers both retain the generation on an error path.
@@ -4259,12 +4264,12 @@ mod tests {
         assert!(!owner.pending_generations.contains_key(&key));
         assert!(owner.wal_segments.contains_key(&key));
         assert!(owner.seal_retry.contains(&key));
-        assert_eq!(owner.memory_ledger.active_bytes(), seed);
+        assert_eq!(owner.memory_ownership.active_bytes(), seed);
         assert_eq!(
             owner.admission.snapshot().immutable_bytes,
             before.immutable_bytes
         );
-        assert!(owner.memory_ledger.is_poisoned());
+        assert!(owner.memory_ownership.is_poisoned());
     }
 
     /// Group cleanup reports the primary failure while the shared cleanup path poisons corruption.
@@ -4296,13 +4301,13 @@ mod tests {
         assert!(
             matches!(error, ScribeError::Internal { detail } if detail == "injected post-sync WAL failure")
         );
-        assert!(owner.memory_ledger.is_poisoned());
+        assert!(owner.memory_ownership.is_poisoned());
         assert_eq!(owner.synced_not_inserted.len(), 1);
         let memtable = owner.memtable.stats().expect("memtable stats");
         assert_eq!(memtable.writable_rows, 0);
         assert_eq!(memtable.immutable_rows, 0);
         assert_eq!(owner.admission.snapshot().active_bytes, 0);
-        assert!(owner.memory_ledger.active_bytes() > 0);
+        assert!(owner.memory_ownership.active_bytes() > 0);
         assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_err());
     }
 }

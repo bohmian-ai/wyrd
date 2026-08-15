@@ -38,7 +38,6 @@ use super::telemetry::{
 };
 use super::{OracleExecutionError, OracleSlotManager, decode_attempt_batches};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
-use crate::scribe::memory::BifrostMemoryGovernor;
 
 /// Fixed private peer protocol version.
 pub const PEER_PROTOCOL_VERSION: u32 = 1;
@@ -660,7 +659,13 @@ impl OraclePeerWorker {
             WorkerCapacity::ReserveRunning => self
                 .resources
                 .as_ref()
-                .map(crate::resources::OracleResources::try_acquire_worker)
+                .map(|resources| {
+                    let class = match running.query_class {
+                        QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
+                        QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
+                    };
+                    resources.try_acquire_worker(class)
+                })
                 .transpose()
                 .map_err(|_| DispatchError::Capacity)?,
             WorkerCapacity::LeaderAdmitted => None,
@@ -790,7 +795,7 @@ mod resource_tests {
         .expect("role composition");
         let oracle = roles.oracle().expect("Oracle capability");
         let resources = oracle
-            .try_acquire_worker()
+            .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
             .expect("advertised worker quantum");
         assert_eq!(resources.memory_bytes(), ORACLE_PARTITION_MEMORY_BYTES);
         let stream: WorkerAttemptStream = Box::pin(futures_util::stream::pending());
@@ -802,7 +807,11 @@ mod resource_tests {
                 .oracle_memory_used_bytes,
             ORACLE_PARTITION_MEMORY_BYTES
         );
-        assert!(oracle.try_acquire_worker().is_err());
+        assert!(
+            oracle
+                .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+                .is_err()
+        );
         drop(retained);
         assert_eq!(
             oracle
@@ -812,7 +821,7 @@ mod resource_tests {
             0
         );
         oracle
-            .try_acquire_worker()
+            .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
             .expect("capacity returns after terminal stream drop");
     }
 }
@@ -1590,7 +1599,7 @@ pub struct DispatchContext {
     /// In-memory threshold before query-scoped spill.
     pub attempt_memory_bytes: usize,
     /// Shared pool from the leader's complete admitted query envelope.
-    pub query_memory_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+    pub query_memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     /// Admission-owned cancellation propagated to every attempt await.
     pub cancellation: CancellationToken,
     /// Absolute deadline shared by reserve, execute, reads, and cleanup.
@@ -1603,8 +1612,6 @@ pub struct FragmentDispatcher {
     ticket_minter: Arc<dyn PeerTicketMinter>,
     /// Node-aware directory enforcing in-process leader and tonic remote routing.
     transports: OraclePeerTransportDirectory,
-    /// Optional production parent governor charged before transport frames are decoded.
-    memory_governor: Option<BifrostMemoryGovernor>,
 }
 
 impl FragmentDispatcher {
@@ -1663,15 +1670,7 @@ impl FragmentDispatcher {
         Self {
             ticket_minter,
             transports,
-            memory_governor: None,
         }
-    }
-
-    /// Attaches the process-wide parent governor used by production dispatch.
-    #[must_use]
-    pub fn with_memory_governor(mut self, governor: BifrostMemoryGovernor) -> Self {
-        self.memory_governor = Some(governor);
-        self
     }
 
     /// Executes on at most three distinct candidates, preserving candidate order.
@@ -1819,23 +1818,12 @@ impl FragmentDispatcher {
             FragmentLocality::Remote
         };
         let mut telemetry = FragmentTelemetry::start(locality);
-        let mut buffer = match (&context.query_memory_pool, &self.memory_governor) {
-            (Some(pool), _) => AttemptBuffer::with_memory_pool(
-                context.attempt_bytes,
-                context.attempt_memory_bytes,
-                pool,
-            )
-            .map_err(attempt_error)?,
-            (None, Some(governor)) => AttemptBuffer::with_memory_governor(
-                context.attempt_bytes,
-                context.attempt_memory_bytes,
-                governor,
-            )
-            .map_err(attempt_error)?,
-            (None, None) => {
-                AttemptBuffer::with_spill_limit(context.attempt_bytes, context.attempt_memory_bytes)
-            }
-        };
+        let mut buffer = AttemptBuffer::with_memory_pool(
+            context.attempt_bytes,
+            context.attempt_memory_bytes,
+            &context.query_memory_pool,
+        )
+        .map_err(attempt_error)?;
         let remaining = context
             .deadline
             .checked_duration_since(Instant::now())
@@ -1919,6 +1907,7 @@ mod tests {
     use super::super::fragment::{SealedScanFile, SealedSourceTier};
     use super::super::peer::DeterministicTestSigner;
     use super::*;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
     use wyrd_spec::vala::api::{
         ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, OracleCapabilitiesV1,
     };
@@ -2678,7 +2667,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
-            query_memory_pool: None,
+            query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
@@ -2747,7 +2736,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
-            query_memory_pool: None,
+            query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
@@ -2814,7 +2803,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
-            query_memory_pool: None,
+            query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_millis(10),
         };

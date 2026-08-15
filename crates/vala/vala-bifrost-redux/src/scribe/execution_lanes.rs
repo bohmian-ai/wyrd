@@ -17,9 +17,9 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError};
+use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
-use crate::scribe::memory::ScribeMemoryBudget;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
@@ -879,18 +879,25 @@ fn append_managed_columns(
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuOp {
     Preprocess(Box<AdmittedAppend>),
-    EncodeParquet {
-        frozen: Box<FrozenMemtable>,
-        binding: TenantTableBinding,
-        tenant: wyrd_spec::ids::DataTenantId,
-        scratch_dir: std::path::PathBuf,
-        object_base: String,
-        /// Exact pre-writer footer child retained through sealed inspection.
-        footer_reservation: crate::scribe::memory::EncodedFooterReservation,
-    },
-    RestoreReplay {
-        replayed: Box<ReplayedSealKey>,
-    },
+    EncodeParquet(Box<EncodeParquetOp>),
+    RestoreReplay { replayed: Box<ReplayedSealKey> },
+}
+
+/// Move-only inputs for one bounded Parquet encoding lane operation.
+#[derive(Debug)]
+pub(crate) struct EncodeParquetOp {
+    /// Frozen generation encoded without retaining the shard actor.
+    pub(crate) frozen: Box<FrozenMemtable>,
+    /// Tenant-qualified physical table binding.
+    pub(crate) binding: TenantTableBinding,
+    /// Authenticated tenant checked again by the encoder.
+    pub(crate) tenant: wyrd_spec::ids::DataTenantId,
+    /// Generation-owned output scratch directory.
+    pub(crate) scratch_dir: std::path::PathBuf,
+    /// Deterministic artifact basename.
+    pub(crate) object_base: String,
+    /// Exact pre-writer footer child retained through sealed inspection.
+    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
 }
 
 /// Results produced by [`ScribePersistenceCpuPool`].
@@ -1022,22 +1029,25 @@ impl ScribePersistenceCpuPool {
                     }
                     prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
                 }
-                ScribePersistenceCpuOp::EncodeParquet {
-                    frozen,
-                    binding,
-                    tenant,
-                    scratch_dir,
-                    object_base,
-                    footer_reservation,
-                } => encode_batch(
-                    &frozen,
-                    &binding,
-                    tenant,
-                    &scratch_dir,
-                    &object_base,
-                    footer_reservation,
-                )
-                .map(ScribePersistenceCpuResult::ParquetEncoded),
+                ScribePersistenceCpuOp::EncodeParquet(operation) => {
+                    let EncodeParquetOp {
+                        frozen,
+                        binding,
+                        tenant,
+                        scratch_dir,
+                        object_base,
+                        footer_reservation,
+                    } = *operation;
+                    encode_batch(
+                        &frozen,
+                        &binding,
+                        tenant,
+                        &scratch_dir,
+                        &object_base,
+                        footer_reservation,
+                    )
+                    .map(ScribePersistenceCpuResult::ParquetEncoded)
+                }
                 ScribePersistenceCpuOp::RestoreReplay { replayed } => {
                     let frozen = crate::scribe::memtable::Memtable::decode_replayed(&replayed)?;
                     Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
@@ -1130,7 +1140,7 @@ pub(crate) enum ScribeWalIoOp {
         /// Replacement actor stream whose lower same-node epochs are eligible.
         recovery_stream: StreamIdentity,
         shard_senders: Vec<mpsc::Sender<crate::scribe::shards::ShardCommand>>,
-        memory: ScribeMemoryBudget,
+        memory: ScribeResources,
     },
     RetireWal {
         wal: WalHandle,

@@ -252,6 +252,10 @@ run = "cargo test --locked -p wyrd-testing bifrost_deployment_contract -- --noca
 description = "Reject deleted Oracle lease and reconciliation telemetry vocabulary"
 run = "scripts/checks/bifrost-oracle-deleted-vocabulary.sh"
 
+[tasks."check:bifrost-resource-governance"]
+description = "Reject obsolete Bifrost resource ownership and verify checker fixtures"
+run = "BIFROST_RESOURCE_GOVERNANCE_SELF_TEST=1 bash scripts/checks/bifrost-resource-governance.sh && bash scripts/checks/bifrost-resource-governance.sh"
+
 [tasks."test:bifrost-oracle-deleted-vocabulary"]
 description = "Self-test the deleted Oracle vocabulary checker against tracked fixtures"
 run = "bash scripts/checks/test-bifrost-oracle-deleted-vocabulary.sh"

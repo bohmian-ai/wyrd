@@ -7,7 +7,7 @@ use crate::contracts::{Scribe, ScribeAppend, ScribeError};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::audit_envelope::encode_audit_event;
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
+use crate::scribe::memory::MemoryCategory;
 use crate::scribe::replay::replay_wal_directory;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::stream_identity::NodeId;
@@ -211,7 +211,7 @@ fn assert_rejection(recorder: &wyrd_bench::BenchmarkRecorder, reason: &str, coun
 /// Pinning ingress at its sublimit trips exactly one D84 ceiling-labelled reason.
 ///
 /// The scenario pins the whole ingress sublimit
-/// ([`crate::scribe::memory::ScribeMemoryBudget::ingress_limit_bytes`]) with a
+/// ([`crate::resources::ScribeResources::ingress_limit_bytes`]) with a
 /// held [`MemoryCategory::Raw`] reservation, so the append's post-seal retry
 /// cannot fit under the ingress ceiling. Per D84 that rejection is labelled by
 /// the closed ceiling that tripped — here
@@ -502,21 +502,19 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
 }
 
 #[test]
-/// Parent and Scribe hard limits reject before any WAL mutation.
-fn parent_scribe_and_wal_hard_limits_reject_before_append() {
-    // Use 4 GiB so both protected role floors fit within managed memory.
-    let governor = BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024).expect("memory governor");
-    let parent = governor
-        .try_reserve_parent(governor.bifrost_limit_bytes())
-        .expect("parent limit reservation");
-    assert!(governor.try_reserve_parent(1).is_err());
-    drop(parent);
-
-    let budget = governor.scribe_budget();
-    let scribe = budget
-        .try_reserve(MemoryCategory::Raw, governor.scribe_limit_bytes())
+/// Root-issued Scribe and WAL hard limits reject before any WAL mutation.
+fn scribe_root_and_wal_hard_limits_reject_before_append() {
+    let resources =
+        crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+    let limit = resources.limit_bytes();
+    let scribe = resources
+        .try_reserve_maintenance(MemoryCategory::Raw, limit)
         .expect("Scribe limit reservation");
-    assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_err());
+    assert!(
+        resources
+            .try_reserve_maintenance(MemoryCategory::Raw, 1)
+            .is_err()
+    );
     drop(scribe);
 
     let wal_root = tempfile::tempdir().expect("WAL directory");

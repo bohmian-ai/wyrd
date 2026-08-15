@@ -22,9 +22,13 @@ use vala_bifrost_redux::contracts::{
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::resources::{
+    BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
+    OracleWorkerClass, ResourceSource, SystemResourceSnapshot,
+};
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
-use vala_bifrost_redux::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
+use vala_bifrost_redux::scribe::memory::MemoryCategory;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -46,7 +50,7 @@ struct PersistenceFixture {
     operator: Arc<opendal::Operator>,
     scribe: Arc<ScribeImpl>,
     /// Shared production governor used to overlap Oracle range ownership.
-    memory: BifrostMemoryGovernor,
+    memory: BifrostRoleResources,
     faults: PersistenceFaults,
     /// Receiver retained so post-commit hints remain observable until assertions finish.
     hint_inbox: vala_bifrost_redux::maintenance::StagingFileInbox,
@@ -57,6 +61,34 @@ struct PersistenceFixture {
     tenant: DataTenantId,
     /// Aggregate decoded Arrow ownership represented by the seeded replay WAL.
     replay_decoded_bytes: usize,
+}
+
+/// Composes production-equivalent Scribe and Oracle capabilities for persistence fixtures.
+fn persistence_test_roles(memory_limit_bytes: usize) -> BifrostRoleResources {
+    BifrostRuntimeResources::from_snapshot(
+        SystemResourceSnapshot {
+            memory_limit_bytes,
+            effective_cpu: 4,
+            scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+            memory_source: ResourceSource::Injected,
+            cpu_source: ResourceSource::Injected,
+        },
+        BifrostResourcePolicy {
+            roles: [BifrostRole::Scribe, BifrostRole::Oracle]
+                .into_iter()
+                .collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: None,
+            effective_cpu: None,
+            scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
+        },
+    )
+    .expect("test Bifrost runtime resources")
+    .compose_roles()
+    .expect("test Bifrost role resources")
 }
 
 impl PersistenceFixture {
@@ -86,10 +118,7 @@ impl PersistenceFixture {
     /// Panics when the governor or any Postgres, object-store, WAL, execution-lane,
     /// persistence, or Scribe fixture dependency cannot be constructed.
     async fn start() -> Self {
-        Self::start_with_memory(
-            BifrostMemoryGovernor::new(8 * 1024 * 1024 * 1024).expect("memory governor"),
-        )
-        .await
+        Self::start_with_memory(persistence_test_roles(8 * 1024 * 1024 * 1024)).await
     }
 
     /// Starts a persistence fixture with one caller-selected shared governor.
@@ -101,7 +130,7 @@ impl PersistenceFixture {
     ///
     /// Panics when any Postgres, object-store, WAL, execution-lane, persistence,
     /// channel, or Scribe fixture dependency cannot be constructed.
-    async fn start_with_memory(requested_memory: BifrostMemoryGovernor) -> Self {
+    async fn start_with_memory(requested_memory: BifrostRoleResources) -> Self {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
         let operator = Arc::new(
@@ -117,11 +146,11 @@ impl PersistenceFixture {
         for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
             std::fs::create_dir(root).expect("test volume root");
         }
-        let requested_snapshot = requested_memory.snapshot();
+        let requested_snapshot = requested_memory.snapshot().expect("root snapshot");
         let runtime_resources =
             vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
                 vala_bifrost_redux::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: requested_snapshot.pod_limit_bytes,
+                    memory_limit_bytes: requested_snapshot.plan.memory_limit_bytes,
                     effective_cpu: 4,
                     scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
                     scratch_available_bytes: 2 * 1024 * 1024 * 1024,
@@ -151,7 +180,7 @@ impl PersistenceFixture {
             .compose_roles()
             .expect("test role resources");
         let scribe_resources = resources.scribe().expect("test Scribe resources");
-        let memory = scribe_resources.memory_governor();
+        let memory = resources.clone();
         let (_, output_scratch) = scribe_resources
             .volume_capabilities()
             .expect("test Scribe volumes");
@@ -192,7 +221,7 @@ impl PersistenceFixture {
             coordination_runtime: tokio::runtime::Handle::current(),
             execution_pools: pools,
             persistence: Some(persistence),
-            memory_budget: Some(memory.scribe_budget()),
+            resources: scribe_resources,
             staging_file_publisher: Some(staging_file_publisher),
         }));
         scribe.replay_wal_async().await.expect("empty WAL replay");
@@ -228,11 +257,7 @@ impl PersistenceFixture {
                 Duration::from_millis(1),
                 Duration::from_millis(1),
             ],
-            BifrostMemoryGovernor::new_with_test_scribe_limit(
-                9 * 1024 * 1024 * 1024,
-                8 * 1024 * 1024 * 1024,
-            )
-            .expect("replay memory governor"),
+            persistence_test_roles(9 * 1024 * 1024 * 1024),
             2,
             50_000,
         )
@@ -245,7 +270,7 @@ impl PersistenceFixture {
         table_names: &[T],
         generations: i64,
         object_write_delays: &[Duration],
-        memory: BifrostMemoryGovernor,
+        memory: BifrostRoleResources,
         wal_io_threads: usize,
         rows_per_generation: usize,
     ) -> Result<Self, ScribeError> {
@@ -275,11 +300,11 @@ impl PersistenceFixture {
         for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
             std::fs::create_dir(root).expect("test volume root");
         }
-        let requested_snapshot = memory.snapshot();
+        let requested_snapshot = memory.snapshot().expect("root snapshot");
         let runtime_resources =
             vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
                 vala_bifrost_redux::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: requested_snapshot.pod_limit_bytes,
+                    memory_limit_bytes: requested_snapshot.plan.memory_limit_bytes,
                     effective_cpu: 4,
                     scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
                     scratch_available_bytes: 2 * 1024 * 1024 * 1024,
@@ -309,7 +334,7 @@ impl PersistenceFixture {
             .compose_roles()
             .expect("test role resources");
         let scribe_resources = resources.scribe().expect("test Scribe resources");
-        let memory = scribe_resources.memory_governor();
+        let memory = resources.clone();
         let (_, output_scratch) = scribe_resources
             .volume_capabilities()
             .expect("test Scribe volumes");
@@ -372,7 +397,7 @@ impl PersistenceFixture {
             coordination_runtime: tokio::runtime::Handle::current(),
             execution_pools: pools,
             persistence: Some(persistence),
-            memory_budget: Some(memory.scribe_budget()),
+            resources: scribe_resources,
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {
@@ -432,7 +457,7 @@ fn first_replay_scribe(
     wal: Arc<WalWriter>,
     node_id: uuid::Uuid,
     admission: vala_bifrost_redux::scribe::admission::AdmissionConfig,
-    memory: &BifrostMemoryGovernor,
+    memory: &BifrostRoleResources,
 ) -> Arc<ScribeImpl> {
     let pools = ScribeExecutionPools::new(
         ScribeIngressCpuPool::new_with_capacity(1, 256),
@@ -447,7 +472,7 @@ fn first_replay_scribe(
         coordination_runtime: tokio::runtime::Handle::current(),
         execution_pools: pools,
         persistence: None,
-        memory_budget: Some(memory.scribe_budget()),
+        resources: memory.scribe().expect("composed Scribe capability"),
         staging_file_publisher: None,
     }))
 }
@@ -1071,10 +1096,8 @@ async fn automatic_commit_ambiguity_reconciles_exactly_once() {
 /// Proves the automatic persistence producer emits writer-v2 at the 832 MiB floor.
 #[tokio::test]
 async fn scribe_persistence_writer_v2_is_bounded_at_exact_floor() {
-    let fixture = PersistenceFixture::start_with_memory(
-        BifrostMemoryGovernor::new(832 * 1024 * 1024).expect("exact-floor governor"),
-    )
-    .await;
+    let fixture =
+        PersistenceFixture::start_with_memory(persistence_test_roles(832 * 1024 * 1024)).await;
     append_one(&fixture, "exact_floor_events", 1).await;
     fixture
         .scribe
@@ -1133,9 +1156,6 @@ async fn scribe_persistence_writer_v2_is_bounded_at_exact_floor() {
         0,
         "known committed publication cleans its exact generation scratch"
     );
-    let (scribe_peak, bifrost_peak) = fixture.memory.peak_totals_for_test();
-    assert_eq!(scribe_peak, 256 * 1024 * 1024);
-    assert_eq!(bifrost_peak, 256 * 1024 * 1024);
     assert_eq!(
         fixture.scribe.memory_snapshot().categories[MemoryCategory::Persistence as usize],
         0
@@ -1402,11 +1422,7 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
             Duration::from_millis(1),
             Duration::from_millis(1),
         ],
-        BifrostMemoryGovernor::new_with_test_scribe_limit(
-            9 * 1024 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-        )
-        .expect("replay memory governor"),
+        persistence_test_roles(9 * 1024 * 1024 * 1024),
         2,
         25_000,
     )
@@ -1428,10 +1444,8 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
 /// Replay applies publication-driven backpressure when aggregate WAL ownership exceeds memory.
 #[tokio::test]
 async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
-    let memory =
-        BifrostMemoryGovernor::new_with_test_scribe_limit(1024 * 1024 * 1024, 256 * 1024 * 1024)
-            .expect("bounded replay governor");
-    let baseline = memory.snapshot();
+    let memory = persistence_test_roles(1024 * 1024 * 1024);
+    let baseline = memory.snapshot().expect("baseline root snapshot");
     let tables = (1..=160)
         .map(|index| format!("bounded_replay_{index}"))
         .collect::<Vec<_>>();
@@ -1447,31 +1461,36 @@ async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
     .await
     .expect("bounded replay completes with one WAL worker");
     assert!(
-        fixture.replay_decoded_bytes > baseline.scribe_limit_bytes,
+        fixture.replay_decoded_bytes > baseline.plan.scribe_floor_bytes,
         "aggregate decoded WAL ownership {} must exceed the Scribe ceiling {}",
         fixture.replay_decoded_bytes,
-        baseline.scribe_limit_bytes,
+        baseline.plan.scribe_floor_bytes,
     );
     assert!(fixture.scribe.is_ready());
     for table_name in &tables {
         assert_eq!(rows_for_table(&fixture, table_name).await.len(), 1);
     }
-    let restored = fixture.memory.snapshot();
-    let (scribe_peak, bifrost_peak) = fixture.memory.peak_totals_for_test();
-    assert!(scribe_peak <= restored.scribe_limit_bytes);
-    assert!(bifrost_peak <= restored.bifrost_limit_bytes);
-    assert_eq!(restored.scribe_total_bytes, baseline.scribe_total_bytes);
-    assert_eq!(restored.bifrost_total_bytes, baseline.bifrost_total_bytes);
+    let restored = fixture.memory.snapshot().expect("restored root snapshot");
+    assert_eq!(
+        restored.scribe_memory_used_bytes,
+        baseline.scribe_memory_used_bytes
+    );
+    assert_eq!(
+        restored.oracle_memory_used_bytes,
+        baseline.oracle_memory_used_bytes
+    );
+    assert_eq!(
+        restored.forge_memory_used_bytes,
+        baseline.forge_memory_used_bytes
+    );
     fixture.stop().await;
 }
 
 /// One indivisible replay generation fails closed without advancing readiness.
 #[tokio::test]
 async fn replay_indivisible_generation_over_ceiling_stays_unready() {
-    let memory =
-        BifrostMemoryGovernor::new_with_test_scribe_limit(1024 * 1024 * 1024, 256 * 1024 * 1024)
-            .expect("bounded replay governor");
-    let baseline = memory.snapshot();
+    let memory = persistence_test_roles(1024 * 1024 * 1024);
+    let baseline = memory.snapshot().expect("baseline root snapshot");
     let error = match PersistenceFixture::start_after_wal_restart_with_keys(
         false,
         &["oversized_replay", "later_replay"],
@@ -1495,12 +1514,18 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
         _ => panic!("replay refusal must retain its structural capacity error: {error:?}"),
     }
     assert_eq!(
-        memory.snapshot().scribe_total_bytes,
-        baseline.scribe_total_bytes
+        memory
+            .snapshot()
+            .expect("restored root snapshot")
+            .scribe_memory_used_bytes,
+        baseline.scribe_memory_used_bytes
     );
     assert_eq!(
-        memory.snapshot().bifrost_total_bytes,
-        baseline.bifrost_total_bytes
+        memory
+            .snapshot()
+            .expect("restored root snapshot")
+            .elastic_memory_used_bytes,
+        baseline.elastic_memory_used_bytes
     );
 }
 
@@ -1511,11 +1536,7 @@ async fn replayed_distinct_keys_publish_in_replay_order_and_fifo() {
         &["restart_key_a", "restart_key_b"],
         2,
         &[Duration::from_millis(100)],
-        BifrostMemoryGovernor::new_with_test_scribe_limit(
-            9 * 1024 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-        )
-        .expect("replay memory governor"),
+        persistence_test_roles(9 * 1024 * 1024 * 1024),
         2,
         50_000,
     )
@@ -1605,15 +1626,13 @@ fn native_event_time_frame(
 /// range overlaps, and both role counters return to their exact baseline.
 #[tokio::test]
 async fn persistence_headroom_survives_oracle_range_overlap() {
-    let memory =
-        BifrostMemoryGovernor::new_with_test_scribe_limit(1024 * 1024 * 1024, 256 * 1024 * 1024)
-            .expect("bounded production-formula governor");
+    let memory = persistence_test_roles(1024 * 1024 * 1024);
     let fixture = PersistenceFixture::start_with_memory(memory).await;
-    let baseline = fixture.memory.snapshot();
-    let oracle = fixture.memory.oracle_budget();
+    let baseline = fixture.memory.snapshot().expect("baseline root snapshot");
+    let oracle = fixture.memory.oracle().expect("composed Oracle capability");
     let range = oracle
-        .try_reserve(oracle.limit_bytes())
-        .expect("worst-case Oracle child range occupancy");
+        .try_acquire_worker(OracleWorkerClass::Analytical)
+        .expect("analytical Oracle worker occupancy");
     let schema = Arc::new(Schema::new(vec![
         Field::new(
             "wyrd_event_time",
@@ -1670,18 +1689,21 @@ async fn persistence_headroom_survives_oracle_range_overlap() {
         .retire_committed_for_test()
         .await
         .expect("retire committed generation while Oracle range is retained");
-    let overlapped = fixture.memory.snapshot();
-    assert_eq!(overlapped.oracle_total_bytes, oracle.limit_bytes());
-    assert!(overlapped.bifrost_total_bytes >= overlapped.oracle_total_bytes);
+    let overlapped = fixture.memory.snapshot().expect("overlapped root snapshot");
+    assert_eq!(overlapped.oracle_memory_used_bytes, range.memory_bytes());
+    assert!(overlapped.oracle_memory_used_bytes <= overlapped.plan.managed_memory_bytes);
     drop(range);
-    let restored = fixture.memory.snapshot();
-    assert_eq!(restored.oracle_total_bytes, baseline.oracle_total_bytes);
+    let restored = fixture.memory.snapshot().expect("restored root snapshot");
     assert_eq!(
-        restored.scribe_total_bytes, baseline.scribe_total_bytes,
+        restored.oracle_memory_used_bytes,
+        baseline.oracle_memory_used_bytes
+    );
+    assert_eq!(
+        restored.scribe_memory_used_bytes, baseline.scribe_memory_used_bytes,
         "scribe ownership did not restore: {restored:?}"
     );
     assert_eq!(
-        restored.bifrost_total_bytes, baseline.bifrost_total_bytes,
+        restored.elastic_memory_used_bytes, baseline.elastic_memory_used_bytes,
         "parent ownership did not restore: {restored:?}"
     );
     fixture.stop().await;

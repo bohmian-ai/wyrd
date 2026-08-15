@@ -721,7 +721,7 @@ async fn sample_paired_peaks(
 ) -> Result<PairedPeaks, JourneyError> {
     let governor = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .ok_or("paired server lacks the shared governor")?;
     let mut peaks = PairedPeaks::default();
@@ -934,12 +934,14 @@ async fn pg_bifrost_oracle_capacity_contract_journey() {
         .expect("reader client");
     let governor = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .expect("shared production memory governor");
-    let oracle = governor.oracle_budget();
+    let oracle = governor.oracle().expect("Oracle resource capability");
     let retained = oracle
-        .try_reserve(oracle.limit_bytes())
+        .try_acquire_query(vala_bifrost_redux::resources::OracleResourceRequest {
+            local_ratio: 1.0,
+        })
         .expect("retain the complete Oracle child budget");
 
     let refusal = match QueryClient::new(&reader)
@@ -995,7 +997,7 @@ async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
         .expect("spill success baseline");
     let memory = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .expect("spill success governor")
         .snapshot();
@@ -1346,7 +1348,7 @@ async fn pg_bifrost_oracle_spill_disk_ceiling_is_typed_and_recovers() {
         .expect("spill ceiling baseline");
     let memory = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .expect("spill ceiling governor")
         .snapshot();
@@ -1406,7 +1408,7 @@ async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
         .expect("spill cancellation baseline");
     let memory = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .expect("spill cancellation governor")
         .snapshot();
@@ -1591,7 +1593,7 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
     assert_eq!(residual.peer_running, 0);
     let memory = restarted
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .expect("restarted Oracle governor")
         .snapshot();
@@ -1649,12 +1651,14 @@ async fn oracle_heartbeat_survives_capacity_refusals() {
             .expect("initial Oracle heartbeat");
     let governor = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .expect("heartbeat shared governor");
-    let oracle = governor.oracle_budget();
+    let oracle = governor.oracle().expect("Oracle resource capability");
     let retained = oracle
-        .try_reserve(oracle.limit_bytes())
+        .try_acquire_query(vala_bifrost_redux::resources::OracleResourceRequest {
+            local_ratio: 1.0,
+        })
         .expect("retain Oracle capacity during heartbeat proof");
     let pressure_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
     let mut refusals = 0_u64;
@@ -3623,7 +3627,7 @@ async fn prepare_spill_table(
     let transport = BifrostGrpcTransport::connect(&writer).await?;
     let scribe_baseline = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .ok_or("spill fixture lacks memory governor")?
         .snapshot()
@@ -3668,7 +3672,7 @@ fn assert_scribe_fixture_peaks_bounded(
 ) -> Result<(), JourneyError> {
     let governor = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .ok_or("spill fixture lacks memory governor")?;
     let snapshot = governor.snapshot();
@@ -3698,7 +3702,7 @@ async fn wait_scribe_memory_restored(
     loop {
         let current = server
             .state()
-            .bifrost_memory
+            .bifrost_resources
             .as_ref()
             .ok_or("spill fixture lacks memory governor")?
             .snapshot()
@@ -3746,7 +3750,7 @@ fn assert_oracle_runtime_restored(
     }
     let memory = server
         .state()
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .ok_or("Oracle server lacks the shared memory governor")?
         .snapshot();

@@ -17,14 +17,13 @@ use wyrd_spec::vala::api::AuditEvent;
 use crate::catalog::{TenantTableBinding, TenantTableKey};
 use crate::contracts::ScribeError;
 use crate::maintenance::StagingFilePublisher;
+use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
-use crate::scribe::memory::{
-    MemoryCategory, MemoryReservation, ScribeMemoryBudget, parquet_producer_delta,
-};
+use crate::scribe::memory::{MemoryCategory, parquet_producer_delta};
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::{BoundedParquetArtifactSet, ParquetEncoded};
 use crate::scribe::seal_key::{ScribeArtifactIdentity, SealKey};
@@ -410,7 +409,7 @@ pub(crate) struct PersistenceRuntimeContext {
     /// Replacement actor stream whose current membership fence authorizes publication.
     pub(crate) actor_stream: StreamIdentity,
     /// Scribe child budget used for per-job workspace reservations.
-    pub(crate) memory: ScribeMemoryBudget,
+    pub(crate) memory: ScribeResources,
     /// Optional local wake-up publisher used after confirmed file-list commits.
     pub(crate) staging_file_publisher: Option<StagingFilePublisher>,
     /// Deterministic fault points used only by test-tier persistence paths.
@@ -465,7 +464,7 @@ enum ScribeReconciliationJob {
         /// Complete local scratch and remote artifact identity owner.
         artifacts: BoundedParquetArtifactSet,
         /// Checked producer workspace retained through reconciliation.
-        parquet_owner: MemoryReservation,
+        parquet_owner: ScribeMemoryLease,
         /// Worker notification; dropping the receiver does not cancel reconciliation.
         completion: oneshot::Sender<Result<FileListCommitKey, ScribeError>>,
     },
@@ -833,7 +832,7 @@ struct PersistenceWorker {
     /// Bounded filesystem lane used for manifest advancement.
     wal_io: ScribeWalIoPool,
     /// Scribe memory budget for persistence workspace reservations.
-    memory: ScribeMemoryBudget,
+    memory: ScribeResources,
     /// Optional local wake-up publisher used after confirmed file-list commits.
     staging_file_publisher: Option<StagingFilePublisher>,
     /// Generation-owned scratch authority required before writer creation.
@@ -974,18 +973,25 @@ impl PersistenceWorker {
             "persisting immutable Scribe generation"
         );
         let generation_owned_bytes = generation.arrow_bytes;
-        let reservation =
-            parquet_producer_delta(generation_owned_bytes).and_then(|workspace_bytes| {
+        let reservation = parquet_producer_delta(generation_owned_bytes)
+            .and_then(|workspace_bytes| {
                 self.memory
                     .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
+            })
+            .and_then(|mut reservation| {
+                reservation
+                    .attach_shard(generation.shard_id)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: error.to_string(),
+                    })?;
+                Ok(reservation)
             });
         let result = match reservation {
-            Ok(mut reservation) => {
+            Ok(reservation) => {
                 // Attribution-only: the exact originating shard is unavailable
                 // here; `generation.shard_id` carries the recorded lane but
                 // the memory-accounting shard is approximate under batch-spread
                 // routing and does not affect correctness.
-                reservation.attach_shard(self.memory.shard_accounting(), generation.shard_id);
                 let mut parquet_owner = Some(reservation);
                 let result = self
                     .persist_once(
@@ -1130,14 +1136,16 @@ impl PersistenceWorker {
         let parquet_started = std::time::Instant::now();
         let encoded = match self
             .persistence_cpu
-            .submit(ScribePersistenceCpuOp::EncodeParquet {
-                frozen: Box::new(frozen.clone()),
-                binding: binding.clone(),
-                tenant: binding.tenant,
-                scratch_dir: scratch_dir.to_path_buf(),
-                object_base: object_base.to_owned(),
-                footer_reservation,
-            })
+            .submit(ScribePersistenceCpuOp::EncodeParquet(Box::new(
+                crate::scribe::execution_lanes::EncodeParquetOp {
+                    frozen: Box::new(frozen.clone()),
+                    binding: binding.clone(),
+                    tenant: binding.tenant,
+                    scratch_dir: scratch_dir.to_path_buf(),
+                    object_base: object_base.to_owned(),
+                    footer_reservation,
+                },
+            )))
             .await?
         {
             ScribePersistenceCpuResult::ParquetEncoded(encoded) => encoded,
@@ -1182,7 +1190,7 @@ impl PersistenceWorker {
         generation: &Arc<ImmutableGeneration>,
         binding: &TenantTableBinding,
         defer_manifest_advance: bool,
-        parquet_owner: &mut Option<MemoryReservation>,
+        parquet_owner: &mut Option<ScribeMemoryLease>,
         generation_owned_bytes: usize,
     ) -> Result<FileListCommitKey, ScribeError> {
         let generation_id = generation.generation_id.0;
@@ -1382,7 +1390,7 @@ impl PersistenceWorker {
         rows: &[file_list_writer::FileListArtifactInsert],
         events: &[AuditEvent],
         artifacts: BoundedParquetArtifactSet,
-        parquet_owner: MemoryReservation,
+        parquet_owner: ScribeMemoryLease,
     ) -> Result<FileListCommitKey, ScribeError> {
         let outcome = loop {
             if let ScribePublicationOutcome::Committed(outcome) =
@@ -1770,9 +1778,9 @@ mod tests {
                 stream,
             ))
             .expect("WAL stream directory");
-            let memory = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
-                .expect("memory governor")
-                .scribe_budget();
+            let memory = crate::scribe::embedded_scribe_resources(
+                &crate::scribe::AdmissionConfig::default(),
+            );
             let runtime = PersistenceRuntime::start(
                 ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 1, 1),
                 PersistenceRuntimeContext {

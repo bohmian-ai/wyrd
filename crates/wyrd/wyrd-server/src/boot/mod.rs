@@ -32,7 +32,6 @@ use vala_bifrost_redux::oracle::{
 };
 use vala_bifrost_redux::resources::{BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources};
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
-use vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
@@ -573,11 +572,6 @@ async fn build_bifrost_parts_from_boot(
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let resource_plan = bifrost_resources.plan();
     let pod_memory_limit = resource_plan.managed_memory_bytes;
-    let bifrost_memory = bifrost_resources.memory_ledger();
-    let bifrost_datafusion_memory_pool = bifrost_memory
-        .clone()
-        .map(BifrostDataFusionMemoryPool::for_oracle)
-        .map(Arc::new);
     let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -686,12 +680,11 @@ async fn build_bifrost_parts_from_boot(
                 })?)
                 .with_output_scratch(scribe_output_volume),
             ),
-            memory_budget: Some(
-                bifrost_memory
-                    .as_ref()
-                    .expect("enabled Scribe role must own its memory ledger")
-                    .scribe_budget(),
-            ),
+            resources: bifrost_resources.scribe().ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "Scribe role selected without a composed Scribe capability".to_owned(),
+                )
+            })?,
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {
@@ -765,9 +758,6 @@ async fn build_bifrost_parts_from_boot(
         .with_bifrost_node_id(ClusterNodeId::new(node_id.as_uuid()))
         .with_bifrost_redux(bifrost_redux)
         .with_bifrost_resources(bifrost_resources);
-    if let (Some(memory), Some(pool)) = (bifrost_memory, bifrost_datafusion_memory_pool) {
-        state = state.with_bifrost_memory_pool(memory, pool);
-    }
     if let Some(forge) = forge {
         state = state.with_forge(forge);
     }
@@ -1234,9 +1224,6 @@ impl<'a> OracleRoleBuilder<'a> {
             OraclePeerAuthority::from_pem(signing_key, security_audit.clone())
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
-        let memory = state.bifrost_memory.clone().ok_or_else(|| {
-            ServerBootError::OraclePeer("shared Bifrost memory governor is absent".to_owned())
-        })?;
         let roles = state.bifrost_resources.clone().ok_or_else(|| {
             ServerBootError::OraclePeer("shared Bifrost role composition is absent".to_owned())
         })?;
@@ -1422,7 +1409,7 @@ impl<'a> OracleRoleBuilder<'a> {
             verifier,
             security_audit.clone(),
             reservations,
-            SealedFragmentExecutor::with_memory_governor(catalog.file_io(), memory.clone()),
+            SealedFragmentExecutor::with_resources(catalog.file_io(), oracle_resources.clone()),
             oracle_resources,
         ));
         let peer = Arc::new(OraclePeerRuntime::new(
@@ -1449,7 +1436,6 @@ impl<'a> OracleRoleBuilder<'a> {
             local_role: role.clone(),
             local_slots: slots,
             memory: OracleMemoryResources {
-                governor: memory,
                 resources,
                 reconciliation_limit_bytes,
             },
@@ -2272,7 +2258,6 @@ pub(crate) mod pg_tests {
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::oracle::dispatcher::DispatchError;
     use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryOptions};
-    use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
     use vala_sql::OperatorPool;
     use wyrd_runtime::permission::{Permission, PermissionSet};
     use wyrd_runtime::{Principal, PrincipalKind, RoleRef};
@@ -2284,6 +2269,34 @@ pub(crate) mod pg_tests {
         AuthMethod, ClusterCapabilities, QueryStreamFrame, QueryTerminalErrorCode,
         QueryTerminalOutcome, VisibilityMode,
     };
+
+    /// Composes production-equivalent Oracle and Scribe capabilities from an injected snapshot.
+    fn oracle_scribe_test_resources() -> vala_bifrost_redux::resources::BifrostRoleResources {
+        vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+            vala_bifrost_redux::resources::SystemResourceSnapshot {
+                memory_limit_bytes: 2 * 1024 * 1024 * 1024,
+                effective_cpu: 2,
+                scratch_capacity_bytes: 1024 * 1024 * 1024,
+                scratch_available_bytes: 1024 * 1024 * 1024,
+                memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            },
+            vala_bifrost_redux::resources::BifrostResourcePolicy {
+                roles: [BifrostRole::Scribe, BifrostRole::Oracle]
+                    .into_iter()
+                    .collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: Some(512 * 1024 * 1024),
+                effective_cpu: None,
+                scratch_root: std::env::temp_dir(),
+                volume_roots: None,
+            },
+        )
+        .expect("injected server-test resource snapshot")
+        .compose_roles()
+        .expect("server-test role composition")
+    }
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
@@ -2402,10 +2415,6 @@ pub(crate) mod pg_tests {
         .expect("test Bifrost runtime resources")
         .compose_roles()
         .expect("test Forge role composition");
-        let memory = roles
-            .memory_ledger()
-            .expect("mixed test topology must own its memory ledger");
-        let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
@@ -2431,7 +2440,7 @@ pub(crate) mod pg_tests {
         (
             state
                 .with_bifrost_redux(redux)
-                .with_bifrost_memory_pool(memory, query_memory)
+                .with_bifrost_resources(roles)
                 .with_forge(forge),
             publisher,
         )
@@ -2442,20 +2451,11 @@ pub(crate) mod pg_tests {
     async fn forge_is_composed_once_and_supervised_directly() {
         let (state, _publisher) = composed_test_state().await;
         let retained = state.forge_handle().expect("retained Forge").clone();
-        let retained_pool = state
-            .bifrost_query_memory
-            .as_ref()
-            .expect("retained query pool")
-            .clone();
         let shutdown = CancellationToken::new();
         let supervised = spawn_maintenance_scheduler(&state, shutdown.clone())
             .expect("Forge supervisor result")
             .expect("Forge supervisor future");
         assert!(Arc::ptr_eq(&retained, state.forge_handle().expect("Forge")));
-        assert!(Arc::ptr_eq(
-            &retained_pool,
-            state.bifrost_query_memory.as_ref().expect("query pool")
-        ));
         let task = tokio::spawn(supervised);
         tokio::task::yield_now().await;
         shutdown.cancel();
@@ -2628,11 +2628,9 @@ pub(crate) mod pg_tests {
             let storage = crate::test_support::test_storage().await;
             let catalog = crate::test_support::test_catalog().await;
             let redux = crate::test_support::test_redux_catalog().await;
-            let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
-            let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
             let state = AppState::new(postgres, storage, catalog)
                 .with_bifrost_redux(redux)
-                .with_bifrost_memory_pool(memory, query_memory);
+                .with_bifrost_resources(oracle_scribe_test_resources());
             let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
             let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
             let mut config = crate::config::WyrdServerConfig::default();
@@ -2688,11 +2686,9 @@ pub(crate) mod pg_tests {
             let storage = crate::test_support::test_storage().await;
             let catalog = crate::test_support::test_catalog().await;
             let redux = crate::test_support::test_redux_catalog().await;
-            let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
-            let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
             let state = AppState::new(postgres, Arc::clone(&storage), catalog)
                 .with_bifrost_redux(Arc::clone(&redux))
-                .with_bifrost_memory_pool(memory, query_memory);
+                .with_bifrost_resources(oracle_scribe_test_resources());
             let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
             let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
             let mut config = crate::config::WyrdServerConfig::default();

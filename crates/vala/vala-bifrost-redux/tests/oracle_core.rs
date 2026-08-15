@@ -645,9 +645,6 @@ impl OracleFixture {
             memory: {
                 let roles = composed_oracle_roles();
                 OracleMemoryResources {
-                    governor: roles
-                        .memory_ledger()
-                        .expect("Oracle test topology must own its memory ledger"),
                     resources: roles
                         .oracle()
                         .expect("composition must issue the Oracle capability"),

@@ -798,9 +798,8 @@ impl TailFenceDrainer<'_> {
                 }
             };
             for batch in page.batches {
-                let Ok(reservation) = crate::resources::OracleQueryMemoryReservation::try_new(
+                let Ok(reservation) = self.memory.resources.try_split_query_memory(
                     &self.query_pool,
-                    self.memory.resources.governor(),
                     "oracle-live-tail",
                     batch.get_array_memory_size(),
                 ) else {
@@ -1161,8 +1160,6 @@ mod tests {
             )
             .oracle()
             .expect("composition must enable the Oracle capability"),
-            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let drained = drainer(&tails, &memory)
@@ -1195,8 +1192,6 @@ mod tests {
             )
             .oracle()
             .expect("composition must enable the Oracle capability"),
-            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let result = drainer(&tails, &memory)
@@ -1231,8 +1226,6 @@ mod tests {
             )
             .oracle()
             .expect("composition must enable the Oracle capability"),
-            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let mut fence = acquired(Arc::clone(&transport) as Arc<dyn TailReadTransport>);
@@ -1265,8 +1258,6 @@ mod tests {
             )
             .oracle()
             .expect("composition must enable the Oracle capability"),
-            governor: BifrostMemoryGovernor::new(4 * 1024 * 1024 * 1024)
-                .expect("test memory governor"),
             reconciliation_limit_bytes: 1024,
         };
         let mut fence = acquired(Arc::clone(&transport) as Arc<dyn TailReadTransport>);

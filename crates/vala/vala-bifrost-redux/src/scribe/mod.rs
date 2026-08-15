@@ -209,14 +209,14 @@ pub struct ScribeImpl {
     /// Pod-global request and shard admission counters.
     admission: AdmissionController,
     /// Scribe-only child capability over the pod-global Bifrost governor.
-    memory: memory::ScribeMemoryBudget,
+    memory: crate::resources::ScribeResources,
     /// Runtime pressure and lifecycle thresholds (D83 watermarks and max age).
     ///
     /// Shared by the admission path and the periodic age scanner so the
     /// flush-first hysteresis is defined once.
     pressure_config: ScribePressureConfig,
     /// Shared active/immutable Arrow ownership ledger.
-    memory_ledger: memory::MemoryLedger,
+    memory_ownership: memory::ScribeOwnership,
     /// Bounded persistence CPU lane retained for replay and seal preparation.
     persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded WAL IO lane retained for recovery and writer execution.
@@ -501,7 +501,7 @@ pub struct ScribeBuildConfig {
     /// Optional server-provisioned immutable persistence dependencies.
     pub persistence: Option<ScribePersistenceConfig>,
     /// Scribe child budget provisioned by server boot.
-    pub memory_budget: Option<memory::ScribeMemoryBudget>,
+    pub resources: crate::resources::ScribeResources,
     /// Optional bounded local wake-up publisher for committed staging files.
     pub staging_file_publisher: Option<StagingFilePublisher>,
 }
@@ -517,9 +517,48 @@ pub struct ScribeEmbeddedConfig {
     /// Optional tenant-scoped immutable persistence runtime.
     pub persistence: Option<ScribePersistenceConfig>,
     /// Optional server-provisioned Scribe child budget.
-    pub memory_budget: Option<memory::ScribeMemoryBudget>,
+    pub resources: crate::resources::ScribeResources,
     /// Optional bounded publisher for post-commit Forge wake-ups.
     pub staging_file_publisher: Option<StagingFilePublisher>,
+}
+
+/// Composes the embedded Scribe capability through the production root path.
+///
+/// # Panics
+///
+/// Panics when the embedded admission configuration cannot cover the protected
+/// unmanaged reserve and Scribe floor, which is a construction invariant.
+fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::ScribeResources {
+    let memory_limit_bytes = config.memory_limit_bytes.max(
+        crate::resources::MIN_UNMANAGED_RESERVE_BYTES + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
+    );
+    let runtime = crate::resources::BifrostRuntimeResources::from_snapshot(
+        crate::resources::SystemResourceSnapshot {
+            memory_limit_bytes,
+            effective_cpu: 1,
+            scratch_capacity_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+            scratch_available_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+            memory_source: crate::resources::ResourceSource::Injected,
+            cpu_source: crate::resources::ResourceSource::Injected,
+        },
+        crate::resources::BifrostResourcePolicy {
+            roles: [crate::resources::BifrostRole::Scribe]
+                .into_iter()
+                .collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
+            effective_cpu: None,
+            scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
+        },
+    )
+    .expect("embedded Scribe resource policy must satisfy its configured floor");
+    runtime
+        .compose_roles()
+        .expect("embedded Scribe root must remain healthy")
+        .scribe()
+        .expect("embedded Scribe role must be enabled")
 }
 
 impl ScribeImpl {
@@ -590,6 +629,7 @@ impl ScribeImpl {
         sync_delay: std::time::Duration,
         admission: AdmissionConfig,
     ) -> Result<Self, String> {
+        let resources = embedded_scribe_resources(&admission);
         Self::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
             operator,
             wal,
@@ -601,7 +641,7 @@ impl ScribeImpl {
                 admission,
                 coordination_runtime: Handle::current(),
                 persistence: None,
-                memory_budget: None,
+                resources,
                 staging_file_publisher: None,
             },
         )
@@ -654,7 +694,7 @@ impl ScribeImpl {
             coordination_runtime: config.coordination_runtime,
             execution_pools,
             persistence: config.persistence,
-            memory_budget: config.memory_budget,
+            resources: config.resources,
             staging_file_publisher: None,
         }))
     }
@@ -725,6 +765,7 @@ impl ScribeImpl {
         admission: AdmissionConfig,
         coordination_runtime: Handle,
     ) -> Self {
+        let resources = embedded_scribe_resources(&admission);
         Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,
@@ -735,7 +776,7 @@ impl ScribeImpl {
                 admission,
                 coordination_runtime,
                 persistence: None,
-                memory_budget: None,
+                resources,
                 staging_file_publisher: None,
             },
         )
@@ -779,7 +820,7 @@ impl ScribeImpl {
                 ScribeWalIoPool::new_with_capacity(config.lane_config.wal_io_threads, 256),
             ),
             persistence: config.persistence,
-            memory_budget: config.memory_budget,
+            resources: config.resources,
             staging_file_publisher: config.staging_file_publisher,
         })
     }
@@ -801,21 +842,9 @@ impl ScribeImpl {
     /// Panics only if the configured fallback memory governor cannot represent
     /// the fixed one-gibibyte invariant or a shard WAL handle cannot be built.
     fn build(config: ScribeBuildConfig) -> Self {
-        let memory = config.memory_budget.clone().unwrap_or_else(|| {
-            memory::BifrostMemoryGovernor::new_with_child_limits(
-                config.admission.memory_limit_bytes,
-                config.admission.scribe_memory_limit_bytes,
-                None,
-            )
-            .or_else(|_| memory::BifrostMemoryGovernor::detect(1024 * 1024 * 1024))
-            .unwrap_or_else(|_| {
-                memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
-                    .expect("one-gibibyte fallback memory budget is valid")
-            })
-            .scribe_budget()
-        });
-        let memory_ledger = memory::MemoryLedger::new(&memory)
-            .expect("zero-sized memory ledger reservations must be valid");
+        let memory = config.resources.clone();
+        let memory_ownership =
+            memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
         let admission =
             AdmissionController::with_config_and_memory(config.admission, memory.clone());
         let ScribeBuildConfig {
@@ -826,7 +855,7 @@ impl ScribeImpl {
             execution_pools,
             persistence: persistence_config,
             admission: _,
-            memory_budget: _,
+            resources: _,
             staging_file_publisher,
         } = config;
         let node_id = stream.node_id.to_string();
@@ -866,7 +895,7 @@ impl ScribeImpl {
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 stream,
-                memory_ledger: memory_ledger.clone(),
+                memory_ownership: memory_ownership.clone(),
             },
             &coordination_runtime,
         );
@@ -880,7 +909,7 @@ impl ScribeImpl {
             admission,
             memory,
             pressure_config,
-            memory_ledger,
+            memory_ownership,
             persistence_cpu,
             wal_io,
             ingress_cpu,
@@ -961,6 +990,7 @@ impl ScribeImpl {
         // Leak temp_dir to keep WAL files for the test lifetime
         std::mem::forget(temp_dir);
 
+        let resources = embedded_scribe_resources(&admission_config);
         Self::build(ScribeBuildConfig {
             operator,
             wal,
@@ -979,7 +1009,7 @@ impl ScribeImpl {
                 wal_io,
             ),
             persistence: None,
-            memory_budget: None,
+            resources,
             staging_file_publisher: None,
         })
     }
@@ -1249,7 +1279,7 @@ impl ScribeImpl {
     /// and the periodic age scanner alike — reads one consistent snapshot.
     #[must_use]
     fn pressure_snapshot(&self) -> memory::MemorySnapshot {
-        self.memory.snapshot().with_ingress_watermarks(
+        self.memory.memory_snapshot().with_ingress_watermarks(
             self.pressure_config.ingress_high_water_percent,
             self.pressure_config.ingress_low_water_percent,
         )
@@ -1310,8 +1340,8 @@ impl ScribeImpl {
     /// the rest of the method makes.
     pub fn check_age(&self, now: std::time::Instant) {
         let snapshot = self.pressure_snapshot();
-        snapshot.emit_governor_gauges();
         self.memory.emit_root_resource_gauges();
+        snapshot.emit_governor_gauges();
         tracing::debug!(
             scribe_total = snapshot.scribe_total_bytes,
             oracle_total = snapshot.oracle_total_bytes,
@@ -1753,7 +1783,7 @@ impl ScribeImpl {
     /// Return pod-global Bifrost memory accounting.
     #[must_use]
     pub fn memory_snapshot(&self) -> memory::MemorySnapshot {
-        self.memory.snapshot()
+        self.memory.memory_snapshot()
     }
 
     /// Return the bounded setup and ownership snapshot used by test harnesses.
@@ -1767,10 +1797,10 @@ impl ScribeImpl {
         let mut coherent = None;
         let mut latest = None;
         for _ in 0..64 {
-            let before = self.memory.snapshot();
+            let before = self.memory.memory_snapshot();
             let owner_snapshots = self.shards.memtable_snapshots()?;
             let transient_by_shard = self.memory.shard_snapshot();
-            let memory = self.memory.snapshot().with_ingress_watermarks(
+            let memory = self.memory.memory_snapshot().with_ingress_watermarks(
                 self.pressure_config.ingress_high_water_percent,
                 self.pressure_config.ingress_low_water_percent,
             );
@@ -2107,14 +2137,14 @@ impl ScribeImpl {
             let result = async {
                 self.admission
                     .preflight_transfer_immutable_to_active(token.memtable_bytes)?;
-                self.memory_ledger
+                self.memory_ownership
                     .preflight_move_immutable_to_active(token.memtable_bytes)?;
                 self.shards
                     .abort_post_commit(token.seal_id, token.shard_id, &token.seal_key)
                     .await?;
                 self.admission
                     .transfer_immutable_to_active(token.memtable_bytes)?;
-                self.memory_ledger
+                self.memory_ownership
                     .move_immutable_to_active(token.memtable_bytes)
                     .map_err(|error| ScribeError::Internal {
                         detail: error.to_string(),
@@ -2310,7 +2340,7 @@ impl ScribeImpl {
                 detail: "WAL IO lane returned the wrong replay result".to_owned(),
             }),
             Err(error) => {
-                let memory = self.memory.snapshot();
+                let memory = self.memory.memory_snapshot();
                 tracing::error!(
                     stage = "replay_stream",
                     purpose = "scribe_replay",

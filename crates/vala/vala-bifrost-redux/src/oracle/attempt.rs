@@ -10,27 +10,8 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use wyrd_spec::vala::api::{WorkerAttemptFrame, WorkerFooter};
 
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryPurpose, ParentMemoryReservation};
-
-/// Complete memory ownership retained by an attempt buffer and its reader.
-#[derive(Debug)]
-pub enum AttemptMemoryReservation {
-    /// Compatibility ownership for callers without an admitted query envelope.
-    Parent(ParentMemoryReservation),
-    /// Nested ownership in the admitted query's shared `DataFusion` pool.
-    Query(MemoryReservation),
-}
-
-impl AttemptMemoryReservation {
-    /// Returns the exact bytes retained by either accounting backend.
-    #[must_use]
-    fn bytes(&self) -> usize {
-        match self {
-            Self::Parent(reservation) => reservation.bytes(),
-            Self::Query(reservation) => reservation.size(),
-        }
-    }
-}
+/// Complete query-nested memory ownership retained by an attempt buffer and its reader.
+type AttemptMemoryReservation = MemoryReservation;
 
 /// Validated whole attempt returned to the leader.
 #[derive(Debug)]
@@ -76,7 +57,7 @@ impl Iterator for AttemptBatchReader {
             } => {
                 let _reserved_bytes = memory_reservation
                     .as_ref()
-                    .map_or(0, AttemptMemoryReservation::bytes);
+                    .map_or(0, MemoryReservation::size);
                 batches.next().map(Ok)
             }
             Self::Spill {
@@ -86,7 +67,7 @@ impl Iterator for AttemptBatchReader {
             } if *remaining > 0 => {
                 let _reserved_bytes = memory_reservation
                     .as_ref()
-                    .map_or(0, AttemptMemoryReservation::bytes);
+                    .map_or(0, MemoryReservation::size);
                 *remaining -= 1;
                 Some(read_payload(file.as_file_mut()))
             }
@@ -178,29 +159,6 @@ impl AttemptBuffer {
         }
     }
 
-    /// Creates a spill-backed buffer after reserving its complete memory tier.
-    ///
-    /// Reserving before the transport stream is polled ensures frame decoding
-    /// cannot begin unless the shared Bifrost parent admits the leader buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AttemptError::ParentCapacity`] when the process-wide parent cannot
-    /// reserve the configured in-memory threshold.
-    pub fn with_memory_governor(
-        limit: usize,
-        memory_limit: usize,
-        governor: &BifrostMemoryGovernor,
-    ) -> Result<Self, AttemptError> {
-        let mut buffer = Self::with_spill_limit(limit, memory_limit);
-        buffer.memory_reservation = Some(AttemptMemoryReservation::Parent(
-            governor
-                .try_reserve_parent_classified(buffer.memory_limit, MemoryPurpose::OracleQuery)
-                .map_err(|_| AttemptError::ParentCapacity)?,
-        ));
-        Ok(buffer)
-    }
-
     /// Creates a spill-backed buffer inside an admitted query's shared pool.
     ///
     /// # Errors
@@ -217,7 +175,7 @@ impl AttemptBuffer {
         reservation
             .try_grow(buffer.memory_limit)
             .map_err(|_| AttemptError::ParentCapacity)?;
-        buffer.memory_reservation = Some(AttemptMemoryReservation::Query(reservation));
+        buffer.memory_reservation = Some(reservation);
         Ok(buffer)
     }
     /// Buffers one frame without admitting it to the leader plan.

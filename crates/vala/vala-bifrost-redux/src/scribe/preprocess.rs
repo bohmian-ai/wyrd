@@ -10,11 +10,12 @@ use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
+use crate::resources::ScribeMemoryLease;
 use crate::schema::SchemaFingerprint;
 use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
 use crate::scribe::audit_envelope::encode_audit_event;
-use crate::scribe::memory::{MemoryCategory, MemoryReservation};
+use crate::scribe::memory::MemoryCategory;
 use crate::scribe::seal_key::{SealKey, split_batch_by_event_day};
 use crate::scribe::wal::PreparedWalAppend;
 use wyrd_spec::ids::DataTenantId;
@@ -28,7 +29,7 @@ pub(crate) struct AdmittedAppend {
     pub measured_wire_bytes: usize,
     pub admitted_bytes: usize,
     pub reservation: InflightFrameReservation,
-    pub memory: MemoryReservation,
+    pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
     pub table: TableRef,
     pub queued_at: Instant,
@@ -44,7 +45,7 @@ pub(crate) struct PreparedAppend {
     pub prepared_bytes: usize,
     pub slices: Vec<PreparedSlice>,
     pub reservation: InflightFrameReservation,
-    pub memory: Option<MemoryReservation>,
+    pub memory: Option<ScribeMemoryLease>,
     pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
 }
 

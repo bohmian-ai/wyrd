@@ -150,9 +150,10 @@ impl BifrostHarness {
                 )
                 .map_err(|error| HarnessError::Scribe(error.to_string()))?,
             );
-            let memory_governor = cluster
+            let scribe_resources = cluster
                 .server(index)
-                .and_then(|server| server.state().bifrost_memory.clone())
+                .and_then(|server| server.state().bifrost_resources.as_ref())
+                .and_then(vala_bifrost_redux::resources::BifrostRoleResources::scribe)
                 .ok_or_else(|| {
                     HarnessError::Configuration(
                         "Bifrost test server did not provision shared memory".to_owned(),
@@ -202,7 +203,7 @@ impl BifrostHarness {
                     )
                     .with_test_faults(persistence_faults.clone()),
                 ),
-                memory_budget: Some(memory_governor.scribe_budget()),
+                resources: scribe_resources,
                 staging_file_publisher: None,
             });
             scribes.push(Arc::new(scribe));

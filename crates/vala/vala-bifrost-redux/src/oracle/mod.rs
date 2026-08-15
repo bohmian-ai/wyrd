@@ -47,7 +47,6 @@ use wyrd_spec::vala::api::{
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryRejection, MemoryRejectionKind};
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
 mod admission;
@@ -213,8 +212,6 @@ pub struct QueryOptions {
 /// Oracle memory and spill resources shared with Scribe's parent governor.
 #[derive(Debug, Clone)]
 pub struct OracleMemoryResources {
-    /// Parent process-wide memory governor.
-    pub governor: BifrostMemoryGovernor,
     /// Narrow Oracle capability issued by the one production composition.
     pub resources: crate::resources::OracleResources,
     /// Maximum bytes reserved by one query for reconciliation state.
@@ -1609,7 +1606,6 @@ impl Oracle {
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
         let fragment_dispatcher = config.peer_transports.map(|transports| {
             dispatcher::FragmentDispatcher::new(Arc::clone(&config.peer_ticket_minter), transports)
-                .with_memory_governor(config.memory.governor.clone())
         });
         Ok(Self {
             planner,
@@ -2784,7 +2780,10 @@ impl Oracle {
             permission_digest,
             attempt_bytes: self.planner.config.attempt_max_bytes,
             attempt_memory_bytes: self.planner.config.attempt_memory_bytes,
-            query_memory_pool: input.admitted.memory_pool(),
+            query_memory_pool: input
+                .admitted
+                .memory_pool()
+                .expect("admitted Oracle query retains its root-issued memory pool"),
             cancellation: input.admitted.cancellation.clone(),
             deadline: input.deadline.into(),
         };
@@ -3249,9 +3248,6 @@ fn admission_limits(usable_slots: u32, class: QueryClass) -> (u32, u32) {
 /// Maps a pre-stream `DataFusion` failure into the stable public catalog.
 fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostError {
     tracing::error!(error = %error, "Oracle DataFusion operation failed");
-    if let Some(rejection) = MemoryRejection::from_source_chain(error) {
-        return map_memory_rejection(rejection);
-    }
     if datafusion_resources_exhausted(error) {
         return BifrostError::QueryAdmissionRejected;
     }
@@ -3286,17 +3282,6 @@ fn datafusion_resources_exhausted(error: &datafusion::error::DataFusionError) ->
         source = current.source();
     }
     false
-}
-
-/// Projects one structured governor refusal into the stable public query catalog.
-fn map_memory_rejection(rejection: MemoryRejection) -> BifrostError {
-    match rejection.kind() {
-        MemoryRejectionKind::Occupied => BifrostError::QueryAdmissionRejected,
-        MemoryRejectionKind::RequestTooLarge | MemoryRejectionKind::CounterOverflow => {
-            BifrostError::QueryMemoryRequestTooLarge
-        }
-        MemoryRejectionKind::AccountingPoisoned => BifrostError::QueryExecutionFailed,
-    }
 }
 
 /// Projects a failed first lookahead before any schema frame can be emitted.
@@ -3400,34 +3385,8 @@ mod tests {
     use super::*;
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
     use std::sync::atomic::AtomicUsize;
-
-    /// Every typed governor kind wins over generic `DataFusion` capacity mapping.
-    #[test]
-    fn datafusion_capacity_mapping_preserves_all_typed_memory_kinds() {
-        for (kind, expected) in [
-            (
-                MemoryRejectionKind::Occupied,
-                BifrostError::QueryAdmissionRejected,
-            ),
-            (
-                MemoryRejectionKind::RequestTooLarge,
-                BifrostError::QueryMemoryRequestTooLarge,
-            ),
-            (
-                MemoryRejectionKind::CounterOverflow,
-                BifrostError::QueryMemoryRequestTooLarge,
-            ),
-            (
-                MemoryRejectionKind::AccountingPoisoned,
-                BifrostError::QueryExecutionFailed,
-            ),
-        ] {
-            let rejection = MemoryRejection::for_mapping_test(kind);
-            let error = datafusion::error::DataFusionError::External(Box::new(rejection));
-            assert_eq!(map_datafusion_error(&error), expected, "kind={kind:?}");
-        }
-    }
 
     /// Generic `DataFusion` resource exhaustion is classified structurally as capacity.
     #[test]
@@ -4072,7 +4031,7 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
-            query_memory_pool: None,
+            query_memory_pool: Arc::new(GreedyMemoryPool::new(2_048)),
             cancellation: CancellationToken::new(),
             deadline: (Instant::now() + Duration::from_secs(5)).into(),
         };

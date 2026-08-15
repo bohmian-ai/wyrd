@@ -9,9 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::contracts::ScribeError;
-#[cfg(any(test, feature = "test-support"))]
-use crate::scribe::memory::BifrostMemoryGovernor;
-use crate::scribe::memory::ScribeMemoryBudget;
+use crate::resources::ScribeResources;
 
 /// Maximum request size accepted by the Scribe seam.
 pub const MAX_REQUEST_BYTES: usize = 33_554_432;
@@ -110,7 +108,7 @@ struct AdmissionInner {
     config: AdmissionConfig,
     state: Mutex<AdmissionState>,
     wal_available: AtomicBool,
-    memory: ScribeMemoryBudget,
+    memory: ScribeResources,
 }
 
 /// Pod-global admission controller.
@@ -136,14 +134,13 @@ impl AdmissionController {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_config(config: AdmissionConfig) -> Self {
-        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024)
-            .expect("test admission governor must construct");
-        Self::with_config_and_memory(config, governor.scribe_budget())
+        let memory = super::embedded_scribe_resources(&config);
+        Self::with_config_and_memory(config, memory)
     }
 
     /// Construct admission with the already-resolved process-wide governor.
     #[must_use]
-    pub fn with_config_and_memory(config: AdmissionConfig, memory: ScribeMemoryBudget) -> Self {
+    pub fn with_config_and_memory(config: AdmissionConfig, memory: ScribeResources) -> Self {
         Self {
             inner: Arc::new(AdmissionInner {
                 config,
@@ -679,12 +676,10 @@ mod tests {
     /// Admission observes the same governor poison bit as memory reservations.
     #[test]
     fn admission_uses_shared_governor_poison() {
-        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
-        let admission = AdmissionController::with_config_and_memory(
-            AdmissionConfig::default(),
-            governor.scribe_budget(),
-        );
-        governor.poison();
+        let memory = super::super::embedded_scribe_resources(&AdmissionConfig::default());
+        let admission =
+            AdmissionController::with_config_and_memory(AdmissionConfig::default(), memory.clone());
+        memory.poison();
         assert!(matches!(
             admission.try_reserve("events", 1),
             Err(ScribeError::Internal { .. })
@@ -694,15 +689,13 @@ mod tests {
     /// Authoritative memtable synchronization repairs inspection counters without poisoning.
     #[test]
     fn authoritative_memtable_sync_does_not_poison() {
-        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("governor");
-        let admission = AdmissionController::with_config_and_memory(
-            AdmissionConfig::default(),
-            governor.scribe_budget(),
-        );
+        let memory = super::super::embedded_scribe_resources(&AdmissionConfig::default());
+        let admission =
+            AdmissionController::with_config_and_memory(AdmissionConfig::default(), memory.clone());
         admission.sync_memtable_bytes(64, 32);
         assert_eq!(admission.snapshot().active_bytes, 64);
         assert_eq!(admission.snapshot().immutable_bytes, 32);
-        assert!(!governor.is_poisoned());
+        assert!(!memory.is_poisoned());
     }
 
     /// A request-byte overflow rejects before either admission counter mutates.

@@ -1220,7 +1220,7 @@ mod tests {
         ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
     };
     #[cfg(test)]
-    use crate::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
 
     /// Report families whose values are projected by the Forge maintenance report.
     #[cfg(test)]
@@ -1434,8 +1434,7 @@ mod tests {
             telemetry.record_compaction_debt(7, 4096);
             telemetry.record_progress_effect(ForgeProgressEffect::Changed);
             telemetry.record_progress_effect(ForgeProgressEffect::AcknowledgedNoop);
-            let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
-            let pool: Arc<dyn MemoryPool> = Arc::new(BifrostDataFusionMemoryPool::new(governor));
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
             let reservation = MemoryConsumer::new("forge-owner-proof").register(&pool);
             reservation.try_grow(0).expect("zero-sized Forge reserve");
 
@@ -1515,9 +1514,14 @@ mod tests {
 
             assert_orphan_gc_operation_emission(&recorder, &telemetry);
 
-            assert_owner_transition(&recorder, "bifrost_memory_reserved_bytes", || {
-                reservation.try_grow(4096).expect("Forge memory reserve");
-            });
+            reservation.try_grow(4096).expect("Forge memory reserve");
+            assert!(
+                recorder
+                    .snapshot()
+                    .gauges
+                    .keys()
+                    .all(|family| !family.starts_with("bifrost_memory_reserved_bytes"))
+            );
         });
     }
 

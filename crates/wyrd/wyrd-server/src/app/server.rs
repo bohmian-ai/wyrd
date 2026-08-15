@@ -707,7 +707,6 @@ mod pg_tests {
     use uuid::Uuid;
     use vala_bifrost_redux::cluster::ClusterRegistry;
     use vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials;
-    use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
     use vala_bifrost_redux::scribe::{
         ScribeImpl,
         wal::{WalConfig, WalWriter},
@@ -807,10 +806,6 @@ mod pg_tests {
     async fn test_state_with_role_tasks() -> AppState {
         let mut state = test_state_with_auth().await;
         state.postgres = crate::test_support::test_server_postgres().await;
-        let memory =
-            BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("test memory governor is valid");
-        let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
-        state = state.with_bifrost_memory_pool(memory, query_memory);
 
         let node_id = ClusterNodeId::new(Uuid::now_v7());
         let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));

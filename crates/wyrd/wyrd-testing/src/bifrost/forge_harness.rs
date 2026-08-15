@@ -93,7 +93,7 @@ pub struct ForgeFixture {
     /// Validated configuration used to construct the production-shaped handle.
     pub config: ForgeConfig,
     /// Shared parent budget used to construct the DataFusion memory pool.
-    memory: vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor,
+    memory: vala_bifrost_redux::resources::BifrostRoleResources,
     /// The logical and physical identity of the seeded table.
     pub binding: TenantTableBinding,
     /// The tenant that owns the table and file-list rows.
@@ -118,7 +118,7 @@ struct ForgeFixtureResources {
     /// Keep the Forge spill root alive for the complete fixture lifetime.
     spill_root: Arc<tempfile::TempDir>,
     /// Shared production memory governor.
-    memory: vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor,
+    memory: vala_bifrost_redux::resources::BifrostRoleResources,
     /// Validated configuration held by rebuilt fixtures.
     config: ForgeConfig,
 }
@@ -189,9 +189,7 @@ impl StandaloneForgeFixture {
         let roles = runtime_resources
             .compose_roles()
             .map_err(|error| crate::server::WyrdTestServerError::Start(error.to_string()))?;
-        let memory = roles
-            .memory_ledger()
-            .expect("standalone Forge fixture must own its inspection ledger");
+        let memory = roles.clone();
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             ForgeObjectStoreControl::new(Arc::clone(&staging));
@@ -1358,8 +1356,8 @@ impl ForgeFixture {
 
     /// Return a read-only snapshot of the shared Bifrost memory parent.
     #[must_use]
-    pub fn memory_snapshot(&self) -> vala_bifrost_redux::scribe::memory::MemorySnapshot {
-        self.memory.snapshot()
+    pub fn memory_snapshot(&self) -> vala_bifrost_redux::resources::ResourceSnapshot {
+        self.memory.snapshot().expect("Forge fixture root snapshot")
     }
 
     /// Report whether the Forge-owned spill root has no retained children.
@@ -1829,7 +1827,7 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         spill_root: Arc::new(tempfile::tempdir().expect("Forge spill root")),
         memory: server
             .state()
-            .bifrost_memory
+            .bifrost_resources
             .clone()
             .expect("Bifrost memory governor"),
         config: ForgeConfig::default(),

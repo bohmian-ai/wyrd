@@ -98,9 +98,7 @@ mod pg_tests {
         let resources = runtime_resources
             .compose_roles()
             .expect("role composition from the one runtime owner");
-        let memory = resources
-            .memory_ledger()
-            .expect("Scribe test topology must own its memory ledger");
+        let scribe_resources = resources.scribe().expect("Scribe capability");
         let scribe = ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
             operator,
             wal,
@@ -112,7 +110,7 @@ mod pg_tests {
                 admission: AdmissionConfig::default(),
                 coordination_runtime: tokio::runtime::Handle::current(),
                 persistence: None,
-                memory_budget: Some(memory.scribe_budget()),
+                resources: scribe_resources,
                 staging_file_publisher: None,
             },
         )

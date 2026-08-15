@@ -59,11 +59,18 @@ async fn scribe_owner_fixed_topology_and_memory_reconciliation() {
         .expect("one Bifrost test server");
     let state = server.state();
     let parent_snapshot = state
-        .bifrost_memory
+        .bifrost_resources
         .as_ref()
         .expect("shared Bifrost parent governor")
-        .snapshot();
-    assert!(state.bifrost_query_memory.is_some());
+        .snapshot()
+        .expect("root snapshot");
+    assert!(
+        state
+            .bifrost_resources
+            .as_ref()
+            .and_then(vala_bifrost_redux::resources::BifrostRoleResources::oracle)
+            .is_some()
+    );
     assert!(state.forge().is_some());
     let scribe_snapshot = harness
         .scribes()

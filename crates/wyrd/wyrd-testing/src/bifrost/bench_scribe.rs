@@ -420,18 +420,15 @@ async fn run_fault_profile(
     let result = match scenario.fault_profile {
         BifrostFaultProfile::None | BifrostFaultProfile::DelayedFsync => return Ok(None),
         BifrostFaultProfile::MemoryPressure => {
-            let parent = harness
+            let roles = harness
                 .cluster()
                 .server(0)
-                .and_then(|server| server.state().bifrost_memory.clone())
-                .ok_or("missing shared Bifrost memory parent")?;
-            let budget = parent.scribe_budget();
-            let snapshot = parent.snapshot();
-            let hard_limit = snapshot.scribe_limit_bytes.saturating_mul(90) / 100;
-            let pressure = budget.try_reserve_ingress(
-                vala_bifrost_redux::scribe::memory::MemoryCategory::Raw,
-                hard_limit.saturating_sub(snapshot.scribe_total_bytes),
-            )?;
+                .and_then(|server| server.state().bifrost_resources.clone())
+                .ok_or("missing shared Bifrost resource composition")?;
+            let pressure = roles
+                .oracle()
+                .ok_or("missing Oracle resource capability")?
+                .try_acquire_worker(vala_bifrost_redux::resources::OracleWorkerClass::Analytical)?;
             let rejected = !append_one(
                 Arc::clone(scribe),
                 tenant,
@@ -470,21 +467,20 @@ async fn run_fault_profile(
             ("wal_pressure_rejects_before_append", rejected)
         }
         BifrostFaultProfile::ConcurrentRoleMemory => {
-            let parent = harness
+            let roles = harness
                 .cluster()
                 .server(0)
-                .and_then(|server| server.state().bifrost_memory.clone())
-                .ok_or("missing shared Bifrost memory parent")?;
-            let scribe_reservation = parent.scribe_budget().try_reserve(
-                vala_bifrost_redux::scribe::memory::MemoryCategory::Queued,
-                1024,
-            )?;
-            let oracle = parent.try_reserve_parent(2048)?;
-            let forge = parent.try_reserve_parent(4096)?;
-            let snapshot = parent.snapshot();
-            let passed = snapshot.bifrost_total_bytes
-                == snapshot.scribe_total_bytes + oracle.bytes() + forge.bytes();
-            drop((scribe_reservation, oracle, forge));
+                .and_then(|server| server.state().bifrost_resources.clone())
+                .ok_or("missing shared Bifrost resource composition")?;
+            let oracle = roles
+                .oracle()
+                .ok_or("missing Oracle resource capability")?
+                .try_acquire_worker(
+                    vala_bifrost_redux::resources::OracleWorkerClass::Interactive,
+                )?;
+            let snapshot = roles.snapshot()?;
+            let passed = snapshot.oracle_memory_used_bytes == oracle.memory_bytes();
+            drop(oracle);
             ("concurrent_roles_share_parent", passed)
         }
         BifrostFaultProfile::Retry

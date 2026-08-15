@@ -287,6 +287,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         } else {
             "failed"
         };
+        drop(batches);
         let terminal = release_and_finish_terminal(
             &mut admitted,
             &mut query_telemetry,

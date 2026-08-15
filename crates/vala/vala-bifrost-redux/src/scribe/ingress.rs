@@ -91,7 +91,7 @@ impl ScribeImpl {
                 &table,
             )?,
         };
-        memory.attach_shard(self.memory.shard_accounting(), shard);
+        memory.attach_shard(shard)?;
         #[cfg(any(test, feature = "test-support"))]
         self.pause_admitted_ingest_for_test().await;
 
@@ -214,17 +214,25 @@ impl ScribeImpl {
         category: MemoryCategory,
         bytes: usize,
         table: &str,
-    ) -> Result<crate::scribe::memory::MemoryReservation, ScribeError> {
+    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
         if self.memory.cgroup_tripwire_engaged() {
             super::record_scribe_ceiling_rejection(
                 crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
             );
-        } else {
-            self.request_pressure_seal_toward_low_water();
-            match self.memory.try_reserve_ingress_classified(category, bytes) {
-                Ok(reservation) => return Ok(reservation),
-                Err(ceiling) => super::record_scribe_ceiling_rejection(ceiling),
-            }
+            return Err(ScribeError::IngestBusy {
+                table: table.to_owned(),
+            });
+        }
+        self.request_pressure_seal_toward_low_water();
+        match self.memory.try_reserve_ingress(category, bytes) {
+            Ok(reservation) => return Ok(reservation),
+            Err(_) => super::record_scribe_ceiling_rejection(
+                if self.memory.ingress_sublimit_exceeded(bytes) {
+                    crate::scribe::memory::ScribeRejectionCeiling::IngressSublimit
+                } else {
+                    crate::scribe::memory::ScribeRejectionCeiling::BifrostParent
+                },
+            ),
         }
         Err(ScribeError::IngestBusy {
             table: table.to_owned(),
@@ -250,23 +258,31 @@ impl ScribeImpl {
     /// when the single post-seal resize retry still exceeds the ingress ceiling.
     fn resize_ingress_after_pressure_seal(
         &self,
-        memory: &mut crate::scribe::memory::MemoryReservation,
+        memory: &mut crate::resources::ScribeMemoryLease,
         estimated_bytes: usize,
         table: &str,
     ) -> Result<(), ScribeError> {
-        if memory.resize_ingress_classified(estimated_bytes).is_ok() {
+        if memory.resize_ingress(estimated_bytes).is_ok() {
             return Ok(());
         }
         if self.memory.cgroup_tripwire_engaged() {
             super::record_scribe_ceiling_rejection(
                 crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
             );
-        } else {
-            self.request_pressure_seal_toward_low_water();
-            match memory.resize_ingress_classified(estimated_bytes) {
-                Ok(()) => return Ok(()),
-                Err(ceiling) => super::record_scribe_ceiling_rejection(ceiling),
-            }
+            return Err(ScribeError::IngestBusy {
+                table: table.to_owned(),
+            });
+        }
+        self.request_pressure_seal_toward_low_water();
+        match memory.resize_ingress(estimated_bytes) {
+            Ok(()) => return Ok(()),
+            Err(_) => super::record_scribe_ceiling_rejection(
+                if self.memory.ingress_sublimit_exceeded(estimated_bytes) {
+                    crate::scribe::memory::ScribeRejectionCeiling::IngressSublimit
+                } else {
+                    crate::scribe::memory::ScribeRejectionCeiling::BifrostParent
+                },
+            ),
         }
         Err(ScribeError::IngestBusy {
             table: table.to_owned(),

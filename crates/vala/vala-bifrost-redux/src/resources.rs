@@ -12,11 +12,13 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::LazyLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use datafusion::error::DataFusionError;
 #[cfg(any(test, feature = "test-support"))]
@@ -1146,11 +1148,58 @@ pub struct ResourceSnapshot {
     pub oracle_query_active: bool,
 }
 
+/// Closed Scribe lifecycle attribution attached to one root-owned memory lease.
+pub(crate) type ScribeMemoryCategory = crate::scribe::memory::MemoryCategory;
+
+/// One checked Scribe memory request admitted by the process root.
+#[derive(Debug, Clone)]
+pub(crate) struct ScribeMemoryRequest {
+    /// Exact bytes that become owned on successful admission.
+    pub bytes: usize,
+    /// Lifecycle category charged by this owner.
+    pub category: ScribeMemoryCategory,
+    /// Optional bounded shard attribution.
+    pub shard: Option<usize>,
+    /// Optional durable artifact-generation attribution.
+    pub generation: Option<crate::scribe::seal_key::ScribeArtifactIdentity>,
+}
+
+/// Closed Scribe attribution exported only for production-equivalent tests.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceAttributionSnapshot {
+    /// Exact category totals indexed by [`ScribeMemoryCategory`] discriminant.
+    pub category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
+    /// Exact shard totals for shards that currently own bytes.
+    pub shard_bytes: BTreeMap<usize, usize>,
+    /// Number of live leases that intentionally omit generation attribution.
+    pub omitted_generation_count: usize,
+}
+
 /// One complete Oracle query request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OracleResourceRequest {
     /// Fraction of pinned input bytes expected to be local, in `[0, 1]`.
     pub local_ratio: f64,
+}
+
+/// Closed remote Oracle worker sizes admitted atomically by the target root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleWorkerClass {
+    /// One 256 MiB quantum for ordinary fragment execution.
+    Interactive,
+    /// Two 256 MiB quanta for analytical fragment execution.
+    Analytical,
+}
+
+impl OracleWorkerClass {
+    /// Returns the exact atomic root-memory request for this worker class.
+    fn memory_bytes(self) -> usize {
+        match self {
+            Self::Interactive => ORACLE_PARTITION_MEMORY_BYTES,
+            Self::Analytical => 2 * ORACLE_PARTITION_MEMORY_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1162,6 +1211,12 @@ struct ResourceState {
     scratch_used_bytes: u64,
     forge_reader_permits_used: usize,
     oracle_query_active: bool,
+    scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
+    scribe_shard_bytes: BTreeMap<usize, usize>,
+    scribe_generation_bytes: usize,
+    scribe_omitted_generation_bytes: usize,
+    scribe_omitted_generation_count: usize,
+    memory_epoch: u64,
     poisoned: bool,
 }
 
@@ -1185,8 +1240,6 @@ pub(crate) struct BifrostResourceGovernor {
 pub struct BifrostRuntimeResources {
     /// Root authority for process memory and disposable scratch ownership.
     governor: BifrostResourceGovernor,
-    /// Scribe compatibility ledger backed by the same root authority.
-    scribe_memory: Option<crate::scribe::memory::BifrostMemoryGovernor>,
     /// Process-wide encoded transport-body admission inside unmanaged memory.
     transport: crate::gate::limits::BifrostTransportAdmission,
     /// Device-grouped physical-volume authority, present on live boot.
@@ -1203,8 +1256,8 @@ impl BifrostRuntimeResources {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostResourceError`] when detection, policy validation, or
-    /// construction of the root-backed Scribe compatibility ledger fails.
+    /// Returns [`BifrostResourceError`] when detection or checked root-policy
+    /// validation fails.
     pub fn detect(policy: BifrostResourcePolicy) -> Result<Self, BifrostResourceError> {
         let snapshot = detect_snapshot(&policy.scratch_root, policy.memory_limit_bytes)?;
         Self::from_snapshot(snapshot, policy)
@@ -1219,7 +1272,7 @@ impl BifrostRuntimeResources {
     /// # Errors
     ///
     /// Returns [`BifrostResourceError`] when the observation cannot satisfy the
-    /// policy or the root-backed Scribe compatibility ledger cannot be built.
+    /// checked root policy.
     pub fn from_snapshot(
         snapshot: SystemResourceSnapshot,
         policy: BifrostResourcePolicy,
@@ -1229,15 +1282,6 @@ impl BifrostRuntimeResources {
             .scratch_limit_bytes
             .unwrap_or(snapshot.scratch_capacity_bytes);
         let root = BifrostResourceGovernor::from_snapshot(snapshot, policy)?;
-        let scribe_memory = (root.is_enabled(BifrostRole::Scribe)
-            || root.is_enabled(BifrostRole::Oracle))
-        .then(|| {
-            crate::scribe::memory::BifrostMemoryGovernor::from_resource_governor(root.clone())
-                .map_err(|error| BifrostResourceError::InvalidPlan {
-                    detail: format!("Scribe compatibility ledger construction failed: {error}"),
-                })
-        })
-        .transpose()?;
         let volumes = roots
             .map(|roots| {
                 BifrostVolumeGovernor::register(roots, configured_limit, root.inner.health.clone())
@@ -1245,7 +1289,6 @@ impl BifrostRuntimeResources {
             .transpose()?;
         Ok(Self {
             governor: root,
-            scribe_memory,
             transport: crate::gate::limits::BifrostTransportAdmission::default(),
             volumes,
         })
@@ -1312,11 +1355,6 @@ impl BifrostRuntimeResources {
         let plan = self.governor.plan();
         let scribe = if plan.scribe_floor_bytes > 0 {
             Some(ScribeResources {
-                memory: self.scribe_memory.clone().ok_or_else(|| {
-                    BifrostResourceError::InvalidPlan {
-                        detail: "enabled Scribe role has no compatibility ledger".to_owned(),
-                    }
-                })?,
                 governor: self.governor.clone(),
                 volumes: self.volumes.clone(),
             })
@@ -1324,7 +1362,6 @@ impl BifrostRuntimeResources {
             None
         };
         Ok(BifrostRoleResources {
-            memory: self.scribe_memory.clone(),
             scribe,
             oracle: (plan.oracle_floor_bytes > 0).then(|| OracleResources {
                 governor: self.governor.clone(),
@@ -1363,16 +1400,6 @@ impl BifrostRuntimeResources {
     pub fn shares_root_with(&self, other: &BifrostRoleResources) -> bool {
         Arc::ptr_eq(&self.governor.inner, &other.governor.inner)
     }
-
-    /// Captures exact live ownership across every role sharing this root.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Poisoned`] when a trustworthy live
-    /// snapshot is unavailable.
-    pub fn snapshot(&self) -> Result<ResourceSnapshot, BifrostResourceError> {
-        self.governor.snapshot()
-    }
 }
 
 /// Enabled narrow role capabilities issued from one composition operation.
@@ -1382,10 +1409,6 @@ impl BifrostRuntimeResources {
 /// production-equivalent caller cannot construct or clone a sibling root.
 #[derive(Debug, Clone)]
 pub struct BifrostRoleResources {
-    /// Root-backed shared memory ledger every role's `DataFusion` ceiling derives
-    /// from, retained here so an Oracle-only or Forge-only node still projects
-    /// the same parent bound without enabling the Scribe role.
-    memory: Option<crate::scribe::memory::BifrostMemoryGovernor>,
     scribe: Option<ScribeResources>,
     oracle: Option<OracleResources>,
     forge: Option<ForgeResources>,
@@ -1432,16 +1455,6 @@ impl BifrostRoleResources {
         self.forge.clone()
     }
 
-    /// Returns the shared memory ledger backing every role's `DataFusion` ceiling.
-    ///
-    /// This is the same root-backed ledger the Scribe capability exposes; it is
-    /// available from the composition itself because the query memory pool
-    /// bound is a process-level property, not a Scribe-role property.
-    #[must_use]
-    pub fn memory_ledger(&self) -> Option<crate::scribe::memory::BifrostMemoryGovernor> {
-        self.memory.clone()
-    }
-
     /// Returns the immutable checked plan shared by every issued capability.
     #[must_use]
     pub fn plan(&self) -> ResourcePlan {
@@ -1472,13 +1485,120 @@ impl BifrostRoleResources {
 /// Protected Scribe memory capability backed by the shared process root.
 #[derive(Debug, Clone)]
 pub struct ScribeResources {
-    memory: crate::scribe::memory::BifrostMemoryGovernor,
     governor: BifrostResourceGovernor,
     /// Physical WAL/output-scratch authority registered during live boot.
     volumes: Option<BifrostVolumeGovernor>,
 }
 
 impl ScribeResources {
+    /// Captures the Scribe-compatible projection of authoritative root state.
+    pub(crate) fn memory_snapshot(&self) -> crate::scribe::memory::MemorySnapshot {
+        let state = self
+            .governor
+            .inner
+            .state
+            .lock()
+            .expect("Scribe root state lock");
+        let plan = self.governor.plan();
+        crate::scribe::memory::MemorySnapshot {
+            pod_limit_bytes: plan.memory_limit_bytes,
+            bifrost_limit_bytes: plan.managed_memory_bytes,
+            bifrost_total_bytes: state
+                .scribe_memory_used_bytes
+                .saturating_add(state.oracle_memory_used_bytes)
+                .saturating_add(state.forge_memory_used_bytes),
+            scribe_total_bytes: state.scribe_memory_used_bytes,
+            scribe_limit_bytes: self.limit_bytes(),
+            oracle_total_bytes: state.oracle_memory_used_bytes,
+            oracle_limit_bytes: plan
+                .oracle_floor_bytes
+                .saturating_add(plan.elastic_memory_bytes),
+            categories: state.scribe_category_bytes,
+            cgroup_current_bytes: self.governor.cgroup_pressure().map(|(current, _)| current),
+            cgroup_limit_bytes: self.governor.inner.cgroup_limit_bytes,
+            ingress_occupancy_bytes: state.scribe_memory_used_bytes,
+            ingress_limit_bytes: self.ingress_limit_bytes(),
+            ingress_high_water_bytes: 0,
+            ingress_low_water_bytes: 0,
+        }
+    }
+
+    /// Returns fixed closed shard totals from root attribution.
+    #[must_use]
+    pub(crate) fn shard_snapshot(&self) -> [usize; 16] {
+        let state = self
+            .governor
+            .inner
+            .state
+            .lock()
+            .expect("Scribe root state lock");
+        std::array::from_fn(|shard| {
+            state
+                .scribe_shard_bytes
+                .get(&shard)
+                .copied()
+                .unwrap_or_default()
+        })
+    }
+
+    /// Emits only the root-owned closed resource gauge family.
+    pub(crate) fn emit_root_resource_gauges(&self) {
+        if let Err(error) = self.governor.emit_metrics() {
+            tracing::error!(%error, "Scribe root resource gauges unavailable");
+        }
+    }
+
+    /// Poisons the sole root after an ownership invariant failure.
+    pub(crate) fn poison(&self) {
+        self.governor.poison("Scribe ownership invariant failed");
+    }
+
+    /// Reports whether the sole root has entered fail-stop health.
+    #[must_use]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.governor.inner.health.reason().is_some()
+    }
+
+    /// Captures reconciled attribution for focused owner rollback tests.
+    #[cfg(test)]
+    pub(crate) fn accounting_snapshot_for_test(&self) -> ResourceAttributionSnapshot {
+        let state = self
+            .governor
+            .inner
+            .state
+            .lock()
+            .expect("test root state lock");
+        ResourceAttributionSnapshot {
+            category_bytes: state.scribe_category_bytes,
+            shard_bytes: state.scribe_shard_bytes.clone(),
+            omitted_generation_count: state.scribe_omitted_generation_count,
+        }
+    }
+
+    /// Injects the fail-stop state used by post-preflight owner tests.
+    #[cfg(test)]
+    pub(crate) fn arm_post_preflight_release_fault(&self) {
+        self.governor
+            .inner
+            .post_preflight_release_fault
+            .store(true, AtomicOrdering::Release);
+    }
+
+    /// Exercises ordinary ingress refusal after test-owned poison.
+    #[cfg(test)]
+    pub(crate) fn try_reserve(
+        &self,
+        category: ScribeMemoryCategory,
+        bytes: usize,
+    ) -> Result<ScribeMemoryLease, crate::contracts::ScribeError> {
+        self.try_reserve_ingress(category, bytes)
+    }
+
+    /// Reports live cgroup pressure through the root's throttled sampler.
+    #[must_use]
+    pub(crate) fn cgroup_tripwire_engaged(&self) -> bool {
+        matches!(self.governor.cgroup_pressure(), Some((current, limit)) if current.saturating_mul(100) >= limit.saturating_mul(90))
+    }
     /// Returns fresh non-cloneable WAL and output-scratch capabilities.
     #[must_use]
     pub fn volume_capabilities(&self) -> Option<(WalVolume, ScratchVolume)> {
@@ -1487,10 +1607,136 @@ impl ScribeResources {
             (capabilities.wal, capabilities.scribe_output)
         })
     }
-    /// Returns the root-backed Scribe ingest/persistence memory ledger.
+    /// Acquires one exact root-owned Scribe lease with lifecycle attribution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed root refusal without changing capacity or attribution.
+    pub(crate) fn try_acquire_memory(
+        &self,
+        request: ScribeMemoryRequest,
+    ) -> Result<ScribeMemoryLease, BifrostResourceError> {
+        self.governor.try_acquire_scribe_memory(request)
+    }
+
+    /// Returns the Scribe floor plus the root's shared elastic ceiling.
     #[must_use]
-    pub fn memory_governor(&self) -> crate::scribe::memory::BifrostMemoryGovernor {
-        self.memory.clone()
+    pub(crate) fn limit_bytes(&self) -> usize {
+        let plan = self.governor.plan();
+        plan.scribe_floor_bytes
+            .saturating_add(plan.elastic_memory_bytes)
+    }
+
+    /// Returns the ingress ceiling after retaining one producer workspace.
+    #[must_use]
+    pub(crate) fn ingress_limit_bytes(&self) -> usize {
+        let limit = self.limit_bytes();
+        limit
+            .saturating_sub(crate::scribe::memory::PARQUET_PRODUCER_OWNER_BYTES.min(limit))
+            .max(limit / 4)
+    }
+
+    /// Returns the bounded active-bucket target derived from root Scribe capacity.
+    #[must_use]
+    pub(crate) fn active_bucket_target_bytes(&self) -> usize {
+        (self.limit_bytes() / 4).clamp(64 * MIB, 512 * MIB)
+    }
+
+    /// Acquires ingress ownership directly from the root capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable Scribe busy/internal projection when root admission
+    /// refuses or cannot account the request.
+    pub(crate) fn try_reserve_ingress(
+        &self,
+        category: ScribeMemoryCategory,
+        bytes: usize,
+    ) -> Result<ScribeMemoryLease, crate::contracts::ScribeError> {
+        let current = self
+            .governor
+            .snapshot()
+            .map_err(scribe_resource_error)?
+            .scribe_memory_used_bytes;
+        if bytes > self.ingress_limit_bytes()
+            || current
+                .checked_add(bytes)
+                .is_none_or(|next| next > self.ingress_limit_bytes())
+        {
+            return Err(crate::contracts::ScribeError::IngestBusy {
+                table: "memory".to_owned(),
+            });
+        }
+        self.try_acquire_memory(ScribeMemoryRequest {
+            bytes,
+            category,
+            shard: None,
+            generation: None,
+        })
+        .map_err(scribe_resource_error)
+    }
+
+    /// Reports whether one rejected request exceeded Scribe's ingress sublimit.
+    ///
+    /// The ingress owner uses this after a failed root acquisition to preserve
+    /// the closed rejection metric vocabulary without exposing root-ledger
+    /// internals or creating a second capacity owner.
+    #[must_use]
+    pub(crate) fn ingress_sublimit_exceeded(&self, bytes: usize) -> bool {
+        self.governor.snapshot().map_or(true, |snapshot| {
+            bytes > self.ingress_limit_bytes()
+                || snapshot
+                    .scribe_memory_used_bytes
+                    .checked_add(bytes)
+                    .is_none_or(|next| next > self.ingress_limit_bytes())
+        })
+    }
+
+    /// Acquires maintenance ownership directly from the root capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable Scribe busy/internal projection when root admission
+    /// refuses or cannot account the request.
+    pub(crate) fn try_reserve_maintenance(
+        &self,
+        category: ScribeMemoryCategory,
+        bytes: usize,
+    ) -> Result<ScribeMemoryLease, crate::contracts::ScribeError> {
+        self.try_acquire_memory(ScribeMemoryRequest {
+            bytes,
+            category,
+            shard: None,
+            generation: None,
+        })
+        .map_err(scribe_resource_error)
+    }
+
+    /// Captures the current root capacity epoch before an admission attempt.
+    #[must_use]
+    pub fn memory_epoch(&self) -> u64 {
+        self.governor.memory_epoch()
+    }
+
+    /// Waits until release, resize, or poison advances the root capacity epoch.
+    ///
+    /// Waiting never grants bytes. The caller must retry root admission after
+    /// every successful wake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] when root accounting becomes
+    /// untrustworthy before or during the wait.
+    pub async fn wait_for_memory_change(
+        &self,
+        observed_epoch: u64,
+    ) -> Result<u64, BifrostResourceError> {
+        self.governor.wait_for_memory_change(observed_epoch).await
+    }
+
+    /// Captures the authoritative root Scribe projection.
+    pub fn snapshot(&self) -> Result<ResourceSnapshot, BifrostResourceError> {
+        self.governor.snapshot()
     }
 
     /// Reports whether `other` was issued from this exact process root.
@@ -1512,16 +1758,34 @@ pub struct OracleResources {
 }
 
 impl OracleResources {
+    /// Splits one named child from an already-admitted Oracle query pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataFusion` resource exhaustion when the query-local pool
+    /// cannot cover `bytes`; this capability never admits root capacity again.
+    pub(crate) fn try_split_query_memory(
+        &self,
+        pool: &Arc<dyn MemoryPool>,
+        consumer: &'static str,
+        bytes: usize,
+    ) -> Result<OracleQueryMemoryReservation, DataFusionError> {
+        OracleQueryMemoryReservation::try_new(pool, self.governor.clone(), consumer, bytes)
+    }
+
     /// Acquires one remote-worker quantum from the Oracle floor and elastic pool.
     ///
     /// # Errors
     ///
     /// Returns a typed refusal when an exclusive query is active or the shared
     /// Oracle role cannot cover one advertised worker quantum.
-    pub fn try_acquire_worker(&self) -> Result<OracleWorkerResources, BifrostResourceError> {
+    pub fn try_acquire_worker(
+        &self,
+        class: OracleWorkerClass,
+    ) -> Result<OracleWorkerResources, BifrostResourceError> {
         let lease = self
             .governor
-            .try_acquire_oracle_memory(ORACLE_PARTITION_MEMORY_BYTES)?;
+            .try_acquire_oracle_memory(class.memory_bytes())?;
         Ok(OracleWorkerResources { lease })
     }
 
@@ -1552,16 +1816,6 @@ impl OracleResources {
                 Some(capabilities.oracle.try_acquire(resources.scratch_bytes)?);
         }
         Ok(resources)
-    }
-
-    /// Returns the crate-private root ledger backing this capability.
-    ///
-    /// Nested query-local consumers must poison the same root they lease from.
-    /// This accessor is crate-private: it never widens the external surface and
-    /// cannot be used to construct a sibling root.
-    #[must_use]
-    pub(crate) fn governor(&self) -> BifrostResourceGovernor {
-        self.governor.clone()
     }
 
     /// Captures exact live ownership for inspection and cleanup assertions.
@@ -1666,8 +1920,36 @@ struct ResourceGovernorInner {
     /// re-deriving activation from floor bytes.
     roles: BTreeSet<BifrostRole>,
     state: Mutex<ResourceState>,
+    /// Lost-wakeup-safe notification paired with `ResourceState::memory_epoch`.
+    memory_changed: Notify,
+    /// Cgroup hard limit used by the live external-pressure tripwire.
+    cgroup_limit_bytes: Option<usize>,
+    /// Live cgroup usage cached for at most one second under the root owner.
+    cgroup_current: Mutex<Option<(Instant, Option<usize>)>>,
     /// Lock-free first-poison signal observed by application supervision.
     health: BifrostResourceHealth,
+    /// One-shot post-preflight release failure used by owner fault tests.
+    #[cfg(test)]
+    post_preflight_release_fault: AtomicBool,
+}
+
+/// Derives every enabled role floor and their checked aggregate.
+///
+/// # Errors
+///
+/// Returns [`BifrostResourceError::InvalidPlan`] if floor arithmetic exceeds
+/// the platform's addressable memory range.
+fn role_memory_floors(
+    roles: &BTreeSet<BifrostRole>,
+) -> Result<(usize, usize, usize, usize), BifrostResourceError> {
+    let scribe = usize::from(roles.contains(&BifrostRole::Scribe)) * ROLE_MEMORY_FLOOR_BYTES;
+    let oracle = usize::from(roles.contains(&BifrostRole::Oracle)) * ROLE_MEMORY_FLOOR_BYTES;
+    let forge = usize::from(roles.contains(&BifrostRole::Forge)) * FORGE_MEMORY_FLOOR_BYTES;
+    let protected = scribe
+        .checked_add(oracle)
+        .and_then(|bytes| bytes.checked_add(forge))
+        .ok_or_else(accounting_overflow)?;
+    Ok((scribe, oracle, forge, protected))
 }
 
 impl BifrostResourceGovernor {
@@ -1705,19 +1987,8 @@ impl BifrostResourceGovernor {
                     "memory {memory_limit_bytes} cannot cover reserve {unmanaged_reserve_bytes}"
                 ),
             })?;
-        let scribe_floor_bytes = usize::from(policy.roles.contains(&BifrostRole::Scribe))
-            .checked_mul(ROLE_MEMORY_FLOOR_BYTES)
-            .ok_or_else(accounting_overflow)?;
-        let oracle_floor_bytes = usize::from(policy.roles.contains(&BifrostRole::Oracle))
-            .checked_mul(ROLE_MEMORY_FLOOR_BYTES)
-            .ok_or_else(accounting_overflow)?;
-        let forge_floor_bytes = usize::from(policy.roles.contains(&BifrostRole::Forge))
-            .checked_mul(FORGE_MEMORY_FLOOR_BYTES)
-            .ok_or_else(accounting_overflow)?;
-        let protected = scribe_floor_bytes
-            .checked_add(oracle_floor_bytes)
-            .and_then(|bytes| bytes.checked_add(forge_floor_bytes))
-            .ok_or_else(accounting_overflow)?;
+        let (scribe_floor_bytes, oracle_floor_bytes, forge_floor_bytes, protected) =
+            role_memory_floors(&policy.roles)?;
         let elastic_memory_bytes = managed_memory_bytes.checked_sub(protected).ok_or_else(|| {
             BifrostResourceError::InvalidPlan {
                 detail: format!("managed memory {managed_memory_bytes} cannot cover enabled role floors {protected}"),
@@ -1782,7 +2053,12 @@ impl BifrostResourceGovernor {
                 },
                 roles: policy.roles,
                 state: Mutex::new(ResourceState::default()),
+                memory_changed: Notify::new(),
+                cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
+                cgroup_current: Mutex::new(None),
                 health: BifrostResourceHealth::default(),
+                #[cfg(test)]
+                post_preflight_release_fault: AtomicBool::new(false),
             }),
         };
         root.record_plan_metrics();
@@ -1843,6 +2119,23 @@ impl BifrostResourceGovernor {
         self.inner.sources
     }
 
+    /// Returns throttled live cgroup usage and its root-owned hard limit.
+    fn cgroup_pressure(&self) -> Option<(usize, usize)> {
+        let current = if let Ok(cache) = self.inner.cgroup_current.lock()
+            && let Some((sampled_at, value)) = *cache
+            && sampled_at.elapsed() < Duration::from_secs(1)
+        {
+            value
+        } else {
+            let value = crate::scribe::memory::read_cgroup_current();
+            if let Ok(mut cache) = self.inner.cgroup_current.lock() {
+                *cache = Some((Instant::now(), value));
+            }
+            value
+        }?;
+        Some((current, self.inner.cgroup_limit_bytes?))
+    }
+
     /// Captures exact live elastic and scratch ownership.
     ///
     /// # Errors
@@ -1851,6 +2144,7 @@ impl BifrostResourceGovernor {
     /// accounting failure makes a trustworthy snapshot unavailable.
     pub(crate) fn snapshot(&self) -> Result<ResourceSnapshot, BifrostResourceError> {
         let state = self.lock_state()?;
+        self.validate_scribe_reconciliation(&state)?;
         Ok(ResourceSnapshot {
             plan: self.plan(),
             scribe_memory_used_bytes: state.scribe_memory_used_bytes,
@@ -1861,6 +2155,90 @@ impl BifrostResourceGovernor {
             forge_reader_permits_used: state.forge_reader_permits_used,
             oracle_query_active: state.oracle_query_active,
         })
+    }
+
+    /// Captures closed Scribe attribution after validating it against role use.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error when category, shard, or generation attribution
+    /// does not reconcile exactly to live Scribe ownership.
+    #[cfg(test)]
+    pub(crate) fn attribution_snapshot(
+        &self,
+    ) -> Result<ResourceAttributionSnapshot, BifrostResourceError> {
+        let state = self.lock_state()?;
+        self.validate_scribe_reconciliation(&state)?;
+        Ok(ResourceAttributionSnapshot {
+            category_bytes: state.scribe_category_bytes,
+            shard_bytes: state.scribe_shard_bytes.clone(),
+            omitted_generation_count: state.scribe_omitted_generation_count,
+        })
+    }
+
+    /// Validates every Scribe attribution projection against root role use.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error when checked totals overflow or any attribution
+    /// projection diverges from the authoritative role counters.
+    fn validate_scribe_reconciliation(
+        &self,
+        state: &ResourceState,
+    ) -> Result<(), BifrostResourceError> {
+        let category_total = state
+            .scribe_category_bytes
+            .iter()
+            .try_fold(0usize, |total, bytes| {
+                total.checked_add(*bytes).ok_or_else(accounting_overflow)
+            })?;
+        let shard_total = state
+            .scribe_shard_bytes
+            .values()
+            .try_fold(0usize, |total, bytes| {
+                total.checked_add(*bytes).ok_or_else(accounting_overflow)
+            })?;
+        let generation_total = state
+            .scribe_generation_bytes
+            .checked_add(state.scribe_omitted_generation_bytes)
+            .ok_or_else(accounting_overflow)?;
+        let role_total = state
+            .scribe_memory_used_bytes
+            .checked_add(state.oracle_memory_used_bytes)
+            .and_then(|bytes| bytes.checked_add(state.forge_memory_used_bytes))
+            .ok_or_else(accounting_overflow)?;
+        let plan = self.plan();
+        let expected_elastic = state
+            .scribe_memory_used_bytes
+            .saturating_sub(plan.scribe_floor_bytes)
+            .checked_add(
+                state
+                    .oracle_memory_used_bytes
+                    .saturating_sub(plan.oracle_floor_bytes),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    state
+                        .forge_memory_used_bytes
+                        .saturating_sub(plan.forge_floor_bytes),
+                )
+            })
+            .ok_or_else(accounting_overflow)?;
+        if category_total != state.scribe_memory_used_bytes
+            || shard_total > state.scribe_memory_used_bytes
+            || generation_total != state.scribe_memory_used_bytes
+            || role_total > plan.managed_memory_bytes
+            || expected_elastic != state.elastic_memory_used_bytes
+        {
+            self.inner
+                .health
+                .poison(BifrostResourcePoisonReason::Accounting);
+            self.inner.memory_changed.notify_waiters();
+            return Err(BifrostResourceError::Poisoned {
+                detail: "Scribe root attribution does not reconcile to live ownership".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Emits the single allocator's bounded plan and live-ownership gauges.
@@ -1904,19 +2282,16 @@ impl BifrostResourceGovernor {
         Ok(())
     }
 
-    /// Reserves Scribe memory while protecting every other active-role floor.
-    ///
-    /// Bytes within the Scribe floor do not consume elastic capacity. Growth
-    /// above the floor atomically consumes only the incremental elastic bytes.
+    /// Atomically admits one Scribe owner and its complete attribution tuple.
     ///
     /// # Errors
     ///
-    /// Returns a typed refusal without mutation when Scribe is inactive,
-    /// arithmetic fails, or shared elastic memory cannot cover the request.
-    pub(crate) fn try_acquire_scribe(
+    /// Returns a typed root refusal with no mutation when capacity or checked
+    /// attribution arithmetic cannot accept the request.
+    fn try_acquire_scribe_memory(
         &self,
-        bytes: usize,
-    ) -> Result<ScribeResourceGrowth, BifrostResourceError> {
+        request: ScribeMemoryRequest,
+    ) -> Result<ScribeMemoryLease, BifrostResourceError> {
         let mut state = self.lock_state()?;
         let plan = self.plan();
         if plan.scribe_floor_bytes == 0 {
@@ -1926,7 +2301,7 @@ impl BifrostResourceGovernor {
         }
         let next = state
             .scribe_memory_used_bytes
-            .checked_add(bytes)
+            .checked_add(request.bytes)
             .ok_or_else(accounting_overflow)?;
         let prior_borrow = state
             .scribe_memory_used_bytes
@@ -1937,6 +2312,34 @@ impl BifrostResourceGovernor {
             .elastic_memory_used_bytes
             .checked_add(added_elastic)
             .ok_or_else(accounting_overflow)?;
+        let category_index = request.category as usize;
+        let next_category = state.scribe_category_bytes[category_index]
+            .checked_add(request.bytes)
+            .ok_or_else(accounting_overflow)?;
+        let next_shard = request
+            .shard
+            .map(|shard| {
+                state
+                    .scribe_shard_bytes
+                    .get(&shard)
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(request.bytes)
+                    .ok_or_else(accounting_overflow)
+            })
+            .transpose()?;
+        let next_generation = state
+            .scribe_generation_bytes
+            .checked_add(usize::from(request.generation.is_some()) * request.bytes)
+            .ok_or_else(accounting_overflow)?;
+        let next_omitted = state
+            .scribe_omitted_generation_bytes
+            .checked_add(usize::from(request.generation.is_none()) * request.bytes)
+            .ok_or_else(accounting_overflow)?;
+        let next_omitted_count = state
+            .scribe_omitted_generation_count
+            .checked_add(usize::from(request.generation.is_none()))
+            .ok_or_else(accounting_overflow)?;
         if next_elastic > plan.elastic_memory_bytes {
             record_memory_transition("scribe", "refused", state.scribe_memory_used_bytes);
             return Err(BifrostResourceError::Occupied {
@@ -1946,55 +2349,49 @@ impl BifrostResourceGovernor {
         }
         state.scribe_memory_used_bytes = next;
         state.elastic_memory_used_bytes = next_elastic;
+        state.scribe_category_bytes[category_index] = next_category;
+        if let (Some(shard), Some(bytes)) = (request.shard, next_shard) {
+            state.scribe_shard_bytes.insert(shard, bytes);
+        }
+        state.scribe_generation_bytes = next_generation;
+        state.scribe_omitted_generation_bytes = next_omitted;
+        state.scribe_omitted_generation_count = next_omitted_count;
         record_memory_transition("scribe", "acquired", next);
-        Ok(ScribeResourceGrowth {
-            bytes,
-            governor: self.clone(),
-            committed: false,
+        Ok(ScribeMemoryLease {
+            root: self.clone(),
+            bytes: request.bytes,
+            category: request.category,
+            shard: request.shard,
+            generation: request.generation,
+            released: false,
         })
     }
 
-    /// Validates a Scribe release without mutating shared counters.
-    ///
-    /// # Errors
-    ///
-    /// Returns a poison error when live Scribe ownership cannot cover `bytes`.
-    pub(crate) fn preflight_release_scribe(
-        &self,
-        bytes: usize,
-    ) -> Result<(), BifrostResourceError> {
-        let mut state = self.lock_state()?;
-        if state.scribe_memory_used_bytes < bytes {
-            return Err(self.poison_locked(&mut state, "Scribe resource release underflow"));
-        }
-        Ok(())
+    /// Returns the current capacity-change epoch from the authoritative lock.
+    fn memory_epoch(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .map_or(u64::MAX, |state| state.memory_epoch)
     }
 
-    /// Releases exact Scribe ownership after all coupled ledgers preflight.
+    /// Waits for a strictly newer epoch without granting capacity.
     ///
     /// # Errors
     ///
-    /// Returns a poison error on underflow; callers fail closed because a
-    /// coupled release may already have made partial progress.
-    pub(crate) fn release_scribe(&self, bytes: usize) -> Result<(), BifrostResourceError> {
-        let mut state = self.lock_state()?;
-        if state.scribe_memory_used_bytes < bytes {
-            return Err(self.poison_locked(&mut state, "Scribe resource release underflow"));
+    /// Returns a poison error when the root becomes untrustworthy.
+    async fn wait_for_memory_change(
+        &self,
+        observed_epoch: u64,
+    ) -> Result<u64, BifrostResourceError> {
+        loop {
+            let notified = self.inner.memory_changed.notified();
+            let current_epoch = { self.lock_state()?.memory_epoch };
+            if current_epoch > observed_epoch {
+                return Ok(current_epoch);
+            }
+            notified.await;
         }
-        let plan = self.plan();
-        let prior_borrow = state
-            .scribe_memory_used_bytes
-            .saturating_sub(plan.scribe_floor_bytes);
-        let next = state.scribe_memory_used_bytes - bytes;
-        let next_borrow = next.saturating_sub(plan.scribe_floor_bytes);
-        let released_elastic = prior_borrow - next_borrow;
-        if state.elastic_memory_used_bytes < released_elastic {
-            return Err(self.poison_locked(&mut state, "Scribe elastic release underflow"));
-        }
-        state.scribe_memory_used_bytes = next;
-        state.elastic_memory_used_bytes -= released_elastic;
-        record_memory_transition("scribe", "released", next);
-        Ok(())
     }
 
     /// Atomically acquires the complete currently-free Oracle query envelope.
@@ -2060,6 +2457,7 @@ impl BifrostResourceGovernor {
             scratch_bytes,
             target_partitions,
             memory_pool,
+            nested_scratch_used_bytes: Arc::new(Mutex::new(0)),
             elastic_bytes: free_elastic,
             governor: self.clone(),
             released: false,
@@ -2207,9 +2605,11 @@ impl BifrostResourceGovernor {
 
     fn poison_locked(&self, state: &mut ResourceState, detail: &str) -> BifrostResourceError {
         state.poisoned = true;
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
         self.inner
             .health
             .poison(BifrostResourcePoisonReason::Accounting);
+        self.inner.memory_changed.notify_waiters();
         BifrostResourceError::Poisoned {
             detail: detail.to_owned(),
         }
@@ -2225,6 +2625,8 @@ impl BifrostResourceGovernor {
         self.inner.health.poison(reason);
         if let Ok(mut state) = self.inner.state.lock() {
             state.poisoned = true;
+            state.memory_epoch = state.memory_epoch.wrapping_add(1);
+            self.inner.memory_changed.notify_waiters();
             tracing::error!(detail, "Bifrost resource accounting poisoned");
         } else {
             tracing::error!(detail, "Bifrost resource lock poisoned");
@@ -2232,27 +2634,548 @@ impl BifrostResourceGovernor {
     }
 }
 
-/// Rollback owner for one provisional Scribe allocation.
-pub(crate) struct ScribeResourceGrowth {
+/// Move-only root-backed owner of exact Scribe memory and attribution.
+#[derive(Debug)]
+pub(crate) struct ScribeMemoryLease {
+    /// Sole process authority that admitted this owner.
+    root: BifrostResourceGovernor,
+    /// Exact bytes retained by this owner.
     bytes: usize,
-    governor: BifrostResourceGovernor,
-    committed: bool,
+    /// Current lifecycle category attributed at the root.
+    category: ScribeMemoryCategory,
+    /// Optional shard attribution retained across ownership transformations.
+    shard: Option<usize>,
+    /// Optional durable-generation attribution retained across transformations.
+    generation: Option<crate::scribe::seal_key::ScribeArtifactIdentity>,
+    /// Whether ownership has already returned or transferred.
+    released: bool,
 }
 
-impl ScribeResourceGrowth {
-    /// Commits root ownership after every coupled Scribe counter succeeds.
-    pub(crate) fn commit(mut self) {
-        self.committed = true;
+impl ScribeMemoryLease {
+    /// Returns the exact bytes retained by this owner.
+    #[must_use]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Splits exact bytes into a second owner without new capacity admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-plan error when `bytes` exceeds this owner.
+    pub(crate) fn split(&mut self, bytes: usize) -> Result<Self, BifrostResourceError> {
+        if bytes > self.bytes {
+            return Err(BifrostResourceError::InvalidPlan {
+                detail: "Scribe lease split exceeds owned bytes".to_owned(),
+            });
+        }
+        if self.generation.is_none() {
+            let mut state = self.root.lock_state()?;
+            state.scribe_omitted_generation_count = state
+                .scribe_omitted_generation_count
+                .checked_add(1)
+                .ok_or_else(accounting_overflow)?;
+        }
+        self.bytes -= bytes;
+        Ok(Self {
+            root: self.root.clone(),
+            bytes,
+            category: self.category,
+            shard: self.shard,
+            generation: self.generation.clone(),
+            released: false,
+        })
+    }
+
+    /// Merges an identically attributed sibling without changing root totals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-plan error for a foreign root, differing attribution,
+    /// or checked byte overflow. The supplied owner remains live on failure.
+    pub(crate) fn merge(&mut self, mut other: Self) -> Result<(), BifrostResourceError> {
+        if !Arc::ptr_eq(&self.root.inner, &other.root.inner)
+            || self.category != other.category
+            || self.shard != other.shard
+            || self.generation != other.generation
+        {
+            return Err(BifrostResourceError::InvalidPlan {
+                detail: "only sibling Scribe leases with identical attribution may merge"
+                    .to_owned(),
+            });
+        }
+        let merged_bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .ok_or_else(accounting_overflow)?;
+        if self.generation.is_none() {
+            let mut state = self.root.lock_state()?;
+            if state.scribe_omitted_generation_count == 0 {
+                return Err(self.root.poison_locked(
+                    &mut state,
+                    "Scribe omitted-generation lease count underflow",
+                ));
+            }
+            state.scribe_omitted_generation_count -= 1;
+        }
+        self.bytes = merged_bytes;
+        other.released = true;
+        other.bytes = 0;
+        Ok(())
+    }
+
+    /// Resizes this owner through one checked root transaction.
+    ///
+    /// Growth performs real floor/elastic admission and shrink returns the
+    /// exact delta. Every successful size change advances the capacity epoch
+    /// before waking waiters.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation when growth cannot fit, or a
+    /// poison error when the retained attribution cannot cover a shrink.
+    pub(crate) fn resize(&mut self, bytes: usize) -> Result<(), BifrostResourceError> {
+        #[cfg(test)]
+        if self
+            .root
+            .inner
+            .post_preflight_release_fault
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            self.root
+                .poison("injected post-preflight Scribe release failure");
+            return Err(BifrostResourceError::Poisoned {
+                detail: "injected post-preflight Scribe release failure".to_owned(),
+            });
+        }
+        if bytes == self.bytes {
+            return Ok(());
+        }
+        let mut state = self.root.lock_state()?;
+        if bytes > self.bytes {
+            self.grow_locked(&mut state, bytes - self.bytes)?;
+        } else {
+            self.shrink_locked(&mut state, self.bytes - bytes)?;
+        }
+        self.bytes = bytes;
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        drop(state);
+        self.root.inner.memory_changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Applies checked Scribe growth while the sole root state lock is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns a capacity refusal or arithmetic error without mutating state.
+    fn grow_locked(
+        &self,
+        state: &mut ResourceState,
+        growth: usize,
+    ) -> Result<(), BifrostResourceError> {
+        let plan = self.root.plan();
+        let next_total = state
+            .scribe_memory_used_bytes
+            .checked_add(growth)
+            .ok_or_else(accounting_overflow)?;
+        let prior_borrow = state
+            .scribe_memory_used_bytes
+            .saturating_sub(plan.scribe_floor_bytes);
+        let added_elastic = next_total.saturating_sub(plan.scribe_floor_bytes) - prior_borrow;
+        let next_elastic = state
+            .elastic_memory_used_bytes
+            .checked_add(added_elastic)
+            .ok_or_else(accounting_overflow)?;
+        if next_elastic > plan.elastic_memory_bytes {
+            return Err(BifrostResourceError::Occupied {
+                detail: "Scribe resize exceeds protected floor plus free elastic memory".to_owned(),
+            });
+        }
+        let category = self.category as usize;
+        let next_category = state.scribe_category_bytes[category]
+            .checked_add(growth)
+            .ok_or_else(accounting_overflow)?;
+        let next_shard = self
+            .shard
+            .map(|shard| {
+                state
+                    .scribe_shard_bytes
+                    .get(&shard)
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(growth)
+                    .ok_or_else(accounting_overflow)
+            })
+            .transpose()?;
+        let generation = if self.generation.is_some() {
+            state.scribe_generation_bytes
+        } else {
+            state.scribe_omitted_generation_bytes
+        };
+        let next_generation = generation
+            .checked_add(growth)
+            .ok_or_else(accounting_overflow)?;
+        state.scribe_memory_used_bytes = next_total;
+        state.elastic_memory_used_bytes = next_elastic;
+        state.scribe_category_bytes[category] = next_category;
+        if let (Some(shard), Some(total)) = (self.shard, next_shard) {
+            state.scribe_shard_bytes.insert(shard, total);
+        }
+        if self.generation.is_some() {
+            state.scribe_generation_bytes = next_generation;
+        } else {
+            state.scribe_omitted_generation_bytes = next_generation;
+        }
+        Ok(())
+    }
+
+    /// Applies checked Scribe shrinkage while the sole root state lock is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error without releasing suspect capacity when any
+    /// attribution or elastic counter cannot cover the requested shrink.
+    fn shrink_locked(
+        &self,
+        state: &mut ResourceState,
+        shrink: usize,
+    ) -> Result<(), BifrostResourceError> {
+        let category = self.category as usize;
+        let shard_total = self.shard.map(|shard| {
+            state
+                .scribe_shard_bytes
+                .get(&shard)
+                .copied()
+                .unwrap_or_default()
+        });
+        let generation_total = if self.generation.is_some() {
+            state.scribe_generation_bytes
+        } else {
+            state.scribe_omitted_generation_bytes
+        };
+        if state.scribe_memory_used_bytes < shrink
+            || state.scribe_category_bytes[category] < shrink
+            || shard_total.is_some_and(|total| total < shrink)
+            || generation_total < shrink
+        {
+            return Err(self
+                .root
+                .poison_locked(state, "Scribe resize attribution underflow"));
+        }
+        let plan = self.root.plan();
+        let prior_borrow = state
+            .scribe_memory_used_bytes
+            .saturating_sub(plan.scribe_floor_bytes);
+        let next_total = state.scribe_memory_used_bytes - shrink;
+        let released_elastic = prior_borrow - next_total.saturating_sub(plan.scribe_floor_bytes);
+        if state.elastic_memory_used_bytes < released_elastic {
+            return Err(self
+                .root
+                .poison_locked(state, "Scribe resize elastic underflow"));
+        }
+        state.scribe_memory_used_bytes = next_total;
+        state.elastic_memory_used_bytes -= released_elastic;
+        state.scribe_category_bytes[category] -= shrink;
+        if let Some(shard) = self.shard {
+            let remaining = shard_total.unwrap_or_default() - shrink;
+            if remaining == 0 {
+                state.scribe_shard_bytes.remove(&shard);
+            } else {
+                state.scribe_shard_bytes.insert(shard, remaining);
+            }
+        }
+        if self.generation.is_some() {
+            state.scribe_generation_bytes -= shrink;
+        } else {
+            state.scribe_omitted_generation_bytes -= shrink;
+        }
+        Ok(())
+    }
+
+    /// Reclassifies this owner without changing root capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error when the prior category cannot cover this owner.
+    pub(crate) fn reclassify(
+        &mut self,
+        category: ScribeMemoryCategory,
+    ) -> Result<(), BifrostResourceError> {
+        if category == self.category {
+            return Ok(());
+        }
+        let mut state = self.root.lock_state()?;
+        let prior = self.category as usize;
+        let next = category as usize;
+        if state.scribe_category_bytes[prior] < self.bytes {
+            return Err(self
+                .root
+                .poison_locked(&mut state, "Scribe category reclassification underflow"));
+        }
+        let next_bytes = state.scribe_category_bytes[next]
+            .checked_add(self.bytes)
+            .ok_or_else(accounting_overflow)?;
+        state.scribe_category_bytes[prior] -= self.bytes;
+        state.scribe_category_bytes[next] = next_bytes;
+        self.category = category;
+        Ok(())
+    }
+
+    /// Reclassifies this owner at the root under the historical lifecycle verb.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable Scribe error projection when attribution diverges.
+    pub(crate) fn transfer_category(
+        &mut self,
+        category: ScribeMemoryCategory,
+    ) -> Result<(), crate::contracts::ScribeError> {
+        self.reclassify(category).map_err(scribe_resource_error)
+    }
+
+    /// Moves this owner's optional shard attribution under the root lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Scribe internal error when prior shard attribution
+    /// cannot cover the lease or checked destination arithmetic overflows.
+    pub(crate) fn attach_shard(
+        &mut self,
+        shard: usize,
+    ) -> Result<(), crate::contracts::ScribeError> {
+        if self.shard == Some(shard) {
+            return Ok(());
+        }
+        let mut state = self.root.lock_state().map_err(scribe_resource_error)?;
+        let next = state
+            .scribe_shard_bytes
+            .get(&shard)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(self.bytes)
+            .ok_or_else(|| crate::contracts::ScribeError::Internal {
+                detail: "Scribe shard attribution overflowed".to_owned(),
+            })?;
+        if let Some(prior) = self.shard {
+            let prior_bytes = state
+                .scribe_shard_bytes
+                .get(&prior)
+                .copied()
+                .unwrap_or_default();
+            if prior_bytes < self.bytes {
+                return Err(scribe_resource_error(
+                    self.root
+                        .poison_locked(&mut state, "Scribe shard reattribution underflow"),
+                ));
+            }
+            let remaining = prior_bytes - self.bytes;
+            if remaining == 0 {
+                state.scribe_shard_bytes.remove(&prior);
+            } else {
+                state.scribe_shard_bytes.insert(prior, remaining);
+            }
+        }
+        state.scribe_shard_bytes.insert(shard, next);
+        self.shard = Some(shard);
+        Ok(())
+    }
+
+    /// Clears shard and generation identity before joining an aggregate owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error when the prior identity attribution cannot cover
+    /// this lease or the omitted-generation counters overflow.
+    pub(crate) fn clear_identity_attribution(&mut self) -> Result<(), BifrostResourceError> {
+        let mut state = self.root.lock_state()?;
+        if let Some(shard) = self.shard {
+            let prior = state
+                .scribe_shard_bytes
+                .get(&shard)
+                .copied()
+                .unwrap_or_default();
+            if prior < self.bytes {
+                return Err(self
+                    .root
+                    .poison_locked(&mut state, "Scribe aggregate shard clear underflow"));
+            }
+            let remaining = prior - self.bytes;
+            if remaining == 0 {
+                state.scribe_shard_bytes.remove(&shard);
+            } else {
+                state.scribe_shard_bytes.insert(shard, remaining);
+            }
+            self.shard = None;
+        }
+        if self.generation.take().is_some() {
+            if state.scribe_generation_bytes < self.bytes {
+                return Err(self
+                    .root
+                    .poison_locked(&mut state, "Scribe aggregate generation clear underflow"));
+            }
+            state.scribe_generation_bytes -= self.bytes;
+            state.scribe_omitted_generation_bytes = state
+                .scribe_omitted_generation_bytes
+                .checked_add(self.bytes)
+                .ok_or_else(accounting_overflow)?;
+            state.scribe_omitted_generation_count = state
+                .scribe_omitted_generation_count
+                .checked_add(1)
+                .ok_or_else(accounting_overflow)?;
+        }
+        Ok(())
+    }
+
+    /// Resizes ingress ownership through the same root transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable Scribe error projection on refusal or poison.
+    pub(crate) fn resize_ingress(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), crate::contracts::ScribeError> {
+        self.resize(bytes).map_err(scribe_resource_error)
+    }
+
+    /// Validates that this owner can release `bytes` without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable internal error and poisons the root on underflow.
+    pub(crate) fn preflight_release(
+        &self,
+        bytes: usize,
+    ) -> Result<(), crate::contracts::ScribeError> {
+        if self.bytes < bytes {
+            self.root.poison("Scribe lease preflight underflow");
+            return Err(crate::contracts::ScribeError::Internal {
+                detail: "Scribe lease preflight underflow".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Transfers exact bytes between sibling category owners without admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable internal error when roots differ, the source cannot
+    /// cover the transfer, or destination arithmetic overflows.
+    pub(crate) fn transfer_bytes_to(
+        &mut self,
+        other: &mut Self,
+        bytes: usize,
+    ) -> Result<(), crate::contracts::ScribeError> {
+        if !Arc::ptr_eq(&self.root.inner, &other.root.inner) || self.bytes < bytes {
+            self.root
+                .poison("Scribe category transfer ownership mismatch");
+            return Err(crate::contracts::ScribeError::Internal {
+                detail: "Scribe category transfer ownership mismatch".to_owned(),
+            });
+        }
+        let target = other.bytes.checked_add(bytes).ok_or_else(|| {
+            crate::contracts::ScribeError::Internal {
+                detail: "Scribe category transfer overflowed".to_owned(),
+            }
+        })?;
+        let mut child = self.split(bytes).map_err(scribe_resource_error)?;
+        child.transfer_category(other.category)?;
+        other.merge(child).map_err(scribe_resource_error)?;
+        debug_assert_eq!(other.bytes, target);
+        Ok(())
+    }
+
+    /// Poisons the sole root after a lease-level invariant failure.
+    pub(crate) fn poison(&self) {
+        self.root.poison("Scribe lease invariant failed");
+    }
+
+    /// Reports root poison for ownership tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.root.inner.health.reason().is_some()
+    }
+
+    /// Returns this owner's exact root capacity and attribution once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error and retains suspect capacity when any root
+    /// projection cannot cover the lease.
+    fn release(&mut self) -> Result<(), BifrostResourceError> {
+        if self.released {
+            return Ok(());
+        }
+        let mut state = self.root.lock_state()?;
+        let category = self.category as usize;
+        let shard_bytes = self.shard.map(|shard| {
+            state
+                .scribe_shard_bytes
+                .get(&shard)
+                .copied()
+                .unwrap_or_default()
+        });
+        let attributed_generation = if self.generation.is_some() {
+            state.scribe_generation_bytes
+        } else {
+            state.scribe_omitted_generation_bytes
+        };
+        if state.scribe_memory_used_bytes < self.bytes
+            || state.scribe_category_bytes[category] < self.bytes
+            || shard_bytes.is_some_and(|bytes| bytes < self.bytes)
+            || attributed_generation < self.bytes
+            || (self.generation.is_none() && state.scribe_omitted_generation_count == 0)
+        {
+            return Err(self
+                .root
+                .poison_locked(&mut state, "Scribe lease release attribution mismatch"));
+        }
+        let plan = self.root.plan();
+        let prior_borrow = state
+            .scribe_memory_used_bytes
+            .saturating_sub(plan.scribe_floor_bytes);
+        let next = state.scribe_memory_used_bytes - self.bytes;
+        let next_borrow = next.saturating_sub(plan.scribe_floor_bytes);
+        let released_elastic = prior_borrow - next_borrow;
+        if state.elastic_memory_used_bytes < released_elastic {
+            return Err(self
+                .root
+                .poison_locked(&mut state, "Scribe lease elastic release underflow"));
+        }
+        state.scribe_memory_used_bytes = next;
+        state.elastic_memory_used_bytes -= released_elastic;
+        state.scribe_category_bytes[category] -= self.bytes;
+        if let Some(shard) = self.shard {
+            let remaining = shard_bytes.unwrap_or_default() - self.bytes;
+            if remaining == 0 {
+                state.scribe_shard_bytes.remove(&shard);
+            } else {
+                state.scribe_shard_bytes.insert(shard, remaining);
+            }
+        }
+        if self.generation.is_some() {
+            state.scribe_generation_bytes -= self.bytes;
+        } else {
+            state.scribe_omitted_generation_bytes -= self.bytes;
+            state.scribe_omitted_generation_count -= 1;
+        }
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        record_memory_transition("scribe", "released", next);
+        self.released = true;
+        drop(state);
+        self.root.inner.memory_changed.notify_waiters();
+        Ok(())
     }
 }
 
-impl Drop for ScribeResourceGrowth {
-    /// Rolls back root ownership when a later coupled allocation step fails.
+impl Drop for ScribeMemoryLease {
+    /// Returns exact root ownership and poisons rather than releasing on mismatch.
     fn drop(&mut self) {
-        if !self.committed
-            && let Err(error) = self.governor.release_scribe(self.bytes)
-        {
-            tracing::error!(%error, "Scribe resource allocation rollback failed");
+        if let Err(error) = self.release() {
+            tracing::error!(%error, "Scribe root lease cleanup failed");
         }
     }
 }
@@ -2345,8 +3268,11 @@ impl OracleMemoryLease {
         }
         state.oracle_memory_used_bytes -= self.bytes;
         state.elastic_memory_used_bytes -= self.elastic_bytes;
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
         self.released = true;
+        drop(state);
+        self.governor.inner.memory_changed.notify_waiters();
         Ok(())
     }
 }
@@ -2371,6 +3297,8 @@ pub struct OracleQueryResources {
     pub target_partitions: usize,
     /// One shared pool used by `DataFusion` and every query-owned Wyrd consumer.
     memory_pool: Arc<dyn MemoryPool>,
+    /// Query-local scratch children split from the already admitted envelope.
+    nested_scratch_used_bytes: Arc<Mutex<u64>>,
     elastic_bytes: usize,
     governor: BifrostResourceGovernor,
     released: bool,
@@ -2385,10 +3313,81 @@ impl OracleQueryResources {
         Arc::clone(&self.memory_pool)
     }
 
+    /// Splits one named memory child from the already admitted query pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataFusion` resource exhaustion when sibling children have
+    /// consumed the query owner. This never admits capacity at the root again.
+    pub fn try_split_memory(
+        &self,
+        consumer: &'static str,
+        bytes: usize,
+    ) -> Result<OracleQueryMemoryReservation, DataFusionError> {
+        OracleQueryMemoryReservation::try_new(
+            &self.memory_pool,
+            self.governor.clone(),
+            consumer,
+            bytes,
+        )
+    }
+
+    /// Splits exact scratch attribution from the admitted query owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without mutation when sibling scratch children
+    /// would exceed the query envelope.
+    pub fn try_split_scratch(
+        &self,
+        bytes: u64,
+    ) -> Result<OracleQueryScratchReservation, BifrostResourceError> {
+        let mut used =
+            self.nested_scratch_used_bytes
+                .lock()
+                .map_err(|_| BifrostResourceError::Poisoned {
+                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
+                })?;
+        let next = used.checked_add(bytes).ok_or_else(accounting_overflow)?;
+        if next > self.scratch_bytes {
+            return Err(BifrostResourceError::Occupied {
+                detail: "Oracle query scratch children exceed the admitted envelope".to_owned(),
+            });
+        }
+        *used = next;
+        Ok(OracleQueryScratchReservation {
+            bytes,
+            used: Arc::clone(&self.nested_scratch_used_bytes),
+            governor: self.governor.clone(),
+            released: false,
+        })
+    }
+
+    /// Releases the query envelope only after every nested child is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error while retaining root capacity when nested memory
+    /// or scratch ownership survives, or when root counters diverge.
     fn release(&mut self) -> Result<(), BifrostResourceError> {
         if self.released {
             return Ok(());
         }
+        let nested_scratch =
+            self.nested_scratch_used_bytes
+                .lock()
+                .map_err(|_| BifrostResourceError::Poisoned {
+                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
+                })?;
+        if *nested_scratch != 0 || self.memory_pool.reserved() != 0 {
+            drop(nested_scratch);
+            self.governor
+                .poison("Oracle query owner outlived a nested resource child");
+            return Err(BifrostResourceError::Poisoned {
+                detail: "Oracle query nested resource child survived owner release".to_owned(),
+            });
+        }
+        drop(nested_scratch);
         let mut state = self.governor.lock_state()?;
         if !state.oracle_query_active
             || state.oracle_memory_used_bytes < self.memory_bytes
@@ -2403,9 +3402,12 @@ impl OracleQueryResources {
         state.oracle_memory_used_bytes -= self.memory_bytes;
         state.scratch_used_bytes -= self.scratch_bytes;
         state.oracle_query_active = false;
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
         self.volume_scratch.take();
         self.released = true;
+        drop(state);
+        self.governor.inner.memory_changed.notify_waiters();
         Ok(())
     }
 }
@@ -2415,7 +3417,7 @@ impl OracleQueryResources {
 /// The reservation is a nested accounting owner inside an already-admitted
 /// pod envelope. It never charges the pod governor a second time.
 #[derive(Debug)]
-pub(crate) struct OracleQueryMemoryReservation {
+pub struct OracleQueryMemoryReservation {
     reservation: MemoryReservation,
     governor: BifrostResourceGovernor,
 }
@@ -2443,14 +3445,71 @@ impl OracleQueryMemoryReservation {
 
     /// Returns the exact bytes retained by this query-local owner.
     #[must_use]
-    pub(crate) fn bytes(&self) -> usize {
+    pub fn bytes(&self) -> usize {
         self.reservation.size()
     }
 
     /// Fails closed when telemetry and query-pool ownership diverge.
-    pub(crate) fn poison(&self) {
+    pub fn poison(&self) {
         self.governor
             .poison("Oracle query memory telemetry diverged");
+    }
+}
+
+/// Move-only scratch child split from one already admitted Oracle query.
+#[derive(Debug)]
+pub struct OracleQueryScratchReservation {
+    /// Exact scratch bytes attributed to this child.
+    bytes: u64,
+    /// Shared query-local attribution counter, never a capacity authority.
+    used: Arc<Mutex<u64>>,
+    /// Root poisoned when query-local attribution diverges.
+    governor: BifrostResourceGovernor,
+    /// Whether this child has already returned its attribution.
+    released: bool,
+}
+
+impl OracleQueryScratchReservation {
+    /// Returns the exact query-local scratch attribution.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Returns query-local attribution exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error and retains suspect attribution on underflow.
+    fn release(&mut self) -> Result<(), BifrostResourceError> {
+        if self.released {
+            return Ok(());
+        }
+        let mut used = self
+            .used
+            .lock()
+            .map_err(|_| BifrostResourceError::Poisoned {
+                detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
+            })?;
+        if *used < self.bytes {
+            self.governor
+                .poison("Oracle query scratch attribution diverged");
+            return Err(BifrostResourceError::Poisoned {
+                detail: "Oracle query scratch attribution underflow".to_owned(),
+            });
+        }
+        *used -= self.bytes;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for OracleQueryScratchReservation {
+    /// Returns the exact nested scratch attribution on every terminal path.
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            tracing::error!(%error, "Oracle query scratch child cleanup failed");
+        }
     }
 }
 
@@ -2523,9 +3582,12 @@ impl ForgeRewriteResources {
         state.elastic_memory_used_bytes -= self.elastic_bytes;
         state.scratch_used_bytes -= self.scratch_bytes;
         state.forge_reader_permits_used -= self.reader_permits;
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("forge", "released", state.forge_memory_used_bytes);
         self.volume_scratch.take();
         self.release_result = Some(ForgeResourceReleaseResult::Released);
+        drop(state);
+        self.governor.inner.memory_changed.notify_waiters();
         Ok(ForgeResourceReleaseResult::Released)
     }
 
@@ -2749,6 +3811,18 @@ fn accounting_overflow() -> BifrostResourceError {
     }
 }
 
+/// Projects private root refusals onto the stable Scribe behavior boundary.
+fn scribe_resource_error(error: BifrostResourceError) -> crate::contracts::ScribeError {
+    match error {
+        BifrostResourceError::Occupied { .. } => crate::contracts::ScribeError::IngestBusy {
+            table: "memory".to_owned(),
+        },
+        error => crate::contracts::ScribeError::Internal {
+            detail: error.to_string(),
+        },
+    }
+}
+
 fn detect_snapshot(
     scratch_root: &Path,
     memory_override: Option<usize>,
@@ -2946,12 +4020,9 @@ mod tests {
         assert!(runtime.shares_root_with(&roles));
         assert_eq!(runtime.plan(), roles.plan());
         assert_eq!(
-            roles
-                .scribe()
-                .expect("Scribe capability must be enabled")
-                .memory_governor()
-                .pod_limit_bytes(),
-            768 * MIB
+            roles.plan().managed_memory_bytes,
+            768 * MIB,
+            "the role capability projects the sole root plan"
         );
         assert!(roles.oracle().is_some());
         assert!(roles.forge().is_none());
@@ -3040,7 +4111,7 @@ mod tests {
             volumes: None,
         };
         let worker = oracle
-            .try_acquire_worker()
+            .try_acquire_worker(OracleWorkerClass::Interactive)
             .expect("one worker spends only the Oracle floor");
         assert_eq!(worker.memory_bytes(), ORACLE_PARTITION_MEMORY_BYTES);
         assert_eq!(
@@ -3100,7 +4171,7 @@ mod tests {
             let sender = sender.clone();
             joins.push(std::thread::spawn(move || {
                 start.wait();
-                let owner = oracle.try_acquire_worker();
+                let owner = oracle.try_acquire_worker(OracleWorkerClass::Interactive);
                 sender.send(owner.is_ok()).expect("race result");
                 finish.wait();
                 drop(owner);
@@ -3387,8 +4458,14 @@ mod tests {
                 governor,
                 volumes: None,
             };
-            let owner = oracle.try_acquire_worker().expect("Oracle grant");
-            assert!(oracle.try_acquire_worker().is_err());
+            let owner = oracle
+                .try_acquire_worker(OracleWorkerClass::Interactive)
+                .expect("Oracle grant");
+            assert!(
+                oracle
+                    .try_acquire_worker(OracleWorkerClass::Interactive)
+                    .is_err()
+            );
             drop(owner);
 
             let temp = tempfile::tempdir().expect("temporary volume root");
@@ -3794,6 +4871,164 @@ mod tests {
         );
     }
 
+    /// Scribe ownership transformations preserve one root and exact attribution.
+    #[test]
+    fn scribe_root_lease_transforms_reconcile_exactly() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle],
+        );
+        let scribe = roles.scribe().expect("Scribe capability");
+        let mut owner = scribe
+            .try_acquire_memory(ScribeMemoryRequest {
+                bytes: 96 * MIB,
+                category: crate::scribe::memory::MemoryCategory::Active,
+                shard: Some(3),
+                generation: None,
+            })
+            .expect("root admission");
+        let child = owner.split(32 * MIB).expect("checked split");
+        owner.merge(child).expect("checked merge");
+        owner.resize(128 * MIB).expect("checked growth");
+        owner
+            .reclassify(crate::scribe::memory::MemoryCategory::Immutable)
+            .expect("net-zero reclassification");
+        let attribution = scribe
+            .governor
+            .attribution_snapshot()
+            .expect("reconciled attribution");
+        assert_eq!(
+            attribution.category_bytes[crate::scribe::memory::MemoryCategory::Immutable as usize],
+            128 * MIB
+        );
+        assert_eq!(attribution.shard_bytes.get(&3), Some(&(128 * MIB)));
+        assert_eq!(attribution.omitted_generation_count, 1);
+        owner.resize(64 * MIB).expect("checked shrink");
+        drop(owner);
+        assert_eq!(
+            scribe
+                .governor
+                .snapshot()
+                .expect("released snapshot")
+                .scribe_memory_used_bytes,
+            0
+        );
+    }
+
+    /// Epoch waiting observes a release that occurs before waiter registration.
+    #[tokio::test]
+    async fn scribe_memory_epoch_prevents_release_lost_wakeup() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle],
+        );
+        let scribe = roles.scribe().expect("Scribe capability");
+        let owner = scribe
+            .try_acquire_memory(ScribeMemoryRequest {
+                bytes: 1,
+                category: crate::scribe::memory::MemoryCategory::Raw,
+                shard: Some(0),
+                generation: None,
+            })
+            .expect("root admission");
+        let observed = scribe.memory_epoch();
+        drop(owner);
+        let advanced = scribe
+            .wait_for_memory_change(observed)
+            .await
+            .expect("release advances the epoch");
+        assert!(advanced > observed);
+    }
+
+    /// A release attribution mismatch poisons the sole root and retains bytes.
+    #[test]
+    fn scribe_release_mismatch_poisons_root_without_reusing_capacity() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle],
+        );
+        let scribe = roles.scribe().expect("Scribe capability");
+        let owner = scribe
+            .try_acquire_memory(ScribeMemoryRequest {
+                bytes: 8,
+                category: crate::scribe::memory::MemoryCategory::Queued,
+                shard: Some(1),
+                generation: None,
+            })
+            .expect("root admission");
+        scribe
+            .governor
+            .inner
+            .state
+            .lock()
+            .expect("test state lock")
+            .scribe_category_bytes[crate::scribe::memory::MemoryCategory::Queued as usize] = 0;
+        drop(owner);
+        assert_eq!(
+            roles.health().reason(),
+            Some(BifrostResourcePoisonReason::Accounting)
+        );
+    }
+
+    /// Oracle worker classes acquire exactly one or two quanta atomically.
+    #[test]
+    fn oracle_worker_classes_use_exact_root_quanta() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let analytical = oracle
+            .try_acquire_worker(OracleWorkerClass::Analytical)
+            .expect("two-quanta worker");
+        assert_eq!(analytical.memory_bytes(), 2 * ORACLE_PARTITION_MEMORY_BYTES);
+        assert!(
+            oracle
+                .try_acquire_worker(OracleWorkerClass::Interactive)
+                .is_err()
+        );
+        drop(analytical);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("released")
+                .oracle_memory_used_bytes,
+            0
+        );
+    }
+
+    /// Query memory and scratch children split admitted ownership without root charge.
+    #[test]
+    fn oracle_query_children_remain_nested_under_one_root_owner() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let query = oracle
+            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
+            .expect("query owner");
+        let root_snapshot = oracle.snapshot().expect("root snapshot");
+        let memory = query
+            .try_split_memory("nested-query-test", 32 * MIB)
+            .expect("nested memory child");
+        let scratch = query
+            .try_split_scratch(64 * MIB as u64)
+            .expect("nested scratch child");
+        assert_eq!(memory.bytes(), 32 * MIB);
+        assert_eq!(scratch.bytes(), 64 * MIB as u64);
+        assert_eq!(oracle.snapshot().expect("nested snapshot"), root_snapshot);
+        drop(memory);
+        drop(scratch);
+        drop(query);
+        assert!(!oracle.snapshot().expect("released").oracle_query_active);
+    }
+
     /// A refused Oracle query mutates no counter and leaves the root usable.
     #[test]
     fn oracle_capability_refusal_is_atomic() {
@@ -4003,12 +5238,17 @@ mod tests {
         .expect("combined role plan");
         let plan = governor.plan();
         assert_eq!(plan.scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
-        let memory =
-            crate::scribe::memory::BifrostMemoryGovernor::from_resource_governor(governor.clone())
-                .expect("Scribe global handle");
-        let scribe_owner = memory
-            .scribe_budget()
-            .try_reserve_maintenance(crate::scribe::memory::MemoryCategory::Active, 300 * MIB)
+        let scribe = ScribeResources {
+            governor: governor.clone(),
+            volumes: None,
+        };
+        let scribe_owner = scribe
+            .try_acquire_memory(ScribeMemoryRequest {
+                bytes: 300 * MIB,
+                category: crate::scribe::memory::MemoryCategory::Active,
+                shard: None,
+                generation: None,
+            })
             .expect("Scribe uses its floor and borrows elastic memory");
         let with_scribe = governor.snapshot().expect("Scribe ownership snapshot");
         assert_eq!(with_scribe.scribe_memory_used_bytes, 300 * MIB);

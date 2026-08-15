@@ -34,7 +34,7 @@ use super::fragment::{
     ClosedLeafPredicate, LeafComparison, LeafScalar, SealedScanFile, SealedScanFragment,
 };
 use super::query_class_label;
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryPurpose};
+use crate::resources::{OracleResources, OracleWorkerClass};
 
 /// Worker-owned physical demand collected for one sealed fragment attempt.
 #[derive(Debug)]
@@ -274,8 +274,8 @@ type TestFileReadFactory = Arc<dyn Fn() -> Box<dyn FileRead> + Send + Sync>;
 pub struct SealedFragmentExecutor {
     /// Optional object-store reader inherited from a pinned Iceberg table.
     file_io: Option<FileIO>,
-    /// Optional process-wide governor required by production worker construction.
-    memory_governor: Option<BifrostMemoryGovernor>,
+    /// Optional narrow Oracle worker issuer required by production construction.
+    resources: Option<OracleResources>,
     /// Deterministic existing-interface reader used only by focused tests.
     #[cfg(test)]
     reader_override: Option<TestFileReadFactory>,
@@ -288,7 +288,7 @@ impl fmt::Debug for SealedFragmentExecutor {
         {
             let mut debug = formatter.debug_struct("SealedFragmentExecutor");
             debug.field("object_store_configured", &self.file_io.is_some());
-            debug.field("memory_governed", &self.memory_governor.is_some());
+            debug.field("memory_governed", &self.resources.is_some());
             debug.field(
                 "reader_override_configured",
                 &self.reader_override.is_some(),
@@ -299,7 +299,7 @@ impl fmt::Debug for SealedFragmentExecutor {
         {
             let mut debug = formatter.debug_struct("SealedFragmentExecutor");
             debug.field("object_store_configured", &self.file_io.is_some());
-            debug.field("memory_governed", &self.memory_governor.is_some());
+            debug.field("memory_governed", &self.resources.is_some());
             debug.finish()
         }
     }
@@ -311,7 +311,7 @@ impl SealedFragmentExecutor {
     pub fn new(file_io: FileIO) -> Self {
         Self {
             file_io: Some(file_io),
-            memory_governor: None,
+            resources: None,
             #[cfg(test)]
             reader_override: None,
         }
@@ -319,10 +319,10 @@ impl SealedFragmentExecutor {
 
     /// Creates a production executor with ranged object reads and parent memory admission.
     #[must_use]
-    pub fn with_memory_governor(file_io: FileIO, memory_governor: BifrostMemoryGovernor) -> Self {
+    pub fn with_resources(file_io: FileIO, resources: OracleResources) -> Self {
         Self {
             file_io: Some(file_io),
-            memory_governor: Some(memory_governor),
+            resources: Some(resources),
             #[cfg(test)]
             reader_override: None,
         }
@@ -528,14 +528,16 @@ impl SealedFragmentExecutor {
         query_class: QueryClass,
     ) -> Result<WorkerFrameStream, ExecutorError> {
         self.validate(fragment)?;
-        let memory_reservation = self
-            .memory_governor
+        let worker_resources = self
+            .resources
             .as_ref()
-            .map(|governor| {
-                let estimate = usize::try_from(fragment.estimated_bytes)
-                    .map_err(|_| ExecutorError::Capacity)?;
-                governor
-                    .try_reserve_parent_classified(estimate, MemoryPurpose::OracleQuery)
+            .map(|resources| {
+                let class = match query_class {
+                    QueryClass::Interactive => OracleWorkerClass::Interactive,
+                    QueryClass::Analytical => OracleWorkerClass::Analytical,
+                };
+                resources
+                    .try_acquire_worker(class)
                     .map_err(|_| ExecutorError::Capacity)
             })
             .transpose()?;
@@ -543,7 +545,7 @@ impl SealedFragmentExecutor {
         let executor = self.clone();
         let metrics = WorkerScanCollector::new(query_class);
         let output = async_stream::try_stream! {
-            let _memory_reservation = memory_reservation;
+            let _worker_resources = worker_resources;
             let attempt_metrics = metrics;
             let mut encoder = AttemptEncoder::default();
             for file in &fragment.files {

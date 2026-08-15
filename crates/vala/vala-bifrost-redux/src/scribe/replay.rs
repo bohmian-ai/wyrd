@@ -12,9 +12,10 @@ use std::path::Path;
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
+use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::audit_envelope::decode_audit_event;
 use crate::scribe::manifest::read_manifest;
-use crate::scribe::memory::{MemoryCategory, MemoryReservation, ScribeMemoryBudget};
+use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::AppendSliceId;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -64,7 +65,7 @@ pub struct ReplayChunk {
     /// Decode memory retained by this handoff, when running on the production
     /// WAL lane. Dropping the chunk releases the reservation after recovery has
     /// transferred its Arrow ownership or publication has completed.
-    pub(crate) memory: Option<MemoryReservation>,
+    pub(crate) memory: Option<ScribeMemoryLease>,
 }
 
 /// Per-append metadata derived during replay.
@@ -130,7 +131,7 @@ pub fn replay_wal_directory_stream(
 pub(crate) fn replay_wal_directory_stream_accounted(
     wal_dir: impl AsRef<Path>,
     recovery_stream: Option<StreamIdentity>,
-    governor: Option<&ScribeMemoryBudget>,
+    governor: Option<&ScribeResources>,
     mut emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
@@ -221,9 +222,9 @@ struct ReplayAccumulator<'a> {
     /// In-flight replay state keyed by seal-key path.
     states: HashMap<String, ReplayedSealKey>,
     /// Optional memory governor supplied by the production WAL lane.
-    governor: Option<&'a ScribeMemoryBudget>,
+    governor: Option<&'a ScribeResources>,
     /// Current memory reservation for the in-flight batch.
-    memory: Option<MemoryReservation>,
+    memory: Option<ScribeMemoryLease>,
     /// Accounted bytes for the in-flight batch.
     memory_bytes: usize,
 }
@@ -241,7 +242,7 @@ impl<'a> ReplayAccumulator<'a> {
         stream: StreamIdentity,
         shard_id: u8,
         sealed_lsn_map: HashMap<String, WalLsn>,
-        governor: Option<&'a ScribeMemoryBudget>,
+        governor: Option<&'a ScribeResources>,
     ) -> Result<Self, ScribeError> {
         let memory = governor
             .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
@@ -276,7 +277,7 @@ impl<'a> ReplayAccumulator<'a> {
             .saturating_add(REPLAY_RECORD_OVERHEAD_BYTES);
         let previous_memory = self.memory_bytes;
         if let Some(memory) = self.memory.as_mut() {
-            memory.resize(previous_memory.saturating_add(record_memory_bytes))?;
+            memory.resize_ingress(previous_memory.saturating_add(record_memory_bytes))?;
         }
         if record.record_kind != 2 {
             return Err(ScribeError::Internal {
@@ -356,7 +357,7 @@ impl<'a> ReplayAccumulator<'a> {
     /// the manifest watermark.
     fn resize_memory(&mut self, bytes: usize) -> Result<(), ScribeError> {
         if let Some(memory) = self.memory.as_mut() {
-            memory.resize(bytes)?;
+            memory.resize_ingress(bytes)?;
         }
         Ok(())
     }
@@ -429,7 +430,6 @@ fn merge_replayed_state(
 mod tests {
     use super::*;
     use crate::catalog::TableRef;
-    use crate::scribe::memory::BifrostMemoryGovernor;
     use crate::scribe::seal_key::EventDay;
     use crate::scribe::stream_identity::NodeId;
     use crate::scribe::wal::WalWriter;
@@ -716,8 +716,8 @@ mod tests {
             .expect("duplicate append");
         wal.sync_data_for_test(&seal_key).expect("sync");
 
-        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
-        let budget = governor.scribe_budget();
+        let budget =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let mut chunks = Vec::new();
         replay_wal_directory_stream_accounted(temp_dir.path(), None, Some(&budget), |chunk| {
             chunks.push(chunk);
@@ -727,7 +727,7 @@ mod tests {
 
         assert!(chunks.len() > 1);
         assert!(
-            governor.snapshot().categories[MemoryCategory::Decode as usize] > 0,
+            budget.memory_snapshot().categories[MemoryCategory::Decode as usize] > 0,
             "queued replay state must carry decode ownership"
         );
         let mut metas = chunks
@@ -735,7 +735,7 @@ mod tests {
             .flat_map(|chunk| chunk.states.into_values())
             .flat_map(|state| state.append_metas)
             .collect::<Vec<_>>();
-        assert_eq!(governor.snapshot().total_bytes(), 0);
+        assert_eq!(budget.memory_snapshot().total_bytes(), 0);
         metas.sort_by_key(|meta| meta.wal_lsn);
         assert_eq!(metas.len(), 5);
         assert!(metas.windows(2).all(|window| {

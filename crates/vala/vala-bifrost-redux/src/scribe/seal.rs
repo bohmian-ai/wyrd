@@ -10,12 +10,13 @@ use vala_sql::TenantConn;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
+use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult,
 };
 use crate::scribe::file_list_writer;
 use crate::scribe::file_list_writer::FileListCommitKey;
-use crate::scribe::memory::{MemoryCategory, MemoryReservation, parquet_producer_delta};
+use crate::scribe::memory::{MemoryCategory, parquet_producer_delta};
 use crate::scribe::memtable::{FrozenMemtable, Memtable};
 use crate::scribe::parquet_writer::BoundedParquetArtifactSet;
 use crate::scribe::parquet_writer::ParquetEncoded;
@@ -338,9 +339,8 @@ mod tests {
     /// Dropping an unsettled COMMIT attempt retains evidence and poisons Scribe.
     #[test]
     fn dropped_unsettled_scribe_commit_attempt_fail_stops_owner() {
-        let governor = crate::scribe::memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
-            .expect("test memory governor");
-        let memory = governor.scribe_budget();
+        let memory =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let tenant = DataTenantId::new_v7();
         let seal_key = SealKey::new(
             tenant,
@@ -413,9 +413,9 @@ pub struct ScribeCommitAttempt {
     /// Uploaded object identities and generation scratch authority.
     pub(crate) artifacts: Option<BoundedParquetArtifactSet>,
     /// Shared Scribe owner poisoned if the attempt is abandoned unsettled.
-    pub(crate) memory: Option<crate::scribe::memory::ScribeMemoryBudget>,
+    pub(crate) memory: Option<ScribeResources>,
     /// Checked delta completing the immutable charge into one 256 MiB owner.
-    pub(crate) parquet_owner: Option<MemoryReservation>,
+    pub(crate) parquet_owner: Option<ScribeMemoryLease>,
     /// Production owner that completes immutable retirement after reconciliation.
     pub(crate) completion: Option<ScribeCommitCompletion>,
     /// Explicit terminal marker suppressing fail-stop drop behavior.
@@ -529,7 +529,7 @@ impl ScribeCommitAttempt {
     ) -> (
         PostCommitToken,
         BoundedParquetArtifactSet,
-        MemoryReservation,
+        ScribeMemoryLease,
     ) {
         self.settled = true;
         let token = self
@@ -577,7 +577,7 @@ pub struct SealDriver {
     /// Generation-owned output scratch authority required before encoding.
     output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
     /// Shared Scribe owner fail-stopped by an abandoned COMMIT attempt.
-    memory: Option<crate::scribe::memory::ScribeMemoryBudget>,
+    memory: Option<ScribeResources>,
 }
 
 impl SealDriver {
@@ -593,7 +593,7 @@ impl SealDriver {
         operator: Arc<Operator>,
         persistence_cpu: ScribePersistenceCpuPool,
         output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
-        memory: Option<crate::scribe::memory::ScribeMemoryBudget>,
+        memory: Option<ScribeResources>,
     ) -> Self {
         Self {
             operator,
@@ -840,14 +840,16 @@ impl SealDriver {
     ) -> Result<ParquetEncoded, ScribeError> {
         match self
             .persistence_cpu
-            .submit(ScribePersistenceCpuOp::EncodeParquet {
-                frozen: Box::new(frozen.clone()),
-                binding: binding.clone(),
-                tenant,
-                scratch_dir: scratch_dir.to_path_buf(),
-                object_base: object_base.to_owned(),
-                footer_reservation,
-            })
+            .submit(ScribePersistenceCpuOp::EncodeParquet(Box::new(
+                crate::scribe::execution_lanes::EncodeParquetOp {
+                    frozen: Box::new(frozen.clone()),
+                    binding: binding.clone(),
+                    tenant,
+                    scratch_dir: scratch_dir.to_path_buf(),
+                    object_base: object_base.to_owned(),
+                    footer_reservation,
+                },
+            )))
             .await?
         {
             ScribePersistenceCpuResult::ParquetEncoded(encoded) => Ok(encoded),

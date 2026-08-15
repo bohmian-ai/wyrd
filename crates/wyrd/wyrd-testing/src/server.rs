@@ -2845,11 +2845,6 @@ impl WyrdTestServerBuilder {
         let bifrost_resources = runtime_resources
             .compose_roles()
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let bifrost_memory = bifrost_resources.memory_ledger().ok_or_else(|| {
-            WyrdTestServerError::Start(
-                "server test topology requires Scribe or Oracle memory".to_owned(),
-            )
-        })?;
         let resource_plan = runtime_resources.plan();
         let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
@@ -2859,11 +2854,6 @@ impl WyrdTestServerBuilder {
         let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let query_memory = Arc::new(
-            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::for_oracle(
-                bifrost_memory.clone(),
-            ),
-        );
         let forge = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
             let root = spill_root.as_ref().ok_or_else(|| {
                 WyrdTestServerError::Start("Forge spill root is unavailable".to_owned())
@@ -2972,7 +2962,11 @@ impl WyrdTestServerBuilder {
                                     })?,
                             ),
                         ),
-                        memory_budget: Some(bifrost_memory.scribe_budget()),
+                        resources: bifrost_resources.scribe().ok_or_else(|| {
+                            WyrdTestServerError::Start(
+                                "test Scribe capability is unavailable".to_owned(),
+                            )
+                        })?,
                         staging_file_publisher: Some(forge_publisher.clone()),
                     },
                 )
@@ -3011,7 +3005,11 @@ impl WyrdTestServerBuilder {
                                     })?,
                             ),
                         ),
-                        memory_budget: Some(bifrost_memory.scribe_budget()),
+                        resources: bifrost_resources.scribe().ok_or_else(|| {
+                            WyrdTestServerError::Start(
+                                "test Scribe capability is unavailable".to_owned(),
+                            )
+                        })?,
                         staging_file_publisher: Some(forge_publisher.clone()),
                     },
                 )
@@ -3058,7 +3056,6 @@ impl WyrdTestServerBuilder {
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_bifrost_node_id(node_id)
             .with_bifrost_redux(Arc::clone(&bifrost_redux))
-            .with_bifrost_memory_pool(bifrost_memory, query_memory)
             .with_bifrost_resources(bifrost_resources)
             .with_bifrost_roles(self.bifrost_roles.clone())
             .with_query_stream_fault(query_stream_fault.clone())

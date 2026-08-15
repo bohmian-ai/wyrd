@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -139,49 +140,145 @@ class ValidationError(Exception):
     """Represent one or more plan-schema validation failures."""
 
 
-COMMAND_START = re.compile(
-    r"^(?:mise\s+(?:run|exec)|cargo\s+|pytest\s+|uv\s+run\s+pytest|"
-    r"pnpm\s+|npm\s+|npx\s+|git\s+)"
-)
 BROAD_MISE = re.compile(r"^mise run (?:lints|check|pre-pr)(?:\s|$)")
 BROAD_TEST_LANE = re.compile(
     r"^mise run (?:test:(?:unit|shared|wyrd|skald|vala|sql|storage(?::matrix)?)|"
-    r"(?:py|python|ts|typescript):test:(?:unit|integration)|test:(?:journey|journeys|cluster|fuzz)(?::\S+)?)\b"
+    r"(?:py|python|ts|typescript):test:(?:unit|integration)|"
+    r"test:(?:journey|journeys|cluster|fuzz)(?::(?:matrix|all))?)\b"
 )
 CANONICAL_MATRIX = re.compile(
-    r"(?:journey|cluster|fuzz)(?::|-|_)?(?:matrix|all)?",
+    r"(?:^|[:_-])(?:journey|journeys|cluster|fuzz)(?::|-|_)(?:matrix|all)(?:$|[:_-])",
     re.IGNORECASE,
 )
 ESCAPE = re.compile(
-    r"(?m)^Broad verification exception:\s*`(?P<command>[^`]+)`\s*[—-]\s*Reason:\s*(?P<reason>\S.+)$"
+    r"(?m)^Exact-lane exception:\s*\n"
+    r"- requirement: (?P<requirement>(?:R|AC)[1-9][0-9]*)\s*\n"
+    r"- lane_owner: `(?P<owner>[^`]+)`\s*\n"
+    r"- narrowing_loss: (?P<loss>\S.+)\s*\n"
+    r"(?P<command_line>`(?P<command>[^`\n]+)`)\s*$"
+)
+KNOWN_COMMANDS = {"cargo", "git", "mise", "npm", "npx", "pnpm", "pytest", "uv"}
+SHELLS = {"bash", "sh", "zsh"}
+WRAPPER_PATH = re.compile(r"^(?:\./|\.agents/|scripts/)[A-Za-z0-9_./-]+$")
+GENERIC_LOSS = re.compile(
+    r"^(?:named tests omit acceptance proof|this exact lane is the acceptance contract)\.?$",
+    re.IGNORECASE,
 )
 
 
-def _commands(body: str) -> list[str]:
-    """Extract executable command lines from one task verification section."""
+def _logical_lines(text: str) -> list[str]:
+    """Normalize prompts and continuations into deterministic shell recipes."""
 
-    commands: list[str] = []
+    text = re.sub(r"\\\s*\n\s*", " ", text)
+    lines: list[str] = []
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate.startswith("#"):
+            continue
+        lines.append(re.sub(r"^\$\s+", "", candidate))
+    return lines
+
+
+def _recipes(body: str) -> list[str]:
+    """Extract every shell recipe from fences, code spans, and command lists."""
+
+    recipes: list[str] = []
     fenced_ranges: list[tuple[int, int]] = []
     for match in re.finditer(r"(?ms)^```(?:bash|sh|shell|zsh)?\s*\n(.*?)^```\s*$", body):
         fenced_ranges.append(match.span())
-        commands.extend(
-            line.strip()
-            for line in match.group(1).splitlines()
-            if COMMAND_START.match(line.strip())
-        )
+        recipes.extend(_logical_lines(match.group(1)))
     remainder = body
     for start, end in reversed(fenced_ranges):
         remainder = remainder[:start] + remainder[end:]
-    commands.extend(
-        match.group(1).strip()
-        for match in re.finditer(r"`([^`\n]+)`", remainder)
-        if COMMAND_START.match(match.group(1).strip())
-    )
+    exception_spans = [match.span("command_line") for match in ESCAPE.finditer(remainder)]
+    for match in re.finditer(r"`([^`\n]+)`", remainder):
+        if any(start <= match.start() and match.end() <= end for start, end in exception_spans):
+            continue
+        candidate = match.group(1).strip()
+        line_start = remainder.rfind("\n", 0, match.start()) + 1
+        line_end = remainder.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(remainder)
+        containing_line = remainder[line_start:line_end]
+        is_standalone_code = re.fullmatch(
+            r"\s*(?:[-*+]\s+|\d+[.)]\s+)?`[^`]+`[.]?\s*",
+            containing_line,
+        ) is not None
+        if _looks_executable(candidate, allow_bare=is_standalone_code):
+            recipes.append(candidate)
     for line in remainder.splitlines():
         candidate = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line).strip()
-        if COMMAND_START.match(candidate) and candidate not in commands:
-            commands.append(candidate)
-    return commands
+        candidate = re.sub(r"^\$\s+", "", candidate)
+        if _looks_executable(candidate) and candidate not in recipes:
+            recipes.append(candidate)
+    return recipes
+
+
+def _looks_executable(candidate: str, *, allow_bare: bool = True) -> bool:
+    """Return whether Markdown content claims to be an executable recipe."""
+
+    if not candidate or candidate.endswith(('.', ':')):
+        return False
+    first = candidate.split(maxsplit=1)[0]
+    return (
+        first in KNOWN_COMMANDS | SHELLS | {"env", "command"}
+        or WRAPPER_PATH.fullmatch(first) is not None
+        or any(operator in candidate for operator in ("&&", "||", ";", "|"))
+        or (
+            allow_bare
+            and re.fullmatch(r"[A-Za-z0-9_.-]+", candidate) is not None
+        )
+    )
+
+
+def _shell_segments(recipe: str) -> tuple[list[str], str | None]:
+    """Split one shell recipe at control and pipe operators with shell quoting."""
+
+    try:
+        lexer = shlex.shlex(recipe, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError as error:
+        return [], str(error)
+    segments: list[str] = []
+    current: list[str] = []
+    for token in tokens:
+        if token and set(token) <= {";", "&", "|"}:
+            if current:
+                segments.append(shlex.join(current))
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(shlex.join(current))
+    return segments, None
+
+
+def _unwrap_segment(segment: str) -> tuple[list[str], str | None]:
+    """Return recursively inspectable commands hidden behind shell wrappers."""
+
+    try:
+        tokens = shlex.split(segment)
+    except ValueError as error:
+        return [], str(error)
+    while tokens and tokens[0] in {"env", "command"}:
+        tokens.pop(0)
+        while tokens and ("=" in tokens[0] or tokens[0].startswith("-")):
+            tokens.pop(0)
+    if not tokens:
+        return [], "empty wrapper payload"
+    if tokens[0] in SHELLS:
+        for index, token in enumerate(tokens[1:], 1):
+            if token in {"-c", "-lc"} and index + 1 < len(tokens):
+                return [tokens[index + 1]], None
+        return [], "shell wrapper must use `-c` or `-lc` with a payload"
+    if tokens[0] == "mise" and tokens[1:3] == ["exec", "--"]:
+        return [shlex.join(tokens[3:])], None
+    if WRAPPER_PATH.fullmatch(tokens[0]) and "--" in tokens:
+        index = tokens.index("--")
+        return [shlex.join(tokens[index + 1 :])], None
+    return [shlex.join(tokens)], None
 
 
 def _cargo_has_package(command: str) -> bool:
@@ -191,7 +288,7 @@ def _cargo_has_package(command: str) -> bool:
 
 
 def _cargo_test_has_filter(command: str) -> bool:
-    """Return whether Cargo test names a test target or test-name filter."""
+    """Return whether Cargo test names an exact positional test-name filter."""
 
     cargo_command = command[command.find("cargo ") :]
     before_harness = cargo_command.split(" -- ", 1)[0]
@@ -223,15 +320,136 @@ def _cargo_test_has_filter(command: str) -> bool:
     return False
 
 
-def _focused_verification_errors(path: Path, body: str) -> list[str]:
+def _segment_defect(command: str) -> str | None:
+    """Return the focus-policy defect for one fully unwrapped command segment."""
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError as error:
+        return f"invalid shell quoting: {error}"
+    if not tokens:
+        return "empty command segment"
+    executable = tokens[0]
+    if executable not in KNOWN_COMMANDS and WRAPPER_PATH.fullmatch(executable) is None:
+        return "unknown alias or function; use an explicit repository path or supported command"
+    if BROAD_MISE.search(command):
+        return "aggregate `mise run lints|check|pre-pr` belongs to parent closeout"
+    if BROAD_TEST_LANE.search(command):
+        return (
+            "workspace, crate-family, or unfiltered language test lane belongs "
+            "to parent closeout"
+        )
+    if executable == "mise" and len(tokens) >= 3 and CANONICAL_MATRIX.search(tokens[2]):
+        return "canonical journey/cluster/fuzz matrix belongs to parent closeout"
+    if executable == "cargo":
+        if re.search(r"(?:^|\s)--workspace(?:\s|$)", command):
+            return "task-level Cargo must not select the workspace"
+        if re.search(r"(?:^|\s)--all-features(?:\s|$)", command):
+            return "task-level `--all-features` is not earned feature selection"
+        if len(tokens) > 1 and tokens[1] == "clippy" and not _cargo_has_package(command):
+            return "task-level Clippy must select an affected package with `-p`"
+        if len(tokens) > 1 and tokens[1] == "test":
+            if not _cargo_has_package(command):
+                return "task-level Cargo test must select an affected package with `-p`"
+            if not _cargo_test_has_filter(command):
+                return "task-level Cargo test must name an exact positional test filter"
+    if re.search(r"(?:pytest|py:test:integration)", command) and not re.search(
+        r"(?:\.py::\S+|\s-k\s+\S+)", command
+    ):
+        return "Python verification must name an exact test node or `-k` filter"
+    if re.search(
+        r"(?:typescript|\bts:|pnpm.*(?:test|integration)|npm.*(?:test|integration)|pnpm\s+vitest)",
+        command,
+    ) and not re.search(
+        r"(?:\.test\.[cm]?[jt]s|\.spec\.[cm]?[jt]s|"
+        r"--testNamePattern|\s-t\s+\S+)",
+        command,
+    ):
+        return "TypeScript verification must name an affected test file or test-name filter"
+    return None
+
+
+def _recipe_defects(recipe: str) -> list[tuple[str, str]]:
+    """Recursively inspect every executable segment within one shell recipe."""
+
+    pending = [recipe]
+    defects: list[tuple[str, str]] = []
+    while pending:
+        current = pending.pop(0)
+        segments, split_error = _shell_segments(current)
+        if split_error is not None:
+            defects.append((current, f"invalid shell recipe: {split_error}"))
+            continue
+        for segment in segments:
+            unwrapped, unwrap_error = _unwrap_segment(segment)
+            if unwrap_error is not None:
+                defects.append((segment, unwrap_error))
+                continue
+            if len(unwrapped) != 1 or unwrapped[0] != segment:
+                pending.extend(unwrapped)
+                continue
+            defect = _segment_defect(segment)
+            if defect is not None:
+                defects.append((segment, defect))
+    return defects
+
+
+def _focused_verification_errors(
+    path: Path,
+    body: str,
+    requirement_ids: set[str],
+) -> list[str]:
     """Reject task-level commands that prove substantially unrelated surfaces."""
 
     errors: list[str] = []
-    exceptions = {
-        match.group("command"): match.group("reason")
-        for match in ESCAPE.finditer(body)
-    }
-    commands = _commands(body)
+    exception_matches = list(ESCAPE.finditer(body))
+    if body.count("Exact-lane exception:") != len(exception_matches):
+        errors.append(
+            f"{path}: every exact-lane exception must use the complete structured form"
+        )
+    exception_commands: dict[str, re.Match[str]] = {}
+    seen_losses: set[str] = set()
+    for match in exception_matches:
+        command = match.group("command")
+        requirement = match.group("requirement")
+        owner = match.group("owner")
+        loss = match.group("loss").strip()
+        if command in exception_commands:
+            errors.append(f"{path}: exact-lane exception command is reused: `{command}`")
+        exception_commands[command] = match
+        if requirement not in requirement_ids:
+            errors.append(
+                f"{path}: exact-lane exception references unknown `{requirement}`"
+            )
+        if not (owner.startswith("mise.toml:") or WRAPPER_PATH.fullmatch(owner)):
+            errors.append(
+                f"{path}: exact-lane exception lane_owner must name `mise.toml:<task>` "
+                "or an explicit repository path"
+            )
+        elif owner.startswith("mise.toml:"):
+            lane = owner.split(":", 1)[1]
+            if re.match(rf"^mise run {re.escape(lane)}(?:\s|$)", command) is None:
+                errors.append(
+                    f"{path}: exact-lane exception command does not match "
+                    f"lane_owner `{owner}`"
+                )
+        elif owner not in command:
+            errors.append(
+                f"{path}: exact-lane exception command does not invoke "
+                f"lane_owner `{owner}`"
+            )
+        normalized_loss = re.sub(r"\s+", " ", loss.lower().rstrip("."))
+        if len(loss.split()) < 8 or GENERIC_LOSS.fullmatch(loss):
+            errors.append(
+                f"{path}: exact-lane exception needs a concrete `narrowing_loss`"
+            )
+        if normalized_loss in seen_losses:
+            errors.append(
+                f"{path}: duplicate exact-lane exception `narrowing_loss`: {loss}"
+            )
+        seen_losses.add(normalized_loss)
+
+    recipes = _recipes(body)
     if re.search(
         r"(?mi)^Affected (?:crate|crates|package|packages|surface|surfaces):\s*\S+",
         body,
@@ -240,59 +458,38 @@ def _focused_verification_errors(path: Path, body: str) -> list[str]:
             f"{path}: `## Focused verification` must declare explicit affected "
             "packages or surfaces"
         )
-    for command in commands:
-        defect: str | None = None
-        if BROAD_MISE.search(command):
-            defect = "aggregate `mise run lints|check|pre-pr` belongs to parent closeout"
-        elif BROAD_TEST_LANE.search(command):
-            defect = "workspace, crate-family, or unfiltered language test lane belongs to parent closeout"
-        elif CANONICAL_MATRIX.search(command) and (
-            "mise run" in command or "integration" in command
-        ):
-            defect = "canonical journey/cluster/fuzz matrix belongs to parent closeout"
-        elif command.startswith("cargo ") or command.startswith("mise exec -- cargo "):
-            if re.search(r"(?:^|\s)--workspace(?:\s|$)", command):
-                defect = "task-level Cargo must not select the workspace"
-            elif re.search(r"(?:^|\s)--all-features(?:\s|$)", command):
-                defect = "task-level `--all-features` is not earned feature selection"
-            elif "cargo clippy" in command and not _cargo_has_package(command):
-                defect = "task-level Clippy must select an affected package with `-p`"
-            elif "cargo test" in command and not _cargo_has_package(command):
-                defect = "task-level Cargo test must select an affected package with `-p`"
-            elif "cargo test" in command and not _cargo_test_has_filter(command):
-                defect = "task-level Cargo test must name a test target or test-name filter"
-        elif re.search(r"(?:pytest|py:test:integration)", command) and not re.search(
-            r"(?:\.py(?:::\S+)?|\s-k\s+\S+)", command
-        ):
-            defect = "Python verification must name an affected test file/node or `-k` filter"
-        elif re.search(
-            r"(?:typescript|\bts:|pnpm.*(?:test|integration)|"
-            r"npm.*(?:test|integration))",
-            command,
-        ) and not re.search(
-            r"(?:\.test\.[cm]?[jt]s|\.spec\.[cm]?[jt]s|"
-            r"--testNamePattern|\s-t\s+\S+)",
-            command,
-        ):
-            defect = "TypeScript verification must name an affected test file or test-name filter"
-        if defect is None:
+    recipes.extend(exception_commands)
+    for recipe in recipes:
+        defects = _recipe_defects(recipe)
+        if not defects:
+            if recipe in exception_commands:
+                errors.append(
+                    f"{path}: exact-lane exception is unnecessary for focused command "
+                    f"`{recipe}`"
+                )
             continue
-        reason = exceptions.get(command)
-        if reason is not None and len(reason.split()) >= 4:
+        if recipe in exception_commands:
+            segments, split_error = _shell_segments(recipe)
+            if split_error is not None or len(segments) != 1:
+                errors.append(
+                    f"{path}: exact-lane exception must bind one command segment"
+                )
+                continue
+            if any(
+                "unknown alias or function" in defect
+                or "invalid shell" in defect
+                or "empty" in defect
+                for _, defect in defects
+            ):
+                errors.append(
+                    f"{path}: exact-lane exception cannot authorize an unauditable "
+                    "or malformed command"
+                )
             continue
-        errors.append(
-            f"{path}: `## Focused verification` rejects `{command}`: {defect}"
-        )
-    for command, reason in exceptions.items():
-        if command not in commands:
+        for segment, defect in defects:
             errors.append(
-                f"{path}: broad verification exception must quote an executable "
-                f"command from the section: `{command}`"
-            )
-        elif len(reason.split()) < 4:
-            errors.append(
-                f"{path}: broad verification exception for `{command}` needs a "
-                "concrete reason"
+                f"{path}: `## Focused verification` rejects segment `{segment}`: "
+                f"{defect}"
             )
     return errors
 
@@ -429,8 +626,21 @@ def _validate_document(
                 )
 
     if expected_headings == TASK_HEADINGS and "Focused verification" in bodies:
+        requirement_ids = set(
+            re.findall(r"\bR[1-9][0-9]*\b", metadata.get("Requirements", ""))
+        )
+        requirement_ids.update(
+            re.findall(
+                r"\bAC[1-9][0-9]*\b",
+                bodies.get("Acceptance criteria", ""),
+            )
+        )
         errors.extend(
-            _focused_verification_errors(path, bodies["Focused verification"])
+            _focused_verification_errors(
+                path,
+                bodies["Focused verification"],
+                requirement_ids,
+            )
         )
 
     return errors
@@ -700,12 +910,22 @@ def self_test() -> int:
             "mise run pre-pr",
             "mise run test:shared",
             "mise run test:journey:matrix",
+            "mise run test:cluster:all",
+            "mise run test:fuzz:matrix",
             "mise run py:test:integration",
             "pnpm test:integration",
             "mise exec -- cargo test --workspace exact_behavior",
             "mise exec -- cargo test -p example --all-features exact_behavior",
             "mise exec -- cargo test -p example",
+            "mise exec -- cargo test -p example --test api",
             "mise exec -- cargo clippy --locked",
+            "cargo test -p example exact_behavior && mise run lints",
+            "cargo test -p example exact_behavior; mise run pre-pr",
+            "cargo test -p example exact_behavior || mise run check",
+            "cargo test -p example exact_behavior | mise run test:shared",
+            "env RUST_LOG=debug command cargo test -p example exact_behavior && lint-all",
+            "bash -lc 'cargo test -p example exact_behavior && mise run lints'",
+            "lint-all",
         )
         valid_command = "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture"
         for command in invalid_commands:
@@ -718,12 +938,32 @@ def self_test() -> int:
                 )
                 return 1
 
+        prompted_continuation = original.replace(
+            f"- `{valid_command}`",
+            "```bash\n"
+            "$ cargo test -p example exact_behavior \\\n"
+            "  && mise run \\\n"
+            "  pre-pr\n"
+            "```",
+        )
+        task_path.write_text(prompted_continuation, encoding="utf-8")
+        prompted_errors = validate_plan_directory(plan_dir)
+        if not any("mise run pre-pr" in error for error in prompted_errors):
+            print(
+                "self-test failed: prompted continuation bypass was accepted",
+                file=sys.stderr,
+            )
+            return 1
+
         valid_commands = (
             "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture",
             "mise exec -- cargo test --locked -p example --test api exact_behavior",
-            "uv run pytest tests/test_api.py::test_exact_behavior",
+            "uv run pytest tests/test_api_journey.py::test_exact_behavior",
             "pnpm vitest run tests/api.test.ts",
             "mise exec -- cargo test --locked -p wyrd-mcp exact_tool_journey",
+            "scripts/postgres/with-test-postgres.sh -- bash -lc "
+            "'cargo test -p wyrd-sql --test postgres exact_round_trip'",
+            "env RUST_LOG=debug command cargo test -p example exact_behavior",
             "mise run codegen:check",
             "mise run docs:check",
             "mise run check:client-tier",
@@ -745,14 +985,71 @@ def self_test() -> int:
                 return 1
 
         escaped = original.replace(
-            valid_command,
-            "mise run test:journey:matrix\n\n"
-            "Broad verification exception: `mise run test:journey:matrix` — "
-            "Reason: this exact lane is the acceptance contract.",
+            f"- `{valid_command}`",
+            "Exact-lane exception:\n"
+            "- requirement: AC1\n"
+            "- lane_owner: `mise.toml:test:journey:matrix`\n"
+            "- narrowing_loss: Named tests cannot prove cross-language startup, "
+            "routing, and teardown in one lane.\n"
+            "`mise run test:journey:matrix`",
         )
         task_path.write_text(escaped, encoding="utf-8")
         if validate_plan_directory(plan_dir):
             print("self-test failed: documented exact-lane exception was rejected", file=sys.stderr)
+            return 1
+
+        escape_abuse = (
+            "Exact-lane exception:\n"
+            "- requirement: AC99\n"
+            "- lane_owner: `unknown-owner`\n"
+            "- narrowing_loss: Named tests omit acceptance proof.\n"
+            "`mise run test:journey:matrix`"
+        )
+        task_path.write_text(
+            original.replace(f"- `{valid_command}`", escape_abuse),
+            encoding="utf-8",
+        )
+        if not validate_plan_directory(plan_dir):
+            print("self-test failed: malformed exact-lane exception was accepted", file=sys.stderr)
+            return 1
+
+        duplicate_escape = escaped.replace(
+            "`mise run test:journey:matrix`",
+            "`mise run test:journey:matrix`\n\n"
+            "Exact-lane exception:\n"
+            "- requirement: AC1\n"
+            "- lane_owner: `mise.toml:test:journey:matrix`\n"
+            "- narrowing_loss: Named tests cannot prove cross-language startup, "
+            "routing, and teardown in one lane.\n"
+            "`mise run test:journey:matrix`",
+            1,
+        )
+        task_path.write_text(duplicate_escape, encoding="utf-8")
+        if not validate_plan_directory(plan_dir):
+            print("self-test failed: reused exact-lane marker was accepted", file=sys.stderr)
+            return 1
+
+        mismatched_owner = escaped.replace(
+            "mise.toml:test:journey:matrix",
+            "mise.toml:test:cluster:all",
+        )
+        task_path.write_text(mismatched_owner, encoding="utf-8")
+        if not validate_plan_directory(plan_dir):
+            print("self-test failed: mismatched lane owner was accepted", file=sys.stderr)
+            return 1
+
+        orphan_escape = original.replace(
+            f"- `{valid_command}`",
+            "Exact-lane exception:\n"
+            "- requirement: AC1\n"
+            "- lane_owner: `mise.toml:test:journey:matrix`\n"
+            "- narrowing_loss: Named tests cannot prove cross-language startup, "
+            "routing, and teardown in one lane.\n\n"
+            "Some prose.\n\n`mise run test:journey:matrix`",
+        )
+        task_path.write_text(orphan_escape, encoding="utf-8")
+        if not validate_plan_directory(plan_dir):
+            print("self-test failed: orphan exact-lane exception was accepted", file=sys.stderr)
             return 1
 
     if valid_repository_artifact("wyrd/active/example/tasks/HANDOFF.md"):

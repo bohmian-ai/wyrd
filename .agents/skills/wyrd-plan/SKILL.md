@@ -126,7 +126,10 @@ Before marking a task `Ready`:
 Task packets must not contain workspace, crate-family, aggregate, full-language,
 canonical journey/cluster/fuzz matrix, or generic all-feature verification.
 Those lanes belong exclusively to parent closeout unless an exact broad lane is
-itself the acceptance contract and the packet uses the documented exception.
+itself the acceptance contract and the packet uses the structured,
+requirement-bound exception in `references/verification-planning.md`. Inspect
+every chained, piped, continued, prompted, environment-prefixed, or recursively
+wrapped shell segment; reject unauditable aliases and functions.
 
 Do not substitute a nearby command without recording the corrected command in
 the task. See `references/verification-planning.md`.

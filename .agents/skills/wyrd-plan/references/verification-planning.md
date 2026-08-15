@@ -89,13 +89,26 @@ canonical journey/cluster/fuzz matrices, and unfiltered package tests belong
 only to parent closeout.
 
 The only escape is when one exact otherwise-broad lane is itself the acceptance
-contract. Quote the command in `## Focused verification` and add:
+contract. Put this structured marker immediately before its exact quoted
+command in `## Focused verification`:
 
 ```markdown
-Broad verification exception: `<exact command>` — Reason: <why this lane, rather than named tests, is the acceptance contract>.
+Exact-lane exception:
+- requirement: AC3
+- lane_owner: `mise.toml:test:journey:matrix`
+- narrowing_loss: Named cases cannot prove cross-language startup, routing, and teardown in one lane.
+`mise run test:journey:matrix`
 ```
 
-Do not use the exception for convenience, baseline cleanup, or confidence.
+The requirement must exist in the task, `lane_owner` must identify the owning
+repository path or `mise.toml` task, and `narrowing_loss` must state the
+acceptance evidence lost by selecting named cases. Do not reuse a marker or use
+generic boilerplate, convenience, baseline cleanup, or confidence as the loss.
+
+Shell recipes are transparent to this policy. Every command behind chaining,
+pipes, prompts, continuations, `env`/`command`, repository wrappers, and
+`bash|sh -c/-lc` is independently focused. Use explicit repository script
+paths; bare aliases and shell functions are not auditable.
 
 Run all Cargo-backed commands sequentially across agents sharing a checkout or
 target directory. Parallel source work must not overlap builds, tests, Clippy,

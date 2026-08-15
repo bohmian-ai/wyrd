@@ -116,7 +116,11 @@ unfiltered package, or generic all-feature lanes from a task packet. Replace
 them with equivalent focused proof over explicit affected packages, default or
 earned features, named tests or journeys, and affected generated or boundary
 checks; record the correction. Run an otherwise-broad lane only when the task
-documents that exact lane as the acceptance contract with a concrete reason.
+immediately binds that exact command to an existing requirement, repository
+lane owner, and concrete statement of acceptance proof lost by narrowing.
+Inspect every chained, piped, continued, prompted, environment-prefixed, and
+recursively wrapped command segment before execution; unknown aliases or shell
+functions are defective recipes.
 
 ## Execute the loop
 

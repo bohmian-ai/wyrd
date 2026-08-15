@@ -157,7 +157,7 @@ ESCAPE = re.compile(
     r"- narrowing_loss: (?P<loss>\S.+)\s*\n"
     r"(?P<command_line>`(?P<command>[^`\n]+)`)\s*$"
 )
-KNOWN_COMMANDS = {"cargo", "git", "mise", "npm", "npx", "pnpm", "pytest", "uv"}
+KNOWN_COMMANDS = {"cargo", "cd", "git", "mise", "npm", "npx", "pnpm", "pytest", "uv"}
 SHELLS = {"bash", "sh", "zsh"}
 WRAPPER_PATH = re.compile(r"^(?:\./|\.agents/|scripts/)[A-Za-z0-9_./-]+$")
 POSTGRES_WRAPPER = "scripts/postgres/with-test-postgres.sh"
@@ -186,7 +186,10 @@ def _recipes(body: str) -> list[str]:
 
     recipes: list[str] = []
     fenced_ranges: list[tuple[int, int]] = []
-    for match in re.finditer(r"(?ms)^```(?:bash|sh|shell|zsh)?\s*\n(.*?)^```\s*$", body):
+    for match in re.finditer(
+        r"(?ms)^\s*```(?:bash|sh|shell|zsh)?\s*\n(.*?)^\s*```\s*$",
+        body,
+    ):
         fenced_ranges.append(match.span())
         recipes.extend(_logical_lines(match.group(1)))
     remainder = body
@@ -211,6 +214,8 @@ def _recipes(body: str) -> list[str]:
     for line in remainder.splitlines():
         candidate = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line).strip()
         candidate = re.sub(r"^\$\s+", "", candidate)
+        if re.fullmatch(r"`[^`]+`[.]?", candidate):
+            continue
         if _looks_executable(candidate) and candidate not in recipes:
             recipes.append(candidate)
     return recipes
@@ -422,7 +427,8 @@ def _canonical_npx(tokens: list[str]) -> tuple[list[str], str | None]:
 def _cargo_test_has_filter(command: str) -> bool:
     """Return whether Cargo test names an exact positional test-name filter."""
 
-    tokens = shlex.split(command.split(" -- ", 1)[0])
+    cargo_part, separator, harness_part = command.partition(" -- ")
+    tokens = shlex.split(cargo_part)
     subcommand, index, error = _cargo_subcommand(tokens)
     if error is not None:
         return False
@@ -449,6 +455,24 @@ def _cargo_test_has_filter(command: str) -> bool:
             index += 1
             continue
         return True
+    if separator:
+        harness_tokens = shlex.split(harness_part)
+        harness_options_with_values = {
+            "--color",
+            "--format",
+            "--logfile",
+            "--test-threads",
+        }
+        index = 0
+        while index < len(harness_tokens):
+            token = harness_tokens[index]
+            if token in harness_options_with_values:
+                index += 2
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            return True
     return False
 
 
@@ -464,6 +488,10 @@ def _segment_defect(command: str) -> str | None:
     executable = tokens[0]
     if executable not in KNOWN_COMMANDS and WRAPPER_PATH.fullmatch(executable) is None:
         return "unknown alias or function; use an explicit repository path or supported command"
+    if executable == "cd":
+        if len(tokens) == 2 and re.fullmatch(r"[A-Za-z0-9_./-]+", tokens[1]):
+            return None
+        return "focused verification `cd` must name one explicit repository-relative path"
     if WRAPPER_PATH.fullmatch(executable) and executable != POSTGRES_WRAPPER:
         return "opaque repository script requires a structured exact-lane exception"
     if executable == POSTGRES_WRAPPER:
@@ -509,7 +537,8 @@ def _segment_defect(command: str) -> str | None:
     ):
         return "Python verification must name an exact test node or `-k` filter"
     if re.search(
-        r"(?:typescript|\bts:|pnpm.*(?:test|integration)|npm.*(?:test|integration)|"
+        r"(?:typescript.*(?:test|integration)|\bts:(?:test|integration)|"
+        r"pnpm.*(?:test|integration)|npm.*(?:test|integration)|"
         r"(?:pnpm|npx)\s+vitest)",
         command,
     ) and not re.search(
@@ -796,7 +825,11 @@ def _validate_document(
                     "`Not applicable: <reason>`"
                 )
 
-    if expected_headings == TASK_HEADINGS and "Focused verification" in bodies:
+    if (
+        expected_headings == TASK_HEADINGS
+        and metadata.get("Status") == "Ready"
+        and "Focused verification" in bodies
+    ):
         requirement_ids = set(
             re.findall(r"\bR[1-9][0-9]*\b", metadata.get("Requirements", ""))
         )
@@ -1166,6 +1199,7 @@ def self_test() -> int:
 
         valid_commands = (
             "mise exec -- cargo test --locked -p example exact_behavior -- --nocapture",
+            "mise exec -- cargo test --locked -p example --test api -- exact_behavior --test-threads=1",
             "cargo +stable --locked test -p example exact_behavior",
             "cargo t -p example exact_behavior",
             "cargo +stable --quiet t -p example exact_behavior",
@@ -1188,6 +1222,7 @@ def self_test() -> int:
             "mise run docs:check",
             "mise run check:client-tier",
             "mise run fmt",
+            "mise run ts:build",
         )
         for command in valid_commands:
             task_path.write_text(
@@ -1203,6 +1238,20 @@ def self_test() -> int:
                 for error in errors:
                     print(error, file=sys.stderr)
                 return 1
+
+        completed_with_legacy_gate = _replace_metadata(
+            original.replace(valid_command, "mise run pre-pr"),
+            "Status",
+            "Ready",
+            "Complete",
+        )
+        task_path.write_text(completed_with_legacy_gate, encoding="utf-8")
+        if validate_plan_directory(plan_dir):
+            print(
+                "self-test failed: completed task was retroactively policy-checked",
+                file=sys.stderr,
+            )
+            return 1
 
         escaped = original.replace(
             f"- `{valid_command}`",

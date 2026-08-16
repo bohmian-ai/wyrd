@@ -6,7 +6,7 @@
 //! rendered by the single `WyrdErrorResponse`.
 
 use arrow::datatypes::Field;
-use vala_bifrost_redux::catalog::{BifrostCatalog, BifrostCatalogError, TableRef};
+use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -25,10 +25,6 @@ use crate::http::error::permission_deny_reason_to_wyrd;
 /// Map a Redux catalog error to the public `WyrdError` via the single delegate.
 fn map_engine_error(error: BifrostCatalogError) -> WyrdError {
     error.into_public().into()
-}
-
-fn redux_catalog(state: &AppState) -> Result<&BifrostCatalog, WyrdError> {
-    Ok(state.bifrost.as_ref())
 }
 
 /// Authorize the caller against a required permission before execution.
@@ -114,7 +110,7 @@ pub async fn register_table(
 
     let fqn = format!("{}.{}", ns.as_str(), body.name);
     let table = TableRef::new(ns, body.name.clone());
-    let catalog = redux_catalog(state)?;
+    let catalog = state.bifrost.as_ref();
 
     match catalog.describe_table(&table, caller.data_tenant_id).await {
         Ok(existing) => {
@@ -160,7 +156,8 @@ pub async fn list_tables(
     caller: Caller,
 ) -> Result<Vec<BifrostTableEntry>, WyrdError> {
     authorize(state, &caller, &Permission::bifrost_table_read())?;
-    redux_catalog(state)?
+    state
+        .bifrost
         .list_tables(caller.data_tenant_id)
         .await
         .map_err(map_engine_error)
@@ -176,7 +173,8 @@ pub async fn describe_table(
     authorize(state, &caller, &Permission::bifrost_table_read())?;
     let ns = convert::namespace_from_wire(&namespace)?;
     let table = TableRef::new(ns, name);
-    redux_catalog(state)?
+    state
+        .bifrost
         .describe_table(&table, caller.data_tenant_id)
         .await
         .map_err(map_engine_error)

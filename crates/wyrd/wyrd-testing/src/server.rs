@@ -3607,6 +3607,15 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
     WyrdTestServerError::Sql(error.to_string())
 }
 
+/// Constructs the sole Redux catalog over the fixture's Vala tenant connection owner.
+///
+/// The returned catalog shares the fixture's migrated Postgres lifetime and the
+/// caller-provided storage backend, matching the server's production ownership shape.
+///
+/// # Errors
+///
+/// Returns [`WyrdTestServerError::Start`] when the Redux catalog cannot connect
+/// to its SQL catalog or construct its storage-backed Iceberg catalog.
 pub(crate) async fn test_catalog(
     fixture: &PgFixture,
     storage: &Arc<wyrd_storage::StorageHandle>,

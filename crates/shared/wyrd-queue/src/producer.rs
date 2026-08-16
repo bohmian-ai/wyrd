@@ -296,8 +296,9 @@ impl ClientByteBudget {
     /// # Errors
     ///
     /// Returns [`WyrdQueueError::Backpressure`] before construction when the
-    /// configured ceiling is zero or the shared configured ceiling is occupied,
-    /// and otherwise propagates a closure failure after rolling its provisional
+    /// configured ceiling is zero, the shared configured ceiling is occupied,
+    /// or a prior task is still releasing fixed storage after its final permit;
+    /// otherwise propagates a closure failure after rolling its provisional
     /// admission back.
     ///
     /// # Panics
@@ -320,6 +321,9 @@ impl ClientByteBudget {
         let provisional_ceiling = state
             .ceiling
             .min(configured_ceiling.clamp(1, QueueConfig::MAX_LIVE_ENTRIES));
+        if state.live == 0 && self.state.fixed_storage.load(Ordering::Acquire) != 0 {
+            return Err(WyrdQueueError::Backpressure);
+        }
         if state.live >= provisional_ceiling {
             return Err(WyrdQueueError::Backpressure);
         }
@@ -393,8 +397,9 @@ impl Drop for ProducerPermit {
     ///
     /// # Panics
     ///
-    /// Panics if producer admission state is poisoned or underflows, which
-    /// would indicate a producer lifecycle accounting invariant violation.
+    /// Panics if producer admission state is poisoned, underflows, or releases
+    /// the final permit before fixed queue storage, which would indicate a
+    /// producer lifecycle accounting invariant violation.
     fn drop(&mut self) {
         let mut state = self
             .budget
@@ -402,6 +407,13 @@ impl Drop for ProducerPermit {
             .producer_permits
             .lock()
             .expect("producer permit lock poisoned");
+        if state.live == 1 {
+            assert_eq!(
+                self.budget.state.fixed_storage.load(Ordering::Acquire),
+                0,
+                "final producer permit must release after fixed queue storage"
+            );
+        }
         state.live = state
             .live
             .checked_sub(1)
@@ -620,8 +632,8 @@ impl Producer {
         // `Task` owns both guards so sender drop cannot release capacity while
         // its receiver, staging ring, or retry queue remains live.
         task.lifetime = Some(TaskLifetime {
-            _producer_permit: producer_permit,
             _fixed_storage: fixed_storage,
+            _producer_permit: producer_permit,
         });
         wyrd_runtime::runtime().spawn(async move {
             if let Some(reply) = task.run().await {
@@ -753,10 +765,10 @@ impl Producer {
 /// staging ring, retry queue, and sealed owners have all been dropped.
 #[derive(Debug)]
 struct TaskLifetime {
-    /// Shared producer admission retained while task-owned queue state remains live.
-    _producer_permit: ProducerPermit,
     /// Fixed queue storage charge retained while task-owned buffers remain live.
     _fixed_storage: FixedStorageGuard,
+    /// Shared producer admission retained until fixed storage has dropped.
+    _producer_permit: ProducerPermit,
 }
 
 /// The owned background receiver that serializes staging and control transitions.
@@ -1261,6 +1273,10 @@ mod tests {
         assert_eq!(
             resolved.live_producers, 0,
             "durable retry acknowledgement permits terminal task cleanup"
+        );
+        assert_eq!(
+            resolved.fixed_storage_bytes, 0,
+            "fixed storage drops before the final producer permit becomes available"
         );
         assert_eq!(resolved.owned_bytes, 0, "ACK releases the same frame owner");
         assert_eq!(resolved.live_batches, 0, "ACK releases the batch slot");

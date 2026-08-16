@@ -518,9 +518,6 @@ pub struct Producer {
     counters: Arc<Counters>,
     state: Arc<AtomicU8>,
     budget: ClientByteBudget,
-    /// One shared producer admission slot until terminal drain or producer drop.
-    producer_permit: Mutex<Option<ProducerPermit>>,
-    fixed_storage: Mutex<Option<FixedStorageGuard>>,
 }
 
 impl Producer {
@@ -540,6 +537,9 @@ impl Producer {
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
     ) -> Result<Self, WyrdQueueError> {
+        if config.max_producers() == 0 {
+            return Err(WyrdQueueError::Backpressure);
+        }
         Self::with_budget(
             table,
             schema,
@@ -571,7 +571,7 @@ impl Producer {
         budget: ClientByteBudget,
     ) -> Result<Self, WyrdQueueError> {
         let capacities = ProducerCapacities::for_handle(config, &budget)?;
-        let (mut producer, producer_permit) =
+        let ((producer, mut task, fixed_storage), producer_permit) =
             budget.construct_producer(config.max_producers(), || {
                 let fixed_storage = budget.reserve_fixed_storage(capacities.charged_bytes)?;
                 let (tx, rx) = mpsc::channel(capacities.data_slots);
@@ -590,36 +590,42 @@ impl Producer {
                     budget.clone(),
                     Arc::clone(&counters),
                 );
-                wyrd_runtime::runtime().spawn(
+                Ok((
+                    Self {
+                        tx,
+                        ctrl_tx,
+                        control_pending: Arc::clone(&control_pending),
+                        staging,
+                        channel_depth: Arc::clone(&channel_depth),
+                        counters: Arc::clone(&counters),
+                        state: Arc::clone(&state),
+                        budget: budget.clone(),
+                    },
                     Task {
                         queue,
                         rx,
                         ctrl_rx,
-                        control_pending: Arc::clone(&control_pending),
-                        channel_depth: Arc::clone(&channel_depth),
-                        state: Arc::clone(&state),
+                        control_pending,
+                        channel_depth,
+                        state,
                         flush_max_rows: config.flush_max_rows(),
                         flush_interval_ms: config.flush_interval_ms,
-                    }
-                    .run(),
-                );
-                Ok(Self {
-                    tx,
-                    ctrl_tx,
-                    control_pending,
-                    staging,
-                    channel_depth,
-                    counters,
-                    state,
-                    budget: budget.clone(),
-                    producer_permit: Mutex::new(None),
-                    fixed_storage: Mutex::new(Some(fixed_storage)),
-                })
+                        lifetime: None,
+                    },
+                    fixed_storage,
+                ))
             })?;
-        *producer
-            .producer_permit
-            .get_mut()
-            .expect("new producer permit mutex is not poisoned") = Some(producer_permit);
+        // `Task` owns both guards so sender drop cannot release capacity while
+        // its receiver, staging ring, or retry queue remains live.
+        task.lifetime = Some(TaskLifetime {
+            _producer_permit: producer_permit,
+            _fixed_storage: fixed_storage,
+        });
+        wyrd_runtime::runtime().spawn(async move {
+            if let Some(reply) = task.run().await {
+                let _ = reply.send(Ok(()));
+            }
+        });
         Ok(producer)
     }
 
@@ -690,14 +696,9 @@ impl Producer {
             self.control_pending.store(false, Ordering::Release);
             return Err(WyrdQueueError::Backpressure);
         }
-        let result = reply_rx
+        reply_rx
             .blocking_recv()
-            .unwrap_or(Err(WyrdQueueError::QueueFull));
-        if self.state.load(Ordering::Acquire) == DRAINED {
-            self.release_fixed_storage();
-            self.release_producer_permit();
-        }
-        result
+            .unwrap_or(Err(WyrdQueueError::QueueFull))
     }
 
     /// Returns a lightweight occupancy snapshot.
@@ -725,36 +726,6 @@ impl Producer {
         self.state.load(Ordering::Acquire) == DRAINED
     }
 
-    /// Releases the lifetime charge after the producer task has terminally drained.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the producer fixed-storage mutex is poisoned, indicating an
-    /// invariant-breaking panic in another producer operation.
-    fn release_fixed_storage(&self) {
-        drop(
-            self.fixed_storage
-                .lock()
-                .expect("producer fixed-storage lock poisoned")
-                .take(),
-        );
-    }
-
-    /// Releases the shared producer slot after terminal drain completes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the producer permit mutex is poisoned, indicating an
-    /// invariant-breaking panic in another producer lifecycle operation.
-    fn release_producer_permit(&self) {
-        drop(
-            self.producer_permit
-                .lock()
-                .expect("producer permit lock poisoned")
-                .take(),
-        );
-    }
-
     /// Sends a flush control command after reserving this producer's one slot.
     fn control(
         &self,
@@ -774,21 +745,47 @@ impl Producer {
     }
 }
 
+/// Task-owned guards that reserve fixed storage and one producer admission slot.
+///
+/// They are intentionally dropped only with the task, after its receiver,
+/// staging ring, retry queue, and sealed owners have all been dropped.
+#[derive(Debug)]
+struct TaskLifetime {
+    /// Shared producer admission retained while task-owned queue state remains live.
+    _producer_permit: ProducerPermit,
+    /// Fixed queue storage charge retained while task-owned buffers remain live.
+    _fixed_storage: FixedStorageGuard,
+}
+
 /// The owned background receiver that serializes staging and control transitions.
 struct Task {
+    /// Staging and retry owner dropped before the task lifetime guards.
     queue: RecordQueue,
+    /// Stage-one receiver dropped before the task lifetime guards.
     rx: mpsc::Receiver<Row>,
+    /// Control receiver dropped before the task lifetime guards.
     ctrl_rx: mpsc::Receiver<Ctrl>,
+    /// One command-slot occupancy flag shared with the producer handle.
     control_pending: Arc<AtomicBool>,
+    /// Visible stage-one row count shared with the producer handle.
     channel_depth: Arc<AtomicUsize>,
+    /// Lifecycle state shared with the producer handle.
     state: Arc<AtomicU8>,
+    /// Row threshold that triggers one seal attempt.
     flush_max_rows: usize,
+    /// Optional periodic flush interval.
     flush_interval_ms: u64,
+    /// Fixed storage and producer admission held through task-owned state drop.
+    lifetime: Option<TaskLifetime>,
 }
 
 impl Task {
-    /// Runs the one receiver loop until shutdown or every sender is dropped.
-    async fn run(mut self) {
+    /// Runs the receiver loop until terminal drain or every sender is dropped.
+    ///
+    /// A successful shutdown returns its reply sender only after this method
+    /// consumes `self`; the outer spawned future sends that reply after all
+    /// task-owned queue state and lifetime guards have dropped.
+    async fn run(mut self) -> Option<oneshot::Sender<Result<(), WyrdQueueError>>> {
         let mut ticker = make_ticker(self.flush_interval_ms);
         loop {
             tokio::select! {
@@ -802,23 +799,22 @@ impl Task {
                     }
                     Some(Ctrl::Shutdown(reply)) => {
                         self.state.store(DRAINING, Ordering::Release);
+                        self.rx.close();
                         self.drain_channel().await;
                         let result = self.drain_to_completion().await;
                         if result.is_ok() {
                             self.state.store(DRAINED, Ordering::Release);
+                            self.control_pending.store(false, Ordering::Release);
+                            return Some(reply);
                         }
                         self.control_pending.store(false, Ordering::Release);
-                        let should_stop = result.is_ok();
                         let _ = reply.send(result);
-                        if should_stop {
-                            break;
-                        }
                     }
                     None => {
                         self.state.store(DRAINING, Ordering::Release);
                         let _ = self.drain_to_completion().await;
                         self.state.store(DRAINED, Ordering::Release);
-                        break;
+                        return None;
                     }
                 },
                 row = self.rx.recv() => match row {
@@ -833,7 +829,7 @@ impl Task {
                         self.state.store(DRAINING, Ordering::Release);
                         let _ = self.drain_to_completion().await;
                         self.state.store(DRAINED, Ordering::Release);
-                        break;
+                        return None;
                     }
                 },
                 () = tick(&mut ticker) => {
@@ -889,6 +885,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
@@ -1090,10 +1087,11 @@ mod tests {
             "replacement owns one permit"
         );
         drop(dropped);
+        std::thread::sleep(Duration::from_millis(20));
         assert_eq!(
             budget.metrics().live_producers,
             0,
-            "producer drop releases permit"
+            "task termination releases the dropped producer permit"
         );
     }
 
@@ -1148,6 +1146,98 @@ mod tests {
         second
             .shutdown()
             .expect("second zero-cap regression producer drains");
+    }
+
+    /// Refuses standalone zero-cap construction before it creates a budget or task.
+    #[test]
+    fn standalone_new_zero_config_refuses_without_queue_activity() {
+        let sink = Arc::new(MockSink::new());
+        assert!(matches!(
+            Producer::new(
+                "vala.bifrost.standalone_zero",
+                schema(),
+                sink.clone(),
+                QueueConfig {
+                    max_producers: 0,
+                    flush_interval_ms: 0,
+                    ..QueueConfig::default()
+                },
+            ),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        assert!(
+            sink.attempted().is_empty(),
+            "refused standalone construction cannot spawn queue transport work"
+        );
+    }
+
+    /// Retains task-owned capacity after a producer handle drops with an ambiguous batch.
+    #[test]
+    fn dropped_timeout_task_holds_capacity_until_terminal_cleanup() {
+        let sink = Arc::new(TimeoutSink::default());
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let config = QueueConfig {
+            max_producers: 1,
+            flush_interval_ms: 0,
+            flush_timeout_ms: 50,
+            ..QueueConfig::default()
+        };
+        let producer = Producer::with_budget(
+            "vala.bifrost.drop_timeout",
+            schema(),
+            sink.clone(),
+            config,
+            budget.clone(),
+        )
+        .expect("first producer fits the one-producer envelope");
+        producer
+            .enqueue(br#"{"id": 9}"#.to_vec(), card(), None)
+            .expect("row accepted before timeout");
+        assert!(matches!(
+            producer.flush(),
+            Err(WyrdQueueError::FlushTimeout)
+        ));
+        drop(producer);
+        let retained = budget.metrics();
+        assert_eq!(
+            retained.live_producers, 1,
+            "dropped handle leaves task permit live"
+        );
+        assert!(
+            retained.fixed_storage_bytes > 0,
+            "task still owns fixed queues"
+        );
+        assert!(matches!(
+            Producer::with_budget(
+                "vala.bifrost.drop_timeout_replacement",
+                schema(),
+                sink.clone(),
+                config,
+                budget.clone(),
+            ),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        std::thread::sleep(Duration::from_millis(150));
+        let replacement = Producer::with_budget(
+            "vala.bifrost.drop_timeout_replacement",
+            schema(),
+            sink,
+            config,
+            budget.clone(),
+        )
+        .expect("capacity releases only after the old task terminates");
+        replacement
+            .shutdown()
+            .expect("replacement producer terminally drains");
+        let settled = budget.metrics();
+        assert_eq!(
+            settled.live_producers, 0,
+            "terminal task cleanup releases permit"
+        );
+        assert_eq!(
+            settled.fixed_storage_bytes, 0,
+            "terminal task cleanup releases fixed queues"
+        );
     }
 
     /// Rolls producer admission back when fixed byte reservation fails after permit acquisition.

@@ -38,6 +38,8 @@ pub struct Bifrost {
     config: QueueConfig,
     budget: ClientByteBudget,
     producers: Mutex<HashMap<ProducerKey, Arc<Producer>>>,
+    /// Rejects inserts once shutdown begins its terminal drain.
+    closed: AtomicBool,
     dropped: AtomicU64,
     drop_warned: AtomicBool,
 }
@@ -49,6 +51,10 @@ pub struct BifrostMetrics {
     pub producers: usize,
     /// Bytes held by queued rows or a sealed batch owner.
     pub owned_bytes: usize,
+    /// Lifetime charges for constructed producer queue and control slots.
+    pub fixed_storage_bytes: usize,
+    /// Total handle reservation including dynamic ownership and fixed storage.
+    pub total_reserved_bytes: usize,
     /// Sealed batches not yet terminally acknowledged, cancelled, or poisoned.
     pub live_batches: usize,
     /// Ambiguous batches retained for a retry rather than released.
@@ -75,6 +81,7 @@ impl Bifrost {
             config,
             budget: ClientByteBudget::new(config.client_byte_limit()),
             producers: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             drop_warned: AtomicBool::new(false),
         }
@@ -102,8 +109,10 @@ impl Bifrost {
     ///
     /// This is a point-in-time telemetry view: concurrent inserts or background
     /// drains can change individual counters immediately after it is returned.
-    /// A fully settled handle reports zero bytes, batches, retry entries, and
-    /// pending controls.
+    /// A durable batch ACK reports zero dynamic bytes, batches, retry entries,
+    /// and pending controls. Constructed producers retain their fixed storage
+    /// charge until [`Self::shutdown`] removes them; then total reservation is
+    /// also zero.
     ///
     /// # Panics
     ///
@@ -113,6 +122,8 @@ impl Bifrost {
     pub fn metrics(&self) -> BifrostMetrics {
         let ClientByteMetrics {
             owned_bytes,
+            fixed_storage_bytes,
+            total_reserved_bytes,
             live_batches,
             retry_entries,
         } = self.budget.metrics();
@@ -120,6 +131,8 @@ impl Bifrost {
         BifrostMetrics {
             producers: producers.len(),
             owned_bytes,
+            fixed_storage_bytes,
+            total_reserved_bytes,
             live_batches,
             retry_entries,
             pending_controls: producers
@@ -151,6 +164,9 @@ impl Bifrost {
         card_ref: CardRef,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WyrdQueueError::QueueFull);
+        }
         self.producer_for(kind, table, schema)?
             .enqueue(json, card_ref, run_id)
     }
@@ -192,10 +208,11 @@ impl Bifrost {
 
     /// Drain every pooled producer and stop its background task.
     ///
-    /// The producer set is snapshotted before blocking. Once each producer
-    /// enters its draining state, new rows are rejected and buffered rows are
-    /// sent before this method returns; later producers are still drained after
-    /// an earlier producer fails.
+    /// The handle closes before it drains the current producer registry. Once
+    /// each producer enters its draining state, new rows are rejected and
+    /// buffered rows are sent before this method returns. Terminally drained
+    /// producers are removed and release their fixed-storage guards; a timed
+    /// out ambiguous producer stays retained for a later shutdown retry.
     ///
     /// # Errors
     /// Returns the first [`WyrdQueueError`] reported by a producer shutdown
@@ -206,6 +223,7 @@ impl Bifrost {
     /// Panics if the producer pool mutex is poisoned, which indicates an
     /// invariant-breaking panic in another handle operation.
     pub fn shutdown(&self) -> Result<(), WyrdQueueError> {
+        self.closed.store(true, Ordering::Release);
         let mut producers = self
             .producers
             .lock()
@@ -222,6 +240,10 @@ impl Bifrost {
                 first_error = Some(error);
             }
         }
+        self.producers
+            .lock()
+            .expect("producer pool poisoned")
+            .retain(|_, producer| !producer.is_drained());
         first_error.map_or(Ok(()), Err)
     }
 
@@ -246,25 +268,28 @@ impl Bifrost {
         table: &str,
         schema: &SchemaRef,
     ) -> Result<Arc<Producer>, WyrdQueueError> {
-        let key = ProducerKey {
-            scope: self.scope.clone(),
-            kind,
-            table: table.to_owned(),
-        };
         let mut pool = self.producers.lock().expect("producer pool poisoned");
-        if let Some(producer) = pool.get(&key) {
-            return Ok(Arc::clone(producer));
+        if let Some(producer) = pool.iter().find_map(|(key, producer)| {
+            (key.scope == self.scope && key.kind == kind && key.table == table)
+                .then(|| Arc::clone(producer))
+        }) {
+            return Ok(producer);
         }
         if pool.len() >= self.config.max_producers() {
             return Err(WyrdQueueError::Backpressure);
         }
         let producer = Arc::new(Producer::with_budget(
-            table.to_owned(),
+            table,
             schema.clone(),
             Arc::clone(&self.sink),
             self.config,
             self.budget.clone(),
-        ));
+        )?);
+        let key = ProducerKey {
+            scope: self.scope.clone(),
+            kind,
+            table: table.to_owned(),
+        };
         pool.insert(key, Arc::clone(&producer));
         Ok(producer)
     }

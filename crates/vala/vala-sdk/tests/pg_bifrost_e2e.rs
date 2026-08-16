@@ -94,8 +94,8 @@ mod pg_tests {
         /// release; the result type is required by the [`BatchSink`] contract.
         async fn send(
             &self,
-            batch: SealedBatch<ClientByteGuard>,
-        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
             self.started.store(true, Ordering::SeqCst);
             while !self.released.load(Ordering::SeqCst) {
                 let notified = self.wake.notified();
@@ -123,8 +123,8 @@ mod pg_tests {
     impl BatchSink<ClientByteGuard> for ReleasingSink {
         async fn send(
             &self,
-            batch: SealedBatch<ClientByteGuard>,
-        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
             self.started.store(true, Ordering::SeqCst);
             loop {
                 if self.released.load(Ordering::SeqCst) {
@@ -241,8 +241,8 @@ mod pg_tests {
         /// Panics if the test-only attempt recorder mutex is poisoned.
         async fn insert_batch(
             &self,
-            batch: SealedBatch<ClientByteGuard>,
-        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
             let byte_address = batch.bytes().as_ptr() as usize;
             self.attempts
                 .lock()
@@ -581,6 +581,11 @@ mod pg_tests {
         .await
         .expect("shutdown task joins")
         .expect("settled producer shutdown");
+        assert_eq!(
+            bifrost.metrics().total_reserved_bytes,
+            0,
+            "shutdown releases the producer's fixed queue reservation"
+        );
         srv.shutdown().await.expect("server shutdown");
     }
 

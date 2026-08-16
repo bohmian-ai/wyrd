@@ -32,7 +32,7 @@ pub struct Row {
 /// The retry state couples a retained sealed batch with its bounded retry slot.
 #[derive(Debug)]
 struct RetryEntry {
-    /// The exact batch returned by the ambiguous transport outcome.
+    /// The exact batch retained by the ambiguous transport outcome.
     batch: SealedBatch<ClientByteGuard>,
     /// Releases the global retry slot when the entry is settled or discarded.
     _permit: RetryPermit,
@@ -177,23 +177,37 @@ impl RecordQueue {
         Ok(())
     }
 
-    /// Sends a batch once and records only an explicit durable acknowledgement.
+    /// Sends a borrowed batch within the configured deadline and records explicit ACKs.
+    ///
+    /// The queue owns `batch` across the entire await. A deadline cancels only
+    /// the borrow-based sink future, then moves that untouched owner into the
+    /// bounded retry state with the same UUIDv7.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::FlushTimeout`] after retaining the exact batch
+    /// on deadline expiry, a sink error after retry or terminal settlement, or
+    /// backpressure if the bounded retry state cannot retain the batch.
     async fn send_one(
         &self,
         batch: SealedBatch<ClientByteGuard>,
         outcome: &mut FlushOutcome,
     ) -> Result<(), WyrdQueueError> {
-        match self.sink.send(batch).await {
-            Ok(DurableBatchAck { batch_id, rows }) => {
+        match tokio::time::timeout(self.config.flush_timeout(), self.sink.send(&batch)).await {
+            Ok(Ok(DurableBatchAck { batch_id, rows })) => {
                 outcome.batch_ids.push(batch_id);
                 outcome.rows_flushed += rows as usize;
                 Ok(())
             }
-            Err(SinkError::Retryable { error, batch }) => {
+            Ok(Err(SinkError::Retryable(error))) => {
                 self.retain_retry(batch)?;
                 Err(WyrdQueueError::Sink(error))
             }
-            Err(SinkError::Terminal(error)) => Err(WyrdQueueError::Sink(error)),
+            Ok(Err(SinkError::Terminal(error))) => Err(WyrdQueueError::Sink(error)),
+            Err(_) => {
+                self.retain_retry(batch)?;
+                Err(WyrdQueueError::FlushTimeout)
+            }
         }
     }
 

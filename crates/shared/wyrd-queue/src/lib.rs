@@ -41,4 +41,6 @@ pub use queue::{Flushable, RecordQueue, Row};
 pub use schema::{
     arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow, json_schema_to_fieldspec,
 };
-pub use sink::{BatchSink, DurableBatchAck, MockSink, OwnedIpcBytes, SealedBatch, SinkError};
+pub use sink::{
+    BatchSink, DurableBatchAck, MockSink, OwnedIpcBytes, SealedBatch, SharedIpcBytes, SinkError,
+};

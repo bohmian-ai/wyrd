@@ -1,5 +1,7 @@
 //! Producer/queue configuration.
 
+use std::time::Duration;
+
 /// Tuning knobs for the two-stage producer.
 ///
 /// Defaults are sane local-development values; a surface crate overrides them
@@ -62,6 +64,16 @@ impl QueueConfig {
     #[must_use]
     pub(crate) fn flush_max_rows(&self) -> usize {
         self.flush_max_rows.clamp(1, 50_000)
+    }
+
+    /// Returns the bounded send deadline, treating zero as one millisecond.
+    ///
+    /// A nonzero timeout guarantees that a borrowed sink future can be
+    /// cancelled while the queue retains its sealed owner for ambiguity
+    /// resolution; zero would otherwise create an accidental busy timeout.
+    #[must_use]
+    pub(crate) fn flush_timeout(&self) -> Duration {
+        Duration::from_millis(self.flush_timeout_ms.max(1))
     }
 }
 

@@ -1,7 +1,7 @@
 //! The client byte owner and one bounded background producer.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_schema::SchemaRef;
@@ -23,6 +23,76 @@ const RUNNING: u8 = 0;
 const DRAINING: u8 = 1;
 /// Fully drained producer state.
 const DRAINED: u8 = 2;
+/// One pending control is allowed for each producer's dedicated command channel.
+const CONTROL_SLOTS_PER_PRODUCER: usize = 1;
+
+/// Charged queue slots selected before one producer allocates its fixed buffers.
+#[derive(Debug, Clone, Copy)]
+struct ProducerCapacities {
+    /// Tokio data-channel slots retaining [`Row`] values.
+    data_slots: usize,
+    /// Fixed crossbeam staging slots retaining [`Row`] values.
+    staging_slots: usize,
+    /// Tokio control-channel slots retaining [`Ctrl`] values.
+    control_slots: usize,
+    /// Repository-owned slot storage charged for the producer lifetime.
+    charged_bytes: usize,
+}
+
+impl ProducerCapacities {
+    /// Derives a per-producer fixed queue allocation from configured cardinality.
+    ///
+    /// Half of each producer partition is charged to concrete
+    /// repository-owned [`Row`] and [`Ctrl`] slots, leaving the other half for
+    /// dynamic row, sealed-batch, and retry ownership. Tokio node headers,
+    /// `Arc` control blocks, allocator slack, TLS, and authentication state
+    /// remain cardinality-bounded T7R residual rather than guessed layout
+    /// bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] when the handle cannot reserve
+    /// at least one data and one staging slot per accepted producer, or when a
+    /// checked capacity calculation overflows.
+    fn for_handle(config: QueueConfig, budget: &ClientByteBudget) -> Result<Self, WyrdQueueError> {
+        let producer_count = config.max_producers().max(1);
+        let per_producer_bytes = budget.limit() / producer_count;
+        // Fixed slots cannot consume the entire partition: every accepted
+        // producer must still be able to reserve dynamic row ownership. Half
+        // of each partition remains available to rows, sealed batches, and
+        // retry retention under the same handle owner.
+        let fixed_storage_bytes = per_producer_bytes / 2;
+        let control_bytes = CONTROL_SLOTS_PER_PRODUCER
+            .checked_mul(std::mem::size_of::<Ctrl>())
+            .ok_or(WyrdQueueError::Backpressure)?;
+        let row_slot_bytes = std::mem::size_of::<Row>();
+        let available_row_bytes = fixed_storage_bytes
+            .checked_sub(control_bytes)
+            .ok_or(WyrdQueueError::Backpressure)?;
+        let row_slots = available_row_bytes / row_slot_bytes;
+        if row_slots < 2 {
+            return Err(WyrdQueueError::Backpressure);
+        }
+        let data_slots = config.channel_capacity().min(row_slots - 1);
+        let staging_slots = config
+            .staging_capacity()
+            .min(row_slots.saturating_sub(data_slots));
+        if data_slots == 0 || staging_slots == 0 {
+            return Err(WyrdQueueError::Backpressure);
+        }
+        let charged_bytes = data_slots
+            .checked_add(staging_slots)
+            .and_then(|slots| slots.checked_mul(row_slot_bytes))
+            .and_then(|rows| rows.checked_add(control_bytes))
+            .ok_or(WyrdQueueError::Backpressure)?;
+        Ok(Self {
+            data_slots,
+            staging_slots,
+            control_slots: CONTROL_SLOTS_PER_PRODUCER,
+            charged_bytes,
+        })
+    }
+}
 
 /// One shared handle-wide byte and cardinality budget.
 #[derive(Debug, Clone)]
@@ -37,6 +107,7 @@ struct ClientBudgetState {
     used: AtomicUsize,
     live_batches: AtomicUsize,
     retry_entries: AtomicUsize,
+    fixed_storage: AtomicUsize,
 }
 
 impl ClientByteBudget {
@@ -49,6 +120,7 @@ impl ClientByteBudget {
                 used: AtomicUsize::new(0),
                 live_batches: AtomicUsize::new(0),
                 retry_entries: AtomicUsize::new(0),
+                fixed_storage: AtomicUsize::new(0),
             }),
         }
     }
@@ -142,23 +214,71 @@ impl ClientByteBudget {
     /// and settlement assertions, rather than a transactional snapshot.
     #[must_use]
     pub fn metrics(&self) -> ClientByteMetrics {
+        let total_reserved_bytes = self.used_bytes();
+        let fixed_storage_bytes = self.state.fixed_storage.load(Ordering::Acquire);
         ClientByteMetrics {
-            owned_bytes: self.used_bytes(),
+            owned_bytes: total_reserved_bytes.saturating_sub(fixed_storage_bytes),
+            fixed_storage_bytes,
+            total_reserved_bytes,
             live_batches: self.state.live_batches.load(Ordering::Acquire),
             retry_entries: self.state.retry_entries.load(Ordering::Acquire),
         }
+    }
+
+    /// Returns the immutable byte limit used to partition fixed producer storage.
+    #[must_use]
+    fn limit(&self) -> usize {
+        self.state.limit
+    }
+
+    /// Reserves fixed producer queue storage before its buffers are constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] before allocation when the
+    /// fixed producer slots cannot fit the one handle-wide budget.
+    fn reserve_fixed_storage(&self, bytes: usize) -> Result<FixedStorageGuard, WyrdQueueError> {
+        let guard = self.reserve(bytes)?;
+        self.state.fixed_storage.fetch_add(bytes, Ordering::AcqRel);
+        Ok(FixedStorageGuard {
+            guard,
+            budget: self.clone(),
+        })
     }
 }
 
 /// Point-in-time accounting for the bounded ownership held by one client handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientByteMetrics {
-    /// Bytes currently reserved by queued rows or a sealed batch owner.
+    /// Dynamic bytes currently reserved by queued rows or a sealed batch owner.
     pub owned_bytes: usize,
+    /// Lifetime charges for constructed producer data, staging, and control slots.
+    pub fixed_storage_bytes: usize,
+    /// Total handle reservation: dynamic owned bytes plus fixed storage charges.
+    pub total_reserved_bytes: usize,
     /// Sealed batch owners that have not reached terminal settlement.
     pub live_batches: usize,
     /// Retained ambiguous batches awaiting a later retry attempt.
     pub retry_entries: usize,
+}
+
+/// Lifetime reservation for fixed producer queue storage.
+#[derive(Debug)]
+struct FixedStorageGuard {
+    /// The one byte-budget guard covering fixed slot storage.
+    guard: ClientByteGuard,
+    /// Shared budget counter reduced with the fixed guard.
+    budget: ClientByteBudget,
+}
+
+impl Drop for FixedStorageGuard {
+    /// Releases the fixed-slot accounting before its byte guard returns capacity.
+    fn drop(&mut self) {
+        self.budget
+            .state
+            .fixed_storage
+            .fetch_sub(self.guard.bytes, Ordering::AcqRel);
+    }
 }
 
 /// The exclusive reservation that follows bytes through every ownership state.
@@ -272,17 +392,26 @@ pub struct Producer {
     counters: Arc<Counters>,
     state: Arc<AtomicU8>,
     budget: ClientByteBudget,
+    fixed_storage: Mutex<Option<FixedStorageGuard>>,
 }
 
 impl Producer {
     /// Creates a standalone producer with its own accepted 32 MiB budget.
-    #[must_use]
+    ///
+    /// The fixed data, staging, and control slots are charged before their
+    /// queues are constructed, then remain charged until terminal shutdown or
+    /// producer drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] before allocating fixed queue
+    /// storage when the accepted envelope cannot fit the client budget.
     pub fn new(
-        table: String,
+        table: &str,
         schema: SchemaRef,
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
-    ) -> Self {
+    ) -> Result<Self, WyrdQueueError> {
         Self::with_budget(
             table,
             schema,
@@ -293,23 +422,34 @@ impl Producer {
     }
 
     /// Creates a producer sharing the supplied handle-wide budget.
-    #[must_use]
+    ///
+    /// The fixed slot partition is derived from the configured producer
+    /// cardinality before constructing Tokio or crossbeam buffers. This keeps
+    /// every accepted producer's material slot capacity inside one handle-wide
+    /// byte owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] before queue construction when
+    /// the fixed storage charge cannot fit the shared client budget.
     pub fn with_budget(
-        table: String,
+        table: &str,
         schema: SchemaRef,
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
         budget: ClientByteBudget,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel(config.channel_capacity());
-        let (ctrl_tx, ctrl_rx) = mpsc::channel(config.max_producers().max(1));
-        let staging = Arc::new(ArrayQueue::new(config.staging_capacity()));
+    ) -> Result<Self, WyrdQueueError> {
+        let capacities = ProducerCapacities::for_handle(config, &budget)?;
+        let fixed_storage = budget.reserve_fixed_storage(capacities.charged_bytes)?;
+        let (tx, rx) = mpsc::channel(capacities.data_slots);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(capacities.control_slots);
+        let staging = Arc::new(ArrayQueue::new(capacities.staging_slots));
         let channel_depth = Arc::new(AtomicUsize::new(0));
         let counters = Arc::new(Counters::default());
         let state = Arc::new(AtomicU8::new(RUNNING));
         let control_pending = Arc::new(AtomicBool::new(false));
         let queue = RecordQueue::new(
-            table,
+            table.to_owned(),
             schema,
             Arc::clone(&staging),
             sink,
@@ -330,7 +470,7 @@ impl Producer {
             }
             .run(),
         );
-        Self {
+        Ok(Self {
             tx,
             ctrl_tx,
             control_pending,
@@ -339,7 +479,8 @@ impl Producer {
             counters,
             state,
             budget,
-        }
+            fixed_storage: Mutex::new(Some(fixed_storage)),
+        })
     }
 
     /// Reserves row capacity before handing it to the bounded channel.
@@ -409,9 +550,13 @@ impl Producer {
             self.control_pending.store(false, Ordering::Release);
             return Err(WyrdQueueError::Backpressure);
         }
-        reply_rx
+        let result = reply_rx
             .blocking_recv()
-            .unwrap_or(Err(WyrdQueueError::QueueFull))
+            .unwrap_or(Err(WyrdQueueError::QueueFull));
+        if self.state.load(Ordering::Acquire) == DRAINED {
+            self.release_fixed_storage();
+        }
+        result
     }
 
     /// Returns a lightweight occupancy snapshot.
@@ -431,6 +576,27 @@ impl Producer {
     #[must_use]
     pub fn has_pending_control(&self) -> bool {
         self.control_pending.load(Ordering::Acquire)
+    }
+
+    /// Returns whether the background owner has terminally drained all retained work.
+    #[must_use]
+    pub fn is_drained(&self) -> bool {
+        self.state.load(Ordering::Acquire) == DRAINED
+    }
+
+    /// Releases the lifetime charge after the producer task has terminally drained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer fixed-storage mutex is poisoned, indicating an
+    /// invariant-breaking panic in another producer operation.
+    fn release_fixed_storage(&self) {
+        drop(
+            self.fixed_storage
+                .lock()
+                .expect("producer fixed-storage lock poisoned")
+                .take(),
+        );
     }
 
     /// Sends a flush control command after reserving this producer's one slot.
@@ -482,10 +648,15 @@ impl Task {
                         self.state.store(DRAINING, Ordering::Release);
                         self.drain_channel().await;
                         let result = self.drain_to_completion().await;
-                        self.state.store(DRAINED, Ordering::Release);
+                        if result.is_ok() {
+                            self.state.store(DRAINED, Ordering::Release);
+                        }
                         self.control_pending.store(false, Ordering::Release);
+                        let should_stop = result.is_ok();
                         let _ = reply.send(result);
-                        break;
+                        if should_stop {
+                            break;
+                        }
                     }
                     None => {
                         self.state.store(DRAINING, Ordering::Release);
@@ -560,13 +731,19 @@ async fn tick(ticker: &mut Option<Interval>) {
 mod tests {
     //! Bounded ownership tests for the ordinary Rust queue.
 
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use async_trait::async_trait;
+    use tokio::sync::Notify;
     use wyrd_spec::reference::CardRef;
 
     use super::ClientByteBudget;
-    use crate::{MockSink, Producer, QueueConfig, WyrdQueueError};
+    use crate::{
+        BatchSink, ClientByteGuard, DurableBatchAck, MockSink, Producer, QueueConfig, SealedBatch,
+        SinkError, WyrdQueueError,
+    };
 
     /// Builds a one-column user schema for sealed-batch tests.
     fn schema() -> SchemaRef {
@@ -576,6 +753,83 @@ mod tests {
     /// Builds the card correlation required by a queue row.
     fn card() -> CardRef {
         "prod/Service/queue@1.0.0".parse().expect("valid test card")
+    }
+
+    /// Cancellable sink that acknowledges only after the test releases it.
+    #[derive(Default)]
+    struct TimeoutSink {
+        /// Identities observed before each borrowed send attempt.
+        attempts: Mutex<Vec<[u8; 16]>>,
+        /// Whether later attempts may complete with a durable acknowledgement.
+        released: AtomicBool,
+        /// Wakes a retained attempt after the test chooses to resolve it.
+        wake: Notify,
+        /// Borrowed send futures cancelled by the queue deadline.
+        cancelled: AtomicUsize,
+    }
+
+    /// Records whether one borrowed sink attempt reached an acknowledgement.
+    struct BorrowedAttempt<'a> {
+        /// Counter updated only when cancellation drops the borrowed future.
+        cancelled: &'a AtomicUsize,
+        /// Set after the sink has produced a durable acknowledgement.
+        acknowledged: bool,
+    }
+
+    impl Drop for BorrowedAttempt<'_> {
+        /// Counts deadline cancellation without touching the queue-owned batch.
+        fn drop(&mut self) {
+            if !self.acknowledged {
+                self.cancelled.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    impl TimeoutSink {
+        /// Releases all future borrowed attempts for durable acknowledgement.
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.wake.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl BatchSink<ClientByteGuard> for TimeoutSink {
+        /// Waits for release without ever taking ownership from the queue.
+        ///
+        /// # Errors
+        ///
+        /// This test sink does not return an error; a queue deadline cancels
+        /// its borrowed future and preserves the batch outside this method.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the test-only attempt recorder mutex is poisoned.
+        async fn send(
+            &self,
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
+            let mut attempt = BorrowedAttempt {
+                cancelled: &self.cancelled,
+                acknowledged: false,
+            };
+            self.attempts
+                .lock()
+                .expect("timeout sink attempt lock poisoned")
+                .push(batch.batch_id);
+            while !self.released.load(Ordering::Acquire) {
+                let notified = self.wake.notified();
+                if self.released.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+            attempt.acknowledged = true;
+            Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
+            })
+        }
     }
 
     /// Refuses a byte reservation before a payload owner can grow beyond 32 MiB.
@@ -596,7 +850,7 @@ mod tests {
         sink.fail_next(1);
         let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
-            "vala.bifrost.queue".to_owned(),
+            "vala.bifrost.queue",
             schema(),
             sink.clone(),
             QueueConfig {
@@ -604,7 +858,8 @@ mod tests {
                 ..QueueConfig::default()
             },
             budget.clone(),
-        );
+        )
+        .expect("fixed queue storage fits the default budget");
         producer
             .enqueue(br#"{"id": 1}"#.to_vec(), card(), None)
             .expect("row accepted");
@@ -616,6 +871,78 @@ mod tests {
         let attempts = sink.attempted();
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0], attempts[1]);
-        assert_eq!(budget.used_bytes(), 0, "durable ACK settles the owner once");
+        let settled = budget.metrics();
+        assert_eq!(
+            settled.owned_bytes, 0,
+            "durable ACK settles dynamic ownership"
+        );
+        assert_eq!(
+            settled.live_batches, 0,
+            "durable ACK releases the batch slot"
+        );
+        assert_eq!(
+            settled.retry_entries, 0,
+            "durable ACK releases the retry slot"
+        );
+        assert!(
+            settled.fixed_storage_bytes > 0,
+            "the live producer retains its fixed queue storage charge"
+        );
+        producer.shutdown().expect("settled producer shutdown");
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "shutdown releases fixed queue storage"
+        );
+    }
+
+    /// Preserves one exact owner when the bounded queue deadline cancels a borrow.
+    #[test]
+    fn flush_timeout_retains_batch_until_later_ack() {
+        let sink = Arc::new(TimeoutSink::default());
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let producer = Producer::with_budget(
+            "vala.bifrost.timeout",
+            schema(),
+            sink.clone(),
+            QueueConfig {
+                flush_interval_ms: 0,
+                flush_timeout_ms: 5,
+                ..QueueConfig::default()
+            },
+            budget.clone(),
+        )
+        .expect("fixed queue storage fits the default budget");
+        producer
+            .enqueue(br#"{"id": 7}"#.to_vec(), card(), None)
+            .expect("row accepted");
+        assert!(matches!(
+            producer.flush(),
+            Err(WyrdQueueError::FlushTimeout)
+        ));
+        let retained = budget.metrics();
+        assert!(retained.owned_bytes > 0, "timeout retains the byte owner");
+        assert_eq!(retained.live_batches, 1, "timeout retains the batch slot");
+        assert_eq!(retained.retry_entries, 1, "timeout retains the retry slot");
+        assert_eq!(
+            sink.cancelled.load(Ordering::Acquire),
+            1,
+            "deadline cancelled only the borrowed sink future"
+        );
+        sink.release();
+        producer.flush().expect("retained timeout batch resolves");
+        let attempts = sink
+            .attempts
+            .lock()
+            .expect("timeout sink attempt lock poisoned")
+            .clone();
+        assert_eq!(attempts.len(), 2, "one timeout then one resolving retry");
+        assert_eq!(attempts[0], attempts[1], "timeout retains the same UUIDv7");
+        let settled = budget.metrics();
+        assert_eq!(settled.owned_bytes, 0, "ACK releases dynamic bytes");
+        assert_eq!(settled.live_batches, 0, "ACK releases batch slot");
+        assert_eq!(settled.retry_entries, 0, "ACK releases retry slot");
+        producer.shutdown().expect("timeout producer shutdown");
+        assert_eq!(budget.used_bytes(), 0, "shutdown releases fixed storage");
     }
 }

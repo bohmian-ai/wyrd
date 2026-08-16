@@ -8,14 +8,14 @@ use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkE
 /// The ordinary Rust transport seam for one owned batch guard type.
 #[async_trait]
 pub trait IngestTransport<G>: Send + Sync + 'static {
-    /// Ships one owned batch, returning that exact owner on an ambiguous outcome.
+    /// Borrows one owned batch while the queue retains its recovery shell.
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::Retryable`] with the unchanged batch when a timeout
-    /// or transport loss leaves durable commit ambiguous, or terminal failure
-    /// after the batch owner has been consumed.
-    async fn insert_batch(&self, batch: SealedBatch<G>) -> Result<DurableBatchAck, SinkError<G>>;
+    /// Returns [`SinkError::Retryable`] when a timeout or transport loss leaves
+    /// durable commit ambiguous, allowing the queue to retain the unchanged
+    /// batch; terminal failure lets the queue consume the owner.
+    async fn insert_batch(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError>;
 }
 
 /// The Record queue sink that forwards each non-cloneable batch to gRPC.
@@ -33,10 +33,16 @@ impl BifrostIngestSink {
 
 #[async_trait]
 impl BatchSink<ClientByteGuard> for BifrostIngestSink {
+    /// Forwards a borrowed sealed owner to the ordinary-Rust transport.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the transport's retryable or terminal settlement without
+    /// consuming the queue-owned batch shell.
     async fn send(
         &self,
-        batch: SealedBatch<ClientByteGuard>,
-    ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+        batch: &SealedBatch<ClientByteGuard>,
+    ) -> Result<DurableBatchAck, SinkError> {
         self.transport.insert_batch(batch).await
     }
 }

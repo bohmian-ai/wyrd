@@ -119,8 +119,8 @@ mod sdk {
     impl BatchSink<ClientByteGuard> for StallSink {
         async fn send(
             &self,
-            _batch: SealedBatch<ClientByteGuard>,
-        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            _batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
             self.started.store(true, Ordering::SeqCst);
             std::future::pending::<()>().await;
             unreachable!()
@@ -137,8 +137,8 @@ mod sdk {
     impl BatchSink<ClientByteGuard> for LifecycleSink {
         async fn send(
             &self,
-            batch: SealedBatch<ClientByteGuard>,
-        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
             self.attempts
                 .lock()
                 .expect("attempts lock")
@@ -242,6 +242,74 @@ mod sdk {
         );
     }
 
+    /// Admits at most the default 64 producer envelopes inside one 32 MiB owner.
+    #[test]
+    fn default_producer_envelopes_charge_before_registry_growth() {
+        let scope =
+            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
+        let bifrost = Bifrost::new(
+            scope,
+            Arc::new(MockSink::new()),
+            QueueConfig {
+                // Disable timer work so the test isolates default cardinality
+                // admission rather than concurrent frame construction.
+                flush_interval_ms: 0,
+                ..QueueConfig::default()
+            },
+        );
+        let schema = test_schema();
+        for index in 0..QueueConfig::MAX_LIVE_ENTRIES {
+            bifrost
+                .insert(
+                    SinkKind::Record,
+                    &format!("ns.capacity_{index}"),
+                    &schema,
+                    row(),
+                    card(),
+                    None,
+                )
+                .expect("default producer envelope fits before construction");
+        }
+        let admitted = bifrost.metrics();
+        assert_eq!(admitted.producers, QueueConfig::MAX_LIVE_ENTRIES);
+        assert!(
+            admitted.total_reserved_bytes <= QueueConfig::MAX_CLIENT_BYTE_LIMIT,
+            "fixed and dynamic ownership stays inside the one 32 MiB budget: {admitted:?}"
+        );
+        assert!(matches!(
+            bifrost.insert(
+                SinkKind::Record,
+                "ns.capacity_overflow",
+                &schema,
+                row(),
+                card(),
+                None,
+            ),
+            Err(wyrd_queue::WyrdQueueError::Backpressure)
+        ));
+        let refused = bifrost.metrics();
+        assert_eq!(
+            refused.producers,
+            QueueConfig::MAX_LIVE_ENTRIES,
+            "refusal occurs before the registry can grow"
+        );
+        assert!(
+            refused.total_reserved_bytes <= QueueConfig::MAX_CLIENT_BYTE_LIMIT,
+            "refusal cannot oversubscribe the owner: {refused:?}"
+        );
+        let shutdown = bifrost.shutdown();
+        assert!(
+            shutdown.is_ok(),
+            "default producer cleanup: {shutdown:?}; metrics={:?}",
+            bifrost.metrics()
+        );
+        assert_eq!(
+            bifrost.metrics().total_reserved_bytes,
+            0,
+            "shutdown removes producer fixed-storage charges"
+        );
+    }
+
     #[test]
     fn insert_propagates_queue_full() {
         let sink = Arc::new(StallSink::default());
@@ -275,8 +343,7 @@ mod sdk {
         );
     }
 
-    /// Flush and shutdown visit every producer, return the deterministic first
-    /// error, and leave successful later producers fully drained.
+    /// Flush visits every producer and shutdown releases fixed storage after terminal settlement.
     #[test]
     fn lifecycle_drains_all_producers_after_first_error() {
         let sink = Arc::new(LifecycleSink::default());
@@ -286,7 +353,7 @@ mod sdk {
             scope,
             Arc::clone(&sink) as Arc<dyn BatchSink<ClientByteGuard>>,
             QueueConfig {
-                flush_max_rows: 1,
+                flush_max_rows: 2,
                 flush_interval_ms: 0,
                 ..QueueConfig::default()
             },
@@ -305,8 +372,9 @@ mod sdk {
         assert!(attempts_after_flush.iter().any(|table| table == "a"));
         assert!(attempts_after_flush.iter().any(|table| table == "b"));
 
-        let shutdown_error = bifrost.shutdown().expect_err("a retry must fail shutdown");
-        assert!(shutdown_error.to_string().contains("a producer failed"));
+        bifrost
+            .shutdown()
+            .expect("terminally settled producers release their fixed storage on shutdown");
         assert!(
             bifrost
                 .insert(SinkKind::Record, "b", &schema, row(), card(), None)
@@ -363,8 +431,8 @@ mod sdk {
     impl IngestTransport<ClientByteGuard> for RecordingTransport {
         async fn insert_batch(
             &self,
-            batch: SealedBatch<ClientByteGuard>,
-        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
             self.seen.lock().expect("poisoned").push(batch.batch_id);
             Ok(DurableBatchAck {
                 batch_id: batch.batch_id,
@@ -391,10 +459,9 @@ mod sdk {
         };
 
         let rt = wyrd_runtime::runtime();
-        rt.block_on(sink.send(batch())).expect("first send");
-        // A retry receives its original owner from a real ambiguous transport;
-        // this test uses a fresh equivalent fixture to assert ID forwarding.
-        rt.block_on(sink.send(batch())).expect("retry send");
+        let batch = batch();
+        rt.block_on(sink.send(&batch)).expect("first send");
+        rt.block_on(sink.send(&batch)).expect("retry send");
 
         let seen = transport.seen.lock().expect("poisoned");
         assert_eq!(seen.len(), 2);

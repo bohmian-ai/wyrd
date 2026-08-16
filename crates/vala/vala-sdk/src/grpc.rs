@@ -15,7 +15,7 @@ use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
 
 use crate::sink::IngestTransport;
-use wyrd_queue::{ClientByteGuard, DurableBatchAck, OwnedIpcBytes, SealedBatch, SinkError};
+use wyrd_queue::{ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 
 /// Maximum Arrow IPC payload for one Bifrost batch after decompression.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
@@ -244,46 +244,35 @@ impl BifrostGrpcTransport {
 
 #[async_trait]
 impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
-    /// Sends a moved sealed owner and returns it unchanged when the gRPC outcome is ambiguous.
+    /// Borrows a sealed owner and shares its frame with gRPC without copying.
     ///
-    /// The `Vec<u8>` queue owner becomes an owned [`Bytes`] transport frame
-    /// without copying. A durable acknowledgement releases the owner; only a
-    /// typed service-unavailable result reconstructs that same owner for the
-    /// queue's bounded retry set.
+    /// The queue's `Arc<Vec<u8>>` shell becomes an owned [`Bytes`] transport
+    /// frame through `Bytes::from_owner` without copying. The queue keeps its
+    /// guard and stable UUIDv7 while this cancellable borrowed attempt runs.
     ///
     /// # Errors
     ///
     /// Returns [`SinkError::Retryable`] for an ambiguous unavailable outcome
     /// and [`SinkError::Terminal`] for frame validation or a terminal server
-    /// failure. Cancellation before an ACK is treated as unavailable by the
-    /// preceding unary attempt and therefore retains the batch.
+    /// failure. Cancellation before an ACK leaves the queue's borrowed owner
+    /// intact for retry resolution.
     async fn insert_batch(
         &self,
-        batch: SealedBatch<ClientByteGuard>,
-    ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+        batch: &SealedBatch<ClientByteGuard>,
+    ) -> Result<DurableBatchAck, SinkError> {
         if let Err(error) = validate_frame(&batch.table, batch.batch_id, batch.bytes().len()) {
             return Err(SinkError::Terminal(error));
         }
-        let SealedBatch {
-            table,
-            batch_id,
-            frame,
-            rows,
-        } = batch;
-        let (frame, guard) = frame.into_parts();
-        let bytes = Bytes::from(frame);
-        let result = self.send_owned_bytes(&table, batch_id, bytes.clone()).await;
+        let bytes = Bytes::from_owner(batch.frame.shared_bytes());
+        let result = self
+            .send_owned_bytes(&batch.table, batch.batch_id, bytes)
+            .await;
         match result {
-            Ok(()) => Ok(DurableBatchAck { batch_id, rows }),
-            Err(error @ WyrdError::ServiceUnavailable { .. }) => Err(SinkError::Retryable {
-                error,
-                batch: SealedBatch {
-                    table,
-                    batch_id,
-                    frame: OwnedIpcBytes::new(Vec::from(bytes), guard),
-                    rows,
-                },
+            Ok(()) => Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
             }),
+            Err(error @ WyrdError::ServiceUnavailable { .. }) => Err(SinkError::Retryable(error)),
             Err(error) => Err(SinkError::Terminal(error)),
         }
     }

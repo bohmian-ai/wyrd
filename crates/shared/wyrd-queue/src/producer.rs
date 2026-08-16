@@ -25,6 +25,8 @@ const DRAINING: u8 = 1;
 const DRAINED: u8 = 2;
 /// One pending control is allowed for each producer's dedicated command channel.
 const CONTROL_SLOTS_PER_PRODUCER: usize = 1;
+/// Bounded delay between dropped-handle ambiguity resolution attempts.
+const DROPPED_HANDLE_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Charged queue slots selected before one producer allocates its fixed buffers.
 #[derive(Debug, Clone, Copy)]
@@ -812,7 +814,7 @@ impl Task {
                     }
                     None => {
                         self.state.store(DRAINING, Ordering::Release);
-                        let _ = self.drain_to_completion().await;
+                        self.drain_dropped_handle().await;
                         self.state.store(DRAINED, Ordering::Release);
                         return None;
                     }
@@ -827,7 +829,7 @@ impl Task {
                     }
                     None => {
                         self.state.store(DRAINING, Ordering::Release);
-                        let _ = self.drain_to_completion().await;
+                        self.drain_dropped_handle().await;
                         self.state.store(DRAINED, Ordering::Release);
                         return None;
                     }
@@ -857,6 +859,24 @@ impl Task {
         }
         Ok(())
     }
+
+    /// Resolves a dropped handle's ambiguous work before releasing task-owned capacity.
+    ///
+    /// The queue serializes one retained batch attempt at a time. An ambiguous
+    /// timeout or retryable result leaves `has_pending` true, so this task keeps
+    /// its byte and producer guards and waits before retrying the same stable
+    /// batch identity. A terminal result that consumed the final owner leaves
+    /// no pending work and permits task cleanup.
+    async fn drain_dropped_handle(&mut self) {
+        self.drain_channel().await;
+        while self.queue.has_pending() {
+            match self.queue.seal_and_send().await {
+                Ok(_) => {}
+                Err(_) if !self.queue.has_pending() => break,
+                Err(_) => tokio::time::sleep(DROPPED_HANDLE_RETRY_BACKOFF).await,
+            }
+        }
+    }
 }
 
 /// Creates the optional interval only after entering the shared Tokio runtime.
@@ -885,7 +905,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
@@ -913,6 +933,8 @@ mod tests {
     struct TimeoutSink {
         /// Identities observed before each borrowed send attempt.
         attempts: Mutex<Vec<[u8; 16]>>,
+        /// Frame allocation addresses observed before each borrowed send attempt.
+        allocations: Mutex<Vec<usize>>,
         /// Whether later attempts may complete with a durable acknowledgement.
         released: AtomicBool,
         /// Wakes a retained attempt after the test chooses to resolve it.
@@ -970,6 +992,10 @@ mod tests {
                 .lock()
                 .expect("timeout sink attempt lock poisoned")
                 .push(batch.batch_id);
+            self.allocations
+                .lock()
+                .expect("timeout sink allocation lock poisoned")
+                .push(batch.bytes().as_ptr() as usize);
             while !self.released.load(Ordering::Acquire) {
                 let notified = self.wake.notified();
                 if self.released.load(Ordering::Acquire) {
@@ -1207,6 +1233,15 @@ mod tests {
             retained.fixed_storage_bytes > 0,
             "task still owns fixed queues"
         );
+        assert!(
+            retained.owned_bytes > 0,
+            "task retains the sealed frame owner"
+        );
+        assert_eq!(
+            retained.live_batches, 1,
+            "task retains the sealed batch slot"
+        );
+        assert_eq!(retained.retry_entries, 1, "task retains the retry slot");
         assert!(matches!(
             Producer::with_budget(
                 "vala.bifrost.drop_timeout_replacement",
@@ -1217,7 +1252,41 @@ mod tests {
             ),
             Err(WyrdQueueError::Backpressure)
         ));
-        std::thread::sleep(Duration::from_millis(150));
+        sink.release();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while budget.metrics().live_producers != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let resolved = budget.metrics();
+        assert_eq!(
+            resolved.live_producers, 0,
+            "durable retry acknowledgement permits terminal task cleanup"
+        );
+        assert_eq!(resolved.owned_bytes, 0, "ACK releases the same frame owner");
+        assert_eq!(resolved.live_batches, 0, "ACK releases the batch slot");
+        assert_eq!(resolved.retry_entries, 0, "ACK releases the retry slot");
+        let attempts = sink
+            .attempts
+            .lock()
+            .expect("timeout sink attempt lock poisoned")
+            .clone();
+        let allocations = sink
+            .allocations
+            .lock()
+            .expect("timeout sink allocation lock poisoned")
+            .clone();
+        assert!(
+            attempts.len() >= 2,
+            "dropped task retries the retained batch"
+        );
+        assert!(
+            attempts.iter().all(|batch_id| *batch_id == attempts[0]),
+            "every dropped-handle attempt retains the same UUIDv7"
+        );
+        assert!(
+            allocations.iter().all(|address| *address == allocations[0]),
+            "every dropped-handle attempt retains the same frame allocation"
+        );
         let replacement = Producer::with_budget(
             "vala.bifrost.drop_timeout_replacement",
             schema(),

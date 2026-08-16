@@ -1781,6 +1781,16 @@ impl Oracle {
         Err(BifrostError::QueryExecutionFailed)
     }
 
+    /// Starts one query telemetry owner once across a possible stale retry.
+    fn ensure_query_telemetry(
+        &self,
+        telemetry: &mut Option<QueryTelemetryGuard>,
+        visibility: VisibilityMode,
+        class: QueryClass,
+    ) {
+        telemetry.get_or_insert_with(|| self.telemetry.start_query(visibility, class));
+    }
+
     /// Execute one bounded plan/admit/audit/scan attempt for a SQL query.
     ///
     /// A stale first attempt returns `Ok(None)` only after releasing its full
@@ -1800,19 +1810,18 @@ impl Oracle {
         let planned = self
             .plan_sql_attempt(context, &request.sql, tables, deadline)
             .await?;
-        let query_class = planned.query_class;
-        query_telemetry
-            .get_or_insert_with(|| self.telemetry.start_query(request.visibility, query_class));
+        self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let admitted = self
-            .admit_sql_query(context, query_class, planned.local_ratio, deadline)
+            .admit_sql_query(context, planned.query_class, planned.local_ratio, deadline)
             .await?;
         let (session, mut admitted) = self.lease_session(deadline, admitted, "lease rejection")?;
+        admitted.retain_physical_projections(&planned.cuts)?;
         let drained = match self
             .audit_and_drain_cut(CutAuditInput {
                 context,
                 request,
                 cuts: &planned.cuts,
-                query_class,
+                query_class: planned.query_class,
                 retry_ordinal,
                 deadline,
                 admitted: &admitted,
@@ -1830,7 +1839,7 @@ impl Oracle {
                 logical_bytes_selected: Self::logical_selected_bytes(&planned.cuts),
                 cuts: planned.cuts,
                 live_batches: drained.batches,
-                query_class,
+                query_class: planned.query_class,
                 admitted: &admitted,
                 session,
                 deadline,
@@ -2111,6 +2120,7 @@ impl Oracle {
             admitted,
             "typed execution lease rejection",
         )?;
+        admitted.retain_physical_projections(&cuts)?;
         let logical_bytes_selected = Self::logical_selected_bytes(&cuts);
         let fence_owner = TailFenceDrainer::new(
             &self.tails,

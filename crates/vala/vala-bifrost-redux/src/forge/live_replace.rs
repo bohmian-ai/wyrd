@@ -189,6 +189,7 @@ impl Forge {
         let resources = super::rewrite::ForgeAttemptResources::acquire(
             &self.core.resources,
             request,
+            binding,
             &self.core.rewrite_spill_root,
             Uuid::nil(),
             Uuid::now_v7(),

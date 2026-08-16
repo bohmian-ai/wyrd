@@ -19,7 +19,7 @@ mod pg_tests {
     use sqlx::types::Uuid;
     use std::sync::Arc;
     use vala_bifrost_redux::catalog::TableRef;
-    use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+    use vala_bifrost_redux::contracts::ScribeAppend;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::resources::{
         BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,

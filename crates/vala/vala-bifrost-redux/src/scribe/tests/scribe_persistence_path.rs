@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::catalog::{TableRef, TenantTableBinding};
-use crate::contracts::Scribe;
 use crate::contracts::ScribeError;
 use crate::namespaces::BifrostNamespace;
 use crate::schema::SchemaFingerprint;

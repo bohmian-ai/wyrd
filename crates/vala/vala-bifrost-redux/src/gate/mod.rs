@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use tracing::Instrument;
 use wyrd_auth_oidc::IssuerConfigResolver;
@@ -24,6 +23,7 @@ use wyrd_tonic::otlp::metrics_service::{
 };
 use wyrd_tonic::otlp::trace_service::trace_service_server::TraceService;
 use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
+use wyrd_tonic::prost::Message;
 use wyrd_tonic::tonic::metadata::MetadataMap;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
@@ -31,8 +31,8 @@ use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
-use crate::catalog::{BifrostCatalog, BifrostCatalogError, TableRef, TenantTableBinding};
-use crate::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
+use crate::catalog::{BifrostCatalog, BifrostCatalogError, TableRef};
+use crate::contracts::{IngressPayload, Scribe, ScribeIngressFrame, ScribeOtlpOutcome};
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 pub use crate::gate::collector::{
     IngestOutcome, IngressCpuProjection, InlineProjectionExecutor, LogsOutcome, MetricsOutcome,
@@ -239,12 +239,12 @@ pub struct Gate<
     R: PermissionResolver + 'static,
     I: IssuerConfigResolver + 'static,
 > {
-    catalog: Arc<C>,
+    /// Retains the server-selected catalog adapter type without owning it.
+    _catalog: std::marker::PhantomData<C>,
     scribe: Option<Arc<dyn Scribe>>,
     /// Optional retained Oracle used by the server's stable local query dispatch.
     oracle: Option<Arc<Oracle>>,
     limits: IngestLimits,
-    projection: Arc<dyn ProjectionExecutor>,
     auth: IngestAuthInterceptor<R, I>,
     closed: Arc<AtomicBool>,
 }
@@ -255,36 +255,39 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// Construct a Gate with a required Scribe capability.
     #[must_use]
     pub fn with_scribe(
-        catalog: Arc<C>,
+        _catalog: Arc<C>,
+        scribe: Arc<crate::scribe::ScribeImpl>,
+        auth: IngestAuthInterceptor<R, I>,
+        limits: IngestLimits,
+    ) -> Self {
+        initialize_gate_metrics();
+        Self {
+            _catalog: std::marker::PhantomData,
+            scribe: Some(scribe),
+            oracle: None,
+            limits,
+            auth,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Constructs a Gate around one crate-local ingress test double.
+    #[cfg(test)]
+    fn with_test_scribe(
+        _catalog: Arc<C>,
         scribe: Arc<dyn Scribe>,
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
         initialize_gate_metrics();
         Self {
-            catalog,
+            _catalog: std::marker::PhantomData,
             scribe: Some(scribe),
             oracle: None,
             limits,
-            projection: Arc::new(InlineProjectionExecutor),
             auth,
             closed: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Construct a Gate whose protocol projection runs on an injected bounded
-    /// ingress CPU executor.
-    #[must_use]
-    pub fn with_scribe_and_projection(
-        catalog: Arc<C>,
-        scribe: Arc<dyn Scribe>,
-        auth: IngestAuthInterceptor<R, I>,
-        limits: IngestLimits,
-        projection: Arc<dyn ProjectionExecutor>,
-    ) -> Self {
-        let mut gate = Self::with_scribe(catalog, scribe, auth, limits);
-        gate.projection = projection;
-        gate
     }
 
     /// Constructs a stable Gate whose ingest role is intentionally unavailable.
@@ -294,17 +297,16 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// WAL allocation.
     #[must_use]
     pub fn without_scribe(
-        catalog: Arc<C>,
+        _catalog: Arc<C>,
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
         initialize_gate_metrics();
         Self {
-            catalog,
+            _catalog: std::marker::PhantomData,
             scribe: None,
             oracle: None,
             limits,
-            projection: Arc::new(InlineProjectionExecutor),
             auth,
             closed: Arc::new(AtomicBool::new(false)),
         }
@@ -475,7 +477,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         oracle.query_plan(context, plan, options).await
     }
 
-    /// Project one OTLP trace export through the Gate-owned Scribe boundary.
+    /// Routes one bounded OTLP trace export to Scribe without projecting it.
     #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
     pub async fn ingest_resource_spans(
         &self,
@@ -488,30 +490,25 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        let projected = match self.projection.project_spans(request).await {
-            Ok(projected) => projected,
-            Err(error) => {
-                record_gate_event("projection_failure");
-                record_gate_event("otlp_rejection");
-                return Err(error);
-            }
+        let measured_wire_bytes = request.encoded_len();
+        let outcome = self
+            .dispatch_otlp(
+                auth,
+                TableRef::new(BifrostNamespace::Traces, "spans"),
+                measured_wire_bytes,
+                IngressPayload::OtlpTraces(Box::new(request)),
+            )
+            .await?;
+        let ScribeOtlpOutcome::Traces(outcome) = outcome else {
+            return Err(IngestError::Internal(
+                "Scribe returned the wrong OTLP outcome".to_owned(),
+            ));
         };
-        record_gate_rows(
-            projected.outcome.accepted_spans,
-            projected.outcome.rejected_spans,
-        );
-        if let Some(batch) = projected.batch
-            && let Err(error) = self
-                .dispatch_projected(auth, "vala.traces.spans", batch, projected.source_bytes)
-                .await
-        {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
-        Ok(projected.outcome)
+        record_gate_rows(outcome.accepted_spans, outcome.rejected_spans);
+        Ok(outcome)
     }
 
-    /// Project one OTLP metrics export through the Gate-owned Scribe boundary.
+    /// Routes one bounded OTLP metrics export to Scribe without projecting it.
     #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
     pub async fn ingest_resource_metrics(
         &self,
@@ -524,30 +521,25 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        let projected = match self.projection.project_metrics(request).await {
-            Ok(projected) => projected,
-            Err(error) => {
-                record_gate_event("projection_failure");
-                record_gate_event("otlp_rejection");
-                return Err(error);
-            }
+        let measured_wire_bytes = request.encoded_len();
+        let outcome = self
+            .dispatch_otlp(
+                auth,
+                TableRef::new(BifrostNamespace::Metrics, "points"),
+                measured_wire_bytes,
+                IngressPayload::OtlpMetrics(Box::new(request)),
+            )
+            .await?;
+        let ScribeOtlpOutcome::Metrics(outcome) = outcome else {
+            return Err(IngestError::Internal(
+                "Scribe returned the wrong OTLP outcome".to_owned(),
+            ));
         };
-        record_gate_rows(
-            projected.outcome.accepted_points,
-            projected.outcome.rejected_points,
-        );
-        if let Some(batch) = projected.batch
-            && let Err(error) = self
-                .dispatch_projected(auth, "vala.metrics.points", batch, projected.source_bytes)
-                .await
-        {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
-        Ok(projected.outcome)
+        record_gate_rows(outcome.accepted_points, outcome.rejected_points);
+        Ok(outcome)
     }
 
-    /// Project one OTLP logs export through the Gate-owned Scribe boundary.
+    /// Routes one bounded OTLP logs export to Scribe without projecting it.
     #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
     pub async fn ingest_resource_logs(
         &self,
@@ -560,66 +552,43 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        let projected = match self.projection.project_logs(request).await {
-            Ok(projected) => projected,
-            Err(error) => {
-                record_gate_event("projection_failure");
-                record_gate_event("otlp_rejection");
-                return Err(error);
-            }
+        let measured_wire_bytes = request.encoded_len();
+        let outcome = self
+            .dispatch_otlp(
+                auth,
+                TableRef::new(BifrostNamespace::Logs, "records"),
+                measured_wire_bytes,
+                IngressPayload::OtlpLogs(Box::new(request)),
+            )
+            .await?;
+        let ScribeOtlpOutcome::Logs(outcome) = outcome else {
+            return Err(IngestError::Internal(
+                "Scribe returned the wrong OTLP outcome".to_owned(),
+            ));
         };
-        record_gate_rows(
-            projected.outcome.accepted_records,
-            projected.outcome.rejected_records,
-        );
-        if let Some(batch) = projected.batch
-            && let Err(error) = self
-                .dispatch_projected(auth, "vala.logs.records", batch, projected.source_bytes)
-                .await
-        {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
-        Ok(projected.outcome)
+        record_gate_rows(outcome.accepted_records, outcome.rejected_records);
+        Ok(outcome)
     }
 
     #[tracing::instrument(
         skip_all,
-        fields(tenant = %auth.tenant, table = table_fqn, request_id = %auth.request_id,
-               rows = rows.num_rows(), wire_bytes = measured_wire_bytes)
+        fields(tenant = %auth.tenant, table = %table, request_id = %auth.request_id,
+               wire_bytes = measured_wire_bytes)
     )]
-    async fn dispatch_projected(
+    async fn dispatch_otlp(
         &self,
         auth: &AuthContext,
-        table_fqn: &str,
-        rows: RecordBatch,
+        table: TableRef,
         measured_wire_bytes: usize,
-    ) -> Result<(), IngestError> {
+        payload: IngressPayload,
+    ) -> Result<ScribeOtlpOutcome, IngestError> {
         self.ensure_open()?;
-        let (namespace, name) = resolve_fqn(table_fqn)?;
-        if namespace == BifrostNamespace::Audit {
-            return Err(IngestError::ReservedBuiltinWriteDenied {
-                table: table_fqn.to_owned(),
+        if measured_wire_bytes > self.limits.max_frame_bytes {
+            return Err(IngestError::PayloadTooLarge {
+                bytes: u64::try_from(measured_wire_bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(self.limits.max_frame_bytes).unwrap_or(u64::MAX),
             });
         }
-        self.catalog
-            .ensure_builtin_for_table(namespace, &name, auth.tenant)
-            .await
-            .map_err(|error| {
-                record_gate_event("catalog_failure");
-                IngestError::from_catalog(error)
-            })?;
-        let registered_fingerprint = self
-            .catalog
-            .table_schema_fingerprint(namespace, &name, auth.tenant)
-            .await
-            .map_err(|error| {
-                record_gate_event("catalog_failure");
-                IngestError::from_catalog(error)
-            })?;
-        let table = TableRef::new(namespace, name);
-        let binding = TenantTableBinding::resolve((auth.tenant, table.clone()))
-            .map_err(|_| IngestError::Internal("invalid tenant/table binding".to_owned()))?;
         let audit_event = wyrd_spec::vala::api::AuditEvent {
             request_id: auth.request_id.clone(),
             trace_id: None,
@@ -632,34 +601,32 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             permission: "bifrost:record:write".to_owned(),
             decision: wyrd_spec::vala::api::AuditDecision::Allow,
             result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "one projected OTLP frame".to_owned(),
+            payload_summary: "one bounded OTLP frame".to_owned(),
             detail: None,
         };
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         scribe
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
-                binding,
-                expected_schema_fingerprint: registered_fingerprint,
+                authenticated_tenant: auth.tenant,
+                table,
+                expected_schema_fingerprint: None,
                 request_id: auth.request_id.clone(),
                 batch_id: uuid::Uuid::now_v7(),
                 audit_event,
                 measured_wire_bytes,
-                payload: IngressPayload::ProjectedArrow(vec![rows]),
+                payload,
             })
             .await
             .map_err(|error| {
                 record_gate_event("scribe_failure");
                 IngestError::from_scribe(error)
-            })
-            .map(|_| ())
+            })?
+            .otlp_outcome
+            .ok_or_else(|| IngestError::Internal("Scribe omitted the OTLP outcome".to_owned()))
     }
 
-    /// Resolve, authorize, stamp, and dispatch one native batch to Scribe.
-    ///
-    /// Gate owns permission, catalog, binding, audit, and batch dispatch
-    /// decisions; the server only supplies the catalog adapter and mounts this
-    /// service.
+    /// Authorizes and routes one bounded native batch to Scribe.
     #[tracing::instrument(
         skip_all,
         fields(tenant = %auth.tenant, table = %frame.table, request_id = %auth.request_id)
@@ -702,26 +669,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         if namespace == BifrostNamespace::Audit {
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
         }
-        self.catalog
-            .ensure_builtin_for_table(namespace, &name, auth.tenant)
-            .await
-            .map_err(|error| {
-                record_gate_event("catalog_failure");
-                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
-                IngestError::from_catalog(error)
-            })?;
-        let registered_fingerprint = self
-            .catalog
-            .table_schema_fingerprint(namespace, &name, auth.tenant)
-            .await
-            .map_err(|error| {
-                record_gate_event("catalog_failure");
-                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
-                IngestError::from_catalog(error)
-            })?;
         let table = TableRef::new(namespace, name);
-        let binding = TenantTableBinding::resolve((auth.tenant, table.clone()))
-            .map_err(|_| IngestError::Internal("invalid tenant/table binding".to_owned()))?;
         let audit_event = wyrd_spec::vala::api::AuditEvent {
             request_id: auth.request_id.clone(),
             trace_id: None,
@@ -741,8 +689,9 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         let admission = scribe
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
-                binding,
-                expected_schema_fingerprint: registered_fingerprint,
+                authenticated_tenant: auth.tenant,
+                table,
+                expected_schema_fingerprint: None,
                 request_id: auth.request_id.clone(),
                 batch_id,
                 audit_event,
@@ -985,16 +934,12 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::collector::{IngestOutcome, ProjectedExport, ProjectionExecutor};
     use super::error::CatalogError;
     use super::limits::IngestLimits;
     use super::{AuthContext, Catalog, Gate, IngestError};
-    use crate::catalog::{TableRef, TenantTableBinding, TenantTableBindingError};
+    use crate::contracts::{IngressPayload, ScribeOtlpOutcome};
     use crate::namespaces::BifrostNamespace;
     use crate::schema::fingerprint::SchemaFingerprint;
-    use arrow::array::Int64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use wyrd_auth_oidc::IssuerConfigResolver;
     use wyrd_auth_verify::PermissionResolver;
@@ -1244,13 +1189,27 @@ mod tests {
 
     #[async_trait]
     impl crate::contracts::Scribe for TestScribe {
+        fn is_ready(&self) -> bool {
+            true
+        }
+
         async fn ingest_frame(
             &self,
-            _frame: crate::contracts::ScribeIngressFrame,
+            frame: crate::contracts::ScribeIngressFrame,
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
+                otlp_outcome: match frame.payload {
+                    IngressPayload::OtlpTraces(_) => {
+                        Some(ScribeOtlpOutcome::Traces(super::collector::IngestOutcome {
+                            accepted_spans: 0,
+                            rejected_spans: 0,
+                            rejection_message: None,
+                        }))
+                    }
+                    _ => None,
+                },
             })
         }
     }
@@ -1277,14 +1236,27 @@ mod tests {
 
     #[async_trait]
     impl crate::contracts::Scribe for CountingScribe {
+        fn is_ready(&self) -> bool {
+            true
+        }
+
         async fn ingest_frame(
             &self,
-            _frame: crate::contracts::ScribeIngressFrame,
+            frame: crate::contracts::ScribeIngressFrame,
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(frame.authenticated_tenant, frame.principal.tenant_id);
+            assert_eq!(frame.table.fqn(), "vala.traces.spans");
+            assert!(frame.expected_schema_fingerprint.is_none());
+            assert!(matches!(frame.payload, IngressPayload::OtlpTraces(_)));
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
-                rows_accepted: 1,
+                rows_accepted: 0,
+                otlp_outcome: Some(ScribeOtlpOutcome::Traces(super::collector::IngestOutcome {
+                    accepted_spans: 0,
+                    rejected_spans: 0,
+                    rejection_message: None,
+                })),
             })
         }
     }
@@ -1300,84 +1272,6 @@ mod tests {
             _tenant: DataTenantId,
         ) -> Result<SchemaFingerprint, CatalogError> {
             Err(CatalogError::TableNotFound(table.to_owned()))
-        }
-    }
-
-    struct FailingProjection {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl ProjectionExecutor for FailingProjection {
-        async fn project_spans(
-            &self,
-            _request: ExportTraceServiceRequest,
-        ) -> Result<ProjectedExport<IngestOutcome>, IngestError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(IngestError::Internal(
-                "projection should not run".to_owned(),
-            ))
-        }
-
-        async fn project_metrics(
-            &self,
-            _request: wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest,
-        ) -> Result<ProjectedExport<super::collector::MetricsOutcome>, IngestError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(IngestError::Internal(
-                "projection should not run".to_owned(),
-            ))
-        }
-
-        async fn project_logs(
-            &self,
-            _request: wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest,
-        ) -> Result<ProjectedExport<super::collector::LogsOutcome>, IngestError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(IngestError::Internal(
-                "projection should not run".to_owned(),
-            ))
-        }
-    }
-
-    struct BatchProjection;
-
-    #[async_trait]
-    impl ProjectionExecutor for BatchProjection {
-        async fn project_spans(
-            &self,
-            _request: ExportTraceServiceRequest,
-        ) -> Result<ProjectedExport<IngestOutcome>, IngestError> {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
-                .map_err(|error| IngestError::Internal(error.to_string()))?;
-            Ok(ProjectedExport {
-                outcome: IngestOutcome {
-                    accepted_spans: 1,
-                    rejected_spans: 0,
-                    rejection_message: None,
-                },
-                batch: Some(batch),
-                source_bytes: 1,
-            })
-        }
-
-        async fn project_metrics(
-            &self,
-            _request: wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest,
-        ) -> Result<ProjectedExport<super::collector::MetricsOutcome>, IngestError> {
-            Err(IngestError::Internal("unused projection".to_owned()))
-        }
-
-        async fn project_logs(
-            &self,
-            _request: wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest,
-        ) -> Result<ProjectedExport<super::collector::LogsOutcome>, IngestError> {
-            Err(IngestError::Internal("unused projection".to_owned()))
         }
     }
 
@@ -1442,28 +1336,25 @@ mod tests {
                 Arc::new(TestPermissionResolver),
                 wyrd_auth_verify::WyrdAuthVerifySettings::default(),
             );
-        let _gate = Gate::<TestCatalog, TestPermissionResolver, TestIssuerResolver>::with_scribe(
-            Arc::new(TestCatalog),
-            Arc::new(TestScribe),
-            crate::gate::auth::ingest_auth_interceptor(Arc::new(verifier)),
-            IngestLimits::default(),
-        );
+        let _gate =
+            Gate::<TestCatalog, TestPermissionResolver, TestIssuerResolver>::with_test_scribe(
+                Arc::new(TestCatalog),
+                Arc::new(TestScribe),
+                crate::gate::auth::ingest_auth_interceptor(Arc::new(verifier)),
+                IngestLimits::default(),
+            );
     }
 
     #[tokio::test]
     async fn gate_enforces_bifrost_record_write() {
-        let projection_calls = Arc::new(AtomicUsize::new(0));
         let scribe_calls = Arc::new(AtomicUsize::new(0));
-        let gate = Gate::with_scribe_and_projection(
+        let gate = Gate::with_test_scribe(
             Arc::new(TestCatalog),
             Arc::new(CountingScribe {
                 calls: Arc::clone(&scribe_calls),
             }),
             test_interceptor(),
             IngestLimits::default(),
-            Arc::new(FailingProjection {
-                calls: Arc::clone(&projection_calls),
-            }),
         );
 
         let error = gate
@@ -1471,13 +1362,12 @@ mod tests {
             .await
             .expect_err("permission must be denied");
         assert!(matches!(error, IngestError::RbacDenied { .. }));
-        assert_eq!(projection_calls.load(Ordering::Relaxed), 0);
         assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn gate_authenticates_before_reading_frames() {
-        let gate = Gate::with_scribe(
+        let gate = Gate::with_test_scribe(
             Arc::new(TestCatalog),
             Arc::new(TestScribe),
             test_interceptor(),
@@ -1487,69 +1377,36 @@ mod tests {
         assert!(gate.authenticate(&metadata).await.is_err());
     }
 
-    #[test]
-    fn gate_resolves_principal_tenant_table_and_binding() {
-        let tenant = DataTenantId::new_v7();
-        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
-        assert_eq!(binding.tenant, tenant);
-        assert_eq!(binding.table_ref, table);
-        assert_eq!(binding.table_name, "events");
-        assert!(
-            binding
-                .object_prefix
-                .starts_with(&format!("tenants/{tenant}/"))
-        );
-    }
-
-    #[test]
-    fn gate_rejects_tenant_binding_mismatch() {
-        let binding = TenantTableBinding::resolve((
-            DataTenantId::new_v7(),
-            TableRef::new(BifrostNamespace::Bifrost, "events"),
-        ))
-        .expect("binding");
-        let error = binding
-            .validate_authenticated_tenant(DataTenantId::new_v7())
-            .expect_err("a binding must not cross tenant boundaries");
-        assert!(matches!(
-            error,
-            TenantTableBindingError::TenantMismatch { .. }
-        ));
-    }
-
     #[tokio::test]
-    async fn catalog_failure_does_not_call_scribe() {
+    async fn gate_routes_logical_frame_without_catalog_resolution() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
-        let gate = Gate::with_scribe_and_projection(
+        let gate = Gate::with_test_scribe(
             Arc::new(FailingCatalog),
             Arc::new(CountingScribe {
                 calls: Arc::clone(&scribe_calls),
             }),
             test_interceptor(),
             IngestLimits::default(),
-            Arc::new(BatchProjection),
         );
 
-        let error = gate
+        let outcome = gate
             .ingest_resource_spans(&auth_context(true), ExportTraceServiceRequest::default())
             .await
-            .expect_err("catalog failure must reject the write");
-        assert!(matches!(error, IngestError::TableNotFound { .. }));
-        assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
+            .expect("Gate must route without consulting its catalog adapter");
+        assert_eq!(outcome.accepted_spans, 0);
+        assert_eq!(scribe_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
-    async fn close_rejects_new_work_before_projection() {
-        let projection_calls = Arc::new(AtomicUsize::new(0));
-        let gate = Gate::with_scribe_and_projection(
+    async fn close_rejects_new_work_before_scribe_handoff() {
+        let scribe_calls = Arc::new(AtomicUsize::new(0));
+        let gate = Gate::with_test_scribe(
             Arc::new(TestCatalog),
-            Arc::new(TestScribe),
+            Arc::new(CountingScribe {
+                calls: Arc::clone(&scribe_calls),
+            }),
             test_interceptor(),
             IngestLimits::default(),
-            Arc::new(FailingProjection {
-                calls: Arc::clone(&projection_calls),
-            }),
         );
         gate.close();
 
@@ -1558,20 +1415,16 @@ mod tests {
             .await
             .expect_err("closed Gate must reject new work");
         assert!(matches!(error, IngestError::IngressClosed));
-        assert_eq!(projection_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn gate_rejects_ingest_when_scribe_recovery_is_incomplete() {
-        let projection_calls = Arc::new(AtomicUsize::new(0));
-        let gate = Gate::with_scribe_and_projection(
+        let gate = Gate::with_test_scribe(
             Arc::new(TestCatalog),
             Arc::new(NotReadyScribe),
             test_interceptor(),
             IngestLimits::default(),
-            Arc::new(FailingProjection {
-                calls: Arc::clone(&projection_calls),
-            }),
         );
 
         let error = gate
@@ -1579,7 +1432,6 @@ mod tests {
             .await
             .expect_err("Gate must fail closed while Scribe recovery is incomplete");
         assert!(matches!(error, IngestError::IngressClosed));
-        assert_eq!(projection_calls.load(Ordering::Relaxed), 0);
     }
 
     /// Query request lifecycles emit one exact terminal and drain active work.

@@ -24,7 +24,6 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
-use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
     ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
@@ -3158,15 +3157,11 @@ impl WyrdTestServerBuilder {
         }
         let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
         let mut gate = if let Some(ingest) = &ingest {
-            let gate_scribe: Arc<dyn Scribe> = ingest.scribe().clone();
-            vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+            vala_bifrost_redux::gate::Gate::with_scribe(
                 Arc::clone(&bifrost),
-                gate_scribe,
+                ingest.scribe().clone(),
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
                 limits,
-                Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
-                    ingest.scribe().ingress_cpu_pool(),
-                )),
             )
         } else {
             vala_bifrost_redux::gate::Gate::without_scribe(

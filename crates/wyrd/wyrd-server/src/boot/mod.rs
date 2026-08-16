@@ -631,6 +631,7 @@ async fn build_bifrost_parts_from_boot(
                 .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
         );
         let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            catalog: Some(Arc::clone(&bifrost)),
             operator: Arc::new(storage.operator().clone()),
             wal,
             stream,
@@ -959,14 +960,11 @@ pub async fn build_state(
         state
     };
     let mut gate = match &state.bifrost_ingest {
-        Some(ingest) => vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+        Some(ingest) => vala_bifrost_redux::gate::Gate::with_scribe(
             bifrost,
             ingest.scribe().clone(),
             vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
             limits,
-            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
-                ingest.scribe().ingress_cpu_pool(),
-            )),
         ),
         None => vala_bifrost_redux::gate::Gate::without_scribe(
             bifrost,

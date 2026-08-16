@@ -12,9 +12,9 @@ const PHYSICAL_COMPONENTS: usize = 2;
 /// Canonical textual length of one hyphenated UUID tenant identity.
 const TENANT_TEXT_BYTES: usize = 36;
 
-/// Validated logical identity borrowed from an authenticated operation.
+/// Validated logical identity borrowed from one authenticated role operation.
 #[derive(Clone, Copy, Debug)]
-pub struct LogicalTableIdentity<'a> {
+pub(crate) struct LogicalTableIdentity<'a> {
     /// Authenticated tenant borrowed without formatting or duplication.
     tenant: &'a DataTenantId,
     /// Stable logical table reference borrowed from the operation.
@@ -34,7 +34,7 @@ impl<'a> LogicalTableIdentity<'a> {
     /// [`LogicalTableIdentityError::InvalidTableName`] for an unsafe table
     /// segment, or [`LogicalTableIdentityError::InvalidLogicalNamespace`] when
     /// the logical namespace cannot map to one physical segment.
-    pub fn try_new(
+    pub(crate) fn try_new(
         authenticated_tenant: &'a DataTenantId,
         binding_tenant: &'a DataTenantId,
         table: &'a TableRef,
@@ -61,14 +61,16 @@ impl<'a> LogicalTableIdentity<'a> {
     }
 
     /// Returns the borrowed authenticated tenant.
+    #[cfg(test)]
     #[must_use]
-    pub const fn tenant(&self) -> &'a DataTenantId {
+    pub(crate) const fn tenant(&self) -> &'a DataTenantId {
         self.tenant
     }
 
     /// Returns the borrowed logical table reference unchanged.
+    #[cfg(test)]
     #[must_use]
-    pub const fn table(&self) -> &'a TableRef {
+    pub(crate) const fn table(&self) -> &'a TableRef {
         self.table
     }
 
@@ -78,7 +80,8 @@ impl<'a> LogicalTableIdentity<'a> {
     ///
     /// Returns [`LogicalTableIdentityError::PersistedIdentityMismatch`] when
     /// either the persisted tenant or logical table differs from this operation.
-    pub fn validate_persisted(
+    #[cfg(test)]
+    pub(crate) fn validate_persisted(
         &self,
         persisted_tenant: &DataTenantId,
         persisted_table: &TableRef,
@@ -90,23 +93,16 @@ impl<'a> LogicalTableIdentity<'a> {
         }
     }
 
-    /// Computes the complete fixed projection and reserves it before allocation.
-    ///
-    /// The caller supplies its existing Gate, Scribe, Forge, or Oracle
-    /// reservation authority. The returned projection retains that opaque guard
-    /// and can only transfer it by moving the complete projection.
+    /// Computes exact projection facts without allocating physical strings.
     ///
     /// # Errors
     ///
     /// Returns [`LogicalTableIdentityError::Overflow`] when component or byte
-    /// arithmetic overflows. Returns [`LogicalTableIdentityError::Reservation`]
-    /// when the role authority refuses the checked facts, before any physical
-    /// projection allocation.
-    pub fn try_project<G, E>(
-        self,
+    /// arithmetic overflows.
+    pub(crate) fn projection_facts(
+        &self,
         role: PhysicalProjectionRole,
-        reserve: impl FnOnce(PhysicalProjectionFacts) -> Result<G, E>,
-    ) -> Result<PhysicalTableProjection<'a, G>, LogicalTableIdentityError<E>> {
+    ) -> Result<PhysicalProjectionFacts, LogicalTableIdentityError<()>> {
         let namespace_bytes = checked_sum(&[
             "vala".len(),
             1,
@@ -128,11 +124,34 @@ impl<'a> LogicalTableIdentity<'a> {
         let material_bytes = namespace_bytes
             .checked_add(object_prefix_bytes)
             .ok_or(LogicalTableIdentityError::Overflow)?;
-        let facts = PhysicalProjectionFacts {
+        Ok(PhysicalProjectionFacts {
             role,
             material_bytes,
             component_count: PHYSICAL_COMPONENTS,
-        };
+            namespace_bytes,
+            object_prefix_bytes,
+        })
+    }
+
+    /// Reserves and constructs one fixed physical projection for this role.
+    ///
+    /// The reservation closure must split the exact bytes from the calling
+    /// role's already admitted owner. It runs before either physical string is
+    /// allocated, and the returned guard remains inseparable from the projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogicalTableIdentityError::Overflow`] when checked planning
+    /// overflows or [`LogicalTableIdentityError::Reservation`] when the existing
+    /// role owner refuses the exact child before allocation.
+    pub(crate) fn try_project<G, E>(
+        self,
+        role: PhysicalProjectionRole,
+        reserve: impl FnOnce(PhysicalProjectionFacts) -> Result<G, E>,
+    ) -> Result<PhysicalTableProjection<G>, LogicalTableIdentityError<E>> {
+        let facts = self
+            .projection_facts(role)
+            .map_err(|_| LogicalTableIdentityError::Overflow)?;
         let guard = reserve(facts).map_err(LogicalTableIdentityError::Reservation)?;
 
         let mut tenant_buffer = uuid::Uuid::encode_buffer();
@@ -141,12 +160,12 @@ impl<'a> LogicalTableIdentity<'a> {
             .as_uuid()
             .hyphenated()
             .encode_lower(&mut tenant_buffer);
-        let mut namespace = String::with_capacity(namespace_bytes);
+        let mut namespace = String::with_capacity(facts.namespace_bytes);
         namespace.push_str("vala.tenants.");
         namespace.push_str(tenant_text);
         namespace.push('.');
         namespace.push_str(self.logical_segment);
-        let mut object_prefix = String::with_capacity(object_prefix_bytes);
+        let mut object_prefix = String::with_capacity(facts.object_prefix_bytes);
         object_prefix.push_str("tenants/");
         object_prefix.push_str(tenant_text);
         object_prefix.push('/');
@@ -155,7 +174,6 @@ impl<'a> LogicalTableIdentity<'a> {
         object_prefix.push_str(&self.table.name);
 
         Ok(PhysicalTableProjection {
-            logical: self,
             _guard: guard,
             namespace: namespace.into_boxed_str(),
             object_prefix: object_prefix.into_boxed_str(),
@@ -166,33 +184,31 @@ impl<'a> LogicalTableIdentity<'a> {
 
 /// Checked material and cardinality facts presented to one role authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalProjectionFacts {
-    /// Runtime role whose existing T5A authority must reserve this projection.
-    pub role: PhysicalProjectionRole,
+pub(crate) struct PhysicalProjectionFacts {
+    /// Runtime role whose existing authority must reserve this projection.
+    pub(crate) role: PhysicalProjectionRole,
     /// Exact bytes across the fixed namespace and object-prefix strings.
-    pub material_bytes: usize,
+    pub(crate) material_bytes: usize,
     /// Exact number of independently allocated physical string components.
-    pub component_count: usize,
+    pub(crate) component_count: usize,
+    /// Exact tenant-qualified namespace bytes.
+    namespace_bytes: usize,
+    /// Exact tenant-qualified object-prefix bytes.
+    object_prefix_bytes: usize,
 }
 
-/// Closed runtime roles that may own one operation-scoped physical projection.
+/// Closed physical roles established by this task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PhysicalProjectionRole {
-    /// Ingress Gate routing and validation.
-    Gate,
-    /// Scribe buffering, WAL, and sealing.
-    Scribe,
+pub(crate) enum PhysicalProjectionRole {
     /// Forge maintenance and publication.
     Forge,
     /// Oracle planning and query execution.
     Oracle,
 }
 
-/// Fixed physical projection retaining one role's opaque reservation guard.
-pub struct PhysicalTableProjection<'a, G> {
-    /// Borrowed logical identity preserved unchanged through the operation.
-    logical: LogicalTableIdentity<'a>,
-    /// Opaque role authority retained solely for its terminal drop behavior.
+/// Fixed physical projection retaining one role's admitted child guard.
+pub(crate) struct PhysicalTableProjection<G> {
+    /// Opaque role child retained solely for its terminal drop behavior.
     _guard: G,
     /// Fixed tenant-qualified physical namespace.
     namespace: Box<str>,
@@ -202,12 +218,11 @@ pub struct PhysicalTableProjection<'a, G> {
     facts: PhysicalProjectionFacts,
 }
 
-impl<G> fmt::Debug for PhysicalTableProjection<'_, G> {
-    /// Formats safe identity and capacity observations without exposing the guard.
+impl<G> fmt::Debug for PhysicalTableProjection<G> {
+    /// Formats safe physical identity and capacity observations without the guard.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PhysicalTableProjection")
-            .field("logical_table", &self.logical.table)
             .field("namespace", &self.namespace)
             .field("object_prefix", &self.object_prefix)
             .field("facts", &self.facts)
@@ -215,29 +230,17 @@ impl<G> fmt::Debug for PhysicalTableProjection<'_, G> {
     }
 }
 
-impl<'a, G> PhysicalTableProjection<'a, G> {
-    /// Returns the original borrowed logical identity.
-    #[must_use]
-    pub const fn logical(&self) -> LogicalTableIdentity<'a> {
-        self.logical
-    }
-
+impl<G> PhysicalTableProjection<G> {
     /// Returns the tenant-qualified physical namespace.
     #[must_use]
-    pub fn namespace(&self) -> &str {
+    pub(crate) fn namespace(&self) -> &str {
         &self.namespace
     }
 
     /// Returns the tenant-qualified contained object prefix.
     #[must_use]
-    pub fn object_prefix(&self) -> &str {
+    pub(crate) fn object_prefix(&self) -> &str {
         &self.object_prefix
-    }
-
-    /// Returns exact materialized bytes and component cardinality.
-    #[must_use]
-    pub const fn materialized_facts(&self) -> PhysicalProjectionFacts {
-        self.facts
     }
 
     /// Validates an object key is contained beneath this projection's prefix.
@@ -246,10 +249,11 @@ impl<'a, G> PhysicalTableProjection<'a, G> {
     ///
     /// Returns [`LogicalTableIdentityError::PathEscape`] for an empty, absolute,
     /// URI, backslash, traversal, repeated-separator, or sibling-prefix path.
-    pub fn validate_object_path<'b>(
+    #[cfg(test)]
+    pub(crate) fn validate_object_path<'a>(
         &self,
-        path: &'b str,
-    ) -> Result<&'b str, LogicalTableIdentityError<()>> {
+        path: &'a str,
+    ) -> Result<&'a str, LogicalTableIdentityError<()>> {
         let prefix = self.object_prefix.trim_end_matches('/');
         if path.is_empty()
             || path.starts_with('/')
@@ -269,8 +273,7 @@ impl<'a, G> PhysicalTableProjection<'a, G> {
 
 /// Validation, checked-planning, or role-reservation failure for table projection.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum LogicalTableIdentityError<E> {
+pub(crate) enum LogicalTableIdentityError<E> {
     /// A nil tenant cannot own logical or physical data.
     #[error("data tenant id must not be nil")]
     InvalidTenant,
@@ -284,6 +287,7 @@ pub enum LogicalTableIdentityError<E> {
     #[error("logical namespace cannot map to one physical segment")]
     InvalidLogicalNamespace,
     /// Persisted tenant or logical table identity differs from the operation.
+    #[cfg(test)]
     #[error("persisted tenant/table identity does not match the operation")]
     PersistedIdentityMismatch,
     /// Checked physical component arithmetic overflowed.
@@ -293,6 +297,7 @@ pub enum LogicalTableIdentityError<E> {
     #[error("physical table projection reservation refused: {0}")]
     Reservation(E),
     /// An object key escaped or did not belong to the projected table prefix.
+    #[cfg(test)]
     #[error("object path escapes the physical table prefix")]
     PathEscape,
 }
@@ -342,16 +347,14 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let table = table();
         let logical = LogicalTableIdentity::try_new(&tenant, &tenant, &table).expect("valid");
-        assert!(std::ptr::eq(logical.tenant(), &tenant));
-        assert!(std::ptr::eq(logical.table(), &table));
+        assert!(std::ptr::eq(logical.tenant(), &raw const tenant));
+        assert!(std::ptr::eq(logical.table(), &raw const table));
     }
 
-    /// All four runtime roles receive exact facts and release only at terminal drop.
+    /// Both physical roles receive exact facts and release only at terminal drop.
     #[test]
     fn logical_table_identity_role_transfer_cancellation_and_release() {
         for role in [
-            PhysicalProjectionRole::Gate,
-            PhysicalProjectionRole::Scribe,
             PhysicalProjectionRole::Forge,
             PhysicalProjectionRole::Oracle,
         ] {
@@ -376,9 +379,7 @@ mod tests {
     }
 
     /// Moves the complete projection and opaque guard through a role boundary.
-    fn transfer<'a, G>(
-        projection: PhysicalTableProjection<'a, G>,
-    ) -> PhysicalTableProjection<'a, G> {
+    fn transfer<G>(projection: PhysicalTableProjection<G>) -> PhysicalTableProjection<G> {
         projection
     }
 
@@ -389,7 +390,7 @@ mod tests {
         let table = table();
         let logical = LogicalTableIdentity::try_new(&tenant, &tenant, &table).expect("valid");
         let error =
-            logical.try_project(PhysicalProjectionRole::Gate, |_| Err::<(), _>("role full"));
+            logical.try_project(PhysicalProjectionRole::Forge, |_| Err::<(), _>("role full"));
         assert!(matches!(
             error,
             Err(LogicalTableIdentityError::Reservation("role full"))

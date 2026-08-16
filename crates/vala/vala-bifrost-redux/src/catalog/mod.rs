@@ -14,9 +14,8 @@ pub use bifrost_catalog::{
     BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable, TableUid,
 };
 pub use error::BifrostCatalogError;
-pub use logical_table_identity::{
-    LogicalTableIdentity, LogicalTableIdentityError, PhysicalProjectionFacts,
-    PhysicalProjectionRole, PhysicalTableProjection,
+pub(crate) use logical_table_identity::{
+    LogicalTableIdentity, PhysicalProjectionRole, PhysicalTableProjection,
 };
 pub use partition_spec::{PartitionTransform, build_partition_spec};
 pub use table_ref::TableRef;

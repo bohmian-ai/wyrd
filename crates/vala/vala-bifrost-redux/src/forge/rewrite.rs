@@ -177,6 +177,10 @@ impl MemoryPool for ForgeAttemptMemoryPool {
 /// `lease`, so the attempt drops its runtime — releasing the spill child — before
 /// the exact root lease is returned to the governor.
 pub(crate) struct ForgeAttemptResources {
+    /// Physical table projection charged to and retained by this attempt.
+    projection: Option<
+        crate::catalog::PhysicalTableProjection<crate::resources::ForgeRewriteMemoryReservation>,
+    >,
     /// Attempt runtime shared with the attempt-local execution pipeline view.
     runtime: Option<Arc<ForgeRewriteRuntime>>,
     /// Exact memory and scratch lease returned to the root governor on drop.
@@ -191,6 +195,45 @@ pub(crate) struct ForgeAttemptResources {
     telemetry: Arc<super::metrics::ForgeTelemetry>,
 }
 
+/// Splits and materializes one binding beneath an admitted Forge attempt.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when logical validation or binding
+/// reconciliation fails and [`ForgeError::Capacity`] when the admitted attempt
+/// pool refuses the exact projection bytes.
+fn project_forge_binding(
+    lease: &crate::resources::ForgeRewriteResources,
+    binding: &crate::catalog::TenantTableBinding,
+) -> Result<
+    crate::catalog::PhysicalTableProjection<crate::resources::ForgeRewriteMemoryReservation>,
+    ForgeError,
+> {
+    let logical = crate::catalog::LogicalTableIdentity::try_new(
+        &binding.tenant,
+        &binding.tenant,
+        &binding.table_ref,
+    )
+    .map_err(|error| ForgeError::Invariant {
+        detail: format!("Forge logical table identity is invalid: {error:?}"),
+    })?;
+    let projection = logical
+        .try_project(crate::catalog::PhysicalProjectionRole::Forge, |facts| {
+            lease.try_split_memory("forge_physical_table_projection", facts.material_bytes)
+        })
+        .map_err(|error| ForgeError::Capacity {
+            detail: format!("Forge physical table projection refused: {error}"),
+        })?;
+    if projection.object_prefix() != binding.object_prefix
+        || projection.namespace() != binding.iceberg_namespace.to_string()
+    {
+        return Err(ForgeError::Invariant {
+            detail: "Forge projection diverged from the validated table binding".to_owned(),
+        });
+    }
+    Ok(projection)
+}
+
 impl ForgeAttemptResources {
     /// Atomically acquires the exact request, then builds its attempt runtime.
     ///
@@ -203,6 +246,7 @@ impl ForgeAttemptResources {
     pub(crate) fn acquire(
         resources: &crate::resources::ForgeResources,
         request: crate::resources::ForgeRewriteRequest,
+        binding: &crate::catalog::TenantTableBinding,
         pod_spill_root: &Path,
         task_id: Uuid,
         attempt_id: Uuid,
@@ -214,6 +258,7 @@ impl ForgeAttemptResources {
                 .map_err(|error| ForgeError::Capacity {
                     detail: format!("{error}; request={request:?}"),
                 })?;
+        let projection = project_forge_binding(&lease, binding)?;
         let decoded_batch_bytes =
             usize::try_from(request.envelope.decoded_batch_bytes).map_err(|_| {
                 ForgeError::Capacity {
@@ -290,6 +335,7 @@ impl ForgeAttemptResources {
             });
         }
         Ok(Self {
+            projection: Some(projection),
             runtime: Some(Arc::new(runtime)),
             lease: Some(lease),
             release_result: None,
@@ -349,6 +395,11 @@ impl ForgeAttemptResources {
         self.observation.peak_scratch = runtime.scratch_peak_bytes();
         let surviving_handle = Arc::strong_count(&runtime) != 1;
         drop(runtime);
+        drop(
+            self.projection
+                .take()
+                .expect("invariant: unfinished attempt retains its physical projection"),
+        );
         let mut lease = self
             .lease
             .take()
@@ -3195,6 +3246,15 @@ mod tests {
 
     use super::*;
 
+    /// Builds the tenant-qualified table binding retained by attempt tests.
+    fn attempt_binding() -> crate::catalog::TenantTableBinding {
+        crate::catalog::TenantTableBinding::resolve((
+            wyrd_spec::DataTenantId::new_v7(),
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("attempt binding")
+    }
+
     /// A claim request retains every validated persisted term without reconstruction.
     #[test]
     fn rewrite_request_preserves_every_persisted_term() {
@@ -3357,6 +3417,7 @@ mod tests {
                 scratch_bytes: envelope.scratch_bytes().expect("scratch total"),
                 reader_permits: 1,
             },
+            &attempt_binding(),
             root.path(),
             Uuid::nil(),
             Uuid::now_v7(),
@@ -3372,6 +3433,11 @@ mod tests {
             usize::try_from(envelope.encoder_buffer_bytes + envelope.upload_chunk_bytes)
                 .expect("platform output allowance")
         );
+        let projection_reserved = attempt.memory_pool().reserved();
+        assert!(
+            projection_reserved > 0,
+            "the physical projection must retain its admitted child"
+        );
         let reservation =
             MemoryConsumer::new("forge-rewrite-output-peak-proof").register(&attempt.memory_pool());
         reservation
@@ -3379,10 +3445,11 @@ mod tests {
             .expect("attempt-local output reservation");
         assert_eq!(
             attempt.peak_memory_bytes.load(Ordering::Acquire),
-            4096,
+            u64::try_from(projection_reserved + 4096).expect("test peak fits u64"),
             "the production pool wrapper must retain the exact attempt peak"
         );
         reservation.free();
+        assert_eq!(attempt.memory_pool().reserved(), projection_reserved);
 
         let held = forge.snapshot().expect("held snapshot");
         assert_eq!(
@@ -3490,6 +3557,7 @@ mod tests {
             let mut attempt = ForgeAttemptResources::acquire(
                 &forge,
                 request,
+                &attempt_binding(),
                 root.path(),
                 Uuid::nil(),
                 Uuid::now_v7(),

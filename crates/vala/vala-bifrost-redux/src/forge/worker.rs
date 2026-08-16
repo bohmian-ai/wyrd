@@ -1855,12 +1855,14 @@ impl ForgeWorker {
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
+        binding: &TenantTableBinding,
     ) -> Result<super::rewrite::ForgeAttemptResources, ForgeError> {
         let request =
             crate::resources::ForgeRewriteRequest::from_claim(&claim.estimates, self.capacity)?;
         super::rewrite::ForgeAttemptResources::acquire(
             &self.forge.core.resources,
             request,
+            binding,
             &self.forge.core.rewrite_spill_root,
             claim.task_id,
             attempt,
@@ -1877,7 +1879,7 @@ impl ForgeWorker {
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        let resources = self.acquire_rewrite_resources(claim, attempt)?;
+        let resources = self.acquire_rewrite_resources(claim, attempt, binding)?;
         let rewrite = resources.pipeline(&self.forge.core.rewrite);
         let table = self.forge.load_table(&binding.table_ident()).await?;
         let base_matches = Self::base_snapshot_matches(&table, claim.base_snapshot_id);

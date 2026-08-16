@@ -14,9 +14,7 @@ use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
-use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::Forge;
-use vala_bifrost_redux::gate::IngressCpuProjection;
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle;
@@ -397,13 +395,11 @@ impl BifrostIngestRuntime {
                 .tail_reader()
                 .expect("constructed Scribe must retain a valid UUID stream identity"),
         );
-        let gate_scribe: Arc<dyn Scribe> = scribe.clone();
-        let gate = Arc::new(ServerGate::with_scribe_and_projection(
+        let gate = Arc::new(ServerGate::with_scribe(
             catalog,
-            gate_scribe,
+            scribe.clone(),
             ingest_auth_interceptor(verifier),
             limits,
-            Arc::new(IngressCpuProjection::new(scribe.ingress_cpu_pool())),
         ));
         Self {
             scribe,

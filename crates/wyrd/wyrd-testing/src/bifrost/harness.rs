@@ -163,6 +163,7 @@ impl BifrostHarness {
                 HarnessError::Configuration("missing Bifrost test server".to_owned())
             })?;
             let scribe = ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+                catalog: Some(Arc::clone(&server.state().bifrost)),
                 operator: Arc::clone(&operator),
                 wal,
                 stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(writer_epoch)),

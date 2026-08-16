@@ -13,7 +13,7 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use vala_bifrost_redux::bench_support::WalBenchSupport;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
-use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::contracts::ScribeAppend;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;

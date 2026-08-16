@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::contracts::ScribeAppend;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::SchemaFingerprint;
 use vala_bifrost_redux::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};

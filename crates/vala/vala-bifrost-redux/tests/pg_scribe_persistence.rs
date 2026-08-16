@@ -14,12 +14,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use vala_bifrost_redux::catalog::{
-    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
-};
-use vala_bifrost_redux::contracts::{
-    IngressPayload, Scribe, ScribeAppend, ScribeError, ScribeIngressFrame,
-};
+use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
+use vala_bifrost_redux::contracts::{ScribeAppend, ScribeError};
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
@@ -33,8 +29,9 @@ use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
-    ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool, ScribeLaneConfig,
-    ScribePersistenceConfig, ScribePersistenceCpuPool, ScribeWalIoPool,
+    NativeIngressTestFrame, ScribeBuildConfig, ScribeExecutionPools, ScribeImpl,
+    ScribeIngressCpuPool, ScribeLaneConfig, ScribePersistenceConfig, ScribePersistenceCpuPool,
+    ScribeWalIoPool,
 };
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
@@ -214,6 +211,7 @@ impl PersistenceFixture {
             ScribeWalIoPool::new_with_capacity(lane_config.wal_io_threads, 256),
         );
         let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            catalog: None,
             operator: Arc::clone(&operator),
             wal,
             stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(1)),
@@ -390,6 +388,7 @@ impl PersistenceFixture {
             ScribeWalIoPool::new_with_capacity(wal_io_threads, 256),
         );
         let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            catalog: None,
             operator: Arc::clone(&operator),
             wal,
             stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(2)),
@@ -465,6 +464,7 @@ fn first_replay_scribe(
         ScribeWalIoPool::new_with_capacity(2, 256),
     );
     Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+        catalog: None,
         operator,
         wal,
         stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(1)),
@@ -1583,7 +1583,7 @@ fn native_event_time_frame(
     table_ref: &TableRef,
     first_day_micros: i64,
     second_day_micros: i64,
-) -> ScribeIngressFrame {
+) -> NativeIngressTestFrame {
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
@@ -1610,15 +1610,14 @@ fn native_event_time_frame(
 
     let user_only = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
     let request_id = RequestId::now_v7();
-    ScribeIngressFrame {
+    NativeIngressTestFrame {
         principal: principal(tenant),
-        binding: TenantTableBinding::resolve((tenant, table_ref.clone())).expect("binding"),
+        table: table_ref.clone(),
         expected_schema_fingerprint: SchemaFingerprint::from_arrow_schema(&user_only),
         request_id: request_id.clone(),
         batch_id: uuid::Uuid::now_v7(),
         audit_event: audit_event("bifrost.append", request_id),
-        measured_wire_bytes: bytes.len(),
-        payload: IngressPayload::ArrowIpc(bytes.into()),
+        payload: bytes.into(),
     }
 }
 
@@ -1736,7 +1735,7 @@ async fn native_caller_event_time_lands_on_two_partition_days() {
     );
     fixture
         .scribe
-        .ingest_frame(frame)
+        .ingest_native_for_test(frame)
         .await
         .expect("native caller event time is admitted");
     fixture

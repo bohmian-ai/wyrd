@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::catalog::TableRef;
-use crate::contracts::{Scribe, ScribeAppend, ScribeError};
+use crate::contracts::{ScribeAppend, ScribeError};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::audit_envelope::encode_audit_event;

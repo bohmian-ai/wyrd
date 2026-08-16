@@ -20,7 +20,7 @@ mod pg_tests {
     use chrono::{Duration as ChronoDuration, NaiveDate};
     use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::catalog::TableRef;
-    use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+    use vala_bifrost_redux::contracts::ScribeAppend;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
     use vala_bifrost_redux::scribe::tail_rpc::{

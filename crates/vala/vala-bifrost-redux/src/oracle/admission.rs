@@ -752,6 +752,7 @@ impl OracleAdmission {
                 fencing_token: self.local_role.fencing_token,
             },
             running: None,
+            physical_projections: Vec::new(),
             local_permit: Some(permit),
             live_reservations: Vec::new(),
             cancellation: self.shared.root_cancel.child_token(),
@@ -966,6 +967,10 @@ pub(super) struct AdmittedQueryGuard {
     pub(super) leader: AdmittedLeader,
     /// Retained for peer compatibility; local admission uses `local_permit`.
     pub(super) running: Option<OwnedSemaphorePermit>,
+    /// Physical table projections charged to this query's admitted pool.
+    physical_projections: Vec<
+        crate::catalog::PhysicalTableProjection<crate::resources::OracleQueryMemoryReservation>,
+    >,
     /// Aggregate leader-local class, tenant, memory, and spill permit.
     local_permit: Option<LocalPermit>,
     /// Canonical local slot-use gauge retained with the running permit.
@@ -985,6 +990,7 @@ impl Drop for AdmittedQueryGuard {
     fn drop(&mut self) {
         self.cancellation.cancel();
         self.live_reservations.clear();
+        self.physical_projections.clear();
         if let Some(permit) = self.local_permit.take() {
             permit.release_inner();
         }
@@ -997,6 +1003,73 @@ impl Drop for AdmittedQueryGuard {
 }
 
 impl AdmittedQueryGuard {
+    /// Materializes every pinned physical table under this admitted query owner.
+    ///
+    /// Each table's exact fixed bytes are split from the live query pool before
+    /// allocation. Completed projections remain with the stream guard and are
+    /// released before its aggregate local permit on every terminal path.
+    ///
+    /// # Errors
+    ///
+    /// Returns query admission rejection when logical validation, checked byte
+    /// planning, or an exact child split fails, or when the derived projection
+    /// disagrees with the catalog-pinned physical binding.
+    pub(super) fn retain_physical_projections(
+        &mut self,
+        cuts: &[crate::catalog::PinnedSealedTable],
+    ) -> Result<(), BifrostError> {
+        self.retain_physical_bindings(cuts.iter().map(|cut| &cut.binding))
+    }
+
+    /// Retains exact physical projections derived from bounded pinned bindings.
+    ///
+    /// The exact-size iterator ensures allocation cardinality is inherited from
+    /// the already bounded query plan rather than introduced by this seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns query admission rejection under the same validation, child
+    /// split, and binding-consistency failures as [`Self::retain_physical_projections`].
+    fn retain_physical_bindings<'a>(
+        &mut self,
+        bindings: impl ExactSizeIterator<Item = &'a crate::catalog::TenantTableBinding>,
+    ) -> Result<(), BifrostError> {
+        let permit = self
+            .local_permit
+            .as_ref()
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
+        let resources = permit
+            .resources
+            .lock()
+            .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+        let resources = resources
+            .as_ref()
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
+        let mut projections = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let logical = crate::catalog::LogicalTableIdentity::try_new(
+                &permit.tenant,
+                &binding.tenant,
+                &binding.table_ref,
+            )
+            .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+            let projection = logical
+                .try_project(crate::catalog::PhysicalProjectionRole::Oracle, |facts| {
+                    resources
+                        .try_split_memory("oracle_physical_table_projection", facts.material_bytes)
+                })
+                .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+            if projection.object_prefix() != binding.object_prefix
+                || projection.namespace() != binding.iceberg_namespace.to_string()
+            {
+                return Err(BifrostError::QueryAdmissionRejected);
+            }
+            projections.push(projection);
+        }
+        self.physical_projections.extend(projections);
+        Ok(())
+    }
+
     /// Returns the immutable spill share retained by this admitted query.
     #[must_use]
     pub(super) fn spill_limit_bytes(&self) -> u64 {
@@ -1109,6 +1182,7 @@ pub(super) fn admitted_guard_for_test()
                 fencing_token: 1,
             },
             running: None,
+            physical_projections: Vec::new(),
             local_permit: Some(LocalPermit {
                 shared: Arc::clone(&shared),
                 class: AdmissionClass::Interactive,
@@ -1244,6 +1318,45 @@ mod tests {
             started_at: Utc::now(),
             heartbeat_at: Utc::now(),
         }])
+    }
+
+    /// Oracle materializes physical identity inside its admitted query pool and
+    /// releases the exact child before the aggregate query owner.
+    #[tokio::test]
+    async fn oracle_physical_projection_uses_admitted_query_owner() {
+        let owner = owner(OracleAdmissionConfig::default());
+        let tenant = DataTenantId::new_v7();
+        let mut admitted = owner
+            .admit(PreparedAdmission {
+                tenant,
+                query_class: QueryClass::Interactive,
+                local_ratio: 0.0,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("query admission");
+        let table =
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans");
+        let binding = crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
+            .expect("tenant table binding");
+        let expected_bytes =
+            crate::catalog::LogicalTableIdentity::try_new(&tenant, &tenant, &table)
+                .expect("logical identity")
+                .projection_facts(crate::catalog::PhysicalProjectionRole::Oracle)
+                .expect("checked projection facts")
+                .material_bytes;
+        let pool = admitted.memory_pool().expect("admitted query memory pool");
+        let baseline = pool.reserved();
+
+        admitted
+            .retain_physical_bindings(std::iter::once(&binding))
+            .expect("projection child split from admitted query");
+
+        assert_eq!(admitted.physical_projections.len(), 1);
+        assert_eq!(pool.reserved(), baseline + expected_bytes);
+        drop(admitted);
+        assert_eq!(pool.reserved(), 0);
     }
 
     /// Local admission capacity never exceeds the independent class ceiling.

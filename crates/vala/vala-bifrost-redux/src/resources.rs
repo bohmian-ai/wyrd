@@ -3582,6 +3582,24 @@ impl ForgeRewriteResources {
         self.scratch_bytes
     }
 
+    /// Splits one named memory child from this admitted rewrite pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataFusion` resource exhaustion when existing rewrite children
+    /// leave insufficient capacity. This method never admits root capacity.
+    pub(crate) fn try_split_memory(
+        &self,
+        consumer: &'static str,
+        bytes: usize,
+    ) -> Result<ForgeRewriteMemoryReservation, DataFusionError> {
+        let reservation = MemoryConsumer::new(consumer).register(&self.memory_pool);
+        reservation.try_grow(bytes)?;
+        Ok(ForgeRewriteMemoryReservation {
+            _reservation: reservation,
+        })
+    }
+
     /// Explicitly releases the complete lease exactly once.
     ///
     /// # Errors
@@ -3630,6 +3648,13 @@ impl ForgeRewriteResources {
         self.release_result = Some(ForgeResourceReleaseResult::Poisoned);
         ForgeResourceReleaseResult::Poisoned
     }
+}
+
+/// Rewrite-local memory child split from one already admitted Forge attempt.
+#[derive(Debug)]
+pub(crate) struct ForgeRewriteMemoryReservation {
+    /// Exact child registered in the attempt-local `DataFusion` pool.
+    _reservation: MemoryReservation,
 }
 
 impl Drop for ForgeRewriteResources {

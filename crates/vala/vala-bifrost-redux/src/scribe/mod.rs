@@ -37,7 +37,10 @@ mod scribe_persistence_path;
 mod wal_closeout;
 use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
-use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
+use crate::contracts::{
+    FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
+    projected_source_schema_fingerprint,
+};
 use crate::maintenance::StagingFilePublisher;
 use crate::scribe::admission::{AdmissionConfig, AdmissionController};
 pub use crate::scribe::execution_lanes::{
@@ -195,8 +198,9 @@ impl ScribeLaneConfig {
 /// owner performs WAL writes, memtable insertion, and `sync_data` in order.
 /// Rotation is a consumer-owned state swap; immutable generations are handed
 /// to the bounded persistence runtime.
-#[derive(Debug)]
 pub struct ScribeImpl {
+    /// Catalog owner used to validate and resolve logical transport frames.
+    catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Opendal operator for object store (shared across seal drivers).
     operator: Arc<opendal::Operator>,
     /// WAL writer for durable append fsync.
@@ -486,6 +490,8 @@ impl Default for ScribePressureConfig {
 /// server so Scribe does not create an unbounded runtime or hide resource
 /// sizing inside a durable data-plane component.
 pub struct ScribeBuildConfig {
+    /// Catalog owner used by Scribe before physical binding or projection.
+    pub catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Object-store operator used by the persistence runtime.
     pub operator: Arc<opendal::Operator>,
     /// WAL writer used by every fixed shard and persistence worker.
@@ -504,6 +510,28 @@ pub struct ScribeBuildConfig {
     pub resources: crate::resources::ScribeResources,
     /// Optional bounded local wake-up publisher for committed staging files.
     pub staging_file_publisher: Option<StagingFilePublisher>,
+}
+
+/// Test-support input for exercising the private native transport seam.
+///
+/// This DTO exists only under `test-support`; production callers cannot bypass
+/// Gate to construct a [`ScribeIngressFrame`].
+#[cfg(feature = "test-support")]
+pub struct NativeIngressTestFrame {
+    /// Server-verified principal used by the fixture.
+    pub principal: wyrd_runtime::principal::Principal,
+    /// Requested logical table preserved through the private seam.
+    pub table: crate::catalog::TableRef,
+    /// Expected logical source-schema fingerprint for the native IPC stream.
+    pub expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Stable request correlation identifier.
+    pub request_id: wyrd_spec::request_id::RequestId,
+    /// Stable idempotency identifier for this test batch.
+    pub batch_id: uuid::Uuid,
+    /// Server-shaped audit event committed with the fixture batch.
+    pub audit_event: wyrd_spec::vala::api::AuditEvent,
+    /// Exact native IPC bytes supplied to the private decoder.
+    pub payload: bytes::Bytes,
 }
 
 /// Runtime, admission, and memory inputs for an embedded Scribe.
@@ -562,6 +590,35 @@ fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::Scri
 }
 
 impl ScribeImpl {
+    /// Admits one native IPC fixture through the crate-private logical seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for the same validation, decode, admission, and
+    /// persistence failures as production ingress.
+    #[cfg(feature = "test-support")]
+    pub async fn ingest_native_for_test(
+        &self,
+        frame: NativeIngressTestFrame,
+    ) -> Result<FrameAdmission, ScribeError> {
+        let measured_wire_bytes = frame.payload.len();
+        Scribe::ingest_frame(
+            self,
+            ScribeIngressFrame {
+                authenticated_tenant: frame.principal.tenant_id,
+                principal: frame.principal,
+                table: frame.table,
+                expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),
+                request_id: frame.request_id,
+                batch_id: frame.batch_id,
+                audit_event: frame.audit_event,
+                measured_wire_bytes,
+                payload: IngressPayload::ArrowIpc(frame.payload),
+            },
+        )
+        .await
+    }
+
     /// Builds the immutable-retirement owner transferred with caller COMMIT attempts.
     fn commit_completion(&self) -> seal::ScribeCommitCompletion {
         seal::ScribeCommitCompletion {
@@ -687,6 +744,7 @@ impl ScribeImpl {
             stream_identity::WriterEpoch::new(writer_epoch),
         );
         Ok(Self::new_with_execution_pools(ScribeBuildConfig {
+            catalog: None,
             operator,
             wal,
             stream,
@@ -803,6 +861,7 @@ impl ScribeImpl {
             stream_identity::WriterEpoch::new(writer_epoch),
         );
         Self::build(ScribeBuildConfig {
+            catalog: None,
             operator,
             wal,
             stream,
@@ -848,6 +907,7 @@ impl ScribeImpl {
         let admission =
             AdmissionController::with_config_and_memory(config.admission, memory.clone());
         let ScribeBuildConfig {
+            catalog,
             operator,
             wal,
             stream,
@@ -901,6 +961,7 @@ impl ScribeImpl {
         );
         Self::install_boot_metrics(wal.bytes_on_disk());
         Self {
+            catalog,
             operator,
             wal,
             node_id,
@@ -992,6 +1053,7 @@ impl ScribeImpl {
 
         let resources = embedded_scribe_resources(&admission_config);
         Self::build(ScribeBuildConfig {
+            catalog: None,
             operator,
             wal,
             stream: stream_identity::StreamIdentity::new(
@@ -1512,14 +1574,91 @@ impl Default for ScribeImpl {
     }
 }
 
+impl ScribeImpl {
+    /// Adapts an engine-only projected append into the private ingress seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the projected schema is incomplete or
+    /// inconsistent, or when private ingress rejects or cannot persist it.
+    pub async fn append_durable(&self, req: ScribeAppend) -> Result<FrameAdmission, ScribeError> {
+        if req
+            .rows
+            .schema()
+            .index_of(wyrd_spec::vala::WYRD_EVENT_TIME)
+            .is_err()
+        {
+            return Err(ScribeError::Internal {
+                detail: "projected append is missing wyrd_event_time".to_owned(),
+            });
+        }
+        if req.schema_fingerprint
+            != crate::schema::fingerprint::SchemaFingerprint::from_arrow_schema(
+                req.rows.schema().as_ref(),
+            )
+        {
+            return Err(ScribeError::FingerprintMismatch {
+                table: req.table.fqn(),
+            });
+        }
+        let audit_event = wyrd_spec::vala::api::AuditEvent {
+            request_id: req.request_id.clone(),
+            trace_id: None,
+            operation: "bifrost.append".to_owned(),
+            resource: req.table.fqn(),
+            card_ref: req.principal.card_ref().cloned(),
+            principal_id: req.principal.id,
+            principal_kind: req.principal.kind.tag(),
+            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+            permission: "bifrost:append".to_owned(),
+            decision: wyrd_spec::vala::api::AuditDecision::Allow,
+            result: wyrd_spec::vala::api::AuditResult::Success,
+            payload_summary: format!("{} rows", req.rows.num_rows()),
+            detail: None,
+        };
+        Scribe::ingest_frame(
+            self,
+            ScribeIngressFrame {
+                authenticated_tenant: req.principal.tenant_id,
+                principal: req.principal,
+                table: req.table,
+                expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                    req.rows.schema().as_ref(),
+                )),
+                request_id: req.request_id,
+                batch_id: req.batch_id,
+                audit_event,
+                measured_wire_bytes: req.measured_wire_bytes,
+                payload: IngressPayload::ProjectedArrow(vec![req.rows]),
+            },
+        )
+        .await
+    }
+
+    /// Adapts an engine-only projected append into the private ingress seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for the same validation, admission, and durable
+    /// acknowledgment failures as [`Self::append_durable`].
+    pub async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+        self.append_durable(req).await.map(|_| ())
+    }
+}
+
 #[async_trait]
 impl Scribe for ScribeImpl {
+    /// Reports whether recovery has opened the private durable ingress seam.
     fn is_ready(&self) -> bool {
         Self::is_ready(self)
     }
 
-    // Keep this method as the Gate→Scribe composition seam. It prepares the
-    // request before dispatch and waits for the shard's durable completion.
+    /// Prepares one logical Gate frame and waits for durable completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when resolution, projection, admission,
+    /// persistence, or durable acknowledgment fails.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
         let active = metrics::gauge!("bifrost_scribe_ingress_active");
         active.increment(1.0);

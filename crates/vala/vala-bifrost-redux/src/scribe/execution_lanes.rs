@@ -368,6 +368,9 @@ fn decode(
                 .map_err(|_| ScribeError::InvalidFrame)?
         }
         IngressPayload::ProjectedArrow(batches) => batches,
+        IngressPayload::OtlpTraces(_)
+        | IngressPayload::OtlpMetrics(_)
+        | IngressPayload::OtlpLogs(_) => return Err(ScribeError::InvalidFrame),
     };
     let schema = batches
         .first()

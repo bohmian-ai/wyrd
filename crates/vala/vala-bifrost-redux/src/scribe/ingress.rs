@@ -1,7 +1,9 @@
 //! Bounded pre-ACK preparation for Scribe requests.
 
 use super::ScribeImpl;
-use crate::contracts::{FrameAdmission, ScribeError, ScribeIngressFrame};
+use crate::contracts::{
+    FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame, ScribeOtlpOutcome,
+};
 use crate::scribe::admission::{MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES};
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
 use crate::scribe::memory::MemoryCategory;
@@ -37,7 +39,165 @@ fn validate_decoded_request_size(
     Ok(bytes)
 }
 
+/// Validates authenticated identity and the raw transport ceiling.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for tenant mismatch or a nil tenant,
+/// and [`ScribeError::PayloadTooLarge`] above the fixed request ceiling.
+fn validate_logical_transport_frame(frame: &ScribeIngressFrame) -> Result<(), ScribeError> {
+    if frame.authenticated_tenant != frame.principal.tenant_id
+        || frame.authenticated_tenant.as_uuid().is_nil()
+    {
+        return Err(ScribeError::InvalidFrame);
+    }
+    if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
+        return Err(ScribeError::PayloadTooLarge {
+            bytes: frame.measured_wire_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Result of projecting or forwarding one bounded transport payload.
+enum PreparedTransportPayload {
+    /// Empty OTLP export acknowledged without entering durable row admission.
+    Empty(FrameAdmission),
+    /// Rows ready for the existing decoded-payload admission path.
+    Rows {
+        /// Native or projected payload consumed by the ingress CPU decoder.
+        payload: IngressPayload,
+        /// Optional OTLP outcome returned after durable row acknowledgment.
+        otlp_outcome: Option<ScribeOtlpOutcome>,
+    },
+}
+
 impl ScribeImpl {
+    /// Resolves one authenticated logical frame under the Scribe catalog owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when no logical-ingress catalog exists, built-in
+    /// provisioning or fingerprint lookup fails, or tenant/binding validation
+    /// rejects the frame.
+    async fn resolve_logical_frame(
+        &self,
+        frame: &ScribeIngressFrame,
+    ) -> Result<
+        (
+            crate::schema::fingerprint::SchemaFingerprint,
+            crate::catalog::TenantTableBinding,
+        ),
+        ScribeError,
+    > {
+        let expected = if let Some(expected) = frame.expected_schema_fingerprint {
+            expected
+        } else {
+            let catalog = self.catalog.as_ref().ok_or_else(|| ScribeError::Internal {
+                detail: "Scribe logical ingress requires its catalog owner".to_owned(),
+            })?;
+            if let Some(definition) = crate::tables::builtin_table(
+                frame
+                    .table
+                    .namespace
+                    .as_str()
+                    .strip_prefix("vala.")
+                    .unwrap_or_default(),
+                &frame.table.name,
+            ) {
+                catalog
+                    .ensure_builtin(frame.authenticated_tenant, definition)
+                    .await
+                    .map_err(|error| ScribeError::Internal {
+                        detail: error.to_string(),
+                    })?;
+            }
+            catalog
+                .table_schema_fingerprint(&frame.table, frame.authenticated_tenant)
+                .await
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?
+        };
+        let binding = crate::catalog::TenantTableBinding::resolve((
+            frame.authenticated_tenant,
+            frame.table.clone(),
+        ))
+        .map_err(|_| ScribeError::InvalidFrame)?;
+        binding
+            .validate_authenticated_tenant(frame.principal.tenant_id)
+            .map_err(|_| ScribeError::InvalidFrame)?;
+        Ok((expected, binding))
+    }
+
+    /// Projects raw OTLP on Scribe's bounded CPU lane or forwards engine payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] when OTLP projection rejects the
+    /// bounded payload, or the CPU lane fails to complete the projection.
+    async fn project_transport_payload(
+        &self,
+        payload: IngressPayload,
+        batch_id: uuid::Uuid,
+    ) -> Result<PreparedTransportPayload, ScribeError> {
+        let (batch, outcome) = match payload {
+            IngressPayload::OtlpTraces(request) => {
+                let projected = self
+                    .ingress_cpu
+                    .run(move || {
+                        crate::gate::collector::project_resource_spans(&request)
+                            .map_err(|_| ScribeError::InvalidFrame)
+                    })
+                    .await?;
+                (
+                    projected.batch,
+                    ScribeOtlpOutcome::Traces(projected.outcome),
+                )
+            }
+            IngressPayload::OtlpMetrics(request) => {
+                let projected = self
+                    .ingress_cpu
+                    .run(move || {
+                        crate::gate::collector::project_resource_metrics(&request)
+                            .map_err(|_| ScribeError::InvalidFrame)
+                    })
+                    .await?;
+                (
+                    projected.batch,
+                    ScribeOtlpOutcome::Metrics(projected.outcome),
+                )
+            }
+            IngressPayload::OtlpLogs(request) => {
+                let projected = self
+                    .ingress_cpu
+                    .run(move || {
+                        crate::gate::collector::project_resource_logs(&request)
+                            .map_err(|_| ScribeError::InvalidFrame)
+                    })
+                    .await?;
+                (projected.batch, ScribeOtlpOutcome::Logs(projected.outcome))
+            }
+            payload @ (IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_)) => {
+                return Ok(PreparedTransportPayload::Rows {
+                    payload,
+                    otlp_outcome: None,
+                });
+            }
+        };
+        Ok(match batch {
+            Some(batch) => PreparedTransportPayload::Rows {
+                payload: IngressPayload::ProjectedArrow(vec![batch]),
+                otlp_outcome: Some(outcome),
+            },
+            None => PreparedTransportPayload::Empty(FrameAdmission {
+                batch_id,
+                rows_accepted: 0,
+                otlp_outcome: Some(outcome),
+            }),
+        })
+    }
+
     /// Prepares one request and dispatches its owned packet to its fixed shard.
     ///
     /// The global item reservation is acquired before decoding and remains
@@ -60,21 +220,24 @@ impl ScribeImpl {
         frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
-        let table = frame.binding.table_ref.fqn();
+        validate_logical_transport_frame(&frame)?;
+        let (expected_schema_fingerprint, binding) = self.resolve_logical_frame(&frame).await?;
+        let (payload, otlp_outcome) = match self
+            .project_transport_payload(frame.payload, frame.batch_id)
+            .await?
+        {
+            PreparedTransportPayload::Empty(admission) => return Ok(admission),
+            PreparedTransportPayload::Rows {
+                payload,
+                otlp_outcome,
+            } => (payload, otlp_outcome),
+        };
+        let table = binding.table_ref.fqn();
         let shard = shard_for(
             frame.principal.tenant_id,
-            &frame.binding.table_ref,
+            &binding.table_ref,
             frame.batch_id,
         );
-        frame
-            .binding
-            .validate_authenticated_tenant(frame.principal.tenant_id)
-            .map_err(|_| ScribeError::InvalidFrame)?;
-        if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
-            return Err(ScribeError::PayloadTooLarge {
-                bytes: frame.measured_wire_bytes,
-            });
-        }
 
         let initial_bytes = frame
             .measured_wire_bytes
@@ -98,9 +261,9 @@ impl ScribeImpl {
         let rows = self
             .ingress_cpu
             .decode(
-                frame.payload,
+                payload,
                 frame.principal.clone(),
-                frame.expected_schema_fingerprint,
+                expected_schema_fingerprint,
                 frame.request_id.clone(),
                 frame.batch_id,
                 self.admission.config().event_time_window,
@@ -127,7 +290,7 @@ impl ScribeImpl {
             reservation,
             memory,
             tenant: frame.principal.tenant_id,
-            table: frame.binding.table_ref.clone(),
+            table: binding.table_ref,
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
         };
@@ -155,6 +318,7 @@ impl ScribeImpl {
         Ok(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted,
+            otlp_outcome,
         })
     }
 
@@ -320,7 +484,7 @@ fn record_accepted_frame(rows_accepted: u64, elapsed: std::time::Duration) {
 mod tests {
     use super::{ScribeImpl, validate_decoded_request_size};
     use crate::catalog::TableRef;
-    use crate::contracts::{Scribe, ScribeAppend, ScribeError};
+    use crate::contracts::{ScribeAppend, ScribeError};
     use crate::namespaces::BifrostNamespace;
     use crate::schema::SchemaFingerprint;
     use crate::scribe::memory::MemoryCategory;

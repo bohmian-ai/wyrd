@@ -19,6 +19,7 @@
 #![deny(missing_docs)]
 
 pub mod batch_builder;
+pub mod bounded_arrow;
 pub mod config;
 pub mod error;
 pub mod producer;
@@ -27,6 +28,10 @@ pub mod schema;
 pub mod sink;
 
 pub use batch_builder::BatchBuilder;
+pub use bounded_arrow::{
+    ArrowIpcMaterialError, ArrowIpcMaterialFacts, ArrowIpcMaterialPlan,
+    ArrowIpcMaterializedCapacity, BoundedArrowIpc,
+};
 pub use config::QueueConfig;
 pub use error::WyrdQueueError;
 pub use producer::{Producer, ProducerMetrics};

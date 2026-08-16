@@ -775,11 +775,12 @@ mod pg_tests {
             )
             .expect("wal initializes"),
         );
-        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
+        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps_and_catalog(
             Arc::new(storage.operator().clone()),
             wal,
             &Uuid::now_v7().to_string(),
             1,
+            Arc::clone(&redux_catalog),
         ));
         let ingest = Arc::new(BifrostIngestRuntime::new(
             scribe,

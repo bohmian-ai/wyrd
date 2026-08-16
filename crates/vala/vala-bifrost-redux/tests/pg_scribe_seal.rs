@@ -152,6 +152,7 @@ mod pg_tests {
             &node_id.to_string(),
             writer_epoch,
             vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                catalog: None,
                 lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
                 admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
                 coordination_runtime: tokio::runtime::Handle::current(),

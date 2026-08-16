@@ -2931,6 +2931,7 @@ impl WyrdTestServerBuilder {
                     &node_name,
                     writer_epoch,
                     vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                        catalog: Some(Arc::clone(&bifrost)),
                         lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
                         admission: scribe_admission,
                         coordination_runtime: tokio::runtime::Handle::current(),
@@ -2974,6 +2975,7 @@ impl WyrdTestServerBuilder {
                     writer_epoch,
                     self.wal_sync_delay,
                     vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                        catalog: Some(Arc::clone(&bifrost)),
                         lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::resolved(),
                         admission: scribe_admission,
                         coordination_runtime: tokio::runtime::Handle::current(),

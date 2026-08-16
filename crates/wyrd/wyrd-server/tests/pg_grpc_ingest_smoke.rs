@@ -11,6 +11,7 @@ mod pg_tests {
     use super::*;
     use arrow::array::{Int64Array, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -22,22 +23,29 @@ mod pg_tests {
     use vala_bifrost_redux::catalog::TableRef;
     use vala_bifrost_redux::contracts::ScribeAppend;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use vala_bifrost_redux::resources::{
+        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+        SystemResourceSnapshot,
+    };
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
     use vala_bifrost_redux::scribe::tail_rpc::{
         TailTicketAudience, TailTicketClaims, TailTicketMinter,
     };
     use vala_bifrost_redux::scribe::{
         ScribeImpl,
+        replay::replay_wal_directory,
         tail_rpc::{LocalTailReadTransport, TailReadTransport, TonicTailReadTransport},
         wal::{WalConfig, WalWriter},
     };
+    use vala_sql::TenantConn;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_server::AppState;
+    use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
     use wyrd_server::components::auth::ServerAuth;
     use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
     use wyrd_server::oracle::{PostgresTailSecurityAudit, ScribeTailAuthority};
@@ -67,6 +75,11 @@ mod pg_tests {
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
     /// Builds one process fixture and returns the temporary roots that keep its IO live.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the isolated Postgres, storage, auth, resource, WAL, or Scribe
+    /// fixture cannot be constructed.
     async fn test_state() -> (AppState, tempfile::TempDir, tempfile::TempDir) {
         let postgres = support::test_server_postgres().await;
         let app_pool = postgres.app_pool().clone();
@@ -107,12 +120,45 @@ mod pg_tests {
             )
             .expect("wal initializes"),
         );
-        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
-            Arc::new(storage.operator().clone()),
-            wal,
-            &uuid::Uuid::now_v7().to_string(),
-            1,
-        ));
+        let resources = BifrostRuntimeResources::from_snapshot(
+            SystemResourceSnapshot {
+                memory_limit_bytes: 1024 * 1024 * 1024,
+                effective_cpu: 2,
+                scratch_capacity_bytes: 1024 * 1024 * 1024,
+                scratch_available_bytes: 1024 * 1024 * 1024,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            },
+            BifrostResourcePolicy {
+                roles: [BifrostRole::Scribe].into_iter().collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: Some(512 * 1024 * 1024),
+                effective_cpu: None,
+                scratch_root: root.path().to_path_buf(),
+                volume_roots: None,
+            },
+        )
+        .expect("injected gRPC test resources")
+        .compose_roles()
+        .expect("gRPC test role composition");
+        let scribe = Arc::new(
+            ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
+                Arc::new(storage.operator().clone()),
+                wal,
+                &uuid::Uuid::now_v7().to_string(),
+                1,
+                vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                    catalog: Some(Arc::clone(&catalog)),
+                    lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
+                    admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+                    coordination_runtime: tokio::runtime::Handle::current(),
+                    persistence: None,
+                    resources: resources.scribe().expect("Scribe test capability"),
+                    staging_file_publisher: None,
+                },
+            ),
+        );
         let tail_audit = Arc::new(
             PostgresTailSecurityAudit::try_new(postgres.as_ref())
                 .await
@@ -138,6 +184,7 @@ mod pg_tests {
         let gate = ingest.gate();
         (
             AppState::new(postgres, storage, catalog)
+                .with_bifrost_resources(resources)
                 .with_bifrost_ingest(ingest)
                 .with_bifrost_gate(gate)
                 .with_auth(ServerAuth {
@@ -150,7 +197,12 @@ mod pg_tests {
         )
     }
 
-    fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
+    /// Mints one user token with the requested SQL-resolved built-in roles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a static role is invalid or the fixture key cannot sign the token.
+    fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
@@ -163,7 +215,14 @@ mod pg_tests {
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")
-            .issue_user_access_token(principal, vec![], ChronoDuration::minutes(5))
+            .issue_user_access_token(
+                principal,
+                roles
+                    .iter()
+                    .map(|role| RoleRef::new(role).expect("static role is valid"))
+                    .collect(),
+                ChronoDuration::minutes(5),
+            )
             .expect("test jwt mints")
     }
 
@@ -313,6 +372,30 @@ mod pg_tests {
         }
     }
 
+    /// Encodes one non-empty logical batch for the public native ingress regression.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed Arrow batch or IPC stream cannot be constructed.
+    fn valid_arrow_ipc() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![11_i64, 22_i64]))],
+        )
+        .expect("valid ingress batch");
+        let mut bytes = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer initializes");
+        writer.write(&batch).expect("IPC batch writes");
+        writer.finish().expect("IPC stream finishes");
+        bytes
+    }
+
     async fn bind_free_loopback() -> SocketAddr {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -385,7 +468,7 @@ mod pg_tests {
     async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
         let (state, _storage_root, _wal_root) = test_state().await;
         let tenant = DataTenantId::new_v7();
-        let jwt = mint_user_jwt(&state, tenant);
+        let jwt = mint_user_jwt(&state, tenant, &[]);
 
         let (_, health_service) = health_reporter();
         let router = build_app_grpc(
@@ -423,6 +506,86 @@ mod pg_tests {
                 );
             }
         }
+    }
+
+    /// Routes valid Arrow IPC through Gate, Scribe catalog resolution, and durable WAL ACK.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture construction, authenticated ingress, shutdown, WAL
+    /// replay, or the durability assertions fail.
+    #[tokio::test]
+    async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
+        const TABLE_NAME: &str = "embedded_ingress_catalog";
+        let (state, _storage_root, wal_root) = test_state().await;
+        let tenant = DataTenantId::new_v7();
+        support::seed_test_tenant(tenant, "embedded-ingress-catalog").await;
+        let mut tenant_conn = TenantConn::acquire(state.postgres.app_pool(), tenant)
+            .await
+            .expect("tenant role seed connection");
+        seed_builtin_roles_for_tenant(&mut tenant_conn, tenant)
+            .await
+            .expect("built-in roles seed for ingress principal");
+        tenant_conn.commit().await.expect("role seed commits");
+        state
+            .bifrost
+            .register_dataset(
+                tenant,
+                TableRef::new(BifrostNamespace::Datasets, TABLE_NAME),
+                vec![Field::new("value", DataType::Int64, false)],
+                None,
+            )
+            .await
+            .expect("logical dataset registers for the authenticated tenant");
+        let jwt = mint_user_jwt(&state, tenant, &["admin"]);
+        let batch_id = uuid::Uuid::now_v7();
+
+        let (_, health_service) = health_reporter();
+        let router = build_app_grpc(
+            &state,
+            health_service,
+            GrpcRouterConfig {
+                reflection_enabled: false,
+                tls_identity: None,
+            },
+        )
+        .expect("gRPC router builds with token verifier");
+        let bind = bind_free_loopback().await;
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        tokio::spawn(async move { serve_grpc(router, bind, token).await });
+
+        let mut request = Request::new(InsertBatchRequest {
+            table: format!("vala.datasets.{TABLE_NAME}"),
+            arrow_ipc: valid_arrow_ipc().into(),
+            wyrd_batch_id: batch_id.as_bytes().to_vec().into(),
+        });
+        request.metadata_mut().insert(
+            "x-wyrd-access-token",
+            format!("Bearer {jwt}").parse().expect("metadata value"),
+        );
+        let response = connect_grpc(bind)
+            .await
+            .insert_batch(request)
+            .await
+            .expect("valid logical ingress reaches Scribe and is durably acknowledged")
+            .into_inner();
+        assert_eq!(response.wyrd_batch_id.as_ref(), batch_id.as_bytes());
+
+        state
+            .bifrost_ingest
+            .as_ref()
+            .expect("fixture retains Scribe")
+            .scribe()
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        shutdown.cancel();
+        let replayed = replay_wal_directory(wal_root.path()).expect("acknowledged WAL replays");
+        let accepted = replayed
+            .values()
+            .find(|stream| stream.seal_key.table.name == TABLE_NAME)
+            .expect("catalog-resolved logical table has durable WAL state");
+        assert_eq!(accepted.data_records.len(), 1);
     }
 
     /// Rejects an unauthenticated private tail request before malformed input reaches lookup.

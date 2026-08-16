@@ -2723,11 +2723,12 @@ pub(crate) mod pg_tests {
                 )
                 .expect("WAL"),
             );
-            let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
+            let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps_and_catalog(
                 Arc::new(storage.operator().clone()),
                 wal,
                 &node_id.as_uuid().to_string(),
                 writer_epoch,
+                Arc::clone(&redux),
             ));
             let verifier = state.auth.token_verifier.clone().expect("test verifier");
             let ingest = Arc::new(

@@ -106,6 +106,7 @@ mod pg_tests {
             1,
             std::time::Duration::ZERO,
             ScribeEmbeddedConfig {
+                catalog: None,
                 lane_config: ScribeLaneConfig::resolved(),
                 admission: AdmissionConfig::default(),
                 coordination_runtime: tokio::runtime::Handle::current(),

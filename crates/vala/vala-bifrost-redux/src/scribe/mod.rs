@@ -35,7 +35,7 @@ mod scribe_persistence_path;
 #[cfg(test)]
 #[path = "tests/wal_closeout.rs"]
 mod wal_closeout;
-use crate::catalog::TenantTableBinding;
+use crate::catalog::{BifrostCatalog, TenantTableBinding};
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{
     FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
@@ -536,6 +536,8 @@ pub struct NativeIngressTestFrame {
 
 /// Runtime, admission, and memory inputs for an embedded Scribe.
 pub struct ScribeEmbeddedConfig {
+    /// Optional catalog owner required when the embedded Scribe serves public ingress.
+    pub catalog: Option<Arc<BifrostCatalog>>,
     /// Execution lane sizes for the embedded Scribe.
     pub lane_config: ScribeLaneConfig,
     /// Admission bounds for the embedded Scribe.
@@ -644,6 +646,41 @@ impl ScribeImpl {
         Self::new_for_embedded_with_runtime(operator, wal, node_id, writer_epoch, Handle::current())
     }
 
+    /// Construct an embedded Scribe that can resolve public logical ingress.
+    ///
+    /// The supplied catalog remains owned by Scribe so Gate only transports
+    /// authenticated logical identity and bounded payload bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the node identifier is not a UUID or the embedded resource
+    /// policy cannot satisfy Scribe's fixed ownership floors.
+    pub fn new_for_embedded_with_deps_and_catalog(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        catalog: Arc<BifrostCatalog>,
+    ) -> Self {
+        let admission = AdmissionConfig::default();
+        let resources = embedded_scribe_resources(&admission);
+        Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            ScribeEmbeddedConfig {
+                catalog: Some(catalog),
+                lane_config: ScribeLaneConfig::default(),
+                admission,
+                coordination_runtime: Handle::current(),
+                persistence: None,
+                resources,
+                staging_file_publisher: None,
+            },
+        )
+    }
+
     /// Construct the embedded Scribe with a deterministic WAL sync delay.
     ///
     /// This seam is used only by real benchmark and failure-injection
@@ -694,6 +731,7 @@ impl ScribeImpl {
             writer_epoch,
             sync_delay,
             ScribeEmbeddedConfig {
+                catalog: None,
                 lane_config: ScribeLaneConfig::resolved(),
                 admission,
                 coordination_runtime: Handle::current(),
@@ -744,7 +782,7 @@ impl ScribeImpl {
             stream_identity::WriterEpoch::new(writer_epoch),
         );
         Ok(Self::new_with_execution_pools(ScribeBuildConfig {
-            catalog: None,
+            catalog: config.catalog,
             operator,
             wal,
             stream,
@@ -830,6 +868,7 @@ impl ScribeImpl {
             node_id,
             writer_epoch,
             ScribeEmbeddedConfig {
+                catalog: None,
                 lane_config,
                 admission,
                 coordination_runtime,
@@ -861,7 +900,7 @@ impl ScribeImpl {
             stream_identity::WriterEpoch::new(writer_epoch),
         );
         Self::build(ScribeBuildConfig {
-            catalog: None,
+            catalog: config.catalog,
             operator,
             wal,
             stream,

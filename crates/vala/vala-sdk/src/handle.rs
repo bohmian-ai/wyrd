@@ -126,6 +126,7 @@ impl Bifrost {
             total_reserved_bytes,
             live_batches,
             retry_entries,
+            ..
         } = self.budget.metrics();
         let producers = self.producers.lock().expect("producer pool poisoned");
         BifrostMetrics {

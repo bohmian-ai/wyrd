@@ -100,14 +100,30 @@ pub struct ClientByteBudget {
     state: Arc<ClientBudgetState>,
 }
 
-/// Atomics that make every scalable client allocation and live entry visible.
+/// Shared allocation and cardinality state for one client handle.
 #[derive(Debug)]
 struct ClientBudgetState {
+    /// Immutable byte ceiling covering fixed and dynamic client ownership.
     limit: usize,
+    /// Bytes currently reserved under the handle-wide owner.
     used: AtomicUsize,
+    /// Sealed batches awaiting terminal settlement.
     live_batches: AtomicUsize,
+    /// Ambiguous batches retained for later retry.
     retry_entries: AtomicUsize,
+    /// Fixed data, staging, and control slot charges for live producers.
     fixed_storage: AtomicUsize,
+    /// Shared producer admission state guarded as one cardinality transition.
+    producer_permits: Mutex<ProducerPermitState>,
+}
+
+/// The accepted producer count and the tightest configuration ceiling seen by a handle.
+#[derive(Debug)]
+struct ProducerPermitState {
+    /// Producers admitted before fixed storage or queue construction.
+    live: usize,
+    /// Never-increasing producer ceiling shared by every direct caller.
+    ceiling: usize,
 }
 
 impl ClientByteBudget {
@@ -121,6 +137,10 @@ impl ClientByteBudget {
                 live_batches: AtomicUsize::new(0),
                 retry_entries: AtomicUsize::new(0),
                 fixed_storage: AtomicUsize::new(0),
+                producer_permits: Mutex::new(ProducerPermitState {
+                    live: 0,
+                    ceiling: QueueConfig::MAX_LIVE_ENTRIES,
+                }),
             }),
         }
     }
@@ -210,16 +230,29 @@ impl ClientByteBudget {
 
     /// Returns one point-in-time view of the handle-wide ownership budget.
     ///
-    /// The values are independent atomic observations intended for telemetry
-    /// and settlement assertions, rather than a transactional snapshot.
+    /// The byte and batch values are independent atomic observations intended
+    /// for telemetry and settlement assertions, rather than a transactional
+    /// snapshot. Producer cardinality is read under its narrow admission lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if producer admission state is poisoned, indicating an
+    /// invariant-breaking panic during producer construction or release.
     #[must_use]
     pub fn metrics(&self) -> ClientByteMetrics {
         let total_reserved_bytes = self.used_bytes();
         let fixed_storage_bytes = self.state.fixed_storage.load(Ordering::Acquire);
+        let live_producers = self
+            .state
+            .producer_permits
+            .lock()
+            .expect("producer permit lock poisoned")
+            .live;
         ClientByteMetrics {
             owned_bytes: total_reserved_bytes.saturating_sub(fixed_storage_bytes),
             fixed_storage_bytes,
             total_reserved_bytes,
+            live_producers,
             live_batches: self.state.live_batches.load(Ordering::Acquire),
             retry_entries: self.state.retry_entries.load(Ordering::Acquire),
         }
@@ -245,6 +278,45 @@ impl ClientByteBudget {
             budget: self.clone(),
         })
     }
+
+    /// Acquires one shared producer slot before fixed queue construction begins.
+    ///
+    /// The state permanently tightens to the smallest accepted configuration
+    /// ceiling used with this budget, so direct callers cannot bypass the
+    /// handle's producer envelope by constructing independent [`Producer`]s.
+    /// Dropping the returned guard rolls the admission back when a later fixed
+    /// byte reservation or queue construction step fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] before producer fixed-storage,
+    /// channel, ring, task, or registry work when the shared configured ceiling
+    /// is occupied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if producer admission state is poisoned, indicating an
+    /// invariant-breaking panic in another producer lifecycle operation.
+    fn reserve_producer(
+        &self,
+        configured_ceiling: usize,
+    ) -> Result<ProducerPermit, WyrdQueueError> {
+        let mut state = self
+            .state
+            .producer_permits
+            .lock()
+            .expect("producer permit lock poisoned");
+        state.ceiling = state
+            .ceiling
+            .min(configured_ceiling.clamp(1, QueueConfig::MAX_LIVE_ENTRIES));
+        if state.live >= state.ceiling {
+            return Err(WyrdQueueError::Backpressure);
+        }
+        state.live += 1;
+        Ok(ProducerPermit {
+            budget: self.clone(),
+        })
+    }
 }
 
 /// Point-in-time accounting for the bounded ownership held by one client handle.
@@ -256,6 +328,8 @@ pub struct ClientByteMetrics {
     pub fixed_storage_bytes: usize,
     /// Total handle reservation: dynamic owned bytes plus fixed storage charges.
     pub total_reserved_bytes: usize,
+    /// Producers admitted by the shared handle before fixed queue construction.
+    pub live_producers: usize,
     /// Sealed batch owners that have not reached terminal settlement.
     pub live_batches: usize,
     /// Retained ambiguous batches awaiting a later retry attempt.
@@ -278,6 +352,34 @@ impl Drop for FixedStorageGuard {
             .state
             .fixed_storage
             .fetch_sub(self.guard.bytes, Ordering::AcqRel);
+    }
+}
+
+/// Lifetime admission guard for one producer under a shared client budget.
+#[derive(Debug)]
+struct ProducerPermit {
+    /// Shared admission state decremented when terminal settlement or drop ends the lifetime.
+    budget: ClientByteBudget,
+}
+
+impl Drop for ProducerPermit {
+    /// Returns one producer slot exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if producer admission state is poisoned or underflows, which
+    /// would indicate a producer lifecycle accounting invariant violation.
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .state
+            .producer_permits
+            .lock()
+            .expect("producer permit lock poisoned");
+        state.live = state
+            .live
+            .checked_sub(1)
+            .expect("live producer permit must be held before release");
     }
 }
 
@@ -392,6 +494,8 @@ pub struct Producer {
     counters: Arc<Counters>,
     state: Arc<AtomicU8>,
     budget: ClientByteBudget,
+    /// One shared producer admission slot until terminal drain or producer drop.
+    producer_permit: Mutex<Option<ProducerPermit>>,
     fixed_storage: Mutex<Option<FixedStorageGuard>>,
 }
 
@@ -426,12 +530,14 @@ impl Producer {
     /// The fixed slot partition is derived from the configured producer
     /// cardinality before constructing Tokio or crossbeam buffers. This keeps
     /// every accepted producer's material slot capacity inside one handle-wide
-    /// byte owner.
+    /// byte owner. A shared producer permit also prevents direct callers from
+    /// constructing more than the accepted configured producer cardinality.
     ///
     /// # Errors
     ///
     /// Returns [`WyrdQueueError::Backpressure`] before queue construction when
-    /// the fixed storage charge cannot fit the shared client budget.
+    /// either the shared producer ceiling is occupied or the fixed storage
+    /// charge cannot fit the shared client budget.
     pub fn with_budget(
         table: &str,
         schema: SchemaRef,
@@ -440,6 +546,7 @@ impl Producer {
         budget: ClientByteBudget,
     ) -> Result<Self, WyrdQueueError> {
         let capacities = ProducerCapacities::for_handle(config, &budget)?;
+        let producer_permit = budget.reserve_producer(config.max_producers())?;
         let fixed_storage = budget.reserve_fixed_storage(capacities.charged_bytes)?;
         let (tx, rx) = mpsc::channel(capacities.data_slots);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(capacities.control_slots);
@@ -479,6 +586,7 @@ impl Producer {
             counters,
             state,
             budget,
+            producer_permit: Mutex::new(Some(producer_permit)),
             fixed_storage: Mutex::new(Some(fixed_storage)),
         })
     }
@@ -555,6 +663,7 @@ impl Producer {
             .unwrap_or(Err(WyrdQueueError::QueueFull));
         if self.state.load(Ordering::Acquire) == DRAINED {
             self.release_fixed_storage();
+            self.release_producer_permit();
         }
         result
     }
@@ -595,6 +704,21 @@ impl Producer {
             self.fixed_storage
                 .lock()
                 .expect("producer fixed-storage lock poisoned")
+                .take(),
+        );
+    }
+
+    /// Releases the shared producer slot after terminal drain completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer permit mutex is poisoned, indicating an
+    /// invariant-breaking panic in another producer lifecycle operation.
+    fn release_producer_permit(&self) {
+        drop(
+            self.producer_permit
+                .lock()
+                .expect("producer permit lock poisoned")
                 .take(),
         );
     }
@@ -841,6 +965,118 @@ mod tests {
             Err(WyrdQueueError::Backpressure)
         ));
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    /// Applies the shared producer ceiling before direct callers construct queue storage.
+    #[test]
+    fn shared_budget_refuses_sixty_fifth_producer_before_construction() {
+        let sink = Arc::new(MockSink::new());
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let config = QueueConfig {
+            flush_interval_ms: 0,
+            ..QueueConfig::default()
+        };
+        let mut producers = Vec::with_capacity(QueueConfig::MAX_LIVE_ENTRIES);
+        for index in 0..QueueConfig::MAX_LIVE_ENTRIES {
+            let table = format!("vala.bifrost.direct_capacity_{index}");
+            producers.push(
+                Producer::with_budget(&table, schema(), sink.clone(), config, budget.clone())
+                    .expect("accepted direct producer fits the shared envelope"),
+            );
+        }
+        let admitted = budget.metrics();
+        assert_eq!(
+            admitted.live_producers,
+            QueueConfig::MAX_LIVE_ENTRIES,
+            "shared admission records every direct producer"
+        );
+        assert!(
+            admitted.total_reserved_bytes <= QueueConfig::MAX_CLIENT_BYTE_LIMIT,
+            "fixed storage remains inside the one byte owner: {admitted:?}"
+        );
+        assert!(matches!(
+            Producer::with_budget(
+                "vala.bifrost.direct_capacity_overflow",
+                schema(),
+                sink.clone(),
+                config,
+                budget.clone(),
+            ),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        assert_eq!(
+            budget.metrics(),
+            admitted,
+            "the refused producer cannot grow fixed accounting or permits"
+        );
+        for producer in &producers {
+            producer
+                .shutdown()
+                .expect("empty direct producer shuts down");
+        }
+        let settled = budget.metrics();
+        assert_eq!(settled.live_producers, 0, "terminal drain releases permits");
+        assert_eq!(
+            settled.fixed_storage_bytes, 0,
+            "terminal drain releases slots"
+        );
+        assert_eq!(
+            settled.total_reserved_bytes, 0,
+            "terminal drain settles owner"
+        );
+
+        let dropped = Producer::with_budget(
+            "vala.bifrost.direct_capacity_drop",
+            schema(),
+            sink,
+            config,
+            budget.clone(),
+        )
+        .expect("released permit allows a replacement producer");
+        assert_eq!(
+            budget.metrics().live_producers,
+            1,
+            "replacement owns one permit"
+        );
+        drop(dropped);
+        assert_eq!(
+            budget.metrics().live_producers,
+            0,
+            "producer drop releases permit"
+        );
+    }
+
+    /// Rolls producer admission back when fixed byte reservation fails after permit acquisition.
+    #[test]
+    fn shared_producer_permit_rolls_back_after_fixed_admission_failure() {
+        let sink = Arc::new(MockSink::new());
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let blocker = budget
+            .reserve(QueueConfig::MAX_CLIENT_BYTE_LIMIT)
+            .expect("test reserves the complete byte owner");
+        assert!(matches!(
+            Producer::with_budget(
+                "vala.bifrost.direct_capacity_blocked",
+                schema(),
+                sink,
+                QueueConfig {
+                    flush_interval_ms: 0,
+                    ..QueueConfig::default()
+                },
+                budget.clone(),
+            ),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        let refused = budget.metrics();
+        assert_eq!(
+            refused.live_producers, 0,
+            "failed fixed admission drops the already-acquired permit"
+        );
+        assert_eq!(
+            refused.fixed_storage_bytes, 0,
+            "failed fixed admission creates no queue storage charge"
+        );
+        drop(blocker);
     }
 
     /// Retries one exact sealed owner identity after an ambiguous sink result.

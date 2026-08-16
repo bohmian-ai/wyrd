@@ -4,14 +4,13 @@
 //! socket), so they live in `mod pg_tests`: the fast family lane skips them via
 //! `--skip pg_tests`; `mise run test:e2e` (Postgres up) runs them.
 //!
-//! The current write path drains into a `MockSink` — the gRPC ingest transport
-//! is wired in a later stage. Until then these tests exercise the SDK lifecycle,
-//! producer-pool identity, and the asymmetric backpressure contract against
-//! real server credentials.
+//! The suite combines mock-sink queue saturation checks with real gRPC ingest
+//! journeys. The timeout journey uses a delayed server WAL to prove that the
+//! public SDK retains its owned batch through ambiguous transport settlement.
 
 mod pg_tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use arrow::array::{Int64Array, StringArray};
@@ -23,7 +22,10 @@ mod pg_tests {
     use tokio::sync::Notify;
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use vala_sdk::{Bifrost, BifrostGrpcTransport, ClientScope, QueryClient, SinkKind, observe};
+    use vala_sdk::{
+        Bifrost, BifrostGrpcTransport, BifrostIngestSink, BifrostTransportConfig, ClientScope,
+        IngestTransport, QueryClient, SinkKind, observe,
+    };
     use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -190,6 +192,66 @@ mod pg_tests {
         bytes
     }
 
+    /// Real gRPC transport wrapper that records the batch identity at the SDK sink seam.
+    ///
+    /// The wrapper performs no retry or payload transformation: it forwards the
+    /// exact non-cloneable sealed batch to [`BifrostGrpcTransport`] so the journey
+    /// can prove the queue returns the same owner after an ambiguous deadline.
+    struct RecordingTransport {
+        /// The authenticated real gRPC transport under test.
+        inner: BifrostGrpcTransport,
+        /// Batch IDs and owned-byte addresses observed before each real attempt.
+        attempts: Mutex<Vec<([u8; 16], usize)>>,
+    }
+
+    impl RecordingTransport {
+        /// Builds a recording wrapper around the real ordinary-Rust gRPC transport.
+        #[must_use]
+        fn new(inner: BifrostGrpcTransport) -> Self {
+            Self {
+                inner,
+                attempts: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Returns ordered `(batch ID, byte address)` observations at the sink boundary.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the test-only attempt recorder mutex is poisoned.
+        fn attempts(&self) -> Vec<([u8; 16], usize)> {
+            self.attempts
+                .lock()
+                .expect("attempt recorder lock poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl IngestTransport<ClientByteGuard> for RecordingTransport {
+        /// Records then forwards the exact owned batch through the real gRPC path.
+        ///
+        /// # Errors
+        ///
+        /// Propagates the real transport outcome, including its retained owner
+        /// for an ambiguous deadline.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the test-only attempt recorder mutex is poisoned.
+        async fn insert_batch(
+            &self,
+            batch: SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            let byte_address = batch.bytes().as_ptr() as usize;
+            self.attempts
+                .lock()
+                .expect("attempt recorder lock poisoned")
+                .push((batch.batch_id, byte_address));
+            IngestTransport::insert_batch(&self.inner, batch).await
+        }
+    }
+
     /// Runs the public Rust SDK through HTTP Gate and Oracle after a real gRPC ingest.
     #[tokio::test]
     async fn oracle_query_returns_arrow_batches_and_terminal() {
@@ -345,6 +407,180 @@ mod pg_tests {
             .stat(&file_path)
             .await
             .expect("sealed Parquet object exists");
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// Proves that an owned SDK batch survives an ambiguous post-receipt deadline,
+    /// retries with its original UUIDv7, and settles after the server deduplicates
+    /// the already-durable append.
+    #[tokio::test]
+    async fn public_sdk_owned_batch_timeout_retry_deduplicates_and_settles() {
+        let srv = WyrdTestServer::builder()
+            .with_wal_sync_delay(Duration::from_millis(250))
+            .start_bound()
+            .await
+            .expect("delayed-WAL test server start");
+        let table_name = format!("sdk_timeout_retry_{}", uuid::Uuid::now_v7().simple());
+        let table_fqn = format!("vala.bifrost.{table_name}");
+        srv.state()
+            .bifrost
+            .create_table(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
+                user_fields: vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                tenant: srv.data_tenant_id(),
+                audit: None,
+            })
+            .await
+            .expect("register timeout-retry table");
+
+        let bootstrap = srv
+            .bootstrap_service("sdk-timeout-retry-writer", &["admin"])
+            .await
+            .expect("bootstrap timeout-retry writer");
+        let target = bootstrap
+            .card_ref()
+            .expect("service bootstrap has a card scope")
+            .clone();
+        let config = ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                timeout_ms: 25,
+                connect_retries: 0,
+                max_message_bytes: 32 * 1024 * 1024,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            ..ClientConfig::default()
+        };
+        let scope = ClientScope::from_config(&config).expect("public SDK scope");
+        let client = WyrdClient::with_config(config).expect("public SDK client");
+        let transport = BifrostGrpcTransport::connect_with_config(
+            &client,
+            BifrostTransportConfig::with_max_frame_retries(0),
+        )
+        .await
+        .expect("connect timeout-retry transport");
+        let recording = Arc::new(RecordingTransport::new(transport));
+        let bifrost = Arc::new(Bifrost::new(
+            scope,
+            Arc::new(BifrostIngestSink::new(recording.clone())),
+            QueueConfig {
+                flush_interval_ms: 0,
+                ..QueueConfig::default()
+            },
+        ));
+
+        bifrost
+            .insert(
+                SinkKind::Record,
+                &table_fqn,
+                &schema(),
+                row(41),
+                target,
+                None,
+            )
+            .expect("enqueue one owned JSON row");
+        let first_error = tokio::task::spawn_blocking({
+            let bifrost = Arc::clone(&bifrost);
+            move || bifrost.flush()
+        })
+        .await
+        .expect("first flush task joins")
+        .expect_err("short deadline after server receipt must leave the durable result ambiguous");
+        let WyrdQueueError::Sink(first_sink_error) = &first_error else {
+            panic!("the queue must receive an ambiguous sink result: {first_error}");
+        };
+        assert!(
+            matches!(
+                first_sink_error,
+                wyrd_spec::error::WyrdError::ServiceUnavailable { .. }
+            ),
+            "the deadline must be projected as a retryable ambiguous result: {first_sink_error:?}"
+        );
+        let retained = bifrost.metrics();
+        assert!(
+            retained.owned_bytes > 0,
+            "retained batch still owns its bytes: {retained:?}"
+        );
+        assert_eq!(
+            retained.live_batches, 1,
+            "one sealed owner is retained: {retained:?}"
+        );
+        assert_eq!(
+            retained.retry_entries, 1,
+            "one retry entry retains that owner: {retained:?}"
+        );
+        assert_eq!(
+            retained.pending_controls, 0,
+            "the failed flush released its control slot"
+        );
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        tokio::task::spawn_blocking({
+            let bifrost = Arc::clone(&bifrost);
+            move || bifrost.flush()
+        })
+        .await
+        .expect("retry flush task joins")
+        .expect("retry resolves the post-receipt ambiguity through durable dedup");
+        let attempts = recording.attempts();
+        assert_eq!(attempts.len(), 2, "one deadline then one resolving retry");
+        assert_eq!(
+            attempts[0].0, attempts[1].0,
+            "the public sink retried the exact same stable batch ID"
+        );
+        assert_eq!(
+            attempts[0].1, attempts[1].1,
+            "the retained batch reused its owned-byte allocation without copying"
+        );
+        let settled = bifrost.metrics();
+        assert_eq!(settled.owned_bytes, 0, "durable ACK releases client bytes");
+        assert_eq!(
+            settled.live_batches, 0,
+            "durable ACK releases the live batch slot"
+        );
+        assert_eq!(
+            settled.retry_entries, 0,
+            "durable ACK releases the retry slot"
+        );
+        assert_eq!(
+            settled.pending_controls, 0,
+            "durable ACK leaves no pending control"
+        );
+
+        srv.flush_bifrost()
+            .await
+            .expect("flush the server-owned durable append");
+        let tenant = srv.data_tenant_id();
+        let mut conn = srv
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant-scoped read connection");
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE namespace = 'vala.bifrost' AND table_name = $1",
+        )
+        .bind(&table_name)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("read durable deduplicated rows");
+        assert_eq!(row_count, 1, "retry did not create a duplicate durable row");
+        conn.commit().await.expect("commit tenant-scoped read");
+        tokio::task::spawn_blocking({
+            let bifrost = Arc::clone(&bifrost);
+            move || bifrost.shutdown()
+        })
+        .await
+        .expect("shutdown task joins")
+        .expect("settled producer shutdown");
         srv.shutdown().await.expect("server shutdown");
     }
 

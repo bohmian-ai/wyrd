@@ -36,7 +36,7 @@ pub use grpc::{
     BifrostFrame, BifrostGrpcTransport, BifrostTransportConfig, MAX_FRAME_BYTES, MAX_FRAME_RETRIES,
     PROTO_FRAME_OVERHEAD_BYTES,
 };
-pub use handle::{Bifrost, schema_from_json_schema};
+pub use handle::{Bifrost, BifrostMetrics, schema_from_json_schema};
 pub use query::{
     CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream, RawQueryStream,
     ValaSdkError,

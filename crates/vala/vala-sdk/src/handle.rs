@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arrow_schema::SchemaRef;
 use wyrd_queue::{
-    BatchSink, ClientByteBudget, ClientByteGuard, Producer, QueueConfig, WyrdQueueError,
+    BatchSink, ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, QueueConfig,
+    WyrdQueueError,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
@@ -39,6 +40,21 @@ pub struct Bifrost {
     producers: Mutex<HashMap<ProducerKey, Arc<Producer>>>,
     dropped: AtomicU64,
     drop_warned: AtomicBool,
+}
+
+/// Point-in-time settlement accounting for one [`Bifrost`] client handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BifrostMetrics {
+    /// Producers currently registered under the bounded handle pool.
+    pub producers: usize,
+    /// Bytes held by queued rows or a sealed batch owner.
+    pub owned_bytes: usize,
+    /// Sealed batches not yet terminally acknowledged, cancelled, or poisoned.
+    pub live_batches: usize,
+    /// Ambiguous batches retained for a retry rather than released.
+    pub retry_entries: usize,
+    /// Flush or shutdown controls currently occupying producer command slots.
+    pub pending_controls: usize,
 }
 
 impl Bifrost {
@@ -80,6 +96,37 @@ impl Bifrost {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::SeqCst)
+    }
+
+    /// Returns the bounded ownership and control state for this client handle.
+    ///
+    /// This is a point-in-time telemetry view: concurrent inserts or background
+    /// drains can change individual counters immediately after it is returned.
+    /// A fully settled handle reports zero bytes, batches, retry entries, and
+    /// pending controls.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer pool mutex is poisoned, which indicates an
+    /// invariant-breaking panic in another handle operation.
+    #[must_use]
+    pub fn metrics(&self) -> BifrostMetrics {
+        let ClientByteMetrics {
+            owned_bytes,
+            live_batches,
+            retry_entries,
+        } = self.budget.metrics();
+        let producers = self.producers.lock().expect("producer pool poisoned");
+        BifrostMetrics {
+            producers: producers.len(),
+            owned_bytes,
+            live_batches,
+            retry_entries,
+            pending_controls: producers
+                .values()
+                .filter(|producer| producer.has_pending_control())
+                .count(),
+        }
     }
 
     /// Explicit write path: enqueue one row, **propagating** queue-full.

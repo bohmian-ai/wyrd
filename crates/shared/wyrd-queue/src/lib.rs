@@ -34,7 +34,9 @@ pub use bounded_arrow::{
 };
 pub use config::QueueConfig;
 pub use error::WyrdQueueError;
-pub use producer::{ClientByteBudget, ClientByteGuard, Producer, ProducerMetrics};
+pub use producer::{
+    ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, ProducerMetrics,
+};
 pub use queue::{Flushable, RecordQueue, Row};
 pub use schema::{
     arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow, json_schema_to_fieldspec,

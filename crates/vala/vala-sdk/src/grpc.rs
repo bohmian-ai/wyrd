@@ -244,6 +244,19 @@ impl BifrostGrpcTransport {
 
 #[async_trait]
 impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
+    /// Sends a moved sealed owner and returns it unchanged when the gRPC outcome is ambiguous.
+    ///
+    /// The `Vec<u8>` queue owner becomes an owned [`Bytes`] transport frame
+    /// without copying. A durable acknowledgement releases the owner; only a
+    /// typed service-unavailable result reconstructs that same owner for the
+    /// queue's bounded retry set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Retryable`] for an ambiguous unavailable outcome
+    /// and [`SinkError::Terminal`] for frame validation or a terminal server
+    /// failure. Cancellation before an ACK is treated as unavailable by the
+    /// preceding unary attempt and therefore retains the batch.
     async fn insert_batch(
         &self,
         batch: SealedBatch<ClientByteGuard>,
@@ -262,17 +275,15 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
         let result = self.send_owned_bytes(&table, batch_id, bytes.clone()).await;
         match result {
             Ok(()) => Ok(DurableBatchAck { batch_id, rows }),
-            Err(error) if error.code() == "WYRD_SPEC_503_SERVICE_UNAVAILABLE" => {
-                Err(SinkError::Retryable {
-                    error,
-                    batch: SealedBatch {
-                        table,
-                        batch_id,
-                        frame: OwnedIpcBytes::new(Vec::from(bytes), guard),
-                        rows,
-                    },
-                })
-            }
+            Err(error @ WyrdError::ServiceUnavailable { .. }) => Err(SinkError::Retryable {
+                error,
+                batch: SealedBatch {
+                    table,
+                    batch_id,
+                    frame: OwnedIpcBytes::new(Vec::from(bytes), guard),
+                    rows,
+                },
+            }),
             Err(error) => Err(SinkError::Terminal(error)),
         }
     }

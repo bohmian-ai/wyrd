@@ -135,6 +135,30 @@ impl ClientByteBudget {
     pub fn used_bytes(&self) -> usize {
         self.state.used.load(Ordering::Acquire)
     }
+
+    /// Returns one point-in-time view of the handle-wide ownership budget.
+    ///
+    /// The values are independent atomic observations intended for telemetry
+    /// and settlement assertions, rather than a transactional snapshot.
+    #[must_use]
+    pub fn metrics(&self) -> ClientByteMetrics {
+        ClientByteMetrics {
+            owned_bytes: self.used_bytes(),
+            live_batches: self.state.live_batches.load(Ordering::Acquire),
+            retry_entries: self.state.retry_entries.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// Point-in-time accounting for the bounded ownership held by one client handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientByteMetrics {
+    /// Bytes currently reserved by queued rows or a sealed batch owner.
+    pub owned_bytes: usize,
+    /// Sealed batch owners that have not reached terminal settlement.
+    pub live_batches: usize,
+    /// Retained ambiguous batches awaiting a later retry attempt.
+    pub retry_entries: usize,
 }
 
 /// The exclusive reservation that follows bytes through every ownership state.
@@ -398,6 +422,15 @@ impl Producer {
             dropped: self.counters.dropped.load(Ordering::Acquire),
             queue_depth: self.channel_depth.load(Ordering::Acquire) + self.staging.len(),
         }
+    }
+
+    /// Reports whether this producer currently owns its one bounded control slot.
+    ///
+    /// A `true` result means a flush or shutdown command is awaiting completion;
+    /// it does not imply that a batch has been accepted by the sink.
+    #[must_use]
+    pub fn has_pending_control(&self) -> bool {
+        self.control_pending.load(Ordering::Acquire)
     }
 
     /// Sends a flush control command after reserving this producer's one slot.

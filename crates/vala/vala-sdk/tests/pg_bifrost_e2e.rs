@@ -21,11 +21,8 @@ mod pg_tests {
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
     use tokio::sync::Notify;
-    use vala_bifrost::catalog::CreateTableRequest;
-    use vala_bifrost::catalog::namespaces::BifrostNamespace;
-    use vala_bifrost::types::TableScope;
-    use vala_bifrost_redux::catalog::{CreateTableRequest as ReduxCreateTableRequest, TableRef};
-    use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
+    use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_sdk::{
         Bifrost, BifrostGrpcTransport, ClientScope, IngestTransport, QueryClient, SinkKind, observe,
     };
@@ -189,11 +186,9 @@ mod pg_tests {
         let table_name = format!("sdk_oracle_{}", uuid::Uuid::now_v7().simple());
         let table_fqn = format!("vala.bifrost.{table_name}");
         srv.state()
-            .bifrost_redux
-            .as_ref()
-            .expect("Redux catalog is provisioned")
-            .create_table(ReduxCreateTableRequest {
-                table: TableRef::new(ReduxNamespace::Bifrost, &table_name),
+            .bifrost
+            .create_table(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![
                     Field::new("id", DataType::Int64, false),
                     Field::new("value", DataType::Utf8, false),
@@ -258,15 +253,12 @@ mod pg_tests {
         srv.state()
             .bifrost
             .create_table(CreateTableRequest {
-                ns: BifrostNamespace::Bifrost,
-                name: &table_name,
+                table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![
                     Field::new("id", DataType::Int64, false),
                     Field::new("value", DataType::Utf8, false),
                 ],
-                scope: TableScope::TenantOwned,
                 tenant: srv.data_tenant_id(),
-                partition_columns: &[],
                 audit: None,
             })
             .await

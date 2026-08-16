@@ -3857,9 +3857,7 @@ async fn register_table(
 ) -> Result<(), JourneyError> {
     server
         .state()
-        .bifrost_redux
-        .as_ref()
-        .ok_or("missing Redux catalog")?
+        .bifrost
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields: vec![
@@ -3881,9 +3879,7 @@ async fn register_paired_table(
 ) -> Result<(), JourneyError> {
     server
         .state()
-        .bifrost_redux
-        .as_ref()
-        .ok_or("missing Redux catalog")?
+        .bifrost
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields: vec![Field::new("row_id", DataType::Int64, false)],

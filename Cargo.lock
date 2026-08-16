@@ -9715,35 +9715,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vala-bifrost"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "async-trait",
- "chrono",
- "dashmap 6.2.1",
- "datafusion",
- "hex",
- "iceberg",
- "iceberg-catalog-sql",
- "iceberg-datafusion",
- "iceberg-storage-opendal",
- "parquet",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx 0.8.1",
- "sqlx 0.9.0",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "uuid",
- "vala-sql",
- "wyrd-spec",
- "wyrd-storage",
-]
-
-[[package]]
 name = "vala-bifrost-redux"
 version = "0.0.1"
 dependencies = [
@@ -9882,7 +9853,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "uuid",
- "vala-bifrost",
  "vala-bifrost-redux",
  "wyrd-client",
  "wyrd-queue",
@@ -10901,7 +10871,6 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
- "vala-bifrost",
  "vala-bifrost-redux",
  "vala-eval",
  "vala-sql",
@@ -11107,7 +11076,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "vala-bifrost",
  "vala-bifrost-redux",
  "vala-sdk",
  "vala-sql",

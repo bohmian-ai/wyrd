@@ -764,8 +764,7 @@ mod pg_tests {
             WyrdAuthVerifySettings::default(),
         ));
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let catalog = crate::test_support::test_catalog().await;
-        let redux_catalog = crate::test_support::test_redux_catalog().await;
+        let redux_catalog = crate::test_support::test_catalog().await;
         let wal_root = tempdir().expect("wal temp dir");
         let wal = Arc::new(
             WalWriter::new(
@@ -790,8 +789,7 @@ mod pg_tests {
             None,
         ));
         let gate = ingest.gate();
-        AppState::new(postgres, storage, catalog)
-            .with_bifrost_redux(redux_catalog)
+        AppState::new(postgres, storage, redux_catalog)
             .with_bifrost_ingest(ingest)
             .with_bifrost_gate(gate)
             .with_auth(ServerAuth {

@@ -181,7 +181,7 @@ impl StandaloneForgeFixture {
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await?;
-        let catalog = crate::server::test_redux_catalog(&database, &storage).await?;
+        let catalog = crate::server::test_catalog(&database, &storage).await?;
         let config = ForgeConfig::default();
         let spill_root = Arc::new(tempfile::tempdir()?);
         let runtime_resources =
@@ -1813,13 +1813,7 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
             .postgres
             .operator_pool()
             .expect("operator pool"),
-        bifrost_catalog: Arc::clone(
-            server
-                .state()
-                .bifrost_redux
-                .as_ref()
-                .expect("Bifrost Redux"),
-        ),
+        bifrost_catalog: Arc::clone(&server.state().bifrost),
         staging: Arc::new(server.state().storage.operator().clone()),
         object_store: ForgeObjectStoreControl::new(Arc::new(
             server.state().storage.operator().clone(),

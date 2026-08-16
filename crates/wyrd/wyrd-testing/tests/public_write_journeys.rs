@@ -547,9 +547,7 @@ async fn public_ack_restart_read_exact_once_journey() {
     let tenant = cluster.data_tenant_id();
     server
         .state()
-        .bifrost_redux
-        .as_ref()
-        .expect("restart Redux catalog")
+        .bifrost
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
@@ -1060,9 +1058,7 @@ async fn run_multitenant_public_journey() -> Result<(), Box<dyn std::error::Erro
         let table_fqn = format!("vala.bifrost.{table_name}");
         server
             .state()
-            .bifrost_redux
-            .as_ref()
-            .ok_or("missing Redux catalog")?
+            .bifrost
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, table_name),
                 user_fields: vec![
@@ -1409,11 +1405,7 @@ async fn fresh_boot_provisions_redux_before_first_write() {
         .expect("fresh WyrdTestCluster boot");
     let server = cluster.server(0).expect("booted Bifrost server");
     let tenant = cluster.data_tenant_id();
-    let redux = server
-        .state()
-        .bifrost_redux
-        .as_ref()
-        .expect("server boot provisions Redux catalog");
+    let redux = &server.state().bifrost;
     redux
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
@@ -1471,9 +1463,7 @@ async fn run_closeout_journey(
     let first = cluster.server(0).ok_or("missing first Bifrost pod")?;
     first
         .state()
-        .bifrost_redux
-        .as_ref()
-        .ok_or("missing Redux catalog")?
+        .bifrost
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
@@ -1683,9 +1673,7 @@ async fn run_delayed_fsync_journey(
     let server = cluster.server(0).ok_or("missing delayed-fsync pod")?;
     server
         .state()
-        .bifrost_redux
-        .as_ref()
-        .ok_or("missing Redux catalog")?
+        .bifrost
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![

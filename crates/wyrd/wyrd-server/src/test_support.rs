@@ -1,6 +1,6 @@
 //! Shared unit-test scaffolding for `wyrd-server`.
 //!
-//! `AppState::new` requires a live `Arc<WyrdCatalog>`, and the catalog connects
+//! `AppState::new` requires a live Redux catalog, and the catalog connects
 //! to Postgres at construction. The in-crate unit tests cannot go through the
 //! `wyrd-testing` harness (that would be a dependency cycle), so this module
 //! stands up one embedded-Postgres-backed catalog and shares it across every
@@ -10,7 +10,6 @@ use std::sync::{Arc, OnceLock};
 
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
-use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_sql::{OperatorPool, ValaPostgres};
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -23,8 +22,7 @@ use wyrd_storage::settings::{BackendConfig, StorageSettings};
 struct SharedCatalog {
     _fixture: PgFixture,
     _warehouse: TempDir,
-    catalog: Arc<WyrdCatalog>,
-    redux_catalog: Arc<BifrostCatalog>,
+    catalog: Arc<BifrostCatalog>,
     storage: Arc<StorageHandle>,
 }
 
@@ -60,16 +58,8 @@ async fn build_shared() -> SharedCatalog {
     .await
     .expect("local storage handle");
 
-    let catalog_dsn = fixture.catalog_dsn();
-    let catalog = WyrdCatalog::new(
-        catalog_dsn.expose_secret(),
-        storage.backend_config(),
-        Arc::new(fixture.app_pool().clone()),
-    )
-    .await
-    .expect("catalog builds against embedded postgres");
-    let redux_catalog = BifrostCatalog::new(
-        catalog_dsn.expose_secret(),
+    let catalog = BifrostCatalog::new(
+        fixture.catalog_dsn().expose_secret(),
         storage.backend_config(),
         fixture.vala_postgres().clone(),
     )
@@ -80,7 +70,6 @@ async fn build_shared() -> SharedCatalog {
         _fixture: fixture,
         _warehouse: warehouse,
         catalog: Arc::new(catalog),
-        redux_catalog: Arc::new(redux_catalog),
         storage,
     }
 }
@@ -106,14 +95,8 @@ fn shared() -> &'static SharedCatalog {
 }
 
 /// Return a live catalog handle for constructing `AppState` in unit tests.
-pub async fn test_catalog() -> Arc<WyrdCatalog> {
-    shared().catalog.clone()
-}
-
-/// Return the independently constructed Redux catalog for tests that exercise
-/// Gate, Forge, Oracle, or tenant-qualified registration.
-pub async fn test_redux_catalog() -> Arc<BifrostCatalog> {
-    Arc::clone(&shared().redux_catalog)
+pub async fn test_catalog() -> Arc<BifrostCatalog> {
+    Arc::clone(&shared().catalog)
 }
 
 /// Return the shared Vala Postgres handle used by the Redux catalog.

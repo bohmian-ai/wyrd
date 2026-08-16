@@ -126,9 +126,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     for (index, tenant) in tenants.iter().copied().enumerate() {
         ingest_server
             .state()
-            .bifrost_redux
-            .as_ref()
-            .ok_or("Oracle benchmark Redux catalog missing")?
+            .bifrost
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![

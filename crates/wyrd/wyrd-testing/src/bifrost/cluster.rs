@@ -10,7 +10,6 @@ use opendal::Operator;
 use sqlx::Row;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
@@ -35,7 +34,7 @@ use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
 use crate::bifrost::telemetry::BifrostTelemetryCapture;
 use crate::server::{
     OracleRuntimeInspection, TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder,
-    WyrdTestServerError, provision_oracle_peer_credentials, test_catalog, test_redux_catalog,
+    WyrdTestServerError, provision_oracle_peer_credentials, test_catalog,
 };
 
 /// Supported role topology for a Bifrost cluster journey.
@@ -702,10 +701,8 @@ pub struct WyrdTestCluster {
     storage: Arc<StorageHandle>,
     /// Shared local storage lifetime guard.
     storage_root: Arc<ClusterStorageRoot>,
-    /// Shared legacy Iceberg catalog.
-    catalog: Arc<WyrdCatalog>,
     /// Shared Redux Bifrost catalog.
-    redux_catalog: Arc<BifrostCatalog>,
+    catalog: Arc<BifrostCatalog>,
     /// Named topology retained for existing lane selection.
     topology: BifrostTopology,
     /// Builder fault configuration retained by the cluster.
@@ -1624,11 +1621,10 @@ impl WyrdTestCluster {
         })
         .await
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let catalog: Arc<WyrdCatalog> = test_catalog(&fixture, &storage).await?;
-        let redux_catalog: Arc<BifrostCatalog> = test_redux_catalog(&fixture, &storage).await?;
+        let catalog: Arc<BifrostCatalog> = test_catalog(&fixture, &storage).await?;
         let commit_uncertainty_catalog = options
             .inject_uncertainty
-            .then(|| CommitUncertaintyCatalog::new(redux_catalog.iceberg_catalog()));
+            .then(|| CommitUncertaintyCatalog::new(catalog.iceberg_catalog()));
         // Reuse the once-provisioned shared credentials when booting over shared
         // resources; their provisioning path is non-idempotent plain inserts, so
         // a fresh provision only runs when this cluster owns its fixture.
@@ -1734,7 +1730,6 @@ impl WyrdTestCluster {
             storage,
             storage_root,
             catalog,
-            redux_catalog,
             topology,
             wal_sync_delay,
             scribe_admission,
@@ -1813,7 +1808,6 @@ impl WyrdTestCluster {
                 Arc::clone(&self.fixture),
                 Arc::clone(&self.storage),
                 Arc::clone(&self.catalog),
-                Arc::clone(&self.redux_catalog),
                 None,
             )
             .await?

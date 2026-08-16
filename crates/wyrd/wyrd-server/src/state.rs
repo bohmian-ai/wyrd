@@ -12,7 +12,6 @@ use tokio::sync::Mutex;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::contracts::Scribe;
@@ -789,10 +788,7 @@ pub struct AppState {
     /// Process-wide artifact storage handle.
     pub storage: Arc<StorageHandle>,
     /// Process-wide Bifrost OLAP catalog.
-    pub bifrost: Arc<WyrdCatalog>,
-    /// Tenant-qualified Redux catalog used by Gate, Scribe, Forge, and Oracle
-    /// query paths.
-    pub bifrost_redux: Option<Arc<BifrostCatalog>>,
+    pub bifrost: Arc<BifrostCatalog>,
     /// Narrow per-role capabilities issued by the one Bifrost resource root.
     ///
     /// The server retains the composition, never a raw governor, so no server
@@ -844,7 +840,7 @@ impl AppState {
     pub fn new(
         postgres: Arc<ServerPostgres>,
         storage: Arc<StorageHandle>,
-        bifrost: Arc<WyrdCatalog>,
+        bifrost: Arc<BifrostCatalog>,
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         Self {
@@ -852,7 +848,6 @@ impl AppState {
             postgres,
             storage,
             bifrost,
-            bifrost_redux: None,
             bifrost_resources: None,
             bifrost_ingest: None,
             bifrost_gate: None,
@@ -972,13 +967,6 @@ impl AppState {
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
         self.storage = storage;
-        self
-    }
-
-    /// Attach the Redux-owned tenant-qualified Bifrost catalog.
-    #[must_use]
-    pub fn with_bifrost_redux(mut self, catalog: Arc<BifrostCatalog>) -> Self {
-        self.bifrost_redux = Some(catalog);
         self
     }
 

@@ -55,7 +55,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
-vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }

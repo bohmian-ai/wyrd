@@ -97,7 +97,6 @@ mod pg_tests {
         ));
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let catalog = support::test_catalog().await;
-        let redux_catalog = support::test_redux_catalog().await;
         let wal_root = tempfile::tempdir().expect("wal temp dir");
         let wal = Arc::new(
             WalWriter::new(
@@ -129,7 +128,7 @@ mod pg_tests {
         let ingest = Arc::new(
             BifrostIngestRuntime::new(
                 scribe,
-                Arc::clone(&redux_catalog),
+                Arc::clone(&catalog),
                 Arc::clone(&verifier),
                 vala_bifrost_redux::gate::limits::IngestLimits::default(),
                 None,
@@ -139,7 +138,6 @@ mod pg_tests {
         let gate = ingest.gate();
         (
             AppState::new(postgres, storage, catalog)
-                .with_bifrost_redux(redux_catalog)
                 .with_bifrost_ingest(ingest)
                 .with_bifrost_gate(gate)
                 .with_auth(ServerAuth {
@@ -807,19 +805,17 @@ mod pg_tests {
         shutdown.cancel();
     }
 
-    /// Keeps the legacy managed-column parity contract exact during Redux migration.
+    /// Pins the Redux managed-column contract after removal of the duplicate catalog.
     ///
     /// # Panics
     ///
     /// Panics when any managed field differs in name, type, order, or nullability.
     #[test]
-    fn legacy_and_redux_managed_columns_are_exactly_equal() {
+    fn redux_managed_columns_remain_stable() {
         let user_fields = vec![Field::new("value", DataType::UInt64, false)];
-        let legacy_dynamic = vala_bifrost::schema::with_managed_columns(user_fields.clone());
         let redux_dynamic = vala_bifrost_redux::schema::with_managed_columns(user_fields);
-        assert_eq!(legacy_dynamic, redux_dynamic);
         assert_eq!(
-            legacy_dynamic
+            redux_dynamic
                 .iter()
                 .map(|field| (
                     field.name().as_str(),
@@ -855,35 +851,22 @@ mod pg_tests {
             ]
         );
 
-        for (legacy, redux) in [
-            (
-                vala_bifrost::tables::managed_columns::ensure_managed_columns(
-                    Vec::new(),
-                    vala_bifrost::tables::CorrelationPolicy::Observation,
-                ),
-                vala_bifrost_redux::tables::managed_columns::ensure_managed_columns(
-                    Vec::new(),
-                    vala_bifrost_redux::tables::CorrelationPolicy::Observation,
-                ),
+        for managed in [
+            vala_bifrost_redux::tables::managed_columns::ensure_managed_columns(
+                Vec::new(),
+                vala_bifrost_redux::tables::CorrelationPolicy::Observation,
             ),
-            (
-                vala_bifrost::tables::managed_columns::ensure_managed_columns(
-                    Vec::new(),
-                    vala_bifrost::tables::CorrelationPolicy::CodeAxis,
-                ),
-                vala_bifrost_redux::tables::managed_columns::ensure_managed_columns(
-                    Vec::new(),
-                    vala_bifrost_redux::tables::CorrelationPolicy::CodeAxis,
-                ),
+            vala_bifrost_redux::tables::managed_columns::ensure_managed_columns(
+                Vec::new(),
+                vala_bifrost_redux::tables::CorrelationPolicy::CodeAxis,
             ),
         ] {
-            assert_eq!(legacy, redux);
             assert_eq!(
-                legacy.last().map(|field| field.name().as_str()),
+                managed.last().map(|field| field.name().as_str()),
                 Some("data_tenant_id")
             );
             assert_eq!(
-                legacy
+                managed
                     .iter()
                     .find(|field| field.name() == "wyrd_row_ordinal")
                     .map(|field| (field.data_type(), field.is_nullable())),

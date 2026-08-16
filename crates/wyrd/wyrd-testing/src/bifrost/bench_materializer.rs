@@ -1091,12 +1091,7 @@ struct RealMaterializerBackend<'a> {
 #[async_trait]
 impl MaterializerBackend for RealMaterializerBackend<'_> {
     async fn provision_table(&self, tenant: DataTenantId) -> Result<(), String> {
-        let catalog = self
-            .server
-            .state()
-            .bifrost_redux
-            .as_ref()
-            .ok_or_else(|| "missing Redux catalog".to_owned())?;
+        let catalog = self.server.state().bifrost;
         catalog
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, QUALIFICATION_TABLE),

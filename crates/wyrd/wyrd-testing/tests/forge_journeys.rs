@@ -974,9 +974,7 @@ async fn prepare_forge_convergence_table(
     let table = format!("forge_local_{}", uuid::Uuid::now_v7().simple());
     server
         .state()
-        .bifrost_redux
-        .as_ref()
-        .ok_or("missing Redux catalog")?
+        .bifrost
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![
@@ -3260,9 +3258,7 @@ async fn assert_snapshot(server: &WyrdTestServer, tenant: DataTenantId, scenario
     .expect("traces binding");
     let table = server
         .state()
-        .bifrost_redux
-        .as_ref()
-        .expect("Redux catalog")
+        .bifrost
         .iceberg_catalog()
         .load_table(&binding.table_ident())
         .await

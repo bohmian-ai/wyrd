@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tower::ServiceExt;
 use uuid::Uuid;
-use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::catalog::BifrostCatalog;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
 use wyrd_auth::pg_resolvers::PgIssuerResolver;
@@ -980,11 +980,11 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestError {
 async fn test_catalog(
     fixture: &PgFixture,
     storage: &Arc<StorageHandle>,
-) -> Result<Arc<WyrdCatalog>, WyrdTestError> {
-    let catalog = WyrdCatalog::new(
+) -> Result<Arc<BifrostCatalog>, WyrdTestError> {
+    let catalog = BifrostCatalog::new(
         fixture.catalog_dsn().expose_secret(),
         storage.backend_config(),
-        Arc::new(fixture.app_pool().clone()),
+        fixture.vala_postgres().clone(),
     )
     .await
     .map_err(|error| WyrdTestError::Start(error.to_string()))?;

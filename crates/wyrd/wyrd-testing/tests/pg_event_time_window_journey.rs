@@ -138,9 +138,7 @@ mod pg_tests {
             .expect("bound Bifrost server");
         let tenant = srv.data_tenant_id();
         srv.state()
-            .bifrost_redux
-            .as_ref()
-            .expect("bound server provisions Redux catalog")
+            .bifrost
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
                 user_fields: vec![

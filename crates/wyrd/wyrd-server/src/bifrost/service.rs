@@ -1,7 +1,7 @@
 //! RBAC-gated Bifrost catalog service functions (register / list / describe).
 //!
 //! Each function authorizes the caller against the runtime RBAC model *before*
-//! touching the `WyrdCatalog`, mirroring `storage::service`. Engine errors cross
+//! touching the Redux catalog, mirroring `storage::service`. Engine errors cross
 //! the public boundary through `BifrostError::into_public().into()` and are
 //! rendered by the single `WyrdErrorResponse`.
 
@@ -28,13 +28,7 @@ fn map_engine_error(error: BifrostCatalogError) -> WyrdError {
 }
 
 fn redux_catalog(state: &AppState) -> Result<&BifrostCatalog, WyrdError> {
-    state
-        .bifrost_redux
-        .as_deref()
-        .ok_or_else(|| WyrdError::Internal {
-            message: "Redux Bifrost catalog is not configured".to_owned(),
-            details: serde_json::Value::Null,
-        })
+    Ok(state.bifrost.as_ref())
 }
 
 /// Authorize the caller against a required permission before execution.
@@ -222,7 +216,6 @@ mod pg_tests {
             Arc::clone(&storage),
             crate::test_support::test_catalog().await,
         )
-        .with_bifrost_redux(crate::test_support::test_redux_catalog().await)
     }
 
     async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {

@@ -11,7 +11,6 @@ use base64::Engine;
 use futures_util::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
-use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 #[cfg(feature = "test-support")]
 use vala_bifrost_redux::cluster::RoleTiming;
@@ -254,9 +253,6 @@ pub enum ServerBootError {
     /// Runtime pool construction failed.
     #[error("database pool construction failed")]
     PoolConnect(#[source] sqlx::Error),
-    /// Bifrost catalog construction failed.
-    #[error(transparent)]
-    Bifrost(#[from] vala_bifrost::error::BifrostError),
     /// Wyrd's own signing key could not be loaded or its public key derived.
     /// Boot fails closed: without a usable signing key the server cannot mint or
     /// verify Wyrd JWTs.
@@ -497,19 +493,7 @@ async fn build_bifrost_parts_from_boot(
     );
     let storage = StorageHandle::from_settings(storage_settings).await?;
     tracing::info!(backend = %storage.backend(), "storage handle ready");
-    let bifrost = WyrdCatalog::new(
-        dsns.catalog_app.expose_secret(),
-        storage.backend_config(),
-        Arc::new(postgres.app_pool().clone()),
-    )
-    .await?;
-    let bifrost = Arc::new(bifrost);
-
-    // Provision the pre-declared OLAP domain tables (traces.spans, genai.*, ...)
-    // so the ingest and query paths have their physical Iceberg tables. Idempotent
-    // and append-only — a no-op after first boot; fails closed on schema drift.
-    vala_bifrost::tables::register_all(&bifrost).await?;
-    let bifrost_redux = Arc::new(
+    let bifrost = Arc::new(
         BifrostCatalog::new(
             dsns.catalog_app.expose_secret(),
             storage.backend_config(),
@@ -738,7 +722,7 @@ async fn build_bifrost_parts_from_boot(
             })?,
             vala: postgres.vala().clone(),
             operator_pool: operator_pool.clone(),
-            catalog: bifrost_redux.iceberg_catalog(),
+            catalog: bifrost.iceberg_catalog(),
             staging,
             object_store,
             rewrite_spill_root,
@@ -754,9 +738,8 @@ async fn build_bifrost_parts_from_boot(
         None
     };
 
-    let mut state = AppState::new(postgres, storage, bifrost)
+    let mut state = AppState::new(postgres, storage, Arc::clone(&bifrost))
         .with_bifrost_node_id(ClusterNodeId::new(node_id.as_uuid()))
-        .with_bifrost_redux(bifrost_redux)
         .with_bifrost_resources(bifrost_resources);
     if let Some(forge) = forge {
         state = state.with_forge(forge);
@@ -939,17 +922,7 @@ pub async fn build_state(
             return Err(error);
         }
     };
-    let bifrost_redux = match state
-        .bifrost_redux
-        .clone()
-        .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))
-    {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
+    let bifrost = Arc::clone(&state.bifrost);
     let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
     let state = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_parts = bifrost_parts.scribe.ok_or_else(|| {
@@ -963,7 +936,7 @@ pub async fn build_state(
         let ingest = Arc::new(
             BifrostIngestRuntime::new(
                 scribe_parts.scribe,
-                Arc::clone(&bifrost_redux),
+                Arc::clone(&bifrost),
                 Arc::clone(&verifier),
                 limits.clone(),
                 Some(
@@ -987,7 +960,7 @@ pub async fn build_state(
     };
     let mut gate = match &state.bifrost_ingest {
         Some(ingest) => vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
-            bifrost_redux,
+            bifrost,
             ingest.scribe().clone(),
             vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
             limits,
@@ -996,7 +969,7 @@ pub async fn build_state(
             )),
         ),
         None => vala_bifrost_redux::gate::Gate::without_scribe(
-            bifrost_redux,
+            bifrost,
             vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
             limits,
         ),
@@ -1233,10 +1206,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 "Oracle role selected without a composed Oracle capability".to_owned(),
             )
         })?;
-        let catalog = state
-            .bifrost_redux
-            .as_ref()
-            .ok_or_else(|| ServerBootError::OraclePeer("Redux catalog is absent".to_owned()))?;
+        let catalog = &state.bifrost;
         let configured_cpu = resource_plan.effective_cpu as f64;
         let memory_bytes_per_slot = u64::try_from(
             vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
@@ -2382,7 +2352,7 @@ pub(crate) mod pg_tests {
     ) {
         let state = make_test_state().await;
         let storage = crate::test_support::test_storage().await;
-        let redux = crate::test_support::test_redux_catalog().await;
+        let redux = Arc::clone(&state.bifrost);
         let vala = crate::test_support::test_vala_postgres().await;
         let operator_pool: OperatorPool = crate::test_support::test_operator_pool().await;
         let (publisher, inbox) = staging_file_channel(16).expect("hint channel");
@@ -2438,10 +2408,7 @@ pub(crate) mod pg_tests {
             .expect("Forge"),
         );
         (
-            state
-                .with_bifrost_redux(redux)
-                .with_bifrost_resources(roles)
-                .with_forge(forge),
+            state.with_bifrost_resources(roles).with_forge(forge),
             publisher,
         )
     }
@@ -2626,10 +2593,8 @@ pub(crate) mod pg_tests {
         wyrd_runtime::runtime().block_on(async {
             let postgres = crate::test_support::test_server_postgres().await;
             let storage = crate::test_support::test_storage().await;
-            let catalog = crate::test_support::test_catalog().await;
-            let redux = crate::test_support::test_redux_catalog().await;
-            let state = AppState::new(postgres, storage, catalog)
-                .with_bifrost_redux(redux)
+            let redux = crate::test_support::test_catalog().await;
+            let state = AppState::new(postgres, storage, redux)
                 .with_bifrost_resources(oracle_scribe_test_resources());
             let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
             let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
@@ -2684,10 +2649,8 @@ pub(crate) mod pg_tests {
         wyrd_runtime::runtime().block_on(async {
             let postgres = crate::test_support::test_server_postgres().await;
             let storage = crate::test_support::test_storage().await;
-            let catalog = crate::test_support::test_catalog().await;
-            let redux = crate::test_support::test_redux_catalog().await;
-            let state = AppState::new(postgres, Arc::clone(&storage), catalog)
-                .with_bifrost_redux(Arc::clone(&redux))
+            let redux = crate::test_support::test_catalog().await;
+            let state = AppState::new(postgres, Arc::clone(&storage), Arc::clone(&redux))
                 .with_bifrost_resources(oracle_scribe_test_resources());
             let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
             let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));

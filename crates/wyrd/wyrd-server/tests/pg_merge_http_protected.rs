@@ -70,7 +70,6 @@ mod pg_tests {
         ));
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let catalog = support::test_catalog().await;
-        let redux_catalog = support::test_redux_catalog().await;
         let wal_root = tempfile::tempdir().expect("wal temp dir");
         let wal = Arc::new(
             WalWriter::new(
@@ -89,14 +88,13 @@ mod pg_tests {
         ));
         let ingest = Arc::new(BifrostIngestRuntime::new(
             scribe,
-            Arc::clone(&redux_catalog),
+            Arc::clone(&catalog),
             Arc::clone(&verifier),
             vala_bifrost_redux::gate::limits::IngestLimits::default(),
             None,
         ));
         let gate = ingest.gate();
         AppState::new(postgres, storage, catalog)
-            .with_bifrost_redux(redux_catalog)
             .with_bifrost_ingest(ingest)
             .with_bifrost_gate(gate)
             .with_auth(ServerAuth {

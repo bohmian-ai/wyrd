@@ -443,6 +443,11 @@ hide = true
 description = "Assert Redux has no legacy Bifrost dependency and run the negative self-test"
 run = "bash scripts/checks/redux-isolation.sh"
 
+[tasks."check:redux-single-authority"]
+hide = true
+description = "Require Redux as the sole Bifrost catalog and server boot authority"
+run = "bash scripts/checks/redux-single-authority.sh"
+
 [tasks."check:redux-single-table-model"]
 hide = true
 description = "Fail closed on obsolete Redux scope, sentinel tenant, and synthetic benchmark vocabulary"

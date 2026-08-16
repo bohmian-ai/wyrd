@@ -3,7 +3,7 @@
 //!
 //! The Arrow-free wire types live in `wyrd-spec`; the Arrow bridge lives here (in
 //! the server), never in `wyrd-spec`. The register handler turns a wire
-//! [`FieldSpec`] list into Arrow [`Field`]s to hand to `WyrdCatalog::create_table`
+//! [`FieldSpec`] list into Arrow [`Field`]s for Redux catalog registration
 //! and derives the server-authoritative schema fingerprint the same way the
 //! catalog does (user-fields-only, over the Arrow schema).
 
@@ -200,7 +200,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 
 /// Server-authoritative, user-fields-only schema fingerprint as lower-case hex.
 ///
-/// Reproduces `WyrdCatalog::create_table`'s fingerprint: the SHA-256 over the
+/// Reproduces the Redux catalog fingerprint: the SHA-256 over the
 /// user Arrow fields, before system/correlation columns are appended.
 pub fn fingerprint_hex(user_fields: &[Field]) -> String {
     let schema = Schema::new(user_fields.to_vec());

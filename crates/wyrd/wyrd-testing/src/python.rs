@@ -458,9 +458,7 @@ async fn prepare_oracle_query_fixture(
         Field::new("value", DataType::Utf8, false),
     ]));
     srv.state()
-        .bifrost_redux
-        .as_ref()
-        .ok_or_else(|| harness_error("Redux catalog is unavailable"))?
+        .bifrost
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
             user_fields: schema

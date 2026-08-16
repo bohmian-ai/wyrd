@@ -22,7 +22,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
-use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::contracts::Scribe;
@@ -2642,7 +2641,6 @@ impl WyrdTestServerBuilder {
             (Some(Arc::new(root)), handle)
         };
         let bifrost = test_catalog(&fixture, &storage).await?;
-        let bifrost_redux = test_redux_catalog(&fixture, &storage).await?;
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
             && self.oracle_peer_credentials.is_none()
         {
@@ -2650,7 +2648,7 @@ impl WyrdTestServerBuilder {
                 Some(provision_oracle_peer_credentials(Arc::clone(&fixture)).await?);
         }
 
-        self.start_with_resources(fixture, storage, bifrost, bifrost_redux, storage_root)
+        self.start_with_resources(fixture, storage, bifrost, storage_root)
             .await
     }
 
@@ -2670,8 +2668,7 @@ impl WyrdTestServerBuilder {
         self,
         fixture: Arc<PgFixture>,
         storage: Arc<wyrd_storage::StorageHandle>,
-        bifrost: Arc<WyrdCatalog>,
-        bifrost_redux: Arc<BifrostCatalog>,
+        bifrost: Arc<BifrostCatalog>,
         storage_root: Option<Arc<tempfile::TempDir>>,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
         wyrd_tls::install_crypto_provider()
@@ -2872,7 +2869,7 @@ impl WyrdTestServerBuilder {
                     operator_pool: operator_pool.clone(),
                     catalog: self
                         .forge_catalog
-                        .unwrap_or_else(|| bifrost_redux.iceberg_catalog()),
+                        .unwrap_or_else(|| bifrost.iceberg_catalog()),
                     staging,
                     object_store,
                     rewrite_spill_root: root.path().to_owned(),
@@ -3042,7 +3039,7 @@ impl WyrdTestServerBuilder {
         let mut ingest = scribe.as_ref().map(|scribe| {
             let runtime = BifrostIngestRuntime::new(
                 Arc::clone(scribe),
-                Arc::clone(&bifrost_redux),
+                Arc::clone(&bifrost),
                 Arc::clone(&verifier),
                 vala_bifrost_redux::gate::limits::IngestLimits::default(),
                 None,
@@ -3053,9 +3050,8 @@ impl WyrdTestServerBuilder {
             }
         });
         let query_stream_fault = QueryStreamFaultController::default();
-        let mut state = AppState::new(postgres, storage, bifrost)
+        let mut state = AppState::new(postgres, storage, Arc::clone(&bifrost))
             .with_bifrost_node_id(node_id)
-            .with_bifrost_redux(Arc::clone(&bifrost_redux))
             .with_bifrost_resources(bifrost_resources)
             .with_bifrost_roles(self.bifrost_roles.clone())
             .with_query_stream_fault(query_stream_fault.clone())
@@ -3164,7 +3160,7 @@ impl WyrdTestServerBuilder {
         let mut gate = if let Some(ingest) = &ingest {
             let gate_scribe: Arc<dyn Scribe> = ingest.scribe().clone();
             vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
-                Arc::clone(&bifrost_redux),
+                Arc::clone(&bifrost),
                 gate_scribe,
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
                 limits,
@@ -3174,7 +3170,7 @@ impl WyrdTestServerBuilder {
             )
         } else {
             vala_bifrost_redux::gate::Gate::without_scribe(
-                Arc::clone(&bifrost_redux),
+                Arc::clone(&bifrost),
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
                 limits,
             )
@@ -3209,7 +3205,7 @@ impl WyrdTestServerBuilder {
                 issuing_key,
                 api_key: SecretString::from(String::new()),
                 forge_publisher,
-                bifrost_catalog: Arc::clone(&bifrost_redux),
+                bifrost_catalog: Arc::clone(&bifrost),
                 forge_clock: forge_clock_control,
                 forge_scheduler_trigger,
                 forge_process_role: self.forge_process_role,
@@ -3614,29 +3610,15 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
 pub(crate) async fn test_catalog(
     fixture: &PgFixture,
     storage: &Arc<wyrd_storage::StorageHandle>,
-) -> Result<Arc<WyrdCatalog>, WyrdTestServerError> {
-    let catalog = WyrdCatalog::new(
-        fixture.catalog_dsn().expose_secret(),
-        storage.backend_config(),
-        Arc::new(fixture.app_pool().clone()),
-    )
-    .await
-    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    Ok(Arc::new(catalog))
-}
-
-pub(crate) async fn test_redux_catalog(
-    fixture: &PgFixture,
-    storage: &Arc<wyrd_storage::StorageHandle>,
 ) -> Result<Arc<BifrostCatalog>, WyrdTestServerError> {
-    BifrostCatalog::new(
+    let catalog = BifrostCatalog::new(
         fixture.catalog_dsn().expose_secret(),
         storage.backend_config(),
         fixture.vala_postgres().clone(),
     )
     .await
-    .map(Arc::new)
-    .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    Ok(Arc::new(catalog))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

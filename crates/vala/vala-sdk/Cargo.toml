@@ -45,7 +45,6 @@ wyrd-utils = { workspace = true, optional = true }
 [dev-dependencies]
 reqwest = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
-vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }

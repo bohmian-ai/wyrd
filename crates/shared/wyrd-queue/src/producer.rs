@@ -51,11 +51,15 @@ impl ProducerCapacities {
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdQueueError::Backpressure`] when the handle cannot reserve
-    /// at least one data and one staging slot per accepted producer, or when a
-    /// checked capacity calculation overflows.
+    /// Returns [`WyrdQueueError::Backpressure`] when the configured producer
+    /// ceiling is zero, the handle cannot reserve at least one data and one
+    /// staging slot per accepted producer, or a checked capacity calculation
+    /// overflows.
     fn for_handle(config: QueueConfig, budget: &ClientByteBudget) -> Result<Self, WyrdQueueError> {
-        let producer_count = config.max_producers().max(1);
+        let producer_count = config.max_producers();
+        if producer_count == 0 {
+            return Err(WyrdQueueError::Backpressure);
+        }
         let per_producer_bytes = budget.limit() / producer_count;
         // Fixed slots cannot consume the entire partition: every accepted
         // producer must still be able to reserve dynamic row ownership. Half
@@ -279,43 +283,63 @@ impl ClientByteBudget {
         })
     }
 
-    /// Acquires one shared producer slot before fixed queue construction begins.
+    /// Constructs one producer under a shared provisional admission slot.
     ///
-    /// The state permanently tightens to the smallest accepted configuration
-    /// ceiling used with this budget, so direct callers cannot bypass the
-    /// handle's producer envelope by constructing independent [`Producer`]s.
-    /// Dropping the returned guard rolls the admission back when a later fixed
-    /// byte reservation or queue construction step fails.
+    /// The narrow admission lock spans the construction closure. It prevents a
+    /// concurrent direct caller from crossing a lower configured ceiling while
+    /// that producer is still reserving fixed storage. The tighter ceiling is
+    /// committed only after construction succeeds; an error restores the live
+    /// count and leaves the prior ceiling unchanged.
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdQueueError::Backpressure`] before producer fixed-storage,
-    /// channel, ring, task, or registry work when the shared configured ceiling
-    /// is occupied.
+    /// Returns [`WyrdQueueError::Backpressure`] before construction when the
+    /// configured ceiling is zero or the shared configured ceiling is occupied,
+    /// and otherwise propagates a closure failure after rolling its provisional
+    /// admission back.
     ///
     /// # Panics
     ///
     /// Panics if producer admission state is poisoned, indicating an
     /// invariant-breaking panic in another producer lifecycle operation.
-    fn reserve_producer(
+    fn construct_producer<T>(
         &self,
         configured_ceiling: usize,
-    ) -> Result<ProducerPermit, WyrdQueueError> {
+        construct: impl FnOnce() -> Result<T, WyrdQueueError>,
+    ) -> Result<(T, ProducerPermit), WyrdQueueError> {
+        if configured_ceiling == 0 {
+            return Err(WyrdQueueError::Backpressure);
+        }
         let mut state = self
             .state
             .producer_permits
             .lock()
             .expect("producer permit lock poisoned");
-        state.ceiling = state
+        let provisional_ceiling = state
             .ceiling
             .min(configured_ceiling.clamp(1, QueueConfig::MAX_LIVE_ENTRIES));
-        if state.live >= state.ceiling {
+        if state.live >= provisional_ceiling {
             return Err(WyrdQueueError::Backpressure);
         }
         state.live += 1;
-        Ok(ProducerPermit {
-            budget: self.clone(),
-        })
+        match construct() {
+            Ok(value) => {
+                state.ceiling = provisional_ceiling;
+                Ok((
+                    value,
+                    ProducerPermit {
+                        budget: self.clone(),
+                    },
+                ))
+            }
+            Err(error) => {
+                state.live = state
+                    .live
+                    .checked_sub(1)
+                    .expect("provisional producer admission must be live");
+                Err(error)
+            }
+        }
     }
 }
 
@@ -536,8 +560,9 @@ impl Producer {
     /// # Errors
     ///
     /// Returns [`WyrdQueueError::Backpressure`] before queue construction when
-    /// either the shared producer ceiling is occupied or the fixed storage
-    /// charge cannot fit the shared client budget.
+    /// the configured producer ceiling is zero, the shared producer ceiling is
+    /// occupied, or the fixed storage charge cannot fit the shared client
+    /// budget.
     pub fn with_budget(
         table: &str,
         schema: SchemaRef,
@@ -546,49 +571,56 @@ impl Producer {
         budget: ClientByteBudget,
     ) -> Result<Self, WyrdQueueError> {
         let capacities = ProducerCapacities::for_handle(config, &budget)?;
-        let producer_permit = budget.reserve_producer(config.max_producers())?;
-        let fixed_storage = budget.reserve_fixed_storage(capacities.charged_bytes)?;
-        let (tx, rx) = mpsc::channel(capacities.data_slots);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel(capacities.control_slots);
-        let staging = Arc::new(ArrayQueue::new(capacities.staging_slots));
-        let channel_depth = Arc::new(AtomicUsize::new(0));
-        let counters = Arc::new(Counters::default());
-        let state = Arc::new(AtomicU8::new(RUNNING));
-        let control_pending = Arc::new(AtomicBool::new(false));
-        let queue = RecordQueue::new(
-            table.to_owned(),
-            schema,
-            Arc::clone(&staging),
-            sink,
-            config,
-            budget.clone(),
-            Arc::clone(&counters),
-        );
-        wyrd_runtime::runtime().spawn(
-            Task {
-                queue,
-                rx,
-                ctrl_rx,
-                control_pending: Arc::clone(&control_pending),
-                channel_depth: Arc::clone(&channel_depth),
-                state: Arc::clone(&state),
-                flush_max_rows: config.flush_max_rows(),
-                flush_interval_ms: config.flush_interval_ms,
-            }
-            .run(),
-        );
-        Ok(Self {
-            tx,
-            ctrl_tx,
-            control_pending,
-            staging,
-            channel_depth,
-            counters,
-            state,
-            budget,
-            producer_permit: Mutex::new(Some(producer_permit)),
-            fixed_storage: Mutex::new(Some(fixed_storage)),
-        })
+        let (mut producer, producer_permit) =
+            budget.construct_producer(config.max_producers(), || {
+                let fixed_storage = budget.reserve_fixed_storage(capacities.charged_bytes)?;
+                let (tx, rx) = mpsc::channel(capacities.data_slots);
+                let (ctrl_tx, ctrl_rx) = mpsc::channel(capacities.control_slots);
+                let staging = Arc::new(ArrayQueue::new(capacities.staging_slots));
+                let channel_depth = Arc::new(AtomicUsize::new(0));
+                let counters = Arc::new(Counters::default());
+                let state = Arc::new(AtomicU8::new(RUNNING));
+                let control_pending = Arc::new(AtomicBool::new(false));
+                let queue = RecordQueue::new(
+                    table.to_owned(),
+                    schema,
+                    Arc::clone(&staging),
+                    sink,
+                    config,
+                    budget.clone(),
+                    Arc::clone(&counters),
+                );
+                wyrd_runtime::runtime().spawn(
+                    Task {
+                        queue,
+                        rx,
+                        ctrl_rx,
+                        control_pending: Arc::clone(&control_pending),
+                        channel_depth: Arc::clone(&channel_depth),
+                        state: Arc::clone(&state),
+                        flush_max_rows: config.flush_max_rows(),
+                        flush_interval_ms: config.flush_interval_ms,
+                    }
+                    .run(),
+                );
+                Ok(Self {
+                    tx,
+                    ctrl_tx,
+                    control_pending,
+                    staging,
+                    channel_depth,
+                    counters,
+                    state,
+                    budget: budget.clone(),
+                    producer_permit: Mutex::new(None),
+                    fixed_storage: Mutex::new(Some(fixed_storage)),
+                })
+            })?;
+        *producer
+            .producer_permit
+            .get_mut()
+            .expect("new producer permit mutex is not poisoned") = Some(producer_permit);
+        Ok(producer)
     }
 
     /// Reserves row capacity before handing it to the bounded channel.
@@ -977,7 +1009,26 @@ mod tests {
             ..QueueConfig::default()
         };
         let mut producers = Vec::with_capacity(QueueConfig::MAX_LIVE_ENTRIES);
-        for index in 0..QueueConfig::MAX_LIVE_ENTRIES {
+        let first_table = "vala.bifrost.direct_capacity_0";
+        producers.push(
+            Producer::with_budget(first_table, schema(), sink.clone(), config, budget.clone())
+                .expect("first direct producer fits the shared envelope"),
+        );
+        assert!(matches!(
+            Producer::with_budget(
+                "vala.bifrost.direct_capacity_lower_failed",
+                schema(),
+                sink.clone(),
+                QueueConfig {
+                    max_producers: 1,
+                    flush_interval_ms: 0,
+                    ..QueueConfig::default()
+                },
+                budget.clone(),
+            ),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        for index in 1..QueueConfig::MAX_LIVE_ENTRIES {
             let table = format!("vala.bifrost.direct_capacity_{index}");
             producers.push(
                 Producer::with_budget(&table, schema(), sink.clone(), config, budget.clone())
@@ -1046,6 +1097,59 @@ mod tests {
         );
     }
 
+    /// Rejects zero producer configuration without changing shared permit state.
+    #[test]
+    fn zero_producer_config_refuses_without_permit_or_ceiling_mutation() {
+        let sink = Arc::new(MockSink::new());
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let before = budget.metrics();
+        assert!(matches!(
+            Producer::with_budget(
+                "vala.bifrost.direct_capacity_zero",
+                schema(),
+                sink.clone(),
+                QueueConfig {
+                    max_producers: 0,
+                    flush_interval_ms: 0,
+                    ..QueueConfig::default()
+                },
+                budget.clone(),
+            ),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        assert_eq!(
+            budget.metrics(),
+            before,
+            "zero configuration cannot reserve bytes, permits, or tighten the ceiling"
+        );
+        let config = QueueConfig {
+            flush_interval_ms: 0,
+            ..QueueConfig::default()
+        };
+        let first = Producer::with_budget(
+            "vala.bifrost.direct_capacity_after_zero_1",
+            schema(),
+            sink.clone(),
+            config,
+            budget.clone(),
+        )
+        .expect("zero refusal leaves default capacity available");
+        let second = Producer::with_budget(
+            "vala.bifrost.direct_capacity_after_zero_2",
+            schema(),
+            sink,
+            config,
+            budget.clone(),
+        )
+        .expect("zero refusal did not tighten the shared ceiling to one");
+        first
+            .shutdown()
+            .expect("first zero-cap regression producer drains");
+        second
+            .shutdown()
+            .expect("second zero-cap regression producer drains");
+    }
+
     /// Rolls producer admission back when fixed byte reservation fails after permit acquisition.
     #[test]
     fn shared_producer_permit_rolls_back_after_fixed_admission_failure() {
@@ -1060,6 +1164,7 @@ mod tests {
                 schema(),
                 sink,
                 QueueConfig {
+                    max_producers: 1,
                     flush_interval_ms: 0,
                     ..QueueConfig::default()
                 },
@@ -1077,6 +1182,32 @@ mod tests {
             "failed fixed admission creates no queue storage charge"
         );
         drop(blocker);
+        let config = QueueConfig {
+            flush_interval_ms: 0,
+            ..QueueConfig::default()
+        };
+        let first = Producer::with_budget(
+            "vala.bifrost.direct_capacity_after_fixed_failure_1",
+            schema(),
+            Arc::new(MockSink::new()),
+            config,
+            budget.clone(),
+        )
+        .expect("failed lower-cap admission leaves default capacity available");
+        let second = Producer::with_budget(
+            "vala.bifrost.direct_capacity_after_fixed_failure_2",
+            schema(),
+            Arc::new(MockSink::new()),
+            config,
+            budget,
+        )
+        .expect("failed fixed admission did not tighten the shared ceiling to one");
+        first
+            .shutdown()
+            .expect("first post-failure producer drains");
+        second
+            .shutdown()
+            .expect("second post-failure producer drains");
     }
 
     /// Retries one exact sealed owner identity after an ambiguous sink result.

@@ -262,6 +262,10 @@ fn checked_align(bytes: usize, alignment: usize) -> Result<usize, ArrowIpcMateri
 
 #[cfg(test)]
 mod tests {
+    //! Focused proof for complete checked peaks, refusal before allocation,
+    //! fixed capacities, intact ownership transfer, and exact terminal guard
+    //! release across ordinary drop and panic unwinding.
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

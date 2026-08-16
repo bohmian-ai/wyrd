@@ -15,6 +15,7 @@ use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
 
 use crate::sink::IngestTransport;
+use wyrd_queue::{ClientByteGuard, DurableBatchAck, OwnedIpcBytes, SealedBatch, SinkError};
 
 /// Maximum Arrow IPC payload for one Bifrost batch after decompression.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
@@ -106,15 +107,50 @@ impl BifrostGrpcTransport {
         self.config
     }
 
-    /// Send one sealed batch through the unary ingest RPC.
+    /// Copies a borrowed external frame into the owned Rust transport boundary.
+    ///
+    /// This is the only ordinary-Rust borrowed-byte copy boundary. Queue-owned
+    /// [`Bytes`] frames bypass it and are sent by reference-counted ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable payload error when the borrowed frame exceeds the
+    /// accepted Bifrost frame ceiling.
+    pub fn copy_external_frame(&self, frame: &[u8]) -> Result<Bytes, WyrdError> {
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(WyrdError::PayloadTooLarge {
+                message: format!("bifrost batch exceeds {MAX_FRAME_BYTES} Arrow IPC bytes"),
+                details: serde_json::json!({ "field": "arrow_ipc", "actual_bytes": frame.len(), "limit_bytes": MAX_FRAME_BYTES }),
+            });
+        }
+        Ok(Bytes::copy_from_slice(frame))
+    }
+
+    /// Sends one externally supplied batch through the unary ingest RPC.
+    ///
+    /// External callers cross [`Self::copy_external_frame`] before the internal
+    /// owned-byte path; queue-owned frames use [`IngestTransport`] directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, validation, or terminal server errors. A retryable
+    /// external call retries its stable identity inside this transport.
+    pub async fn insert_batch(
+        &self,
+        table: &str,
+        batch_id: [u8; 16],
+        arrow_ipc: Vec<u8>,
+    ) -> Result<(), WyrdError> {
+        validate_frame(table, batch_id, arrow_ipc.len())?;
+        let bytes = self.copy_external_frame(&arrow_ipc)?;
+        self.send_owned_bytes(table, batch_id, bytes).await
+    }
+
+    /// Sends one sealed batch through the unary ingest RPC.
     pub async fn send_frame(&self, frame: BifrostFrame) -> Result<(), WyrdError> {
-        <Self as IngestTransport>::insert_batch(
-            self,
-            &frame.table,
-            frame.batch_id,
-            frame.arrow_ipc.to_vec(),
-        )
-        .await
+        validate_frame(&frame.table, frame.batch_id, frame.arrow_ipc.len())?;
+        self.send_owned_bytes(&frame.table, frame.batch_id, frame.arrow_ipc)
+            .await
     }
 
     /// Send batches sequentially, preserving each batch identity.
@@ -153,6 +189,31 @@ impl BifrostGrpcTransport {
         }
     }
 
+    /// Retries an internally owned frame without copying its payload bytes.
+    async fn send_owned_bytes(
+        &self,
+        table: &str,
+        batch_id: [u8; 16],
+        arrow_ipc: Bytes,
+    ) -> Result<(), WyrdError> {
+        let mut retry_number = 0_u32;
+        loop {
+            let request = InsertBatchRequest {
+                table: table.to_owned(),
+                arrow_ipc: arrow_ipc.clone(),
+                wyrd_batch_id: Bytes::copy_from_slice(&batch_id),
+            };
+            match self.send_once(request).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.retryable && retry_number < self.config.max_frame_retries => {
+                    tokio::time::sleep(retry_delay(retry_number)).await;
+                    retry_number = retry_number.saturating_add(1);
+                }
+                Err(error) => return Err(error.error),
+            }
+        }
+    }
+
     async fn add_auth_metadata<T>(&self, request: &mut Request<T>) -> Result<(), WyrdError> {
         let bearer = self
             .connection
@@ -182,29 +243,37 @@ impl BifrostGrpcTransport {
 }
 
 #[async_trait]
-impl IngestTransport for BifrostGrpcTransport {
+impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
     async fn insert_batch(
         &self,
-        table: &str,
-        batch_id: [u8; 16],
-        arrow_ipc: Vec<u8>,
-    ) -> Result<(), WyrdError> {
-        validate_frame(table, batch_id, arrow_ipc.len())?;
-        let request = InsertBatchRequest {
-            table: table.to_owned(),
-            arrow_ipc: Bytes::from(arrow_ipc),
-            wyrd_batch_id: Bytes::copy_from_slice(&batch_id),
-        };
-        let mut retry_number = 0_u32;
-        loop {
-            match self.send_once(request.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(error) if error.retryable && retry_number < self.config.max_frame_retries => {
-                    tokio::time::sleep(retry_delay(retry_number)).await;
-                    retry_number = retry_number.saturating_add(1);
-                }
-                Err(error) => return Err(error.error),
+        batch: SealedBatch<ClientByteGuard>,
+    ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+        if let Err(error) = validate_frame(&batch.table, batch.batch_id, batch.bytes().len()) {
+            return Err(SinkError::Terminal(error));
+        }
+        let SealedBatch {
+            table,
+            batch_id,
+            frame,
+            rows,
+        } = batch;
+        let (frame, guard) = frame.into_parts();
+        let bytes = Bytes::from(frame);
+        let result = self.send_owned_bytes(&table, batch_id, bytes.clone()).await;
+        match result {
+            Ok(()) => Ok(DurableBatchAck { batch_id, rows }),
+            Err(error) if error.code() == "WYRD_SPEC_503_SERVICE_UNAVAILABLE" => {
+                Err(SinkError::Retryable {
+                    error,
+                    batch: SealedBatch {
+                        table,
+                        batch_id,
+                        frame: OwnedIpcBytes::new(Vec::from(bytes), guard),
+                        rows,
+                    },
+                })
             }
+            Err(error) => Err(SinkError::Terminal(error)),
         }
     }
 }

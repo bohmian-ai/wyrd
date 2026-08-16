@@ -62,7 +62,10 @@ mod sdk {
     use async_trait::async_trait;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::HttpConfig;
-    use wyrd_queue::{BatchSink, MockSink, QueueConfig, SealedBatch};
+    use wyrd_queue::{
+        BatchSink, ClientByteBudget, ClientByteGuard, DurableBatchAck, MockSink, OwnedIpcBytes,
+        QueueConfig, SealedBatch, SinkError,
+    };
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::reference::CardRef;
 
@@ -101,6 +104,7 @@ mod sdk {
             flush_interval_ms: 0,
             flush_timeout_ms: 60_000,
             max_message_bytes: 4 * 1024 * 1024,
+            ..QueueConfig::default()
         }
     }
 
@@ -112,8 +116,11 @@ mod sdk {
     }
 
     #[async_trait]
-    impl BatchSink for StallSink {
-        async fn send(&self, _batch: SealedBatch) -> Result<u64, WyrdError> {
+    impl BatchSink<ClientByteGuard> for StallSink {
+        async fn send(
+            &self,
+            _batch: SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
             self.started.store(true, Ordering::SeqCst);
             std::future::pending::<()>().await;
             unreachable!()
@@ -127,19 +134,25 @@ mod sdk {
     }
 
     #[async_trait]
-    impl BatchSink for LifecycleSink {
-        async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
+    impl BatchSink<ClientByteGuard> for LifecycleSink {
+        async fn send(
+            &self,
+            batch: SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
             self.attempts
                 .lock()
                 .expect("attempts lock")
                 .push(batch.table.clone());
             if batch.table == "a" {
-                return Err(WyrdError::Internal {
+                return Err(SinkError::Terminal(WyrdError::Internal {
                     message: "a producer failed".to_owned(),
                     details: serde_json::json!({}),
-                });
+                }));
             }
-            Ok(batch.rows)
+            Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
+            })
         }
     }
 
@@ -201,6 +214,34 @@ mod sdk {
         assert_eq!(bifrost.producer_count(), 2, "a new table is a new producer");
     }
 
+    /// Refuses a distinct producer before the handle grows beyond its configured cap.
+    #[test]
+    fn bifrost_producer_cap_refuses_before_registry_growth() {
+        let scope =
+            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
+        let bifrost = Bifrost::new(
+            scope,
+            Arc::new(MockSink::new()),
+            QueueConfig {
+                max_producers: 1,
+                ..QueueConfig::default()
+            },
+        );
+        let schema = test_schema();
+        bifrost
+            .insert(SinkKind::Record, "ns.first", &schema, row(), card(), None)
+            .expect("first producer accepted");
+        assert!(matches!(
+            bifrost.insert(SinkKind::Record, "ns.second", &schema, row(), card(), None),
+            Err(wyrd_queue::WyrdQueueError::Backpressure)
+        ));
+        assert_eq!(
+            bifrost.producer_count(),
+            1,
+            "rejection precedes pool growth"
+        );
+    }
+
     #[test]
     fn insert_propagates_queue_full() {
         let sink = Arc::new(StallSink::default());
@@ -243,7 +284,7 @@ mod sdk {
             ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
         let bifrost = Bifrost::new(
             scope,
-            Arc::clone(&sink) as Arc<dyn BatchSink>,
+            Arc::clone(&sink) as Arc<dyn BatchSink<ClientByteGuard>>,
             QueueConfig {
                 flush_max_rows: 1,
                 flush_interval_ms: 0,
@@ -319,15 +360,16 @@ mod sdk {
     }
 
     #[async_trait]
-    impl IngestTransport for RecordingTransport {
+    impl IngestTransport<ClientByteGuard> for RecordingTransport {
         async fn insert_batch(
             &self,
-            _table: &str,
-            batch_id: [u8; 16],
-            _frames: Vec<u8>,
-        ) -> Result<(), WyrdError> {
-            self.seen.lock().expect("poisoned").push(batch_id);
-            Ok(())
+            batch: SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
+            self.seen.lock().expect("poisoned").push(batch.batch_id);
+            Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
+            })
         }
     }
 
@@ -337,17 +379,22 @@ mod sdk {
             seen: Mutex::new(Vec::new()),
         });
         let sink = BifrostIngestSink::new(transport.clone());
-        let batch = SealedBatch {
+        let budget = ClientByteBudget::new(1024);
+        let batch = || SealedBatch {
             table: "ns.tbl".to_owned(),
             batch_id: [7u8; 16],
-            frames: vec![1, 2, 3],
+            frame: OwnedIpcBytes::new(
+                vec![1, 2, 3],
+                budget.reserve_sealed(3).expect("batch budget"),
+            ),
             rows: 1,
         };
 
         let rt = wyrd_runtime::runtime();
-        rt.block_on(sink.send(batch.clone())).expect("first send");
-        // A retry re-sends the identical batch — the sink forwards batch_id verbatim.
-        rt.block_on(sink.send(batch)).expect("retry send");
+        rt.block_on(sink.send(batch())).expect("first send");
+        // A retry receives its original owner from a real ambiguous transport;
+        // this test uses a fresh equivalent fixture to assert ID forwarding.
+        rt.block_on(sink.send(batch())).expect("retry send");
 
         let seen = transport.seen.lock().expect("poisoned");
         assert_eq!(seen.len(), 2);

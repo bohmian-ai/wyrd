@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arrow_schema::SchemaRef;
-use wyrd_queue::{BatchSink, Producer, QueueConfig, WyrdQueueError};
+use wyrd_queue::{
+    BatchSink, ClientByteBudget, ClientByteGuard, Producer, QueueConfig, WyrdQueueError,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
@@ -31,8 +33,9 @@ struct ProducerKey {
 /// [`crate::observe`] path swallows and counts it.
 pub struct Bifrost {
     scope: ClientScope,
-    sink: Arc<dyn BatchSink>,
+    sink: Arc<dyn BatchSink<ClientByteGuard>>,
     config: QueueConfig,
+    budget: ClientByteBudget,
     producers: Mutex<HashMap<ProducerKey, Arc<Producer>>>,
     dropped: AtomicU64,
     drop_warned: AtomicBool,
@@ -45,11 +48,16 @@ impl Bifrost {
     /// Production wraps a [`crate::BifrostIngestSink`]; tests inject a
     /// `wyrd-queue` mock or a stall sink through the same seam.
     #[must_use]
-    pub fn new(scope: ClientScope, sink: Arc<dyn BatchSink>, config: QueueConfig) -> Self {
+    pub fn new(
+        scope: ClientScope,
+        sink: Arc<dyn BatchSink<ClientByteGuard>>,
+        config: QueueConfig,
+    ) -> Self {
         Self {
             scope,
             sink,
             config,
+            budget: ClientByteBudget::new(config.client_byte_limit()),
             producers: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
             drop_warned: AtomicBool::new(false),
@@ -96,7 +104,7 @@ impl Bifrost {
         card_ref: CardRef,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.producer_for(kind, table, schema)
+        self.producer_for(kind, table, schema)?
             .enqueue(json, card_ref, run_id)
     }
 
@@ -185,21 +193,33 @@ impl Bifrost {
     }
 
     /// Get-or-create the pooled producer for `(scope, kind, table)`.
-    fn producer_for(&self, kind: SinkKind, table: &str, schema: &SchemaRef) -> Arc<Producer> {
+    fn producer_for(
+        &self,
+        kind: SinkKind,
+        table: &str,
+        schema: &SchemaRef,
+    ) -> Result<Arc<Producer>, WyrdQueueError> {
         let key = ProducerKey {
             scope: self.scope.clone(),
             kind,
             table: table.to_owned(),
         };
         let mut pool = self.producers.lock().expect("producer pool poisoned");
-        Arc::clone(pool.entry(key).or_insert_with(|| {
-            Arc::new(Producer::new(
-                table.to_owned(),
-                schema.clone(),
-                Arc::clone(&self.sink),
-                self.config,
-            ))
-        }))
+        if let Some(producer) = pool.get(&key) {
+            return Ok(Arc::clone(producer));
+        }
+        if pool.len() >= self.config.max_producers() {
+            return Err(WyrdQueueError::Backpressure);
+        }
+        let producer = Arc::new(Producer::with_budget(
+            table.to_owned(),
+            schema.clone(),
+            Arc::clone(&self.sink),
+            self.config,
+            self.budget.clone(),
+        ));
+        pool.insert(key, Arc::clone(&producer));
+        Ok(producer)
     }
 }
 

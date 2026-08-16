@@ -38,7 +38,7 @@ use vala_bifrost_redux::resources::{
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
-use vala_sdk::{BifrostGrpcTransport, IngestTransport};
+use vala_sdk::BifrostGrpcTransport;
 use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;

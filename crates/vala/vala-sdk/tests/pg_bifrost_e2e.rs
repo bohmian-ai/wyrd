@@ -23,14 +23,14 @@ mod pg_tests {
     use tokio::sync::Notify;
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use vala_sdk::{
-        Bifrost, BifrostGrpcTransport, ClientScope, IngestTransport, QueryClient, SinkKind, observe,
-    };
+    use vala_sdk::{Bifrost, BifrostGrpcTransport, ClientScope, QueryClient, SinkKind, observe};
     use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{GrpcConfig, HttpConfig};
-    use wyrd_queue::{BatchSink, MockSink, QueueConfig, SealedBatch, WyrdQueueError};
-    use wyrd_spec::error::WyrdError;
+    use wyrd_queue::{
+        BatchSink, ClientByteGuard, DurableBatchAck, MockSink, QueueConfig, SealedBatch, SinkError,
+        WyrdQueueError,
+    };
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
     use wyrd_testing::server::WyrdTestServer;
@@ -84,13 +84,16 @@ mod pg_tests {
     }
 
     #[async_trait]
-    impl BatchSink for StallSink {
+    impl BatchSink<ClientByteGuard> for StallSink {
         /// Block accepted batches until the test explicitly releases the sink.
         ///
         /// # Errors
         /// This test sink has no error condition and always returns `Ok` after
         /// release; the result type is required by the [`BatchSink`] contract.
-        async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
+        async fn send(
+            &self,
+            batch: SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
             self.started.store(true, Ordering::SeqCst);
             while !self.released.load(Ordering::SeqCst) {
                 let notified = self.wake.notified();
@@ -99,7 +102,10 @@ mod pg_tests {
                 }
                 notified.await;
             }
-            Ok(batch.rows)
+            Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
+            })
         }
     }
 
@@ -112,14 +118,20 @@ mod pg_tests {
     }
 
     #[async_trait]
-    impl BatchSink for ReleasingSink {
-        async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
+    impl BatchSink<ClientByteGuard> for ReleasingSink {
+        async fn send(
+            &self,
+            batch: SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError<ClientByteGuard>> {
             self.started.store(true, Ordering::SeqCst);
             loop {
                 if self.released.load(Ordering::SeqCst) {
                     let rows = usize::try_from(batch.rows).unwrap_or(usize::MAX);
                     self.sent_rows.fetch_add(rows, Ordering::SeqCst);
-                    return Ok(batch.rows);
+                    return Ok(DurableBatchAck {
+                        batch_id: batch.batch_id,
+                        rows: batch.rows,
+                    });
                 }
                 let notified = self.wake.notified();
                 if self.released.load(Ordering::SeqCst) {
@@ -154,6 +166,7 @@ mod pg_tests {
             flush_interval_ms: 0,
             flush_timeout_ms: 60_000,
             max_message_bytes: 4 * 1024 * 1024,
+            ..QueueConfig::default()
         }
     }
 

@@ -18,7 +18,7 @@ class Fixtures(unittest.TestCase):
             if h=="Target paths, symbols, callers, and consumers": return "| Path | Path kind | Symbol | Symbol kind | Why | Callers | Consumers |\n|---|---|---|---|---|---|---|\n| `src/lib.rs` | existing | `Owner::run` | new | add locked owner operation | `tests::owner_runs` | `Owner` |"
             if h=="Required types and interfaces": return "```rust\nfn run(&self) -> Result<(), Error>\n```"
             if h=="Failure and edge-case matrix": return "| State | Trigger | Exact result |\n|---|---|---|\n| rejected | invalid input | return typed Error without mutation |"
-            values={"User and operator value":"The developer receives a typed deterministic result.","Current behavior and evidence":"Evidence: `src/lib.rs:Owner` has no run method.","Non-goals":"Do not change unrelated runtime behavior.","Allowed scope":"Only `src/lib.rs` and its inline tests.","Prohibited changes":"Must not alter public wire contracts.","Control flow and pseudocode":"1. Validate input.\n2. Return typed result.","Allocation and lifecycle contract":"Construction owns no heap allocation; shutdown, cancellation, concurrency, and recovery are synchronous no-ops.","Required tests":"Add `tests::owner_runs` with exact result assertions.","Required features":"Default features only.","Focused verification":"Run `mise exec -- cargo test --locked -p owner --lib --no-run`.","Concurrency and integration locks":"Use the contracts lock and serialize the Cargo lane.","Commands explicitly excluded":"Exclude `mise run pre-pr`.","Stop and escalate if":"Stop if the owner contract differs at the accepted revision.","Completion evidence":"Record command result, test output, digest, and diff."}
+            values={"User and operator value":"The developer receives a typed deterministic result.","Current behavior and evidence":"Evidence: `src/lib.rs:Owner` has no run method.","Non-goals":"Do not change unrelated runtime behavior.","Allowed scope":"Only `src/lib.rs` and its inline tests.","Prohibited changes":"Must not alter public wire contracts.","Control flow and pseudocode":"1. Validate input.\n2. Return typed result.","Allocation and lifecycle contract":"Construction owns no heap allocation; shutdown, cancellation, concurrency, and recovery are synchronous no-ops.","Required tests":"Add `tests::owner_runs` with exact result assertions.","Required features":"Default features only.","Focused verification":"Preflight `mise exec -- cargo test --locked -p owner --lib --no-run`. Acceptance `mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact`.","Concurrency and integration locks":"Use the contracts lock and serialize the Cargo lane.","Commands explicitly excluded":"Exclude `mise run pre-pr`.","Stop and escalate if":"Stop if the owner contract differs at the accepted revision.","Completion evidence":"Record command result, test output, digest, and diff."}
             if h in values:return values[h]
             return "R1 D1 AC1 exact behavior, repository boundary, and named proof."
         self.task_text=f"# T1\nStatus: Planned\nRepository revision: {self.rev}\nDepends on: None\n\n"+"\n\n".join(f"## {h}\n\n{task_body(h)}" for h in validator.TASK_HEADINGS)
@@ -106,6 +106,11 @@ class Fixtures(unittest.TestCase):
         """Reject a packet that supplies preflight compilation but no executable acceptance command."""
         self.data["tasks"][0]["proofs"][0]["acceptance_command"]=""; self.write(); self.assert_error("acceptance command must select named test")
 
+    def test_packet_must_contain_every_exact_proof_command(self)->None:
+        """Reject manifest commands that drift from the implementor-facing packet."""
+        self.data["tasks"][0]["proofs"][0]["preflight_command"]="mise exec -- cargo test --locked -p owner --tests --no-run"
+        self.write(); self.assert_error("focused verification does not contain exact proof commands")
+
     def test_modified_caller_must_be_in_write_set(self)->None:
         """Reject a modified caller omitted from manifest write ownership."""
         packet=self.plan/"tasks/01-owner.md"; packet.write_text(packet.read_text().replace("`tests::owner_runs` | `Owner`","modified:src/server.rs | `Owner`")); self.write(); self.assert_error("modified caller/consumer absent from write_set")
@@ -115,6 +120,8 @@ class Fixtures(unittest.TestCase):
         proof=self.data["tasks"][0]["proofs"][0]
         proof["setup"]="scripts/postgres/with-test-postgres.sh"
         proof["acceptance_command"]="scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact'"
+        packet=self.plan/"tasks/01-owner.md"
+        packet.write_text(packet.read_text().replace("mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact",proof["acceptance_command"]))
         self.write(); self.assertEqual([],self.errors())
 
     def test_accepts_distinct_planned_command_proof(self)->None:
@@ -124,6 +131,8 @@ class Fixtures(unittest.TestCase):
         proof["selector"]="owner-command"
         proof["test_name"]="owner-command"
         proof["acceptance_command"]="mise run owner-command"
+        packet=self.plan/"tasks/01-owner.md"
+        packet.write_text(packet.read_text().replace("mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact","mise run owner-command"))
         self.write(); self.assertEqual([],self.errors())
 
     def test_rejects_unaudited_or_incomplete_postgres_wrapper(self)->None:

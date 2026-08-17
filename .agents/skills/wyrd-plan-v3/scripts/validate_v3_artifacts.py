@@ -243,6 +243,7 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
         if has_new_or_cross and not re.search(r"```(?:rust|python|typescript|ts)\s+.*?\b(?:fn|struct|enum|class|interface|type|def)\b.*?```",type_body,re.S): errors.append(f"{tid} new/cross-owner symbols require typed signature block")
         stateful=any(task.get("lifecycle",{}).get(d,{}).get("applicable") for d in ("shutdown","cancellation","concurrency","recovery"))
         failure_body=task_sections.get("Failure and edge-case matrix","")
+        focused_body=task_sections.get("Focused verification","")
         if stateful and not re.search(r"^\|[^\n]+\|[^\n]+\|[^\n]+\|\s*$",failure_body,re.M): errors.append(f"{tid} stateful task requires exact failure-matrix row")
         for proof in task.get("proofs",[]):
             required={"id","requires_integrated","acceptance","coverage","package","target","features","selector","test_kind","test_path","test_name","expected_selected_count","setup","lane","expected_result","preflight_command","acceptance_command","preflight"}
@@ -252,6 +253,8 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
             if not isinstance(prerequisites,list) or len(prerequisites)!=len(set(prerequisites)) or any(value not in tasks or value==tid for value in prerequisites): errors.append(f"{tid} invalid proof prerequisites")
             if isinstance(prerequisites,list): proof_prerequisites[str(tid)].update(str(value) for value in prerequisites)
             command=str(proof.get("preflight_command","")); acceptance_command=str(proof.get("acceptance_command","")); selector=str(proof.get("selector",""))
+            if command not in focused_body or acceptance_command not in focused_body:
+                errors.append(f"{tid} focused verification does not contain exact proof commands for {proof.get('id','unknown')}")
             kind=proof.get("test_kind")
             if kind not in {"existing","new","command"} or not safe_path(str(proof.get("test_path",""))) or proof.get("test_name")!=selector or not isinstance(proof.get("expected_selected_count"),int) or proof.get("expected_selected_count",0)<=0: errors.append(f"{tid} invalid planned test identity")
             if not (command.startswith("mise ") or command.startswith("uv ") or command.startswith("pnpm ")): errors.append(f"{tid} command is not exact/auditable")

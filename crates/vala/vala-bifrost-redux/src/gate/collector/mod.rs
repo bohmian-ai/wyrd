@@ -7,9 +7,7 @@
 pub mod map;
 mod tables;
 
-use crate::contracts::ScribeError;
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::execution_lanes::ScribeIngressCpuPool;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wyrd_tonic::otlp::logs_service::{ExportLogsPartialSuccess, ExportLogsServiceRequest};
@@ -30,96 +28,6 @@ pub struct ProjectedExport<T> {
     pub outcome: T,
     pub batch: Option<RecordBatch>,
     pub source_bytes: usize,
-}
-
-#[async_trait::async_trait]
-pub trait ProjectionExecutor: Send + Sync {
-    async fn project_spans(
-        &self,
-        request: ExportTraceServiceRequest,
-    ) -> Result<ProjectedExport<IngestOutcome>, IngestError>;
-
-    async fn project_metrics(
-        &self,
-        request: ExportMetricsServiceRequest,
-    ) -> Result<ProjectedExport<MetricsOutcome>, IngestError>;
-
-    async fn project_logs(
-        &self,
-        request: ExportLogsServiceRequest,
-    ) -> Result<ProjectedExport<LogsOutcome>, IngestError>;
-}
-
-#[derive(Debug, Default)]
-pub struct InlineProjectionExecutor;
-
-#[async_trait::async_trait]
-impl ProjectionExecutor for InlineProjectionExecutor {
-    async fn project_spans(
-        &self,
-        request: ExportTraceServiceRequest,
-    ) -> Result<ProjectedExport<IngestOutcome>, IngestError> {
-        project_resource_spans(&request)
-    }
-
-    async fn project_metrics(
-        &self,
-        request: ExportMetricsServiceRequest,
-    ) -> Result<ProjectedExport<MetricsOutcome>, IngestError> {
-        project_resource_metrics(&request)
-    }
-
-    async fn project_logs(
-        &self,
-        request: ExportLogsServiceRequest,
-    ) -> Result<ProjectedExport<LogsOutcome>, IngestError> {
-        project_resource_logs(&request)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IngressCpuProjection {
-    pool: ScribeIngressCpuPool,
-}
-
-impl IngressCpuProjection {
-    #[must_use]
-    pub fn new(pool: ScribeIngressCpuPool) -> Self {
-        Self { pool }
-    }
-}
-
-#[async_trait::async_trait]
-impl ProjectionExecutor for IngressCpuProjection {
-    async fn project_spans(
-        &self,
-        request: ExportTraceServiceRequest,
-    ) -> Result<ProjectedExport<IngestOutcome>, IngestError> {
-        self.pool
-            .run(move || project_resource_spans(&request).map_err(|_| ScribeError::InvalidFrame))
-            .await
-            .map_err(IngestError::from_scribe)
-    }
-
-    async fn project_metrics(
-        &self,
-        request: ExportMetricsServiceRequest,
-    ) -> Result<ProjectedExport<MetricsOutcome>, IngestError> {
-        self.pool
-            .run(move || project_resource_metrics(&request).map_err(|_| ScribeError::InvalidFrame))
-            .await
-            .map_err(IngestError::from_scribe)
-    }
-
-    async fn project_logs(
-        &self,
-        request: ExportLogsServiceRequest,
-    ) -> Result<ProjectedExport<LogsOutcome>, IngestError> {
-        self.pool
-            .run(move || project_resource_logs(&request).map_err(|_| ScribeError::InvalidFrame))
-            .await
-            .map_err(IngestError::from_scribe)
-    }
 }
 
 /// Fingerprint the user-owned columns before Scribe adds server correlation

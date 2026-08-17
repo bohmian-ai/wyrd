@@ -43,6 +43,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use vala_bifrost_redux::contracts::DecodedOtlp;
 use vala_bifrost_redux::gate::{AuthContext, IngestError};
 use wyrd_spec::error::WyrdError;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
@@ -203,8 +204,6 @@ async fn export_traces(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let request: ExportTraceServiceRequest = decode_request(encoding, &body)
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
     let auth = caller_auth_context(&caller);
 
     let gate = state
@@ -217,8 +216,13 @@ async fn export_traces(
                 details: serde_json::Value::Null,
             })
         })?;
+    let owner = gate
+        .reserve_otlp_decode(body.len())
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+    let request: ExportTraceServiceRequest = decode_request(encoding, &body)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
     let outcome = gate
-        .ingest_resource_spans(&auth, request)
+        .ingest_decoded_resource_spans(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
 
@@ -250,8 +254,6 @@ async fn export_metrics(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let request: ExportMetricsServiceRequest = decode_request(encoding, &body)
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
     let auth = caller_auth_context(&caller);
 
     let gate = state
@@ -264,8 +266,13 @@ async fn export_metrics(
                 details: serde_json::Value::Null,
             })
         })?;
+    let owner = gate
+        .reserve_otlp_decode(body.len())
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+    let request: ExportMetricsServiceRequest = decode_request(encoding, &body)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
     let outcome = gate
-        .ingest_resource_metrics(&auth, request)
+        .ingest_decoded_resource_metrics(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
 
@@ -297,8 +304,6 @@ async fn export_logs(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let request: ExportLogsServiceRequest = decode_request(encoding, &body)
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
     let auth = caller_auth_context(&caller);
 
     let gate = state
@@ -311,8 +316,13 @@ async fn export_logs(
                 details: serde_json::Value::Null,
             })
         })?;
+    let owner = gate
+        .reserve_otlp_decode(body.len())
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+    let request: ExportLogsServiceRequest = decode_request(encoding, &body)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
     let outcome = gate
-        .ingest_resource_logs(&auth, request)
+        .ingest_decoded_resource_logs(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
 

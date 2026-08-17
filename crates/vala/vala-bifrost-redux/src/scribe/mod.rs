@@ -1692,6 +1692,17 @@ impl ScribeImpl {
 
 #[async_trait]
 impl Scribe for ScribeImpl {
+    /// Acquires the adapter-decode child from the sole Scribe root.
+    fn reserve_otlp_decode(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::contracts::OtlpDecodeOwner, ScribeError> {
+        let memory = self
+            .memory
+            .try_reserve_ingress(memory::MemoryCategory::Decode, bytes)?;
+        Ok(crate::contracts::OtlpDecodeOwner { memory })
+    }
+
     /// Reports whether recovery has opened the private durable ingress seam.
     fn is_ready(&self) -> bool {
         Self::is_ready(self)

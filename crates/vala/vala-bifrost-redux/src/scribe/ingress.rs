@@ -185,13 +185,13 @@ impl ScribeImpl {
         let plan = match &frame.payload {
             IngressPayload::ArrowIpc(bytes) => planner.plan_native(bytes, name_bytes),
             IngressPayload::OtlpTraces(request) => {
-                planner.plan_traces(request, frame.measured_wire_bytes, name_bytes)
+                planner.plan_traces(&request.request, request.wire_bytes, name_bytes)
             }
             IngressPayload::OtlpMetrics(request) => {
-                planner.plan_metrics(request, frame.measured_wire_bytes, name_bytes)
+                planner.plan_metrics(&request.request, request.wire_bytes, name_bytes)
             }
             IngressPayload::OtlpLogs(request) => {
-                planner.plan_logs(request, frame.measured_wire_bytes, name_bytes)
+                planner.plan_logs(&request.request, request.wire_bytes, name_bytes)
             }
             IngressPayload::ProjectedArrow(batches) => {
                 planner.plan_projected(batches, frame.measured_wire_bytes, name_bytes)
@@ -239,6 +239,7 @@ impl ScribeImpl {
     ) -> Result<PreparedTransportPayload, ScribeError> {
         let (batch, outcome) = match payload {
             IngressPayload::OtlpTraces(request) => {
+                let request = request.request;
                 let projected = self
                     .ingress_cpu
                     .run(move || {
@@ -252,6 +253,7 @@ impl ScribeImpl {
                 )
             }
             IngressPayload::OtlpMetrics(request) => {
+                let request = request.request;
                 let projected = self
                     .ingress_cpu
                     .run(move || {
@@ -265,6 +267,7 @@ impl ScribeImpl {
                 )
             }
             IngressPayload::OtlpLogs(request) => {
+                let request = request.request;
                 let projected = self
                     .ingress_cpu
                     .run(move || {
@@ -313,22 +316,31 @@ impl ScribeImpl {
     /// shard owns its eventual completion and retry semantics.
     pub(super) async fn prepare_and_dispatch(
         &self,
-        frame: ScribeIngressFrame,
+        mut frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
         validate_logical_transport_frame(&frame)?;
         let expected_schema_fingerprint = self.resolve_logical_frame(&frame).await?;
         let material_plan = self.plan_transport_payload(&frame)?;
-        let mut memory = match self
-            .memory
-            .try_reserve_ingress(MemoryCategory::Raw, material_plan.root_bytes)
-        {
-            Ok(reservation) => reservation,
-            Err(_) => self.reserve_ingress_after_pressure_seal(
-                MemoryCategory::Raw,
-                material_plan.root_bytes,
-                &frame.table.name,
-            )?,
+        let decode_owner = match &mut frame.payload {
+            IngressPayload::OtlpTraces(decoded) => decoded.owner.take(),
+            IngressPayload::OtlpMetrics(decoded) => decoded.owner.take(),
+            IngressPayload::OtlpLogs(decoded) => decoded.owner.take(),
+            IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_) => None,
+        };
+        let mut memory = match decode_owner {
+            Some(owner) => owner.complete(material_plan.root_bytes)?,
+            None => match self
+                .memory
+                .try_reserve_ingress(MemoryCategory::Raw, material_plan.root_bytes)
+            {
+                Ok(reservation) => reservation,
+                Err(_) => self.reserve_ingress_after_pressure_seal(
+                    MemoryCategory::Raw,
+                    material_plan.root_bytes,
+                    &frame.table.name,
+                )?,
+            },
         };
         let binding = self.construct_physical_binding(&frame)?;
         let table = binding.table_ref.fqn();

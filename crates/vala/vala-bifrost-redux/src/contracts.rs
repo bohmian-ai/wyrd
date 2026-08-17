@@ -99,11 +99,57 @@ pub(crate) enum IngressPayload {
     /// Arrow batches projected by a protocol adapter such as OTLP.
     ProjectedArrow(Vec<RecordBatch>),
     /// Raw bounded OTLP trace transport payload.
-    OtlpTraces(Box<wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest>),
+    OtlpTraces(DecodedOtlp<wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest>),
     /// Raw bounded OTLP metric transport payload.
-    OtlpMetrics(Box<wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest>),
+    OtlpMetrics(DecodedOtlp<wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest>),
     /// Raw bounded OTLP log transport payload.
-    OtlpLogs(Box<wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest>),
+    OtlpLogs(DecodedOtlp<wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest>),
+}
+
+/// Move-only adapter-decoded OTLP request paired with its root-backed owner.
+#[derive(Debug)]
+pub struct DecodedOtlp<T> {
+    /// Fixed-capacity typed request produced by the server adapter.
+    pub request: Box<T>,
+    /// Actual encoded bytes observed before typed decoding.
+    pub wire_bytes: usize,
+    /// Decode allocation owner adopted by Scribe's complete admission root.
+    pub(crate) owner: Option<OtlpDecodeOwner>,
+}
+
+impl<T> DecodedOtlp<T> {
+    /// Couples one typed adapter result to the exact wire fact and decode owner.
+    #[must_use]
+    pub fn new(request: T, wire_bytes: usize, owner: OtlpDecodeOwner) -> Self {
+        Self {
+            request: Box::new(request),
+            wire_bytes,
+            owner: Some(owner),
+        }
+    }
+}
+
+/// Opaque move-only ownership of server-side OTLP decode capacity.
+#[derive(Debug)]
+pub struct OtlpDecodeOwner {
+    /// Sole Scribe root lease retained across Gate routing.
+    pub(crate) memory: crate::resources::ScribeMemoryLease,
+}
+
+impl OtlpDecodeOwner {
+    /// Atomically grows the decode child into Scribe's one complete root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] without losing this owner when root capacity
+    /// cannot cover the immutable material plan.
+    pub(crate) fn complete(
+        mut self,
+        root_bytes: usize,
+    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
+        self.memory.resize_ingress(root_bytes)?;
+        Ok(self.memory)
+    }
 }
 
 /// The portion of a batch admission visible to the transport.
@@ -270,6 +316,12 @@ impl From<vala_sql::SqlError> for ScribeError {
 /// private visibility keeps the owned logical frame inside Redux.
 #[async_trait]
 pub(crate) trait Scribe: Send + Sync {
+    /// Acquires exact root-backed capacity before an OTLP adapter decodes.
+    fn reserve_otlp_decode(&self, _bytes: usize) -> Result<OtlpDecodeOwner, ScribeError> {
+        Err(ScribeError::Internal {
+            detail: "test Scribe does not expose decode ownership".to_owned(),
+        })
+    }
     /// Report whether recovery completed and the durable write path accepts work.
     ///
     /// Implementations that do not have a startup recovery phase are ready by

@@ -2633,7 +2633,7 @@ impl BifrostResourceGovernor {
 
 /// Move-only root-backed owner of exact Scribe memory and attribution.
 #[derive(Debug)]
-pub(crate) struct ScribeMemoryLease {
+pub struct ScribeMemoryLease {
     /// Sole process authority that admitted this owner.
     root: BifrostResourceGovernor,
     /// Exact bytes retained by this owner.

@@ -32,12 +32,13 @@ use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
 use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, TableRef};
-use crate::contracts::{IngressPayload, Scribe, ScribeIngressFrame, ScribeOtlpOutcome};
+use crate::contracts::{
+    DecodedOtlp, IngressPayload, OtlpDecodeOwner, Scribe, ScribeIngressFrame, ScribeOtlpOutcome,
+};
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 pub use crate::gate::collector::{
-    IngestOutcome, IngressCpuProjection, InlineProjectionExecutor, LogsOutcome, MetricsOutcome,
-    ProjectionExecutor, project_resource_logs, project_resource_metrics, project_resource_spans,
-    source_schema_fingerprint,
+    IngestOutcome, LogsOutcome, MetricsOutcome, project_resource_logs, project_resource_metrics,
+    project_resource_spans, source_schema_fingerprint,
 };
 pub use crate::gate::error::{CatalogError, IngestError};
 pub use crate::gate::limits::IngestLimits;
@@ -252,6 +253,20 @@ pub struct Gate<
 impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
     Gate<C, R, I>
 {
+    /// Acquires exact root-backed capacity before the server adapter decodes OTLP.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable ingress refusal when Scribe is absent or its root cannot
+    /// admit the encoded request bytes.
+    pub fn reserve_otlp_decode(&self, bytes: usize) -> Result<OtlpDecodeOwner, IngestError> {
+        self.scribe
+            .as_ref()
+            .ok_or(IngestError::IngressClosed)?
+            .reserve_otlp_decode(bytes)
+            .map_err(IngestError::from_scribe)
+    }
+
     /// Construct a Gate with a required Scribe capability.
     #[must_use]
     pub fn with_scribe(
@@ -496,7 +511,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 auth,
                 TableRef::new(BifrostNamespace::Traces, "spans"),
                 measured_wire_bytes,
-                IngressPayload::OtlpTraces(Box::new(request)),
+                IngressPayload::OtlpTraces(DecodedOtlp {
+                    request: Box::new(request),
+                    wire_bytes: measured_wire_bytes,
+                    owner: None,
+                }),
             )
             .await?;
         let ScribeOtlpOutcome::Traces(outcome) = outcome else {
@@ -506,6 +525,35 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         };
         record_gate_rows(outcome.accepted_spans, outcome.rejected_spans);
         Ok(outcome)
+    }
+
+    /// Routes one adapter-decoded trace export and its move-only owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, request-limit, Scribe, or outcome-shape errors.
+    pub async fn ingest_decoded_resource_spans(
+        &self,
+        auth: &AuthContext,
+        decoded: DecodedOtlp<ExportTraceServiceRequest>,
+    ) -> Result<IngestOutcome, IngestError> {
+        self.ensure_open()?;
+        authorize_record_write(auth)?;
+        let wire_bytes = decoded.wire_bytes;
+        let outcome = self
+            .dispatch_otlp(
+                auth,
+                TableRef::new(BifrostNamespace::Traces, "spans"),
+                wire_bytes,
+                IngressPayload::OtlpTraces(decoded),
+            )
+            .await?;
+        match outcome {
+            ScribeOtlpOutcome::Traces(outcome) => Ok(outcome),
+            _ => Err(IngestError::Internal(
+                "Scribe returned the wrong OTLP outcome".to_owned(),
+            )),
+        }
     }
 
     /// Routes one bounded OTLP metrics export to Scribe without projecting it.
@@ -527,7 +575,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 auth,
                 TableRef::new(BifrostNamespace::Metrics, "points"),
                 measured_wire_bytes,
-                IngressPayload::OtlpMetrics(Box::new(request)),
+                IngressPayload::OtlpMetrics(DecodedOtlp {
+                    request: Box::new(request),
+                    wire_bytes: measured_wire_bytes,
+                    owner: None,
+                }),
             )
             .await?;
         let ScribeOtlpOutcome::Metrics(outcome) = outcome else {
@@ -537,6 +589,35 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         };
         record_gate_rows(outcome.accepted_points, outcome.rejected_points);
         Ok(outcome)
+    }
+
+    /// Routes one adapter-decoded metrics export and its move-only owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, request-limit, Scribe, or outcome-shape errors.
+    pub async fn ingest_decoded_resource_metrics(
+        &self,
+        auth: &AuthContext,
+        decoded: DecodedOtlp<ExportMetricsServiceRequest>,
+    ) -> Result<MetricsOutcome, IngestError> {
+        self.ensure_open()?;
+        authorize_record_write(auth)?;
+        let wire_bytes = decoded.wire_bytes;
+        let outcome = self
+            .dispatch_otlp(
+                auth,
+                TableRef::new(BifrostNamespace::Metrics, "points"),
+                wire_bytes,
+                IngressPayload::OtlpMetrics(decoded),
+            )
+            .await?;
+        match outcome {
+            ScribeOtlpOutcome::Metrics(outcome) => Ok(outcome),
+            _ => Err(IngestError::Internal(
+                "Scribe returned the wrong OTLP outcome".to_owned(),
+            )),
+        }
     }
 
     /// Routes one bounded OTLP logs export to Scribe without projecting it.
@@ -558,7 +639,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 auth,
                 TableRef::new(BifrostNamespace::Logs, "records"),
                 measured_wire_bytes,
-                IngressPayload::OtlpLogs(Box::new(request)),
+                IngressPayload::OtlpLogs(DecodedOtlp {
+                    request: Box::new(request),
+                    wire_bytes: measured_wire_bytes,
+                    owner: None,
+                }),
             )
             .await?;
         let ScribeOtlpOutcome::Logs(outcome) = outcome else {
@@ -568,6 +653,35 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         };
         record_gate_rows(outcome.accepted_records, outcome.rejected_records);
         Ok(outcome)
+    }
+
+    /// Routes one adapter-decoded log export and its move-only owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, request-limit, Scribe, or outcome-shape errors.
+    pub async fn ingest_decoded_resource_logs(
+        &self,
+        auth: &AuthContext,
+        decoded: DecodedOtlp<ExportLogsServiceRequest>,
+    ) -> Result<LogsOutcome, IngestError> {
+        self.ensure_open()?;
+        authorize_record_write(auth)?;
+        let wire_bytes = decoded.wire_bytes;
+        let outcome = self
+            .dispatch_otlp(
+                auth,
+                TableRef::new(BifrostNamespace::Logs, "records"),
+                wire_bytes,
+                IngressPayload::OtlpLogs(decoded),
+            )
+            .await?;
+        match outcome {
+            ScribeOtlpOutcome::Logs(outcome) => Ok(outcome),
+            _ => Err(IngestError::Internal(
+                "Scribe returned the wrong OTLP outcome".to_owned(),
+            )),
+        }
     }
 
     #[tracing::instrument(

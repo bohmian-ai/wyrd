@@ -2,14 +2,19 @@
 
 pub mod admission;
 pub mod audit_envelope;
+mod direct_logs;
+mod direct_metrics;
+mod direct_traces;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
+mod fixed_ipc;
 mod ingress;
 pub mod manifest;
 mod material_plan;
 pub mod memory;
 pub mod memtable;
+mod otlp_managed;
 pub mod parquet_writer;
 pub mod persistence;
 pub mod preprocess;

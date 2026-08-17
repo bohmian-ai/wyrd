@@ -1151,6 +1151,7 @@ impl PersistenceWorker {
             ScribePersistenceCpuResult::ParquetEncoded(encoded) => encoded,
             ScribePersistenceCpuResult::Prepared(_)
             | ScribePersistenceCpuResult::NativeSliceProduced { .. }
+            | ScribePersistenceCpuResult::OtlpSliceProduced { .. }
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong persistence result".to_owned(),

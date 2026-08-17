@@ -1,15 +1,16 @@
 //! Bounded pre-ACK preparation for Scribe requests.
 
 use super::ScribeImpl;
-use crate::contracts::{
-    FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame, ScribeOtlpOutcome,
-};
+use crate::contracts::{FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame};
 use crate::scribe::admission::MAX_REQUEST_BYTES;
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
 use crate::scribe::material_plan::{IngestMaterialPlan, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
-use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows};
+use crate::scribe::preprocess::{
+    AdmittedAppend, AdmittedRows, NativeAdmittedRows, OtlpAdmittedRows, OtlpTypedRows,
+};
 use crate::scribe::routing::shard_for;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
@@ -66,7 +67,7 @@ fn physical_binding_string_bytes(frame: &ScribeIngressFrame) -> Result<usize, Sc
         name.len(),
     ]
     .into_iter()
-    .try_fold(0_usize, |total, value| total.checked_add(value))
+    .try_fold(0_usize, usize::checked_add)
     .ok_or(ScribeError::DecodedPayloadTooLarge {
         bytes: usize::MAX,
         limit: usize::MAX,
@@ -86,7 +87,7 @@ fn physical_binding_string_bytes(frame: &ScribeIngressFrame) -> Result<usize, Sc
         name.len(),
     ]
     .into_iter()
-    .try_fold(0_usize, |total, value| total.checked_add(value))
+    .try_fold(0_usize, usize::checked_add)
     .ok_or(ScribeError::DecodedPayloadTooLarge {
         bytes: usize::MAX,
         limit: usize::MAX,
@@ -113,17 +114,49 @@ fn validate_logical_transport_frame(frame: &ScribeIngressFrame) -> Result<(), Sc
     Ok(())
 }
 
-/// Result of projecting or forwarding one bounded transport payload.
-enum PreparedTransportPayload {
-    /// Empty OTLP export acknowledged without entering durable row admission.
-    Empty(FrameAdmission),
-    /// Rows ready for the existing decoded-payload admission path.
-    Rows {
-        /// Native or projected payload consumed by the ingress CPU decoder.
-        payload: IngressPayload,
-        /// Optional OTLP outcome returned after durable row acknowledgment.
-        otlp_outcome: Option<ScribeOtlpOutcome>,
-    },
+/// Move-only context required to form one admitted row source.
+struct AdmittedRowContext {
+    /// Authenticated principal moved into the retained source.
+    principal: wyrd_runtime::Principal,
+    /// Catalog fingerprint required of the projected source schema.
+    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Stable request identity moved into managed-column stamping.
+    request_id: wyrd_spec::request_id::RequestId,
+    /// Stable logical batch identity.
+    batch_id: uuid::Uuid,
+    /// One authoritative receipt time shared by planning and projection.
+    receipt_micros: i64,
+    /// Fixed material ceiling admitted for the current slice.
+    material_limit: usize,
+    /// Native event-time acceptance window.
+    event_time_window: crate::scribe::admission::EventTimeWindow,
+    /// Shared publication slot read only after the durable ACK.
+    otlp_outcome: Arc<OnceLock<crate::contracts::ScribeOtlpOutcome>>,
+    /// Native schema frame start established by preflight.
+    native_schema_start: usize,
+    /// Native schema frame end established by preflight.
+    native_schema_end: usize,
+    /// Fixed native source descriptors established by preflight.
+    native_sources: [crate::scribe::material_plan::SourceMaterialPlan;
+        crate::scribe::material_plan::MAX_SOURCE_PLANS],
+    /// Live prefix length within `native_sources`.
+    native_source_count: usize,
+}
+
+/// Root admission state established before any scalable materialization.
+struct RootAdmission {
+    /// Catalog fingerprint required of the caller-owned source schema.
+    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// One authoritative receipt time shared by planning and projection.
+    receipt_micros: i64,
+    /// Complete immutable source-derived material plan.
+    material_plan: IngestMaterialPlan,
+    /// Sole root lease retained through detached persistence work.
+    memory: crate::resources::ScribeMemoryLease,
+    /// Tenant-qualified physical binding constructed after root admission.
+    binding: crate::catalog::TenantTableBinding,
+    /// Pod-global item reservation transferred to the shard owner.
+    reservation: crate::scribe::admission::InflightFrameReservation,
 }
 
 impl ScribeImpl {
@@ -179,29 +212,41 @@ impl ScribeImpl {
     fn plan_transport_payload(
         &self,
         frame: &ScribeIngressFrame,
+        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let name_bytes = physical_binding_string_bytes(frame)?;
         let planner = ScribeIngressPlanner::new(self.ingest_limits);
         let plan = match &frame.payload {
             IngressPayload::ArrowIpc(bytes) => planner.plan_native(bytes, name_bytes),
-            IngressPayload::OtlpTraces(request) => {
-                planner.plan_traces(&request.request, request.decode_bytes, name_bytes)
-            }
-            IngressPayload::OtlpMetrics(request) => {
-                planner.plan_metrics(&request.request, request.decode_bytes, name_bytes)
-            }
-            IngressPayload::OtlpLogs(request) => {
-                planner.plan_logs(&request.request, request.decode_bytes, name_bytes)
-            }
+            IngressPayload::OtlpTraces(request) => planner.plan_traces(
+                &request.request,
+                request.decode_bytes,
+                name_bytes,
+                receipt_micros,
+            ),
+            IngressPayload::OtlpMetrics(request) => planner.plan_metrics(
+                &request.request,
+                request.decode_bytes,
+                name_bytes,
+                receipt_micros,
+            ),
+            IngressPayload::OtlpLogs(request) => planner.plan_logs(
+                &request.request,
+                request.decode_bytes,
+                name_bytes,
+                receipt_micros,
+            ),
             IngressPayload::ProjectedArrow(batches) => {
                 planner.plan_projected(batches, frame.measured_wire_bytes, name_bytes)
             }
         }?;
-        validate_decoded_request_size(
-            plan.current_material_bytes,
-            plan.request_bytes,
-            self.decoded_request_limit(),
-        )?;
+        if matches!(&frame.payload, IngressPayload::ProjectedArrow(_)) {
+            validate_decoded_request_size(
+                plan.current_material_bytes,
+                plan.request_bytes,
+                self.decoded_request_limit(),
+            )?;
+        }
         Ok(plan)
     }
 
@@ -212,7 +257,6 @@ impl ScribeImpl {
     /// Returns [`ScribeError::InvalidFrame`] when logical identity cannot form
     /// the canonical tenant-qualified binding or its tenant tripwire fails.
     fn construct_physical_binding(
-        &self,
         frame: &ScribeIngressFrame,
     ) -> Result<crate::catalog::TenantTableBinding, ScribeError> {
         let binding = crate::catalog::TenantTableBinding::resolve((
@@ -226,74 +270,169 @@ impl ScribeImpl {
         Ok(binding)
     }
 
-    /// Projects raw OTLP on Scribe's bounded CPU lane or forwards engine payloads.
+    /// Converts one move-only transport payload into its retained row source.
+    ///
+    /// Typed OTLP remains unprojected, native Arrow retains its preflight
+    /// descriptors, and the engine-only projected path uses the bounded ingress
+    /// CPU lane.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::InvalidFrame`] when OTLP projection rejects the
-    /// bounded payload, or the CPU lane fails to complete the projection.
-    async fn project_transport_payload(
+    /// Returns the bounded ingress decode or material-ceiling error for the
+    /// selected payload.
+    async fn prepare_admitted_rows(
         &self,
         payload: IngressPayload,
-        batch_id: uuid::Uuid,
-    ) -> Result<PreparedTransportPayload, ScribeError> {
-        let (batch, outcome) = match payload {
-            IngressPayload::OtlpTraces(request) => {
-                let request = request.request;
-                let projected = self
+        context: AdmittedRowContext,
+    ) -> Result<AdmittedRows, ScribeError> {
+        let AdmittedRowContext {
+            principal,
+            expected_schema_fingerprint,
+            request_id,
+            batch_id,
+            receipt_micros,
+            material_limit,
+            event_time_window,
+            otlp_outcome,
+            native_schema_start,
+            native_schema_end,
+            native_sources,
+            native_source_count,
+        } = context;
+        match payload {
+            IngressPayload::ArrowIpc(bytes) => {
+                Ok(AdmittedRows::Native(Box::new(NativeAdmittedRows {
+                    bytes,
+                    principal,
+                    expected_schema_fingerprint,
+                    request_id,
+                    batch_id,
+                    event_time_window,
+                    receipt_micros,
+                    schema_start: native_schema_start,
+                    schema_end: native_schema_end,
+                    sources: native_sources,
+                    source_count: native_source_count,
+                })))
+            }
+            IngressPayload::OtlpTraces(decoded) => {
+                Ok(AdmittedRows::Otlp(Box::new(OtlpAdmittedRows {
+                    request: OtlpTypedRows::Traces(decoded.request),
+                    principal,
+                    expected_schema_fingerprint,
+                    request_id,
+                    batch_id,
+                    receipt_micros,
+                    material_limit,
+                    outcome: otlp_outcome,
+                })))
+            }
+            IngressPayload::OtlpMetrics(decoded) => {
+                Ok(AdmittedRows::Otlp(Box::new(OtlpAdmittedRows {
+                    request: OtlpTypedRows::Metrics(decoded.request),
+                    principal,
+                    expected_schema_fingerprint,
+                    request_id,
+                    batch_id,
+                    receipt_micros,
+                    material_limit,
+                    outcome: otlp_outcome,
+                })))
+            }
+            IngressPayload::OtlpLogs(decoded) => {
+                Ok(AdmittedRows::Otlp(Box::new(OtlpAdmittedRows {
+                    request: OtlpTypedRows::Logs(decoded.request),
+                    principal,
+                    expected_schema_fingerprint,
+                    request_id,
+                    batch_id,
+                    receipt_micros,
+                    material_limit,
+                    outcome: otlp_outcome,
+                })))
+            }
+            payload @ IngressPayload::ProjectedArrow(_) => {
+                let rows = self
                     .ingress_cpu
-                    .run(move || {
-                        crate::gate::collector::project_resource_spans(&request)
-                            .map_err(|_| ScribeError::InvalidFrame)
-                    })
+                    .decode(
+                        payload,
+                        principal,
+                        expected_schema_fingerprint,
+                        request_id,
+                        batch_id,
+                        event_time_window,
+                    )
                     .await?;
-                (
-                    projected.batch,
-                    ScribeOtlpOutcome::Traces(projected.outcome),
-                )
+                let decoded_request_bytes = rows.get_array_memory_size();
+                if decoded_request_bytes > material_limit {
+                    return Err(ScribeError::DecodedPayloadTooLarge {
+                        bytes: decoded_request_bytes,
+                        limit: material_limit,
+                    });
+                }
+                Ok(AdmittedRows::Projected(rows))
             }
-            IngressPayload::OtlpMetrics(request) => {
-                let request = request.request;
-                let projected = self
-                    .ingress_cpu
-                    .run(move || {
-                        crate::gate::collector::project_resource_metrics(&request)
-                            .map_err(|_| ScribeError::InvalidFrame)
-                    })
-                    .await?;
-                (
-                    projected.batch,
-                    ScribeOtlpOutcome::Metrics(projected.outcome),
-                )
-            }
-            IngressPayload::OtlpLogs(request) => {
-                let request = request.request;
-                let projected = self
-                    .ingress_cpu
-                    .run(move || {
-                        crate::gate::collector::project_resource_logs(&request)
-                            .map_err(|_| ScribeError::InvalidFrame)
-                    })
-                    .await?;
-                (projected.batch, ScribeOtlpOutcome::Logs(projected.outcome))
-            }
-            payload @ (IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_)) => {
-                return Ok(PreparedTransportPayload::Rows {
-                    payload,
-                    otlp_outcome: None,
-                });
-            }
+        }
+    }
+
+    /// Validates, plans, and reserves one complete logical root.
+    ///
+    /// A transport-decode owner is adopted when present; otherwise Scribe
+    /// obtains the root directly. Physical binding and shard attachment happen
+    /// only after the complete source-derived plan has been admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable transport, catalog, material, memory, admission, or
+    /// shard-attachment refusal before row materialization begins.
+    async fn admit_transport_frame(
+        &self,
+        frame: &mut ScribeIngressFrame,
+    ) -> Result<RootAdmission, ScribeError> {
+        validate_logical_transport_frame(frame)?;
+        let expected_schema_fingerprint = self.resolve_logical_frame(frame).await?;
+        let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
+        let material_plan = self.plan_transport_payload(frame, receipt_micros)?;
+        let decode_owner = match &mut frame.payload {
+            IngressPayload::OtlpTraces(decoded) => decoded.owner.take(),
+            IngressPayload::OtlpMetrics(decoded) => decoded.owner.take(),
+            IngressPayload::OtlpLogs(decoded) => decoded.owner.take(),
+            IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_) => None,
         };
-        Ok(match batch {
-            Some(batch) => PreparedTransportPayload::Rows {
-                payload: IngressPayload::ProjectedArrow(vec![batch]),
-                otlp_outcome: Some(outcome),
+        let mut memory = match decode_owner {
+            Some(owner) => owner.complete(material_plan.root_bytes)?,
+            None => match self
+                .memory
+                .try_reserve_ingress(MemoryCategory::Raw, material_plan.root_bytes)
+            {
+                Ok(reservation) => reservation,
+                Err(_) => self.reserve_ingress_after_pressure_seal(
+                    MemoryCategory::Raw,
+                    material_plan.root_bytes,
+                    &frame.table.name,
+                )?,
             },
-            None => PreparedTransportPayload::Empty(FrameAdmission {
-                batch_id,
-                rows_accepted: 0,
-                otlp_outcome: Some(outcome),
-            }),
+        };
+        let binding = Self::construct_physical_binding(frame)?;
+        let table = binding.table_ref.fqn();
+        let shard = shard_for(
+            frame.principal.tenant_id,
+            &binding.table_ref,
+            frame.batch_id,
+        );
+        let reservation = self
+            .admission
+            .try_reserve(table, material_plan.root_bytes)?;
+        memory.attach_shard(shard)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_admitted_ingest_for_test().await;
+        Ok(RootAdmission {
+            expected_schema_fingerprint,
+            receipt_micros,
+            material_plan,
+            memory,
+            binding,
+            reservation,
         })
     }
 
@@ -319,89 +458,35 @@ impl ScribeImpl {
         mut frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
-        validate_logical_transport_frame(&frame)?;
-        let expected_schema_fingerprint = self.resolve_logical_frame(&frame).await?;
-        let material_plan = self.plan_transport_payload(&frame)?;
-        let decode_owner = match &mut frame.payload {
-            IngressPayload::OtlpTraces(decoded) => decoded.owner.take(),
-            IngressPayload::OtlpMetrics(decoded) => decoded.owner.take(),
-            IngressPayload::OtlpLogs(decoded) => decoded.owner.take(),
-            IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_) => None,
-        };
-        let mut memory = match decode_owner {
-            Some(owner) => owner.complete(material_plan.root_bytes)?,
-            None => match self
-                .memory
-                .try_reserve_ingress(MemoryCategory::Raw, material_plan.root_bytes)
-            {
-                Ok(reservation) => reservation,
-                Err(_) => self.reserve_ingress_after_pressure_seal(
-                    MemoryCategory::Raw,
-                    material_plan.root_bytes,
-                    &frame.table.name,
-                )?,
-            },
-        };
-        let binding = self.construct_physical_binding(&frame)?;
-        let table = binding.table_ref.fqn();
-        let shard = shard_for(
-            frame.principal.tenant_id,
-            &binding.table_ref,
-            frame.batch_id,
-        );
-        let reservation = self
-            .admission
-            .try_reserve(table.clone(), material_plan.root_bytes)?;
-        memory.attach_shard(shard)?;
-        #[cfg(any(test, feature = "test-support"))]
-        self.pause_admitted_ingest_for_test().await;
-        let (payload, otlp_outcome) = match self
-            .project_transport_payload(frame.payload, frame.batch_id)
-            .await?
-        {
-            PreparedTransportPayload::Empty(admission) => return Ok(admission),
-            PreparedTransportPayload::Rows {
-                payload,
-                otlp_outcome,
-            } => (payload, otlp_outcome),
-        };
-
-        let rows = match payload {
-            IngressPayload::ArrowIpc(bytes) => AdmittedRows::Native(NativeAdmittedRows {
-                bytes,
-                principal: frame.principal.clone(),
-                expected_schema_fingerprint,
-                request_id: frame.request_id.clone(),
-                batch_id: frame.batch_id,
-                event_time_window: self.admission.config().event_time_window,
-                receipt_micros: crate::scribe::execution_lanes::current_receipt_micros()?,
-                schema_start: material_plan.native_schema_start,
-                schema_end: material_plan.native_schema_end,
-                sources: material_plan.sources,
-                source_count: material_plan.source_count,
-            }),
-            payload => {
-                let rows = self
-                    .ingress_cpu
-                    .decode(
-                        payload,
-                        frame.principal.clone(),
-                        expected_schema_fingerprint,
-                        frame.request_id.clone(),
-                        frame.batch_id,
-                        self.admission.config().event_time_window,
-                    )
-                    .await?;
-                let decoded_request_bytes = rows.get_array_memory_size();
-                if decoded_request_bytes > material_plan.current_material_bytes {
-                    return Err(ScribeError::DecodedPayloadTooLarge {
-                        bytes: decoded_request_bytes,
-                        limit: material_plan.current_material_bytes,
-                    });
-                }
-                AdmittedRows::Projected(rows)
-            }
-        };
+        let RootAdmission {
+            expected_schema_fingerprint,
+            receipt_micros,
+            material_plan,
+            mut memory,
+            binding,
+            reservation,
+        } = self.admit_transport_frame(&mut frame).await?;
+        let otlp_outcome = Arc::new(OnceLock::new());
+        let tenant = frame.principal.tenant_id;
+        let rows = self
+            .prepare_admitted_rows(
+                frame.payload,
+                AdmittedRowContext {
+                    principal: frame.principal,
+                    expected_schema_fingerprint,
+                    request_id: frame.request_id,
+                    batch_id: frame.batch_id,
+                    receipt_micros,
+                    material_limit: material_plan.current_material_bytes,
+                    event_time_window: self.admission.config().event_time_window,
+                    otlp_outcome: Arc::clone(&otlp_outcome),
+                    native_schema_start: material_plan.native_schema_start,
+                    native_schema_end: material_plan.native_schema_end,
+                    native_sources: material_plan.sources,
+                    native_source_count: material_plan.source_count,
+                },
+            )
+            .await?;
         memory.transfer_category(MemoryCategory::Decode)?;
         memory.transfer_category(MemoryCategory::Prepared)?;
 
@@ -415,12 +500,12 @@ impl ScribeImpl {
             wal_workspace_bytes: material_plan.wal_workspace_bytes,
             reservation,
             memory,
-            tenant: frame.principal.tenant_id,
+            tenant,
             table: binding.table_ref,
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
         };
-        let rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
+        let planned_rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
         let prepared = match self
             .persistence_cpu
             .submit(ScribePersistenceCpuOp::Preprocess(Box::new(admitted)))
@@ -428,6 +513,7 @@ impl ScribeImpl {
         {
             ScribePersistenceCpuResult::Prepared(value) => value,
             ScribePersistenceCpuResult::NativeSliceProduced { .. }
+            | ScribePersistenceCpuResult::OtlpSliceProduced { .. }
             | ScribePersistenceCpuResult::ParquetEncoded(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
@@ -441,11 +527,25 @@ impl ScribeImpl {
         durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
+        let published_outcome = otlp_outcome.get().cloned();
+        let rows_accepted = published_outcome
+            .as_ref()
+            .map_or(planned_rows_accepted, |outcome| match outcome {
+                crate::contracts::ScribeOtlpOutcome::Traces(value) => {
+                    u64::try_from(value.accepted_spans).unwrap_or(u64::MAX)
+                }
+                crate::contracts::ScribeOtlpOutcome::Metrics(value) => {
+                    u64::try_from(value.accepted_points).unwrap_or(u64::MAX)
+                }
+                crate::contracts::ScribeOtlpOutcome::Logs(value) => {
+                    u64::try_from(value.accepted_records).unwrap_or(u64::MAX)
+                }
+            });
         record_accepted_frame(rows_accepted, append_started.elapsed());
         Ok(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted,
-            otlp_outcome,
+            otlp_outcome: published_outcome,
         })
     }
 

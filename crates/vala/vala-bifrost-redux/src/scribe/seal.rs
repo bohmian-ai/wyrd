@@ -861,6 +861,9 @@ impl SealDriver {
             ScribePersistenceCpuResult::NativeSliceProduced { .. } => Err(ScribeError::Internal {
                 detail: "persistence lane returned native slice during seal".to_owned(),
             }),
+            ScribePersistenceCpuResult::OtlpSliceProduced { .. } => Err(ScribeError::Internal {
+                detail: "persistence lane returned OTLP slice during seal".to_owned(),
+            }),
             ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned replay output during seal".to_owned(),
             }),

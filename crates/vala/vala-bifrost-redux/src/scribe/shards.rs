@@ -2035,6 +2035,12 @@ struct DurableSlice {
     commit_already_synced: bool,
 }
 
+/// Public-layout bytes retained for one WAL-durable slice descriptor.
+///
+/// Scribe material planning uses this fact before root admission so the exact
+/// fixed `Vec<DurableSlice>` backing allocated by group write is never hidden.
+pub(crate) const DURABLE_SLICE_LAYOUT_BYTES: usize = std::mem::size_of::<DurableSlice>();
+
 /// A WAL-synced slice whose Arrow rows have not yet reached the active
 /// memtable. Successful insertion removes the entry, so this bounded index
 /// only covers the fsync-success/memtable-failure retry window.
@@ -2441,6 +2447,34 @@ impl ShardOwner {
                     }),
                 }
             }
+            PreparedSliceSet::Otlp(producer_slot) => {
+                let producer = producer_slot.take().ok_or_else(|| ScribeError::Internal {
+                    detail: "OTLP prepared-slice producer owner is missing".to_owned(),
+                })?;
+                let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
+                    detail: "OTLP root owner missing before CPU dispatch".to_owned(),
+                })?;
+                match persistence_cpu
+                    .submit(crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceOtlpSlice {
+                        producer,
+                        memory,
+                    })
+                    .await?
+                {
+                    crate::scribe::execution_lanes::ScribePersistenceCpuResult::OtlpSliceProduced {
+                        producer: returned,
+                        slice,
+                        memory,
+                    } => {
+                        *producer_slot = Some(returned);
+                        append.memory = Some(memory);
+                        Ok(slice)
+                    }
+                    _ => Err(ScribeError::Internal {
+                        detail: "persistence lane returned the wrong OTLP slice result".to_owned(),
+                    }),
+                }
+            }
         }
     }
 
@@ -2612,7 +2646,7 @@ impl ShardOwner {
     ) -> Result<HashSet<crate::scribe::seal_key::SealKey>, ScribeError> {
         let mut touched_keys = HashSet::new();
         for append in &mut state.prepared {
-            let is_native = match &mut append.slices {
+            let is_lazy = match &mut append.slices {
                 PreparedSliceSet::Native(Some(producer)) => {
                     producer.restart()?;
                     true
@@ -2622,9 +2656,18 @@ impl ShardOwner {
                         detail: "native producer owner missing before visibility".to_owned(),
                     });
                 }
+                PreparedSliceSet::Otlp(Some(producer)) => {
+                    producer.restart();
+                    true
+                }
+                PreparedSliceSet::Otlp(None) => {
+                    return Err(ScribeError::Internal {
+                        detail: "OTLP producer owner missing before visibility".to_owned(),
+                    });
+                }
                 PreparedSliceSet::Materialized(_) => false,
             };
-            if !is_native {
+            if !is_lazy {
                 continue;
             }
             while let Some(produced) =
@@ -2646,8 +2689,7 @@ impl ShardOwner {
                     || durable.payload_len != payload_len
                 {
                     return Err(ScribeError::Internal {
-                        detail: "regenerated native slice identity diverged after COMMIT"
-                            .to_owned(),
+                        detail: "regenerated lazy slice identity diverged after COMMIT".to_owned(),
                     });
                 }
                 durable.rows = Some(produced.rows);

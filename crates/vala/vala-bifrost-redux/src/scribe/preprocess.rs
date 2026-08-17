@@ -1,9 +1,9 @@
 //! Blocking preprocessing for admitted appends.
 
 use arrow::buffer::Buffer;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -48,7 +48,41 @@ pub(crate) enum AdmittedRows {
     /// One already-stamped projected batch.
     Projected(RecordBatch),
     /// One native stream decoded a record batch at a time on the persistence lane.
-    Native(NativeAdmittedRows),
+    Native(Box<NativeAdmittedRows>),
+    /// One typed OTLP request projected only when persistence requests its slice.
+    Otlp(Box<OtlpAdmittedRows>),
+}
+
+/// Closed typed request retained by the private Scribe OTLP producer.
+#[derive(Debug)]
+pub(crate) enum OtlpTypedRows {
+    /// Typed trace export.
+    Traces(Box<wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest>),
+    /// Typed metrics export.
+    Metrics(Box<wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest>),
+    /// Typed logs export.
+    Logs(Box<wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest>),
+}
+
+/// Retained typed OTLP request and deterministic managed-column context.
+#[derive(Debug)]
+pub(crate) struct OtlpAdmittedRows {
+    /// Move-only typed request retained through post-COMMIT regeneration.
+    pub(crate) request: OtlpTypedRows,
+    /// Authenticated principal stamped into the current projected slice.
+    pub(crate) principal: Principal,
+    /// Catalog fingerprint checked against the projected schema.
+    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Stable request identity stamped into every accepted row.
+    pub(crate) request_id: RequestId,
+    /// Stable batch identity stamped into every accepted row.
+    pub(crate) batch_id: Uuid,
+    /// One authoritative receipt instant and partition day.
+    pub(crate) receipt_micros: i64,
+    /// Configured combined Arrow plus IPC ceiling for the sole current slice.
+    pub(crate) material_limit: usize,
+    /// Outcome published by the producer after its deterministic projection pass.
+    pub(crate) outcome: Arc<OnceLock<crate::contracts::ScribeOtlpOutcome>>,
 }
 
 /// Retained native source and immutable stamping context.
@@ -99,6 +133,140 @@ pub(crate) enum PreparedSliceSet {
     Materialized(Vec<PreparedSlice>),
     /// Native path producing exactly one current slice per CPU-lane turn.
     Native(Option<Box<NativeSliceProducer>>),
+    /// OTLP path producing one receipt-day slice on demand.
+    Otlp(Option<Box<OtlpSliceProducer>>),
+}
+
+/// One-shot typed OTLP current-slice producer.
+#[derive(Debug)]
+pub(crate) struct OtlpSliceProducer {
+    /// Retained request and immutable stamping context.
+    source: OtlpAdmittedRows,
+    /// Whether the sole receipt-day slice has been produced.
+    produced: bool,
+    /// Canonical batch audit moved only into the current durable slice.
+    audit_event: AuditEvent,
+    /// Authenticated tenant used by the slice seal key.
+    tenant: DataTenantId,
+    /// Logical table used by the slice seal key.
+    table: TableRef,
+    /// Exact-capacity audit JSON ceiling.
+    wal_workspace_bytes: usize,
+}
+
+impl OtlpSliceProducer {
+    /// Builds one retained producer without projecting the typed request.
+    #[must_use]
+    fn new(
+        source: OtlpAdmittedRows,
+        audit_event: AuditEvent,
+        tenant: DataTenantId,
+        table: TableRef,
+        wal_workspace_bytes: usize,
+    ) -> Self {
+        Self {
+            source,
+            produced: false,
+            audit_event,
+            tenant,
+            table,
+            wal_workspace_bytes,
+        }
+    }
+
+    /// Projects and prepares the sole receipt-day slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable projection, schema, stamping, day, or IPC preparation
+    /// error. A second call after success returns exhaustion without allocating.
+    pub(crate) fn next_slice(&mut self) -> Result<Option<PreparedSlice>, ScribeError> {
+        if self.produced {
+            return Ok(None);
+        }
+        let (batch, outcome) = match &self.source.request {
+            OtlpTypedRows::Traces(request) => {
+                let (batch, outcome) = crate::scribe::direct_traces::project(
+                    request,
+                    self.source.material_limit,
+                    &self.source.principal,
+                    self.source.expected_schema_fingerprint,
+                    &self.source.request_id,
+                    self.source.batch_id,
+                    self.source.receipt_micros,
+                )?;
+                (batch, crate::contracts::ScribeOtlpOutcome::Traces(outcome))
+            }
+            OtlpTypedRows::Metrics(request) => {
+                let (batch, outcome) = crate::scribe::direct_metrics::project(
+                    request,
+                    self.source.material_limit,
+                    &self.source.principal,
+                    self.source.expected_schema_fingerprint,
+                    &self.source.request_id,
+                    self.source.batch_id,
+                    self.source.receipt_micros,
+                )?;
+                (batch, crate::contracts::ScribeOtlpOutcome::Metrics(outcome))
+            }
+            OtlpTypedRows::Logs(request) => {
+                let (batch, outcome) = crate::scribe::direct_logs::project(
+                    request,
+                    self.source.material_limit,
+                    &self.source.principal,
+                    self.source.expected_schema_fingerprint,
+                    &self.source.request_id,
+                    self.source.batch_id,
+                    self.source.receipt_micros,
+                )?;
+                (batch, crate::contracts::ScribeOtlpOutcome::Logs(outcome))
+            }
+        };
+        if self.source.outcome.get().is_none() {
+            let _ = self.source.outcome.set(outcome);
+        }
+        self.produced = true;
+        let Some(batch) = batch else {
+            return Ok(None);
+        };
+        let crate::scribe::otlp_managed::OtlpManagedBatch { rows, ipc_plan } = batch;
+        let receipt = chrono::DateTime::from_timestamp_micros(self.source.receipt_micros)
+            .ok_or(ScribeError::InvalidFrame)?;
+        let event_day = crate::scribe::seal_key::EventDay::from_timestamp(receipt);
+        let current_bytes = rows
+            .get_array_memory_size()
+            .checked_add(ipc_plan.encoded_bytes())
+            .ok_or(ScribeError::DecodedPayloadTooLarge {
+                bytes: usize::MAX,
+                limit: self.source.material_limit,
+            })?;
+        if current_bytes > self.source.material_limit {
+            return Err(ScribeError::DecodedPayloadTooLarge {
+                bytes: current_bytes,
+                limit: self.source.material_limit,
+            });
+        }
+        let mut slice = prepare_slice(
+            SliceContext {
+                batch_id: self.source.batch_id,
+                audit_event: &self.audit_event,
+                tenant: self.tenant,
+                table: &self.table,
+                wal_workspace_bytes: self.wal_workspace_bytes,
+            },
+            event_day,
+            rows,
+            Some(ipc_plan),
+        )?;
+        slice.wal_append.assign_slice_ordinal(0, 1);
+        slice.id.slice_index = 0;
+        Ok(Some(slice))
+    }
+
+    /// Rewinds deterministic projection for post-COMMIT identity regeneration.
+    pub(crate) fn restart(&mut self) {
+        self.produced = false;
+    }
 }
 
 /// Stateful current-only native slice producer.
@@ -188,13 +356,16 @@ impl NativeSliceProducer {
                         current.days.materialize(&current.rows, current.next_day)?;
                     current.next_day += 1;
                     let mut slice = prepare_slice(
-                        self.source.batch_id,
-                        &self.audit_event,
-                        self.tenant,
-                        &self.table,
+                        SliceContext {
+                            batch_id: self.source.batch_id,
+                            audit_event: &self.audit_event,
+                            tenant: self.tenant,
+                            table: &self.table,
+                            wal_workspace_bytes: self.wal_workspace_bytes,
+                        },
                         event_day,
                         rows,
-                        self.wal_workspace_bytes,
+                        None,
                     )?;
                     slice
                         .wal_append
@@ -221,7 +392,7 @@ impl NativeSliceProducer {
                 return Ok(None);
             };
             self.source_index += 1;
-            let rows = stamp_native_source(rows, &self.source)?;
+            let rows = stamp_native_source(&rows, &self.source)?;
             let days = plan_event_days(&rows)?;
             self.current = Some(NativeCurrentSource {
                 rows,
@@ -263,6 +434,10 @@ impl PreparedSliceSet {
             Self::Native(None) => Err(ScribeError::Internal {
                 detail: "native producer owner missing during capacity planning".to_owned(),
             }),
+            Self::Otlp(Some(_)) => Ok(1),
+            Self::Otlp(None) => Err(ScribeError::Internal {
+                detail: "OTLP producer owner missing during capacity planning".to_owned(),
+            }),
         }
     }
 }
@@ -280,7 +455,7 @@ fn count_native_slices(source: &NativeAdmittedRows) -> Result<u32, ScribeError> 
     for source_index in 0..source.source_count {
         let rows = decode_planned_native_source(&mut decoder, source, source_index)?
             .ok_or(ScribeError::InvalidFrame)?;
-        let rows = stamp_native_source(rows, source)?;
+        let rows = stamp_native_source(&rows, source)?;
         slices = slices
             .checked_add(plan_event_days(&rows)?.len())
             .ok_or_else(|| ScribeError::Internal {
@@ -360,7 +535,7 @@ fn decode_planned_native_source(
         .ok_or(ScribeError::InvalidFrame)?;
     let aligned = (source.bytes.as_ptr() as usize)
         .checked_add(plan.body_start)
-        .is_some_and(|address| address & 7 == 0);
+        .is_some_and(|address| address.is_multiple_of(8));
     let mut body = if aligned {
         Buffer::from(source.bytes.slice(plan.body_start..plan.body_end))
     } else {
@@ -385,7 +560,7 @@ fn decode_planned_native_source(
 /// Returns the stable fingerprint, scope, event-time, or managed-column error
 /// produced by the native decode contract.
 fn stamp_native_source(
-    rows: RecordBatch,
+    rows: &RecordBatch,
     source: &NativeAdmittedRows,
 ) -> Result<RecordBatch, ScribeError> {
     crate::scribe::execution_lanes::decode_native_batch(
@@ -421,7 +596,100 @@ pub struct AppendSliceId {
     pub slice_index: u32,
 }
 
+/// Move-only context used to convert admitted rows into their prepared source.
+struct PreparedRowsContext {
+    /// Stable logical batch identity.
+    batch_id: Uuid,
+    /// Canonical audit envelope retained by each produced slice.
+    audit_event: AuditEvent,
+    /// Authenticated tenant used by every seal key.
+    tenant: DataTenantId,
+    /// Logical table used by every seal key.
+    table: TableRef,
+    /// Exact-capacity audit JSON ceiling.
+    wal_workspace_bytes: usize,
+    /// Root bytes retained while the prepared source is live.
+    memory_bytes: usize,
+}
+
+/// Converts admitted rows into a materialized or current-only prepared source.
+///
+/// Native and OTLP requests retain their move-only producer state; only the
+/// engine fixture path materializes its complete closed slice set here.
+///
+/// # Errors
+///
+/// Returns a stable day-planning, native decode, IPC, audit, or checked-size
+/// refusal while the caller still owns the root lease.
+fn prepare_rows(
+    rows: AdmittedRows,
+    context: PreparedRowsContext,
+) -> Result<(PreparedSliceSet, usize), ScribeError> {
+    let PreparedRowsContext {
+        batch_id,
+        audit_event,
+        tenant,
+        table,
+        wal_workspace_bytes,
+        memory_bytes,
+    } = context;
+    match rows {
+        AdmittedRows::Projected(rows) => {
+            let mut slices = Vec::new();
+            append_prepared_slices(
+                &mut slices,
+                batch_id,
+                &audit_event,
+                tenant,
+                &table,
+                &rows,
+                wal_workspace_bytes,
+            )?;
+            let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
+                detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
+            })?;
+            for (slice_index, slice) in slices.iter_mut().enumerate() {
+                let slice_index =
+                    u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
+                        detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
+                    })?;
+                slice
+                    .wal_append
+                    .assign_slice_ordinal(slice_index, slice_count);
+                slice.id.slice_index = slice_index;
+            }
+            let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
+            Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
+        }
+        AdmittedRows::Native(native) => Ok((
+            PreparedSliceSet::Native(Some(Box::new(NativeSliceProducer::new(
+                *native,
+                audit_event,
+                tenant,
+                table,
+                wal_workspace_bytes,
+            )?))),
+            memory_bytes,
+        )),
+        AdmittedRows::Otlp(otlp) => Ok((
+            PreparedSliceSet::Otlp(Some(Box::new(OtlpSliceProducer::new(
+                *otlp,
+                audit_event,
+                tenant,
+                table,
+                wal_workspace_bytes,
+            )))),
+            memory_bytes,
+        )),
+    }
+}
+
 /// Split and serialize an admitted append on the bounded pre-ACK CPU lane.
+///
+/// # Errors
+///
+/// Returns the preparation error after notifying the durable waiter, or a
+/// stable material refusal when the retained prepared source exceeds its root.
 pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
         batch_id,
@@ -441,48 +709,17 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     metrics::histogram!("bifrost_scribe_queue_wait_seconds")
         .record(queued_at.elapsed().as_secs_f64());
 
-    let slices_result = (|| -> Result<(PreparedSliceSet, usize), ScribeError> {
-        match rows {
-            AdmittedRows::Projected(rows) => {
-                let mut slices = Vec::new();
-                append_prepared_slices(
-                    &mut slices,
-                    batch_id,
-                    &audit_event,
-                    tenant,
-                    &table,
-                    &rows,
-                    wal_workspace_bytes,
-                )?;
-                let slice_count =
-                    u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-                        detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
-                    })?;
-                for (slice_index, slice) in slices.iter_mut().enumerate() {
-                    let slice_index =
-                        u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
-                            detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
-                        })?;
-                    slice
-                        .wal_append
-                        .assign_slice_ordinal(slice_index, slice_count);
-                    slice.id.slice_index = slice_index;
-                }
-                let prepared_bytes = prepared_slice_bytes(&slices, memory.bytes())?;
-                Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
-            }
-            AdmittedRows::Native(native) => Ok((
-                PreparedSliceSet::Native(Some(Box::new(NativeSliceProducer::new(
-                    native,
-                    audit_event,
-                    tenant,
-                    table.clone(),
-                    wal_workspace_bytes,
-                )?))),
-                memory.bytes(),
-            )),
-        }
-    })();
+    let slices_result = prepare_rows(
+        rows,
+        PreparedRowsContext {
+            batch_id,
+            audit_event,
+            tenant,
+            table: table.clone(),
+            wal_workspace_bytes,
+            memory_bytes: memory.bytes(),
+        },
+    );
     let (slices, prepared_bytes) = match slices_result {
         Ok(result) => result,
         Err(error) => {
@@ -557,19 +794,33 @@ fn append_prepared_slices(
     rows: &RecordBatch,
     wal_workspace_bytes: usize,
 ) -> Result<(), ScribeError> {
+    let context = SliceContext {
+        batch_id,
+        audit_event,
+        tenant,
+        table,
+        wal_workspace_bytes,
+    };
     for slice in split_batch_by_event_day(rows)? {
         let (event_day, day_rows) = slice?;
-        slices.push(prepare_slice(
-            batch_id,
-            audit_event,
-            tenant,
-            table,
-            event_day,
-            day_rows,
-            wal_workspace_bytes,
-        )?);
+        slices.push(prepare_slice(context, event_day, day_rows, None)?);
     }
     Ok(())
+}
+
+/// Borrowed immutable context shared by each current slice preparation.
+#[derive(Clone, Copy)]
+struct SliceContext<'a> {
+    /// Stable logical batch identity.
+    batch_id: Uuid,
+    /// Canonical logical-batch audit envelope.
+    audit_event: &'a AuditEvent,
+    /// Authenticated tenant used by the seal key.
+    tenant: DataTenantId,
+    /// Logical table used by the seal key.
+    table: &'a TableRef,
+    /// Exact-capacity audit JSON ceiling.
+    wal_workspace_bytes: usize,
 }
 
 /// Builds one fixed-capacity WAL slice from the current materialized day.
@@ -578,22 +829,19 @@ fn append_prepared_slices(
 ///
 /// Returns [`ScribeError`] when audit encoding or fixed IPC encoding fails.
 fn prepare_slice(
-    batch_id: Uuid,
-    audit_event: &AuditEvent,
-    tenant: DataTenantId,
-    table: &TableRef,
+    context: SliceContext<'_>,
     event_day: crate::scribe::seal_key::EventDay,
     rows: RecordBatch,
-    wal_workspace_bytes: usize,
+    ipc_plan: Option<crate::scribe::fixed_ipc::FixedIpcPlan>,
 ) -> Result<PreparedSlice, ScribeError> {
-    let seal_key = SealKey::new(tenant, table.clone(), event_day);
-    let mut day_audit = audit_event.clone();
+    let seal_key = SealKey::new(context.tenant, context.table.clone(), event_day);
+    let mut day_audit = context.audit_event.clone();
     day_audit.payload_summary = format!("{} rows", rows.num_rows());
-    let audit_payload = encode_audit_event_bounded(&day_audit, wal_workspace_bytes)?;
-    let data_payload = encode_ipc_fixed(&rows)?;
+    let audit_payload = encode_audit_event_bounded(&day_audit, context.wal_workspace_bytes)?;
+    let data_payload = encode_ipc_fixed(&rows, ipc_plan)?;
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
-        *batch_id.as_bytes(),
+        *context.batch_id.as_bytes(),
         Bytes::from(audit_payload),
         data_payload,
     )
@@ -604,7 +852,7 @@ fn prepare_slice(
     let memtable_bytes = rows.get_array_memory_size();
     Ok(PreparedSlice {
         id: AppendSliceId {
-            batch_id,
+            batch_id: context.batch_id,
             seal_key: seal_key.clone(),
             slice_index: 0,
         },
@@ -618,34 +866,26 @@ fn prepare_slice(
 
 /// Encodes one current day into a capacity-frozen IPC payload.
 ///
-/// The first writer pass retains no output and establishes the exact public
-/// byte count. The second pass allocates once at that capacity and verifies
-/// that the vector did not grow before ownership transfers into [`Bytes`].
+/// A fixed inline plan establishes the complete stream length before the sole
+/// output allocation and revalidates physical facts during encoding.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::Internal`] when either Arrow pass fails or the second
 /// pass diverges from its counted length or initial capacity.
-fn encode_ipc_fixed(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
-    let output_bytes = crate::scribe::material_plan::count_ipc_bytes(rows)?;
-    let mut payload = Vec::with_capacity(output_bytes);
-    let fixed_capacity = payload.capacity();
-    {
-        let mut writer = StreamWriter::try_new(&mut payload, &rows.schema()).map_err(|error| {
-            ScribeError::Internal {
-                detail: format!("Arrow IPC writer init failed: {error}"),
-            }
-        })?;
-        writer.write(rows).map_err(|error| ScribeError::Internal {
-            detail: format!("Arrow IPC write failed: {error}"),
-        })?;
-        writer.finish().map_err(|error| ScribeError::Internal {
-            detail: format!("Arrow IPC finish failed: {error}"),
-        })?;
-    }
-    if payload.len() != output_bytes || payload.capacity() != fixed_capacity {
+fn encode_ipc_fixed(
+    rows: &RecordBatch,
+    plan: Option<crate::scribe::fixed_ipc::FixedIpcPlan>,
+) -> Result<Bytes, ScribeError> {
+    let plan = match plan {
+        Some(plan) => plan,
+        None => crate::scribe::fixed_ipc::FixedIpcPlan::count(rows)?,
+    };
+    let encoded_bytes = plan.encoded_bytes();
+    let payload = plan.encode(rows)?;
+    if payload.len() != encoded_bytes || payload.capacity() != encoded_bytes {
         return Err(ScribeError::Internal {
-            detail: "Arrow IPC fixed-capacity output diverged from count pass".to_owned(),
+            detail: "fixed IPC encoder diverged from its admitted capacity".to_owned(),
         });
     }
     Ok(Bytes::from(payload))

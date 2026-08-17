@@ -10,14 +10,17 @@ use std::mem::size_of;
 
 use arrow::ipc::writer::StreamWriter;
 use arrow::ipc::{
-    root_as_message, DateUnit, Endianness, IntervalUnit, MessageHeader, MetadataVersion, Precision,
-    TimeUnit, Type,
+    DateUnit, Endianness, IntervalUnit, MessageHeader, MetadataVersion, Precision, TimeUnit, Type,
+    root_as_message,
 };
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use wyrd_tonic::otlp::common::v1::{any_value, AnyValue, KeyValue};
+use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
-use wyrd_tonic::otlp::metrics::v1::metric;
+use wyrd_tonic::otlp::metrics::v1::{
+    Exemplar, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+    metric,
+};
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
@@ -95,6 +98,8 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) current_material_bytes: usize,
     /// Aggregate native rows transferred into active memtable ownership.
     pub(crate) active_output_bytes: usize,
+    /// Authorized fixed backing ceiling for WAL-durable slice descriptors.
+    pub(crate) durable_metadata_bytes: usize,
     /// Fixed WAL framing/digest workspace.
     pub(crate) wal_workspace_bytes: usize,
     /// Complete simultaneous-live-set charge.
@@ -117,10 +122,11 @@ impl IngestMaterialPlan {
             self.aligned_copy_bytes,
             self.current_material_bytes,
             self.active_output_bytes,
+            self.durable_metadata_bytes,
             self.wal_workspace_bytes,
         ]
         .into_iter()
-        .try_fold(0_usize, |total, value| total.checked_add(value))
+        .try_fold(0_usize, usize::checked_add)
         .ok_or(ScribeError::DecodedPayloadTooLarge {
             bytes: usize::MAX,
             limit: usize::MAX,
@@ -163,6 +169,334 @@ enum NativeFieldLayout {
     Fixed(usize),
     /// Variable values use validity, offset, and value buffers.
     Variable(usize),
+}
+
+/// Owns the bounded state accumulated while scanning one native Arrow stream.
+struct NativeScan {
+    /// Frozen ingress limits shared with the public planner.
+    limits: crate::gate::limits::IngestLimits,
+    /// Current aligned frame cursor.
+    cursor: usize,
+    /// Whether the single required schema has been observed.
+    schema_seen: bool,
+    /// Inclusive schema-frame start.
+    schema_start: usize,
+    /// Exclusive aligned schema-frame end.
+    schema_end: usize,
+    /// Whether the terminal end-of-stream marker has been observed.
+    eos_seen: bool,
+    /// Number of schema fields used to validate every batch.
+    fields: usize,
+    /// Closed layout for each schema field.
+    field_layouts: [NativeFieldLayout; MAX_NATIVE_FIELDS],
+    /// Nullability for each schema field.
+    field_nullable: [bool; MAX_NATIVE_FIELDS],
+    /// Number of admitted record-batch sources.
+    source_count: usize,
+    /// Aggregate admitted rows.
+    rows: usize,
+    /// Largest frame metadata region required as decode scratch.
+    max_metadata_bytes: usize,
+    /// Exact schema object and retained string material.
+    schema_material_bytes: usize,
+    /// Aggregate active Arrow and managed-column output.
+    active_output_bytes: usize,
+    /// Fixed source descriptors populated in traversal order.
+    sources: [SourceMaterialPlan; MAX_SOURCE_PLANS],
+}
+
+impl NativeScan {
+    /// Creates an empty scan under one frozen limit snapshot.
+    fn new(limits: crate::gate::limits::IngestLimits) -> Self {
+        Self {
+            limits,
+            cursor: 0,
+            schema_seen: false,
+            schema_start: 0,
+            schema_end: 0,
+            eos_seen: false,
+            fields: 0,
+            field_layouts: [NativeFieldLayout::Null; MAX_NATIVE_FIELDS],
+            field_nullable: [false; MAX_NATIVE_FIELDS],
+            source_count: 0,
+            rows: 0,
+            max_metadata_bytes: 0,
+            schema_material_bytes: size_of::<arrow::datatypes::Schema>(),
+            active_output_bytes: 0,
+            sources: [SourceMaterialPlan::default(); MAX_SOURCE_PLANS],
+        }
+    }
+
+    /// Scans framing and delegates schema and batch invariants to focused stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] for malformed framing, metadata,
+    /// message order, body ranges, or a missing terminal marker.
+    fn scan(&mut self, bytes: &Bytes) -> Result<(), ScribeError> {
+        while self.cursor < bytes.len() {
+            let frame_start = self.cursor;
+            let prefix = read_u32(bytes, self.cursor)?;
+            self.cursor = self
+                .cursor
+                .checked_add(4)
+                .ok_or(ScribeError::InvalidFrame)?;
+            let metadata_len = if prefix == u32::MAX {
+                let length = read_u32(bytes, self.cursor)?;
+                self.cursor = self
+                    .cursor
+                    .checked_add(4)
+                    .ok_or(ScribeError::InvalidFrame)?;
+                length
+            } else {
+                prefix
+            };
+            if metadata_len == 0 {
+                self.eos_seen = self.cursor == bytes.len();
+                break;
+            }
+            let metadata_len =
+                usize::try_from(metadata_len).map_err(|_| ScribeError::InvalidFrame)?;
+            let metadata_end = self
+                .cursor
+                .checked_add(metadata_len)
+                .ok_or(ScribeError::InvalidFrame)?;
+            let metadata = bytes
+                .get(self.cursor..metadata_end)
+                .ok_or(ScribeError::InvalidFrame)?;
+            let message = root_as_message(metadata).map_err(|_| ScribeError::InvalidFrame)?;
+            if message.version() != MetadataVersion::V5 {
+                return Err(ScribeError::InvalidFrame);
+            }
+            self.cursor = align_eight(metadata_end)?;
+            let body_len =
+                usize::try_from(message.bodyLength()).map_err(|_| ScribeError::InvalidFrame)?;
+            let body_end = self
+                .cursor
+                .checked_add(body_len)
+                .ok_or(ScribeError::InvalidFrame)?;
+            if body_end > bytes.len() {
+                return Err(ScribeError::InvalidFrame);
+            }
+            match message.header_type() {
+                MessageHeader::Schema => {
+                    self.visit_schema(&message, frame_start, body_len)?;
+                }
+                MessageHeader::RecordBatch => {
+                    self.visit_batch(&message, bytes, frame_start, body_end)?;
+                }
+                _ => return Err(ScribeError::InvalidFrame),
+            }
+            self.cursor = align_eight(body_end)?;
+        }
+        if !self.schema_seen || self.source_count == 0 || self.rows == 0 || !self.eos_seen {
+            return Err(ScribeError::InvalidFrame);
+        }
+        Ok(())
+    }
+
+    /// Validates and retains the stream's single leading schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] for ordering, schema features,
+    /// unsupported field layouts, or field-count violations, and a material
+    /// error when checked schema accounting overflows.
+    fn visit_schema(
+        &mut self,
+        message: &arrow::ipc::Message<'_>,
+        frame_start: usize,
+        body_len: usize,
+    ) -> Result<(), ScribeError> {
+        if self.schema_seen || self.source_count != 0 || body_len != 0 {
+            return Err(ScribeError::InvalidFrame);
+        }
+        let schema = message
+            .header_as_schema()
+            .ok_or(ScribeError::InvalidFrame)?;
+        if schema.endianness() != Endianness::Little
+            || schema.features().is_some_and(|value| !value.is_empty())
+            || schema
+                .custom_metadata()
+                .is_some_and(|value| !value.is_empty())
+        {
+            return Err(ScribeError::InvalidFrame);
+        }
+        let schema_fields = schema.fields().ok_or(ScribeError::InvalidFrame)?;
+        self.fields = schema_fields.len();
+        if self.fields == 0 || self.fields > self.limits.native_fields {
+            return Err(ScribeError::InvalidFrame);
+        }
+        for (index, field) in schema_fields.into_iter().enumerate() {
+            self.field_layouts[index] = native_field_layout(field)?;
+            self.field_nullable[index] = field.nullable();
+            self.schema_material_bytes = self
+                .schema_material_bytes
+                .checked_add(size_of::<arrow::datatypes::Field>())
+                .and_then(|value| {
+                    value.checked_add(size_of::<std::sync::Arc<arrow::datatypes::Field>>())
+                })
+                .and_then(|value| value.checked_add(field.name().map_or(0, str::len)))
+                .and_then(|value| {
+                    value.checked_add(
+                        field
+                            .type_as_timestamp()
+                            .and_then(|timestamp| timestamp.timezone())
+                            .map_or(0, str::len),
+                    )
+                })
+                .ok_or(ScribeError::DecodedPayloadTooLarge {
+                    bytes: usize::MAX,
+                    limit: self.limits.otlp.material_bytes,
+                })?;
+        }
+        self.schema_seen = true;
+        self.schema_start = frame_start;
+        self.schema_end = self.cursor;
+        self.max_metadata_bytes = self.max_metadata_bytes.max(self.cursor - frame_start);
+        Ok(())
+    }
+
+    /// Validates one record batch and appends its exact source descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable row, frame, layout, and material errors for invalid batch
+    /// metadata, buffer ranges, checked accounting, or configured limits.
+    fn visit_batch(
+        &mut self,
+        message: &arrow::ipc::Message<'_>,
+        bytes: &Bytes,
+        frame_start: usize,
+        body_end: usize,
+    ) -> Result<(), ScribeError> {
+        if !self.schema_seen || self.source_count == self.limits.native_sources {
+            return Err(ScribeError::InvalidFrame);
+        }
+        let batch = message
+            .header_as_record_batch()
+            .ok_or(ScribeError::InvalidFrame)?;
+        if batch.compression().is_some() || batch.variadicBufferCounts().is_some() {
+            return Err(ScribeError::InvalidFrame);
+        }
+        let batch_rows = usize::try_from(batch.length()).map_err(|_| ScribeError::InvalidFrame)?;
+        self.rows = self
+            .rows
+            .checked_add(batch_rows)
+            .ok_or(ScribeError::TooManyRows {
+                rows: u64::MAX,
+                limit: self.limits.rows as u64,
+            })?;
+        if self.rows > self.limits.rows {
+            return Err(ScribeError::TooManyRows {
+                rows: u64::try_from(self.rows).unwrap_or(u64::MAX),
+                limit: self.limits.rows as u64,
+            });
+        }
+        let nodes = batch.nodes().ok_or(ScribeError::InvalidFrame)?;
+        if nodes.len() != self.fields
+            || nodes.into_iter().enumerate().any(|(index, node)| {
+                node.length() != batch.length()
+                    || node.null_count() < 0
+                    || node.null_count() > node.length()
+                    || (!self.field_nullable[index] && node.null_count() != 0)
+                    || (self.field_layouts[index] == NativeFieldLayout::Null
+                        && node.null_count() != node.length())
+            })
+        {
+            return Err(ScribeError::InvalidFrame);
+        }
+        let buffers = batch.buffers().ok_or(ScribeError::InvalidFrame)?;
+        let body = bytes
+            .get(self.cursor..body_end)
+            .ok_or(ScribeError::InvalidFrame)?;
+        let buffer_bytes = validate_buffer_layouts(
+            &self.field_layouts[..self.fields],
+            nodes.into_iter(),
+            buffers.into_iter(),
+            body,
+        )?;
+        self.active_output_bytes = self
+            .active_output_bytes
+            .checked_add(buffer_bytes)
+            .and_then(|value| {
+                managed_projection_bytes(batch_rows, 36)
+                    .ok()
+                    .and_then(|managed| value.checked_add(managed))
+            })
+            .ok_or(ScribeError::DecodedPayloadTooLarge {
+                bytes: usize::MAX,
+                limit: self.limits.otlp.material_bytes,
+            })?;
+        self.sources[self.source_count] = SourceMaterialPlan {
+            rows: batch_rows,
+            body_bytes: buffer_bytes,
+            buffers: buffers.len(),
+            frame_start,
+            body_start: self.cursor,
+            body_end,
+            frame_end: align_eight(body_end)?,
+        };
+        self.source_count += 1;
+        self.max_metadata_bytes = self.max_metadata_bytes.max(self.cursor - frame_start);
+        Ok(())
+    }
+
+    /// Freezes a successful scan into the native ingress material plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a material error when checked capacity or root arithmetic overflows.
+    fn finish(self, bytes: &Bytes, name_bytes: usize) -> Result<IngestMaterialPlan, ScribeError> {
+        let current_material_bytes = self
+            .schema_material_bytes
+            .checked_add(self.max_metadata_bytes)
+            .and_then(|value| value.checked_add(self.limits.otlp.material_bytes))
+            .ok_or(ScribeError::DecodedPayloadTooLarge {
+                bytes: usize::MAX,
+                limit: self.limits.otlp.material_bytes,
+            })?;
+        IngestMaterialPlan {
+            path: IngestPath::Native,
+            request_bytes: bytes.len(),
+            planner_bytes: size_of::<IngestMaterialPlan>(),
+            name_bytes,
+            aligned_copy_bytes: self.sources[..self.source_count]
+                .iter()
+                .filter(|source| {
+                    (bytes.as_ptr() as usize)
+                        .checked_add(source.body_start)
+                        .is_none_or(|address| address & 7 != 0)
+                })
+                .map(|source| source.body_end - source.body_start)
+                .max()
+                .unwrap_or(0),
+            native_schema_start: self.schema_start,
+            native_schema_end: self.schema_end,
+            native_schema_material_bytes: self.schema_material_bytes,
+            native_metadata_scratch_bytes: self.max_metadata_bytes,
+            sources: self.sources,
+            source_count: self.source_count,
+            rows: self.rows,
+            event_days: [0; MAX_EVENT_DAYS],
+            event_day_count: 0,
+            current_material_bytes,
+            active_output_bytes: self.active_output_bytes,
+            durable_metadata_bytes: self
+                .source_count
+                .checked_mul(self.limits.otlp.event_days)
+                .and_then(|count| {
+                    count.checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
+                })
+                .ok_or(ScribeError::DecodedPayloadTooLarge {
+                    bytes: usize::MAX,
+                    limit: self.limits.otlp.material_bytes,
+                })?,
+            wal_workspace_bytes: self.limits.wal_workspace_bytes,
+            root_bytes: 0,
+        }
+        .finish()
+    }
 }
 
 impl ScribeIngressPlanner {
@@ -267,6 +601,13 @@ impl ScribeIngressPlanner {
             event_day_count: 0,
             current_material_bytes,
             active_output_bytes: 0,
+            durable_metadata_bytes: batches
+                .len()
+                .checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
+                .ok_or(ScribeError::DecodedPayloadTooLarge {
+                    bytes: usize::MAX,
+                    limit: self.limits.otlp.material_bytes,
+                })?,
             wal_workspace_bytes: self.limits.wal_workspace_bytes,
             root_bytes: 0,
         }
@@ -288,240 +629,9 @@ impl ScribeIngressPlanner {
         if bytes.len() > self.limits.max_frame_bytes {
             return Err(ScribeError::PayloadTooLarge { bytes: bytes.len() });
         }
-        let mut cursor = 0_usize;
-        let mut schema_seen = false;
-        let mut native_schema_start = 0_usize;
-        let mut native_schema_end = 0_usize;
-        let mut eos_seen = false;
-        let mut fields = 0_usize;
-        let mut field_layouts = [NativeFieldLayout::Null; MAX_NATIVE_FIELDS];
-        let mut field_nullable = [false; MAX_NATIVE_FIELDS];
-        let mut source_count = 0_usize;
-        let mut rows = 0_usize;
-        let mut max_source_rows = 0_usize;
-        let mut max_body_bytes = 0_usize;
-        let mut max_metadata_bytes = 0_usize;
-        let mut schema_material_bytes = size_of::<arrow::datatypes::Schema>();
-        let mut active_output_bytes = 0_usize;
-        let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
-        while cursor < bytes.len() {
-            let frame_start = cursor;
-            let prefix = read_u32(bytes, cursor)?;
-            cursor = cursor.checked_add(4).ok_or(ScribeError::InvalidFrame)?;
-            let metadata_len = if prefix == u32::MAX {
-                let length = read_u32(bytes, cursor)?;
-                cursor = cursor.checked_add(4).ok_or(ScribeError::InvalidFrame)?;
-                length
-            } else {
-                prefix
-            };
-            if metadata_len == 0 {
-                eos_seen = cursor == bytes.len();
-                break;
-            }
-            let metadata_len =
-                usize::try_from(metadata_len).map_err(|_| ScribeError::InvalidFrame)?;
-            let metadata_end = cursor
-                .checked_add(metadata_len)
-                .ok_or(ScribeError::InvalidFrame)?;
-            let metadata = bytes
-                .get(cursor..metadata_end)
-                .ok_or(ScribeError::InvalidFrame)?;
-            let message = root_as_message(metadata).map_err(|_| ScribeError::InvalidFrame)?;
-            if message.version() != MetadataVersion::V5 {
-                return Err(ScribeError::InvalidFrame);
-            }
-            cursor = align_eight(metadata_end)?;
-            let body_len =
-                usize::try_from(message.bodyLength()).map_err(|_| ScribeError::InvalidFrame)?;
-            let body_end = cursor
-                .checked_add(body_len)
-                .ok_or(ScribeError::InvalidFrame)?;
-            if body_end > bytes.len() {
-                return Err(ScribeError::InvalidFrame);
-            }
-            match message.header_type() {
-                MessageHeader::Schema if !schema_seen && source_count == 0 && body_len == 0 => {
-                    let schema = message
-                        .header_as_schema()
-                        .ok_or(ScribeError::InvalidFrame)?;
-                    if schema.endianness() != Endianness::Little
-                        || schema.features().is_some_and(|value| !value.is_empty())
-                        || schema
-                            .custom_metadata()
-                            .is_some_and(|value| !value.is_empty())
-                    {
-                        return Err(ScribeError::InvalidFrame);
-                    }
-                    let schema_fields = schema.fields().ok_or(ScribeError::InvalidFrame)?;
-                    fields = schema_fields.len();
-                    if fields == 0 || fields > self.limits.native_fields {
-                        return Err(ScribeError::InvalidFrame);
-                    }
-                    for (index, field) in schema_fields.into_iter().enumerate() {
-                        field_layouts[index] = native_field_layout(field)?;
-                        field_nullable[index] = field.nullable();
-                        schema_material_bytes = schema_material_bytes
-                            .checked_add(size_of::<arrow::datatypes::Field>())
-                            .and_then(|value| {
-                                value.checked_add(
-                                    size_of::<std::sync::Arc<arrow::datatypes::Field>>(),
-                                )
-                            })
-                            .and_then(|value| value.checked_add(field.name().map_or(0, str::len)))
-                            .and_then(|value| {
-                                value.checked_add(
-                                    field
-                                        .type_as_timestamp()
-                                        .and_then(|timestamp| timestamp.timezone())
-                                        .map_or(0, str::len),
-                                )
-                            })
-                            .ok_or(ScribeError::DecodedPayloadTooLarge {
-                                bytes: usize::MAX,
-                                limit: self.limits.otlp.material_bytes,
-                            })?;
-                    }
-                    schema_seen = true;
-                    native_schema_start = frame_start;
-                    native_schema_end = cursor;
-                    max_metadata_bytes = max_metadata_bytes.max(cursor - frame_start);
-                }
-                MessageHeader::RecordBatch
-                    if schema_seen && source_count < self.limits.native_sources =>
-                {
-                    let batch = message
-                        .header_as_record_batch()
-                        .ok_or(ScribeError::InvalidFrame)?;
-                    if batch.compression().is_some() || batch.variadicBufferCounts().is_some() {
-                        return Err(ScribeError::InvalidFrame);
-                    }
-                    let batch_rows =
-                        usize::try_from(batch.length()).map_err(|_| ScribeError::InvalidFrame)?;
-                    rows = rows
-                        .checked_add(batch_rows)
-                        .ok_or(ScribeError::TooManyRows {
-                            rows: u64::MAX,
-                            limit: self.limits.rows as u64,
-                        })?;
-                    if rows > self.limits.rows {
-                        return Err(ScribeError::TooManyRows {
-                            rows: u64::try_from(rows).unwrap_or(u64::MAX),
-                            limit: self.limits.rows as u64,
-                        });
-                    }
-                    let nodes = batch.nodes().ok_or(ScribeError::InvalidFrame)?;
-                    if nodes.len() != fields
-                        || nodes.into_iter().enumerate().any(|(index, node)| {
-                            node.length() != batch.length()
-                                || node.null_count() < 0
-                                || node.null_count() > node.length()
-                                || (!field_nullable[index] && node.null_count() != 0)
-                                || (field_layouts[index] == NativeFieldLayout::Null
-                                    && node.null_count() != node.length())
-                        })
-                    {
-                        return Err(ScribeError::InvalidFrame);
-                    }
-                    let buffers = batch.buffers().ok_or(ScribeError::InvalidFrame)?;
-                    let body = bytes
-                        .get(cursor..body_end)
-                        .ok_or(ScribeError::InvalidFrame)?;
-                    let buffer_bytes = validate_buffer_layouts(
-                        &field_layouts[..fields],
-                        nodes.into_iter(),
-                        buffers.into_iter(),
-                        body,
-                    )?;
-                    active_output_bytes = active_output_bytes
-                        .checked_add(buffer_bytes)
-                        .and_then(|value| {
-                            managed_projection_bytes(batch_rows, 36)
-                                .ok()
-                                .and_then(|managed| value.checked_add(managed))
-                        })
-                        .ok_or(ScribeError::DecodedPayloadTooLarge {
-                            bytes: usize::MAX,
-                            limit: self.limits.otlp.material_bytes,
-                        })?;
-                    sources[source_count] = SourceMaterialPlan {
-                        rows: batch_rows,
-                        body_bytes: buffer_bytes,
-                        buffers: buffers.len(),
-                        frame_start,
-                        body_start: cursor,
-                        body_end,
-                        frame_end: align_eight(body_end)?,
-                    };
-                    source_count += 1;
-                    max_source_rows = max_source_rows.max(batch_rows);
-                    max_body_bytes = max_body_bytes.max(body_len);
-                    max_metadata_bytes = max_metadata_bytes.max(cursor - frame_start);
-                }
-                _ => return Err(ScribeError::InvalidFrame),
-            }
-            cursor = align_eight(body_end)?;
-        }
-        if !schema_seen || source_count == 0 || rows == 0 || !eos_seen {
-            return Err(ScribeError::InvalidFrame);
-        }
-        let managed_bytes = managed_projection_bytes(max_source_rows, 36)?;
-        let decoded_bytes = schema_material_bytes
-            .checked_add(max_metadata_bytes)
-            .and_then(|value| value.checked_add(managed_bytes))
-            .ok_or(ScribeError::DecodedPayloadTooLarge {
-                bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
-            })?;
-        let encoded_bytes = max_body_bytes
-            .checked_add(managed_bytes)
-            .and_then(|value| value.checked_add(self.limits.wal_workspace_bytes))
-            .ok_or(ScribeError::DecodedPayloadTooLarge {
-                bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
-            })?;
-        let current_material_bytes = decoded_bytes.checked_add(encoded_bytes).ok_or(
-            ScribeError::DecodedPayloadTooLarge {
-                bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
-            },
-        )?;
-        if current_material_bytes > self.limits.otlp.material_bytes {
-            return Err(ScribeError::DecodedPayloadTooLarge {
-                bytes: current_material_bytes,
-                limit: self.limits.otlp.material_bytes,
-            });
-        }
-        IngestMaterialPlan {
-            path: IngestPath::Native,
-            request_bytes: bytes.len(),
-            planner_bytes: size_of::<IngestMaterialPlan>(),
-            name_bytes,
-            aligned_copy_bytes: sources[..source_count]
-                .iter()
-                .filter(|source| {
-                    (bytes.as_ptr() as usize)
-                        .checked_add(source.body_start)
-                        .is_none_or(|address| address & 7 != 0)
-                })
-                .map(|source| source.body_end - source.body_start)
-                .max()
-                .unwrap_or(0),
-            native_schema_start,
-            native_schema_end,
-            native_schema_material_bytes: schema_material_bytes,
-            native_metadata_scratch_bytes: max_metadata_bytes,
-            sources,
-            source_count,
-            rows,
-            event_days: [0; MAX_EVENT_DAYS],
-            event_day_count: 0,
-            current_material_bytes,
-            active_output_bytes,
-            wal_workspace_bytes: self.limits.wal_workspace_bytes,
-            root_bytes: 0,
-        }
-        .finish()
+        let mut scan = NativeScan::new(self.limits);
+        scan.scan(bytes)?;
+        scan.finish(bytes, name_bytes)
     }
 
     /// Counts a typed trace request without projecting records.
@@ -535,27 +645,34 @@ impl ScribeIngressPlanner {
         request: &ExportTraceServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
+        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_spans {
             counts.add_resources(1)?;
-            count_attributes(
-                resource
-                    .resource
-                    .as_ref()
-                    .map_or(&[], |value| &value.attributes),
-                &mut counts,
-            )?;
+            counts.add_bytes(resource.schema_url.len())?;
+            count_resource(resource.resource.as_ref(), &mut counts)?;
             for scope in &resource.scope_spans {
                 counts.add_scopes(1)?;
+                counts.add_bytes(scope.schema_url.len())?;
+                if let Some(identity) = &scope.scope {
+                    counts.add_bytes(identity.name.len())?;
+                    counts.add_bytes(identity.version.len())?;
+                }
                 count_attributes(
                     scope.scope.as_ref().map_or(&[], |value| &value.attributes),
                     &mut counts,
                 )?;
                 for span in &scope.spans {
                     counts.add_records(1)?;
-                    counts.add_event_time(span.start_time_unix_nano)?;
-                    counts.add_bytes(span.name.len().saturating_add(span.trace_state.len()))?;
+                    counts.add_bytes(span.name.len())?;
+                    counts.add_bytes(span.trace_state.len())?;
+                    counts.add_bytes(span.trace_id.len())?;
+                    counts.add_bytes(span.span_id.len())?;
+                    counts.add_bytes(span.parent_span_id.len())?;
+                    if let Some(status) = &span.status {
+                        counts.add_bytes(status.message.len())?;
+                    }
                     count_attributes(&span.attributes, &mut counts)?;
                     for event in &span.events {
                         counts.add_bytes(event.name.len())?;
@@ -563,12 +680,14 @@ impl ScribeIngressPlanner {
                     }
                     for link in &span.links {
                         counts.add_bytes(link.trace_state.len())?;
+                        counts.add_bytes(link.trace_id.len())?;
+                        counts.add_bytes(link.span_id.len())?;
                         count_attributes(&link.attributes, &mut counts)?;
                     }
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes)
+        counts.finish(request_bytes, name_bytes, receipt_micros)
     }
 
     /// Counts a typed metrics request without projecting records.
@@ -582,59 +701,61 @@ impl ScribeIngressPlanner {
         request: &ExportMetricsServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
+        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_metrics {
             counts.add_resources(1)?;
-            count_attributes(
-                resource
-                    .resource
-                    .as_ref()
-                    .map_or(&[], |value| &value.attributes),
-                &mut counts,
-            )?;
+            counts.add_bytes(resource.schema_url.len())?;
+            count_resource(resource.resource.as_ref(), &mut counts)?;
             for scope in &resource.scope_metrics {
                 counts.add_scopes(1)?;
+                counts.add_bytes(scope.schema_url.len())?;
+                if let Some(identity) = &scope.scope {
+                    counts.add_bytes(identity.name.len())?;
+                    counts.add_bytes(identity.version.len())?;
+                }
                 count_attributes(
                     scope.scope.as_ref().map_or(&[], |value| &value.attributes),
                     &mut counts,
                 )?;
                 for metric in &scope.metrics {
-                    counts.add_bytes(
-                        metric
-                            .name
-                            .len()
-                            .saturating_add(metric.description.len())
-                            .saturating_add(metric.unit.len()),
-                    )?;
+                    counts.add_bytes(metric.name.len())?;
+                    counts.add_bytes(metric.description.len())?;
+                    counts.add_bytes(metric.unit.len())?;
+                    count_attributes(&metric.metadata, &mut counts)?;
                     match metric.data.as_ref() {
-                        Some(metric::Data::Gauge(value)) => count_points(
-                            value.data_points.iter().map(|point| &point.attributes),
-                            &mut counts,
-                        )?,
-                        Some(metric::Data::Sum(value)) => count_points(
-                            value.data_points.iter().map(|point| &point.attributes),
-                            &mut counts,
-                        )?,
-                        Some(metric::Data::Histogram(value)) => count_points(
-                            value.data_points.iter().map(|point| &point.attributes),
-                            &mut counts,
-                        )?,
-                        Some(metric::Data::ExponentialHistogram(value)) => count_points(
-                            value.data_points.iter().map(|point| &point.attributes),
-                            &mut counts,
-                        )?,
-                        Some(metric::Data::Summary(value)) => count_points(
-                            value.data_points.iter().map(|point| &point.attributes),
-                            &mut counts,
-                        )?,
+                        Some(metric::Data::Gauge(value)) => {
+                            for point in &value.data_points {
+                                count_number_point(point, &mut counts)?;
+                            }
+                        }
+                        Some(metric::Data::Sum(value)) => {
+                            for point in &value.data_points {
+                                count_number_point(point, &mut counts)?;
+                            }
+                        }
+                        Some(metric::Data::Histogram(value)) => {
+                            for point in &value.data_points {
+                                count_histogram_point(point, &mut counts)?;
+                            }
+                        }
+                        Some(metric::Data::ExponentialHistogram(value)) => {
+                            for point in &value.data_points {
+                                count_exponential_point(point, &mut counts)?;
+                            }
+                        }
+                        Some(metric::Data::Summary(value)) => {
+                            for point in &value.data_points {
+                                count_summary_point(point, &mut counts)?;
+                            }
+                        }
                         None => {}
                     }
-                    count_metric_days(metric, &mut counts)?;
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes)
+        counts.finish(request_bytes, name_bytes, receipt_micros)
     }
 
     /// Counts a typed logs request without projecting records.
@@ -648,27 +769,30 @@ impl ScribeIngressPlanner {
         request: &ExportLogsServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
+        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_logs {
             counts.add_resources(1)?;
-            count_attributes(
-                resource
-                    .resource
-                    .as_ref()
-                    .map_or(&[], |value| &value.attributes),
-                &mut counts,
-            )?;
+            counts.add_bytes(resource.schema_url.len())?;
+            count_resource(resource.resource.as_ref(), &mut counts)?;
             for scope in &resource.scope_logs {
                 counts.add_scopes(1)?;
+                counts.add_bytes(scope.schema_url.len())?;
+                if let Some(identity) = &scope.scope {
+                    counts.add_bytes(identity.name.len())?;
+                    counts.add_bytes(identity.version.len())?;
+                }
                 count_attributes(
                     scope.scope.as_ref().map_or(&[], |value| &value.attributes),
                     &mut counts,
                 )?;
                 for record in &scope.log_records {
                     counts.add_records(1)?;
-                    counts.add_event_time(record.time_unix_nano)?;
                     counts.add_bytes(record.severity_text.len())?;
+                    counts.add_bytes(record.trace_id.len())?;
+                    counts.add_bytes(record.span_id.len())?;
+                    counts.add_bytes(record.event_name.len())?;
                     count_attributes(&record.attributes, &mut counts)?;
                     if let Some(body) = &record.body {
                         count_value(body, 1, &mut counts)?;
@@ -676,7 +800,7 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes)
+        counts.finish(request_bytes, name_bytes, receipt_micros)
     }
 }
 
@@ -1090,8 +1214,6 @@ struct OtlpCounts {
     value_bytes: usize,
     /// Fixed set of nonzero Unix-day ordinals.
     event_days: [u64; MAX_EVENT_DAYS],
-    /// Live prefix length in `event_days`.
-    event_day_count: usize,
 }
 
 impl OtlpCounts {
@@ -1106,7 +1228,6 @@ impl OtlpCounts {
             attributes: 0,
             value_bytes: 0,
             event_days: [0; MAX_EVENT_DAYS],
-            event_day_count: 0,
         }
     }
 
@@ -1175,63 +1296,35 @@ impl OtlpCounts {
         Ok(())
     }
 
-    /// Adds one nonzero Unix timestamp to the fixed distinct-day set.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] when a request spans more than the
-    /// closed 32-day limit.
-    fn add_event_time(&mut self, unix_nanos: u64) -> Result<(), ScribeError> {
-        if unix_nanos == 0 {
-            return Ok(());
-        }
-        let day = unix_nanos / 86_400_000_000_000;
-        if self.event_days[..self.event_day_count].contains(&day) {
-            return Ok(());
-        }
-        if self.event_day_count == self.limits.otlp.event_days {
-            return Err(ScribeError::InvalidFrame);
-        }
-        self.event_days[self.event_day_count] = day;
-        self.event_day_count += 1;
-        Ok(())
-    }
-
     /// Freezes counters into one conservative fixed-capacity material plan.
     ///
     /// # Errors
     ///
     /// Returns a stable material-too-large refusal for checked capacity excess.
     fn finish(
-        self,
+        mut self,
         request_bytes: usize,
         name_bytes: usize,
+        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         if request_bytes > self.limits.otlp.request_bytes {
             return Err(ScribeError::PayloadTooLarge {
                 bytes: request_bytes,
             });
         }
-        let projected_floor = self
-            .records
-            .checked_mul(256)
-            .and_then(|value| value.checked_add(self.value_bytes))
-            .and_then(|value| value.checked_add(self.attributes.checked_mul(16)?))
+        let current_material_bytes = usize::from(self.records != 0)
+            .checked_mul(self.limits.otlp.material_bytes)
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
                 limit: self.limits.otlp.material_bytes,
             })?;
-        if projected_floor > self.limits.otlp.material_bytes {
-            return Err(ScribeError::DecodedPayloadTooLarge {
-                bytes: projected_floor,
-                limit: self.limits.otlp.material_bytes,
-            });
-        }
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
         if self.records != 0 {
+            self.event_days[0] = u64::try_from(receipt_micros.div_euclid(86_400_000_000))
+                .map_err(|_| ScribeError::InvalidFrame)?;
             sources[0] = SourceMaterialPlan {
                 rows: self.records,
-                body_bytes: projected_floor,
+                body_bytes: current_material_bytes,
                 buffers: 0,
                 frame_start: 0,
                 body_start: 0,
@@ -1253,54 +1346,20 @@ impl OtlpCounts {
             source_count: usize::from(self.records != 0),
             rows: self.records,
             event_days: self.event_days,
-            event_day_count: self.event_day_count,
-            current_material_bytes: projected_floor,
+            event_day_count: usize::from(self.records != 0),
+            current_material_bytes,
             active_output_bytes: 0,
+            durable_metadata_bytes: usize::from(self.records != 0)
+                .checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
+                .ok_or(ScribeError::DecodedPayloadTooLarge {
+                    bytes: usize::MAX,
+                    limit: self.limits.otlp.material_bytes,
+                })?,
             wal_workspace_bytes: self.limits.wal_workspace_bytes,
             root_bytes: 0,
         }
         .finish()
     }
-}
-
-/// Counts event days across the closed metric point variants.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::InvalidFrame`] when the distinct-day cap is exceeded.
-fn count_metric_days(
-    metric: &wyrd_tonic::otlp::metrics::v1::Metric,
-    counts: &mut OtlpCounts,
-) -> Result<(), ScribeError> {
-    match metric.data.as_ref() {
-        Some(metric::Data::Gauge(value)) => {
-            for point in &value.data_points {
-                counts.add_event_time(point.time_unix_nano)?;
-            }
-        }
-        Some(metric::Data::Sum(value)) => {
-            for point in &value.data_points {
-                counts.add_event_time(point.time_unix_nano)?;
-            }
-        }
-        Some(metric::Data::Histogram(value)) => {
-            for point in &value.data_points {
-                counts.add_event_time(point.time_unix_nano)?;
-            }
-        }
-        Some(metric::Data::ExponentialHistogram(value)) => {
-            for point in &value.data_points {
-                counts.add_event_time(point.time_unix_nano)?;
-            }
-        }
-        Some(metric::Data::Summary(value)) => {
-            for point in &value.data_points {
-                counts.add_event_time(point.time_unix_nano)?;
-            }
-        }
-        None => {}
-    }
-    Ok(())
 }
 
 /// Adds one bounded counter.
@@ -1318,18 +1377,95 @@ fn bounded_add(current: usize, count: usize, limit: usize) -> Result<usize, Scri
     Ok(next)
 }
 
-/// Counts point attributes for any metric data-point iterator.
+/// Counts one gauge or sum point's adapter-visible semantic fields.
 ///
 /// # Errors
 ///
-/// Returns a stable cardinality, depth, or byte refusal.
-fn count_points<'a>(
-    points: impl Iterator<Item = &'a Vec<KeyValue>>,
+/// Returns a stable row, cardinality, depth, or byte refusal.
+fn count_number_point(point: &NumberDataPoint, counts: &mut OtlpCounts) -> Result<(), ScribeError> {
+    counts.add_records(1)?;
+    count_attributes(&point.attributes, counts)?;
+    count_exemplars(&point.exemplars, counts)
+}
+
+/// Counts one explicit histogram point's adapter-visible semantic fields.
+///
+/// # Errors
+///
+/// Returns a stable row, cardinality, depth, or byte refusal.
+fn count_histogram_point(
+    point: &HistogramDataPoint,
     counts: &mut OtlpCounts,
 ) -> Result<(), ScribeError> {
-    for attributes in points {
-        counts.add_records(1)?;
-        count_attributes(attributes, counts)?;
+    counts.add_records(1)?;
+    count_attributes(&point.attributes, counts)?;
+    count_exemplars(&point.exemplars, counts)
+}
+
+/// Counts one exponential histogram point's adapter-visible semantic fields.
+///
+/// # Errors
+///
+/// Returns a stable row, cardinality, depth, or byte refusal.
+fn count_exponential_point(
+    point: &ExponentialHistogramDataPoint,
+    counts: &mut OtlpCounts,
+) -> Result<(), ScribeError> {
+    counts.add_records(1)?;
+    count_attributes(&point.attributes, counts)?;
+    count_exemplars(&point.exemplars, counts)
+}
+
+/// Counts one summary point's adapter-visible semantic fields.
+///
+/// # Errors
+///
+/// Returns a stable row, cardinality, depth, or byte refusal.
+fn count_summary_point(
+    point: &SummaryDataPoint,
+    counts: &mut OtlpCounts,
+) -> Result<(), ScribeError> {
+    counts.add_records(1)?;
+    count_attributes(&point.attributes, counts)?;
+    Ok(())
+}
+
+/// Counts raw scalable fields retained by one OTLP resource.
+///
+/// # Errors
+///
+/// Returns a stable cardinality, depth, or cumulative-byte refusal.
+fn count_resource(
+    resource: Option<&wyrd_tonic::otlp::resource::v1::Resource>,
+    counts: &mut OtlpCounts,
+) -> Result<(), ScribeError> {
+    let Some(resource) = resource else {
+        return Ok(());
+    };
+    count_attributes(&resource.attributes, counts)?;
+    for entity in &resource.entity_refs {
+        counts.add_bytes(entity.schema_url.len())?;
+        counts.add_bytes(entity.r#type.len())?;
+        for key in &entity.id_keys {
+            counts.add_bytes(key.len())?;
+        }
+        for key in &entity.description_keys {
+            counts.add_bytes(key.len())?;
+        }
+    }
+    Ok(())
+}
+
+/// Counts exemplar identifiers and filtered attributes exactly once.
+///
+/// # Errors
+///
+/// Returns a stable cardinality, depth, or cumulative-byte refusal.
+fn count_exemplars(values: &[Exemplar], counts: &mut OtlpCounts) -> Result<(), ScribeError> {
+    for exemplar in values {
+        count_attributes(&exemplar.filtered_attributes, counts)?;
+        counts.add_bytes(exemplar.trace_id.len())?;
+        counts.add_bytes(exemplar.span_id.len())?;
     }
     Ok(())
 }
@@ -1340,7 +1476,7 @@ fn count_points<'a>(
 ///
 /// Returns a stable cardinality, depth, or byte refusal.
 fn count_attributes(attributes: &[KeyValue], counts: &mut OtlpCounts) -> Result<(), ScribeError> {
-    count_attributes_at_depth(attributes, 1, counts)
+    count_attribute_nodes(attributes, 1, counts)
 }
 
 /// Counts attributes while preserving their current recursive value depth.
@@ -1348,11 +1484,14 @@ fn count_attributes(attributes: &[KeyValue], counts: &mut OtlpCounts) -> Result<
 /// # Errors
 ///
 /// Returns a stable cardinality, depth, or cumulative-byte refusal.
-fn count_attributes_at_depth(
+fn count_attribute_nodes(
     attributes: &[KeyValue],
     depth: usize,
     counts: &mut OtlpCounts,
 ) -> Result<(), ScribeError> {
+    if depth > counts.limits.otlp.value_depth {
+        return Err(ScribeError::InvalidFrame);
+    }
     counts.attributes = bounded_add(
         counts.attributes,
         attributes.len(),
@@ -1361,7 +1500,7 @@ fn count_attributes_at_depth(
     for attribute in attributes {
         counts.add_bytes(attribute.key.len())?;
         if let Some(value) = &attribute.value {
-            count_value(value, depth, counts)?;
+            count_value_nodes(value, depth, counts)?;
         }
     }
     Ok(())
@@ -1374,23 +1513,38 @@ fn count_attributes_at_depth(
 /// Returns [`ScribeError::InvalidFrame`] beyond the depth cap and a stable
 /// material refusal beyond the cumulative key/value cap.
 fn count_value(value: &AnyValue, depth: usize, counts: &mut OtlpCounts) -> Result<(), ScribeError> {
+    count_value_nodes(value, depth, counts)
+}
+
+/// Traverses recursive OTLP values while charging only retained raw bytes.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] beyond the depth or nested attribute cap.
+fn count_value_nodes(
+    value: &AnyValue,
+    depth: usize,
+    counts: &mut OtlpCounts,
+) -> Result<(), ScribeError> {
     if depth > counts.limits.otlp.value_depth {
         return Err(ScribeError::InvalidFrame);
     }
     match value.value.as_ref() {
-        Some(any_value::Value::StringValue(value)) => counts.add_bytes(value.len())?,
-        Some(any_value::Value::BytesValue(value)) => counts.add_bytes(value.len())?,
         Some(any_value::Value::ArrayValue(values)) => {
             for value in &values.values {
-                count_value(value, depth + 1, counts)?;
+                count_value_nodes(value, depth + 1, counts)?;
             }
         }
         Some(any_value::Value::KvlistValue(values)) => {
-            count_attributes_at_depth(&values.values, depth + 1, counts)?;
+            count_attribute_nodes(&values.values, depth + 1, counts)?;
         }
-        Some(any_value::Value::BoolValue(_))
-        | Some(any_value::Value::IntValue(_))
-        | Some(any_value::Value::DoubleValue(_))
+        Some(any_value::Value::StringValue(value)) => counts.add_bytes(value.len())?,
+        Some(any_value::Value::BytesValue(value)) => counts.add_bytes(value.len())?,
+        Some(
+            any_value::Value::BoolValue(_)
+            | any_value::Value::IntValue(_)
+            | any_value::Value::DoubleValue(_),
+        )
         | None => {}
     }
     Ok(())
@@ -1408,12 +1562,27 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
-    use wyrd_tonic::otlp::common::v1::{any_value, AnyValue, ArrayValue, KeyValue};
+    use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
     use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+    use wyrd_tonic::otlp::metrics::v1::{
+        Exemplar, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint,
+        SummaryDataPoint, exponential_histogram_data_point, summary_data_point,
+    };
 
-    use super::{root_as_message, ScribeIngressPlanner};
+    use super::{
+        OtlpCounts, ScribeIngressPlanner, count_exponential_point, count_histogram_point,
+        count_number_point, count_summary_point, count_value, root_as_message,
+    };
     use crate::contracts::ScribeError;
+
+    /// Builds OTLP counters with focused value and node limits.
+    fn otlp_counts(value_bytes: usize, attributes: usize) -> OtlpCounts {
+        let mut limits = crate::gate::limits::IngestLimits::default();
+        limits.otlp.value_bytes = value_bytes;
+        limits.otlp.attributes = attributes;
+        OtlpCounts::new(limits)
+    }
 
     /// Encodes one canonical V5 stream for scanner tests.
     ///
@@ -1677,9 +1846,107 @@ mod tests {
             }],
         };
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_logs(&request, 1, 0),
+            ScribeIngressPlanner::default().plan_logs(&request, 1, 0, 0),
             Err(ScribeError::InvalidFrame)
         ));
+    }
+
+    /// Nested KeyValue entries consume the same cardinality budget as top-level attributes.
+    #[test]
+    fn otlp_count_pass_rejects_nested_attribute_cap_plus_one() {
+        let value = AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![KeyValue::default(); 3],
+            })),
+        };
+        let mut counts = otlp_counts(usize::MAX, 2);
+        assert!(matches!(
+            count_value(&value, 1, &mut counts),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// AnyValue admission charges raw retained string and byte values exactly once.
+    #[test]
+    fn otlp_count_pass_uses_exact_raw_any_value_bytes() {
+        let value = AnyValue {
+            value: Some(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![
+                    AnyValue {
+                        value: Some(any_value::Value::StringValue("quoted \"value\"".to_owned())),
+                    },
+                    AnyValue {
+                        value: Some(any_value::Value::BytesValue(vec![1, 2, 3, 4])),
+                    },
+                    AnyValue {
+                        value: Some(any_value::Value::IntValue(-12)),
+                    },
+                ],
+            })),
+        };
+        let exact = "quoted \"value\"".len() + 4;
+        let mut boundary = otlp_counts(exact, 0);
+        count_value(&value, 1, &mut boundary).expect("exact byte boundary");
+        assert_eq!(boundary.value_bytes, exact);
+        let mut over = otlp_counts(exact - 1, 0);
+        assert!(matches!(
+            count_value(&value, 1, &mut over),
+            Err(ScribeError::DecodedPayloadTooLarge { .. })
+        ));
+    }
+
+    /// Every metric point shape contributes records while semantic bytes stay adapter-parity exact.
+    #[test]
+    fn otlp_count_pass_covers_every_metric_shape() {
+        let exemplar = Exemplar {
+            filtered_attributes: vec![KeyValue {
+                key: "filtered".to_owned(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue("yes".to_owned())),
+                }),
+            }],
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            ..Exemplar::default()
+        };
+        let number = NumberDataPoint {
+            exemplars: vec![exemplar.clone()],
+            ..NumberDataPoint::default()
+        };
+        let histogram = HistogramDataPoint {
+            bucket_counts: vec![1, 2],
+            explicit_bounds: vec![0.5],
+            ..HistogramDataPoint::default()
+        };
+        let exponential = ExponentialHistogramDataPoint {
+            positive: Some(exponential_histogram_data_point::Buckets {
+                offset: -2,
+                bucket_counts: vec![3, 4],
+            }),
+            negative: Some(exponential_histogram_data_point::Buckets {
+                offset: 1,
+                bucket_counts: vec![5],
+            }),
+            ..ExponentialHistogramDataPoint::default()
+        };
+        let summary = SummaryDataPoint {
+            quantile_values: vec![summary_data_point::ValueAtQuantile {
+                quantile: 0.5,
+                value: 9.0,
+            }],
+            ..SummaryDataPoint::default()
+        };
+        let mut counts = otlp_counts(usize::MAX, usize::MAX);
+        count_number_point(&number, &mut counts).expect("number point");
+        count_number_point(&NumberDataPoint::default(), &mut counts).expect("sum point");
+        count_histogram_point(&histogram, &mut counts).expect("histogram point");
+        count_exponential_point(&exponential, &mut counts).expect("exponential point");
+        count_summary_point(&summary, &mut counts).expect("summary point");
+        let expected =
+            "filtered".len() + "yes".len() + exemplar.trace_id.len() + exemplar.span_id.len();
+        assert_eq!(counts.records, 5);
+        assert_eq!(counts.attributes, 1);
+        assert_eq!(counts.value_bytes, expected);
     }
 
     /// The canonical fixture remains a valid stream-reader input.

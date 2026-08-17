@@ -5,7 +5,7 @@
 //! whole-stream writer.
 
 pub mod map;
-mod tables;
+pub(crate) mod tables;
 
 use crate::schema::fingerprint::SchemaFingerprint;
 use arrow::datatypes::{Field, Schema};
@@ -81,7 +81,7 @@ pub fn project_resource_spans(
 
 /// Result of one accepted OTLP export: how many spans committed and how many the
 /// receiver dropped for a per-span reason.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IngestOutcome {
     /// Spans committed to `traces.spans`.
     pub accepted_spans: i64,
@@ -144,7 +144,7 @@ pub fn project_resource_metrics(
 }
 
 /// Result of one accepted OTLP metrics export: committed vs. dropped data points.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MetricsOutcome {
     /// Data points committed to `metrics.points`.
     pub accepted_points: i64,
@@ -204,7 +204,7 @@ pub fn project_resource_logs(
 }
 
 /// Result of one accepted OTLP logs export: committed vs. dropped records.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LogsOutcome {
     /// Records committed to `logs.records`.
     pub accepted_records: i64,

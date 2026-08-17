@@ -23,7 +23,8 @@ use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{
-    AdmittedAppend, NativeSliceProducer, PreparedAppend, PreparedSlice, prepare_append,
+    AdmittedAppend, NativeSliceProducer, OtlpSliceProducer, PreparedAppend, PreparedSlice,
+    prepare_append,
 };
 use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
@@ -226,6 +227,7 @@ impl ScribeIngressCpuPool {
         })?
     }
 
+    #[cfg(test)]
     pub(crate) async fn run<T, F>(&self, job: F) -> Result<T, ScribeError>
     where
         T: Send + 'static,
@@ -387,14 +389,16 @@ fn decode(
         arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?
     };
     decode_rows(
-        rows,
-        principal,
-        expected_schema_fingerprint,
-        request_id,
-        batch_id,
-        native_payload,
-        window,
-        None,
+        &rows,
+        &DecodeContext {
+            principal,
+            expected_schema_fingerprint,
+            request_id,
+            batch_id,
+            native_payload,
+            window,
+            receipt_micros: None,
+        },
     )
 }
 
@@ -408,7 +412,7 @@ fn decode(
 /// Returns the same schema, scope, event-time, row, and managed-column errors
 /// as the ordinary ingress decode path.
 pub(crate) fn decode_native_batch(
-    rows: RecordBatch,
+    rows: &RecordBatch,
     principal: &Principal,
     expected_schema_fingerprint: SchemaFingerprint,
     request_id: &RequestId,
@@ -418,14 +422,34 @@ pub(crate) fn decode_native_batch(
 ) -> Result<RecordBatch, ScribeError> {
     decode_rows(
         rows,
-        principal,
-        expected_schema_fingerprint,
-        request_id,
-        batch_id,
-        true,
-        window,
-        Some(receipt_micros),
+        &DecodeContext {
+            principal,
+            expected_schema_fingerprint,
+            request_id,
+            batch_id,
+            native_payload: true,
+            window,
+            receipt_micros: Some(receipt_micros),
+        },
     )
+}
+
+/// Immutable validation and stamping context for one decoded batch.
+struct DecodeContext<'a> {
+    /// Authenticated principal used for scope checks and managed columns.
+    principal: &'a Principal,
+    /// Catalog fingerprint required of the caller-owned source schema.
+    expected_schema_fingerprint: SchemaFingerprint,
+    /// Stable request identity stamped into every accepted row.
+    request_id: &'a RequestId,
+    /// Stable batch identity stamped into every accepted row.
+    batch_id: uuid::Uuid,
+    /// Whether the caller supplied native Arrow rather than projected rows.
+    native_payload: bool,
+    /// Accepted caller event-time window.
+    window: EventTimeWindow,
+    /// Fixed receipt time retained by current-only native production.
+    receipt_micros: Option<i64>,
 }
 
 /// Applies source-contract validation and server-managed stamping to one batch.
@@ -436,14 +460,8 @@ pub(crate) fn decode_native_batch(
 /// fingerprint mismatch, card-scope failure, invalid event time, or managed
 /// column construction failure.
 fn decode_rows(
-    rows: RecordBatch,
-    principal: &Principal,
-    expected_schema_fingerprint: SchemaFingerprint,
-    request_id: &RequestId,
-    batch_id: uuid::Uuid,
-    native_payload: bool,
-    window: EventTimeWindow,
-    receipt_micros: Option<i64>,
+    rows: &RecordBatch,
+    context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
     if rows.num_rows() >= i32::MAX as usize {
         return Err(ScribeError::TooManyRows {
@@ -467,28 +485,28 @@ fn decode_rows(
                 | WYRD_INGESTED_AT
                 | WYRD_REQUEST_ID
         );
-        let native_run_id = native_payload && field.name() == "run_id";
-        let projected_correlation =
-            !native_payload && matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id");
+        let native_run_id = context.native_payload && field.name() == "run_id";
+        let projected_correlation = !context.native_payload
+            && matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id");
         if reserved && !projected_correlation && !native_run_id {
             return Err(ScribeError::InvalidFrame);
         }
     }
     let actual_source_fingerprint = source_schema_fingerprint(rows.schema().as_ref());
-    if actual_source_fingerprint != expected_schema_fingerprint {
+    if actual_source_fingerprint != context.expected_schema_fingerprint {
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         });
     }
-    validate_card_scope(&rows, principal)?;
+    validate_card_scope(rows, context.principal)?;
     stamp_correlation_columns(
-        &rows,
-        principal,
-        request_id,
-        batch_id,
-        native_payload,
-        window,
-        receipt_micros,
+        rows,
+        context.principal,
+        context.request_id,
+        context.batch_id,
+        context.native_payload,
+        context.window,
+        context.receipt_micros,
     )
 }
 
@@ -982,6 +1000,13 @@ pub(crate) enum ScribePersistenceCpuOp {
         /// Root-backed owner that must outlive every allocation in the job.
         memory: crate::resources::ScribeMemoryLease,
     },
+    /// Advance the root-owned one-shot OTLP producer.
+    ProduceOtlpSlice {
+        /// Current-only producer state moved into the detached Rayon job.
+        producer: Box<OtlpSliceProducer>,
+        /// Root-backed owner that must outlive every allocation in the job.
+        memory: crate::resources::ScribeMemoryLease,
+    },
     EncodeParquet(Box<EncodeParquetOp>),
     RestoreReplay {
         replayed: Box<ReplayedSealKey>,
@@ -1028,8 +1053,103 @@ pub(crate) enum ScribePersistenceCpuResult {
         /// Root-backed owner returned only after the detached job completes.
         memory: crate::resources::ScribeMemoryLease,
     },
+    /// OTLP producer state returned with its optional current slice.
+    OtlpSliceProduced {
+        /// Producer retained for post-COMMIT deterministic regeneration.
+        producer: Box<OtlpSliceProducer>,
+        /// Sole current slice, or `None` for an empty/exhausted request.
+        slice: Option<PreparedSlice>,
+        /// Root-backed owner returned only after the detached job completes.
+        memory: crate::resources::ScribeMemoryLease,
+    },
     ParquetEncoded(ParquetEncoded),
     ReplayRestored(Box<FrozenMemtable>),
+}
+
+/// Executes one persistence operation after it has moved onto a Rayon worker.
+///
+/// Keeping dispatch inside the detached worker preserves ownership of root
+/// memory for native and OTLP production even when the async submitter is
+/// cancelled.
+///
+/// # Errors
+///
+/// Returns the stable preprocessing, projection, encoding, replay, or
+/// test-synchronization error produced by the selected operation.
+fn execute_persistence_operation(
+    operation: ScribePersistenceCpuOp,
+    preprocess_delay: std::time::Duration,
+) -> Result<ScribePersistenceCpuResult, ScribeError> {
+    match operation {
+        ScribePersistenceCpuOp::Preprocess(append) => {
+            if !preprocess_delay.is_zero() {
+                std::thread::sleep(preprocess_delay);
+            }
+            prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
+        }
+        ScribePersistenceCpuOp::ProduceNativeSlice {
+            mut producer,
+            memory,
+        } => {
+            let slice = producer.next_slice()?;
+            Ok(ScribePersistenceCpuResult::NativeSliceProduced {
+                producer,
+                slice,
+                memory,
+            })
+        }
+        ScribePersistenceCpuOp::ProduceOtlpSlice {
+            mut producer,
+            memory,
+        } => {
+            let slice = producer.next_slice()?;
+            Ok(ScribePersistenceCpuResult::OtlpSliceProduced {
+                producer,
+                slice,
+                memory,
+            })
+        }
+        ScribePersistenceCpuOp::EncodeParquet(operation) => {
+            let EncodeParquetOp {
+                frozen,
+                binding,
+                tenant,
+                scratch_dir,
+                object_base,
+                footer_reservation,
+            } = *operation;
+            encode_batch(
+                &frozen,
+                &binding,
+                tenant,
+                &scratch_dir,
+                &object_base,
+                footer_reservation,
+            )
+            .map(ScribePersistenceCpuResult::ParquetEncoded)
+        }
+        ScribePersistenceCpuOp::RestoreReplay { replayed } => {
+            let frozen = crate::scribe::memtable::Memtable::decode_replayed(&replayed)?;
+            Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
+        }
+        #[cfg(test)]
+        ScribePersistenceCpuOp::HoldMemory {
+            memory,
+            started,
+            release,
+        } => {
+            started.send(()).map_err(|error| ScribeError::Internal {
+                detail: format!("stalled ownership test could not signal start: {error}"),
+            })?;
+            release.recv().map_err(|error| ScribeError::Internal {
+                detail: format!("stalled ownership test release failed: {error}"),
+            })?;
+            drop(memory);
+            Err(ScribeError::Internal {
+                detail: "stalled ownership test completed".to_owned(),
+            })
+        }
+    }
 }
 
 /// Bounded persistence CPU lane for day splitting and WAL serialization.
@@ -1102,28 +1222,47 @@ impl ScribePersistenceCpuPool {
         })
     }
 
-    pub(crate) async fn submit(
-        &self,
-        operation: ScribePersistenceCpuOp,
-    ) -> Result<ScribePersistenceCpuResult, ScribeError> {
-        let permit = match self.permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
+    /// Acquires one application-level persistence lane permit.
+    ///
+    /// A saturated lane waits on the bounded semaphore and records one
+    /// saturation event; a closed lane refuses the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the persistence lane is closed.
+    async fn acquire_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ScribeError> {
+        match Arc::clone(&self.permits).try_acquire_owned() {
+            Ok(permit) => Ok(permit),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 self.saturation_events.fetch_add(1, Ordering::Relaxed);
-                self.permits
-                    .clone()
+                Arc::clone(&self.permits)
                     .acquire_owned()
                     .await
                     .map_err(|error| ScribeError::Internal {
                         detail: format!("persistence CPU lane closed: {error}"),
-                    })?
+                    })
             }
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(ScribeError::Internal {
-                    detail: "persistence CPU lane closed".to_owned(),
-                });
-            }
-        };
+            Err(tokio::sync::TryAcquireError::Closed) => Err(ScribeError::Internal {
+                detail: "persistence CPU lane closed".to_owned(),
+            }),
+        }
+    }
+
+    /// Runs one persistence CPU operation on the fixed Rayon pool.
+    ///
+    /// The operation and every root-backed owner it contains move into the
+    /// detached worker. Dropping the async waiter therefore cannot release
+    /// admitted memory before the worker exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operation error, a stable panic refusal, or an internal
+    /// error when the worker drops its result channel.
+    pub(crate) async fn submit(
+        &self,
+        operation: ScribePersistenceCpuOp,
+    ) -> Result<ScribePersistenceCpuResult, ScribeError> {
+        let permit = self.acquire_permit().await?;
         let depth = Arc::clone(&self.depth);
         let drained = Arc::clone(&self.drained);
         let panics = Arc::clone(&self.panics);
@@ -1146,64 +1285,8 @@ impl ScribePersistenceCpuPool {
                 depth.load(Ordering::Acquire),
                 active.load(Ordering::Acquire),
             );
-            let result = catch_unwind(AssertUnwindSafe(|| match operation {
-                ScribePersistenceCpuOp::Preprocess(append) => {
-                    if !delay.is_zero() {
-                        std::thread::sleep(delay);
-                    }
-                    prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
-                }
-                ScribePersistenceCpuOp::ProduceNativeSlice {
-                    mut producer,
-                    memory,
-                } => {
-                    let slice = producer.next_slice()?;
-                    Ok(ScribePersistenceCpuResult::NativeSliceProduced {
-                        producer,
-                        slice,
-                        memory,
-                    })
-                }
-                ScribePersistenceCpuOp::EncodeParquet(operation) => {
-                    let EncodeParquetOp {
-                        frozen,
-                        binding,
-                        tenant,
-                        scratch_dir,
-                        object_base,
-                        footer_reservation,
-                    } = *operation;
-                    encode_batch(
-                        &frozen,
-                        &binding,
-                        tenant,
-                        &scratch_dir,
-                        &object_base,
-                        footer_reservation,
-                    )
-                    .map(ScribePersistenceCpuResult::ParquetEncoded)
-                }
-                ScribePersistenceCpuOp::RestoreReplay { replayed } => {
-                    let frozen = crate::scribe::memtable::Memtable::decode_replayed(&replayed)?;
-                    Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
-                }
-                #[cfg(test)]
-                ScribePersistenceCpuOp::HoldMemory {
-                    memory,
-                    started,
-                    release,
-                } => {
-                    started.send(()).map_err(|error| ScribeError::Internal {
-                        detail: format!("stalled ownership test could not signal start: {error}"),
-                    })?;
-                    release.recv().map_err(|error| ScribeError::Internal {
-                        detail: format!("stalled ownership test release failed: {error}"),
-                    })?;
-                    drop(memory);
-                    Err(ScribeError::Internal {
-                        detail: "stalled ownership test completed".to_owned(),
-                    })
-                }
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                execute_persistence_operation(operation, delay)
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);

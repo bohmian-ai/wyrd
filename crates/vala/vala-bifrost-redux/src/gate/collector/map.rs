@@ -17,6 +17,7 @@
 //! happens at coordinator flush (the table is `PayloadClass::Sensitive`), never
 //! in this crate.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use super::tables::{CorrelationPolicy, DomainTable, PointsTable, RecordsTable, SpansTable};
@@ -422,12 +423,11 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
         records.iter().map(|r| status_str(&r.status)),
     )) as ArrayRef;
 
-    let attributes = Arc::new(
-        records
-            .iter()
-            .map(|r| Some(attrs_json(&r.attributes)))
-            .collect::<StringArray>(),
-    ) as ArrayRef;
+    let attributes = records
+        .iter()
+        .map(|record| attrs_json(&record.attributes).map(Some))
+        .collect::<Result<Vec<_>, _>>()?;
+    let attributes = Arc::new(StringArray::from(attributes)) as ArrayRef;
 
     let dropped_attributes_count = Arc::new(Int64Array::from_iter_values(
         records
@@ -492,8 +492,8 @@ fn micros(ts: DateTime<Utc>) -> i64 {
     ts.timestamp_micros()
 }
 
-fn attrs_json(attributes: &serde_json::Map<String, serde_json::Value>) -> String {
-    serde_json::Value::Object(attributes.clone()).to_string()
+fn attrs_json(attributes: &serde_json::Map<String, serde_json::Value>) -> Result<String, String> {
+    exact_json_string(attributes)
 }
 
 fn fixed16(values: impl Iterator<Item = Option<[u8; 16]>>) -> Result<ArrayRef, String> {
@@ -999,7 +999,7 @@ pub fn metrics_to_record_batch(records: &[MetricRecord]) -> Result<RecordBatch, 
     let n = records.len();
 
     let mut columns = metric_scalar_columns(records);
-    columns.extend(metric_opaque_columns(records));
+    columns.extend(metric_opaque_columns(records)?);
     columns.extend([
         Arc::new(StringArray::new_null(n)) as ArrayRef,
         Arc::new(StringArray::new_null(n)) as ArrayRef,
@@ -1076,17 +1076,17 @@ fn metric_scalar_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
     ]
 }
 
-fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
+fn metric_opaque_columns(records: &[MetricRecord]) -> Result<Vec<ArrayRef>, String> {
     let bucket_counts = json_col(
         records
             .iter()
             .map(|r| r.bucket_counts.as_ref().map(json_of)),
-    );
+    )?;
     let explicit_bounds = json_col(
         records
             .iter()
             .map(|r| r.explicit_bounds.as_ref().map(json_of)),
-    );
+    )?;
     let scale = Arc::new(records.iter().map(|r| r.scale).collect::<Int32Array>()) as ArrayRef;
     let zero_count = Arc::new(
         records
@@ -1104,30 +1104,29 @@ fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
         records
             .iter()
             .map(|r| r.positive_buckets.as_ref().map(json_of)),
-    );
+    )?;
     let negative_buckets = json_col(
         records
             .iter()
             .map(|r| r.negative_buckets.as_ref().map(json_of)),
-    );
+    )?;
     let quantile_values = json_col(
         records
             .iter()
             .map(|r| r.quantile_values.as_ref().map(json_of)),
-    );
+    )?;
     let exemplars = json_col(records.iter().map(|r| {
         if r.exemplars.is_empty() {
             None
         } else {
             Some(json_of(&r.exemplars))
         }
-    }));
-    let attributes = Arc::new(
-        records
-            .iter()
-            .map(|r| Some(attrs_json(&r.attributes)))
-            .collect::<StringArray>(),
-    ) as ArrayRef;
+    }))?;
+    let attributes = records
+        .iter()
+        .map(|record| attrs_json(&record.attributes).map(Some))
+        .collect::<Result<Vec<_>, _>>()?;
+    let attributes = Arc::new(StringArray::from(attributes)) as ArrayRef;
     let service_name = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| r.resource.service_name.clone()),
     )) as ArrayRef;
@@ -1144,7 +1143,7 @@ fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
             .collect::<StringArray>(),
     ) as ArrayRef;
 
-    vec![
+    Ok(vec![
         bucket_counts,
         explicit_bounds,
         scale,
@@ -1158,7 +1157,7 @@ fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
         service_name,
         scope_name,
         scope_version,
-    ]
+    ])
 }
 
 // ─── logs ────────────────────────────────────────────────────────────────────
@@ -1325,7 +1324,7 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
             .map(|r| r.event_name.clone())
             .collect::<StringArray>(),
     ) as ArrayRef;
-    let body = json_col(records.iter().map(|r| r.body.as_ref().map(json_of)));
+    let body = json_col(records.iter().map(|r| r.body.as_ref().map(json_of)))?;
     let trace_id = fixed16(records.iter().map(|r| r.trace_id.map(|id| *id.as_bytes())))?;
     let span_id = fixed8(records.iter().map(|r| r.span_id.map(|id| *id.as_bytes())))?;
     let trace_flags = Arc::new(
@@ -1340,7 +1339,7 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
         } else {
             Some(attrs_json(&r.attributes))
         }
-    }));
+    }))?;
     let dropped_attributes_count = Arc::new(Int64Array::from_iter_values(
         records
             .iter()
@@ -1404,14 +1403,66 @@ fn ts_micros_col(values: impl Iterator<Item = Option<DateTime<Utc>>>) -> ArrayRe
 }
 
 /// Build a `Utf8` column from an iterator of optional JSON strings.
-fn json_col(values: impl Iterator<Item = Option<String>>) -> ArrayRef {
-    Arc::new(values.collect::<StringArray>()) as ArrayRef
+fn json_col(
+    values: impl Iterator<Item = Option<Result<String, String>>>,
+) -> Result<ArrayRef, String> {
+    let values = values
+        .map(Option::transpose)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(StringArray::from(values)) as ArrayRef)
 }
 
 /// Serialize a value to its compact JSON string form for an opaque `Utf8`
 /// column.
-fn json_of<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
+fn json_of<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    exact_json_string(value)
+}
+
+/// Checked byte counter used to pre-size one compact JSON column value.
+#[derive(Debug, Default)]
+struct JsonByteCounter {
+    /// Exact bytes emitted by the compact serializer.
+    bytes: usize,
+}
+
+impl Write for JsonByteCounter {
+    /// Counts one serializer fragment without retaining it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if the compact JSON length overflows `usize`.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("compact JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    /// Flushes the counter, which retains no buffered IO state.
+    ///
+    /// # Errors
+    ///
+    /// This operation is infallible because the counter has no backing sink.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serializes one opaque OTLP value into an exact-capacity compact JSON string.
+///
+/// The first pass retains only a checked byte count. The second pass writes to
+/// that exact allocation and reports any serializer divergence instead of
+/// silently replacing the domain value.
+fn exact_json_string<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(counter.bytes);
+    serde_json::to_writer(&mut bytes, value).map_err(|error| error.to_string())?;
+    if bytes.len() != counter.bytes || bytes.capacity() != counter.bytes {
+        return Err("compact JSON serialization diverged from count pass".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
 /// Iceberg has no unsigned integer type; counts are physical `Int64` columns.
@@ -1432,6 +1483,16 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{
         ResourceSpans, ScopeSpans, Span as OtlpSpan, Status as OtlpStatus, span, status::StatusCode,
     };
+
+    /// Compact JSON projection allocates exactly the counted output bytes.
+    #[test]
+    fn compact_json_uses_exact_capacity() {
+        let value = serde_json::json!({"escaped": "line\nvalue", "items": [1, 2, 3]});
+        let encoded = exact_json_string(&value).expect("exact JSON serialization");
+
+        assert_eq!(encoded, serde_json::to_string(&value).expect("valid JSON"));
+        assert_eq!(encoded.capacity(), encoded.len());
+    }
 
     fn kv(key: &str, value: any_value::Value) -> KeyValue {
         KeyValue {

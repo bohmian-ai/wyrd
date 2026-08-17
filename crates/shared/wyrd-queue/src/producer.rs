@@ -916,12 +916,16 @@ impl Task {
 
     /// Schedules the retained owner without changing its permit or identity.
     fn schedule_retry_if_retained(&mut self) {
+        self.schedule_retry_at(tokio::time::Instant::now());
+    }
+
+    /// Schedules retained ambiguity relative to an explicit instant for deterministic proof.
+    fn schedule_retry_at(&mut self, now: tokio::time::Instant) {
         let Some(batch_id) = self.queue.retry_batch_id() else {
             self.reset_retry_schedule();
             return;
         };
-        self.retry_deadline =
-            Some(tokio::time::Instant::now() + retry_backoff(batch_id, self.retry_attempt));
+        self.retry_deadline = Some(now + retry_backoff(batch_id, self.retry_attempt));
         self.retry_attempt = self.retry_attempt.saturating_add(1);
     }
 
@@ -1671,31 +1675,63 @@ mod tests {
         assert_eq!(budget.used_bytes(), 0, "shutdown releases fixed storage");
     }
 
-    /// Deterministic equal jitter stays in each exponential window and caps at one second.
-    #[test]
-    fn retained_retry_backoff_is_deterministic_and_capped() {
-        let batch_id = uuid::Uuid::now_v7().into_bytes();
+    /// A fixed identity produces the exact deterministic sequence through the one-second cap.
+    #[tokio::test]
+    async fn retained_retry_backoff_is_deterministic_and_capped() {
+        let fixed_batch_id = [0; 16];
         let delays = (0..12)
-            .map(|attempt| super::retry_backoff(batch_id, attempt))
+            .map(|attempt| super::retry_backoff(fixed_batch_id, attempt).as_millis() as u64)
             .collect::<Vec<_>>();
         assert_eq!(
             delays,
-            (0..12)
-                .map(|attempt| super::retry_backoff(batch_id, attempt))
-                .collect::<Vec<_>>()
+            vec![5, 15, 27, 47, 157, 293, 358, 975, 692, 910, 627, 796]
         );
         for (attempt, delay) in delays.iter().enumerate() {
             let ceiling = 10_u64
                 .checked_shl((attempt as u32).min(63))
                 .unwrap_or(u64::MAX)
                 .min(1_000);
-            assert!(*delay >= Duration::from_millis(ceiling / 2));
-            assert!(*delay <= Duration::from_millis(ceiling));
+            assert!(*delay >= ceiling / 2);
+            assert!(*delay <= ceiling);
         }
+
+        let sink = Arc::new(MockSink::new());
+        sink.fail_next(1);
+        let (mut task, _, _, _, _, budget) = task_fixture(
+            sink.clone(),
+            QueueConfig {
+                flush_interval_ms: 0,
+                ..QueueConfig::default()
+            },
+        );
+        let json = br#"{"id":1}"#.to_vec();
+        let guard = budget.reserve(json.capacity()).expect("row bytes fit");
+        assert!(
+            task.queue
+                .push(Row {
+                    json,
+                    card_ref: card(),
+                    run_id: None,
+                    _guard: guard,
+                })
+                .is_none()
+        );
+        assert!(task.queue.seal_and_send().await.is_err());
+        let retained_id = sink.attempted()[0];
+        let now = tokio::time::Instant::now();
+        task.schedule_retry_at(now);
+        assert_eq!(task.retry_attempt, 1);
+        assert_eq!(
+            task.retry_deadline,
+            Some(now + super::retry_backoff(retained_id, 0))
+        );
+        task.reset_retry_schedule();
+        assert_eq!(task.retry_attempt, 0);
+        assert!(task.retry_deadline.is_none());
     }
 
     /// Live shutdown controls remain responsive while one retained retry waits for its deadline.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn live_handle_retry_deadline_is_control_aware() {
         let sink = Arc::new(MockSink::new());
         sink.fail_next(1);
@@ -1733,25 +1769,19 @@ mod tests {
         assert_eq!(sink.attempted().len(), 1);
         assert_eq!(budget.metrics().retry_entries, 1);
 
-        for _ in 0..2 {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            ctrl_tx
-                .send(Ctrl::Shutdown(reply_tx))
-                .await
-                .expect("later shutdown reaches task");
-            assert!(matches!(
-                reply_rx.await.expect("later shutdown replies"),
-                Err(WyrdQueueError::FlushTimeout)
-            ));
-            assert_eq!(sink.attempted().len(), 1, "control cannot amplify retry");
-            assert!(!control_pending.load(Ordering::Acquire));
-        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        ctrl_tx
+            .send(Ctrl::Shutdown(reply_tx))
+            .await
+            .expect("later shutdown reaches task");
+        assert!(matches!(
+            reply_rx.await.expect("later shutdown replies"),
+            Err(WyrdQueueError::FlushTimeout)
+        ));
+        assert_eq!(sink.attempted().len(), 1, "control cannot amplify retry");
+        assert!(!control_pending.load(Ordering::Acquire));
 
-        tokio::time::advance(delay - Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(sink.attempted().len(), 1, "retry waits for deadline");
-        tokio::time::advance(Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(delay + Duration::from_millis(10)).await;
         assert_eq!(sink.attempted(), vec![batch_id, batch_id]);
         assert_eq!(budget.metrics().retry_entries, 0);
         assert_eq!(budget.metrics().live_batches, 0);

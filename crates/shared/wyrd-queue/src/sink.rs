@@ -114,8 +114,10 @@ impl<G> SealedBatch<G> {
 /// Retryable or terminal failure from a sink that consumed a sealed batch.
 #[derive(Debug)]
 pub enum SinkError {
-    /// The server may not have acknowledged the operation; the queue retains
-    /// its unchanged batch owner and retries the same identity.
+    /// The server either may not have acknowledged the operation or returned
+    /// stable no-write `WYRD_VALA_429_INGEST_BUSY`; the queue retains the
+    /// unchanged UUID, bytes, allocation guard, and retry permit until the
+    /// exact owner reaches ACK or terminal settlement.
     Retryable(WyrdError),
     /// The batch reached a terminal outcome and its owner has been consumed.
     Terminal(WyrdError),
@@ -142,9 +144,11 @@ pub trait BatchSink<G>: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::Retryable`] when commit acknowledgement is ambiguous
-    /// and the caller must retain the borrowed batch, or [`SinkError::Terminal`]
-    /// when the queue can consume it after terminal rejection.
+    /// Returns [`SinkError::Retryable`] when commit acknowledgement is
+    /// ambiguous or stable no-write `WYRD_VALA_429_INGEST_BUSY` requires the
+    /// exact borrowed UUID, bytes, allocation guard, and retry permit to remain
+    /// retained. Returns [`SinkError::Terminal`] only when the queue may consume
+    /// the owner after a permanent rejection.
     async fn send(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError>;
 }
 

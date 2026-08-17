@@ -12,9 +12,11 @@ pub trait IngestTransport<G>: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::Retryable`] when a timeout or transport loss leaves
-    /// durable commit ambiguous, allowing the queue to retain the unchanged
-    /// batch; terminal failure lets the queue consume the owner.
+    /// Returns [`SinkError::Retryable`] when timeout or transport loss leaves
+    /// durable commit ambiguous, or when stable no-write
+    /// `WYRD_VALA_429_INGEST_BUSY` requires retry. In both cases the queue
+    /// retains the exact UUID, bytes, allocation guard, and retry permit.
+    /// Terminal failure lets the queue consume that owner.
     async fn insert_batch(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError>;
 }
 

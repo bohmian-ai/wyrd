@@ -12,6 +12,14 @@ pub const BIFROST_TRANSPORT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 pub const BIFROST_TRANSPORT_QUANTUM_BYTES: usize = 64 * 1024;
 /// Largest individual encoded HTTP or tonic message admitted by Bifrost.
 pub const BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// Largest canonical native schema accepted by V1.
+pub const BIFROST_NATIVE_FIELD_LIMIT: usize = 256;
+/// Largest canonical native record-batch count accepted by V1.
+pub const BIFROST_NATIVE_SOURCE_LIMIT: usize = 64;
+/// Largest logical row count accepted by one V1 request.
+pub const BIFROST_INGEST_ROW_LIMIT: usize = 131_072;
+/// Fixed WAL header and digest scratch maximum.
+pub const BIFROST_WAL_WORKSPACE_LIMIT_BYTES: usize = 4 * 1024;
 
 /// Immutable V1 OTLP limits shared by the server adapter and Scribe planner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,13 +174,23 @@ fn record_transport(result: &'static str, current_bytes: usize) {
 }
 
 /// Hard bounds enforced before a batch enters Scribe.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IngestLimits {
     /// Maximum size of one decompressed Arrow IPC batch.
     pub max_frame_bytes: usize,
     /// tonic `max_decoding_message_size` (default 4 MiB silently drops large
     /// frames; the server raises it and enforces its own cap instead).
     pub max_decoding_message_size: usize,
+    /// Immutable operator-selected OTLP count and material ceilings.
+    pub otlp: OtlpWireLimits,
+    /// Maximum canonical native schema field count.
+    pub native_fields: usize,
+    /// Maximum canonical native record-batch/source count.
+    pub native_sources: usize,
+    /// Maximum logical rows in one native or OTLP request.
+    pub rows: usize,
+    /// Fixed WAL header and digest scratch retained by one ingress root.
+    pub wal_workspace_bytes: usize,
 }
 
 impl Default for IngestLimits {
@@ -180,6 +198,11 @@ impl Default for IngestLimits {
         Self {
             max_frame_bytes: 32 * 1024 * 1024,
             max_decoding_message_size: 32 * 1024 * 1024 + 64 * 1024,
+            otlp: OTLP_WIRE_LIMITS,
+            native_fields: BIFROST_NATIVE_FIELD_LIMIT,
+            native_sources: BIFROST_NATIVE_SOURCE_LIMIT,
+            rows: BIFROST_INGEST_ROW_LIMIT,
+            wal_workspace_bytes: BIFROST_WAL_WORKSPACE_LIMIT_BYTES,
         }
     }
 }

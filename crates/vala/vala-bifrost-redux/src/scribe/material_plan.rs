@@ -27,24 +27,10 @@ use crate::contracts::ScribeError;
 pub(crate) const MAX_SOURCE_PLANS: usize = 64;
 /// Maximum top-level fields in the canonical native schema.
 pub(crate) const MAX_NATIVE_FIELDS: usize = 256;
-/// Maximum rows or OTLP signal records in one request.
-pub(crate) const MAX_INGEST_ROWS: usize = crate::gate::limits::OTLP_WIRE_LIMITS.records;
-/// Maximum OTLP resource groups in one request.
-pub(crate) const MAX_OTLP_RESOURCES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.resources;
-/// Maximum OTLP scope groups in one request.
-pub(crate) const MAX_OTLP_SCOPES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.scopes;
-/// Maximum OTLP attribute nodes in one request.
-pub(crate) const MAX_OTLP_ATTRIBUTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.attributes;
-/// Maximum cumulative OTLP key/value/body bytes in one request.
-pub(crate) const MAX_OTLP_VALUE_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.value_bytes;
-/// Maximum nested OTLP value depth.
-pub(crate) const MAX_OTLP_VALUE_DEPTH: usize = crate::gate::limits::OTLP_WIRE_LIMITS.value_depth;
 /// Maximum distinct event days in one request.
 pub(crate) const MAX_EVENT_DAYS: usize = crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
 /// Maximum projected Arrow and IPC bytes in one request.
 pub(crate) const MAX_PROJECTED_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.material_bytes;
-/// Fixed WAL header and digest workspace.
-pub(crate) const WAL_WORKSPACE_BYTES: usize = 4 * 1024;
 
 /// Metadata-only facts for one current source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -128,8 +114,26 @@ impl IngestMaterialPlan {
 }
 
 /// Scribe-owned planner for native and typed OTLP ingress.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ScribeIngressPlanner;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScribeIngressPlanner {
+    /// Immutable operator-selected limits validated by server boot.
+    limits: crate::gate::limits::IngestLimits,
+}
+
+impl ScribeIngressPlanner {
+    /// Constructs one planner from the same frozen limits snapshot used by Gate.
+    #[must_use]
+    pub(crate) const fn new(limits: crate::gate::limits::IngestLimits) -> Self {
+        Self { limits }
+    }
+}
+
+impl Default for ScribeIngressPlanner {
+    /// Uses immutable V1 maxima for embedded and unit-test construction.
+    fn default() -> Self {
+        Self::new(crate::gate::limits::IngestLimits::default())
+    }
+}
 
 /// Scalar buffer layout retained from the schema for batch validation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -169,26 +173,26 @@ impl ScribeIngressPlanner {
                 .checked_add(batch.num_rows())
                 .ok_or(ScribeError::TooManyRows {
                     rows: u64::MAX,
-                    limit: MAX_INGEST_ROWS as u64,
+                    limit: self.limits.rows as u64,
                 })?;
             max_ipc_bytes = max_ipc_bytes.max(count_ipc_bytes(batch)?);
             total_bytes = total_bytes
                 .checked_add(batch.get_array_memory_size())
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: MAX_PROJECTED_BYTES,
+                    limit: self.limits.otlp.material_bytes,
                 })?;
         }
-        if rows > MAX_INGEST_ROWS {
+        if rows > self.limits.rows {
             return Err(ScribeError::TooManyRows {
                 rows: u64::try_from(rows).unwrap_or(u64::MAX),
-                limit: MAX_INGEST_ROWS as u64,
+                limit: self.limits.rows as u64,
             });
         }
-        if total_bytes > MAX_PROJECTED_BYTES {
+        if total_bytes > self.limits.otlp.material_bytes {
             return Err(ScribeError::DecodedPayloadTooLarge {
                 bytes: total_bytes,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             });
         }
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
@@ -205,25 +209,25 @@ impl ScribeIngressPlanner {
                 .checked_add(managed_bytes)
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: MAX_PROJECTED_BYTES,
+                    limit: self.limits.otlp.material_bytes,
                 })?;
         let encoded_bytes = max_ipc_bytes
             .checked_add(managed_bytes)
-            .and_then(|value| value.checked_add(WAL_WORKSPACE_BYTES))
+            .and_then(|value| value.checked_add(self.limits.wal_workspace_bytes))
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             })?;
         let current_material_bytes = decoded_bytes.checked_add(encoded_bytes).ok_or(
             ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             },
         )?;
-        if current_material_bytes > MAX_PROJECTED_BYTES {
+        if current_material_bytes > self.limits.otlp.material_bytes {
             return Err(ScribeError::DecodedPayloadTooLarge {
                 bytes: current_material_bytes,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             });
         }
         IngestMaterialPlan {
@@ -239,7 +243,7 @@ impl ScribeIngressPlanner {
             event_day_count: 0,
             current_material_bytes,
             active_output_bytes: 0,
-            wal_workspace_bytes: WAL_WORKSPACE_BYTES,
+            wal_workspace_bytes: self.limits.wal_workspace_bytes,
             root_bytes: 0,
         }
         .finish()
@@ -257,7 +261,7 @@ impl ScribeIngressPlanner {
         bytes: &Bytes,
         name_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        if bytes.len() > crate::scribe::admission::MAX_REQUEST_BYTES {
+        if bytes.len() > self.limits.max_frame_bytes {
             return Err(ScribeError::PayloadTooLarge { bytes: bytes.len() });
         }
         let mut cursor = 0_usize;
@@ -322,7 +326,7 @@ impl ScribeIngressPlanner {
                     }
                     let schema_fields = schema.fields().ok_or(ScribeError::InvalidFrame)?;
                     fields = schema_fields.len();
-                    if fields == 0 || fields > MAX_NATIVE_FIELDS {
+                    if fields == 0 || fields > self.limits.native_fields {
                         return Err(ScribeError::InvalidFrame);
                     }
                     for (index, field) in schema_fields.into_iter().enumerate() {
@@ -330,7 +334,9 @@ impl ScribeIngressPlanner {
                     }
                     schema_seen = true;
                 }
-                MessageHeader::RecordBatch if schema_seen && source_count < MAX_SOURCE_PLANS => {
+                MessageHeader::RecordBatch
+                    if schema_seen && source_count < self.limits.native_sources =>
+                {
                     let batch = message
                         .header_as_record_batch()
                         .ok_or(ScribeError::InvalidFrame)?;
@@ -343,12 +349,12 @@ impl ScribeIngressPlanner {
                         .checked_add(batch_rows)
                         .ok_or(ScribeError::TooManyRows {
                             rows: u64::MAX,
-                            limit: MAX_INGEST_ROWS as u64,
+                            limit: self.limits.rows as u64,
                         })?;
-                    if rows > MAX_INGEST_ROWS {
+                    if rows > self.limits.rows {
                         return Err(ScribeError::TooManyRows {
                             rows: u64::try_from(rows).unwrap_or(u64::MAX),
-                            limit: MAX_INGEST_ROWS as u64,
+                            limit: self.limits.rows as u64,
                         });
                     }
                     let nodes = batch.nodes().ok_or(ScribeError::InvalidFrame)?;
@@ -380,7 +386,7 @@ impl ScribeIngressPlanner {
                         })
                         .ok_or(ScribeError::DecodedPayloadTooLarge {
                             bytes: usize::MAX,
-                            limit: MAX_PROJECTED_BYTES,
+                            limit: self.limits.otlp.material_bytes,
                         })?;
                     sources[source_count] = SourceMaterialPlan {
                         rows: batch_rows,
@@ -403,26 +409,26 @@ impl ScribeIngressPlanner {
         let decoded_bytes = max_buffer_bytes.checked_add(managed_bytes).ok_or(
             ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             },
         )?;
         let encoded_bytes = max_body_bytes
             .checked_add(managed_bytes)
-            .and_then(|value| value.checked_add(WAL_WORKSPACE_BYTES))
+            .and_then(|value| value.checked_add(self.limits.wal_workspace_bytes))
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             })?;
         let current_material_bytes = decoded_bytes.checked_add(encoded_bytes).ok_or(
             ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             },
         )?;
-        if current_material_bytes > MAX_PROJECTED_BYTES {
+        if current_material_bytes > self.limits.otlp.material_bytes {
             return Err(ScribeError::DecodedPayloadTooLarge {
                 bytes: current_material_bytes,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             });
         }
         IngestMaterialPlan {
@@ -438,7 +444,7 @@ impl ScribeIngressPlanner {
             event_day_count: 0,
             current_material_bytes,
             active_output_bytes,
-            wal_workspace_bytes: WAL_WORKSPACE_BYTES,
+            wal_workspace_bytes: self.limits.wal_workspace_bytes,
             root_bytes: 0,
         }
         .finish()
@@ -456,7 +462,7 @@ impl ScribeIngressPlanner {
         request_bytes: usize,
         name_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        let mut counts = OtlpCounts::default();
+        let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_spans {
             counts.add_resources(1)?;
             count_attributes(
@@ -503,7 +509,7 @@ impl ScribeIngressPlanner {
         request_bytes: usize,
         name_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        let mut counts = OtlpCounts::default();
+        let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_metrics {
             counts.add_resources(1)?;
             count_attributes(
@@ -569,7 +575,7 @@ impl ScribeIngressPlanner {
         request_bytes: usize,
         name_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        let mut counts = OtlpCounts::default();
+        let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_logs {
             counts.add_resources(1)?;
             count_attributes(
@@ -977,8 +983,10 @@ fn managed_projection_bytes(rows: usize, request_id_bytes: usize) -> Result<usiz
 }
 
 /// Constant-space typed OTLP counters.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OtlpCounts {
+    /// Immutable operator-selected ceilings for this count pass.
+    limits: crate::gate::limits::IngestLimits,
     /// Resource groups visited.
     resources: usize,
     /// Scope groups visited.
@@ -996,13 +1004,28 @@ struct OtlpCounts {
 }
 
 impl OtlpCounts {
+    /// Starts a constant-space count pass under one frozen limits snapshot.
+    #[must_use]
+    fn new(limits: crate::gate::limits::IngestLimits) -> Self {
+        Self {
+            limits,
+            resources: 0,
+            scopes: 0,
+            records: 0,
+            attributes: 0,
+            value_bytes: 0,
+            event_days: [0; MAX_EVENT_DAYS],
+            event_day_count: 0,
+        }
+    }
+
     /// Adds resources under the hard cap.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::InvalidFrame`] on overflow or cap+1.
     fn add_resources(&mut self, count: usize) -> Result<(), ScribeError> {
-        self.resources = bounded_add(self.resources, count, MAX_OTLP_RESOURCES)?;
+        self.resources = bounded_add(self.resources, count, self.limits.otlp.resources)?;
         Ok(())
     }
 
@@ -1012,7 +1035,7 @@ impl OtlpCounts {
     ///
     /// Returns [`ScribeError::InvalidFrame`] on overflow or cap+1.
     fn add_scopes(&mut self, count: usize) -> Result<(), ScribeError> {
-        self.scopes = bounded_add(self.scopes, count, MAX_OTLP_SCOPES)?;
+        self.scopes = bounded_add(self.scopes, count, self.limits.otlp.scopes)?;
         Ok(())
     }
 
@@ -1027,12 +1050,13 @@ impl OtlpCounts {
             .checked_add(count)
             .ok_or(ScribeError::TooManyRows {
                 rows: u64::MAX,
-                limit: MAX_INGEST_ROWS as u64,
+                limit: self.limits.otlp.records as u64,
             })?;
-        if self.records > MAX_INGEST_ROWS {
+        if self.records > self.limits.otlp.records || self.records > self.limits.rows {
+            let limit = self.limits.otlp.records.min(self.limits.rows);
             return Err(ScribeError::TooManyRows {
                 rows: u64::try_from(self.records).unwrap_or(u64::MAX),
-                limit: MAX_INGEST_ROWS as u64,
+                limit: limit as u64,
             });
         }
         Ok(())
@@ -1049,12 +1073,12 @@ impl OtlpCounts {
                 .checked_add(bytes)
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: MAX_OTLP_VALUE_BYTES,
+                    limit: self.limits.otlp.value_bytes,
                 })?;
-        if self.value_bytes > MAX_OTLP_VALUE_BYTES {
+        if self.value_bytes > self.limits.otlp.value_bytes {
             return Err(ScribeError::DecodedPayloadTooLarge {
                 bytes: self.value_bytes,
-                limit: MAX_OTLP_VALUE_BYTES,
+                limit: self.limits.otlp.value_bytes,
             });
         }
         Ok(())
@@ -1074,7 +1098,7 @@ impl OtlpCounts {
         if self.event_days[..self.event_day_count].contains(&day) {
             return Ok(());
         }
-        if self.event_day_count == MAX_EVENT_DAYS {
+        if self.event_day_count == self.limits.otlp.event_days {
             return Err(ScribeError::InvalidFrame);
         }
         self.event_days[self.event_day_count] = day;
@@ -1092,7 +1116,7 @@ impl OtlpCounts {
         request_bytes: usize,
         name_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        if request_bytes > crate::scribe::admission::MAX_REQUEST_BYTES {
+        if request_bytes > self.limits.otlp.request_bytes {
             return Err(ScribeError::PayloadTooLarge {
                 bytes: request_bytes,
             });
@@ -1104,12 +1128,12 @@ impl OtlpCounts {
             .and_then(|value| value.checked_add(self.attributes.checked_mul(16)?))
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             })?;
-        if projected_floor > MAX_PROJECTED_BYTES {
+        if projected_floor > self.limits.otlp.material_bytes {
             return Err(ScribeError::DecodedPayloadTooLarge {
                 bytes: projected_floor,
-                limit: MAX_PROJECTED_BYTES,
+                limit: self.limits.otlp.material_bytes,
             });
         }
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
@@ -1133,7 +1157,7 @@ impl OtlpCounts {
             event_day_count: self.event_day_count,
             current_material_bytes: projected_floor,
             active_output_bytes: 0,
-            wal_workspace_bytes: WAL_WORKSPACE_BYTES,
+            wal_workspace_bytes: self.limits.wal_workspace_bytes,
             root_bytes: 0,
         }
         .finish()
@@ -1217,11 +1241,28 @@ fn count_points<'a>(
 ///
 /// Returns a stable cardinality, depth, or byte refusal.
 fn count_attributes(attributes: &[KeyValue], counts: &mut OtlpCounts) -> Result<(), ScribeError> {
-    counts.attributes = bounded_add(counts.attributes, attributes.len(), MAX_OTLP_ATTRIBUTES)?;
+    count_attributes_at_depth(attributes, 1, counts)
+}
+
+/// Counts attributes while preserving their current recursive value depth.
+///
+/// # Errors
+///
+/// Returns a stable cardinality, depth, or cumulative-byte refusal.
+fn count_attributes_at_depth(
+    attributes: &[KeyValue],
+    depth: usize,
+    counts: &mut OtlpCounts,
+) -> Result<(), ScribeError> {
+    counts.attributes = bounded_add(
+        counts.attributes,
+        attributes.len(),
+        counts.limits.otlp.attributes,
+    )?;
     for attribute in attributes {
         counts.add_bytes(attribute.key.len())?;
         if let Some(value) = &attribute.value {
-            count_value(value, 1, counts)?;
+            count_value(value, depth, counts)?;
         }
     }
     Ok(())
@@ -1234,7 +1275,7 @@ fn count_attributes(attributes: &[KeyValue], counts: &mut OtlpCounts) -> Result<
 /// Returns [`ScribeError::InvalidFrame`] beyond the depth cap and a stable
 /// material refusal beyond the cumulative key/value cap.
 fn count_value(value: &AnyValue, depth: usize, counts: &mut OtlpCounts) -> Result<(), ScribeError> {
-    if depth > MAX_OTLP_VALUE_DEPTH {
+    if depth > counts.limits.otlp.value_depth {
         return Err(ScribeError::InvalidFrame);
     }
     match value.value.as_ref() {
@@ -1246,7 +1287,7 @@ fn count_value(value: &AnyValue, depth: usize, counts: &mut OtlpCounts) -> Resul
             }
         }
         Some(any_value::Value::KvlistValue(values)) => {
-            count_attributes(&values.values, counts)?;
+            count_attributes_at_depth(&values.values, depth + 1, counts)?;
         }
         Some(any_value::Value::BoolValue(_))
         | Some(any_value::Value::IntValue(_))
@@ -1270,7 +1311,7 @@ mod tests {
     use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 
-    use super::{MAX_OTLP_VALUE_DEPTH, ScribeIngressPlanner};
+    use super::ScribeIngressPlanner;
     use crate::contracts::ScribeError;
 
     /// Encodes one canonical V5 stream for scanner tests.
@@ -1302,7 +1343,7 @@ mod tests {
     #[test]
     fn native_preflight_accepts_canonical_v1_stream() {
         let bytes = canonical_stream();
-        let plan = ScribeIngressPlanner
+        let plan = ScribeIngressPlanner::default()
             .plan_native(&bytes, 32)
             .expect("canonical stream plan");
         assert_eq!(plan.source_count, 1);
@@ -1316,7 +1357,7 @@ mod tests {
         let bytes = canonical_stream();
         let truncated = bytes.slice(..bytes.len() - 8);
         assert!(matches!(
-            ScribeIngressPlanner.plan_native(&truncated, 0),
+            ScribeIngressPlanner::default().plan_native(&truncated, 0),
             Err(ScribeError::InvalidFrame)
         ));
     }
@@ -1327,7 +1368,7 @@ mod tests {
         let mut value = AnyValue {
             value: Some(any_value::Value::StringValue("leaf".to_owned())),
         };
-        for _ in 0..MAX_OTLP_VALUE_DEPTH {
+        for _ in 0..crate::gate::limits::OTLP_WIRE_LIMITS.value_depth {
             value = AnyValue {
                 value: Some(any_value::Value::ArrayValue(ArrayValue {
                     values: vec![value],
@@ -1350,7 +1391,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            ScribeIngressPlanner.plan_logs(&request, 1, 0),
+            ScribeIngressPlanner::default().plan_logs(&request, 1, 0),
             Err(ScribeError::InvalidFrame)
         ));
     }

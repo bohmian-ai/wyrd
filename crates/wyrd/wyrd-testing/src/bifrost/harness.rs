@@ -205,6 +205,7 @@ impl BifrostHarness {
                     .with_test_faults(persistence_faults.clone()),
                 ),
                 resources: scribe_resources,
+                ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
                 staging_file_publisher: None,
             });
             scribes.push(Arc::new(scribe));

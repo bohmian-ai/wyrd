@@ -220,6 +220,7 @@ impl PersistenceFixture {
             execution_pools: pools,
             persistence: Some(persistence),
             resources: scribe_resources,
+            ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
             staging_file_publisher: Some(staging_file_publisher),
         }));
         scribe.replay_wal_async().await.expect("empty WAL replay");
@@ -397,6 +398,7 @@ impl PersistenceFixture {
             execution_pools: pools,
             persistence: Some(persistence),
             resources: scribe_resources,
+            ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {
@@ -473,6 +475,7 @@ fn first_replay_scribe(
         execution_pools: pools,
         persistence: None,
         resources: memory.scribe().expect("composed Scribe capability"),
+        ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
         staging_file_publisher: None,
     }))
 }

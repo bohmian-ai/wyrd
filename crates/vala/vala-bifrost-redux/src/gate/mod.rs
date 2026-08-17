@@ -270,7 +270,13 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// Returns the immutable OTLP limits shared with the server decode adapter.
     #[must_use]
     pub const fn otlp_wire_limits(&self) -> OtlpWireLimits {
-        crate::gate::limits::OTLP_WIRE_LIMITS
+        self.limits.otlp
+    }
+
+    /// Returns the tonic frame ceiling derived from the same boot snapshot.
+    #[must_use]
+    pub const fn otlp_decoding_message_size(&self) -> usize {
+        self.limits.max_decoding_message_size
     }
 
     /// Construct a Gate with a required Scribe capability.

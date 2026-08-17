@@ -215,6 +215,8 @@ pub struct ScribeImpl {
     admission: AdmissionController,
     /// Scribe-only child capability over the pod-global Bifrost governor.
     memory: crate::resources::ScribeResources,
+    /// Immutable boot-selected ingest ceilings shared with Gate.
+    ingest_limits: crate::gate::limits::IngestLimits,
     /// Runtime pressure and lifecycle thresholds (D83 watermarks and max age).
     ///
     /// Shared by the admission path and the periodic age scanner so the
@@ -509,6 +511,8 @@ pub struct ScribeBuildConfig {
     pub persistence: Option<ScribePersistenceConfig>,
     /// Scribe child budget provisioned by server boot.
     pub resources: crate::resources::ScribeResources,
+    /// Immutable boot-selected ingest ceilings shared with Gate.
+    pub ingest_limits: crate::gate::limits::IngestLimits,
     /// Optional bounded local wake-up publisher for committed staging files.
     pub staging_file_publisher: Option<StagingFilePublisher>,
 }
@@ -792,6 +796,7 @@ impl ScribeImpl {
             execution_pools,
             persistence: config.persistence,
             resources: config.resources,
+            ingest_limits: crate::gate::limits::IngestLimits::default(),
             staging_file_publisher: None,
         }))
     }
@@ -920,6 +925,7 @@ impl ScribeImpl {
             ),
             persistence: config.persistence,
             resources: config.resources,
+            ingest_limits: crate::gate::limits::IngestLimits::default(),
             staging_file_publisher: config.staging_file_publisher,
         })
     }
@@ -956,6 +962,7 @@ impl ScribeImpl {
             persistence: persistence_config,
             admission: _,
             resources: _,
+            ingest_limits,
             staging_file_publisher,
         } = config;
         let node_id = stream.node_id.to_string();
@@ -1013,6 +1020,7 @@ impl ScribeImpl {
             writer_epoch,
             admission,
             memory,
+            ingest_limits,
             pressure_config,
             memory_ownership,
             persistence_cpu,
@@ -1116,6 +1124,7 @@ impl ScribeImpl {
             ),
             persistence: None,
             resources,
+            ingest_limits: crate::gate::limits::IngestLimits::default(),
             staging_file_publisher: None,
         })
     }

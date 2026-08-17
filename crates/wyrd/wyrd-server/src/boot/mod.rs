@@ -670,6 +670,7 @@ async fn build_bifrost_parts_from_boot(
                     "Scribe role selected without a composed Scribe capability".to_owned(),
                 )
             })?,
+            ingest_limits: scribe_config.ingest_limits(),
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {
@@ -924,7 +925,7 @@ pub async fn build_state(
         }
     };
     let bifrost = Arc::clone(&state.bifrost);
-    let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
+    let limits = config.bifrost.scribe.ingest_limits();
     let state = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_parts = bifrost_parts.scribe.ok_or_else(|| {
             ServerBootError::Scribe("selected Scribe role was not constructed".to_owned())

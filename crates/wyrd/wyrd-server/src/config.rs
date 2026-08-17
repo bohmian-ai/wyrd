@@ -321,6 +321,45 @@ pub struct ScribeRuntimeConfig {
     /// default of 24 hours applies. Per-tenant overrides are not supported.
     #[serde(default)]
     pub event_time_future_window_secs: Option<u64>,
+    /// Maximum encoded bytes accepted for one native or OTLP request.
+    #[serde(default = "default_ingest_request_bytes")]
+    pub ingest_request_bytes: usize,
+    /// Maximum field count in one canonical native IPC schema.
+    #[serde(default = "default_ingest_native_fields")]
+    pub ingest_native_fields: usize,
+    /// Maximum record-batch/source count in one canonical native IPC stream.
+    #[serde(default = "default_ingest_native_sources")]
+    pub ingest_native_sources: usize,
+    /// Maximum logical rows or signal records in one request.
+    #[serde(default = "default_ingest_rows")]
+    pub ingest_rows: usize,
+    /// Maximum OTLP resource groups in one request.
+    #[serde(default = "default_ingest_otlp_resources")]
+    pub ingest_otlp_resources: usize,
+    /// Maximum OTLP instrumentation-scope groups in one request.
+    #[serde(default = "default_ingest_otlp_scopes")]
+    pub ingest_otlp_scopes: usize,
+    /// Maximum OTLP signal records in one request.
+    #[serde(default = "default_ingest_otlp_records")]
+    pub ingest_otlp_records: usize,
+    /// Maximum OTLP attribute nodes in one request.
+    #[serde(default = "default_ingest_otlp_attributes")]
+    pub ingest_otlp_attributes: usize,
+    /// Maximum cumulative OTLP key, value, body, and identifier bytes.
+    #[serde(default = "default_ingest_otlp_value_bytes")]
+    pub ingest_otlp_value_bytes: usize,
+    /// Maximum recursive OTLP `AnyValue` nesting depth.
+    #[serde(default = "default_ingest_otlp_value_depth")]
+    pub ingest_otlp_value_depth: usize,
+    /// Maximum distinct event-day partitions in one request.
+    #[serde(default = "default_ingest_event_days")]
+    pub ingest_event_days: usize,
+    /// Maximum simultaneous projected Arrow and IPC material bytes.
+    #[serde(default = "default_ingest_projected_bytes")]
+    pub ingest_projected_bytes: usize,
+    /// Fixed WAL header and digest workspace bytes retained by an ingress root.
+    #[serde(default = "default_ingest_wal_workspace_bytes")]
+    pub ingest_wal_workspace_bytes: usize,
 }
 
 /// Independently deployable Bifrost server role.
@@ -1039,6 +1078,71 @@ fn default_scribe_wal_io_threads() -> usize {
     4
 }
 
+/// Returns the immutable V1 transport-request hard maximum.
+fn default_ingest_request_bytes() -> usize {
+    vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
+}
+
+/// Returns the immutable V1 native field hard maximum.
+fn default_ingest_native_fields() -> usize {
+    vala_bifrost_redux::gate::limits::BIFROST_NATIVE_FIELD_LIMIT
+}
+
+/// Returns the immutable V1 native source hard maximum.
+fn default_ingest_native_sources() -> usize {
+    vala_bifrost_redux::gate::limits::BIFROST_NATIVE_SOURCE_LIMIT
+}
+
+/// Returns the immutable V1 logical row hard maximum.
+fn default_ingest_rows() -> usize {
+    vala_bifrost_redux::gate::limits::BIFROST_INGEST_ROW_LIMIT
+}
+
+/// Returns the immutable V1 OTLP resource hard maximum.
+fn default_ingest_otlp_resources() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.resources
+}
+
+/// Returns the immutable V1 OTLP scope hard maximum.
+fn default_ingest_otlp_scopes() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.scopes
+}
+
+/// Returns the immutable V1 OTLP record hard maximum.
+fn default_ingest_otlp_records() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.records
+}
+
+/// Returns the immutable V1 OTLP attribute hard maximum.
+fn default_ingest_otlp_attributes() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.attributes
+}
+
+/// Returns the immutable V1 OTLP cumulative-value-byte hard maximum.
+fn default_ingest_otlp_value_bytes() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.value_bytes
+}
+
+/// Returns the immutable V1 OTLP recursive-value-depth hard maximum.
+fn default_ingest_otlp_value_depth() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.value_depth
+}
+
+/// Returns the immutable V1 event-day hard maximum.
+fn default_ingest_event_days() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.event_days
+}
+
+/// Returns the immutable V1 projected-material hard maximum.
+fn default_ingest_projected_bytes() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.material_bytes
+}
+
+/// Returns the immutable V1 WAL-workspace hard maximum.
+fn default_ingest_wal_workspace_bytes() -> usize {
+    vala_bifrost_redux::gate::limits::BIFROST_WAL_WORKSPACE_LIMIT_BYTES
+}
+
 impl Default for ScribeRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -1049,12 +1153,31 @@ impl Default for ScribeRuntimeConfig {
             wal_disk_limit_bytes: None,
             event_time_past_window_secs: None,
             event_time_future_window_secs: None,
+            ingest_request_bytes: default_ingest_request_bytes(),
+            ingest_native_fields: default_ingest_native_fields(),
+            ingest_native_sources: default_ingest_native_sources(),
+            ingest_rows: default_ingest_rows(),
+            ingest_otlp_resources: default_ingest_otlp_resources(),
+            ingest_otlp_scopes: default_ingest_otlp_scopes(),
+            ingest_otlp_records: default_ingest_otlp_records(),
+            ingest_otlp_attributes: default_ingest_otlp_attributes(),
+            ingest_otlp_value_bytes: default_ingest_otlp_value_bytes(),
+            ingest_otlp_value_depth: default_ingest_otlp_value_depth(),
+            ingest_event_days: default_ingest_event_days(),
+            ingest_projected_bytes: default_ingest_projected_bytes(),
+            ingest_wal_workspace_bytes: default_ingest_wal_workspace_bytes(),
         }
     }
 }
 
 impl ScribeRuntimeConfig {
     /// Validate that every configured bound can provide bounded operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field-specific boot error when a thread or ingest bound is
+    /// zero, an ingest bound exceeds its immutable V1 maximum, or a configured
+    /// WAL disk budget is zero.
     pub fn validate(&self) -> Result<(), String> {
         let thread_values = [
             ("coordination_threads", self.coordination_threads),
@@ -1070,7 +1193,113 @@ impl ScribeRuntimeConfig {
         {
             return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
         }
+        let ingest_values = [
+            (
+                "ingest_request_bytes",
+                self.ingest_request_bytes,
+                default_ingest_request_bytes(),
+            ),
+            (
+                "ingest_native_fields",
+                self.ingest_native_fields,
+                default_ingest_native_fields(),
+            ),
+            (
+                "ingest_native_sources",
+                self.ingest_native_sources,
+                default_ingest_native_sources(),
+            ),
+            ("ingest_rows", self.ingest_rows, default_ingest_rows()),
+            (
+                "ingest_otlp_resources",
+                self.ingest_otlp_resources,
+                default_ingest_otlp_resources(),
+            ),
+            (
+                "ingest_otlp_scopes",
+                self.ingest_otlp_scopes,
+                default_ingest_otlp_scopes(),
+            ),
+            (
+                "ingest_otlp_records",
+                self.ingest_otlp_records,
+                default_ingest_otlp_records(),
+            ),
+            (
+                "ingest_otlp_attributes",
+                self.ingest_otlp_attributes,
+                default_ingest_otlp_attributes(),
+            ),
+            (
+                "ingest_otlp_value_bytes",
+                self.ingest_otlp_value_bytes,
+                default_ingest_otlp_value_bytes(),
+            ),
+            (
+                "ingest_otlp_value_depth",
+                self.ingest_otlp_value_depth,
+                default_ingest_otlp_value_depth(),
+            ),
+            (
+                "ingest_event_days",
+                self.ingest_event_days,
+                default_ingest_event_days(),
+            ),
+            (
+                "ingest_projected_bytes",
+                self.ingest_projected_bytes,
+                default_ingest_projected_bytes(),
+            ),
+            (
+                "ingest_wal_workspace_bytes",
+                self.ingest_wal_workspace_bytes,
+                default_ingest_wal_workspace_bytes(),
+            ),
+        ];
+        if let Some((name, _, _)) = ingest_values.iter().find(|(_, value, _)| *value == 0) {
+            return Err(format!("scribe.{name} must be at least 1"));
+        }
+        if let Some((name, value, maximum)) = ingest_values
+            .iter()
+            .find(|(_, value, maximum)| value > maximum)
+        {
+            return Err(format!(
+                "scribe.{name} must not exceed the V1 hard maximum {maximum} (got {value})"
+            ));
+        }
         Ok(())
+    }
+
+    /// Freezes the validated operator-selected limits passed to Gate and Scribe.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when called before [`Self::validate`] has established that
+    /// the tonic framing allowance can be added without overflow.
+    #[must_use]
+    pub fn ingest_limits(&self) -> vala_bifrost_redux::gate::limits::IngestLimits {
+        vala_bifrost_redux::gate::limits::IngestLimits {
+            max_frame_bytes: self.ingest_request_bytes,
+            max_decoding_message_size: self
+                .ingest_request_bytes
+                .checked_add(64 * 1024)
+                .expect("validated request bound plus tonic framing allowance must fit"),
+            otlp: vala_bifrost_redux::gate::limits::OtlpWireLimits {
+                request_bytes: self.ingest_request_bytes,
+                resources: self.ingest_otlp_resources,
+                scopes: self.ingest_otlp_scopes,
+                records: self.ingest_otlp_records,
+                attributes: self.ingest_otlp_attributes,
+                value_bytes: self.ingest_otlp_value_bytes,
+                value_depth: self.ingest_otlp_value_depth,
+                event_days: self.ingest_event_days,
+                material_bytes: self.ingest_projected_bytes,
+            },
+            native_fields: self.ingest_native_fields,
+            native_sources: self.ingest_native_sources,
+            rows: self.ingest_rows,
+            wal_workspace_bytes: self.ingest_wal_workspace_bytes,
+        }
     }
 }
 
@@ -2789,6 +3018,10 @@ minimum_slots = 2
         let cfg = ScribeRuntimeConfig::default();
         assert_eq!(cfg.coordination_threads, 2);
         assert_eq!(cfg.wal_disk_limit_bytes, None);
+        assert_eq!(
+            cfg.ingest_limits(),
+            vala_bifrost_redux::gate::limits::IngestLimits::default()
+        );
         cfg.validate().expect("resolved defaults must validate");
     }
 
@@ -2803,6 +3036,51 @@ minimum_slots = 2
         let mut cfg = ScribeRuntimeConfig::default();
         cfg.wal_disk_limit_bytes = Some(0);
         assert!(cfg.validate().is_err());
+
+        let mut cfg = ScribeRuntimeConfig::default();
+        cfg.ingest_otlp_resources = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = ScribeRuntimeConfig::default();
+        cfg.ingest_native_fields = vala_bifrost_redux::gate::limits::BIFROST_NATIVE_FIELD_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    /// Proves one lower operator limit is frozen into the shared Gate/Scribe snapshot.
+    #[test]
+    fn scribe_runtime_freezes_lower_ingest_limits() {
+        let config = ScribeRuntimeConfig {
+            ingest_request_bytes: 1024,
+            ingest_native_fields: 4,
+            ingest_native_sources: 2,
+            ingest_rows: 8,
+            ingest_otlp_resources: 2,
+            ingest_otlp_scopes: 3,
+            ingest_otlp_records: 8,
+            ingest_otlp_attributes: 16,
+            ingest_otlp_value_bytes: 512,
+            ingest_otlp_value_depth: 3,
+            ingest_event_days: 2,
+            ingest_projected_bytes: 4096,
+            ingest_wal_workspace_bytes: 256,
+            ..ScribeRuntimeConfig::default()
+        };
+        config.validate().expect("lower V1 limits validate");
+
+        let frozen = config.ingest_limits();
+        assert_eq!(frozen.max_frame_bytes, 1024);
+        assert_eq!(frozen.native_fields, 4);
+        assert_eq!(frozen.native_sources, 2);
+        assert_eq!(frozen.rows, 8);
+        assert_eq!(frozen.otlp.resources, 2);
+        assert_eq!(frozen.otlp.scopes, 3);
+        assert_eq!(frozen.otlp.records, 8);
+        assert_eq!(frozen.otlp.attributes, 16);
+        assert_eq!(frozen.otlp.value_bytes, 512);
+        assert_eq!(frozen.otlp.value_depth, 3);
+        assert_eq!(frozen.otlp.event_days, 2);
+        assert_eq!(frozen.otlp.material_bytes, 4096);
+        assert_eq!(frozen.wal_workspace_bytes, 256);
     }
 
     // ── 2. TOML with unknown legacy field fails with ParseToml ────────────────

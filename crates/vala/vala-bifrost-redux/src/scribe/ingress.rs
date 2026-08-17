@@ -181,7 +181,7 @@ impl ScribeImpl {
         frame: &ScribeIngressFrame,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let name_bytes = physical_binding_string_bytes(frame)?;
-        let planner = ScribeIngressPlanner;
+        let planner = ScribeIngressPlanner::new(self.ingest_limits);
         let plan = match &frame.payload {
             IngressPayload::ArrowIpc(bytes) => planner.plan_native(bytes, name_bytes),
             IngressPayload::OtlpTraces(request) => {

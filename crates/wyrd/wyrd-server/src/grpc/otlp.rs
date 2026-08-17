@@ -70,11 +70,10 @@ where
             let method = TraceExportUnary {
                 gate: Arc::clone(&gate),
             };
+            let maximum_message_size = gate.otlp_decoding_message_size();
             let codec = TraceOtlpCodec { gate };
             let response = Grpc::new(codec)
-                .max_decoding_message_size(
-                    vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
-                )
+                .max_decoding_message_size(maximum_message_size)
                 .unary(method, request)
                 .await;
             Ok(response)

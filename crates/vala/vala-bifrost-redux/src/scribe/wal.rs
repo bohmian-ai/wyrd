@@ -282,7 +282,7 @@ impl SegmentHeader {
 pub struct WalRecord {
     /// LSN for this record (monotonic per stream).
     pub lsn: WalLsn,
-    /// Exactly one of [`RECORD_FLAG_SLICE`] or [`RECORD_FLAG_COMMIT`].
+    /// Exactly one of `RECORD_FLAG_SLICE` or `RECORD_FLAG_COMMIT`.
     pub flags: u32,
     /// Authenticated tenant owning the record.
     pub tenant_id: [u8; 16],

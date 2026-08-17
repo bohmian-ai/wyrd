@@ -71,7 +71,7 @@ pub(crate) struct ScribeIngressFrame {
 }
 
 /// In-process projected-frame adapter retained for engine-only tests and
-/// benchmark fixtures. Gate alone constructs [`ScribeIngressFrame`] for public
+/// benchmark fixtures. Gate alone constructs `ScribeIngressFrame` for public
 /// transport traffic.
 #[derive(Debug, Clone)]
 pub struct ScribeAppend {

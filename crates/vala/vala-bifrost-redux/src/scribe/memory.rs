@@ -203,7 +203,7 @@ pub struct MemorySnapshot {
     /// High-water byte threshold = `ingress_limit_bytes * high_water / 100`.
     ///
     /// Populated by [`MemorySnapshot::with_ingress_watermarks`] from the
-    /// runtime [`ScribePressureConfig`]; a bare governor snapshot leaves it `0`.
+    /// runtime `ScribePressureConfig`; a bare governor snapshot leaves it `0`.
     pub ingress_high_water_bytes: usize,
     /// Low-water byte target = `ingress_limit_bytes * low_water / 100`.
     ///

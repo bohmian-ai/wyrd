@@ -1827,7 +1827,7 @@ impl FetchLiveTailRequest {
     /// Under batch-spread routing the live-tail data for one (tenant, table)
     /// may be spread across multiple shard lanes, so this value is used only
     /// for approximate attribution and diagnostics — not for dispatch. Use
-    /// [`crate::scribe::shards::ScribeShardRuntime::snapshot`] for the
+    /// `ScribeShardRuntime::snapshot` for the
     /// fan-out that merges results across all shards.
     #[must_use]
     pub fn shard_id(&self) -> usize {
@@ -1869,7 +1869,7 @@ impl FetchLiveTailService {
     ///
     /// The direct-memtable branch backs the narrow in-process adapter used by
     /// unit tests; production readers submit shard snapshots through
-    /// [`Self::with_runtime`].
+    /// `FetchLiveTailService::with_runtime`.
     #[must_use]
     pub fn new(stream: StreamIdentity, memtable: Arc<Memtable>) -> Self {
         Self {

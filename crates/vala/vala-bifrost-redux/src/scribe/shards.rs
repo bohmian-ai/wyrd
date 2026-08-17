@@ -286,7 +286,7 @@ pub(crate) enum ShardCommand {
     },
     /// Retire committed generations and acknowledge completion for test control.
     ///
-    /// Retirement is immediate: any [`ImmutableState::Committed`] generation is
+    /// Retirement is immediate: any `ImmutableState::Committed` generation is
     /// retired on this pass. The `response` fires after the owner completes the
     /// retirement and the test-support sweep, so the caller has a deterministic
     /// observation point.
@@ -895,7 +895,7 @@ impl ScribeShardRuntime {
     /// has completed its retirement pass. It lets integration journeys establish
     /// a deterministic observation point without changing production scheduling.
     ///
-    /// Retirement is immediate: all [`ImmutableState::Committed`] generations are
+    /// Retirement is immediate: all `ImmutableState::Committed` generations are
     /// retired on this call.
     ///
     /// # Errors
@@ -1737,7 +1737,7 @@ impl ShardOwner {
     /// Retires all committed generations on the current lifecycle sweep.
     ///
     /// A generation is eligible the moment its state is
-    /// [`ImmutableState::Committed`], which is only reached after the fenced
+    /// `ImmutableState::Committed`, which is only reached after the fenced
     /// `vala.file_list` + audit transaction commits. Retirement ordering is
     /// preserved: `admission.release_immutable` and `memory_ownership.release_immutable`
     /// are called before `ScribeWalIoOp::RetireWal` is submitted, so WAL

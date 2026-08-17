@@ -36,7 +36,7 @@ pub const ACTIVE_GENERATION_MAX_AGE: Duration = Duration::from_mins(10);
 /// Closed reason a memtable bucket was sealed/rotated (D83/D84 seam).
 ///
 /// Every seal or rotation event classifies into exactly one variant.
-/// [`MemtableBucket::should_seal_at`] distinguishes [`SealTriggerReason::Size`]
+/// `MemtableBucket::should_seal_at` distinguishes [`SealTriggerReason::Size`]
 /// from [`SealTriggerReason::Age`]; the coordinated ingress-pressure path tags
 /// [`SealTriggerReason::Pressure`]. T40 (18-H2) reads this to label the
 /// `bifrost_scribe_seal_total{trigger}` counter, so the variant names are a
@@ -386,7 +386,7 @@ impl Memtable {
     /// Returns the size/age trigger that would seal this key, if any.
     ///
     /// This is the reason-carrying form of [`Self::should_seal`]: it applies the
-    /// same size-then-age precedence as [`MemtableBucket::should_seal_at`] and
+    /// same size-then-age precedence as `MemtableBucket::should_seal_at` and
     /// returns the [`SealTriggerReason`] that fired so the caller (the shard
     /// rotation sweep) can split keys by trigger and label the
     /// `bifrost_scribe_seal_total{trigger}` counter (D84). Only `Size` and `Age`
@@ -1322,7 +1322,7 @@ pub(crate) struct CommittedRetirement {
 /// both forms here would double the Arrow memory charged to Scribe.
 ///
 /// The `shard_id` field carries the pod-local shard lane that froze this
-/// generation. It is set by the [`crate::scribe::shards::ShardOwner`] after
+/// generation. It is set by the `ScribeShardRuntime` owner after
 /// freezing so that post-commit routing can dispatch back to the correct lane
 /// without recomputing the routing key.
 #[derive(Debug, Clone)]

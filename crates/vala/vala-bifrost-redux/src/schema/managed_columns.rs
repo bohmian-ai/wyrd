@@ -75,7 +75,7 @@ pub(crate) fn row_ordinals(batch: &RecordBatch) -> Result<&Int32Array, RowOrdina
 /// Iceberg schema so the columnar write has a landing target. Optional card/run
 /// context stays nullable, while the authenticated principal and request identity
 /// are required. These columns do **not** perturb the user-fields-only
-/// [`SchemaFingerprint`], which is computed over the user fields alone in
+/// `SchemaFingerprint`, which is computed over the user fields alone in
 /// `create_table`.
 pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));

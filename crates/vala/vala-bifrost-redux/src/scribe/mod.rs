@@ -525,7 +525,7 @@ pub struct ScribeBuildConfig {
 /// Test-support input for exercising the private native transport seam.
 ///
 /// This DTO exists only under `test-support`; production callers cannot bypass
-/// Gate to construct a [`ScribeIngressFrame`].
+/// Gate to construct a `ScribeIngressFrame`.
 #[cfg(feature = "test-support")]
 pub struct NativeIngressTestFrame {
     /// Server-verified principal used by the fixture.
@@ -1355,12 +1355,12 @@ impl ScribeImpl {
 
     /// Retire all committed generations through an acknowledged test-only retirement pass.
     ///
-    /// Production lifecycle scheduling uses [`Self::check_age`] as a
+    /// Production lifecycle scheduling uses `Scribe::check_age` as a
     /// coalescing best-effort signal. Tests use this control when they need to
     /// observe the public read path after every eligible committed generation
     /// has been retired.
     ///
-    /// Retirement is immediate: all [`ImmutableState::Committed`] generations across
+    /// Retirement is immediate: all `ImmutableState::Committed` generations across
     /// every shard are retired on this call with no grace period.
     ///
     /// # Errors
@@ -1408,8 +1408,8 @@ impl ScribeImpl {
     /// Request a coordinated pressure seal that drains ingress toward low-water.
     ///
     /// This is the single definition of the flush-first hysteresis, shared by
-    /// the admission path ([`Self::prepare_and_dispatch`]) and the periodic age
-    /// scanner ([`Self::check_age`]). It is a no-op below the high-water mark;
+    /// the admission path (`Scribe::prepare_and_dispatch`) and the periodic age
+    /// scanner (`Scribe::check_age`). It is a no-op below the high-water mark;
     /// at or above it, it selects the largest writable buckets aggregated across
     /// all shards (shard-count-invariant, via
     /// [`memtable::Memtable::select_pressure_victims`]) sufficient to release
@@ -1444,7 +1444,7 @@ impl ScribeImpl {
     /// Publish one coalescing lifecycle age tick to every shard owner.
     ///
     /// The ingress-pressure branch shares its hysteresis with admission through
-    /// [`Self::request_pressure_seal_toward_low_water`]: crossing the ingress
+    /// `Scribe::request_pressure_seal_toward_low_water`: crossing the ingress
     /// high-water mark seals down toward low-water; below low-water it no-ops.
     /// The independent WAL-disk soft-pressure branch is unchanged.
     ///
@@ -1542,16 +1542,16 @@ impl ScribeImpl {
     /// Execute seal pre-commit stages (Freeze → Parquet → PUT → PG tx) for a
     /// specific seal-key on the caller's tenant-scoped transaction.
     ///
-    /// Returns a `SealCommit` handle whose post-commit token must be completed
+    /// Returns `ScribeCommitAttempt` handles whose post-commit tokens must be completed
     /// only after the caller commits the transaction. The caller owns commit/rollback.
     ///
     /// Repo rule (`check:from-pools-allowlist`): this signature MUST take
     /// `&mut vala_sql::TenantConn<'_>` and MUST NOT accept `sqlx::PgPool`.
     ///
     /// Under batch-spread routing a seal key may have buckets on several shards,
-    /// so [`crate::scribe::shards::ScribeShardRuntime::freeze_key`] now returns
+    /// so `ScribeShardRuntime::freeze_key` now returns
     /// every shard's frozen memtable. Each is pre-committed within the caller's
-    /// transaction and returned as a separate [`seal::SealCommit`], so no frozen
+    /// transaction and returned as a separate [`seal::ScribeCommitAttempt`], so no frozen
     /// Arrow data is orphaned. If any pre-commit fails after earlier ones
     /// succeeded, the already-committed generations are aborted back to the
     /// active ledger before the error is returned, mirroring
@@ -2036,7 +2036,7 @@ impl ScribeImpl {
     /// Pure read: it sums every shard's writable and immutable counters without
     /// touching admission or emitting telemetry, so both the admission-syncing
     /// [`Self::memtable_stats`] and the emission-only age scanner
-    /// ([`Self::check_age`]) can share one aggregation without one path forcing
+    /// (`Scribe::check_age`) can share one aggregation without one path forcing
     /// the other's side effects.
     ///
     /// # Errors

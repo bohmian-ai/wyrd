@@ -141,7 +141,7 @@ impl ScribeIngressCpuPool {
     /// Submit one native decode without waiting for an application queue slot.
     ///
     /// The `window` argument carries the pod-wide event-time acceptance bounds
-    /// sourced from [`AdmissionConfig`] by the caller. It is passed by value
+    /// sourced from `AdmissionConfig` by the caller. It is passed by value
     /// into the Rayon closure so no heap allocation is required.
     ///
     /// # Errors

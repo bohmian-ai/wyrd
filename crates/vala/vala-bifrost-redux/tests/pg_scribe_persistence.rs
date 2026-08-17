@@ -501,6 +501,12 @@ async fn register_replay_tables<T: AsRef<str>>(
     }
 }
 
+/// Seeds complete one-slice WAL batches and returns their aggregate decoded Arrow ownership.
+///
+/// # Panics
+///
+/// Panics when a managed Arrow batch, audit envelope, seal key, or complete WAL
+/// batch cannot be constructed and durably appended.
 fn write_replay_records<T: AsRef<str>>(
     wal: &WalWriter,
     table_names: &[T],
@@ -509,6 +515,7 @@ fn write_replay_records<T: AsRef<str>>(
     rows_per_generation: usize,
 ) -> usize {
     let mut decoded_bytes = 0_usize;
+    let replay_day = chrono::Utc::now().date_naive();
     for table_name in table_names {
         let table_name = table_name.as_ref();
         for value in 1_i64..=generations {
@@ -522,12 +529,10 @@ fn write_replay_records<T: AsRef<str>>(
             let key = vala_bifrost_redux::scribe::seal_key::SealKey::new(
                 tenant,
                 table(table_name),
-                vala_bifrost_redux::scribe::seal_key::EventDay::new(
-                    chrono::NaiveDate::from_ymd_opt(2026, 7, 24).expect("date"),
-                ),
+                vala_bifrost_redux::scribe::seal_key::EventDay::new(replay_day),
             );
-            wal.append_and_fsync_for_test(&key, batch_id, &audit, &data)
-                .expect("raw WAL append");
+            wal.append_and_commit_for_replay_test(&key, batch_id, &audit, &data)
+                .expect("complete replay WAL batch");
         }
     }
     decoded_bytes
@@ -659,6 +664,35 @@ fn managed_batch_bytes(
     writer.write(&batch).expect("IPC batch");
     writer.finish().expect("IPC finish");
     (bytes, decoded_bytes)
+}
+
+/// Derives a row count whose managed Arrow ownership strictly exceeds `limit_bytes`.
+///
+/// The managed fixture schema has linear buffer growth. Two adjacent fixed-size
+/// samples therefore expose its exact per-sample growth without hard-coding an
+/// assumed byte-per-row ratio into the capacity test.
+///
+/// # Panics
+///
+/// Panics when the managed fixture stops growing linearly or the derived row
+/// count exceeds the platform's addressable size.
+fn replay_rows_exceeding(limit_bytes: usize, tenant: DataTenantId) -> usize {
+    const SAMPLE_ROWS: usize = 1024;
+    let request_id = RequestId::now_v7();
+    let (_, one_sample) = managed_batch_bytes(1, tenant, [0_u8; 16], &request_id, SAMPLE_ROWS);
+    let (_, two_samples) = managed_batch_bytes(1, tenant, [0_u8; 16], &request_id, 2 * SAMPLE_ROWS);
+    let sample_growth = two_samples
+        .checked_sub(one_sample)
+        .expect("managed Arrow ownership grows between fixture samples");
+    let sample_count = limit_bytes
+        .saturating_sub(one_sample)
+        .checked_div(sample_growth)
+        .expect("fixture sample growth is positive")
+        .checked_add(2)
+        .expect("fixture sample count fits usize");
+    SAMPLE_ROWS
+        .checked_mul(sample_count)
+        .expect("fixture row count fits usize")
 }
 
 async fn append_one(fixture: &PersistenceFixture, table_name: &str, value: i64) {
@@ -824,21 +858,51 @@ fn assert_wal_lsn_chain(ranges: &[(i64, i64, String)], expected_len: usize) {
     );
 }
 
-async fn audit_count(fixture: &PersistenceFixture) -> i64 {
+/// Returns canonical ingest-control and visibility-publication audit cardinality.
+///
+/// # Panics
+///
+/// Panics when the repository-managed tenant connection or audit query fails.
+async fn audit_counts(fixture: &PersistenceFixture) -> (i64, i64) {
     let mut conn = fixture
         .database
         .tenant_conn_for(fixture.tenant)
         .await
         .expect("tenant connection");
-    sqlx::query_scalar(
-        "SELECT count(*)::bigint
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE operation = 'bifrost.append')::bigint,
+                count(*) FILTER (WHERE operation = 'bifrost.scribe.visibility.publish')::bigint
            FROM vala.audit_outbox
-          WHERE data_tenant_id = wyrd.current_tenant()
-            AND operation = 'bifrost.append'",
+          WHERE data_tenant_id = wyrd.current_tenant()",
     )
     .fetch_one(&mut **conn.transaction())
     .await
-    .expect("audit count")
+    .expect("operation-specific audit counts")
+}
+
+/// Returns ordered audit operation, request, resource, and principal identities.
+///
+/// # Panics
+///
+/// Panics when the repository-managed tenant connection or audit query fails.
+async fn audit_identities(
+    fixture: &PersistenceFixture,
+) -> Vec<(String, String, String, uuid::Uuid)> {
+    let mut conn = fixture
+        .database
+        .tenant_conn_for(fixture.tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query_as(
+        "SELECT operation, request_id, resource, principal_id
+           FROM vala.audit_outbox
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND operation IN ('bifrost.append', 'bifrost.scribe.visibility.publish')
+          ORDER BY seq",
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("ordered audit identities")
 }
 
 async fn object_paths(fixture: &PersistenceFixture) -> Vec<String> {
@@ -1023,6 +1087,7 @@ async fn failed_generation_reuses_deterministic_object_id() {
     fixture.stop().await;
 }
 
+/// A failed publication transaction retains its WAL while preserving only the prior ingest audit.
 #[tokio::test]
 async fn sql_failure_keeps_wal_and_file_list_unchanged() {
     let fixture = PersistenceFixture::start().await;
@@ -1038,7 +1103,7 @@ async fn sql_failure_keeps_wal_and_file_list_unchanged() {
 
     assert_eq!(fixture.scribe.wal_bytes_on_disk(), wal_before);
     assert!(rows(&fixture).await.is_empty());
-    assert_eq!(audit_count(&fixture).await, 0);
+    assert_eq!(audit_counts(&fixture).await, (1, 0));
     fixture.stop().await;
 }
 
@@ -1063,7 +1128,8 @@ async fn confirmed_commit_publishes_hint() {
 }
 
 /// A lost automatic COMMIT response transfers the exact generation into the
-/// runtime reconciler and completes without duplicate rows, audit, or objects.
+/// runtime reconciler and completes without duplicate rows, audit operations,
+/// or objects.
 #[tokio::test]
 async fn automatic_commit_ambiguity_reconciles_exactly_once() {
     let mut fixture = PersistenceFixture::start().await;
@@ -1086,7 +1152,20 @@ async fn automatic_commit_ambiguity_reconciles_exactly_once() {
     let artifacts = artifact_rows_for_table(&fixture, "automatic_ambiguous_commit_events").await;
     assert_eq!(artifacts.len(), 1, "retry preserves one artifact set");
     assert_catalog_object_parity(&fixture, &artifacts).await;
-    assert_eq!(audit_count(&fixture).await, 1, "retry preserves one audit");
+    assert_eq!(
+        audit_counts(&fixture).await,
+        (1, 1),
+        "retry preserves one ingest audit and one publication audit"
+    );
+    let audits = audit_identities(&fixture).await;
+    assert_eq!(audits.len(), 2);
+    assert_eq!(audits[0].0, "bifrost.append");
+    assert_eq!(audits[1].0, "bifrost.scribe.visibility.publish");
+    assert_eq!(
+        (&audits[0].1, &audits[0].2, &audits[0].3),
+        (&audits[1].1, &audits[1].2, &audits[1].3),
+        "publication retry must retain the ingest request, resource, and principal identity"
+    );
     assert_eq!(object_paths(&fixture).await.len(), 1);
     assert!(hint_outcome(&mut fixture).is_ok());
     assert!(matches!(
@@ -1096,11 +1175,11 @@ async fn automatic_commit_ambiguity_reconciles_exactly_once() {
     fixture.stop().await;
 }
 
-/// Proves the automatic persistence producer emits writer-v2 at the 832 MiB floor.
+/// Proves the automatic persistence producer emits writer-v2 at the exact mixed-role floor.
 #[tokio::test]
 async fn scribe_persistence_writer_v2_is_bounded_at_exact_floor() {
     let fixture =
-        PersistenceFixture::start_with_memory(persistence_test_roles(832 * 1024 * 1024)).await;
+        PersistenceFixture::start_with_memory(persistence_test_roles(768 * 1024 * 1024)).await;
     append_one(&fixture, "exact_floor_events", 1).await;
     fixture
         .scribe
@@ -1221,6 +1300,7 @@ async fn manifest_failure_after_commit_still_publishes_hint() {
     fixture.stop().await;
 }
 
+/// A post-commit manifest failure retains exactly one ingest and publication audit.
 #[tokio::test]
 async fn manifest_failure_retains_retryable_front() {
     let fixture = PersistenceFixture::start().await;
@@ -1237,7 +1317,7 @@ async fn manifest_failure_retains_retryable_front() {
         1,
         "SQL commits before manifest failure"
     );
-    assert_eq!(audit_count(&fixture).await, 1);
+    assert_eq!(audit_counts(&fixture).await, (1, 1));
 
     retry_and_wait(&fixture).await;
     assert_eq!(
@@ -1246,13 +1326,14 @@ async fn manifest_failure_retains_retryable_front() {
         "manifest retry must dedupe SQL"
     );
     assert_eq!(
-        audit_count(&fixture).await,
-        1,
-        "manifest retry must not duplicate audit"
+        audit_counts(&fixture).await,
+        (1, 1),
+        "manifest retry must not duplicate either audit operation"
     );
     fixture.stop().await;
 }
 
+/// The visibility row and publication audit roll back together after ingest was audited.
 #[tokio::test]
 async fn file_list_and_audit_commit_atomically() {
     let fixture = PersistenceFixture::start().await;
@@ -1265,11 +1346,11 @@ async fn file_list_and_audit_commit_atomically() {
         .expect("atomic SQL fault flush");
     wait_for_state(&fixture, 1).await;
     assert!(rows(&fixture).await.is_empty());
-    assert_eq!(audit_count(&fixture).await, 0);
+    assert_eq!(audit_counts(&fixture).await, (1, 0));
 
     retry_and_wait(&fixture).await;
     assert_eq!(rows(&fixture).await.len(), 1);
-    assert_eq!(audit_count(&fixture).await, 1);
+    assert_eq!(audit_counts(&fixture).await, (1, 1));
     fixture.stop().await;
 }
 
@@ -1325,7 +1406,7 @@ async fn replayed_generation_publishes_durably_after_restart() {
     // of disjoint WAL-LSN ranges (durable FIFO order lives in the WAL range, not
     // in `created_at`, which ties across the batched replay commits).
     assert_wal_lsn_chain(&rows_for_table(&fixture, "restart_publish_events").await, 3);
-    assert_eq!(audit_count(&fixture).await, 3);
+    assert_eq!(audit_counts(&fixture).await, (0, 3));
     assert_eq!(object_paths(&fixture).await.len(), 3);
     fixture.stop().await;
 }
@@ -1369,7 +1450,7 @@ async fn automatic_scribe_artifact_identity_survives_cross_epoch_restart() {
         "cross-epoch durable paths must be distinct: {rows:?}"
     );
     assert_catalog_object_parity(&fixture, &rows).await;
-    assert_eq!(audit_count(&fixture).await, 4);
+    assert_eq!(audit_counts(&fixture).await, (1, 4));
     fixture.stop().await;
 }
 
@@ -1449,7 +1530,25 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
 async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
     let memory = persistence_test_roles(1024 * 1024 * 1024);
     let baseline = memory.snapshot().expect("baseline root snapshot");
-    let tables = (1..=160)
+    let replay_ceiling = baseline
+        .plan
+        .scribe_floor_bytes
+        .checked_add(baseline.plan.elastic_memory_bytes)
+        .expect("test Scribe ceiling fits usize");
+    let rows_per_generation = 10_000;
+    let request_id = RequestId::now_v7();
+    let (_, generation_bytes) = managed_batch_bytes(
+        1,
+        DataTenantId::SYSTEM_OWNER,
+        [0_u8; 16],
+        &request_id,
+        rows_per_generation,
+    );
+    let table_count = replay_ceiling
+        .checked_div(generation_bytes)
+        .expect("replay generation owns positive memory")
+        .saturating_add(1);
+    let tables = (1..=table_count)
         .map(|index| format!("bounded_replay_{index}"))
         .collect::<Vec<_>>();
     let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
@@ -1459,15 +1558,15 @@ async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
         &[Duration::from_millis(1)],
         memory,
         1,
-        10_000,
+        rows_per_generation,
     )
     .await
     .expect("bounded replay completes with one WAL worker");
     assert!(
-        fixture.replay_decoded_bytes > baseline.plan.scribe_floor_bytes,
+        fixture.replay_decoded_bytes > replay_ceiling,
         "aggregate decoded WAL ownership {} must exceed the Scribe ceiling {}",
         fixture.replay_decoded_bytes,
-        baseline.plan.scribe_floor_bytes,
+        replay_ceiling,
     );
     assert!(fixture.scribe.is_ready());
     for table_name in &tables {
@@ -1494,14 +1593,20 @@ async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
 async fn replay_indivisible_generation_over_ceiling_stays_unready() {
     let memory = persistence_test_roles(1024 * 1024 * 1024);
     let baseline = memory.snapshot().expect("baseline root snapshot");
+    let replay_ceiling = baseline
+        .plan
+        .scribe_floor_bytes
+        .checked_add(baseline.plan.elastic_memory_bytes)
+        .expect("test Scribe ceiling fits usize");
+    let oversized_rows = replay_rows_exceeding(replay_ceiling, DataTenantId::SYSTEM_OWNER);
     let error = match PersistenceFixture::start_after_wal_restart_with_keys(
         false,
-        &["oversized_replay", "later_replay"],
+        &["oversized_replay"],
         1,
         &[Duration::from_millis(1)],
         memory.clone(),
         1,
-        100_000,
+        oversized_rows,
     )
     .await
     {
@@ -1570,7 +1675,7 @@ async fn replayed_distinct_keys_publish_in_replay_order_and_fifo() {
     for table_name in ["restart_key_a", "restart_key_b"] {
         assert_wal_lsn_chain(&rows_for_table(&fixture, table_name).await, 2);
     }
-    assert_eq!(audit_count(&fixture).await, 4);
+    assert_eq!(audit_counts(&fixture).await, (0, 4));
     assert_eq!(object_paths(&fixture).await.len(), 4);
     fixture.stop().await;
 }
@@ -1717,8 +1822,10 @@ async fn persistence_headroom_survives_oracle_range_overlap() {
 #[tokio::test]
 async fn native_caller_event_time_lands_on_two_partition_days() {
     let fixture = PersistenceFixture::start().await;
-    let first_day = chrono::Utc::now().date_naive();
-    let second_day = first_day.succ_opt().expect("current date has a successor");
+    let second_day = chrono::Utc::now().date_naive();
+    let first_day = second_day
+        .pred_opt()
+        .expect("current date has a predecessor");
     let first_day_micros = first_day
         .and_hms_opt(12, 0, 0)
         .expect("valid time")

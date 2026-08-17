@@ -8,7 +8,7 @@
 use wyrd_runtime::PermissionDenyReason;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_tonic::tonic::{Code, Status};
+use wyrd_tonic::tonic::{Code, Status, metadata::MetadataValue};
 use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
 /// Error domain used in the attached `google.rpc.ErrorInfo`.
@@ -300,10 +300,9 @@ impl IngestError {
         let mut status =
             Status::with_error_details(grpc_code_for_wyrd(&public), public.to_string(), details);
         if retryable_busy {
-            status.metadata_mut().insert(
-                "retry-after-ms",
-                "1000".parse().expect("static metadata is valid"),
-            );
+            status
+                .metadata_mut()
+                .insert("retry-after-ms", MetadataValue::from_static("1000"));
         }
         status
     }

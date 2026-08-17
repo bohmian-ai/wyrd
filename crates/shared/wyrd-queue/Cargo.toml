@@ -26,7 +26,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 serde_json = { workspace = true }

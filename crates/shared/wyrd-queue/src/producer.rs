@@ -626,6 +626,8 @@ impl Producer {
                         state,
                         flush_max_rows: config.flush_max_rows(),
                         flush_interval_ms: config.flush_interval_ms,
+                        retry_attempt: 0,
+                        retry_deadline: None,
                         lifetime: None,
                     },
                     fixed_storage,
@@ -791,6 +793,10 @@ struct Task {
     flush_max_rows: usize,
     /// Optional periodic flush interval.
     flush_interval_ms: u64,
+    /// Attempt number used to derive the next retained-batch retry delay.
+    retry_attempt: u32,
+    /// Scheduled instant for the oldest retained ambiguity, if one is waiting.
+    retry_deadline: Option<tokio::time::Instant>,
     /// Fixed storage and producer admission held through task-owned state drop.
     lifetime: Option<TaskLifetime>,
 }
@@ -808,16 +814,46 @@ impl Task {
                 biased;
                 control = self.ctrl_rx.recv() => match control {
                     Some(Ctrl::Flush(reply)) => {
-                        self.drain_channel().await;
-                        let result = self.queue.seal_and_send().await.map(|outcome| outcome.batch_ids);
+                        let result = if self.retry_deadline.is_some() {
+                            Err(WyrdQueueError::FlushTimeout)
+                        } else {
+                            self.drain_channel().await;
+                            match self.queue.seal_and_send().await {
+                                Ok(outcome) => {
+                                    self.reset_retry_schedule();
+                                    Ok(outcome.batch_ids)
+                                }
+                                Err(error) => {
+                                    self.schedule_retry_if_retained();
+                                    Err(error)
+                                }
+                            }
+                        };
                         self.control_pending.store(false, Ordering::Release);
                         let _ = reply.send(result);
                     }
                     Some(Ctrl::Shutdown(reply)) => {
                         self.state.store(DRAINING, Ordering::Release);
                         self.rx.close();
-                        self.drain_channel().await;
-                        let result = self.drain_to_completion().await;
+                        let result = if self.retry_deadline.is_some() {
+                            Err(WyrdQueueError::FlushTimeout)
+                        } else {
+                            self.drain_channel().await;
+                            match self.queue.seal_and_send().await {
+                                Ok(_) => {
+                                    self.reset_retry_schedule();
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    self.schedule_retry_if_retained();
+                                    if self.retry_deadline.is_some() {
+                                        Err(WyrdQueueError::FlushTimeout)
+                                    } else {
+                                        Err(error)
+                                    }
+                                }
+                            }
+                        };
                         if result.is_ok() {
                             self.state.store(DRAINED, Ordering::Release);
                             self.control_pending.store(false, Ordering::Release);
@@ -833,12 +869,15 @@ impl Task {
                         return None;
                     }
                 },
-                row = self.rx.recv() => match row {
+                row = self.rx.recv(), if self.retry_deadline.is_none() => match row {
                     Some(row) => {
                         self.channel_depth.fetch_sub(1, Ordering::AcqRel);
                         self.queue.ingest(row).await;
                         if self.queue.staging_len() >= self.flush_max_rows {
-                            let _ = self.queue.seal_and_send().await;
+                            match self.queue.seal_and_send().await {
+                                Ok(_) => self.reset_retry_schedule(),
+                                Err(_) => self.schedule_retry_if_retained(),
+                            }
                         }
                     }
                     None => {
@@ -849,8 +888,18 @@ impl Task {
                     }
                 },
                 () = tick(&mut ticker) => {
-                    if self.queue.staging_len() > 0 {
-                        let _ = self.queue.seal_and_send().await;
+                    if self.retry_deadline.is_none() && self.queue.staging_len() > 0 {
+                        match self.queue.seal_and_send().await {
+                            Ok(_) => self.reset_retry_schedule(),
+                            Err(_) => self.schedule_retry_if_retained(),
+                        }
+                    }
+                },
+                () = wait_for_retry(self.retry_deadline), if self.retry_deadline.is_some() => {
+                    self.retry_deadline = None;
+                    match self.queue.seal_and_send().await {
+                        Ok(_) => self.reset_retry_schedule(),
+                        Err(_) => self.schedule_retry_if_retained(),
                     }
                 },
             }
@@ -865,13 +914,21 @@ impl Task {
         }
     }
 
-    /// Repeats seal attempts until no row or ambiguous batch owner remains.
-    async fn drain_to_completion(&mut self) -> Result<(), WyrdQueueError> {
-        self.drain_channel().await;
-        while self.queue.has_pending() {
-            self.queue.seal_and_send().await?;
-        }
-        Ok(())
+    /// Schedules the retained owner without changing its permit or identity.
+    fn schedule_retry_if_retained(&mut self) {
+        let Some(batch_id) = self.queue.retry_batch_id() else {
+            self.reset_retry_schedule();
+            return;
+        };
+        self.retry_deadline =
+            Some(tokio::time::Instant::now() + retry_backoff(batch_id, self.retry_attempt));
+        self.retry_attempt = self.retry_attempt.saturating_add(1);
+    }
+
+    /// Clears retry timing after ACK or terminal settlement consumes the owner.
+    fn reset_retry_schedule(&mut self) {
+        self.retry_attempt = 0;
+        self.retry_deadline = None;
     }
 
     /// Resolves a dropped handle's ambiguous work before releasing task-owned capacity.
@@ -883,7 +940,10 @@ impl Task {
     /// no pending work and permits task cleanup.
     async fn drain_dropped_handle(&mut self) {
         self.drain_channel().await;
-        let mut attempt = 0_u32;
+        if let Some(deadline) = self.retry_deadline.take() {
+            tokio::time::sleep_until(deadline).await;
+        }
+        let mut attempt = self.retry_attempt;
         while self.queue.has_pending() {
             match self.queue.seal_and_send().await {
                 Ok(_) => attempt = 0,
@@ -920,6 +980,14 @@ fn retry_backoff(batch_id: [u8; 16], attempt: u32) -> Duration {
     Duration::from_millis(floor + mixed % (ceiling - floor + 1))
 }
 
+/// Waits until a retained-batch deadline while remaining cancellation-safe in `select!`.
+async fn wait_for_retry(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Creates the optional interval only after entering the shared Tokio runtime.
 fn make_ticker(interval_ms: u64) -> Option<Interval> {
     if interval_ms == 0 {
@@ -944,19 +1012,20 @@ async fn tick(ticker: &mut Option<Interval>) {
 mod tests {
     //! Bounded ownership tests for the ordinary Rust queue.
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
-    use tokio::sync::Notify;
+    use crossbeam_queue::ArrayQueue;
+    use tokio::sync::{Notify, mpsc, oneshot};
     use wyrd_spec::reference::CardRef;
 
-    use super::ClientByteBudget;
+    use super::{ClientByteBudget, Counters, Ctrl, RUNNING, Task};
     use crate::{
-        BatchSink, ClientByteGuard, DurableBatchAck, MockSink, Producer, QueueConfig, SealedBatch,
-        SinkError, WyrdQueueError,
+        BatchSink, ClientByteGuard, DurableBatchAck, MockSink, Producer, QueueConfig, RecordQueue,
+        Row, SealedBatch, SinkError, WyrdQueueError,
     };
 
     /// Builds a one-column user schema for sealed-batch tests.
@@ -967,6 +1036,57 @@ mod tests {
     /// Builds the card correlation required by a queue row.
     fn card() -> CardRef {
         "prod/Service/queue@1.0.0".parse().expect("valid test card")
+    }
+
+    /// Builds an unspawned task whose channels are exposed for paused-time control tests.
+    fn task_fixture(
+        sink: Arc<MockSink>,
+        config: QueueConfig,
+    ) -> (
+        Task,
+        mpsc::Sender<Row>,
+        mpsc::Sender<Ctrl>,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+        ClientByteBudget,
+    ) {
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let staging = Arc::new(ArrayQueue::new(8));
+        let counters = Arc::new(Counters::default());
+        let (tx, rx) = mpsc::channel(8);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let control_pending = Arc::new(AtomicBool::new(false));
+        let channel_depth = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(AtomicU8::new(RUNNING));
+        let queue = RecordQueue::new(
+            "events".to_owned(),
+            schema(),
+            staging,
+            sink,
+            config,
+            budget.clone(),
+            counters,
+        );
+        (
+            Task {
+                queue,
+                rx,
+                ctrl_rx,
+                control_pending: control_pending.clone(),
+                channel_depth: channel_depth.clone(),
+                state,
+                flush_max_rows: config.flush_max_rows(),
+                flush_interval_ms: config.flush_interval_ms,
+                retry_attempt: 0,
+                retry_deadline: None,
+                lifetime: None,
+            },
+            tx,
+            ctrl_tx,
+            control_pending,
+            channel_depth,
+            budget,
+        )
     }
 
     /// Cancellable sink that acknowledges only after the test releases it.
@@ -1461,14 +1581,17 @@ mod tests {
         );
         assert!(
             producer.flush().is_err(),
-            "reattempt remains ambiguous without reacquiring its occupied slot"
+            "control cannot bypass the scheduled retained attempt"
         );
         assert_eq!(
             budget.metrics().retry_entries,
             QueueConfig::MAX_LIVE_ENTRIES
         );
         drop(saturated);
-        producer.flush().expect("retained batch retries");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while sink.attempted().len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let attempts = sink.attempted();
         assert_eq!(attempts.len(), 3);
         assert_eq!(attempts[0], attempts[1]);
@@ -1569,5 +1692,69 @@ mod tests {
             assert!(*delay >= Duration::from_millis(ceiling / 2));
             assert!(*delay <= Duration::from_millis(ceiling));
         }
+    }
+
+    /// Live shutdown controls remain responsive while one retained retry waits for its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn live_handle_retry_deadline_is_control_aware() {
+        let sink = Arc::new(MockSink::new());
+        sink.fail_next(1);
+        let config = QueueConfig {
+            flush_interval_ms: 0,
+            flush_timeout_ms: 50,
+            ..QueueConfig::default()
+        };
+        let (task, tx, ctrl_tx, control_pending, channel_depth, budget) =
+            task_fixture(sink.clone(), config);
+        let task_handle = tokio::spawn(task.run());
+        let json = br#"{"id":1}"#.to_vec();
+        let guard = budget.reserve(json.capacity()).expect("row bytes fit");
+        tx.send(Row {
+            json,
+            card_ref: card(),
+            run_id: None,
+            _guard: guard,
+        })
+        .await
+        .expect("task row channel is open");
+        channel_depth.fetch_add(1, Ordering::Release);
+
+        let (first_tx, first_rx) = oneshot::channel();
+        ctrl_tx
+            .send(Ctrl::Shutdown(first_tx))
+            .await
+            .expect("first shutdown reaches task");
+        assert!(matches!(
+            first_rx.await.expect("first shutdown replies"),
+            Err(WyrdQueueError::FlushTimeout)
+        ));
+        let batch_id = sink.attempted()[0];
+        let delay = super::retry_backoff(batch_id, 0);
+        assert_eq!(sink.attempted().len(), 1);
+        assert_eq!(budget.metrics().retry_entries, 1);
+
+        for _ in 0..2 {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            ctrl_tx
+                .send(Ctrl::Shutdown(reply_tx))
+                .await
+                .expect("later shutdown reaches task");
+            assert!(matches!(
+                reply_rx.await.expect("later shutdown replies"),
+                Err(WyrdQueueError::FlushTimeout)
+            ));
+            assert_eq!(sink.attempted().len(), 1, "control cannot amplify retry");
+            assert!(!control_pending.load(Ordering::Acquire));
+        }
+
+        tokio::time::advance(delay - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.attempted().len(), 1, "retry waits for deadline");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.attempted(), vec![batch_id, batch_id]);
+        assert_eq!(budget.metrics().retry_entries, 0);
+        assert_eq!(budget.metrics().live_batches, 0);
+        task_handle.abort();
     }
 }

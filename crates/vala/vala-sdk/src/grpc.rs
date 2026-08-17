@@ -252,10 +252,13 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::Retryable`] for an ambiguous unavailable outcome
-    /// and [`SinkError::Terminal`] for frame validation or a terminal server
-    /// failure. Cancellation before an ACK leaves the queue's borrowed owner
-    /// intact for retry resolution.
+    /// Returns [`SinkError::Retryable`] for ambiguous transport unavailability
+    /// and for stable `WYRD_VALA_429_INGEST_BUSY`, whose no-write contract
+    /// requires retrying the exact borrowed batch owner. Returns
+    /// [`SinkError::Terminal`] for frame validation and every other server
+    /// refusal, including permanent `RESOURCE_EXHAUSTED` identities.
+    /// Cancellation before an ACK leaves the queue's borrowed UUID, bytes, and
+    /// permit intact for retry resolution.
     async fn insert_batch(
         &self,
         batch: &SealedBatch<ClientByteGuard>,
@@ -382,6 +385,83 @@ fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use secrecy::SecretString;
+    use tokio::sync::Mutex;
+    use wyrd_client::auth::AuthMiddleware;
+    use wyrd_client::config::ClientConfig;
+    use wyrd_client::transport::HttpTransport;
+    use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_tonic::tonic::Response;
+    use wyrd_tonic::tonic::transport::Server;
+    use wyrd_tonic::wyrd::v1::InsertBatchResponse;
+    use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
+        BifrostIngestService, BifrostIngestServiceServer,
+    };
+
+    /// Scripted real gRPC service that returns busy, ACK, then permanent capacity.
+    #[derive(Clone, Default)]
+    struct ScriptedIngest {
+        /// Ordered stable batch identities observed at the RPC boundary.
+        batch_ids: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// Selects the next scripted response without serializing request recording.
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[wyrd_tonic::tonic::async_trait]
+    impl BifrostIngestService for ScriptedIngest {
+        /// Returns stable busy once, acknowledges its retry, then refuses permanently.
+        ///
+        /// # Errors
+        ///
+        /// Returns scripted stable busy and WAL-capacity statuses so the real
+        /// client transport proves its retry and terminal classification.
+        async fn insert_batch(
+            &self,
+            request: Request<InsertBatchRequest>,
+        ) -> Result<Response<InsertBatchResponse>, Status> {
+            let request = request.into_inner();
+            self.batch_ids
+                .lock()
+                .await
+                .push(request.wyrd_batch_id.to_vec());
+            match self.attempts.fetch_add(1, Ordering::AcqRel) {
+                0 => {
+                    use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
+                    let mut status = Status::with_error_details(
+                        Code::ResourceExhausted,
+                        "ingest coordinator busy for table events — local buffer full",
+                        ErrorDetails::with_error_info(
+                            "WYRD_VALA_429_INGEST_BUSY",
+                            "wyrd.dev",
+                            [] as [(String, String); 0],
+                        ),
+                    );
+                    status
+                        .metadata_mut()
+                        .insert("retry-after-ms", MetadataValue::from_static("1000"));
+                    Err(status)
+                }
+                1 => Ok(Response::new(InsertBatchResponse {
+                    wyrd_batch_id: request.wyrd_batch_id,
+                })),
+                _ => {
+                    use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
+                    Err(Status::with_error_details(
+                        Code::ResourceExhausted,
+                        "ingest WAL storage is unavailable",
+                        ErrorDetails::with_error_info(
+                            "WYRD_VALA_507_WAL_DISK_FULL",
+                            "wyrd.dev",
+                            [] as [(String, String); 0],
+                        ),
+                    ))
+                }
+            }
+        }
+    }
 
     #[test]
     fn frame_limit_is_enforced() {
@@ -408,10 +488,60 @@ mod tests {
     }
 
     /// Stable busy retries while every other capacity status terminalizes.
-    #[test]
-    fn ingest_busy_retries_same_batch_and_permanent_capacity_is_terminal() {
+    #[tokio::test]
+    async fn ingest_busy_retries_same_batch_and_permanent_capacity_is_terminal() {
         use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
+        let service = ScriptedIngest::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test port binds");
+        let address = listener.local_addr().expect("test address resolves");
+        drop(listener);
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(BifrostIngestServiceServer::new(service.clone()))
+                .serve(address),
+        );
+        tokio::task::yield_now().await;
+
+        let config = ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: format!("http://{address}"),
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            ..ClientConfig::default()
+        };
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::BearerToken(SecretString::from("test-token")),
+        )
+        .expect("test auth builds");
+        let http = HttpTransport::new(&config.http, auth.clone()).expect("test HTTP layer builds");
+        let client = WyrdClient::from_parts(auth, http, config.grpc);
+        let transport = BifrostGrpcTransport::connect_with_config(
+            &client,
+            BifrostTransportConfig::with_max_frame_retries(3),
+        )
+        .await
+        .expect("real test gRPC transport connects");
+        let batch_id = Uuid::now_v7().into_bytes();
+        transport
+            .insert_batch("events", batch_id, vec![1, 2, 3])
+            .await
+            .expect("stable busy retries to concrete ACK");
+        let observed = service.batch_ids.lock().await.clone();
+        assert_eq!(observed, vec![batch_id.to_vec(), batch_id.to_vec()]);
+
+        let terminal = transport
+            .insert_batch("events", Uuid::now_v7().into_bytes(), vec![4])
+            .await
+            .expect_err("permanent capacity terminalizes without retry");
+        assert_ne!(terminal.code(), "WYRD_VALA_429_INGEST_BUSY");
+        assert_eq!(service.attempts.load(Ordering::Acquire), 3);
+        server.abort();
+
+        // Pin the classifier independently so malformed capacity identities
+        // cannot become transport retries if the scripted server changes.
         let busy = Status::with_error_details(
             Code::ResourceExhausted,
             "ingest coordinator busy for table events — local buffer full",
@@ -421,9 +551,7 @@ mod tests {
                 [] as [(String, String); 0],
             ),
         );
-        let busy = AttemptError::from_status(busy);
-        assert!(busy.retryable);
-        assert_eq!(busy.error.code(), "WYRD_VALA_429_INGEST_BUSY");
+        assert!(AttemptError::from_status(busy).retryable);
 
         for reason in [
             "WYRD_VALA_413_PAYLOAD_TOO_LARGE",

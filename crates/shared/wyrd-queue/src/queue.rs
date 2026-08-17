@@ -387,7 +387,7 @@ mod tests {
             .flat_map(|receipt| {
                 StreamReader::try_new(Cursor::new(&receipt.bytes), None)
                     .expect("receipt is valid IPC")
-                    .map(|batch| {
+                    .flat_map(|batch| {
                         let batch = batch.expect("receipt batch decodes");
                         let ids = batch
                             .column(0)
@@ -398,7 +398,6 @@ mod tests {
                             .map(|index| ids.value(index))
                             .collect::<Vec<_>>()
                     })
-                    .flatten()
                     .collect::<Vec<_>>()
             })
             .collect()

@@ -1328,6 +1328,81 @@ struct FenceRegistry {
     pending_payload_bytes: usize,
     /// Fixed scalar lifecycle observations emitted by this enforcing registry.
     lifecycle: TailOwnershipSnapshot,
+    /// Whether terminal teardown has closed every future fence acquisition.
+    terminal: bool,
+}
+
+impl FenceRegistry {
+    /// Closes admission and settles every retained root-backed fence owner.
+    ///
+    /// Pending guards borrow their [`ScribeTailReader`], so final reader
+    /// destruction cannot reach this operation until their cancellation or
+    /// transfer has settled. An explicit terminal close enforces the same
+    /// invariant before releasing any retained owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TailReadError::State`] without releasing retained owners when
+    /// pending acquisition facts have not settled or checked lifecycle
+    /// arithmetic diverges. Admission remains terminally closed so cancellation
+    /// can settle those pending guards before an idempotent retry.
+    fn drain_terminal(&mut self) -> Result<TailOwnershipSnapshot, TailReadError> {
+        self.terminal = true;
+        if self.pending_fences != 0 || self.pending_payload_bytes != 0 {
+            return Err(TailReadError::State {
+                detail: "tail terminal drain observed an unsettled pending acquisition".to_owned(),
+            });
+        }
+        let release_count =
+            u64::try_from(self.retained.len()).map_err(|error| TailReadError::State {
+                detail: format!("tail terminal release count does not fit u64: {error}"),
+            })?;
+        let released_bytes = self.retained.values().try_fold(0usize, |bytes, retained| {
+            bytes
+                .checked_add(retained.owner.bytes())
+                .ok_or_else(|| TailReadError::State {
+                    detail: "tail terminal release byte count overflow".to_owned(),
+                })
+        })?;
+        let active_reservations = self
+            .lifecycle
+            .active_reservations
+            .checked_sub(self.retained.len())
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail terminal active reservation count underflow".to_owned(),
+            })?;
+        let active_reserved_bytes = self
+            .lifecycle
+            .active_reserved_bytes
+            .checked_sub(released_bytes)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail terminal active reservation bytes underflow".to_owned(),
+            })?;
+        let releases = self
+            .lifecycle
+            .releases
+            .checked_add(release_count)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail terminal release count overflow".to_owned(),
+            })?;
+        let total_released_bytes = self
+            .lifecycle
+            .released_bytes
+            .checked_add(released_bytes)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail terminal cumulative release bytes overflow".to_owned(),
+            })?;
+
+        let retained = std::mem::take(&mut self.retained);
+        self.retained_bytes = 0;
+        self.released.clear();
+        self.lifecycle.releases = releases;
+        self.lifecycle.released_bytes = total_released_bytes;
+        self.lifecycle.active_reservations = active_reservations;
+        self.lifecycle.active_reserved_bytes = active_reserved_bytes;
+        drop(retained);
+        Ok(self.lifecycle)
+    }
 }
 
 /// Fixed-size live-tail ownership facts from plan through terminal settlement.
@@ -1466,7 +1541,8 @@ impl PendingFence<'_> {
     /// # Errors
     ///
     /// Returns [`TailReadError::State`] when materialization did not complete,
-    /// the registry lock is poisoned, or pending accounting diverges.
+    /// terminal shutdown closed the registry, the registry lock is poisoned,
+    /// or pending accounting diverges.
     fn retain(
         mut self,
         fence: tail::TailReadFence,
@@ -1486,6 +1562,11 @@ impl PendingFence<'_> {
             .map_err(|error| TailReadError::State {
                 detail: format!("tail fence registry lock poisoned: {error}"),
             })?;
+        if registry.terminal {
+            return Err(TailReadError::State {
+                detail: "tail fence registry closed during materialization".to_owned(),
+            });
+        }
         let pending_fences =
             registry
                 .pending_fences
@@ -1581,8 +1662,29 @@ impl ScribeTailReader {
                 pending_fences: 0,
                 pending_payload_bytes: 0,
                 lifecycle: TailOwnershipSnapshot::default(),
+                terminal: false,
             }),
         }
+    }
+
+    /// Closes this reader and settles its retained root-backed fence owners.
+    ///
+    /// This is the same terminal operation invoked by [`Drop`]. It remains
+    /// crate-private so shutdown does not add a public or wire lifecycle API.
+    /// A successful second invocation is an idempotent snapshot read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TailReadError::State`] when a pending acquisition has not
+    /// settled or exact lifecycle arithmetic diverges. A poisoned lock is
+    /// recovered only for terminal owner settlement, and the registry remains
+    /// closed to new acquisitions on failure.
+    pub(crate) fn drain_terminal(&self) -> Result<TailOwnershipSnapshot, TailReadError> {
+        let mut registry = self.fences.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("recovering poisoned tail registry for terminal owner drain");
+            poisoned.into_inner()
+        });
+        registry.drain_terminal()
     }
 
     /// Returns the exact local stream incarnation used for ticket validation.
@@ -1812,15 +1914,18 @@ impl ScribeTailReader {
     /// # Errors
     ///
     /// Returns [`TailReadError::Capacity`] before materialization when the fixed
-    /// fence/aggregate payload ceiling is exhausted or the Scribe root refuses
-    /// the current-root/configured payload plus simultaneous descriptor
-    /// ceiling. Returns [`TailReadError::State`] when checked arithmetic or the
-    /// registry lock fails.
+    /// fence/aggregate payload ceiling is exhausted, terminal shutdown closed
+    /// admission, or the Scribe root refuses the current-root/configured payload
+    /// plus simultaneous descriptor ceiling. Returns [`TailReadError::State`]
+    /// when checked arithmetic or the registry lock fails.
     fn reserve_pending_fence(&self) -> Result<PendingFence<'_>, TailReadError> {
         let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
             detail: format!("tail fence registry lock poisoned: {error}"),
         })?;
         Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
+        if registry.terminal {
+            return Err(TailReadError::Capacity);
+        }
         if registry
             .retained
             .len()
@@ -2198,6 +2303,15 @@ impl ScribeTailReader {
     }
 }
 
+impl Drop for ScribeTailReader {
+    /// Runs the enforcing registry's terminal owner drain before destruction.
+    fn drop(&mut self) {
+        if let Err(error) = self.drain_terminal() {
+            tracing::error!(%error, "Scribe tail terminal owner drain failed");
+        }
+    }
+}
+
 /// Exact, bounded hot-read request handed from Oracle to Scribe.
 #[derive(Debug, Clone)]
 pub struct FetchLiveTailRequest {
@@ -2447,12 +2561,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        FetchLiveTailService, LocalTailReadTransport, ScribeTailReader, TailFenceConfig,
-        TailReadError, TailReadTransport, TailTicketAudience, TailTicketBinding, TailTicketClaims,
-        TailTicketVerifier, cursor_cmp,
+        FetchLiveTailService, LocalTailReadTransport, RetainedBatch, ScribeTailReader,
+        TailFenceConfig, TailReadError, TailReadTransport, TailTicketAudience, TailTicketBinding,
+        TailTicketClaims, TailTicketVerifier, cursor_cmp,
     };
     use crate::scribe::memtable::Memtable;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
+    use crate::scribe::wal::WalLsn;
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::api as tail;
     use wyrd_spec::vala::api::{
@@ -2723,6 +2840,197 @@ mod tests {
         assert_eq!(released.active_reserved_bytes, 0);
         assert_eq!(released.planned_bytes, released.reserved_bytes);
         assert_eq!(released.reserved_bytes, released.released_bytes);
+    }
+
+    /// Nonempty retained owner and its exact pre-acquire root baseline.
+    struct RetainedTerminalFixture {
+        /// Reader whose production terminal path owns the retained fence.
+        reader: ScribeTailReader,
+        /// Authoritative root used to prove exact terminal release.
+        resources: crate::resources::ScribeResources,
+        /// Root bytes in use before the fence reservation.
+        baseline_bytes: usize,
+        /// Lifecycle facts immediately before terminal settlement.
+        active: super::TailOwnershipSnapshot,
+    }
+
+    /// Acquires one nonempty retained fence under its production root owner.
+    fn retained_terminal_fixture() -> RetainedTerminalFixture {
+        let tenant = DataTenantId::new_v7();
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let resources = tail_resources();
+        let baseline_bytes = resources
+            .snapshot()
+            .expect("baseline root snapshot")
+            .scribe_memory_used_bytes;
+        let reader = ScribeTailReader::new(
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                resources.clone(),
+            )),
+            TailFenceConfig::default(),
+        );
+        let mut pending = reader
+            .reserve_pending_fence()
+            .expect("terminal fixture reserves one root-backed owner");
+        let batch = Arc::new(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![7_i64]))],
+            )
+            .expect("terminal fixture batch"),
+        );
+        let payload_bytes = batch.get_array_memory_size();
+        let batches = vec![RetainedBatch {
+            lsn: WalLsn::new(1),
+            batch_id: uuid::Uuid::now_v7(),
+            rows: batch,
+        }];
+        let descriptor_bytes = batches
+            .capacity()
+            .checked_mul(std::mem::size_of::<RetainedBatch>())
+            .expect("one retained descriptor fits usize");
+        pending
+            .materialized(payload_bytes, descriptor_bytes)
+            .expect("terminal fixture materializes under its root owner");
+        let request = empty_fence_request(tenant);
+        let fence = tail::TailReadFence {
+            fence_id: tail::TailFenceId::new(uuid::Uuid::now_v7()),
+            binding: request.binding,
+            event_day: request.event_day,
+            stream: tail::TailStreamIdentity {
+                node_id: tail::NodeId::new(stream.node_id.as_uuid()),
+                writer_epoch: 1,
+            },
+            exclusive_sealed: request.exclusive_sealed,
+            inclusive_live: TailCursor {
+                writer_epoch: 1,
+                wal_lsn: 1,
+                batch_id: batches[0].batch_id,
+                row_ordinal: 0,
+            },
+            schema_fingerprint: request.schema_fingerprint,
+            tail_protocol_version: 1,
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(5),
+        };
+        pending
+            .retain(fence, batches, Duration::from_secs(5), payload_bytes)
+            .expect("terminal fixture retains one nonempty fence");
+        let active = reader
+            .ownership_snapshot_for_test()
+            .expect("active terminal fixture snapshot");
+        assert_eq!(active.releases, 0);
+        assert_eq!(active.active_reservations, 1);
+        assert!(active.active_reserved_bytes > 0);
+        assert!(
+            resources
+                .snapshot()
+                .expect("active root snapshot")
+                .scribe_memory_used_bytes
+                > baseline_bytes
+        );
+        RetainedTerminalFixture {
+            reader,
+            resources,
+            baseline_bytes,
+            active,
+        }
+    }
+
+    /// Terminal drain settles one nonempty retained owner and is idempotent.
+    #[tokio::test]
+    async fn terminal_drain_settles_retained_owner_once() {
+        let fixture = retained_terminal_fixture();
+        let drained = fixture
+            .reader
+            .drain_terminal()
+            .expect("production terminal drain settles the retained owner");
+        assert_eq!(drained.releases, fixture.active.releases + 1);
+        assert_eq!(
+            drained.released_bytes,
+            fixture.active.released_bytes + fixture.active.active_reserved_bytes
+        );
+        assert_eq!(drained.active_reservations, 0);
+        assert_eq!(drained.active_reserved_bytes, 0);
+        assert_eq!(
+            fixture
+                .resources
+                .snapshot()
+                .expect("terminal root snapshot")
+                .scribe_memory_used_bytes,
+            fixture.baseline_bytes
+        );
+        assert_eq!(
+            fixture
+                .reader
+                .drain_terminal()
+                .expect("second terminal drain is idempotent"),
+            drained
+        );
+        assert!(matches!(
+            fixture
+                .reader
+                .acquire_fence(empty_fence_request(DataTenantId::new_v7()))
+                .await,
+            Err(TailReadError::Capacity)
+        ));
+    }
+
+    /// Terminal close waits for a pending guard to settle its own root owner.
+    #[test]
+    fn terminal_drain_preserves_pending_owner_until_cancellation() {
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let resources = tail_resources();
+        let baseline = resources.snapshot().expect("baseline root snapshot");
+        let reader = ScribeTailReader::new(
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                resources.clone(),
+            )),
+            TailFenceConfig::default(),
+        );
+        let pending = reader
+            .reserve_pending_fence()
+            .expect("pending terminal fixture owns one reservation");
+        let active = reader
+            .ownership_snapshot_for_test()
+            .expect("pending terminal snapshot");
+        assert_eq!(active.active_reservations, 1);
+        assert!(reader.drain_terminal().is_err());
+        assert_eq!(
+            reader
+                .ownership_snapshot_for_test()
+                .expect("terminal close preserves pending owner"),
+            active
+        );
+
+        drop(pending);
+        let cancelled = reader
+            .ownership_snapshot_for_test()
+            .expect("pending cancellation settles terminal owner");
+        assert_eq!(cancelled.releases, 1);
+        assert_eq!(cancelled.active_reservations, 0);
+        assert_eq!(cancelled.active_reserved_bytes, 0);
+        assert_eq!(cancelled.reserved_bytes, cancelled.released_bytes);
+        assert_eq!(
+            reader
+                .drain_terminal()
+                .expect("terminal retry after cancellation is idempotent"),
+            cancelled
+        );
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("cancelled terminal root snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
     }
 
     /// Refuses a concurrent fence before materialization and settles cancellation once.

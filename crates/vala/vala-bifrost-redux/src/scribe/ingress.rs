@@ -169,16 +169,12 @@ impl ScribeImpl {
                 catalog
                     .ensure_builtin(frame.authenticated_tenant, definition)
                     .await
-                    .map_err(|error| ScribeError::Internal {
-                        detail: error.to_string(),
-                    })?;
+                    .map_err(scribe_catalog_error)?;
             }
             catalog
                 .table_schema_fingerprint(&frame.table, frame.authenticated_tenant)
                 .await
-                .map_err(|error| ScribeError::Internal {
-                    detail: error.to_string(),
-                })?
+                .map_err(scribe_catalog_error)?
         };
         Ok(expected)
     }
@@ -648,6 +644,21 @@ impl ScribeImpl {
             let _completion = super::IngestStallCompletion(&stall);
             stall.release.notified().await;
         }
+    }
+}
+
+/// Preserves caller-actionable catalog failures across Scribe's private boundary.
+fn scribe_catalog_error(error: crate::catalog::BifrostCatalogError) -> ScribeError {
+    match error {
+        crate::catalog::BifrostCatalogError::TableNotFound(table) => {
+            ScribeError::TableNotFound { table }
+        }
+        crate::catalog::BifrostCatalogError::FingerprintMismatch(table) => {
+            ScribeError::FingerprintMismatch { table }
+        }
+        other => ScribeError::Internal {
+            detail: other.to_string(),
+        },
     }
 }
 

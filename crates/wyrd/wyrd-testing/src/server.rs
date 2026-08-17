@@ -2841,10 +2841,10 @@ impl WyrdTestServerBuilder {
             })
         };
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
-            memory_limit_bytes: 1024 * 1024 * 1024,
+            memory_limit_bytes: 3 * 1024 * 1024 * 1024,
             effective_cpu: 4,
-            scratch_capacity_bytes: 1280 * 1024 * 1024,
-            scratch_available_bytes: 1280 * 1024 * 1024,
+            scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 4 * 1024 * 1024 * 1024,
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });

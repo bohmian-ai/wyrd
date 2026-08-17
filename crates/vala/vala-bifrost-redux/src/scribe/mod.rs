@@ -1806,6 +1806,7 @@ impl Scribe for ScribeImpl {
                     | ScribeError::InvalidFrame
                     | ScribeError::EventTimeOutOfRange { .. }
                     | ScribeError::FingerprintMismatch { .. }
+                    | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
                     | ScribeError::CardUnresolved
                     | ScribeError::StreamMismatch { .. } => Some("invalid"),

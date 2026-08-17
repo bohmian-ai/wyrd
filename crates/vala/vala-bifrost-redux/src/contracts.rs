@@ -250,6 +250,13 @@ pub enum ScribeError {
     #[error("schema fingerprint mismatch for table: {table}")]
     FingerprintMismatch { table: String },
 
+    /// The tenant-scoped logical table does not exist in the Scribe-owned catalog.
+    #[error("bifrost table not found: {table}")]
+    TableNotFound {
+        /// Fully-qualified logical table requested by the authenticated writer.
+        table: String,
+    },
+
     #[error("ingest request has too many rows: {rows} > {limit}")]
     TooManyRows { rows: u64, limit: u64 },
 
@@ -316,6 +323,9 @@ impl ScribeError {
                 limit: *limit,
             },
             Self::FingerprintMismatch { table } => Self::FingerprintMismatch {
+                table: table.clone(),
+            },
+            Self::TableNotFound { table } => Self::TableNotFound {
                 table: table.clone(),
             },
             Self::TooManyRows { rows, limit } => Self::TooManyRows {

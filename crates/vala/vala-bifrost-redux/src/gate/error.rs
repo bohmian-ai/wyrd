@@ -247,6 +247,7 @@ impl IngestError {
             crate::contracts::ScribeError::FingerprintMismatch { table } => {
                 Self::SchemaMismatch { table }
             }
+            crate::contracts::ScribeError::TableNotFound { table } => Self::TableNotFound { table },
             crate::contracts::ScribeError::TooManyRows { rows, limit } => {
                 Self::TooManyRows { rows, limit }
             }
@@ -605,6 +606,13 @@ mod tests {
                 },
                 "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
                 "vala.logs.records",
+            ),
+            (
+                ScribeError::TableNotFound {
+                    table: "vala.bifrost.missing".to_owned(),
+                },
+                "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+                "vala.bifrost.missing",
             ),
             (
                 ScribeError::TooManyRows { rows: 2, limit: 1 },

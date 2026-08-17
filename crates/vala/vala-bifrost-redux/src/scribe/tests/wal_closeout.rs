@@ -208,6 +208,27 @@ fn assert_rejection(recorder: &wyrd_bench::BenchmarkRecorder, reason: &str, coun
     }));
 }
 
+/// Assert every admitted ingress root has one terminal release and no live child.
+fn assert_ingress_owners_settled(scribe: &crate::scribe::ScribeImpl) {
+    let lifecycle = scribe
+        .inspection_snapshot()
+        .expect("settled ingress inspection")
+        .ingress_lifecycle;
+    assert_eq!(lifecycle.active_attempts, 0);
+    assert_eq!(lifecycle.active_reservations, 0);
+    assert_eq!(lifecycle.active_reserved_bytes, 0);
+    assert_eq!(lifecycle.active_materializations, 0);
+    assert_eq!(lifecycle.active_materialized_bytes, 0);
+    assert_eq!(lifecycle.active_shard_transfers, 0);
+    assert_eq!(lifecycle.active_shard_transferred_bytes, 0);
+    assert_eq!(lifecycle.reservations, lifecycle.releases);
+    assert_eq!(lifecycle.reserved_bytes, lifecycle.released_bytes);
+    assert_eq!(lifecycle.shard_transfers, lifecycle.reservations);
+    assert_eq!(lifecycle.shard_transferred_bytes, lifecycle.reserved_bytes);
+    assert!(lifecycle.transfers <= lifecycle.materializations);
+    assert!(lifecycle.transferred_bytes <= lifecycle.materialized_bytes);
+}
+
 /// Pinning ingress at its sublimit trips exactly one D84 ceiling-labelled reason.
 ///
 /// The scenario pins the whole ingress sublimit
@@ -344,6 +365,7 @@ async fn duplicate_shutdown_is_idempotent_and_closes_owners() {
     let snapshot = scribe.inspection_snapshot().expect("shutdown inspection");
     assert_eq!(snapshot.queued_items, 0);
     assert_eq!(snapshot.open_wal_stream_count, 0);
+    assert_ingress_owners_settled(&scribe);
 }
 
 /// Cancelling the graceful owner cannot strand Scribe in its draining state.
@@ -393,6 +415,7 @@ async fn cancelled_shutdown_owner_is_recovered_by_abort_finalizer() {
             .open_wal_stream_count,
         0
     );
+    assert_ingress_owners_settled(&scribe);
 }
 
 #[test]
@@ -429,6 +452,7 @@ async fn sync_failure_has_no_ack_or_memtable_visibility() {
         wal.bytes_on_disk() > 0,
         "record was written before sync failed"
     );
+    assert_ingress_owners_settled(&scribe);
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
@@ -449,11 +473,13 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
         .expect_err("post-sync failure must not acknowledge");
     assert!(error.to_string().contains("post-sync"));
     assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 0);
+    assert_ingress_owners_settled(&scribe);
 
     append(&scribe, tenant, "post_sync_failure", batch_id)
         .await
         .expect("stable batch retry");
     assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 1);
+    assert_ingress_owners_settled(&scribe);
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
@@ -468,6 +494,12 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
         1,
         "retry must not append a duplicate WAL record"
     );
+    assert_eq!(state.append_metas.len(), 1);
+    let replayed_identity = &state.append_metas[0].append_slice_id;
+    assert_eq!(replayed_identity.batch_id, batch_id);
+    assert_eq!(replayed_identity.seal_key.tenant, tenant);
+    assert_eq!(replayed_identity.seal_key.table.name, "post_sync_failure");
+    assert_eq!(replayed_identity.slice_index, 0);
 }
 
 #[test]

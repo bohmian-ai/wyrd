@@ -13,14 +13,17 @@
 mod pg_tests {
     use std::time::{Duration, Instant};
 
-    use crate::otlp_support::export_and_flush;
+    use crate::otlp_support::{
+        assert_grpc_otlp_limit, assert_http_otlp_limit, assert_otlp_owner_settled,
+        export_and_flush, public_otlp_limits,
+    };
     use wyrd_testing::{Bootstrap, WyrdTestServer};
-    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+    use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
     use wyrd_tonic::otlp::logs::v1::{
         LogRecord as OtlpLog, ResourceLogs, ScopeLogs, SeverityNumber,
     };
-    use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
     use wyrd_tonic::otlp::logs_service::logs_service_client::LogsServiceClient;
+    use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
     use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
     use wyrd_tonic::prost::Message;
     use wyrd_tonic::tonic::Request;
@@ -102,6 +105,70 @@ mod pg_tests {
                 scope_logs: vec![ScopeLogs {
                     scope: None,
                     log_records: vec![log],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// Build one alternating OTLP value tree at an exact recursive depth.
+    fn alternating_value(depth: usize) -> AnyValue {
+        if depth == 1 {
+            return AnyValue {
+                value: Some(any_value::Value::StringValue("leaf".to_owned())),
+            };
+        }
+        let nested = alternating_value(depth - 1);
+        let value = if depth.is_multiple_of(2) {
+            any_value::Value::ArrayValue(ArrayValue {
+                values: vec![nested],
+            })
+        } else {
+            any_value::Value::KvlistValue(KeyValueList {
+                values: vec![KeyValue {
+                    key: "nested".to_owned(),
+                    value: Some(nested),
+                }],
+            })
+        };
+        AnyValue { value: Some(value) }
+    }
+
+    /// Build a logs request with exact record and recursive-value counts.
+    fn bounded_export_request(
+        record_count: usize,
+        value_depth: usize,
+        marker: u8,
+    ) -> ExportLogsServiceRequest {
+        let log_records = (0..record_count)
+            .map(|index| OtlpLog {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                observed_time_unix_nano: 1_700_000_000_001_000_000,
+                severity_number: SeverityNumber::Info as i32,
+                severity_text: "INFO".to_owned(),
+                body: Some(alternating_value(value_depth)),
+                attributes: Vec::new(),
+                dropped_attributes_count: 0,
+                flags: 0,
+                trace_id: vec![marker; 16],
+                span_id: vec![u8::try_from(index + 1).expect("small fixture index"); 8],
+                event_name: String::new(),
+            })
+            .collect();
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(OtlpResource {
+                    attributes: vec![kv(
+                        "service.name",
+                        any_value::Value::StringValue(format!("bounded-logs-{marker}")),
+                    )],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records,
                     schema_url: String::new(),
                 }],
                 schema_url: String::new(),
@@ -220,6 +287,88 @@ mod pg_tests {
         let grpc = srv.grpc_url().expect("grpc url");
         let channel = connect(&grpc).await;
         read_back_log(channel, &jwt, TRACE_ID_HTTP, SPAN_ID_HTTP).await;
+
+        srv.shutdown().await.expect("shutdown");
+    }
+
+    /// Public logs transports accept exact caps, reject cap plus one, and settle owners.
+    #[tokio::test]
+    async fn logs_http_and_grpc_enforce_bounded_decode_projection() {
+        let srv = WyrdTestServer::builder()
+            .with_scribe_ingest_limits_for_test(public_otlp_limits(1, 2))
+            .start_bound()
+            .await
+            .expect("bounded logs server");
+        let jwt = bootstrap_writer(&srv, "bounded-logs-writer").await;
+        let grpc = srv.grpc_url().expect("gRPC URL");
+        let mut logs = LogsServiceClient::new(connect(&grpc).await);
+
+        let accepted_grpc = export_and_flush(
+            &srv,
+            logs.export(with_token(
+                Request::new(bounded_export_request(1, 2, 0x41)),
+                &jwt,
+            )),
+        )
+        .await
+        .into_inner();
+        assert!(
+            accepted_grpc
+                .partial_success
+                .as_ref()
+                .is_none_or(|partial| partial.rejected_log_records == 0),
+            "bounded gRPC log must materialize one accepted record: {accepted_grpc:?}"
+        );
+        assert_otlp_owner_settled(&srv);
+        for (records, depth, marker) in [(2, 1, 0x42), (1, 3, 0x43)] {
+            let error = logs
+                .export(with_token(
+                    Request::new(bounded_export_request(records, depth, marker)),
+                    &jwt,
+                ))
+                .await
+                .expect_err("logs cap plus one must fail");
+            assert_grpc_otlp_limit(&error);
+            assert_otlp_owner_settled(&srv);
+        }
+
+        let client = reqwest::Client::new();
+        let base = srv.base_url().expect("HTTP URL");
+        let accepted = export_and_flush(
+            &srv,
+            client
+                .post(format!("{base}/v1/logs"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .header("content-type", "application/x-protobuf")
+                .body(bounded_export_request(1, 2, 0x44).encode_to_vec())
+                .send(),
+        )
+        .await;
+        assert_eq!(accepted.status(), 200);
+        let accepted_http = ExportLogsServiceResponse::decode(
+            accepted.bytes().await.expect("bounded logs response bytes"),
+        )
+        .expect("bounded logs response protobuf");
+        assert!(
+            accepted_http
+                .partial_success
+                .as_ref()
+                .is_none_or(|partial| partial.rejected_log_records == 0),
+            "bounded HTTP log must materialize one accepted record: {accepted_http:?}"
+        );
+        assert_otlp_owner_settled(&srv);
+        for (records, depth, marker) in [(2, 1, 0x45), (1, 3, 0x46)] {
+            let response = client
+                .post(format!("{base}/v1/logs"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .header("content-type", "application/x-protobuf")
+                .body(bounded_export_request(records, depth, marker).encode_to_vec())
+                .send()
+                .await
+                .expect("bounded logs request");
+            assert_http_otlp_limit(response).await;
+            assert_otlp_owner_settled(&srv);
+        }
 
         srv.shutdown().await.expect("shutdown");
     }

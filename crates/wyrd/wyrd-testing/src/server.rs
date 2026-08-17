@@ -28,6 +28,7 @@ use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
     ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
+use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
@@ -397,6 +398,8 @@ pub struct WyrdTestServerBuilder {
     forge_max_files_per_bin: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
+    /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
+    scribe_ingest_limits: IngestLimits,
     /// Optional accelerated role cadence for heartbeat-specific journeys.
     role_timing: Option<RoleTiming>,
     /// Stable node identity retained when a cluster restarts this builder.
@@ -462,6 +465,7 @@ impl Default for WyrdTestServerBuilder {
             forge_max_files_per_bin: 3,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
+            scribe_ingest_limits: IngestLimits::default(),
             role_timing: None,
             node_id: None,
             bifrost_roles: [
@@ -2524,6 +2528,17 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Replaces the shared Gate-and-Scribe ingest limits for deterministic journeys.
+    ///
+    /// The builder retains one copied immutable snapshot and supplies it to both
+    /// owners during startup, preserving the production single-authority contract
+    /// while allowing cap and cap-plus-one requests to remain small in tests.
+    #[must_use]
+    pub fn with_scribe_ingest_limits_for_test(mut self, limits: IngestLimits) -> Self {
+        self.scribe_ingest_limits = limits;
+        self
+    }
+
     /// Retain one stable physical identity and role set across cluster restarts.
     #[must_use]
     pub(crate) fn with_bifrost_node(
@@ -3013,7 +3028,9 @@ impl WyrdTestServerBuilder {
                 )
                 .map_err(WyrdTestServerError::Start)?
             };
-            Some(Arc::new(scribe))
+            Some(Arc::new(
+                scribe.with_ingest_limits_for_test(self.scribe_ingest_limits),
+            ))
         } else {
             None
         };
@@ -3042,7 +3059,7 @@ impl WyrdTestServerBuilder {
                 Arc::clone(scribe),
                 Arc::clone(&bifrost),
                 Arc::clone(&verifier),
-                vala_bifrost_redux::gate::limits::IngestLimits::default(),
+                self.scribe_ingest_limits,
                 None,
             );
             match &tail_authority {
@@ -3157,7 +3174,7 @@ impl WyrdTestServerBuilder {
             }
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         }
-        let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
+        let limits = self.scribe_ingest_limits;
         let mut gate = if let Some(ingest) = &ingest {
             vala_bifrost_redux::gate::Gate::with_scribe(
                 Arc::clone(&bifrost),

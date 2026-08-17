@@ -13,14 +13,19 @@
 mod pg_tests {
     use std::time::{Duration, Instant};
 
-    use crate::otlp_support::export_and_flush;
+    use crate::otlp_support::{
+        assert_grpc_otlp_limit, assert_http_otlp_limit, assert_otlp_owner_settled,
+        export_and_flush, public_otlp_limits,
+    };
     use wyrd_testing::{Bootstrap, WyrdTestServer};
-    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+    use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
     use wyrd_tonic::otlp::metrics::v1::{
         Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
     };
-    use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
     use wyrd_tonic::otlp::metrics_service::metrics_service_client::MetricsServiceClient;
+    use wyrd_tonic::otlp::metrics_service::{
+        ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    };
     use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
     use wyrd_tonic::prost::Message;
     use wyrd_tonic::tonic::Request;
@@ -94,6 +99,80 @@ mod pg_tests {
                 scope_metrics: vec![ScopeMetrics {
                     scope: None,
                     metrics: vec![metric],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// Build one alternating OTLP value tree at an exact recursive depth.
+    fn alternating_value(depth: usize) -> AnyValue {
+        if depth == 1 {
+            return AnyValue {
+                value: Some(any_value::Value::IntValue(1)),
+            };
+        }
+        let nested = alternating_value(depth - 1);
+        let value = if depth.is_multiple_of(2) {
+            any_value::Value::ArrayValue(ArrayValue {
+                values: vec![nested],
+            })
+        } else {
+            any_value::Value::KvlistValue(KeyValueList {
+                values: vec![KeyValue {
+                    key: "nested".to_owned(),
+                    value: Some(nested),
+                }],
+            })
+        };
+        AnyValue { value: Some(value) }
+    }
+
+    /// Build a metrics request with exact point and recursive-value counts.
+    fn bounded_export_request(
+        record_count: usize,
+        value_depth: usize,
+        marker: &str,
+    ) -> ExportMetricsServiceRequest {
+        let data_points = (0..record_count)
+            .map(|index| NumberDataPoint {
+                attributes: vec![KeyValue {
+                    key: "nested".to_owned(),
+                    value: Some(alternating_value(value_depth)),
+                }],
+                start_time_unix_nano: 1_700_000_000_000_000_000,
+                time_unix_nano: 1_700_000_000_001_000_000,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(number_data_point::Value::AsInt(
+                    i64::try_from(index).expect("small fixture index"),
+                )),
+            })
+            .collect();
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(OtlpResource {
+                    attributes: vec![kv(
+                        "service.name",
+                        any_value::Value::StringValue(format!("bounded-metrics-{marker}")),
+                    )],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: format!("bounded.metric.{marker}"),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(metric::Data::Sum(Sum {
+                            data_points,
+                            aggregation_temporality: OTLP_TEMPORALITY_CUMULATIVE,
+                            is_monotonic: true,
+                        })),
+                    }],
                     schema_url: String::new(),
                 }],
                 schema_url: String::new(),
@@ -211,6 +290,91 @@ mod pg_tests {
         let grpc = srv.grpc_url().expect("grpc url");
         let channel = connect(&grpc).await;
         read_back_metric(channel, &jwt, "http.server.requests.http").await;
+
+        srv.shutdown().await.expect("shutdown");
+    }
+
+    /// Public metrics transports accept exact caps, reject cap plus one, and settle owners.
+    #[tokio::test]
+    async fn metrics_http_and_grpc_enforce_bounded_decode_projection() {
+        let srv = WyrdTestServer::builder()
+            .with_scribe_ingest_limits_for_test(public_otlp_limits(1, 2))
+            .start_bound()
+            .await
+            .expect("bounded metrics server");
+        let jwt = bootstrap_writer(&srv, "bounded-metrics-writer").await;
+        let grpc = srv.grpc_url().expect("gRPC URL");
+        let mut metrics = MetricsServiceClient::new(connect(&grpc).await);
+
+        let accepted_grpc = export_and_flush(
+            &srv,
+            metrics.export(with_token(
+                Request::new(bounded_export_request(1, 2, "grpc-cap")),
+                &jwt,
+            )),
+        )
+        .await
+        .into_inner();
+        assert!(
+            accepted_grpc
+                .partial_success
+                .as_ref()
+                .is_none_or(|partial| partial.rejected_data_points == 0),
+            "bounded gRPC metric must materialize one accepted point: {accepted_grpc:?}"
+        );
+        assert_otlp_owner_settled(&srv);
+        for (records, depth, marker) in [(2, 1, "grpc-records"), (1, 3, "grpc-depth")] {
+            let error = metrics
+                .export(with_token(
+                    Request::new(bounded_export_request(records, depth, marker)),
+                    &jwt,
+                ))
+                .await
+                .expect_err("metrics cap plus one must fail");
+            assert_grpc_otlp_limit(&error);
+            assert_otlp_owner_settled(&srv);
+        }
+
+        let client = reqwest::Client::new();
+        let base = srv.base_url().expect("HTTP URL");
+        let accepted = export_and_flush(
+            &srv,
+            client
+                .post(format!("{base}/v1/metrics"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .header("content-type", "application/x-protobuf")
+                .body(bounded_export_request(1, 2, "http-cap").encode_to_vec())
+                .send(),
+        )
+        .await;
+        assert_eq!(accepted.status(), 200);
+        let accepted_http = ExportMetricsServiceResponse::decode(
+            accepted
+                .bytes()
+                .await
+                .expect("bounded metrics response bytes"),
+        )
+        .expect("bounded metrics response protobuf");
+        assert!(
+            accepted_http
+                .partial_success
+                .as_ref()
+                .is_none_or(|partial| partial.rejected_data_points == 0),
+            "bounded HTTP metric must materialize one accepted point: {accepted_http:?}"
+        );
+        assert_otlp_owner_settled(&srv);
+        for (records, depth, marker) in [(2, 1, "http-records"), (1, 3, "http-depth")] {
+            let response = client
+                .post(format!("{base}/v1/metrics"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .header("content-type", "application/x-protobuf")
+                .body(bounded_export_request(records, depth, marker).encode_to_vec())
+                .send()
+                .await
+                .expect("bounded metrics request");
+            assert_http_otlp_limit(response).await;
+            assert_otlp_owner_settled(&srv);
+        }
 
         srv.shutdown().await.expect("shutdown");
     }

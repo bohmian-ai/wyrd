@@ -17,8 +17,7 @@ use vala_bifrost_redux::forge::ForgeLifecycleEvent;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::ScribePublicationEvent;
 use vala_sdk::{
-    BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, CollectedQueryResult,
-    IngestTransport, QueryClient,
+    BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, CollectedQueryResult, QueryClient,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -535,7 +534,12 @@ async fn distributed_write_compact_read_journey() {
         .expect("distributed write/compact/read journey");
 }
 
-/// Proves acknowledged rows survive a node replacement before the final read.
+/// Proves one fully fenced acknowledgement survives node replacement exactly once.
+///
+/// The returned ACK is accepted only after its complete WAL slice set and
+/// terminal commit are durable, the tenant-scoped control row and canonical
+/// audit are committed, and the rows are visible to Scribe. Restart then
+/// preserves that exact durable identity through publication and retirement.
 #[tokio::test]
 #[ignore = "requires the real Postgres-backed Bifrost journey lane"]
 async fn public_ack_restart_read_exact_once_journey() {
@@ -562,25 +566,129 @@ async fn public_ack_restart_read_exact_once_journey() {
     let writer = bootstrap_transport(server, "restart-writer", &["admin"])
         .await
         .expect("restart writer");
+    let batch_id = uuid::Uuid::now_v7();
     writer
-        .send_frame(frame(uuid::Uuid::now_v7().into_bytes(), &[707]))
+        .send_frame(frame(batch_id.into_bytes(), &[707]))
         .await
         .expect("durable restart ACK");
+    let node = cluster
+        .configured_node_ids()
+        .first()
+        .copied()
+        .expect("restart journey node");
+    let mut tenant_conn = cluster
+        .pg_fixture()
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("restart journey tenant connection");
+    let durable_identity: (
+        Vec<u8>,
+        i32,
+        uuid::Uuid,
+        i64,
+        i16,
+        i64,
+        i64,
+        i64,
+        uuid::Uuid,
+    ) = sqlx::query_as(
+        "SELECT slice_set_digest, slice_count, wal_node_id, wal_writer_epoch,
+                    wal_shard_id, wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id
+               FROM vala.scribe_batch_commits
+              WHERE data_tenant_id=$1 AND logical_table_fqn=$2 AND batch_id=$3",
+    )
+    .bind(tenant.as_uuid())
+    .bind(TABLE_FQN)
+    .bind(batch_id)
+    .fetch_one(&mut **tenant_conn.transaction())
+    .await
+    .expect("ACKed batch control fence");
+    assert_eq!(durable_identity.0.len(), 32);
+    assert!(durable_identity.1 > 0, "ACK requires a nonempty slice set");
+    assert_eq!(durable_identity.2, node.as_uuid());
+    assert!(durable_identity.3 > 0);
+    assert!(durable_identity.4 >= 0);
+    assert!(durable_identity.5 >= 0);
+    assert!(
+        durable_identity.6 < durable_identity.7,
+        "SLICE LSN must precede its terminal COMMIT LSN"
+    );
+    let ingest_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM vala.audit_outbox
+          WHERE data_tenant_id=$1 AND request_id=$2 AND operation='bifrost.ingest_batch'
+            AND resource=$3",
+    )
+    .bind(tenant.as_uuid())
+    .bind(durable_identity.8.to_string())
+    .bind(TABLE_FQN)
+    .fetch_one(&mut **tenant_conn.transaction())
+    .await
+    .expect("ACKed batch canonical audit");
+    assert_eq!(
+        ingest_audits, 1,
+        "control fence and canonical audit must commit before ACK"
+    );
+    let visible = server
+        .bifrost_scribe()
+        .expect("restart Scribe")
+        .memtable_stats()
+        .expect("post-ACK memtable visibility");
+    assert_eq!(visible.writable_rows + visible.immutable_rows, 1);
+    let ownership = server
+        .scribe_inspection_snapshot()
+        .expect("post-ACK Scribe ownership");
+    assert_eq!(ownership.ingress_lifecycle.active_attempts, 0);
+    assert_eq!(ownership.ingress_lifecycle.active_reservations, 0);
+    assert_eq!(ownership.ingress_lifecycle.active_materializations, 0);
+    assert_eq!(ownership.ingress_lifecycle.active_shard_transfers, 0);
+    assert_eq!(
+        ownership.ingress_lifecycle.active_shard_transferred_bytes,
+        0
+    );
+    assert_eq!(
+        ownership.ingress_lifecycle.reservations,
+        ownership.ingress_lifecycle.releases
+    );
+    assert_eq!(
+        ownership.ingress_lifecycle.reserved_bytes,
+        ownership.ingress_lifecycle.released_bytes
+    );
+    assert_eq!(
+        ownership.ingress_lifecycle.shard_transfers,
+        ownership.ingress_lifecycle.reservations
+    );
+    assert_eq!(
+        ownership.ingress_lifecycle.shard_transferred_bytes,
+        ownership.ingress_lifecycle.reserved_bytes
+    );
+    assert!(
+        ownership.ingress_lifecycle.transfers > 0
+            && ownership.ingress_lifecycle.transfers
+                <= ownership.ingress_lifecycle.materializations,
+        "WAL transfers must be a positive subset of current-slice materializations"
+    );
+    assert!(
+        ownership.ingress_lifecycle.transferred_bytes > 0
+            && ownership.ingress_lifecycle.transferred_bytes
+                <= ownership.ingress_lifecycle.materialized_bytes,
+        "WAL-owned bytes must be a positive subset of materialized bytes"
+    );
+    assert_eq!(ownership.ingress_lifecycle.succeeded, 1);
     let unpublished: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list
          WHERE data_tenant_id = $1 AND namespace = 'vala.bifrost' AND table_name = $2",
     )
     .bind(tenant.as_uuid())
     .bind(TABLE_NAME)
-    .fetch_one(cluster.pg_fixture().operator_pool().pool())
+    .fetch_one(&mut **tenant_conn.transaction())
     .await
     .expect("restart pre-publication inspection");
     assert_eq!(unpublished, 0, "ACK precedes file-list publication");
-    let node = cluster
-        .configured_node_ids()
-        .first()
-        .copied()
-        .expect("restart journey node");
+    tenant_conn
+        .commit()
+        .await
+        .expect("commit restart pre-replacement inspection");
     let roots = cluster
         .terminate_node_abruptly_for_test(node)
         .await
@@ -613,6 +721,38 @@ async fn public_ack_restart_read_exact_once_journey() {
         .flush_bifrost()
         .await
         .expect("replay and publish WAL");
+    let mut restarted_tenant_conn = cluster
+        .pg_fixture()
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("restarted journey tenant connection");
+    let restarted_identity: (
+        Vec<u8>,
+        i32,
+        uuid::Uuid,
+        i64,
+        i16,
+        i64,
+        i64,
+        i64,
+        uuid::Uuid,
+    ) = sqlx::query_as(
+        "SELECT slice_set_digest, slice_count, wal_node_id, wal_writer_epoch,
+                    wal_shard_id, wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id
+               FROM vala.scribe_batch_commits
+              WHERE data_tenant_id=$1 AND logical_table_fqn=$2 AND batch_id=$3",
+    )
+    .bind(tenant.as_uuid())
+    .bind(TABLE_FQN)
+    .bind(batch_id)
+    .fetch_one(&mut **restarted_tenant_conn.transaction())
+    .await
+    .expect("restarted batch control fence");
+    assert_eq!(
+        restarted_identity, durable_identity,
+        "retry and restart must preserve every durable batch identity field"
+    );
     let reader = bootstrap_client(replacement, "restart-reader", &["admin"])
         .await
         .expect("restart reader");
@@ -630,19 +770,28 @@ async fn public_ack_restart_read_exact_once_journey() {
     let source_epoch = roots
         .previous_writer_epoch
         .expect("acknowledged source epoch is retained");
-    let recovered_identity: (uuid::Uuid, i64, i64) = sqlx::query_as(
-        "SELECT node_id, writer_epoch, COUNT(*)::bigint FROM vala.file_list
+    let recovered_identity: (uuid::Uuid, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT node_id, writer_epoch, wal_lsn_min, wal_lsn_max, COUNT(*)::bigint FROM vala.file_list
          WHERE data_tenant_id=$1 AND namespace='vala.bifrost' AND table_name=$2
-         GROUP BY node_id, writer_epoch",
+         GROUP BY node_id, writer_epoch, wal_lsn_min, wal_lsn_max",
     )
     .bind(tenant.as_uuid())
     .bind(TABLE_NAME)
-    .fetch_one(cluster.pg_fixture().operator_pool().pool())
+    .fetch_one(&mut **restarted_tenant_conn.transaction())
     .await
     .expect("recovered source identity");
     assert_eq!(recovered_identity.0, node.as_uuid());
     assert_eq!(recovered_identity.1, source_epoch);
-    assert_eq!(recovered_identity.2, 1);
+    assert_eq!(recovered_identity.2, durable_identity.6);
+    assert!(
+        recovered_identity.3 < durable_identity.7,
+        "published slice range must precede its terminal COMMIT LSN"
+    );
+    assert_eq!(recovered_identity.4, 1);
+    restarted_tenant_conn
+        .commit()
+        .await
+        .expect("commit restart post-replacement inspection");
     let writer = bootstrap_transport(replacement, "restart-convergence-writer", &["admin"])
         .await
         .expect("restart convergence writer");

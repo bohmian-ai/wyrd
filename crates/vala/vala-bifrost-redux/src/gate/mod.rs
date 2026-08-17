@@ -600,6 +600,17 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
     }
 
     /// Authorizes and routes one bounded native batch to Scribe.
+    ///
+    /// Once validation and admission reach Scribe, the durable append runs in
+    /// its own task so a transport deadline cannot cancel the WAL decision.
+    /// The caller still awaits that decision when connected; after cancellation,
+    /// a retry with the same batch ID observes Scribe's durable dedup result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable validation, authorization, admission, persistence, or
+    /// task-failure error. Transport cancellation can make the result ambiguous
+    /// to the caller, but does not revoke an already-dispatched durable append.
     #[tracing::instrument(
         skip_all,
         fields(tenant = %auth.tenant, table = %frame.table, request_id = %auth.request_id)
@@ -659,19 +670,21 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             detail: None,
         };
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
-        let admission = scribe
-            .ingest_frame(ScribeIngressFrame {
-                principal: auth.principal.clone(),
-                authenticated_tenant: auth.tenant,
-                table,
-                expected_schema_fingerprint: None,
-                request_id: auth.request_id.clone(),
-                batch_id,
-                audit_event,
-                measured_wire_bytes: frame.arrow_ipc.len(),
-                payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
-            })
+        let ingress = ScribeIngressFrame {
+            principal: auth.principal.clone(),
+            authenticated_tenant: auth.tenant,
+            table,
+            expected_schema_fingerprint: None,
+            request_id: auth.request_id.clone(),
+            batch_id,
+            audit_event,
+            measured_wire_bytes: frame.arrow_ipc.len(),
+            payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
+        };
+        let scribe = Arc::clone(scribe);
+        let admission = tokio::spawn(async move { scribe.ingest_frame(ingress).await })
             .await
+            .map_err(|error| IngestError::Internal(format!("durable Scribe task failed: {error}")))?
             .map_err(|error| {
                 record_gate_event("scribe_failure");
                 metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);

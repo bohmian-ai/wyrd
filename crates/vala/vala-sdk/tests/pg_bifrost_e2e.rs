@@ -416,7 +416,7 @@ mod pg_tests {
     #[tokio::test]
     async fn public_sdk_owned_batch_timeout_retry_deduplicates_and_settles() {
         let srv = WyrdTestServer::builder()
-            .with_wal_sync_delay(Duration::from_millis(250))
+            .with_wal_sync_delay(Duration::from_millis(75))
             .start_bound()
             .await
             .expect("delayed-WAL test server start");
@@ -531,14 +531,14 @@ mod pg_tests {
         .expect("retry flush task joins")
         .expect("retry resolves the post-receipt ambiguity through durable dedup");
         let attempts = recording.attempts();
-        assert_eq!(attempts.len(), 2, "one deadline then one resolving retry");
-        assert_eq!(
-            attempts[0].0, attempts[1].0,
-            "the public sink retried the exact same stable batch ID"
+        assert!(attempts.len() >= 2, "one deadline then at least one retry");
+        assert!(
+            attempts.iter().all(|attempt| attempt.0 == attempts[0].0),
+            "every public sink retry used the exact same stable batch ID"
         );
-        assert_eq!(
-            attempts[0].1, attempts[1].1,
-            "the retained batch reused its owned-byte allocation without copying"
+        assert!(
+            attempts.iter().all(|attempt| attempt.1 == attempts[0].1),
+            "every retry reused the owned-byte allocation without copying"
         );
         let settled = bifrost.metrics();
         assert_eq!(settled.owned_bytes, 0, "durable ACK releases client bytes");

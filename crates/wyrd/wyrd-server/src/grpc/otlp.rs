@@ -4,6 +4,8 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use tower::Service;
@@ -40,6 +42,57 @@ const METRICS_SERVICE_NAME: &str = "opentelemetry.proto.collector.metrics.v1.Met
 const LOGS_EXPORT_PATH: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
 /// Canonical OTLP logs service name used by tonic routing.
 const LOGS_SERVICE_NAME: &str = "opentelemetry.proto.collector.logs.v1.LogsService";
+
+/// Bounded debug-build counters used only by transport integration tests.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtlpCodecActivity {
+    /// Codec preflight entries.
+    pub preflight: usize,
+    /// Typed decode construction entries.
+    pub decode: usize,
+    /// Scribe decode-reservation attempts.
+    pub scribe_reservation: usize,
+}
+
+#[cfg(debug_assertions)]
+static OTLP_PREFLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
+static OTLP_DECODE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
+static OTLP_RESERVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Clears bounded debug-build codec counters before an isolated test.
+#[cfg(debug_assertions)]
+pub fn reset_otlp_codec_activity() {
+    OTLP_PREFLIGHT.store(0, Ordering::Release);
+    OTLP_DECODE.store(0, Ordering::Release);
+    OTLP_RESERVE.store(0, Ordering::Release);
+}
+
+/// Snapshots bounded debug-build codec counters after an isolated test.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn snapshot_otlp_codec_activity() -> OtlpCodecActivity {
+    OtlpCodecActivity {
+        preflight: OTLP_PREFLIGHT.load(Ordering::Acquire),
+        decode: OTLP_DECODE.load(Ordering::Acquire),
+        scribe_reservation: OTLP_RESERVE.load(Ordering::Acquire),
+    }
+}
+
+/// Records a codec stage in debug builds without changing release behavior.
+fn record_codec_activity(stage: &str) {
+    #[cfg(debug_assertions)]
+    match stage {
+        "preflight" => OTLP_PREFLIGHT.fetch_add(1, Ordering::Relaxed),
+        "decode" => OTLP_DECODE.fetch_add(1, Ordering::Relaxed),
+        "reserve" => OTLP_RESERVE.fetch_add(1, Ordering::Relaxed),
+        _ => 0,
+    };
+    #[cfg(not(debug_assertions))]
+    let _ = stage;
+}
 
 /// Server-owned trace service that installs bounded decode before typed construction.
 #[derive(Clone)]
@@ -222,12 +275,15 @@ impl Decoder for TraceRequestDecoder {
                 "OTLP unary frame is not contiguous",
             ));
         }
+        record_codec_activity("preflight");
         let plan =
             preflight_trace_protobuf(bytes, self.gate.otlp_wire_limits()).map_err(Status::from)?;
+        record_codec_activity("reserve");
         let owner = self
             .gate
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
+        record_codec_activity("decode");
         let request = decode_trace_protobuf(bytes).map_err(Status::from)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
@@ -382,12 +438,15 @@ impl Decoder for MetricsRequestDecoder {
                 "OTLP unary frame is not contiguous",
             ));
         }
+        record_codec_activity("preflight");
         let plan = preflight_metrics_protobuf(bytes, self.gate.otlp_wire_limits())
             .map_err(Status::from)?;
+        record_codec_activity("reserve");
         let owner = self
             .gate
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
+        record_codec_activity("decode");
         let request = decode_metrics_protobuf(bytes, plan).map_err(Status::from)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
@@ -542,12 +601,15 @@ impl Decoder for LogsRequestDecoder {
                 "OTLP unary frame is not contiguous",
             ));
         }
+        record_codec_activity("preflight");
         let plan =
             preflight_logs_protobuf(bytes, self.gate.otlp_wire_limits()).map_err(Status::from)?;
+        record_codec_activity("reserve");
         let owner = self
             .gate
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
+        record_codec_activity("decode");
         let request = decode_logs_protobuf(bytes).map_err(Status::from)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))

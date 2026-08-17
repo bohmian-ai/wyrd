@@ -194,10 +194,13 @@ impl TenantTableBinding {
     /// only to the physical Iceberg namespace and object-store prefix.
     ///
     /// # Errors
-    /// Returns [`TenantTableBindingError::InvalidTableName`] when the logical
-    /// table name is not a safe local identifier, or
+    /// Returns [`TenantTableBindingError::InvalidTenant`] for a nil tenant,
+    /// [`TenantTableBindingError::InvalidTableName`] when the logical table
+    /// name is not a safe local identifier,
     /// [`TenantTableBindingError::InvalidPhysicalNamespace`] when the fixed
-    /// namespace cannot be represented by Iceberg.
+    /// namespace cannot be represented by Iceberg, or
+    /// [`TenantTableBindingError::BindingSizeOverflow`] when exact physical
+    /// allocation accounting cannot be represented.
     pub fn resolve((tenant, table_ref): TenantTableKey) -> Result<Self, TenantTableBindingError> {
         let facts = Self::facts(&tenant, &table_ref)?;
         Self::from_facts(facts)

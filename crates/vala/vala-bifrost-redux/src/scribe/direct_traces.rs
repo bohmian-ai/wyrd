@@ -20,8 +20,8 @@ use wyrd_tonic::otlp::trace::v1::{ResourceSpans, Span, span, status::StatusCode}
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
 use crate::contracts::ScribeError;
-use crate::gate::collector::tables::{DomainTable, SpansTable};
 use crate::otlp_contract::IngestOutcome;
+use crate::tables::{DomainTable, SpansTable};
 
 /// Stable fallback used by the existing mapper for a missing or unnamed scope.
 const UNKNOWN_SCOPE: &str = "unknown_service";
@@ -1191,7 +1191,8 @@ mod tests {
         let mut invalid = request.resource_spans[0].scope_spans[0].spans[0].clone();
         invalid.trace_id = vec![1_u8; 15];
         request.resource_spans[0].scope_spans[0].spans.push(invalid);
-        let mapped = crate::gate::collector::map::map_resource_spans(&request.resource_spans);
+        let mapped =
+            crate::scribe::test_projection_oracle::map::map_resource_spans(&request.resource_spans);
         let expected_reason = mapped.rejected.first().map(|value| value.reason.clone());
         let (actual, outcome) = project_fixture(&request, usize::MAX).expect("direct projection");
         assert_eq!(

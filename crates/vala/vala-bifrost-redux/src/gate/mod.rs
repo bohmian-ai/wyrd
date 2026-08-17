@@ -1,7 +1,6 @@
 //! Bifrost Gate — the server-independent auth, transport-limit, and routing boundary.
 
 pub mod auth;
-pub(crate) mod collector;
 pub mod error;
 pub mod limits;
 
@@ -304,11 +303,11 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         }
     }
 
-    /// Authenticates one server-owned OTLP adapter request before Gate routing.
+    /// Authenticates one server-owned OTLP adapter request before tonic codec work.
     ///
-    /// The server adapter invokes this after its bounded wire decode. Gate keeps
-    /// authentication and readiness authority while the adapter remains the
-    /// sole owner of protobuf framing and typed construction.
+    /// The outer service invokes this before `Grpc::unary`, preflight, decode
+    /// reservation, or typed construction. Gate retains authentication and
+    /// readiness authority while the adapter owns protobuf framing.
     ///
     /// # Errors
     ///
@@ -1093,13 +1092,13 @@ mod tests {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
                 otlp_outcome: match frame.payload {
-                    IngressPayload::OtlpTraces(_) => {
-                        Some(ScribeOtlpOutcome::Traces(super::collector::IngestOutcome {
+                    IngressPayload::OtlpTraces(_) => Some(ScribeOtlpOutcome::Traces(
+                        crate::otlp_contract::IngestOutcome {
                             accepted_spans: 0,
                             rejected_spans: 0,
                             rejection_message: None,
-                        }))
-                    }
+                        },
+                    )),
                     _ => None,
                 },
             })
@@ -1153,11 +1152,13 @@ mod tests {
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
-                otlp_outcome: Some(ScribeOtlpOutcome::Traces(super::collector::IngestOutcome {
-                    accepted_spans: 0,
-                    rejected_spans: 0,
-                    rejection_message: None,
-                })),
+                otlp_outcome: Some(ScribeOtlpOutcome::Traces(
+                    crate::otlp_contract::IngestOutcome {
+                        accepted_spans: 0,
+                        rejected_spans: 0,
+                        rejection_message: None,
+                    },
+                )),
             })
         }
     }

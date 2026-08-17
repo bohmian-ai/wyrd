@@ -23,8 +23,8 @@ use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 
 use super::direct_traces::{ByteCounter, ExactStringColumn, write_attributes};
 use crate::contracts::ScribeError;
-use crate::gate::collector::tables::{DomainTable, PointsTable};
 use crate::otlp_contract::MetricsOutcome;
+use crate::tables::{DomainTable, PointsTable};
 
 /// One borrowed metric point closed over the five OTLP point variants.
 #[derive(Clone, Copy)]
@@ -1741,7 +1741,9 @@ mod tests {
                 })),
                 ..Metric::default()
             });
-        let mapped = crate::gate::collector::map::map_resource_metrics(&request.resource_metrics);
+        let mapped = crate::scribe::test_projection_oracle::map::map_resource_metrics(
+            &request.resource_metrics,
+        );
         let expected_reason = mapped.rejected.first().map(|value| value.reason.clone());
         let (actual, outcome) = project_fixture(&request, usize::MAX).expect("direct projection");
         assert_eq!(

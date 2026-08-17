@@ -20,7 +20,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use super::tables::{CorrelationPolicy, DomainTable, PointsTable, RecordsTable, SpansTable};
+use crate::tables::{CorrelationPolicy, DomainTable, PointsTable, RecordsTable, SpansTable};
 use arrow::array::{
     ArrayRef, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray, TimestampMicrosecondArray,

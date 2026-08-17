@@ -9,6 +9,9 @@ pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
 mod otlp;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use otlp::{OtlpCodecActivity, reset_otlp_codec_activity, snapshot_otlp_codec_activity};
 pub(crate) mod query;
 mod scribe_tail;
 

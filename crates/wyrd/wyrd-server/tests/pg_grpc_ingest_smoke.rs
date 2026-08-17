@@ -473,9 +473,7 @@ mod pg_tests {
         let token = shutdown.clone();
         tokio::spawn(async move { serve_grpc(router, bind, token).await });
         let channel = connect_channel(bind).await;
-        let observed_preflight = 0_usize;
-        let observed_decode = 0_usize;
-        let observed_scribe_reservation = 0_usize;
+        wyrd_server::grpc::reset_otlp_codec_activity();
 
         let trace = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -521,9 +519,10 @@ mod pg_tests {
         assert_eq!(logs_status.code(), Code::Unauthenticated);
 
         shutdown.cancel();
-        assert_eq!(observed_preflight, 0);
-        assert_eq!(observed_decode, 0);
-        assert_eq!(observed_scribe_reservation, 0);
+        let activity = wyrd_server::grpc::snapshot_otlp_codec_activity();
+        assert_eq!(activity.preflight, 0);
+        assert_eq!(activity.decode, 0);
+        assert_eq!(activity.scribe_reservation, 0);
     }
 
     #[tokio::test]

@@ -20,8 +20,8 @@ use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use super::direct_metrics::{ExactPrimitive, NullableText};
 use super::direct_traces::{ByteCounter, ExactStringColumn, write_any, write_attributes};
 use crate::contracts::ScribeError;
-use crate::gate::collector::tables::{DomainTable, RecordsTable};
 use crate::otlp_contract::LogsOutcome;
+use crate::tables::{DomainTable, RecordsTable};
 
 /// Exact nullable UTF-8 capacity for one log column.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -897,7 +897,8 @@ mod tests {
         request.resource_logs[0].scope_logs[0]
             .log_records
             .push(invalid);
-        let mapped = crate::gate::collector::map::map_resource_logs(&request.resource_logs);
+        let mapped =
+            crate::scribe::test_projection_oracle::map::map_resource_logs(&request.resource_logs);
         let expected_reason = mapped.rejected.first().map(|value| value.reason.clone());
         let (actual, outcome) = project_fixture(&request, usize::MAX).expect("direct projection");
         assert_eq!(

@@ -85,6 +85,8 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) rows: usize,
     /// Largest current-only decoded or projected source.
     pub(crate) current_material_bytes: usize,
+    /// Aggregate native rows transferred into active memtable ownership.
+    pub(crate) active_output_bytes: usize,
     /// Fixed WAL framing/digest workspace.
     pub(crate) wal_workspace_bytes: usize,
     /// Complete simultaneous-live-set charge.
@@ -106,6 +108,7 @@ impl IngestMaterialPlan {
             self.name_bytes,
             self.aligned_copy_bytes,
             self.current_material_bytes,
+            self.active_output_bytes,
             self.wal_workspace_bytes,
         ]
         .into_iter()
@@ -227,6 +230,7 @@ impl ScribeIngressPlanner {
             source_count: usize::from(rows != 0),
             rows,
             current_material_bytes,
+            active_output_bytes: 0,
             wal_workspace_bytes: WAL_WORKSPACE_BYTES,
             root_bytes: 0,
         }
@@ -258,6 +262,7 @@ impl ScribeIngressPlanner {
         let mut max_source_rows = 0_usize;
         let mut max_body_bytes = 0_usize;
         let mut max_buffer_bytes = 0_usize;
+        let mut active_output_bytes = 0_usize;
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
         while cursor < bytes.len() {
             let prefix = read_u32(bytes, cursor)?;
@@ -358,6 +363,17 @@ impl ScribeIngressPlanner {
                         buffers.into_iter(),
                         body,
                     )?;
+                    active_output_bytes = active_output_bytes
+                        .checked_add(buffer_bytes)
+                        .and_then(|value| {
+                            managed_projection_bytes(batch_rows, 36)
+                                .ok()
+                                .and_then(|managed| value.checked_add(managed))
+                        })
+                        .ok_or(ScribeError::DecodedPayloadTooLarge {
+                            bytes: usize::MAX,
+                            limit: MAX_PROJECTED_BYTES,
+                        })?;
                     sources[source_count] = SourceMaterialPlan {
                         rows: batch_rows,
                         body_bytes: buffer_bytes,
@@ -411,6 +427,7 @@ impl ScribeIngressPlanner {
             source_count,
             rows,
             current_material_bytes,
+            active_output_bytes,
             wal_workspace_bytes: WAL_WORKSPACE_BYTES,
             root_bytes: 0,
         }
@@ -1074,6 +1091,7 @@ impl OtlpCounts {
             source_count: usize::from(self.records != 0),
             rows: self.records,
             current_material_bytes: projected_floor,
+            active_output_bytes: 0,
             wal_workspace_bytes: WAL_WORKSPACE_BYTES,
             root_bytes: 0,
         }

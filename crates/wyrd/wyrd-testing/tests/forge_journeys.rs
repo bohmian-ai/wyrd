@@ -18,9 +18,7 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::resources::{
-    MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
-};
+use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
 use vala_sdk::BifrostGrpcTransport;
 use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::row_types::forge_tasks::{
@@ -952,14 +950,11 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
 
 /// Builds the production-shaped resource observation used by Forge convergence.
 fn forge_convergence_system_resources() -> SystemResourceSnapshot {
-    let scratch = (1_u64 << 30)
-        .checked_add(MIN_SCRATCH_FREE_BYTES)
-        .expect("fixed convergence scratch observation fits u64");
     SystemResourceSnapshot {
-        memory_limit_bytes: 2 << 30,
+        memory_limit_bytes: 3 * 1024 * 1024 * 1024,
         effective_cpu: 4,
-        scratch_capacity_bytes: scratch,
-        scratch_available_bytes: scratch,
+        scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+        scratch_available_bytes: 4 * 1024 * 1024 * 1024,
         memory_source: ResourceSource::Injected,
         cpu_source: ResourceSource::Injected,
     }

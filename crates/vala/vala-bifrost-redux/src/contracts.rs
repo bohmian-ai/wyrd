@@ -370,9 +370,9 @@ pub(crate) trait Scribe: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Capacity`] when the requested decode child does
-    /// not fit the Scribe root, or [`ScribeError::Internal`] when an
-    /// implementation does not expose transport-decode ownership.
+    /// Returns [`ScribeError::IngestBusy`] when another owner occupies the
+    /// ingress envelope, or [`ScribeError::Internal`] when accounting fails or
+    /// an implementation does not expose transport-decode ownership.
     fn reserve_otlp_decode(&self, _bytes: usize) -> Result<OtlpDecodeOwner, ScribeError> {
         Err(ScribeError::Internal {
             detail: "test Scribe does not expose decode ownership".to_owned(),

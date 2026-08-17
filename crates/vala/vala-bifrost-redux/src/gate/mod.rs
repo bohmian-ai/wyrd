@@ -1,4 +1,4 @@
-//! Bifrost Gate — the server-independent auth, admission, and dispatch boundary.
+//! Bifrost Gate — the server-independent auth, transport-limit, and routing boundary.
 
 pub mod auth;
 pub mod collector;
@@ -247,12 +247,13 @@ pub struct Gate<
 impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
     Gate<C, R, I>
 {
-    /// Acquires exact root-backed capacity before the server adapter decodes OTLP.
+    /// Requests an exact root-backed decode child from Scribe for the adapter.
     ///
     /// # Errors
     ///
-    /// Returns a stable ingress refusal when Scribe is absent or its root cannot
-    /// admit the encoded request bytes.
+    /// Returns a stable ingress refusal when Scribe is absent, the ingress
+    /// envelope is occupied, or Scribe resource accounting fails while
+    /// reserving the preflighted typed-request capacity.
     pub fn reserve_otlp_decode(&self, bytes: usize) -> Result<OtlpDecodeOwner, IngestError> {
         self.scribe
             .as_ref()

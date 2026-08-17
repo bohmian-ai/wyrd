@@ -1,8 +1,11 @@
-//! Pure OTLP projection helpers used by the Redux-owned Bifrost Gate.
+//! Legacy/test OTLP projection helpers retained for parity verification.
 //!
-//! This module owns protocol-to-Arrow mapping and Gate-to-Scribe frame
-//! projection. It does not authenticate requests, mount services, or expose a
-//! whole-stream writer.
+//! Production adapters transfer fixed-capacity typed OTLP requests and their
+//! move-only decode owners through routing-only Gate. Scribe owns catalog
+//! resolution, projection planning and materialization, physical binding,
+//! material admission, WAL durability, visibility, and acknowledgment. These
+//! IO-free helpers remain only for reusable mapping and test or benchmark
+//! comparisons; they do not describe the production ownership boundary.
 
 pub mod map;
 pub(crate) mod tables;
@@ -21,8 +24,10 @@ use map::{
     map_resource_metrics, map_resource_spans, metrics_to_record_batch, spans_to_record_batch,
 };
 
-/// The result of projecting one OTLP request. The Gate owns authorization,
-/// catalog resolution, audit, and dispatch of the projected rows.
+/// Legacy/test result of projecting one typed OTLP request without persistence.
+///
+/// Production Gate never constructs this value or dispatches its projected
+/// rows; Scribe performs the authoritative current-slice projection.
 #[derive(Debug)]
 pub struct ProjectedExport<T> {
     pub outcome: T,
@@ -47,7 +52,7 @@ pub fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
     SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
 }
 
-/// Project one OTLP trace request into Arrow rows without performing a write.
+/// Projects one OTLP trace request for legacy/test parity without writing.
 pub fn project_resource_spans(
     request: &ExportTraceServiceRequest,
 ) -> Result<ProjectedExport<IngestOutcome>, IngestError> {
@@ -111,7 +116,7 @@ impl IngestOutcome {
     }
 }
 
-/// Project one OTLP metrics request into Arrow rows without performing a write.
+/// Projects one OTLP metrics request for legacy/test parity without writing.
 pub fn project_resource_metrics(
     request: &ExportMetricsServiceRequest,
 ) -> Result<ProjectedExport<MetricsOutcome>, IngestError> {
@@ -171,7 +176,7 @@ impl MetricsOutcome {
     }
 }
 
-/// Project one OTLP logs request into Arrow rows without performing a write.
+/// Projects one OTLP logs request for legacy/test parity without writing.
 pub fn project_resource_logs(
     request: &ExportLogsServiceRequest,
 ) -> Result<ProjectedExport<LogsOutcome>, IngestError> {

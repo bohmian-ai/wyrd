@@ -2,13 +2,15 @@
 //!
 //! Wyrd is a drop-in OTLP backend over HTTP as well as gRPC: `POST /v1/traces`
 //! accepts both `application/x-protobuf` (the OTLP default) and
-//! `application/json` (OTLP protobuf-JSON), decodes the payload into the same
-//! `ExportTraceServiceRequest` the gRPC collector uses, and drives Task B's
-//! shared decode→write core in `vala_bifrost_redux::gate`. There is one
-//! RBAC + map + `commit_one` core; this module only owns the HTTP framing.
+//! `application/json` (OTLP protobuf-JSON), preflights the payload and constructs
+//! the same fixed-capacity typed request the gRPC adapter uses. The typed
+//! request and move-only decode owner then cross routing-only Gate; Scribe owns
+//! catalog resolution, projection, binding, material admission, WAL durability,
+//! visibility, and acknowledgment.
 //!
 //! Content-Type handling (shared by all three signals):
-//! - `application/x-protobuf` → `prost::Message::decode`.
+//! - `application/x-protobuf` → bounded wire preflight followed by direct,
+//!   fixed-capacity generated-message construction.
 //! - `application/json` → bounded schema-aware preflight followed by direct,
 //!   exact-capacity generated-message construction.
 //! - missing / unrecognized Content-Type → treated as protobuf, per the OTLP/HTTP
@@ -29,7 +31,7 @@
 //! then yields the token-derived tenant/principal (never wire-derived).
 //!
 //! `/v1/metrics` and `/v1/logs` share the same three-step shape as `/v1/traces`:
-//! Content-Type decode, the shared decode→write core
+//! bounded adapter decode, owner-backed Gate routing
 //! (`vala_bifrost_redux::gate::Gate::ingest_decoded_resource_metrics` /
 //! `Gate::ingest_decoded_resource_logs`),
 //! then a response encoded in the request's encoding with `partial_success` for
@@ -184,7 +186,8 @@ where
 ///
 /// Returns [`WyrdErrorResponse`] when Gate is unavailable, protobuf/JSON
 /// preflight or fixed-capacity decode fails, decode ownership cannot be
-/// reserved/adopted, or Gate/Scribe rejects admission or durable ingest.
+/// reserved/adopted, Gate rejects routing or transport limits, or Scribe
+/// rejects material admission or durable ingest.
 #[tracing::instrument(
     name = "otlp.http.trace.export",
     skip_all,
@@ -271,7 +274,8 @@ async fn export_traces(
 ///
 /// Returns [`WyrdErrorResponse`] when Gate is unavailable, protobuf/JSON
 /// preflight or fixed-capacity decode fails, decode ownership cannot be
-/// reserved/adopted, or Gate/Scribe rejects admission or durable ingest.
+/// reserved/adopted, Gate rejects routing or transport limits, or Scribe
+/// rejects material admission or durable ingest.
 #[tracing::instrument(
     name = "otlp.http.metrics.export",
     skip_all,
@@ -359,7 +363,8 @@ async fn export_metrics(
 ///
 /// Returns [`WyrdErrorResponse`] when Gate is unavailable, protobuf/JSON
 /// preflight or fixed-capacity decode fails, decode ownership cannot be
-/// reserved/adopted, or Gate/Scribe rejects admission or durable ingest.
+/// reserved/adopted, Gate rejects routing or transport limits, or Scribe
+/// rejects material admission or durable ingest.
 #[tracing::instrument(
     name = "otlp.http.logs.export",
     skip_all,

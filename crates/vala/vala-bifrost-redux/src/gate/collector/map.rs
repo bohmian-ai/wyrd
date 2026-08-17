@@ -1,6 +1,8 @@
-//! Pure OTLP → `SpanRecord` mapping and the `SpanRecord` → Arrow encoder.
+//! Legacy/test OTLP domain mapping and Arrow encoders.
 //!
-//! Two responsibilities, both IO-free and server-free:
+//! Production Scribe uses its direct fixed-capacity projectors. These IO-free
+//! utilities remain as independent semantic-parity or fixture oracles with two
+//! responsibilities:
 //!
 //! 1. Flatten an `ExportTraceServiceRequest`'s `ResourceSpans → ScopeSpans →
 //!    Span` tree into flat [`SpanRecord`]s, carrying resource + scope identity
@@ -8,14 +10,12 @@
 //!    reported as a rejection, not a whole-request failure.
 //! 2. Encode a slice of [`SpanRecord`]s into an Arrow [`RecordBatch`] whose
 //!    schema matches `SpansTable::arrow_fields()` plus the Observation-policy
-//!    correlation columns (`run_id`, `card_uid`, `principal_id`), exactly what
-//!    the group-commit coordinator expects as input before it stamps the
-//!    system columns.
+//!    correlation columns (`run_id`, `card_uid`, `principal_id`) for comparison
+//!    with the authoritative direct projector before server-managed columns.
 //!
 //! `attributes` stays OPAQUE here: each span's attribute bag is serialized to a
-//! JSON string in the `attributes` `Utf8` column. Redaction of that column
-//! happens at coordinator flush (the table is `PayloadClass::Sensitive`), never
-//! in this crate.
+//! JSON string in the `attributes` `Utf8` column. This legacy/test utility does
+//! not own policy redaction or durable publication.
 
 use std::io::Write;
 use std::sync::Arc;

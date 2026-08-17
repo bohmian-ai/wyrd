@@ -431,8 +431,9 @@ impl<'a> ReplayAccumulator<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Capacity`] when the next replay decode owner
-    /// cannot be reserved from the maintenance envelope.
+    /// Returns [`ScribeError::IngestBusy`] when the maintenance envelope is
+    /// occupied, or [`ScribeError::Internal`] for accounting, poison, or other
+    /// resource-owner failures.
     fn take_chunk(&mut self) -> Result<Option<ReplayChunk>, ScribeError> {
         if self.states.is_empty() || !self.pending_batches.is_empty() {
             return Ok(None);
@@ -455,8 +456,9 @@ impl<'a> ReplayAccumulator<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Capacity`] when the replay decode reservation
-    /// cannot be resized to the remaining bounded batch.
+    /// Returns [`ScribeError::IngestBusy`] when the replay reservation cannot
+    /// resize because its envelope is occupied, or [`ScribeError::Internal`]
+    /// for accounting, poison, or other resource-owner failures.
     fn resize_memory(&mut self, bytes: usize) -> Result<(), ScribeError> {
         if let Some(memory) = self.memory.as_mut() {
             memory.resize_ingress(bytes)?;

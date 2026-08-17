@@ -1741,12 +1741,13 @@ impl ScribeImpl {
 
 #[async_trait]
 impl Scribe for ScribeImpl {
-    /// Acquires the adapter-decode child from the sole Scribe root.
+    /// Acquires the adapter-decode child from Scribe's ingress resources.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Capacity`] when the exact decode reservation
-    /// cannot be acquired from the Scribe ingress root.
+    /// Returns [`ScribeError::IngestBusy`] when another owner occupies the
+    /// ingress envelope, or [`ScribeError::Internal`] for accounting, poison,
+    /// or other resource-owner failures.
     fn reserve_otlp_decode(
         &self,
         bytes: usize,
@@ -2210,7 +2211,7 @@ impl ScribeImpl {
         self.admission.trip_wal_disk_full();
     }
 
-    /// Return the bounded ingress CPU pool for Gate protocol projection.
+    /// Returns the bounded CPU pool used by Scribe's ingest materialization.
     #[must_use]
     pub fn ingress_cpu_pool(&self) -> ScribeIngressCpuPool {
         self.ingress_cpu.clone()

@@ -40,7 +40,7 @@ const LOGS_EXPORT_PATH: &str = "/opentelemetry.proto.collector.logs.v1.LogsServi
 /// Canonical OTLP logs service name used by tonic routing.
 const LOGS_SERVICE_NAME: &str = "opentelemetry.proto.collector.logs.v1.LogsService";
 
-/// Server-owned trace service that installs the bounded decoder before prost.
+/// Server-owned trace service that installs bounded decode before typed construction.
 #[derive(Clone)]
 pub(super) struct TraceOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
@@ -129,7 +129,7 @@ impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
     }
 }
 
-/// Tonic codec whose decoder owns trace preflight and root-backed admission.
+/// Tonic codec whose decoder owns trace preflight and root-backed decode reservation.
 struct TraceOtlpCodec {
     /// Gate used only to acquire the Scribe transport-decode child.
     gate: Arc<ServerGate>,
@@ -146,7 +146,7 @@ impl Codec for TraceOtlpCodec {
         OtlpResponseEncoder::default()
     }
 
-    /// Creates a decoder retaining the exact Gate/Scribe owner source.
+    /// Creates a decoder that obtains its decode child through routing-only Gate.
     fn decoder(&mut self) -> Self::Decoder {
         TraceRequestDecoder {
             gate: Arc::clone(&self.gate),
@@ -205,7 +205,8 @@ impl Decoder for TraceRequestDecoder {
     /// # Errors
     ///
     /// Returns invalid argument for malformed or fragmented input and the
-    /// stable Gate capacity status when the decode owner cannot be acquired.
+    /// Scribe reservation refusal mapped through Gate when ownership cannot be
+    /// acquired.
     fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Status> {
         let wire_bytes = source.remaining();
         let bytes = source.chunk();
@@ -352,8 +353,9 @@ impl Decoder for MetricsRequestDecoder {
     ///
     /// # Errors
     ///
-    /// Returns stable invalid/capacity status for fragmented, malformed, or
-    /// over-limit frames before any generated scalable field can grow.
+    /// Returns invalid argument for fragmented, malformed, or over-limit frames,
+    /// or the Scribe ownership refusal mapped through Gate when the decode child
+    /// cannot be reserved.
     fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Status> {
         let wire_bytes = source.remaining();
         let bytes = source.chunk();
@@ -500,8 +502,9 @@ impl Decoder for LogsRequestDecoder {
     ///
     /// # Errors
     ///
-    /// Returns stable invalid/capacity status for fragmented, malformed, or
-    /// over-limit frames before any generated scalable field can grow.
+    /// Returns invalid argument for fragmented, malformed, or over-limit frames,
+    /// or the Scribe ownership refusal mapped through Gate when the decode child
+    /// cannot be reserved.
     fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Status> {
         let wire_bytes = source.remaining();
         let bytes = source.chunk();

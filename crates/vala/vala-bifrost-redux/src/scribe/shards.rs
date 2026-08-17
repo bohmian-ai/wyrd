@@ -48,6 +48,22 @@ struct PendingGeneration {
 type PendingGenerationsByKey =
     HashMap<crate::scribe::seal_key::SealKey, VecDeque<PendingGeneration>>;
 
+/// Resolves the physical table binding needed to persist one replayed seal.
+///
+/// # Errors
+///
+/// Returns an internal Scribe error when the replayed tenant/table identity is
+/// not a valid catalog binding.
+fn replay_binding(
+    seal_key: &crate::scribe::seal_key::SealKey,
+) -> Result<crate::catalog::TenantTableBinding, ScribeError> {
+    crate::catalog::TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone())).map_err(
+        |error| ScribeError::Internal {
+            detail: error.to_string(),
+        },
+    )
+}
+
 #[derive(Debug, Clone)]
 struct RetainedGeneration {
     arrow_bytes: usize,
@@ -1309,6 +1325,16 @@ impl ShardOwner {
         replayed_state: crate::scribe::replay::ReplayedSealKey,
         response: tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
     ) {
+        let mut response = Some(response);
+        if self
+            .settle_replay_fence(&replayed_state, &mut response)
+            .await
+        {
+            return;
+        }
+        let Some(response) = response else {
+            return;
+        };
         let source_stream = replayed_state.stream;
         let seal_key = replayed_state.seal_key.clone();
         let segment_refs = replayed_state.wal_segments.clone();
@@ -1363,15 +1389,9 @@ impl ShardOwner {
             let _ = response.send(Ok(None));
             return;
         }
-        let binding = match crate::catalog::TenantTableBinding::resolve((
-            seal_key.tenant,
-            seal_key.table.clone(),
-        )) {
+        let binding = match replay_binding(&seal_key) {
             Ok(binding) => binding,
             Err(error) => {
-                let error = ScribeError::Internal {
-                    detail: error.to_string(),
-                };
                 let result = self
                     .rollback_replayed_generation(frozen.seal_id, frozen.arrow_bytes)
                     .map_or_else(Err, |()| Err(error));
@@ -1403,6 +1423,101 @@ impl ShardOwner {
                 replay_response: Some(response),
             });
         self.submit_front(&seal_key);
+    }
+
+    /// Settles a suppressed or rejected replay before material reconstruction.
+    ///
+    /// Returns `true` after consuming the response for a terminal SQL decision;
+    /// `false` retains the response for canonical restoration.
+    async fn settle_replay_fence(
+        &self,
+        replayed: &crate::scribe::replay::ReplayedSealKey,
+        response: &mut Option<
+            tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
+        >,
+    ) -> bool {
+        let resolution = self.resolve_replay_fence(replayed).await;
+        let terminal = match resolution {
+            Ok(Some(retirement)) => Ok(Some(retirement)),
+            Ok(None) => return false,
+            Err(error) => Err(error),
+        };
+        if let Some(response) = response.take() {
+            let _ = response.send(terminal);
+        }
+        true
+    }
+
+    /// Resolves one replay commit against the tenant-scoped durable batch fence.
+    ///
+    /// The canonical WAL location restores. A later exact logical retry is
+    /// suppressed before Arrow reconstruction, publication, or audit. Without
+    /// configured Postgres (isolated unit mode), replay uses its in-memory WAL
+    /// identity checks only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when production replay lacks terminal identity,
+    /// integer conversion fails, tenant-scoped SQL is unavailable, or the
+    /// durable tenant/table/batch identity contradicts digest or slice count.
+    async fn resolve_replay_fence(
+        &self,
+        replayed: &crate::scribe::replay::ReplayedSealKey,
+    ) -> Result<Option<ReplayRetirement>, ScribeError> {
+        let Some(postgres) = &self.control_postgres else {
+            return Ok(None);
+        };
+        let commit = replayed
+            .commit
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "production WAL replay lacks terminal commit identity".to_owned(),
+            })?;
+        let durable = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+            tenant: replayed.seal_key.tenant,
+            logical_table_fqn: replayed.seal_key.table.fqn(),
+            batch_id: uuid::Uuid::from_bytes(commit.batch_id),
+            slice_set_digest: commit.slice_set_digest,
+            slice_count: i32::try_from(commit.slice_count).map_err(|_| ScribeError::Internal {
+                detail: "WAL replay slice count exceeds SQL integer range".to_owned(),
+            })?,
+            wal_node_id: replayed.stream.node_id.as_uuid(),
+            wal_writer_epoch: replayed.stream.writer_epoch.as_i64(),
+            wal_shard_id: i16::from(replayed.shard_id),
+            wal_segment_sequence: i64::try_from(commit.segment_sequence).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "WAL replay segment sequence exceeds SQL bigint range".to_owned(),
+                }
+            })?,
+            wal_lsn_min: i64::try_from(commit.wal_lsn_min.as_u64()).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "WAL replay first LSN exceeds SQL bigint range".to_owned(),
+                }
+            })?,
+            wal_lsn_max: i64::try_from(commit.wal_lsn_max.as_u64()).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "WAL replay commit LSN exceeds SQL bigint range".to_owned(),
+                }
+            })?,
+            request_id: commit.request_id,
+        };
+        let mut conn = postgres.tenant_conn(durable.tenant).await?;
+        let resolution =
+            vala_sql::queries::scribe_batch_commits::resolve_replay(&mut conn, &durable)
+                .await
+                .map_err(ScribeError::from)?;
+        if resolution
+            == vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore
+        {
+            return Ok(None);
+        }
+        Ok(Some(ReplayRetirement {
+            wal: self.wal_handle.clone(),
+            segments: replayed.wal_segments.clone(),
+            stream: replayed.stream,
+            seal_key: replayed.seal_key.clone(),
+            sealed_lsn: commit.wal_lsn_max,
+        }))
     }
 
     /// Rolls back a replay generation that failed after immutable admission.

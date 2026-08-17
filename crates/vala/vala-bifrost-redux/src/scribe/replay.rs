@@ -71,6 +71,27 @@ pub struct ReplayedSealKey {
     /// remain pinned until the replayed generation is published and its grace
     /// period expires.
     pub wal_segments: Vec<WalSegmentRef>,
+    /// Durable terminal identity used to distinguish canonical WAL from retries.
+    pub commit: Option<ReplayedCommitIdentity>,
+}
+
+/// SQL-fence identity reconstructed from one terminal WAL commit.
+#[derive(Debug, Clone)]
+pub struct ReplayedCommitIdentity {
+    /// Stable client batch identity.
+    pub batch_id: [u8; 16],
+    /// Digest authenticating the ordered slice set.
+    pub slice_set_digest: [u8; 32],
+    /// Number of slices authenticated by the commit.
+    pub slice_count: u32,
+    /// Segment sequence containing the terminal commit.
+    pub segment_sequence: u64,
+    /// First slice LSN in the batch.
+    pub wal_lsn_min: WalLsn,
+    /// Terminal commit LSN.
+    pub wal_lsn_max: WalLsn,
+    /// Audit request identity persisted with the fence.
+    pub request_id: uuid::Uuid,
 }
 
 /// A bounded group of replayed WAL state sent from the WAL lane to recovery.
@@ -356,7 +377,7 @@ impl<'a> ReplayAccumulator<'a> {
             memory.resize_ingress(next_memory)?;
         }
         if record.is_commit() {
-            self.commit(record)?;
+            self.commit(&segment_path, record)?;
             self.resize_memory(self.memory_bytes)?;
             return Ok(());
         }
@@ -418,7 +439,7 @@ impl<'a> ReplayAccumulator<'a> {
     /// Returns [`ScribeError`] when the commit has no complete matching slice
     /// set, its tenant or digest disagrees with the set, or a slice payload
     /// cannot be decoded into replay state.
-    fn commit(&mut self, record: &WalRecord) -> Result<(), ScribeError> {
+    fn commit(&mut self, segment_path: &Path, record: &WalRecord) -> Result<(), ScribeError> {
         if let Some(committed) = self
             .committed_batches
             .iter()
@@ -447,13 +468,14 @@ impl<'a> ReplayAccumulator<'a> {
                 detail: "WAL v4 COMMIT has no preceding complete slice set".to_owned(),
             })?;
         validate_pending_batch(&pending, record)?;
+        let commit = replayed_commit_identity(segment_path, &pending, record)?;
         for slice in pending.slices.into_values() {
             if self
                 .sealed_lsn_map
                 .get(&slice.seal_key_path)
                 .is_none_or(|sealed_lsn| slice.record.lsn > *sealed_lsn)
             {
-                self.release_slice(slice)?;
+                self.release_slice(slice, commit.clone())?;
             }
         }
         self.reserve_committed_identity()?;
@@ -499,7 +521,11 @@ impl<'a> ReplayAccumulator<'a> {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the durable audit envelope cannot be decoded.
-    fn release_slice(&mut self, slice: PendingSlice) -> Result<(), ScribeError> {
+    fn release_slice(
+        &mut self,
+        slice: PendingSlice,
+        commit: ReplayedCommitIdentity,
+    ) -> Result<(), ScribeError> {
         let audit_event = decode_audit_event(&slice.decoded.audit)?;
         let seal_key = slice.decoded.seal_key;
         let state = self
@@ -513,6 +539,7 @@ impl<'a> ReplayAccumulator<'a> {
                 data_records: Vec::new(),
                 append_metas: Vec::new(),
                 wal_segments: Vec::new(),
+                commit: Some(commit),
             });
         let segment = WalSegmentRef {
             path: slice.segment_path,
@@ -707,6 +734,52 @@ fn slice_set_digest<'a>(slices: impl Iterator<Item = &'a PendingSlice>) -> [u8; 
         digest.update(Sha256::digest(&slice.record.payload));
     }
     digest.finalize().into()
+}
+
+/// Reconstructs the durable SQL-fence identity from a validated pending batch.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] when the commit digest, segment sequence, first LSN,
+/// or audit request UUID cannot be reconstructed from validated WAL state.
+fn replayed_commit_identity(
+    segment_path: &Path,
+    pending: &PendingBatch,
+    commit: &WalRecord,
+) -> Result<ReplayedCommitIdentity, ScribeError> {
+    let mut slice_set_digest = [0_u8; 32];
+    slice_set_digest
+        .as_mut_slice()
+        .copy_from_slice(commit.payload.as_slice());
+    let first = pending
+        .slices
+        .values()
+        .next()
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "WAL v4 COMMIT has no first slice identity".to_owned(),
+        })?;
+    let event = decode_audit_event(&first.decoded.audit)?;
+    let request_id = uuid::Uuid::parse_str(event.request_id.as_str()).map_err(|error| {
+        ScribeError::Internal {
+            detail: format!("WAL replay audit request identity is invalid: {error}"),
+        }
+    })?;
+    let segment_sequence = segment_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "WAL replay commit segment sequence is invalid".to_owned(),
+        })?;
+    Ok(ReplayedCommitIdentity {
+        batch_id: commit.batch_id,
+        slice_set_digest,
+        slice_count: commit.slice_count,
+        segment_sequence,
+        wal_lsn_min: first.record.lsn,
+        wal_lsn_max: commit.lsn,
+        request_id,
+    })
 }
 
 /// Validates that one pending slice set is exactly closed by `commit`.

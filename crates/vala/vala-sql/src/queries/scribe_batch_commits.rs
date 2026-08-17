@@ -85,6 +85,49 @@ pub enum ScribeBatchCommitResolution {
     Committed,
 }
 
+/// Durable replay decision for one tenant/table/batch identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScribeBatchReplayResolution {
+    /// No durable fence exists, or this is the canonical WAL location to restore.
+    Restore,
+    /// The logical batch already committed from another WAL location.
+    Suppress,
+}
+
+/// Resolves whether one replayed WAL commit is canonical or a later exact retry.
+///
+/// The durable row remains authoritative. Matching logical digest/count at the
+/// original WAL coordinates restores; matching logical identity at different
+/// coordinates suppresses duplicate restoration. Any logical mismatch fails.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when the tenant differs from `conn`, PostgreSQL is
+/// unavailable, or an existing tenant/table/batch row contradicts digest/count.
+pub async fn resolve_replay(
+    conn: &mut TenantConn<'_>,
+    commit: &ScribeBatchCommit,
+) -> Result<ScribeBatchReplayResolution, SqlError> {
+    if conn.data_tenant_id() != commit.tenant {
+        return Err(invariant(
+            "scribe batch replay tenant does not match TenantConn",
+        ));
+    }
+    let Some(existing) = load(conn, commit).await? else {
+        return Ok(ScribeBatchReplayResolution::Restore);
+    };
+    if existing.slice_set_digest != commit.slice_set_digest
+        || existing.slice_count != commit.slice_count
+    {
+        return Err(invariant("scribe batch replay identity mismatch"));
+    }
+    if existing.matches(commit) {
+        Ok(ScribeBatchReplayResolution::Restore)
+    } else {
+        Ok(ScribeBatchReplayResolution::Suppress)
+    }
+}
+
 /// Resolves an uncertain transaction outcome against the durable batch fence.
 ///
 /// The lookup runs through the authenticated tenant connection and compares

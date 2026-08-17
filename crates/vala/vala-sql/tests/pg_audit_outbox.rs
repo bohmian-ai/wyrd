@@ -167,5 +167,79 @@ mod pg_tests {
             assert_eq!(second[0].seq, 2);
             assert_eq!(second[0].resource, "ns.tbl");
         }
+
+        /// Two-epoch replay suppresses an exact retry and fails a contradiction without mutation.
+        #[tokio::test]
+        async fn replay_two_epoch_batch_fence_suppresses_exact_and_rejects_contradiction() {
+            let (fixture, superuser, tenant) = setup().await;
+            let batch_id = Uuid::now_v7();
+            let audit = event("bifrost.append");
+            let request_id = Uuid::parse_str(audit.request_id.as_str()).expect("request UUID");
+            let canonical = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                tenant,
+                logical_table_fqn: "bifrost.replay_two_epoch".to_owned(),
+                batch_id,
+                slice_set_digest: [7; 32],
+                slice_count: 1,
+                wal_node_id: Uuid::now_v7(),
+                wal_writer_epoch: 1,
+                wal_shard_id: 3,
+                wal_segment_sequence: 4,
+                wal_lsn_min: 10,
+                wal_lsn_max: 11,
+                request_id,
+            };
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .expect("tenant connection");
+            vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical, &audit)
+                .await
+                .expect("canonical fence");
+            conn.commit().await.expect("commit canonical fence");
+
+            let retry = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                wal_writer_epoch: 2,
+                wal_segment_sequence: 0,
+                wal_lsn_min: 0,
+                wal_lsn_max: 1,
+                ..canonical.clone()
+            };
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .expect("retry connection");
+            assert_eq!(
+                vala_sql::queries::scribe_batch_commits::resolve_replay(&mut conn, &retry)
+                    .await
+                    .expect("exact retry resolution"),
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress
+            );
+            let contradiction = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                slice_set_digest: [8; 32],
+                ..retry
+            };
+            assert!(
+                vala_sql::queries::scribe_batch_commits::resolve_replay(&mut conn, &contradiction)
+                    .await
+                    .is_err(),
+                "contradictory replay identity must fail closed"
+            );
+            conn.commit().await.expect("commit read-only replay checks");
+
+            let audit_rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&superuser)
+            .await
+            .expect("audit count");
+            let publication_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM vala.file_list WHERE data_tenant_id = $1")
+                    .bind(tenant.as_uuid())
+                    .fetch_one(&superuser)
+                    .await
+                    .expect("publication count");
+            assert_eq!(audit_rows, 1, "replay resolution must not duplicate audit");
+            assert_eq!(publication_rows, 0, "replay resolution must not publish");
+        }
     }
 }

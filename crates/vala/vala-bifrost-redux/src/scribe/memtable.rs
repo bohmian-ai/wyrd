@@ -1635,6 +1635,7 @@ mod tests {
                 schema_fingerprint: [0; 32],
             }],
             wal_segments: Vec::new(),
+            commit: None,
         }
     }
 

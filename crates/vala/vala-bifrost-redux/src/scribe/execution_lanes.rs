@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{
     Array, ArrayRef, FixedSizeBinaryBuilder, Int32Builder, StringArray, TimestampMicrosecondArray,
@@ -1435,6 +1435,8 @@ pub(crate) enum ScribeWalIoOp {
         recovery_stream: StreamIdentity,
         shard_senders: Vec<mpsc::Sender<crate::scribe::shards::ShardCommand>>,
         memory: ScribeResources,
+        /// Cooperative shutdown flag checked between replay records and settlements.
+        cancelled: Arc<AtomicBool>,
     },
     RetireWal {
         wal: WalHandle,
@@ -1732,58 +1734,82 @@ fn execute_wal_io(
             recovery_stream,
             shard_senders,
             memory,
-        } => {
-            let mut restored = 0_usize;
-            let mut retirements = Vec::new();
-            crate::scribe::replay::replay_wal_directory_stream_accounted(
-                path,
-                Some(recovery_stream),
-                Some(&memory),
-                |chunk| {
-                    let crate::scribe::replay::ReplayChunk { states, memory } = chunk;
-                    drop(memory);
-                    for state in states.into_values() {
-                        // Use the shard_id recorded in the WAL segment header
-                        // rather than recomputing the routing key. Under
-                        // batch-spread routing the routing key includes the
-                        // client batch_id, which is unavailable here; the
-                        // recorded lane is the authoritative dispatch target
-                        // that holds the per-shard dedup state.
-                        let shard = usize::from(state.shard_id);
-                        let (response, receiver) = tokio::sync::oneshot::channel();
-                        shard_senders[shard]
-                            .blocking_send(crate::scribe::shards::ShardCommand::Replay {
-                                state: Box::new(state),
-                                response,
-                            })
-                            .map_err(|_| ScribeError::Internal {
-                                detail: "replay owner dropped its command channel".to_owned(),
-                            })?;
-                        if let Some(retirement) =
-                            receiver
-                                .blocking_recv()
-                                .map_err(|_| ScribeError::Internal {
-                                    detail: "replay owner dropped its completion response"
-                                        .to_owned(),
-                                })??
-                        {
-                            retirements.push(retirement);
-                        }
-                        restored = restored.saturating_add(1);
-                    }
-                    Ok(())
-                },
-            )?;
-            Ok(ScribeWalIoResult::ReplayStreamCompleted {
-                restored,
-                retirements,
-            })
-        }
+            cancelled,
+        } => execute_replay_directory_stream(
+            path,
+            recovery_stream,
+            &shard_senders,
+            &memory,
+            &cancelled,
+        ),
         ScribeWalIoOp::RetireWal { wal, segments } => {
             wal.retire_segments(&segments)?;
             Ok(ScribeWalIoResult::Completed)
         }
     }
+}
+
+/// Replays one bounded WAL inventory and synchronously settles each shard handoff.
+///
+/// Cancellation is checked before every new shard send. Once sent, the response
+/// is awaited before cancellation may terminate recovery, preserving one owner
+/// and deterministic settlement.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] for discovery, admission, corruption, cancellation,
+/// channel closure, or shard restoration failure.
+fn execute_replay_directory_stream(
+    path: PathBuf,
+    recovery_stream: StreamIdentity,
+    shard_senders: &[mpsc::Sender<crate::scribe::shards::ShardCommand>],
+    memory: &ScribeResources,
+    cancelled: &AtomicBool,
+) -> Result<ScribeWalIoResult, ScribeError> {
+    let mut restored = 0_usize;
+    let mut retirements = Vec::new();
+    crate::scribe::replay::replay_wal_directory_stream_accounted(
+        path,
+        Some(recovery_stream),
+        Some(memory),
+        Some(cancelled),
+        |chunk| {
+            let crate::scribe::replay::ReplayChunk { states, memory } = chunk;
+            drop(memory);
+            for state in states.into_values() {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL replay cancelled".to_owned(),
+                    });
+                }
+                let shard = usize::from(state.shard_id);
+                let (response, receiver) = tokio::sync::oneshot::channel();
+                shard_senders[shard]
+                    .blocking_send(crate::scribe::shards::ShardCommand::Replay {
+                        state: Box::new(state),
+                        response,
+                    })
+                    .map_err(|_| ScribeError::Internal {
+                        detail: "replay owner dropped its command channel".to_owned(),
+                    })?;
+                if let Some(retirement) =
+                    receiver
+                        .blocking_recv()
+                        .map_err(|_| ScribeError::Internal {
+                            detail: "replay owner dropped its completion response".to_owned(),
+                        })??
+                {
+                    retirements.push(retirement);
+                }
+                restored = restored.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(ScribeWalIoResult::ReplayStreamCompleted {
+        restored,
+        retirements,
+    })
 }
 
 fn replace_manifest(path: &PathBuf, contents: &[u8]) -> Result<(), ScribeError> {

@@ -253,6 +253,8 @@ pub struct ScribeImpl {
     shutdown_draining_notify: tokio::sync::Notify,
     /// False while startup WAL recovery is active or has failed.
     recovery_ready: AtomicBool,
+    /// Cooperative V1 recovery cancellation observed between WAL records and phases.
+    recovery_cancelled: Arc<AtomicBool>,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
     /// Optional local wake-up publisher retained for caller-owned commits.
@@ -1086,6 +1088,7 @@ impl ScribeImpl {
             #[cfg(any(test, feature = "test-support"))]
             shutdown_draining_notify: tokio::sync::Notify::new(),
             recovery_ready: AtomicBool::new(true),
+            recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
             staging_file_publisher,
             #[cfg(any(test, feature = "test-support"))]
@@ -1342,6 +1345,7 @@ impl ScribeImpl {
     /// transition is fail-closed; [`Self::abort_shutdown`] performs final abort.
     fn begin_shutdown(&self) {
         self.closed.store(true, Ordering::Release);
+        self.recovery_cancelled.store(true, Ordering::Release);
         self.shards.close();
     }
 
@@ -2633,10 +2637,25 @@ impl ScribeImpl {
         })
     }
 
-    /// Replay WAL through the bounded filesystem lane before readiness.
+    /// Replays eligible WAL sequentially through the bounded filesystem lane.
+    ///
+    /// Readiness remains false until every restored shard result, manifest
+    /// advance, and WAL retirement settles. Shutdown requests cancellation
+    /// between records; an already-started shard settlement completes first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for bounded discovery or admission refusal,
+    /// corrupt or contradictory WAL, cancellation, shard restoration failure,
+    /// manifest advancement failure, or WAL retirement failure.
     pub async fn replay_wal_async(&self) -> Result<usize, ScribeError> {
         let started = std::time::Instant::now();
         self.recovery_ready.store(false, Ordering::Release);
+        if self.recovery_cancelled.load(Ordering::Acquire) {
+            return Err(ScribeError::Internal {
+                detail: "WAL replay cancelled".to_owned(),
+            });
+        }
         let result = self
             .wal_io
             .submit(
@@ -2645,6 +2664,7 @@ impl ScribeImpl {
                     recovery_stream: self.stream,
                     shard_senders: self.shards.replay_senders(),
                     memory: self.memory.clone(),
+                    cancelled: Arc::clone(&self.recovery_cancelled),
                 },
             )
             .await;

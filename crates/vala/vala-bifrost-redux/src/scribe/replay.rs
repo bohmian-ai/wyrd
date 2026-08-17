@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 use bytes::Bytes;
@@ -41,13 +42,6 @@ pub const REPLAY_BATCH_MEMORY_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMI
     + REPLAY_RECORD_OVERHEAD_BYTES
         * crate::gate::limits::BIFROST_NATIVE_SOURCE_LIMIT
         * crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
-/// Fixed number of terminal batch identities retained by one replay accumulator.
-///
-/// Each entry is preallocated and root-charged before replay begins. Reaching
-/// this bound refuses more terminal identities instead of growing the replay
-/// index or discarding the exact tenant-scoped identity needed to validate a
-/// duplicate COMMIT.
-const REPLAY_COMMITTED_IDENTITY_CAPACITY: usize = 4_096;
 
 /// Replayed state for one seal-key.
 ///
@@ -140,61 +134,95 @@ pub fn replay_wal_directory(
 /// and publishes each chunk before the reader advances. The deduplication set
 /// remains live for the scan so a retry split across chunks is still emitted
 /// exactly once.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] when WAL discovery, validation, decoding, replay
+/// assembly, or the synchronous settlement callback fails.
 pub fn replay_wal_directory_stream(
     wal_dir: impl AsRef<Path>,
     emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
-    replay_wal_directory_stream_accounted(wal_dir, None, None, emit)
+    replay_wal_directory_stream_accounted(wal_dir, None, None, None, emit)
 }
 
 /// Replay the WAL directory with a bounded decode reservation on each emitted
-/// batch. The production WAL lane supplies the governor; unit tests may omit
-/// it when they are exercising parser ordering or deduplication in isolation.
+/// batch. The production WAL lane supplies the governor and a shutdown flag;
+/// unit tests may omit them for isolated parsing or deduplication. Cancellation
+/// is observed between records and only after a started callback has settled.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] for bounded discovery or admission refusal, WAL
+/// corruption, replay identity conflicts, callback failure, or cancellation.
 pub(crate) fn replay_wal_directory_stream_accounted(
     wal_dir: impl AsRef<Path>,
     recovery_stream: Option<StreamIdentity>,
     governor: Option<&ScribeResources>,
+    cancelled: Option<&AtomicBool>,
     mut emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
-    let reader = WalReader::open_directory_unfiltered(wal_dir)?;
+    let reader = if let Some(current) = recovery_stream {
+        WalReader::open_directory_for_recovery(wal_dir, current)?
+    } else {
+        WalReader::open_directory_unfiltered(wal_dir)?
+    };
     // Key is (stream, shard_id) so that each shard's records accumulate
     // independently with the correct shard_id threaded to ReplayedSealKey.
     let mut accumulators: HashMap<(StreamIdentity, u8), ReplayAccumulator<'_>> = HashMap::new();
 
-    reader.for_each_stream_record(|stream, shard_id, segment_path, record| {
-        if recovery_stream.is_some_and(|current| {
-            stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
-        }) {
-            return Ok(());
-        }
-        let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
-        let key = (stream, shard_id);
-        if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
-            entry.insert(ReplayAccumulator::new(
-                stream,
-                shard_id,
-                sealed_lsn_map,
-                governor,
-            )?);
-        }
-        let accumulator = accumulators
-            .get_mut(&key)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay accumulator disappeared after insertion".to_owned(),
-            })?;
-        accumulator.append(segment_path, &record)?;
-        // A WAL record is the indivisible replay unit. Hand it off immediately
-        // so partial accumulators from other shard streams cannot retain decode
-        // reservations while publication owns immutable and encoding workspace.
-        // The existing synchronous callback supplies the required backpressure.
-        if let Some(chunk) = accumulator.take_chunk()? {
-            emit(chunk)?;
-        }
-        Ok(())
-    })?;
+    reader.for_each_stream_record_accounted(
+        governor,
+        |stream, shard_id, segment_path, record| {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                return Err(ScribeError::Internal {
+                    detail: "WAL replay cancelled".to_owned(),
+                });
+            }
+            if recovery_stream.is_some_and(|current| {
+                stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
+            }) {
+                return Ok(());
+            }
+            let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
+            let key = (stream, shard_id);
+            if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
+                entry.insert(ReplayAccumulator::new(
+                    stream,
+                    shard_id,
+                    sealed_lsn_map,
+                    governor,
+                )?);
+            }
+            let accumulator = accumulators
+                .get_mut(&key)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay accumulator disappeared after insertion".to_owned(),
+                })?;
+            accumulator.append(segment_path, &record)?;
+            // A WAL record is the indivisible replay unit. Hand it off immediately
+            // so partial accumulators from other shard streams cannot retain decode
+            // reservations while publication owns immutable and encoding workspace.
+            // The existing synchronous callback supplies the required backpressure.
+            if let Some(chunk) = accumulator.take_chunk()? {
+                emit(chunk)?;
+                if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL replay cancelled".to_owned(),
+                    });
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     for accumulator in accumulators.values_mut() {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(ScribeError::Internal {
+                detail: "WAL replay cancelled".to_owned(),
+            });
+        }
         if let Some(chunk) = accumulator.take_chunk()? {
             emit(chunk)?;
         }
@@ -241,7 +269,7 @@ struct ReplayAccumulator<'a> {
     sealed_lsn_map: HashMap<String, WalLsn>,
     /// Incomplete v4 batches retained until their terminal COMMIT is read.
     pending_batches: HashMap<[u8; 16], PendingBatch>,
-    /// Fixed-capacity canonical identities of completed slice sets already emitted.
+    /// Accounted canonical identities of completed slice sets already emitted.
     committed_batches: Vec<CommittedBatchEntry>,
     /// In-flight replay state keyed by seal-key path.
     states: HashMap<String, ReplayedSealKey>,
@@ -273,28 +301,15 @@ impl<'a> ReplayAccumulator<'a> {
         let memory = governor
             .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
             .transpose()?;
-        let identity_bytes = REPLAY_COMMITTED_IDENTITY_CAPACITY
-            .checked_mul(std::mem::size_of::<CommittedBatchEntry>())
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay committed-identity capacity overflow".to_owned(),
-            })?;
         let identity_memory = governor
-            .map(|governor| {
-                governor.try_reserve_maintenance(MemoryCategory::Decode, identity_bytes)
-            })
+            .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
             .transpose()?;
-        let committed_batches = Vec::with_capacity(REPLAY_COMMITTED_IDENTITY_CAPACITY);
-        if committed_batches.capacity() != REPLAY_COMMITTED_IDENTITY_CAPACITY {
-            return Err(ScribeError::Internal {
-                detail: "replay committed-identity allocation changed capacity".to_owned(),
-            });
-        }
         Ok(Self {
             stream,
             shard_id,
             sealed_lsn_map,
             pending_batches: HashMap::new(),
-            committed_batches,
+            committed_batches: Vec::new(),
             states: HashMap::new(),
             governor,
             memory,
@@ -441,15 +456,41 @@ impl<'a> ReplayAccumulator<'a> {
                 self.release_slice(slice)?;
             }
         }
-        if self.committed_batches.len() == REPLAY_COMMITTED_IDENTITY_CAPACITY {
-            return Err(ScribeError::IngestBusy {
-                table: "WAL replay identity index".to_owned(),
-            });
-        }
+        self.reserve_committed_identity()?;
         self.committed_batches.push(CommittedBatchEntry {
             batch_id: record.batch_id,
             identity: CommittedBatchIdentity::from_commit(record),
         });
+        Ok(())
+    }
+
+    /// Admits one additional compact replay identity before growing its vector.
+    ///
+    /// Eligible WAL bytes are bounded during discovery, while this reservation
+    /// charges the actual identity count. This removes the unrelated 4,096
+    /// commit ceiling without introducing an external recovery index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the byte calculation overflows or the
+    /// existing Scribe maintenance envelope cannot admit another identity.
+    fn reserve_committed_identity(&mut self) -> Result<(), ScribeError> {
+        let entries =
+            self.committed_batches
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay committed-identity count overflow".to_owned(),
+                })?;
+        let bytes = entries
+            .checked_mul(std::mem::size_of::<CommittedBatchEntry>())
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay committed-identity bytes overflow".to_owned(),
+            })?;
+        if let Some(memory) = self.identity_memory.as_mut() {
+            memory.resize_ingress(bytes)?;
+        }
+        self.committed_batches.reserve_exact(1);
         Ok(())
     }
 
@@ -956,10 +997,16 @@ mod tests {
         let current =
             StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(3));
         let mut recovered = Vec::new();
-        replay_wal_directory_stream_accounted(temp_dir.path(), Some(current), None, |chunk| {
-            recovered.extend(chunk.states.into_values().map(|state| state.stream));
-            Ok(())
-        })
+        replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            Some(current),
+            None,
+            None,
+            |chunk| {
+                recovered.extend(chunk.states.into_values().map(|state| state.stream));
+                Ok(())
+            },
+        )
         .expect("recovery");
         recovered.sort_by_key(|stream| stream.writer_epoch);
         assert_eq!(
@@ -1071,10 +1118,16 @@ mod tests {
         let budget =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let mut chunks = Vec::new();
-        replay_wal_directory_stream_accounted(temp_dir.path(), None, Some(&budget), |chunk| {
-            chunks.push(chunk);
-            Ok(())
-        })
+        replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            None,
+            Some(&budget),
+            None,
+            |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
+        )
         .expect("streamed replay");
 
         assert!(chunks.len() > 1);
@@ -1097,6 +1150,157 @@ mod tests {
 
         let merged = replay_wal_directory(temp_dir.path()).expect("merged replay");
         assert_eq!(merged[&seal_key.as_path_components()].append_metas.len(), 5);
+    }
+
+    /// Proves rotated V1 recovery has no unrelated 4,096-commit ceiling.
+    #[test]
+    fn replay_more_than_4096_commits_across_rotated_files() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node.as_bytes(),
+            1,
+            WalConfig::new(16 * 1024).expect("rotating WAL config"),
+        )
+        .expect("writer");
+        let seal_key = replay_key(tenant);
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "append".to_owned(),
+            resource: "replay-cap".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 row".to_owned(),
+            detail: None,
+        };
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
+        for value in 0_u64..4_097 {
+            let mut batch = [0_u8; 16];
+            batch[..8].copy_from_slice(&value.to_le_bytes());
+            wal.append_and_commit_for_replay_test(&seal_key, batch, &audit, &[1])
+                .expect("append");
+        }
+
+        let current =
+            StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(2));
+        let mut restored = 0_usize;
+        replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            Some(current),
+            None,
+            None,
+            |chunk| {
+                restored = restored.saturating_add(
+                    chunk
+                        .states
+                        .into_values()
+                        .map(|state| state.append_metas.len())
+                        .sum::<usize>(),
+                );
+                Ok(())
+            },
+        )
+        .expect("replay");
+        assert_eq!(restored, 4_097);
+    }
+
+    /// Proves replay admission occurs before the single payload allocation.
+    #[test]
+    fn wal_replay_refuses_before_payload_allocation() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let wal = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+            .expect("writer");
+        let seal_key = replay_key(tenant);
+        wal.append_and_commit_for_replay_test(&seal_key, [7; 16], b"audit", &[9; 1024])
+            .expect("append");
+        let budget = crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig {
+            memory_limit_bytes: 1,
+            scribe_memory_limit_bytes: Some(1),
+            ..crate::scribe::AdmissionConfig::default()
+        });
+        let occupied = budget
+            .try_reserve_maintenance(
+                MemoryCategory::Decode,
+                budget.memory_snapshot().scribe_limit_bytes,
+            )
+            .expect("occupy replay envelope");
+        crate::scribe::wal::reset_replay_payload_allocations_for_test();
+        let current =
+            StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(2));
+        let error = replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            Some(current),
+            Some(&budget),
+            None,
+            |_| Ok(()),
+        )
+        .expect_err("payload admission must refuse");
+        assert!(
+            matches!(error, ScribeError::IngestBusy { .. }),
+            "unexpected refusal: {error:?}"
+        );
+        assert_eq!(crate::scribe::wal::replay_payload_allocations_for_test(), 0);
+        drop(occupied);
+    }
+
+    /// Proves cooperative cancellation is observed after an emitted record settles.
+    #[test]
+    fn replay_cancels_between_records_after_settlement() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let wal = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+            .expect("writer");
+        let seal_key = replay_key(tenant);
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "cancel".to_owned(),
+            resource: "replay".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 row".to_owned(),
+            detail: None,
+        };
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
+        for batch in [[1; 16], [2; 16]] {
+            wal.append_and_commit_for_replay_test(&seal_key, batch, &audit, &[1])
+                .expect("append");
+        }
+        let cancelled = AtomicBool::new(false);
+        let mut settled = 0_usize;
+        let error = replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            None,
+            None,
+            Some(&cancelled),
+            |chunk| {
+                settled = settled.saturating_add(chunk.states.len());
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .expect_err("replay must observe cancellation");
+        assert_eq!(settled, 1);
+        assert!(matches!(
+            error,
+            ScribeError::Internal { detail } if detail == "WAL replay cancelled"
+        ));
     }
 
     #[test]
@@ -1336,7 +1540,7 @@ mod tests {
 
     /// Proves an exact repeated slice set and COMMIT remain idempotent.
     #[test]
-    fn wal_replay_deduplicates_one_batch_identity() {
+    fn replay_duplicate_commit_is_suppressed() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
         let tenant_id = crate::test_support::tenant();

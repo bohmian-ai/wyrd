@@ -34,6 +34,7 @@ use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
+use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::stream_identity::StreamIdentity;
 
@@ -58,6 +59,8 @@ fn record_wal_fsync(result: &Result<(), ScribeError>, started: Instant) {
 
 #[cfg(test)]
 static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WAL_REPLAY_PAYLOAD_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static WAL_ENCODE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -160,6 +163,16 @@ const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL4";
 const RECORD_FLAG_SLICE: u32 = 1;
 /// A record carrying the digest that closes one ordered slice set.
 const RECORD_FLAG_COMMIT: u32 = 2;
+/// Maximum number of eligible WAL files considered during one V1 recovery.
+const WAL_RECOVERY_FILE_LIMIT: usize = 4_096;
+/// Maximum UTF-8 path length accepted for one eligible recovery file.
+const WAL_RECOVERY_PATH_LIMIT: usize = 4_096;
+redacted
+const WAL_RECOVERY_FILE_BYTES_LIMIT: u64 = 128 * 1024 * 1024;
+/// Maximum single record payload admitted by V1 recovery.
+const WAL_RECOVERY_RECORD_BYTES_LIMIT: usize = 128 * 1024 * 1024;
+/// Maximum aggregate eligible WAL bytes admitted during one startup recovery.
+const WAL_RECOVERY_TOTAL_BYTES_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 
 impl SegmentHeader {
     /// Construct a new segment header.
@@ -324,6 +337,14 @@ struct DecodedWalRecordHeader {
     slice_count: u32,
     /// Checked payload length declared by the frame.
     payload_len: u32,
+}
+
+impl DecodedWalRecordHeader {
+    /// Returns the exact payload bytes that replay must admit before allocation.
+    #[must_use]
+    fn payload_bytes(&self) -> usize {
+        usize::try_from(self.payload_len).expect("u32 fits usize on supported targets")
+    }
 }
 
 /// Explicit WAL sizing used by every Scribe writer.
@@ -1270,6 +1291,8 @@ impl WalRecord {
     ) -> Result<Self, ScribeError> {
         let payload_len =
             usize::try_from(header.payload_len).expect("u32 fits usize on supported targets");
+        #[cfg(test)]
+        WAL_REPLAY_PAYLOAD_ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
         let mut payload = vec![0u8; payload_len];
         reader
             .read_exact(&mut payload)
@@ -1286,11 +1309,7 @@ impl WalRecord {
             })?;
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        let mut crc_input = Vec::with_capacity(RECORD_HEADER_SIZE + payload.len());
-        crc_input.extend_from_slice(&header.encoded);
-        crc_input.extend_from_slice(&payload);
-
-        let computed_crc = crc32c_hash(&crc_input);
+        let computed_crc = crc32c::crc32c_append(crc32c_hash(&header.encoded), &payload);
         if computed_crc != expected_crc {
             return Err(ScribeError::Internal {
                 detail: format!(
@@ -3046,11 +3065,30 @@ impl ShardRecordCursor {
     ///
     /// Returns [`ScribeError`] for payload corruption, non-monotonic shard LSN,
     /// filesystem errors, or a failed durable torn-tail repair.
-    fn take_record(&mut self) -> Result<Option<(PathBuf, WalRecord)>, ScribeError> {
+    fn take_record(
+        &mut self,
+        governor: Option<&ScribeResources>,
+    ) -> Result<Option<(PathBuf, WalRecord, Option<ScribeMemoryLease>)>, ScribeError> {
         self.ensure_header()?;
         let Some(header) = self.header.take() else {
             return Ok(None);
         };
+        if header.payload_bytes() > WAL_RECOVERY_RECORD_BYTES_LIMIT {
+            return Err(ScribeError::IngestBusy {
+                table: "WAL recovery record".to_owned(),
+            });
+        }
+        // The fixed header is validated before this reservation. Holding the
+        // lease across decode and the visitor prevents the payload allocation
+        // from ever becoming unaccounted recovery memory.
+        let payload_memory = governor
+            .map(|governor| {
+                governor.try_reserve_maintenance(
+                    crate::scribe::memory::MemoryCategory::Decode,
+                    header.payload_bytes(),
+                )
+            })
+            .transpose()?;
         let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
             detail: "WAL replay cursor lost its current segment".to_owned(),
         })?;
@@ -3075,7 +3113,7 @@ impl ShardRecordCursor {
         let path = self.path.clone().ok_or_else(|| ScribeError::Internal {
             detail: "WAL replay cursor lost its segment path".to_owned(),
         })?;
-        Ok(Some((path, record)))
+        Ok(Some((path, record, payload_memory)))
     }
 
     /// Advances through clean segment ends until one header or stream EOF exists.
@@ -3189,6 +3227,56 @@ impl WalReader {
         Self::open_directory_filtered(dir, None)
     }
 
+    /// Opens bounded same-node segments from epochs older than the live writer.
+    ///
+    /// Recovery begins at the current node directory, so foreign or malformed
+    /// WAL trees are never opened or charged as replay work. Eligible files are
+    /// bounded by count, path length, individual size, and aggregate bytes
+    /// before any record payload is inspected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when eligible discovery exceeds a V1 bound, an
+    /// eligible directory or file cannot be inspected, or segment identities
+    /// are invalid, duplicated, or out of order.
+    pub fn open_directory_for_recovery(
+        dir: impl AsRef<Path>,
+        current: StreamIdentity,
+    ) -> Result<Self, ScribeError> {
+        let node_dir = dir
+            .as_ref()
+            .join(current.node_id.as_uuid().simple().to_string());
+        if !node_dir.exists() {
+            return Ok(Self {
+                segments: Vec::new(),
+            });
+        }
+        let mut paths = Vec::new();
+        let mut aggregate_bytes = 0_u64;
+        for entry in std::fs::read_dir(&node_dir).map_err(|error| ScribeError::Internal {
+            detail: format!("failed to read WAL node directory: {error}"),
+        })? {
+            let entry = entry.map_err(|error| ScribeError::Internal {
+                detail: format!("failed to read WAL epoch directory entry: {error}"),
+            })?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Some(epoch) = entry
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if epoch >= current.writer_epoch.as_i64() {
+                continue;
+            }
+            collect_bounded_segment_paths(&entry.path(), &mut paths, &mut aggregate_bytes)?;
+        }
+        Self::open_paths(paths, Some(*current.node_id.as_uuid().as_bytes()))
+    }
+
     /// Opens and orders every segment admitted by the optional stream filter.
     ///
     /// # Errors
@@ -3209,14 +3297,30 @@ impl WalReader {
 
         let mut paths = Vec::new();
         collect_segment_paths(dir, &mut paths)?;
+        let mut reader = Self::open_paths(
+            paths,
+            stream.map(|stream| *stream.node_id.as_uuid().as_bytes()),
+        )?;
+        if let Some(stream) = stream {
+            reader
+                .segments
+                .retain(|segment| segment.header().writer_epoch == stream.writer_epoch.as_i64());
+        }
+        Ok(reader)
+    }
+
+    /// Opens, sorts, and validates already-discovered WAL paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a segment cannot be opened, belongs to a
+    /// different node, or duplicates an existing stream/shard/sequence key.
+    fn open_paths(paths: Vec<PathBuf>, node_filter: Option<[u8; 16]>) -> Result<Self, ScribeError> {
         let mut segments = Vec::new();
         for path in paths {
             if path.extension().and_then(|s| s.to_str()) == Some("wal") {
                 let segment = WalSegment::open(&path)?;
-                if let Some(stream) = stream
-                    && (segment.header().node_id != *stream.node_id.as_uuid().as_bytes()
-                        || segment.header().writer_epoch != stream.writer_epoch.as_i64())
-                {
+                if node_filter.is_some_and(|node_id| segment.header().node_id != node_id) {
                     continue;
                 }
                 segments.push(Arc::new(segment));
@@ -3239,6 +3343,20 @@ impl WalReader {
                 .then_with(|| left_header.seg_seq.cmp(&right_header.seg_seq))
                 .then_with(|| left.path().cmp(right.path()))
         });
+
+        for pair in segments.windows(2) {
+            let left = pair[0].header();
+            let right = pair[1].header();
+            if left.node_id == right.node_id
+                && left.writer_epoch == right.writer_epoch
+                && left.shard_id == right.shard_id
+                && left.seg_seq == right.seg_seq
+            {
+                return Err(ScribeError::Internal {
+                    detail: "duplicate WAL stream/shard/segment identity".to_owned(),
+                });
+            }
+        }
 
         Ok(Self { segments })
     }
@@ -3270,7 +3388,29 @@ impl WalReader {
     /// # Errors
     /// Returns [`ScribeError`] when a segment cannot be read or its records
     /// fail WAL validation.
-    pub(crate) fn for_each_stream_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
+    pub(crate) fn for_each_stream_record<F>(&self, visit: F) -> Result<(), ScribeError>
+    where
+        F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
+    {
+        self.for_each_stream_record_accounted(None, visit)
+    }
+
+    /// Visits records while reserving each declared payload before allocation.
+    ///
+    /// The reservation is derived only from a validated fixed header and stays
+    /// live until the visitor returns. Replay therefore holds at most one
+    /// separately accounted encoded record while it constructs the current
+    /// decoded batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for admission refusal, invalid WAL framing,
+    /// filesystem failures, non-monotonic ordering, or visitor failure.
+    pub(crate) fn for_each_stream_record_accounted<F>(
+        &self,
+        governor: Option<&ScribeResources>,
+        mut visit: F,
+    ) -> Result<(), ScribeError>
     where
         F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
@@ -3308,7 +3448,7 @@ impl WalReader {
                     break;
                 };
                 let (shard_id, cursor) = &mut cursors[index];
-                let Some((path, record)) = cursor.take_record()? else {
+                let Some((path, record, payload_memory)) = cursor.take_record(governor)? else {
                     continue;
                 };
                 if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
@@ -3319,6 +3459,7 @@ impl WalReader {
                 }
                 previous_lsn = Some(record.lsn);
                 visit(stream, *shard_id, path, record)?;
+                drop(payload_memory);
             }
         }
         Ok(())
@@ -3338,6 +3479,68 @@ fn collect_segment_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Scr
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
             paths.push(path);
         }
+    }
+    Ok(())
+}
+
+/// Collects eligible WAL paths within fixed V1 recovery limits.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] for filesystem failures or when file count, path,
+/// individual size, or aggregate recovery-byte bounds are exceeded.
+fn collect_bounded_segment_paths(
+    dir: &Path,
+    paths: &mut Vec<PathBuf>,
+    aggregate_bytes: &mut u64,
+) -> Result<(), ScribeError> {
+    for entry in std::fs::read_dir(dir).map_err(|error| ScribeError::Internal {
+        detail: format!("failed to read eligible WAL directory: {error}"),
+    })? {
+        let entry = entry.map_err(|error| ScribeError::Internal {
+            detail: format!("failed to read eligible WAL directory entry: {error}"),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_bounded_segment_paths(&path, paths, aggregate_bytes)?;
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("wal") {
+            continue;
+        }
+        if path.as_os_str().as_encoded_bytes().len() > WAL_RECOVERY_PATH_LIMIT {
+            return Err(ScribeError::Internal {
+                detail: "eligible WAL path exceeds recovery limit".to_owned(),
+            });
+        }
+        if paths.len() == WAL_RECOVERY_FILE_LIMIT {
+            return Err(ScribeError::IngestBusy {
+                table: "WAL recovery file inventory".to_owned(),
+            });
+        }
+        let file_bytes = entry
+            .metadata()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("failed to inspect eligible WAL file: {error}"),
+            })?
+            .len();
+        if file_bytes > WAL_RECOVERY_FILE_BYTES_LIMIT {
+            return Err(ScribeError::IngestBusy {
+                table: "WAL recovery segment".to_owned(),
+            });
+        }
+        *aggregate_bytes =
+            aggregate_bytes
+                .checked_add(file_bytes)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "WAL recovery byte inventory overflow".to_owned(),
+                })?;
+        if *aggregate_bytes > WAL_RECOVERY_TOTAL_BYTES_LIMIT {
+            return Err(ScribeError::IngestBusy {
+                table: "WAL recovery bytes".to_owned(),
+            });
+        }
+        paths.push(path);
     }
     Ok(())
 }
@@ -3363,6 +3566,18 @@ pub struct ScribeAppendMeta {
 /// Compute CRC32C hash of the given bytes.
 fn crc32c_hash(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
+}
+
+/// Resets the test-only count of replay payload allocations.
+#[cfg(test)]
+pub(crate) fn reset_replay_payload_allocations_for_test() {
+    WAL_REPLAY_PAYLOAD_ALLOCATIONS.store(0, Ordering::Release);
+}
+
+/// Returns the test-only count of replay payload allocations.
+#[cfg(test)]
+pub(crate) fn replay_payload_allocations_for_test() -> u64 {
+    WAL_REPLAY_PAYLOAD_ALLOCATIONS.load(Ordering::Acquire)
 }
 
 #[cfg(test)]

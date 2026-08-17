@@ -2158,7 +2158,7 @@ mod tests {
             data_records: Vec::new(),
             append_metas: Vec::new(),
             wal_segments: Vec::new(),
-            commit: None,
+            commits: Vec::new(),
         };
         let _ = persistence
             .submit(ScribePersistenceCpuOp::RestoreReplay {

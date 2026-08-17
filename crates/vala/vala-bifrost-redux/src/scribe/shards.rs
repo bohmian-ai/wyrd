@@ -64,6 +64,26 @@ fn replay_binding(
     )
 }
 
+/// Removes exact-retry batches from one replay group while preserving append order.
+fn retain_replayed_batches(
+    replayed: &mut crate::scribe::replay::ReplayedSealKey,
+    suppressed: &HashSet<[u8; 16]>,
+) {
+    let metas = std::mem::take(&mut replayed.append_metas);
+    let audits = std::mem::take(&mut replayed.audit_events);
+    let data = std::mem::take(&mut replayed.data_records);
+    for ((meta, audit), payload) in metas.into_iter().zip(audits).zip(data) {
+        if !suppressed.contains(&meta.batch_id) {
+            replayed.append_metas.push(meta);
+            replayed.audit_events.push(audit);
+            replayed.data_records.push(payload);
+        }
+    }
+    replayed
+        .commits
+        .retain(|commit| !suppressed.contains(&commit.batch_id));
+}
+
 #[derive(Debug, Clone)]
 struct RetainedGeneration {
     arrow_bytes: usize,
@@ -1322,12 +1342,12 @@ impl ShardOwner {
     /// publication and checked immutable retirement finish.
     async fn replay_state(
         &mut self,
-        replayed_state: crate::scribe::replay::ReplayedSealKey,
+        mut replayed_state: crate::scribe::replay::ReplayedSealKey,
         response: tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
     ) {
         let mut response = Some(response);
         if self
-            .settle_replay_fence(&replayed_state, &mut response)
+            .settle_replay_fence(&mut replayed_state, &mut response)
             .await
         {
             return;
@@ -1431,7 +1451,7 @@ impl ShardOwner {
     /// `false` retains the response for canonical restoration.
     async fn settle_replay_fence(
         &self,
-        replayed: &crate::scribe::replay::ReplayedSealKey,
+        replayed: &mut crate::scribe::replay::ReplayedSealKey,
         response: &mut Option<
             tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
         >,
@@ -1462,16 +1482,65 @@ impl ShardOwner {
     /// durable tenant/table/batch identity contradicts digest or slice count.
     async fn resolve_replay_fence(
         &self,
-        replayed: &crate::scribe::replay::ReplayedSealKey,
+        replayed: &mut crate::scribe::replay::ReplayedSealKey,
     ) -> Result<Option<ReplayRetirement>, ScribeError> {
-        let Some(postgres) = &self.control_postgres else {
+        if self.control_postgres.is_none() {
             return Ok(None);
-        };
-        let commit = replayed
-            .commit
+        }
+        if replayed.commits.is_empty() {
+            return Err(ScribeError::Internal {
+                detail: "production WAL replay lacks terminal commit identity".to_owned(),
+            });
+        }
+        let commits = replayed.commits.clone();
+        let mut suppressed = HashSet::new();
+        for commit in &commits {
+            if self.resolve_replayed_commit(replayed, commit).await?
+                == vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress
+            {
+                suppressed.insert(commit.batch_id);
+            }
+        }
+        if suppressed.is_empty() {
+            return Ok(None);
+        }
+        retain_replayed_batches(replayed, &suppressed);
+        if !replayed.data_records.is_empty() {
+            return Ok(None);
+        }
+        let sealed_lsn = commits
+            .iter()
+            .map(|commit| commit.wal_lsn_max)
+            .max()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "production WAL replay lacks a retirement watermark".to_owned(),
+            })?;
+        Ok(Some(ReplayRetirement {
+            wal: self.wal_handle.clone(),
+            segments: replayed.wal_segments.clone(),
+            stream: replayed.stream,
+            seal_key: replayed.seal_key.clone(),
+            sealed_lsn,
+        }))
+    }
+
+    /// Resolves one reconstructed batch against its tenant-scoped SQL fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for invalid SQL integer coordinates, unavailable
+    /// tenant control storage, or a contradictory durable batch identity.
+    async fn resolve_replayed_commit(
+        &self,
+        replayed: &crate::scribe::replay::ReplayedSealKey,
+        commit: &crate::scribe::replay::ReplayedCommitIdentity,
+    ) -> Result<vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution, ScribeError>
+    {
+        let postgres = self
+            .control_postgres
             .as_ref()
             .ok_or_else(|| ScribeError::Internal {
-                detail: "production WAL replay lacks terminal commit identity".to_owned(),
+                detail: "production WAL replay lacks control Postgres".to_owned(),
             })?;
         let durable = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
             tenant: replayed.seal_key.tenant,
@@ -1506,18 +1575,7 @@ impl ShardOwner {
             vala_sql::queries::scribe_batch_commits::resolve_replay(&mut conn, &durable)
                 .await
                 .map_err(ScribeError::from)?;
-        if resolution
-            == vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore
-        {
-            return Ok(None);
-        }
-        Ok(Some(ReplayRetirement {
-            wal: self.wal_handle.clone(),
-            segments: replayed.wal_segments.clone(),
-            stream: replayed.stream,
-            seal_key: replayed.seal_key.clone(),
-            sealed_lsn: commit.wal_lsn_max,
-        }))
+        Ok(resolution)
     }
 
     /// Rolls back a replay generation that failed after immutable admission.
@@ -3554,6 +3612,56 @@ mod tests {
             payload_summary: "owner-test".to_owned(),
             detail: None,
         }
+    }
+
+    /// Exact retries are removed batch-wise without dropping canonical siblings.
+    #[test]
+    fn replay_fence_filters_only_suppressed_batches_in_same_seal() {
+        let key = owner_key();
+        let canonical = [1_u8; 16];
+        let retry = [2_u8; 16];
+        let commit = |batch_id| crate::scribe::replay::ReplayedCommitIdentity {
+            batch_id,
+            slice_set_digest: [3; 32],
+            slice_count: 1,
+            segment_sequence: 1,
+            wal_lsn_min: WalLsn::new(1),
+            wal_lsn_max: WalLsn::new(2),
+            request_id: uuid::Uuid::now_v7(),
+        };
+        let meta = |batch_id, lsn| crate::scribe::replay::ReplayedAppendMeta {
+            batch_id,
+            wal_lsn: WalLsn::new(lsn),
+            rows_accepted: 1,
+            append_slice_id: crate::scribe::preprocess::AppendSliceId {
+                batch_id: uuid::Uuid::from_bytes(batch_id),
+                seal_key: key.clone(),
+                slice_index: 0,
+            },
+            schema_fingerprint: [4; 32],
+        };
+        let mut replayed = crate::scribe::replay::ReplayedSealKey {
+            stream: StreamIdentity::new(
+                crate::scribe::stream_identity::NodeId::generate(),
+                crate::scribe::stream_identity::WriterEpoch::new(2),
+            ),
+            seal_key: key.clone(),
+            shard_id: 0,
+            audit_events: vec![owner_event(), owner_event()],
+            data_records: vec![vec![1], vec![2]],
+            append_metas: vec![meta(canonical, 1), meta(retry, 3)],
+            wal_segments: Vec::new(),
+            commits: vec![commit(canonical), commit(retry)],
+        };
+
+        retain_replayed_batches(&mut replayed, &HashSet::from([retry]));
+
+        assert_eq!(replayed.append_metas.len(), 1);
+        assert_eq!(replayed.append_metas[0].batch_id, canonical);
+        assert_eq!(replayed.audit_events.len(), 1);
+        assert_eq!(replayed.data_records, vec![vec![1]]);
+        assert_eq!(replayed.commits.len(), 1);
+        assert_eq!(replayed.commits[0].batch_id, canonical);
     }
 
     fn owner_batch() -> RecordBatch {

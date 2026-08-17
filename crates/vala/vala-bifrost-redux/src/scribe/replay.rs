@@ -71,8 +71,8 @@ pub struct ReplayedSealKey {
     /// remain pinned until the replayed generation is published and its grace
     /// period expires.
     pub wal_segments: Vec<WalSegmentRef>,
-    /// Durable terminal identity used to distinguish canonical WAL from retries.
-    pub commit: Option<ReplayedCommitIdentity>,
+    /// Durable terminal identities for every batch represented by this seal.
+    pub commits: Vec<ReplayedCommitIdentity>,
 }
 
 /// SQL-fence identity reconstructed from one terminal WAL commit.
@@ -475,7 +475,7 @@ impl<'a> ReplayAccumulator<'a> {
                 .get(&slice.seal_key_path)
                 .is_none_or(|sealed_lsn| slice.record.lsn > *sealed_lsn)
             {
-                self.release_slice(slice, commit.clone())?;
+                self.release_slice(slice, commit.clone(), segment_path)?;
             }
         }
         self.reserve_committed_identity()?;
@@ -525,6 +525,7 @@ impl<'a> ReplayAccumulator<'a> {
         &mut self,
         slice: PendingSlice,
         commit: ReplayedCommitIdentity,
+        commit_segment_path: &Path,
     ) -> Result<(), ScribeError> {
         let audit_event = decode_audit_event(&slice.decoded.audit)?;
         let seal_key = slice.decoded.seal_key;
@@ -539,13 +540,26 @@ impl<'a> ReplayAccumulator<'a> {
                 data_records: Vec::new(),
                 append_metas: Vec::new(),
                 wal_segments: Vec::new(),
-                commit: Some(commit),
+                commits: Vec::new(),
             });
         let segment = WalSegmentRef {
             path: slice.segment_path,
         };
         if !state.wal_segments.contains(&segment) {
             state.wal_segments.push(segment);
+        }
+        let commit_segment = WalSegmentRef {
+            path: commit_segment_path.to_path_buf(),
+        };
+        if !state.wal_segments.contains(&commit_segment) {
+            state.wal_segments.push(commit_segment);
+        }
+        if !state
+            .commits
+            .iter()
+            .any(|existing| existing.batch_id == commit.batch_id)
+        {
+            state.commits.push(commit);
         }
         let rows_accepted = count_rows(&slice.decoded.data);
         state.audit_events.push(audit_event);
@@ -873,6 +887,15 @@ fn merge_replayed_state(
             existing.wal_segments.push(segment);
         }
     }
+    for commit in incoming.commits {
+        if !existing
+            .commits
+            .iter()
+            .any(|candidate| candidate.batch_id == commit.batch_id)
+        {
+            existing.commits.push(commit);
+        }
+    }
     // Re-sort the parallel append vectors by LSN so cross-shard merges produce
     // a temporally ordered result. Build a sort key over append_metas indices,
     // then permute all three parallel vectors together.
@@ -1136,6 +1159,56 @@ mod tests {
                 .windows(2)
                 .all(|window| window[0].wal_lsn < window[1].wal_lsn)
         );
+    }
+
+    /// Replay retains every batch fence and its rotated terminal segment.
+    #[test]
+    fn replay_groups_multiple_batches_and_retains_commit_only_segments() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node.as_bytes(),
+            1,
+            WalConfig::new(256).expect("rotating WAL config"),
+        )
+        .expect("writer");
+        let seal_key = replay_key(tenant);
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "append".to_owned(),
+            resource: "multi-batch-replay".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 row".to_owned(),
+            detail: None,
+        };
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
+        for batch in [[1_u8; 16], [2_u8; 16]] {
+            wal.append_and_commit_for_replay_test(&seal_key, batch, &audit, &[7; 128])
+                .expect("append");
+        }
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        let state = &replayed[&seal_key.as_path_components()];
+        assert_eq!(state.commits.len(), 2);
+        assert_eq!(state.append_metas.len(), 2);
+        for commit in &state.commits {
+            assert!(state.wal_segments.iter().any(|segment| {
+                segment
+                    .path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem == commit.segment_sequence.to_string())
+            }));
+        }
     }
 
     #[test]

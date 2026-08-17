@@ -1711,12 +1711,12 @@ mod tests {
 
     /// All metric variants match the established mapper column for column.
     #[test]
-    fn all_metric_variants_match_mapper() {
+    fn otlp_projection_parity_metrics() {
         let request = request();
-        let mapped = crate::gate::collector::map::map_resource_metrics(&request.resource_metrics);
-        assert!(mapped.rejected.is_empty());
-        let expected = crate::gate::collector::map::metrics_to_record_batch(&mapped.records)
-            .expect("mapper batch");
+        let expected = crate::scribe::test_projection_oracle::project_resource_metrics(&request)
+            .expect("oracle projection")
+            .batch
+            .expect("oracle batch");
         let (actual, outcome) = project_fixture(&request, usize::MAX).expect("direct projection");
         let actual = actual.expect("direct batch").rows;
         let retained = expected.num_columns() - 2;

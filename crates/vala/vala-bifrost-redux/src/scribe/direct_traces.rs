@@ -1167,11 +1167,12 @@ mod tests {
 
     /// Direct trace projection is column-for-column identical to the existing mapper.
     #[test]
-    fn nonempty_projection_matches_mapper() {
+    fn otlp_projection_parity_traces() {
         let request = request();
-        let mapped = crate::gate::collector::map::map_resource_spans(&request.resource_spans);
-        let expected = crate::gate::collector::map::spans_to_record_batch(&mapped.records)
-            .expect("mapper batch");
+        let expected = crate::scribe::test_projection_oracle::project_resource_spans(&request)
+            .expect("oracle projection")
+            .batch
+            .expect("oracle batch");
         let (actual, outcome) = project_fixture(&request, usize::MAX).expect("direct projection");
         let actual = actual.expect("direct batch").rows;
         let retained = expected.num_columns() - 2;

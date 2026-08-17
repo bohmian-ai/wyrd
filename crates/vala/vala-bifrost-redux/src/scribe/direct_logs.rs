@@ -870,12 +870,12 @@ mod tests {
 
     /// Rich body, identifier, attribute, resource, and scope columns match the mapper.
     #[test]
-    fn rich_log_matches_mapper() {
+    fn otlp_projection_parity_logs() {
         let request = request();
-        let mapped = crate::gate::collector::map::map_resource_logs(&request.resource_logs);
-        assert!(mapped.rejected.is_empty());
-        let expected = crate::gate::collector::map::logs_to_record_batch(&mapped.records)
-            .expect("mapper batch");
+        let expected = crate::scribe::test_projection_oracle::project_resource_logs(&request)
+            .expect("oracle projection")
+            .batch
+            .expect("oracle batch");
         let (actual, outcome) = project_fixture(&request, usize::MAX).expect("direct projection");
         let actual = actual.expect("direct batch").rows;
         let retained = expected.num_columns() - 2;

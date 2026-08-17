@@ -58,6 +58,34 @@ pub(crate) struct PhysicalBindingFacts<'a> {
     pub(crate) peak_bytes: usize,
 }
 
+/// Computes the five checked physical binding totals from component lengths.
+///
+/// # Errors
+///
+/// Returns [`TenantTableBindingError::BindingSizeOverflow`] when any exact
+/// formula cannot be represented by `usize`.
+fn checked_binding_totals(
+    name: usize,
+    namespace: usize,
+    segment: usize,
+) -> Result<(usize, usize, usize, usize, usize), TenantTableBindingError> {
+    let add = |values: &[usize]| {
+        values
+            .iter()
+            .try_fold(0_usize, |total, value| total.checked_add(*value))
+    };
+    let input = add(&[4, 7, 36, segment]).ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+    let output =
+        add(&[8, 36, 1, segment, 1, name]).ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+    let binding = add(&[name, name, namespace, input, output])
+        .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+    let file_prefix =
+        add(&[namespace, 1, name]).ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+    let peak =
+        add(&[36, binding, file_prefix]).ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+    Ok((input, output, binding, file_prefix, peak))
+}
+
 /// Canonical physical identity derived from `(DataTenantId, TableRef)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantTableBinding {
@@ -101,28 +129,8 @@ impl TenantTableBinding {
             .ok_or_else(|| TenantTableBindingError::InvalidPhysicalNamespace {
                 detail: format!("logical namespace `{namespace}` is not one segment"),
             })?;
-        let add = |values: &[usize]| {
-            values
-                .iter()
-                .try_fold(0_usize, |total, value| total.checked_add(*value))
-        };
-        let tenant_bytes = 36;
-        let input_bytes = add(&[4, 7, tenant_bytes, segment.len()])
-            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
-        let output_bytes = add(&[8, tenant_bytes, 1, segment.len(), 1, table_ref.name.len()])
-            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
-        let binding_bytes = add(&[
-            table_ref.name.len(),
-            table_ref.name.len(),
-            namespace.len(),
-            input_bytes,
-            output_bytes,
-        ])
-        .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
-        let file_prefix_bytes = add(&[namespace.len(), 1, table_ref.name.len()])
-            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
-        let peak_bytes = add(&[tenant_bytes, binding_bytes, file_prefix_bytes])
-            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+        let (input_bytes, output_bytes, binding_bytes, file_prefix_bytes, peak_bytes) =
+            checked_binding_totals(table_ref.name.len(), namespace.len(), segment.len())?;
         Ok(PhysicalBindingFacts {
             tenant,
             table_ref,
@@ -285,6 +293,17 @@ mod tests {
         let binding = TenantTableBinding::from_facts(facts).expect("materialized binding");
         assert_eq!(binding.object_prefix.len(), facts.output_bytes);
         assert_eq!(binding.object_prefix.capacity(), facts.output_bytes);
+    }
+
+    /// Proves each unrepresentable formula fails before physical allocation.
+    #[test]
+    fn physical_binding_facts_reject_overflow() {
+        for lengths in [(usize::MAX, 11, 6), (5, usize::MAX, 6), (5, 11, usize::MAX)] {
+            assert_eq!(
+                checked_binding_totals(lengths.0, lengths.1, lengths.2),
+                Err(TenantTableBindingError::BindingSizeOverflow)
+            );
+        }
     }
 
     #[test]

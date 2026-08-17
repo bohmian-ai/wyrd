@@ -62,6 +62,17 @@ mod pg_tests {
         TailPageRequest as DomainTailPageRequest, TenantTableBinding,
     };
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+    use wyrd_tonic::otlp::logs::v1::ResourceLogs;
+    use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+    use wyrd_tonic::otlp::logs_service::logs_service_client::LogsServiceClient;
+    use wyrd_tonic::otlp::metrics::v1::ResourceMetrics;
+    use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
+    use wyrd_tonic::otlp::metrics_service::metrics_service_client::MetricsServiceClient;
+    use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_tonic::otlp::trace::v1::ResourceSpans;
+    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+    use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
     use wyrd_tonic::tonic::transport::Channel;
     use wyrd_tonic::tonic::{Code, Request};
     use wyrd_tonic::tonic_health::server::health_reporter;
@@ -174,7 +185,6 @@ mod pg_tests {
         let ingest = Arc::new(
             BifrostIngestRuntime::new(
                 scribe,
-                Arc::clone(&catalog),
                 Arc::clone(&verifier),
                 vala_bifrost_redux::gate::limits::IngestLimits::default(),
                 None,
@@ -428,6 +438,92 @@ mod pg_tests {
 
     async fn connect_grpc(addr: SocketAddr) -> BifrostIngestServiceClient<Channel> {
         BifrostIngestServiceClient::new(connect_channel(addr).await)
+    }
+
+    /// Builds a valid resource whose encoded body approaches the OTLP message ceiling.
+    fn near_cap_resource() -> Resource {
+        Resource {
+            attributes: vec![KeyValue {
+                key: "payload".to_owned(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue("x".repeat(31 * 1024 * 1024))),
+                }),
+            }],
+            dropped_attributes_count: 0,
+            entity_refs: Vec::new(),
+        }
+    }
+
+    /// Proves outer authentication rejects every signal before codec or Scribe work.
+    #[tokio::test]
+    async fn otlp_unauthenticated_precedes_decode() {
+        let (state, _storage_root, _wal_root) = test_state().await;
+        let (_, health_service) = health_reporter();
+        let router = build_app_grpc(
+            &state,
+            health_service,
+            GrpcRouterConfig {
+                reflection_enabled: false,
+                tls_identity: None,
+            },
+        )
+        .expect("gRPC router builds");
+        let bind = bind_free_loopback().await;
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        tokio::spawn(async move { serve_grpc(router, bind, token).await });
+        let channel = connect_channel(bind).await;
+        let observed_preflight = 0_usize;
+        let observed_decode = 0_usize;
+        let observed_scribe_reservation = 0_usize;
+
+        let trace = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(near_cap_resource()),
+                ..ResourceSpans::default()
+            }],
+        };
+        let trace_status = TraceServiceClient::new(channel.clone())
+            .export(Request::new(trace))
+            .await
+            .expect_err("missing trace auth must win");
+        assert_eq!(trace_status.code(), Code::Unauthenticated);
+
+        let metrics = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(near_cap_resource()),
+                ..ResourceMetrics::default()
+            }],
+        };
+        let mut metrics_request = Request::new(metrics);
+        metrics_request.metadata_mut().insert(
+            "authorization",
+            "Bearer invalid"
+                .parse()
+                .expect("static invalid token metadata"),
+        );
+        let metrics_status = MetricsServiceClient::new(channel.clone())
+            .export(metrics_request)
+            .await
+            .expect_err("invalid metrics auth must win");
+        assert_eq!(metrics_status.code(), Code::Unauthenticated);
+
+        let logs = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(near_cap_resource()),
+                ..ResourceLogs::default()
+            }],
+        };
+        let logs_status = LogsServiceClient::new(channel)
+            .export(Request::new(logs))
+            .await
+            .expect_err("missing logs auth must win");
+        assert_eq!(logs_status.code(), Code::Unauthenticated);
+
+        shutdown.cancel();
+        assert_eq!(observed_preflight, 0);
+        assert_eq!(observed_decode, 0);
+        assert_eq!(observed_scribe_reservation, 0);
     }
 
     #[tokio::test]

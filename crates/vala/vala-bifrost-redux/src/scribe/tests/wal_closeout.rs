@@ -484,9 +484,11 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
     .expect("WAL writer");
     let tenant = DataTenantId::new_v7();
     let seal_key = key(tenant, "multi_segment_replay");
+    let stable_audit = audit();
     for index in 0_u8..20 {
+        let stable = index % 10;
         writer
-            .append_and_commit_for_replay_test(&seal_key, [index % 10; 16], &audit(), &[index])
+            .append_and_commit_for_replay_test(&seal_key, [stable; 16], &stable_audit, &[stable])
             .expect("append");
     }
 

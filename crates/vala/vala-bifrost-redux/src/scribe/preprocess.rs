@@ -141,7 +141,7 @@ impl NativeSliceProducer {
         let input = Buffer::from(source.bytes.clone());
         Ok(Self {
             source,
-            decoder: arrow::ipc::reader::StreamDecoder::new(),
+            decoder: arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true),
             input,
             current: None,
             slice_index: 0,
@@ -209,7 +209,7 @@ impl NativeSliceProducer {
     /// The same root continues to own the aliased bytes; this operation only
     /// replaces fixed decoder state and resets ordinals.
     pub(crate) fn restart(&mut self) {
-        self.decoder = arrow::ipc::reader::StreamDecoder::new();
+        self.decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
         self.input = Buffer::from(self.source.bytes.clone());
         self.current = None;
         self.slice_index = 0;
@@ -223,7 +223,7 @@ impl NativeSliceProducer {
 /// Returns [`ScribeError`] when decoding, stamping, day planning, or checked
 /// slice-count conversion fails.
 fn count_native_slices(source: &NativeAdmittedRows) -> Result<u32, ScribeError> {
-    let mut decoder = arrow::ipc::reader::StreamDecoder::new();
+    let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
     let mut input = Buffer::from(source.bytes.clone());
     let mut slices = 0_usize;
     while let Some(rows) = decode_next_native_source(&mut decoder, &mut input)? {

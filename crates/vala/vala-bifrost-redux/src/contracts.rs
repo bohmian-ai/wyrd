@@ -140,11 +140,43 @@ pub struct OtlpDecodeOwner {
     pub(crate) memory: crate::resources::ScribeMemoryLease,
 }
 
+/// Temporary adapter-decode capacity split from an OTLP typed owner.
+///
+/// The server adapter keeps this guard alive while it uses bounded lexical
+/// scratch. Dropping the guard returns only that scratch capacity, leaving the
+/// paired [`OtlpDecodeOwner`] with the exact generated-request capacity that
+/// crosses Gate into Scribe.
+#[derive(Debug)]
+pub struct OtlpDecodeScratch {
+    /// Root-backed scratch lease released when adapter construction finishes.
+    _memory: crate::resources::ScribeMemoryLease,
+}
+
 impl OtlpDecodeOwner {
     /// Returns the exact adapter-decode capacity retained by this owner.
     #[must_use]
     fn bytes(&self) -> usize {
         self.memory.bytes()
+    }
+
+    /// Splits bounded temporary scratch from the retained typed-request owner.
+    ///
+    /// The split performs no second admission. The returned guard must remain
+    /// live for the complete adapter construction pass and be dropped before
+    /// this owner is paired with the decoded request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when `bytes` exceeds the capacity
+    /// admitted for this owner or root accounting cannot perform the split.
+    pub fn split_scratch(&mut self, bytes: usize) -> Result<OtlpDecodeScratch, ScribeError> {
+        let memory = self
+            .memory
+            .split(bytes)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("OTLP decode scratch split failed: {error}"),
+            })?;
+        Ok(OtlpDecodeScratch { _memory: memory })
     }
 
     /// Atomically grows the decode child into Scribe's one complete root.
@@ -174,7 +206,7 @@ pub struct FrameAdmission {
 }
 
 /// Closed OTLP projection outcome returned through the private Scribe seam.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ScribeOtlpOutcome {
     /// Trace export counts and partial-success detail.
     Traces(crate::gate::collector::IngestOutcome),

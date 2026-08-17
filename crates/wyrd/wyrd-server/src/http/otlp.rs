@@ -9,8 +9,8 @@
 //!
 //! Content-Type handling (shared by all three signals):
 //! - `application/x-protobuf` → `prost::Message::decode`.
-//! - `application/json` → `serde_json` (the OTLP protobuf-JSON mapping the
-//!   `with-serde` feature emits on the proto message types).
+//! - `application/json` → bounded schema-aware preflight followed by direct,
+//!   exact-capacity generated-message construction.
 //! - missing / unrecognized Content-Type → treated as protobuf, per the OTLP/HTTP
 //!   spec, which defines `application/x-protobuf` as the default request encoding.
 //!
@@ -42,7 +42,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use vala_bifrost_redux::contracts::DecodedOtlp;
 use vala_bifrost_redux::gate::{AuthContext, IngestError};
 use wyrd_spec::error::WyrdError;
@@ -56,8 +55,12 @@ use wyrd_tonic::prost::Message;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
+use crate::otlp_json::{preflight_logs_json, preflight_metrics_json, preflight_trace_json};
 use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
+use crate::otlp_logs_json::decode_logs_json;
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
+use crate::otlp_metrics_json::decode_metrics_json;
+use crate::otlp_trace_json::decode_trace_json;
 use crate::state::AppState;
 
 /// The OTLP signal type handled by a specific export endpoint.
@@ -144,23 +147,6 @@ pub fn router() -> Router<AppState> {
         .route("/logs", post(export_logs))
 }
 
-/// Decode an OTLP request body under the resolved `encoding`.
-///
-/// Protobuf bodies are length-delimited prost messages; JSON bodies use the OTLP
-/// protobuf-JSON mapping. Decode failures map to the ingest protocol code so both
-/// transports report a malformed export identically.
-fn decode_request<T>(encoding: OtlpEncoding, body: &Bytes) -> Result<T, IngestError>
-where
-    T: Message + DeserializeOwned + Default,
-{
-    match encoding {
-        OtlpEncoding::Protobuf => T::decode(body.as_ref())
-            .map_err(|error| IngestError::Decode(format!("OTLP protobuf decode failed: {error}"))),
-        OtlpEncoding::Json => serde_json::from_slice(body.as_ref())
-            .map_err(|error| IngestError::Decode(format!("OTLP JSON decode failed: {error}"))),
-    }
-}
-
 /// Encode an OTLP response message in the request's `encoding` and attach the
 /// matching `Content-Type`.
 fn encode_response<T>(encoding: OtlpEncoding, message: &T) -> Response
@@ -231,11 +217,27 @@ async fn export_traces(
             (owner, request)
         }
         OtlpEncoding::Json => {
-            let owner = gate
-                .reserve_otlp_decode(body.len())
+            let plan = preflight_trace_json(&body, gate.otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-            let request = decode_request(encoding, &body)
+            let total = plan
+                .decode_bytes
+                .checked_add(plan.scratch_bytes)
+                .ok_or_else(|| {
+                    ingest_error_to_response(
+                        IngestError::Decode("OTLP JSON capacity overflow".to_owned()),
+                        OtlpSignal::Traces,
+                    )
+                })?;
+            let mut owner = gate
+                .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            let scratch = owner
+                .split_scratch(plan.scratch_bytes)
+                .map_err(IngestError::from_scribe)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            let request = decode_trace_json(&body, plan.decode_bytes)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            drop(scratch);
             (owner, request)
         }
     };
@@ -296,11 +298,28 @@ async fn export_metrics(
             (owner, request)
         }
         OtlpEncoding::Json => {
-            let owner = gate
-                .reserve_otlp_decode(body.len())
+            let plan = preflight_metrics_json(&body, gate.otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
-            let request: ExportMetricsServiceRequest = decode_request(encoding, &body)
+            let total = plan
+                .decode_bytes
+                .checked_add(plan.scratch_bytes)
+                .ok_or_else(|| {
+                    ingest_error_to_response(
+                        IngestError::Decode("OTLP JSON capacity overflow".to_owned()),
+                        OtlpSignal::Metrics,
+                    )
+                })?;
+            let mut owner = gate
+                .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            let scratch = owner
+                .split_scratch(plan.scratch_bytes)
+                .map_err(IngestError::from_scribe)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            let request: ExportMetricsServiceRequest =
+                decode_metrics_json(&body, plan.decode_bytes)
+                    .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            drop(scratch);
             (owner, request)
         }
     };
@@ -361,11 +380,27 @@ async fn export_logs(
             (owner, request)
         }
         OtlpEncoding::Json => {
-            let owner = gate
-                .reserve_otlp_decode(body.len())
+            let plan = preflight_logs_json(&body, gate.otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
-            let request: ExportLogsServiceRequest = decode_request(encoding, &body)
+            let total = plan
+                .decode_bytes
+                .checked_add(plan.scratch_bytes)
+                .ok_or_else(|| {
+                    ingest_error_to_response(
+                        IngestError::Decode("OTLP JSON capacity overflow".to_owned()),
+                        OtlpSignal::Logs,
+                    )
+                })?;
+            let mut owner = gate
+                .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            let scratch = owner
+                .split_scratch(plan.scratch_bytes)
+                .map_err(IngestError::from_scribe)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            let request: ExportLogsServiceRequest = decode_logs_json(&body, plan.decode_bytes)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            drop(scratch);
             (owner, request)
         }
     };

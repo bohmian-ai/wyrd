@@ -1843,6 +1843,63 @@ mod pressure_config_tests {
 
 #[cfg(test)]
 mod telemetry_tests {
+    /// Decode scratch remains charged during construction and settles separately.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the production-equivalent root cannot reserve, split, or
+    /// release the exact decode capacities.
+    #[tokio::test]
+    async fn otlp_decode_scratch_split_settles_exactly_once() {
+        let scribe = super::ScribeImpl::default();
+        let baseline = scribe
+            .memory
+            .snapshot()
+            .expect("baseline resource snapshot")
+            .scribe_memory_used_bytes;
+        let mut owner =
+            <super::ScribeImpl as crate::contracts::Scribe>::reserve_otlp_decode(&scribe, 1024)
+                .expect("decode owner reservation");
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("reserved resource snapshot")
+                .scribe_memory_used_bytes,
+            baseline + 1024
+        );
+
+        let scratch = owner.split_scratch(256).expect("scratch split");
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("split resource snapshot")
+                .scribe_memory_used_bytes,
+            baseline + 1024
+        );
+        drop(scratch);
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("scratch release snapshot")
+                .scribe_memory_used_bytes,
+            baseline + 768
+        );
+        let decoded = crate::contracts::DecodedOtlp::new((), 1, owner);
+        assert_eq!(decoded.decode_bytes, 768);
+        drop(decoded);
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("terminal resource snapshot")
+                .scribe_memory_used_bytes,
+            baseline
+        );
+    }
+
     /// The steady-state age path emits only root-owned capacity metric families.
     ///
     /// # Panics

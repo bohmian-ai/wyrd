@@ -137,8 +137,7 @@ pub async fn record(
         "SELECT slice_set_digest, slice_count, wal_node_id, wal_writer_epoch, wal_shard_id, \
                     wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id \
                FROM vala.scribe_batch_commits \
-              WHERE data_tenant_id = wyrd.current_tenant() \
-                AND logical_table_fqn = $1 AND batch_id = $2",
+              WHERE logical_table_fqn = $1 AND batch_id = $2",
     )
     .bind(&commit.logical_table_fqn)
     .bind(commit.batch_id)

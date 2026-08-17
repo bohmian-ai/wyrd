@@ -159,6 +159,11 @@ fn exemplars_capacity(values: &Vec<Exemplar>) -> usize {
 }
 
 /// Decodes the metrics request root.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate
+/// `resourceMetrics`, or an invalid nested resource-metrics array.
 fn decode_request(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<ExportMetricsServiceRequest, JsonDecodeError> {
@@ -174,6 +179,11 @@ fn decode_request(
 }
 
 /// Decodes one metrics resource group.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid resource or scope-metrics messages, or malformed strings.
 fn decode_resource_metrics(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<ResourceMetrics, JsonDecodeError> {
@@ -197,6 +207,11 @@ fn decode_resource_metrics(
 }
 
 /// Decodes one metrics scope group.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid scope or metric messages, or malformed strings.
 fn decode_scope_metrics(cursor: &mut JsonCursor<'_>) -> Result<ScopeMetrics, JsonDecodeError> {
     let mut output = ScopeMetrics::default();
     object(cursor, |field, cursor| match field {
@@ -218,6 +233,12 @@ fn decode_scope_metrics(cursor: &mut JsonCursor<'_>) -> Result<ScopeMetrics, Jso
 }
 
 /// Decodes one metric descriptor and its flattened data oneof.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, malformed descriptor or metadata values, invalid aggregation
+/// content, or more than one metric data variant.
 fn decode_metric(cursor: &mut JsonCursor<'_>) -> Result<Metric, JsonDecodeError> {
     let mut output = Metric::default();
     object(cursor, |field, cursor| match field {
@@ -269,6 +290,11 @@ fn decode_metric(cursor: &mut JsonCursor<'_>) -> Result<Metric, JsonDecodeError>
 }
 
 /// Sets the metric oneof once, matching derived-serde duplicate behavior.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the metric already contains an aggregation
+/// variant.
 fn set_metric_data(output: &mut Metric, value: metric::Data) -> Result<(), JsonDecodeError> {
     if output.data.is_some() {
         return Err(JsonDecodeError::at(0, "duplicate metric data field"));
@@ -278,6 +304,11 @@ fn set_metric_data(output: &mut Metric, value: metric::Data) -> Result<(), JsonD
 }
 
 /// Decodes a gauge aggregation.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, a duplicate
+/// `dataPoints` field, or an invalid number-point array.
 fn decode_gauge(cursor: &mut JsonCursor<'_>) -> Result<Gauge, JsonDecodeError> {
     let mut output = Gauge::default();
     object(cursor, |field, cursor| match field {
@@ -291,6 +322,12 @@ fn decode_gauge(cursor: &mut JsonCursor<'_>) -> Result<Gauge, JsonDecodeError> {
 }
 
 /// Decodes a sum aggregation.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid number points, an out-of-range temporality, or a non-boolean
+/// monotonicity value.
 fn decode_sum(cursor: &mut JsonCursor<'_>) -> Result<Sum, JsonDecodeError> {
     let mut output = Sum::default();
     object(cursor, |field, cursor| match field {
@@ -312,6 +349,11 @@ fn decode_sum(cursor: &mut JsonCursor<'_>) -> Result<Sum, JsonDecodeError> {
 }
 
 /// Decodes a histogram aggregation.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid histogram points, or an out-of-range temporality.
 fn decode_histogram(cursor: &mut JsonCursor<'_>) -> Result<Histogram, JsonDecodeError> {
     let mut output = Histogram::default();
     object(cursor, |field, cursor| match field {
@@ -329,6 +371,11 @@ fn decode_histogram(cursor: &mut JsonCursor<'_>) -> Result<Histogram, JsonDecode
 }
 
 /// Decodes an exponential-histogram aggregation.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid exponential-histogram points, or an out-of-range temporality.
 fn decode_exponential_histogram(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<ExponentialHistogram, JsonDecodeError> {
@@ -348,6 +395,11 @@ fn decode_exponential_histogram(
 }
 
 /// Decodes a summary aggregation.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, a duplicate
+/// `dataPoints` field, or an invalid summary-point array.
 fn decode_summary(cursor: &mut JsonCursor<'_>) -> Result<Summary, JsonDecodeError> {
     let mut output = Summary::default();
     object(cursor, |field, cursor| match field {
@@ -361,6 +413,12 @@ fn decode_summary(cursor: &mut JsonCursor<'_>) -> Result<Summary, JsonDecodeErro
 }
 
 /// Decodes one number data point and its flattened value oneof.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid attributes or exemplars, out-of-range timestamps, flags, or numeric
+/// values, or more than one number-point value variant.
 fn decode_number_point(cursor: &mut JsonCursor<'_>) -> Result<NumberDataPoint, JsonDecodeError> {
     let mut output = NumberDataPoint::default();
     object(cursor, |field, cursor| match field {
@@ -401,6 +459,11 @@ fn decode_number_point(cursor: &mut JsonCursor<'_>) -> Result<NumberDataPoint, J
 }
 
 /// Sets a number-point oneof once.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the number point already contains a value
+/// variant.
 fn set_number_value(
     output: &mut NumberDataPoint,
     value: number_data_point::Value,
@@ -413,6 +476,12 @@ fn set_number_value(
 }
 
 /// Decodes one explicit histogram point.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid attributes, exemplars, bucket arrays, bounds, or optional numeric
+/// values, or out-of-range timestamps, counts, and flags.
 fn decode_histogram_point(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<HistogramDataPoint, JsonDecodeError> {
@@ -468,6 +537,12 @@ fn decode_histogram_point(
 }
 
 /// Decodes one exponential histogram point.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid attributes, exemplars, bucket messages, or optional numeric values,
+/// or out-of-range timestamps, counts, scale, and flags.
 fn decode_exponential_histogram_point(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<ExponentialHistogramDataPoint, JsonDecodeError> {
@@ -535,6 +610,11 @@ fn decode_exponential_histogram_point(
 }
 
 /// Decodes one exponential bucket set.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// an out-of-range offset, or an invalid bucket-count array.
 fn decode_buckets(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<exponential_histogram_data_point::Buckets, JsonDecodeError> {
@@ -554,6 +634,12 @@ fn decode_buckets(
 }
 
 /// Decodes one summary point.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid attributes or quantile messages, or out-of-range timestamps,
+/// counts, flags, and floating-point values.
 fn decode_summary_point(cursor: &mut JsonCursor<'_>) -> Result<SummaryDataPoint, JsonDecodeError> {
     let mut output = SummaryDataPoint::default();
     object(cursor, |field, cursor| match field {
@@ -591,6 +677,11 @@ fn decode_summary_point(cursor: &mut JsonCursor<'_>) -> Result<SummaryDataPoint,
 }
 
 /// Decodes one summary quantile/value pair.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// or invalid quantile and value numbers.
 fn decode_quantile(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<summary_data_point::ValueAtQuantile, JsonDecodeError> {
@@ -610,6 +701,12 @@ fn decode_quantile(
 }
 
 /// Decodes one metric exemplar and its flattened value oneof.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid filtered attributes, hexadecimal identifiers, timestamps, or
+/// numeric values, or more than one exemplar value variant.
 fn decode_exemplar(cursor: &mut JsonCursor<'_>) -> Result<Exemplar, JsonDecodeError> {
     let mut output = Exemplar::default();
     object(cursor, |field, cursor| match field {
@@ -643,6 +740,11 @@ fn decode_exemplar(cursor: &mut JsonCursor<'_>) -> Result<Exemplar, JsonDecodeEr
 }
 
 /// Sets an exemplar oneof once.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the exemplar already contains a value
+/// variant.
 fn set_exemplar_value(
     output: &mut Exemplar,
     value: exemplar::Value,
@@ -655,6 +757,12 @@ fn set_exemplar_value(
 }
 
 /// Decodes one object, rejecting duplicate recognized fields while skipping unknowns.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate
+/// recognized fields, malformed skipped values or excessive nesting, or any
+/// error propagated by `field_decoder`.
 fn object(
     cursor: &mut JsonCursor<'_>,
     mut field_decoder: impl FnMut(Field, &mut JsonCursor<'_>) -> Result<bool, JsonDecodeError>,

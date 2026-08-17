@@ -596,9 +596,8 @@ async fn public_ack_restart_read_exact_once_journey() {
         "SELECT slice_set_digest, slice_count, wal_node_id, wal_writer_epoch,
                     wal_shard_id, wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id
                FROM vala.scribe_batch_commits
-              WHERE data_tenant_id=$1 AND logical_table_fqn=$2 AND batch_id=$3",
+              WHERE logical_table_fqn=$1 AND batch_id=$2",
     )
-    .bind(tenant.as_uuid())
     .bind(TABLE_FQN)
     .bind(batch_id)
     .fetch_one(&mut **tenant_conn.transaction())
@@ -616,10 +615,9 @@ async fn public_ack_restart_read_exact_once_journey() {
     );
     let ingest_audits: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM vala.audit_outbox
-          WHERE data_tenant_id=$1 AND request_id=$2 AND operation='bifrost.ingest_batch'
-            AND resource=$3",
+          WHERE request_id=$1 AND operation='bifrost.ingest_batch'
+            AND resource=$2",
     )
-    .bind(tenant.as_uuid())
     .bind(durable_identity.8.to_string())
     .bind(TABLE_FQN)
     .fetch_one(&mut **tenant_conn.transaction())
@@ -677,9 +675,8 @@ async fn public_ack_restart_read_exact_once_journey() {
     assert_eq!(ownership.ingress_lifecycle.succeeded, 1);
     let unpublished: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list
-         WHERE data_tenant_id = $1 AND namespace = 'vala.bifrost' AND table_name = $2",
+         WHERE namespace = 'vala.bifrost' AND table_name = $1",
     )
-    .bind(tenant.as_uuid())
     .bind(TABLE_NAME)
     .fetch_one(&mut **tenant_conn.transaction())
     .await
@@ -741,9 +738,8 @@ async fn public_ack_restart_read_exact_once_journey() {
         "SELECT slice_set_digest, slice_count, wal_node_id, wal_writer_epoch,
                     wal_shard_id, wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id
                FROM vala.scribe_batch_commits
-              WHERE data_tenant_id=$1 AND logical_table_fqn=$2 AND batch_id=$3",
+              WHERE logical_table_fqn=$1 AND batch_id=$2",
     )
-    .bind(tenant.as_uuid())
     .bind(TABLE_FQN)
     .bind(batch_id)
     .fetch_one(&mut **restarted_tenant_conn.transaction())
@@ -772,10 +768,9 @@ async fn public_ack_restart_read_exact_once_journey() {
         .expect("acknowledged source epoch is retained");
     let recovered_identity: (uuid::Uuid, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT node_id, writer_epoch, wal_lsn_min, wal_lsn_max, COUNT(*)::bigint FROM vala.file_list
-         WHERE data_tenant_id=$1 AND namespace='vala.bifrost' AND table_name=$2
+         WHERE namespace='vala.bifrost' AND table_name=$1
          GROUP BY node_id, writer_epoch, wal_lsn_min, wal_lsn_max",
     )
-    .bind(tenant.as_uuid())
     .bind(TABLE_NAME)
     .fetch_one(&mut **restarted_tenant_conn.transaction())
     .await

@@ -872,8 +872,7 @@ async fn audit_counts(fixture: &PersistenceFixture) -> (i64, i64) {
     sqlx::query_as(
         "SELECT count(*) FILTER (WHERE operation = 'bifrost.append')::bigint,
                 count(*) FILTER (WHERE operation = 'bifrost.scribe.visibility.publish')::bigint
-           FROM vala.audit_outbox
-          WHERE data_tenant_id = wyrd.current_tenant()",
+           FROM vala.audit_outbox",
     )
     .fetch_one(&mut **conn.transaction())
     .await
@@ -896,8 +895,7 @@ async fn audit_identities(
     sqlx::query_as(
         "SELECT operation, request_id, resource, principal_id
            FROM vala.audit_outbox
-          WHERE data_tenant_id = wyrd.current_tenant()
-            AND operation IN ('bifrost.append', 'bifrost.scribe.visibility.publish')
+          WHERE operation IN ('bifrost.append', 'bifrost.scribe.visibility.publish')
           ORDER BY seq",
     )
     .fetch_all(&mut **conn.transaction())

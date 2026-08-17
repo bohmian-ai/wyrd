@@ -98,6 +98,11 @@ fn span_capacity(value: &Span) -> usize {
 }
 
 /// Decodes the trace export root.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate
+/// `resourceSpans`, or an invalid nested resource-spans array.
 fn decode_trace_request(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<ExportTraceServiceRequest, JsonDecodeError> {
@@ -122,6 +127,11 @@ fn decode_trace_request(
 }
 
 /// Decodes one resource-spans group.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid resource or scope-spans messages, or malformed strings.
 fn decode_resource_spans(cursor: &mut JsonCursor<'_>) -> Result<ResourceSpans, JsonDecodeError> {
     let mut output = ResourceSpans::default();
     let mut first = true;
@@ -149,6 +159,11 @@ fn decode_resource_spans(cursor: &mut JsonCursor<'_>) -> Result<ResourceSpans, J
 }
 
 /// Decodes one scope-spans group.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid scope or span messages, or malformed strings.
 fn decode_scope_spans(cursor: &mut JsonCursor<'_>) -> Result<ScopeSpans, JsonDecodeError> {
     let mut output = ScopeSpans::default();
     let mut first = true;
@@ -171,6 +186,12 @@ fn decode_scope_spans(cursor: &mut JsonCursor<'_>) -> Result<ScopeSpans, JsonDec
 }
 
 /// Decodes one span and all nested events, links, and attributes.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid hexadecimal identifiers, out-of-range numeric values, or
+/// malformed nested attributes, events, links, and status messages.
 fn decode_span(cursor: &mut JsonCursor<'_>) -> Result<Span, JsonDecodeError> {
     let mut output = Span::default();
     let mut first = true;
@@ -226,6 +247,11 @@ fn decode_span(cursor: &mut JsonCursor<'_>) -> Result<Span, JsonDecodeError> {
 }
 
 /// Decodes one span event.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid timestamps or counts, malformed strings, or invalid attributes.
 fn decode_event(cursor: &mut JsonCursor<'_>) -> Result<span::Event, JsonDecodeError> {
     let mut output = span::Event::default();
     let mut first = true;
@@ -254,6 +280,12 @@ fn decode_event(cursor: &mut JsonCursor<'_>) -> Result<span::Event, JsonDecodeEr
 }
 
 /// Decodes one span link.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// invalid hexadecimal identifiers, malformed strings or attributes, or
+/// out-of-range flags and counts.
 fn decode_link(cursor: &mut JsonCursor<'_>) -> Result<span::Link, JsonDecodeError> {
     let mut output = span::Link::default();
     let mut first = true;
@@ -289,6 +321,11 @@ fn decode_link(cursor: &mut JsonCursor<'_>) -> Result<span::Link, JsonDecodeErro
 }
 
 /// Decodes one span status.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate fields,
+/// malformed status text, or an out-of-range status code.
 fn decode_status(cursor: &mut JsonCursor<'_>) -> Result<Status, JsonDecodeError> {
     let mut output = Status::default();
     let mut first = true;

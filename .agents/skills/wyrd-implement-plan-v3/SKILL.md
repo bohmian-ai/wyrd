@@ -46,7 +46,15 @@ implement, mutate controller state, or invoke another workflow. Run the advisor
 as `gpt-5.6-sol` with `low` reasoning.
 
 The root validates the recommendation against source and authorities and owns
-the decision. If the root agrees, record the evidence and rationale and author
+the decision. Reject and rerun an advisory result that does not select exactly
+one recommendation, merely enumerates alternatives, asks planning to decide,
+or returns the decision to the controller. Validate the result with
+`scripts/validate_advisory_result.py` before any workflow transition. Record
+escalation phases distinctly as `requested`, `recommended`, `root_validated`,
+and `root_accepted` or `root_rejected`; neither planning nor task revision may
+start before the root decision is recorded.
+
+If the root agrees, record the evidence and rationale and author
 one digest-bound successor task revision for only the frozen cone, with exact
 contract, write-set, lock, dependency, proof, and escalation changes. Invalidate
 affected candidates, proofs, and reviews; validate the revised task request and
@@ -68,6 +76,12 @@ a projection of its append-only event log; resume by reconstructing from that
 log and comparing the resulting snapshot. Never use a context capsule or
 context cache.
 
+Initialize the complete scheduling identity of every task before first
+dispatch: canonical digest and revision, dependencies, semantic locks, declared
+write set, proof requirements, and proof prerequisites. Never populate these
+fields lazily. An empty write set is invalid because it makes overlap checks
+non-conservative.
+
 The root alone writes canonical task status and evidence in the external plan
 repository. Proof and review evidence first records the SHA-256 content digest
 of each immutable artifact. After those digests and the source candidate SHA
@@ -77,6 +91,28 @@ or self-referential evidence commit SHA. Worker reports, chat memory, branch
 names, and worktree contents are not canonical task evidence.
 
 ## Schedule bounded work
+
+Run a work-conserving scheduling pass after initialization and every state
+transition, including dispatch, candidate publication, proof or review result,
+failure, lane release, freeze, advisory transition, revision acceptance, and
+integration. Each pass must:
+
+1. recompute all dependency-ready tasks;
+2. exclude tasks conflicting with active or accepted candidates;
+3. honor the approved concurrency schedule and lane limits;
+4. dispatch every selected task for which an implementor slot exists; and
+5. record a concrete lane, conflict, dependency, approved-serialization, or
+   agent-capacity reason for every ready task left idle.
+
+Validate the resulting scheduling report with
+`scripts/validate_schedule_pass.py` before dispatching or waiting. An eligible
+task absent from both implementors and selected-but-idle reasons invalidates the
+pass.
+
+Do not focus the controller on the first active task. Freezing one cone releases
+its implementor and lane allocations immediately and triggers another
+scheduling pass; unaffected work continues. A task waiting for a proof lane
+does not consume an implementor allocation.
 
 Dispatch only dependency-ready tasks whose declared write sets do not overlap
 any active or accepted-but-not-integrated candidate. Use at most three fresh
@@ -96,6 +132,11 @@ Workers produce committed candidate SHAs. A candidate is immutable: any
 remediation produces a new descendant candidate and invalidates review and
 proof for the old SHA. Never amend, force-update, or continue editing a
 candidate worktree after publication.
+
+Report allocations by class after each scheduling pass: implementors, proof
+lanes, reviewers, advisors, frozen tasks, dependency-blocked tasks, and every
+selected-but-idle task with its reason. Reviewers do not count as implementors
+and cannot be allocated before an immutable candidate exists.
 
 ## Prove and review candidates
 

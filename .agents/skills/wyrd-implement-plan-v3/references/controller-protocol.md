@@ -30,6 +30,12 @@ Every task projection records:
   the external-plan `evidence_commit` produced
   after source and evidence acceptance.
 
+Populate every task projection completely in the initialization event. The
+task digest binds its dependencies, locks, write set, and proof requirements;
+none may be filled lazily. `write_set` must be a nonempty list of normalized
+repository-relative paths. `dependencies` and `locks` must be present,
+duplicate-free lists even when empty.
+
 Content digests are lowercase SHA-256. Git object IDs are lowercase 40- or
 64-character hexadecimal values. Artifact digests describe immutable proof or
 review content; they are never predicted Git commit SHAs. Record the resulting
@@ -92,6 +98,16 @@ used the same controller-state identity the root later accepts.
 
 ## Scheduling and integration
 
+Every event projection includes a scheduling report with separate
+implementors, proof lanes, reviewers, advisors, frozen tasks,
+dependency-blocked tasks, and selected-but-idle tasks. Recompute it after every
+transition. Give each selected-but-idle task one concrete reason: dependency,
+source or semantic conflict, approved serialization, Cargo lane, stateful lane,
+or agent capacity. A generic `blocked`, `busy`, or `waiting` reason is invalid.
+Dispatch every dependency-ready, nonconflicting task selected by the approved
+schedule when an implementor slot exists. Validate this report with
+`scripts/validate_schedule_pass.py` before dispatch or wait.
+
 - Implementation dependencies form a DAG. A task becomes active only after
   every implementation dependency is integrated. Proof prerequisites never
   affect dispatch. Integration order is dependency-respecting and
@@ -112,6 +128,27 @@ used the same controller-state identity the root later accepts.
   integrated-commit ancestry/order, and cherry-pick patch identity.
 - `integration_head` equals the last integrated commit when any task is
   integrated. Task and global external-plan evidence commit values agree.
+
+## Material-decision guard
+
+Keep one escalation record per frozen cone. Its phase advances only through:
+
+```text
+requested -> recommended -> root_validated -> root_accepted | root_rejected
+```
+
+The advisory artifact must pass `scripts/validate_advisory_result.py`. It names
+one recommendation, rejected alternatives, evidence, authorities, impact cone,
+and whether the decision changes the V1 objective, DAG, or cross-task semantic
+ownership. Enumerating alternatives or delegating the choice is not a
+recommendation.
+
+After `root_accepted`, stage proposed successor artifacts outside canonical
+execution authority. Promote a bounded successor task only after its digest and
+complete scheduling identity validate. Invoke `$wyrd-plan-v3` only when the
+accepted decision explicitly changes the objective, DAG, or cross-task semantic
+ownership. Unaccepted or merely proposed artifacts never drive dispatch and do
+not invalidate the last accepted plan.
 
 Run:
 

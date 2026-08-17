@@ -270,6 +270,31 @@ def validate(state: dict[str, Any]) -> list[str]:
             errors.append(f"{task_id}: revision must be positive")
         if not is_digest(task.get("digest")):
             errors.append(f"{task_id}: invalid task digest")
+        dependencies = task.get("dependencies")
+        if (
+            not isinstance(dependencies, list)
+            or len(dependencies) != len(set(dependencies))
+        ):
+            errors.append(f"{task_id}: dependencies must be a duplicate-free list")
+            dependencies = []
+        locks = task.get("locks")
+        if not isinstance(locks, list) or len(locks) != len(set(locks)):
+            errors.append(f"{task_id}: locks must be a duplicate-free list")
+        write_set = task.get("write_set")
+        if (
+            not isinstance(write_set, list)
+            or not write_set
+            or len(write_set) != len(set(write_set))
+            or not all(
+                isinstance(path, str)
+                and path
+                and not PurePosixPath(path).is_absolute()
+                for path in write_set
+            )
+        ):
+            errors.append(
+                f"{task_id}: write_set must be a nonempty duplicate-free list of relative paths"
+            )
         for dependency in task.get("dependencies", []):
             if dependency not in tasks:
                 errors.append(f"{task_id}: unknown dependency {dependency}")

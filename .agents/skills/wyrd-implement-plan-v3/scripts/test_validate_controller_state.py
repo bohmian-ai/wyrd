@@ -201,6 +201,23 @@ class ControllerStateTests(unittest.TestCase):
         self.assertIn("T1: invalid candidate_sha", errors)
         self.assertIn("T1: invalid diff identity", errors)
 
+    def test_empty_write_set_is_rejected(self) -> None:
+        """Reject incomplete scheduling identity that hides source conflicts."""
+        state = valid_state()
+        state["mutable"]["tasks"]["T1"]["write_set"] = []
+        project(state)
+        self.assertIn(
+            "T1: write_set must be a nonempty duplicate-free list of relative paths",
+            validate(state),
+        )
+
+    def test_missing_lock_projection_is_rejected(self) -> None:
+        """Require semantic-lock identity even when a task owns no locks."""
+        state = valid_state()
+        del state["mutable"]["tasks"]["T1"]["locks"]
+        project(state)
+        self.assertIn("T1: locks must be a duplicate-free list", validate(state))
+
     def test_stale_candidate_generation_is_rejected(self) -> None:
         """Reject proof and review bound to an older generation."""
         state = valid_state()

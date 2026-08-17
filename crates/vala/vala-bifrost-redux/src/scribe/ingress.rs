@@ -185,13 +185,13 @@ impl ScribeImpl {
         let plan = match &frame.payload {
             IngressPayload::ArrowIpc(bytes) => planner.plan_native(bytes, name_bytes),
             IngressPayload::OtlpTraces(request) => {
-                planner.plan_traces(&request.request, request.wire_bytes, name_bytes)
+                planner.plan_traces(&request.request, request.decode_bytes, name_bytes)
             }
             IngressPayload::OtlpMetrics(request) => {
-                planner.plan_metrics(&request.request, request.wire_bytes, name_bytes)
+                planner.plan_metrics(&request.request, request.decode_bytes, name_bytes)
             }
             IngressPayload::OtlpLogs(request) => {
-                planner.plan_logs(&request.request, request.wire_bytes, name_bytes)
+                planner.plan_logs(&request.request, request.decode_bytes, name_bytes)
             }
             IngressPayload::ProjectedArrow(batches) => {
                 planner.plan_projected(batches, frame.measured_wire_bytes, name_bytes)

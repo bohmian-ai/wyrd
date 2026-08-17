@@ -28,21 +28,21 @@ pub(crate) const MAX_SOURCE_PLANS: usize = 64;
 /// Maximum top-level fields in the canonical native schema.
 pub(crate) const MAX_NATIVE_FIELDS: usize = 256;
 /// Maximum rows or OTLP signal records in one request.
-pub(crate) const MAX_INGEST_ROWS: usize = 131_072;
+pub(crate) const MAX_INGEST_ROWS: usize = crate::gate::limits::OTLP_WIRE_LIMITS.records;
 /// Maximum OTLP resource groups in one request.
-pub(crate) const MAX_OTLP_RESOURCES: usize = 4_096;
+pub(crate) const MAX_OTLP_RESOURCES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.resources;
 /// Maximum OTLP scope groups in one request.
-pub(crate) const MAX_OTLP_SCOPES: usize = 8_192;
+pub(crate) const MAX_OTLP_SCOPES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.scopes;
 /// Maximum OTLP attribute nodes in one request.
-pub(crate) const MAX_OTLP_ATTRIBUTES: usize = 1_048_576;
+pub(crate) const MAX_OTLP_ATTRIBUTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.attributes;
 /// Maximum cumulative OTLP key/value/body bytes in one request.
-pub(crate) const MAX_OTLP_VALUE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_OTLP_VALUE_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.value_bytes;
 /// Maximum nested OTLP value depth.
-pub(crate) const MAX_OTLP_VALUE_DEPTH: usize = 8;
+pub(crate) const MAX_OTLP_VALUE_DEPTH: usize = crate::gate::limits::OTLP_WIRE_LIMITS.value_depth;
 /// Maximum distinct event days in one request.
-pub(crate) const MAX_EVENT_DAYS: usize = 32;
+pub(crate) const MAX_EVENT_DAYS: usize = crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
 /// Maximum projected Arrow and IPC bytes in one request.
-pub(crate) const MAX_PROJECTED_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PROJECTED_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.material_bytes;
 /// Fixed WAL header and digest workspace.
 pub(crate) const WAL_WORKSPACE_BYTES: usize = 4 * 1024;
 

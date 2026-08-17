@@ -13,6 +13,42 @@ pub const BIFROST_TRANSPORT_QUANTUM_BYTES: usize = 64 * 1024;
 /// Largest individual encoded HTTP or tonic message admitted by Bifrost.
 pub const BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Immutable V1 OTLP limits shared by the server adapter and Scribe planner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OtlpWireLimits {
+    /// Largest encoded protobuf or JSON request accepted by an adapter.
+    pub request_bytes: usize,
+    /// Largest number of resource groups in one export.
+    pub resources: usize,
+    /// Largest number of instrumentation-scope groups in one export.
+    pub scopes: usize,
+    /// Largest number of signal records in one export.
+    pub records: usize,
+    /// Largest number of attribute entries in one export.
+    pub attributes: usize,
+    /// Largest cumulative key, value, body, and identifier byte count.
+    pub value_bytes: usize,
+    /// Largest recursive `AnyValue` nesting depth.
+    pub value_depth: usize,
+    /// Largest number of distinct event-day partitions.
+    pub event_days: usize,
+    /// Largest admitted typed-request or projected Arrow material capacity.
+    pub material_bytes: usize,
+}
+
+/// Canonical immutable OTLP V1 limits used by both decode and projection.
+pub const OTLP_WIRE_LIMITS: OtlpWireLimits = OtlpWireLimits {
+    request_bytes: BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+    resources: 4_096,
+    scopes: 8_192,
+    records: 131_072,
+    attributes: 1_048_576,
+    value_bytes: 32 * 1024 * 1024,
+    value_depth: 8,
+    event_days: 32,
+    material_bytes: 64 * 1024 * 1024,
+};
+
 /// Byte-weighted process admission for encoded HTTP and tonic bodies.
 #[derive(Debug, Clone, Default)]
 pub struct BifrostTransportAdmission {

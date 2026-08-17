@@ -8,12 +8,14 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
+mod otlp;
 pub(crate) mod query;
 mod scribe_tail;
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::StreamExt;
@@ -139,9 +141,7 @@ where
         .bifrost_gate
         .as_ref()
         .ok_or(GrpcError::MissingScribe)?;
-    let traces = wyrd_tonic::otlp::trace_service::trace_service_server::TraceServiceServer::new(
-        (**ingest).clone(),
-    );
+    let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(ingest));
     let metrics =
         wyrd_tonic::otlp::metrics_service::metrics_service_server::MetricsServiceServer::new(
             (**ingest).clone(),

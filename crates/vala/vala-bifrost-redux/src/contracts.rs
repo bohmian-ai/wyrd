@@ -113,6 +113,8 @@ pub struct DecodedOtlp<T> {
     pub request: Box<T>,
     /// Actual encoded bytes observed before typed decoding.
     pub wire_bytes: usize,
+    /// Exact generated-request capacity admitted before typed construction.
+    pub decode_bytes: usize,
     /// Decode allocation owner adopted by Scribe's complete admission root.
     pub(crate) owner: Option<OtlpDecodeOwner>,
 }
@@ -121,9 +123,11 @@ impl<T> DecodedOtlp<T> {
     /// Couples one typed adapter result to the exact wire fact and decode owner.
     #[must_use]
     pub fn new(request: T, wire_bytes: usize, owner: OtlpDecodeOwner) -> Self {
+        let decode_bytes = owner.bytes();
         Self {
             request: Box::new(request),
             wire_bytes,
+            decode_bytes,
             owner: Some(owner),
         }
     }
@@ -137,6 +141,12 @@ pub struct OtlpDecodeOwner {
 }
 
 impl OtlpDecodeOwner {
+    /// Returns the exact adapter-decode capacity retained by this owner.
+    #[must_use]
+    fn bytes(&self) -> usize {
+        self.memory.bytes()
+    }
+
     /// Atomically grows the decode child into Scribe's one complete root.
     ///
     /// # Errors

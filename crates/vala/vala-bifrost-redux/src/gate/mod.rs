@@ -41,7 +41,7 @@ pub use crate::gate::collector::{
     project_resource_spans, source_schema_fingerprint,
 };
 pub use crate::gate::error::{CatalogError, IngestError};
-pub use crate::gate::limits::IngestLimits;
+pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{
     AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions, QueryStreamLifecycle,
@@ -267,6 +267,12 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             .map_err(IngestError::from_scribe)
     }
 
+    /// Returns the immutable OTLP limits shared with the server decode adapter.
+    #[must_use]
+    pub const fn otlp_wire_limits(&self) -> OtlpWireLimits {
+        crate::gate::limits::OTLP_WIRE_LIMITS
+    }
+
     /// Construct a Gate with a required Scribe capability.
     #[must_use]
     pub fn with_scribe(
@@ -378,6 +384,23 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 Err(error)
             }
         }
+    }
+
+    /// Authenticates one server-owned OTLP adapter request before Gate routing.
+    ///
+    /// The server adapter invokes this after its bounded wire decode. Gate keeps
+    /// authentication and readiness authority while the adapter remains the
+    /// sole owner of protobuf framing and typed construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable authentication or ingress-closed refusal produced by
+    /// the ordinary generated-service path.
+    pub async fn authenticate_otlp_metadata(
+        &self,
+        metadata: &MetadataMap,
+    ) -> Result<AuthContext, IngestError> {
+        self.authenticate(metadata).await
     }
 
     /// Mount the Gate on the shared tonic router.
@@ -514,6 +537,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngressPayload::OtlpTraces(DecodedOtlp {
                     request: Box::new(request),
                     wire_bytes: measured_wire_bytes,
+                    decode_bytes: measured_wire_bytes,
                     owner: None,
                 }),
             )
@@ -578,6 +602,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngressPayload::OtlpMetrics(DecodedOtlp {
                     request: Box::new(request),
                     wire_bytes: measured_wire_bytes,
+                    decode_bytes: measured_wire_bytes,
                     owner: None,
                 }),
             )
@@ -642,6 +667,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngressPayload::OtlpLogs(DecodedOtlp {
                     request: Box::new(request),
                     wire_bytes: measured_wire_bytes,
+                    decode_bytes: measured_wire_bytes,
                     owner: None,
                 }),
             )

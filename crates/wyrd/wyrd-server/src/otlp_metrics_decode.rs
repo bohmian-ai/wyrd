@@ -962,13 +962,13 @@ fn select_any_value_bodies(bodies: MessageBodies<'_>) -> Result<OneofSelection, 
                     nested_count: 0,
                 };
             }
-            if let WireValue::Bytes(nested) = value {
-                if matches!(tag, 5 | 6) {
-                    selection.nested_count = selection
-                        .nested_count
-                        .checked_add(repeated_message_count(nested, 1)?)
-                        .ok_or_else(|| malformed("OTLP nested value count overflow"))?;
-                }
+            if let WireValue::Bytes(nested) = value
+                && matches!(tag, 5 | 6)
+            {
+                selection.nested_count = selection
+                    .nested_count
+                    .checked_add(repeated_message_count(nested, 1)?)
+                    .ok_or_else(|| malformed("OTLP nested value count overflow"))?;
             }
         }
         Ok(())
@@ -1176,7 +1176,7 @@ fn merge_metric_data(bytes: &[u8], data: &mut metric::Data) -> Result<(), Ingest
                 summary.data_points.push(decode_summary_point(body)?);
             }
             (metric::Data::Gauge(_), 1, _)
-            | (metric::Data::Sum(_), 1 | 2 | 3, _)
+            | (metric::Data::Sum(_), 1..=3, _)
             | (metric::Data::Histogram(_), 1 | 2, _)
             | (metric::Data::ExponentialHistogram(_), 1 | 2, _)
             | (metric::Data::Summary(_), 1, _) => {
@@ -1804,11 +1804,11 @@ fn last_bytes_field(bytes: &[u8], wanted_tag: u32) -> Result<Option<&[u8]>, Inge
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid parent/child framing or wire types.
-fn last_bytes_across_messages<'a>(
-    bytes: &'a [u8],
+fn last_bytes_across_messages(
+    bytes: &[u8],
     parent_tag: u32,
     child_tag: u32,
-) -> Result<Option<&'a [u8]>, IngestError> {
+) -> Result<Option<&[u8]>, IngestError> {
     let mut retained = None;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
@@ -1910,7 +1910,7 @@ fn repeated_fixed64_count(bytes: &[u8], wanted_tag: u32) -> Result<usize, Ingest
 ///
 /// Returns a malformed-request error when the payload length is not divisible by eight.
 fn packed_fixed64_count(bytes: &[u8]) -> Result<usize, IngestError> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(malformed("packed fixed64 payload has a partial value"));
     }
     Ok(bytes.len() / 8)

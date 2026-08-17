@@ -940,7 +940,7 @@ pub async fn build_state(
                 scribe_parts.scribe,
                 Arc::clone(&bifrost),
                 Arc::clone(&verifier),
-                limits.clone(),
+                limits,
                 Some(
                     scribe_parts
                         .coordination_runtime

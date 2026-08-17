@@ -954,11 +954,11 @@ fn last_bytes_field(bytes: &[u8], wanted_tag: u32) -> Result<Option<&[u8]>, Inge
 /// # Errors
 ///
 /// Returns a malformed refusal for invalid parent or child framing.
-fn last_bytes_across_messages<'a>(
-    bytes: &'a [u8],
+fn last_bytes_across_messages(
+    bytes: &[u8],
     parent_tag: u32,
     child_tag: u32,
-) -> Result<Option<&'a [u8]>, IngestError> {
+) -> Result<Option<&[u8]>, IngestError> {
     let mut retained = None;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
@@ -1171,13 +1171,13 @@ fn select_any_value_bodies(bodies: AnyValueBodies<'_>) -> Result<AnyValueSelecti
                     nested_count: 0,
                 };
             }
-            if let WireValue::Bytes(nested) = value {
-                if matches!(tag, 5 | 6) {
-                    selection.nested_count = selection
-                        .nested_count
-                        .checked_add(repeated_message_count(nested, 1)?)
-                        .ok_or_else(|| malformed("OTLP nested value count overflow"))?;
-                }
+            if let WireValue::Bytes(nested) = value
+                && matches!(tag, 5 | 6)
+            {
+                selection.nested_count = selection
+                    .nested_count
+                    .checked_add(repeated_message_count(nested, 1)?)
+                    .ok_or_else(|| malformed("OTLP nested value count overflow"))?;
             }
         }
         Ok(())

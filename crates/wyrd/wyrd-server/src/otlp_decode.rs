@@ -490,7 +490,7 @@ fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErro
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1 | 2 | 3 | 4 | 5, WireValue::Bytes(_)) => {}
+            (1..=5, WireValue::Bytes(_)) => {}
             (6 | 10 | 12 | 14, WireValue::Varint(_)) => {}
             (7 | 8, WireValue::Fixed64(_)) => {}
             (9, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
@@ -591,7 +591,7 @@ fn visit_span_link(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Inges
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1 | 2 | 3, WireValue::Bytes(_)) => {}
+            (1..=3, WireValue::Bytes(_)) => {}
             (4, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (5, WireValue::Varint(_)) | (6, WireValue::Fixed32(_)) => {}
             (1..=6, _) => return Err(wrong_wire("span link")),
@@ -782,11 +782,11 @@ fn last_bytes_field(bytes: &[u8], wanted_tag: u32) -> Result<Option<&[u8]>, Inge
 ///
 /// Returns a malformed-request error for invalid parent/child framing or wire
 /// types.
-fn last_bytes_across_messages<'a>(
-    bytes: &'a [u8],
+fn last_bytes_across_messages(
+    bytes: &[u8],
     parent_tag: u32,
     child_tag: u32,
-) -> Result<Option<&'a [u8]>, IngestError> {
+) -> Result<Option<&[u8]>, IngestError> {
     let mut retained = None;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
@@ -1197,11 +1197,13 @@ fn decode_merged_status(bytes: &[u8], wanted_tag: u32) -> Result<Option<Status>,
     if occurrences == 0 {
         return Ok(None);
     }
-    let mut status = Status::default();
-    status.message = last_bytes_across_messages(bytes, wanted_tag, 2)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
+    let mut status = Status {
+        message: last_bytes_across_messages(bytes, wanted_tag, 2)?
+            .map(fixed_string)
+            .transpose()?
+            .unwrap_or_default(),
+        ..Status::default()
+    };
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         if tag == wanted_tag {
@@ -1368,13 +1370,13 @@ fn select_any_value_bodies(bodies: AnyValueBodies<'_>) -> Result<AnyValueSelecti
                     nested_count: 0,
                 };
             }
-            if let WireValue::Bytes(nested) = value {
-                if matches!(tag, 5 | 6) {
-                    selection.nested_count = selection
-                        .nested_count
-                        .checked_add(repeated_message_count(nested, 1)?)
-                        .ok_or_else(|| malformed("OTLP nested value count overflow"))?;
-                }
+            if let WireValue::Bytes(nested) = value
+                && matches!(tag, 5 | 6)
+            {
+                selection.nested_count = selection
+                    .nested_count
+                    .checked_add(repeated_message_count(nested, 1)?)
+                    .ok_or_else(|| malformed("OTLP nested value count overflow"))?;
             }
         }
         Ok(())

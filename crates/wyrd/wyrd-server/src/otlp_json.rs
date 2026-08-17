@@ -1521,7 +1521,7 @@ fn base64_token_decoded_len(token: JsonStringToken<'_>) -> Option<usize> {
         return (padding == 0).then_some(0);
     }
     let remainder = unpadded % 4;
-    if remainder == 1 || (padding > 0 && length % 4 != 0) {
+    if remainder == 1 || (padding > 0 && !length.is_multiple_of(4)) {
         return None;
     }
     if (padding == 2 && remainder != 2) || (padding == 1 && remainder != 3) {

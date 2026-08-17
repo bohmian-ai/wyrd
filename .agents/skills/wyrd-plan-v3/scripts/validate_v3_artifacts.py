@@ -9,7 +9,7 @@ HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 IDS = {"R": re.compile(r"R[1-9][0-9]*\Z"), "D": re.compile(r"D[1-9][0-9]*\Z"), "T": re.compile(r"T[1-9][0-9]*\Z"), "AC": re.compile(r"AC[1-9][0-9]*\Z")}
 LOCK_CATEGORIES = {"semantic", "contracts", "manifests", "migrations", "generated", "fixtures", "config"}
 LIFECYCLE = {"construction", "shutdown", "cancellation", "concurrency", "recovery"}
-PLAN_HEADINGS = ["Objective", "Current state and evidence", "Requirements", "Non-goals", "Constraints", "Architecture and design decisions", "Domain and data contracts", "Interfaces and function contracts", "Control flow and pseudocode", "Failure and edge-case matrix", "Milestones", "Task inventory", "Global acceptance criteria", "Verification strategy", "Closeout verification", "Risks, migration, and rollout", "Execution handoff"]
+PLAN_HEADINGS = ["Objective", "Current state and evidence", "Requirements", "Non-goals", "Constraints", "Concurrency design and alternatives", "Architecture and design decisions", "Domain and data contracts", "Interfaces and function contracts", "Control flow and pseudocode", "Failure and edge-case matrix", "Milestones", "Task inventory", "Global acceptance criteria", "Verification strategy", "Closeout verification", "Risks, migration, and rollout", "Execution handoff"]
 TASK_HEADINGS = ["Objective", "User and operator value", "Current behavior and evidence", "Required changes", "Non-goals", "Allowed scope", "Prohibited changes", "Target paths, symbols, callers, and consumers", "Required types and interfaces", "Implementation guidance", "Control flow and pseudocode", "Failure and edge-case matrix", "Allocation and lifecycle contract", "Acceptance criteria", "Required tests", "Required features", "Focused verification", "Concurrency and integration locks", "Commands explicitly excluded", "Stop and escalate if", "Completion evidence"]
 GENERIC = re.compile(r"\b(?:add a concrete|add recovery suite owner|add [^.\n]+ and proof|as needed|follow existing patterns|appropriate tests?|TBD|TODO)\b", re.I)
 TASK_SEMANTICS = {
@@ -86,6 +86,55 @@ def derived_lock(path: str) -> str | None:
     if any(token in lowered for token in ("fixture","fixtures","testdata")): return "fixtures"
     if any(token in lowered for token in ("config",".github/","dockerfile","compose")): return "config"
     return None
+
+def graph_metrics(graph: dict[str, list[str]], slots: int = 3) -> dict[str, float | int] | None:
+    """Compute deterministic unit-duration DAG metrics or return None for an invalid graph."""
+    if not graph or slots < 1 or any(not isinstance(deps, list) for deps in graph.values()):
+        return None
+    if any(dep not in graph for deps in graph.values() for dep in deps):
+        return None
+    remaining = set(graph)
+    complete: set[str] = set()
+    waves = 0
+    max_width = 0
+    while remaining:
+        ready = sorted(task for task in remaining if set(graph[task]) <= complete)
+        if not ready:
+            return None
+        max_width = max(max_width, len(ready))
+        selected = ready[:slots]
+        complete.update(selected)
+        remaining.difference_update(selected)
+        waves += 1
+    depth: dict[str, int] = {}
+    pending = set(graph)
+    while pending:
+        progressed = False
+        for task in sorted(pending):
+            if all(dep in depth for dep in graph[task]):
+                depth[task] = 1 + max((depth[dep] for dep in graph[task]), default=0)
+                pending.remove(task)
+                progressed = True
+                break
+        if not progressed:
+            return None
+    def ordered(task: str, predecessor: str, seen: set[str] | None = None) -> bool:
+        visited = set() if seen is None else seen
+        if task in visited:
+            return False
+        visited.add(task)
+        return predecessor in graph[task] or any(ordered(dep, predecessor, visited) for dep in graph[task])
+    parallel = {
+        task for task in graph
+        if any(peer != task and not ordered(task, peer) and not ordered(peer, task) for peer in graph)
+    }
+    return {
+        "critical_path_tasks": max(depth.values()),
+        "max_runnable_width": max_width,
+        "scheduled_waves": waves,
+        "average_occupied_slots": round(len(graph) / waves, 3),
+        "parallel_task_fraction": round(len(parallel) / len(graph), 3),
+    }
 
 def audited_acceptance(command: str, selector: str) -> bool:
     """Accept direct lanes or the one repository-audited Postgres wrapper."""
@@ -237,6 +286,77 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
         seen.add(a)
         return b in graph.get(a,[]) or any(ordered(d,b,seen) for d in graph.get(a,[]))
     tids=sorted(graph)
+
+    optimization = data.get("optimization", {})
+    if optimization.get("objective") != "concurrency_correctness_speed":
+        errors.append("optimization objective must be concurrency_correctness_speed")
+    if optimization.get("implementor_slots") != 3:
+        errors.append("optimization must model exactly three implementor slots")
+    candidates = optimization.get("candidate_decompositions", [])
+    selected_name = optimization.get("selected_decomposition")
+    if not isinstance(candidates, list) or len(candidates) < 2:
+        errors.append("optimization requires at least two candidate decompositions")
+        candidates = []
+    names: set[str] = set()
+    selected_metrics: dict[str, float | int] | None = None
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            errors.append("invalid candidate decomposition")
+            continue
+        name = str(candidate.get("name", ""))
+        candidate_graph = candidate.get("graph", {})
+        if not name or name in names or not isinstance(candidate_graph, dict):
+            errors.append("candidate decomposition names and graphs must be unique")
+            continue
+        names.add(name)
+        normalized = {str(task): deps for task, deps in candidate_graph.items()}
+        metrics = graph_metrics(normalized, 3)
+        if metrics is None:
+            errors.append(f"candidate decomposition is not a valid DAG: {name}")
+            continue
+        for field, actual in metrics.items():
+            if candidate.get(field) != actual:
+                errors.append(f"candidate decomposition metric mismatch: {name}/{field}")
+        if not str(candidate.get("tradeoff", "")).strip():
+            errors.append(f"candidate decomposition lacks tradeoff: {name}")
+        if name == selected_name:
+            selected_metrics = metrics
+            if normalized != graph:
+                errors.append("selected decomposition graph must equal task dependency graph")
+    if selected_name not in names:
+        errors.append("selected decomposition is absent")
+
+    direct_edges = {(dep, task) for task, deps in graph.items() for dep in deps}
+    serialized: set[tuple[str, str]] = set()
+    for edge in optimization.get("serialization_edges", []):
+        if not isinstance(edge, dict) or set(edge) != {"before", "after", "consumed_identity", "evidence"}:
+            errors.append("invalid serialization edge schema")
+            continue
+        pair = (str(edge.get("before", "")), str(edge.get("after", "")))
+        if pair not in direct_edges or not str(edge.get("consumed_identity", "")).strip() or not str(edge.get("evidence", "")).strip():
+            errors.append(f"serialization edge lacks direct dependency identity: {pair[0]}/{pair[1]}")
+        serialized.add(pair)
+    if serialized != direct_edges:
+        errors.append("every direct implementation dependency requires one serialization edge")
+
+    if selected_metrics is not None:
+        task_count = len(graph)
+        misses = (
+            selected_metrics["critical_path_tasks"] / task_count > 0.70
+            or selected_metrics["max_runnable_width"] < 2
+            or selected_metrics["average_occupied_slots"] < 1.5
+            or selected_metrics["parallel_task_fraction"] < 0.35
+        )
+        waiver = optimization.get("concurrency_waiver")
+        if misses:
+            evidence = waiver.get("evidence", []) if isinstance(waiver, dict) else []
+            accepted = waiver.get("accepted_by_user") if isinstance(waiver, dict) else False
+            joined = " ".join(str(value) for value in evidence).lower()
+            if not accepted or not evidence or not all(word in joined for word in ("foundation", "module", "join")):
+                errors.append("selected graph misses concurrency thresholds without an explicit source-backed user waiver")
+        elif waiver not in (None, {}):
+            errors.append("concurrency waiver must be absent when selected graph meets thresholds")
+
     for i,a in enumerate(tids):
         for b in tids[i+1:]:
             if any(overlaps(left,right) for left in writes[a] for right in writes[b]) and not ordered(a,b) and not ordered(b,a): errors.append(f"parallel write overlap {a}/{b}")

@@ -24,8 +24,8 @@ missing.
 ## Canonical artifacts
 
 Write `plan.md` in the validator's canonical heading order: Objective; Current
-state and evidence; Requirements; Non-goals; Constraints; Architecture and
-design decisions; Domain and data contracts; Interfaces and function contracts;
+state and evidence; Requirements; Non-goals; Constraints; Concurrency design
+and alternatives; Architecture and design decisions; Domain and data contracts; Interfaces and function contracts;
 Control flow and pseudocode; Failure and edge-case matrix; Milestones; Task
 inventory; Global acceptance criteria; Verification strategy; Closeout
 verification; Risks, migration, and rollout; Execution handoff.
@@ -76,11 +76,52 @@ exactly `gpt-5.6-sol` with `low` reasoning.
 
 ## Decomposition and proof
 
+Design the execution graph before writing task packets. Produce at least two
+source-bound decompositions: the safest ownership-minimizing graph and the
+fastest concurrency-maximizing graph. Compare their task count, unit-duration
+critical path, maximum runnable width, average occupied implementor slots,
+parallel-capable task fraction, verification/stateful bottlenecks, and merge
+risk. Select the graph that minimizes wall time without weakening correctness.
+Do not inherit predecessor task boundaries merely because they already exist.
+
+For a concurrency-optimized plan, the manifest must prove meaningful parallel
+implementation: the critical path is at most 70% of all tasks, at least 35% of
+tasks have an unordered implementation peer, runnable width reaches at least
+two, and average occupied implementor slots reach at least 1.5. If source
+authority makes any threshold impossible, keep the plan
+`Draft`, record the exact symbol/path conflicts and attempted decompositions,
+and require explicit user acceptance of the serial shape. A late two-task fork
+does not by itself establish a concurrency-optimized plan.
+
+Separate implementation dependencies from integration dependencies and
+verification dependencies. Only implementation dependencies belong in
+`depends_on`. Model integration ordering and verification lanes separately. A
+shared Cargo target, Postgres fixture, mutable artifact root, or final
+registration file does not by itself serialize source implementation.
+
+Before serializing capabilities that touch a shared file, attempt, in order:
+
+1. establish the shared contract in a small foundation task;
+2. move behavior behind a narrow existing or new owning module;
+3. defer mechanical manifest, registration, or generated-output edits to a
+   join task;
+4. assign the shared seam to one producer while parallel consumers depend only
+   on its committed contract;
+5. serialize full capabilities only when exact semantic ownership conflicts.
+
+Every dependency edge must name the consumed symbol or artifact and explain
+why foundation extraction, module ownership, or a join task cannot remove the
+edge. Every task's concurrency section must explain why it exists separately,
+which tasks it can run beside, and why each direct dependency is an
+implementation dependency rather than only an integration or verification
+constraint.
+
 Prefer vertical tasks that leave the repository coherent. A task must never
 need an uncommitted peer implementation: express the producer as a dependency
-and lock its consumed contract. Parallel tasks require disjoint write sets and
-must not share generated artifacts, migrations, manifests, lockfiles, or mutable
-fixtures. Serialize all Cargo-backed verification.
+and lock its consumed contract. Parallel candidates require disjoint semantic
+ownership. File overlap is not sufficient evidence for whole-capability
+serialization when a foundation or join task can isolate it. Serialize
+Cargo-backed verification per declared lane, not all source implementation.
 
 Map every requirement to at least one task and every acceptance criterion to a
 named test. Use the highest Wyrd test tier required by `AGENTS.md`. New public

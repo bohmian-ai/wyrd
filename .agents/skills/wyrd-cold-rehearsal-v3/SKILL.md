@@ -45,6 +45,23 @@ Reject a task when it:
 - has overlapping parallel writes, a cycle, an unstated dependency, or cannot
   leave the repository coherent at its boundary.
 
+Reject the milestone when concurrency was not designed rather than merely
+declared. Recompute the selected and alternative DAG metrics with three
+implementor slots. Confirm every serialization edge consumes predecessor code
+or a committed contract; remove edges caused only by Cargo contention,
+Postgres/stateful contention, integration order, manifests, registration, or
+generated outputs that can be isolated in a foundation or join task. Attempt a
+foundation/module/join decomposition for every shared central owner. Return
+`FAIL` when a speed-optimized plan misses its critical-path, runnable-width, or
+parallel-fraction threshold without an exact source-backed waiver explicitly
+accepted by the user.
+
+Simulate source implementation, root integration, Cargo verification, and
+stateful verification as separate schedules. Report a failure when the plan
+uses a verification constraint to serialize independently compilable source
+candidates. Confirm that claimed utilization and wall-time improvement are
+reproducible from the manifest graph rather than prose.
+
 For `test_kind: new`, validate the planned test path and name against the task's
 write set and required-test section, the accepted package/target via successful
 compile-only preflight, and the positive expected post-implementation count.

@@ -12,6 +12,17 @@ their IDs and binds their files.
   "repository": {"origin": "https://github.com/bohmian-ai/wyrd.git", "revision": "<40 lowercase hex>"},
   "artifacts": {"plan.md": "sha256:<64 hex>", "tasks/01-example.md": "sha256:<64 hex>"},
   "delegation": {"model": "gpt-5.6-sol", "reasoning_effort": "low", "cargo_execution_lanes": 1},
+  "optimization": {
+    "objective": "concurrency_correctness_speed",
+    "implementor_slots": 3,
+    "selected_decomposition": "balanced",
+    "candidate_decompositions": [
+      {"name": "safest", "graph": {"T1": []}, "critical_path_tasks": 1, "max_runnable_width": 1, "scheduled_waves": 1, "average_occupied_slots": 1.0, "parallel_task_fraction": 0.0, "tradeoff": "Exact source-bound comparison."},
+      {"name": "balanced", "graph": {"T1": []}, "critical_path_tasks": 1, "max_runnable_width": 1, "scheduled_waves": 1, "average_occupied_slots": 1.0, "parallel_task_fraction": 0.0, "tradeoff": "Selected source-bound comparison."}
+    ],
+    "serialization_edges": [],
+    "concurrency_waiver": {"accepted_by_user": true, "evidence": ["Exact source evidence when thresholds cannot be met."]}
+  },
   "requirements": {"R1": ["T1"]},
   "decisions": ["D1"],
   "locks": [
@@ -65,3 +76,17 @@ Arbitrary scripts, `bash -lc` payloads, or wrapper forms are invalid.
 
 `rehearsal.json` is not listed under `artifacts`. It binds a PASS/FAIL/STALE
 verdict to the manifest digest, artifact digests, origin, and revision.
+
+`optimization` is mandatory. Each candidate graph is acyclic and records
+validator-computed unit-duration scheduling metrics. The selected graph must
+exactly match task `depends_on` edges. A concurrency-optimized graph requires a
+critical-path ratio no greater than `0.70`, runnable width of at least `2`,
+average occupied slots of at least `1.5`, and parallel-task fraction of at
+least `0.35`. A plan below any threshold remains
+Draft unless `concurrency_waiver.accepted_by_user` is true and its evidence
+names exact source conflicts plus the rejected foundation/module/join
+alternatives. `serialization_edges` records only implementation dependencies;
+each entry names `before`, `after`, `consumed_identity`, and exact source
+`evidence`. Cargo lanes, stateful lanes, integration ordering, and other
+resource contention remain locks or execution-controller state, not task
+dependencies.

@@ -24,7 +24,8 @@ class Fixtures(unittest.TestCase):
         self.task_text=f"# T1\nStatus: Planned\nRepository revision: {self.rev}\nDepends on: None\n\n"+"\n\n".join(f"## {h}\n\n{task_body(h)}" for h in validator.TASK_HEADINGS)
         (self.plan/"plan.md").write_text(self.plan_text); (self.plan/"tasks/01-owner.md").write_text(self.task_text)
         command="mise exec -- cargo test --locked -p owner --lib --no-run"; evidence={"command":command,"exit_code":0,"selected_count":0,"output":"compiled test target","repository":{"origin":"https://example.com/wyrd.git","revision":self.rev},"package":"owner","target":"lib"}; ep=self.plan/"evidence/T1-AC1.json"; ep.write_text(json.dumps(evidence))
-        self.data={"schema_version":3,"plan_id":"p","repository":{"origin":"https://example.com/wyrd.git","revision":self.rev},"artifacts":{},"delegation":{"model":"gpt-5.6-sol","reasoning_effort":"low","cargo_execution_lanes":1},"requirements":{"R1":["T1"]},"decisions":["D1"],"locks":[{"category":"contracts","key":"Owner::run","owners":["T1"]}],"tasks":[{"id":"T1","packet":"tasks/01-owner.md","depends_on":[],"write_set":[{"path":"src/lib.rs","kind":"existing","why":"add locked owner operation","coverage":["owner-lib"],"symbols":[{"name":"Owner::run","kind":"new"}]}],"requirements":["R1"],"decisions":["D1"],"acceptance":["AC1"],"lifecycle":{d:{"applicable":d=="construction","behavior":"canonical packet names exact behavior and boundary","proof":"AC1"} for d in validator.LIFECYCLE},"proofs":[{"acceptance":"AC1","coverage":["owner-lib"],"package":"owner","target":"lib","features":[],"selector":"tests::owner_runs","test_kind":"new","test_path":"src/lib.rs","test_name":"tests::owner_runs","expected_selected_count":1,"setup":"none","lane":"cargo-1","expected_result":"one test passes","preflight_command":command,"acceptance_command":"mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact","preflight":{"path":"evidence/T1-AC1.json","digest":validator.sha256(ep)}}]}]}
+        metrics=validator.graph_metrics({"T1":[]},3); assert metrics
+        self.data={"schema_version":3,"plan_id":"p","repository":{"origin":"https://example.com/wyrd.git","revision":self.rev},"artifacts":{},"delegation":{"model":"gpt-5.6-sol","reasoning_effort":"low","cargo_execution_lanes":1},"optimization":{"objective":"concurrency_correctness_speed","implementor_slots":3,"selected_decomposition":"balanced","candidate_decompositions":[{"name":"safest","graph":{"T1":[]},**metrics,"tradeoff":"Safest exact source graph."},{"name":"balanced","graph":{"T1":[]},**metrics,"tradeoff":"Only coherent fixture graph."}],"serialization_edges":[],"concurrency_waiver":{"accepted_by_user":True,"evidence":["Source proves foundation extraction, module ownership, and a join task cannot split the single operation."]}},"requirements":{"R1":["T1"]},"decisions":["D1"],"locks":[{"category":"contracts","key":"Owner::run","owners":["T1"]}],"tasks":[{"id":"T1","packet":"tasks/01-owner.md","depends_on":[],"write_set":[{"path":"src/lib.rs","kind":"existing","why":"add locked owner operation","coverage":["owner-lib"],"symbols":[{"name":"Owner::run","kind":"new"}]}],"requirements":["R1"],"decisions":["D1"],"acceptance":["AC1"],"lifecycle":{d:{"applicable":d=="construction","behavior":"canonical packet names exact behavior and boundary","proof":"AC1"} for d in validator.LIFECYCLE},"proofs":[{"acceptance":"AC1","coverage":["owner-lib"],"package":"owner","target":"lib","features":[],"selector":"tests::owner_runs","test_kind":"new","test_path":"src/lib.rs","test_name":"tests::owner_runs","expected_selected_count":1,"setup":"none","lane":"cargo-1","expected_result":"one test passes","preflight_command":command,"acceptance_command":"mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact","preflight":{"path":"evidence/T1-AC1.json","digest":validator.sha256(ep)}}]}]}
         self.write()
     def tearDown(self)->None:
         """Remove fixture storage."""
@@ -41,6 +42,17 @@ class Fixtures(unittest.TestCase):
     def test_valid_draft(self)->None:
         """Accept a source-bound, traceable draft."""
         self.assertEqual([],self.errors())
+
+    def test_rejects_serial_graph_without_user_waiver(self)->None:
+        """Reject a speed plan whose selected graph leaves all implementors idle."""
+        self.data["optimization"]["concurrency_waiver"]=None; self.write()
+        self.assert_error("misses concurrency thresholds")
+
+    def test_rejects_unbound_metrics_and_serialization_edges(self)->None:
+        """Bind scheduling claims and every direct dependency to exact identity."""
+        self.data["optimization"]["candidate_decompositions"][1]["scheduled_waves"]=9
+        self.data["optimization"]["serialization_edges"]=[{"before":"T9","after":"T1","consumed_identity":"Owner::run","evidence":"src/lib.rs:Owner::run"}]
+        self.write(); self.assert_error("metric mismatch"); self.assert_error("serialization edge")
 
     def test_path_overlap_includes_ancestry(self)->None:
         """Treat a directory and its descendant as overlapping ownership."""

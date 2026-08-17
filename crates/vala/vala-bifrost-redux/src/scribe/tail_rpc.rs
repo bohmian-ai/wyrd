@@ -305,7 +305,7 @@ pub struct TailFenceConfig {
     pub ttl: Duration,
     /// Maximum number of simultaneously retained fences.
     pub max_fences: usize,
-    /// Maximum shallow Arrow bytes held by all retained fences.
+    /// Maximum Arrow payload ceiling shared by pending and retained fences.
     pub max_retained_bytes: usize,
     /// Maximum rows returned by one page irrespective of a caller's request.
     pub max_page_rows: u32,
@@ -1306,11 +1306,13 @@ pub fn encode_tail_batch_exact(
 
 /// Bounded owner of pending and retained live-tail fences.
 ///
-/// A pending slot excludes both its configured payload ceiling and its
-/// root-backed lease before materialization. Successful acquisition atomically
-/// moves that lease into `retained`; cancellation returns the pending slot and
-/// lease once. `retained_bytes` is an admission fact only—the lease stored by
-/// each [`RetainedFence`] is the authoritative owner through release or expiry.
+/// A pending slot excludes both its configured/current-root payload ceiling
+/// and simultaneous descriptor capacity before materialization. Successful
+/// acquisition atomically moves that root-backed owner into `retained`;
+/// cancellation returns the pending slot and owner once. `retained_bytes` and
+/// `pending_payload_bytes` are payload admission facts only—the lease stored by
+/// each pending or retained fence is the authoritative owner through shrink,
+/// cancellation, release, expiry, or registry shutdown.
 #[derive(Debug)]
 struct FenceRegistry {
     /// Fences currently retaining shallow Scribe Arrow arrays.
@@ -1318,42 +1320,43 @@ struct FenceRegistry {
     /// Released ownership tombstones retained until the original fence expiry.
     /// A tombstone makes duplicate release idempotent without reopening state.
     released: HashMap<tail::TailFenceId, (Instant, tail::TailReadFence)>,
-    /// Aggregate Arrow array bytes retained by every live fence.
+    /// Aggregate Arrow payload bytes tracked for retained-fence admission.
     retained_bytes: usize,
     /// Fence acquisitions that own a slot while materialization is in flight.
     pending_fences: usize,
-    /// Aggregate payload ceiling reserved by in-flight acquisitions.
+    /// Aggregate payload-ceiling portion reserved by pending acquisitions.
     pending_payload_bytes: usize,
     /// Fixed scalar lifecycle observations emitted by this enforcing registry.
     lifecycle: TailOwnershipSnapshot,
 }
 
-/// Fixed-size live-tail ownership facts from plan through retirement.
+/// Fixed-size live-tail ownership facts from plan through terminal settlement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TailOwnershipSnapshot {
-    /// Fence snapshots planned from source-derived Arrow bytes.
+    /// Acquisitions whose complete pre-material root ceiling was planned.
     pub plans: u64,
-    /// Source-derived bytes represented by those plans.
+    /// Planned payload ceilings plus simultaneous descriptor capacity.
     pub planned_bytes: usize,
-    /// Fence reservations admitted by configured limits.
+    /// Planned root-backed owners admitted before materialization.
     pub reservations: u64,
-    /// Arrow bytes retained by admitted reservations.
+    /// Initial payload ceilings plus descriptor capacity owned by reservations.
     pub reserved_bytes: usize,
-    /// Shallow immutable snapshots materialized under admitted fences.
+    /// Pending snapshots completed and shrank to their exact retained live set.
     pub materializations: u64,
-    /// Arrow bytes represented by those snapshots.
+    /// Retained Arrow payload and descriptor backing represented by snapshots.
     pub materialized_bytes: usize,
     /// Page batches transferred to a local or remote transport.
     pub transfers: u64,
     /// Exact canonical IPC bytes represented by transferred pages.
     pub transferred_bytes: usize,
-    /// Explicit or expiry-driven fence releases.
+    /// Terminal owner settlements from pending cancellation, explicit release,
+    /// expiry, shutdown, or other registry teardown.
     pub releases: u64,
-    /// Arrow bytes released by fence retirement.
+    /// Root bytes returned by shrink, cancellation, or terminal fence settlement.
     pub released_bytes: usize,
-    /// Fences currently retaining shallow Arrow ownership.
+    /// Pending acquisitions and retained fences with live root-backed owners.
     pub active_reservations: usize,
-    /// Arrow bytes currently retained by live fences.
+    /// Complete live bytes across pending ceilings and retained snapshots.
     pub active_reserved_bytes: usize,
 }
 
@@ -1366,9 +1369,9 @@ struct RetainedFence {
     expires_at: Instant,
     /// Shallow append batches frozen at acquisition.
     batches: Vec<RetainedBatch>,
-    /// Bytes charged to this fence when releasing registry capacity.
+    /// Arrow payload bytes tracked for aggregate retained-fence admission.
     retained_bytes: usize,
-    /// Sole root-backed capacity owner retained with the shallow snapshot.
+    /// Sole owner of the retained Arrow payload and descriptor backing.
     owner: crate::resources::ScribeMemoryLease,
 }
 
@@ -1376,16 +1379,16 @@ struct RetainedFence {
 ///
 /// The reservation is created under the fence registry lock before any shard
 /// snapshot descriptor or Arrow handle is materialized. Dropping it before
-/// transfer returns the pending slot, payload ceiling, and root lease exactly
-/// once; successful transfer moves the lease into [`RetainedFence`].
+/// transfer returns the pending slot and complete payload-plus-descriptor owner
+/// exactly once; successful transfer moves that owner into [`RetainedFence`].
 struct PendingFence<'a> {
     /// Reader whose registry owns this pending slot.
     reader: &'a ScribeTailReader,
-    /// Root-backed configured-ceiling reservation protecting materialization.
+    /// Root-backed payload-plus-descriptor ceiling protecting materialization.
     owner: Option<crate::resources::ScribeMemoryLease>,
-    /// Aggregate Arrow payload ceiling excluded from concurrent acquisitions.
+    /// Configured/current-root payload portion excluded from other acquisitions.
     payload_limit: usize,
-    /// Whether a snapshot completed and the lease was shrunk to its live set.
+    /// Whether exact payload and descriptor facts shrank the owner to its live set.
     materialized: bool,
 }
 
@@ -1400,7 +1403,7 @@ struct RetainedBatch {
 }
 
 impl PendingFence<'_> {
-    /// Records a completed snapshot and shrinks its ceiling owner to the live set.
+    /// Records a completed snapshot and returns unused ceiling bytes by shrinking.
     ///
     /// # Errors
     ///
@@ -1529,7 +1532,7 @@ impl PendingFence<'_> {
 }
 
 impl Drop for PendingFence<'_> {
-    /// Returns an untransferred pending slot and root owner exactly once.
+    /// Records cancellation and returns an untransferred pending owner exactly once.
     fn drop(&mut self) {
         let Some(owner) = self.owner.take() else {
             return;
@@ -1702,10 +1705,11 @@ impl ScribeTailReader {
 
     /// Acquires metadata for one exact `(exclusive, inclusive]` shallow interval.
     ///
-    /// A pending registry slot and root-backed configured ceiling are acquired
-    /// before the shard request can allocate snapshot descriptors or shallow
-    /// Arrow handles. Cancellation moves through the pending owner's `Drop`,
-    /// while success transfers the same owner into the retained fence.
+    /// A pending registry slot and root-backed payload-plus-descriptor ceiling
+    /// are acquired before the shard request can allocate snapshot descriptors
+    /// or shallow Arrow handles. Cancellation settles through the pending
+    /// owner's `Drop`, while success shrinks and transfers the same owner into
+    /// the retained fence.
     ///
     /// # Errors
     ///
@@ -1803,15 +1807,15 @@ impl ScribeTailReader {
         pending.retain(fence, batches, ttl, retained_bytes)
     }
 
-    /// Reserves one bounded registry slot and root-backed materialization ceiling.
+    /// Reserves one slot and complete pre-material root-backed ceiling.
     ///
     /// # Errors
     ///
     /// Returns [`TailReadError::Capacity`] before materialization when the fixed
     /// fence/aggregate payload ceiling is exhausted or the Scribe root refuses
-    /// the complete payload-plus-descriptor ceiling. Returns
-    /// [`TailReadError::State`] when checked arithmetic or the registry lock
-    /// fails.
+    /// the current-root/configured payload plus simultaneous descriptor
+    /// ceiling. Returns [`TailReadError::State`] when checked arithmetic or the
+    /// registry lock fails.
     fn reserve_pending_fence(&self) -> Result<PendingFence<'_>, TailReadError> {
         let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
             detail: format!("tail fence registry lock poisoned: {error}"),
@@ -2034,7 +2038,7 @@ impl ScribeTailReader {
         })
     }
 
-    /// Releases one retained fence exactly once; repeat calls are successful no-ops.
+    /// Settles one retained owner exactly once; repeat calls are successful no-ops.
     ///
     /// # Errors
     ///
@@ -2063,7 +2067,7 @@ impl ScribeTailReader {
         self.release_fence_inner(Some(tenant), fence_id)
     }
 
-    /// Implements local and authenticated release under one atomic registry mutation.
+    /// Settles a retained payload-plus-descriptor owner under one registry mutation.
     ///
     /// # Errors
     ///
@@ -2134,7 +2138,7 @@ impl ScribeTailReader {
         Ok(FenceRelease { released: true })
     }
 
-    /// Removes at most `max` expired fences and reports retained capacity after the pass.
+    /// Settles at most `max` expired owners and reports remaining retained fences.
     #[must_use]
     pub fn expire_due(&self, now: Instant, max: usize) -> ExpiryReport {
         let Ok(mut registry) = self.fences.lock() else {
@@ -2150,7 +2154,7 @@ impl ScribeTailReader {
         }
     }
 
-    /// Reclaims a bounded number of expired entries and their byte accounting.
+    /// Reclaims bounded expired entries and their payload-plus-descriptor owners.
     fn reclaim_expired(registry: &mut FenceRegistry, now: Instant, max: usize) -> usize {
         let expired = registry
             .retained
@@ -2310,7 +2314,7 @@ impl FetchLiveTailService {
     /// # Errors
     ///
     /// Returns the stable Scribe capacity/internal error when the existing
-    /// process root cannot admit the configured materialization ceiling.
+    /// process root cannot admit the complete payload-plus-descriptor ceiling.
     fn reserve_fence_owner(
         &self,
         bytes: usize,

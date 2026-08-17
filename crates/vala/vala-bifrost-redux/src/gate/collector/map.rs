@@ -85,7 +85,17 @@ pub struct MappedSpans {
 /// [`MappedSpans::rejected`] so the caller can report OTLP `partial_success`.
 #[must_use]
 pub fn map_resource_spans(resource_spans: &[ResourceSpans]) -> MappedSpans {
-    let mut out = MappedSpans::default();
+    let capacity = resource_spans
+        .iter()
+        .flat_map(|resource| &resource.scope_spans)
+        .map(|scope| scope.spans.len())
+        .sum();
+    let mut out = MappedSpans {
+        records: Vec::with_capacity(capacity),
+        rejected: Vec::with_capacity(capacity),
+    };
+    let record_capacity = out.records.capacity();
+    let rejected_capacity = out.rejected.capacity();
     for rs in resource_spans {
         let resource = resource_from_otlp(rs.resource.as_ref());
         for ss in &rs.scope_spans {
@@ -98,6 +108,8 @@ pub fn map_resource_spans(resource_spans: &[ResourceSpans]) -> MappedSpans {
             }
         }
     }
+    debug_assert_eq!(out.records.capacity(), record_capacity);
+    debug_assert_eq!(out.rejected.capacity(), rejected_capacity);
     out
 }
 
@@ -536,7 +548,18 @@ pub struct MappedMetrics {
 /// [`MappedMetrics::rejected`] so the caller can report OTLP `partial_success`.
 #[must_use]
 pub fn map_resource_metrics(resource_metrics: &[ResourceMetrics]) -> MappedMetrics {
-    let mut out = MappedMetrics::default();
+    let capacity = resource_metrics
+        .iter()
+        .flat_map(|resource| &resource.scope_metrics)
+        .flat_map(|scope| &scope.metrics)
+        .map(metric_point_count)
+        .sum();
+    let mut out = MappedMetrics {
+        records: Vec::with_capacity(capacity),
+        rejected: Vec::with_capacity(capacity),
+    };
+    let record_capacity = out.records.capacity();
+    let rejected_capacity = out.rejected.capacity();
     for rm in resource_metrics {
         let resource = resource_from_otlp(rm.resource.as_ref());
         for sm in &rm.scope_metrics {
@@ -546,7 +569,21 @@ pub fn map_resource_metrics(resource_metrics: &[ResourceMetrics]) -> MappedMetri
             }
         }
     }
+    debug_assert_eq!(out.records.capacity(), record_capacity);
+    debug_assert_eq!(out.rejected.capacity(), rejected_capacity);
     out
+}
+
+/// Counts typed metric points without mapping or allocating domain records.
+fn metric_point_count(metric: &Metric) -> usize {
+    match metric.data.as_ref() {
+        Some(metric::Data::Gauge(value)) => value.data_points.len(),
+        Some(metric::Data::Sum(value)) => value.data_points.len(),
+        Some(metric::Data::Histogram(value)) => value.data_points.len(),
+        Some(metric::Data::ExponentialHistogram(value)) => value.data_points.len(),
+        Some(metric::Data::Summary(value)) => value.data_points.len(),
+        None => 0,
+    }
 }
 
 /// Instrumentation scope for a metric/log signal.
@@ -1150,7 +1187,17 @@ pub struct MappedLogs {
 /// [`MappedLogs::rejected`] so the caller can report OTLP `partial_success`.
 #[must_use]
 pub fn map_resource_logs(resource_logs: &[ResourceLogs]) -> MappedLogs {
-    let mut out = MappedLogs::default();
+    let capacity = resource_logs
+        .iter()
+        .flat_map(|resource| &resource.scope_logs)
+        .map(|scope| scope.log_records.len())
+        .sum();
+    let mut out = MappedLogs {
+        records: Vec::with_capacity(capacity),
+        rejected: Vec::with_capacity(capacity),
+    };
+    let record_capacity = out.records.capacity();
+    let rejected_capacity = out.rejected.capacity();
     for rl in resource_logs {
         let resource = resource_from_otlp(rl.resource.as_ref());
         for sl in &rl.scope_logs {
@@ -1163,6 +1210,8 @@ pub fn map_resource_logs(resource_logs: &[ResourceLogs]) -> MappedLogs {
             }
         }
     }
+    debug_assert_eq!(out.records.capacity(), record_capacity);
+    debug_assert_eq!(out.rejected.capacity(), rejected_capacity);
     out
 }
 

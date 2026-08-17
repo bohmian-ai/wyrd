@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Implement v3"
+  short_description: "Build one immutable candidate"
+  default_prompt: "Use $wyrd-implement-v3 to implement one exact Ready Wyrd task from its accepted SHA in an isolated worktree and return one immutable candidate or BLOCKED."

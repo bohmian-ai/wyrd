@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Review v3"
+  short_description: "Review one immutable candidate"
+  default_prompt: "Use $wyrd-review-v3 for one read-only static review of an exact parent..candidate against its bound Ready task artifact."

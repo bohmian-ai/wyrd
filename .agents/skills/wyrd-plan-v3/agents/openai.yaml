@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Plan v3"
+  short_description: "Create executable Wyrd plans"
+  default_prompt: "Use $wyrd-plan-v3 to investigate current Wyrd source and create a decision-complete plan, task packets, execution manifest, command preflight, and rehearsal evidence."

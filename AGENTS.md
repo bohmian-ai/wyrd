@@ -489,8 +489,20 @@ task packets, or documentation.
   a dedicated clean worktree. It dispatches one serial task at a time through
   the surface-appropriate implementation skill and the repo-local
   `wyrd-review` skill, then owns integrated verification.
+- A plan may opt into the self-contained repo-local v3 pilot only when its
+  `Execution handoff` explicitly names `wyrd-implement-plan-v3`. An opted-in
+  plan uses the complete v3 family for planning, cold rehearsal, isolated task
+  implementation, immutable-candidate review, remediation planning, bounded
+  concurrent control, and terminal review. Every v3 root and delegated role
+  runs `gpt-5.6-sol` at low reasoning effort. V3 plans require a validated
+  dependency DAG, disjoint source and shared-artifact locks, digest-bound
+  focused proof, and serial root integration. Existing plans never inherit v3
+  behavior implicitly, and UI work is excluded from the initial v3 pilot.
 - The complete integration review runs the global `review-and-plan` skill; its
   repo-specific review binding is the `wyrd-review` skill.
+  For an explicitly opted-in v3 plan, `wyrd-review-and-plan-v3` replaces that
+  terminal binding and routes confirmed remediation only through
+  `wyrd-plan-v3`.
 
 ## 15. Implementation Rules
 

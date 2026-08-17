@@ -20,8 +20,8 @@ use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use super::direct_metrics::{ExactPrimitive, NullableText};
 use super::direct_traces::{ByteCounter, ExactStringColumn, write_any, write_attributes};
 use crate::contracts::ScribeError;
-use crate::gate::collector::LogsOutcome;
 use crate::gate::collector::tables::{DomainTable, RecordsTable};
+use crate::otlp_contract::LogsOutcome;
 
 /// Exact nullable UTF-8 capacity for one log column.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

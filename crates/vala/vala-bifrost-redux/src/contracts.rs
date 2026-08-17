@@ -215,11 +215,11 @@ pub struct FrameAdmission {
 #[derive(Debug, Clone)]
 pub(crate) enum ScribeOtlpOutcome {
     /// Trace export counts and partial-success detail.
-    Traces(crate::gate::collector::IngestOutcome),
+    Traces(crate::otlp_contract::IngestOutcome),
     /// Metrics export counts and partial-success detail.
-    Metrics(crate::gate::collector::MetricsOutcome),
+    Metrics(crate::otlp_contract::MetricsOutcome),
     /// Log export counts and partial-success detail.
-    Logs(crate::gate::collector::LogsOutcome),
+    Logs(crate::otlp_contract::LogsOutcome),
 }
 
 /// Scribe-layer errors per CONTRACTS §10.

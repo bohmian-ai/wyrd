@@ -3065,7 +3065,6 @@ impl WyrdTestServerBuilder {
         let mut ingest = scribe.as_ref().map(|scribe| {
             let runtime = BifrostIngestRuntime::new(
                 Arc::clone(scribe),
-                Arc::clone(&bifrost),
                 Arc::clone(&verifier),
                 self.scribe_ingest_limits,
                 None,
@@ -3185,14 +3184,12 @@ impl WyrdTestServerBuilder {
         let limits = self.scribe_ingest_limits;
         let mut gate = if let Some(ingest) = &ingest {
             vala_bifrost_redux::gate::Gate::with_scribe(
-                Arc::clone(&bifrost),
                 ingest.scribe().clone(),
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
                 limits,
             )
         } else {
             vala_bifrost_redux::gate::Gate::without_scribe(
-                Arc::clone(&bifrost),
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
                 limits,
             )

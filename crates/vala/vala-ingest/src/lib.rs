@@ -13,10 +13,4 @@
 
 pub mod decode;
 
-pub use vala_bifrost_redux::gate::IngestError;
-pub use vala_bifrost_redux::gate::collector;
-pub use vala_bifrost_redux::gate::collector::{
-    IngestOutcome, LogsOutcome, MetricsOutcome, ProjectedExport, project_resource_logs,
-    project_resource_metrics, project_resource_spans, source_schema_fingerprint,
-};
 pub use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};

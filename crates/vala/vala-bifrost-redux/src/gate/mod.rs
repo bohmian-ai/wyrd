@@ -1,7 +1,7 @@
 //! Bifrost Gate — the server-independent auth, transport-limit, and routing boundary.
 
 pub mod auth;
-pub mod collector;
+pub(crate) mod collector;
 pub mod error;
 pub mod limits;
 
@@ -9,12 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tracing::Instrument;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::PermissionCheck;
-use wyrd_spec::ids::DataTenantId;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
@@ -25,84 +23,20 @@ use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
-use crate::catalog::{BifrostCatalog, BifrostCatalogError, TableRef};
+use crate::catalog::TableRef;
 use crate::contracts::{
     DecodedOtlp, IngressPayload, OtlpDecodeOwner, Scribe, ScribeIngressFrame, ScribeOtlpOutcome,
 };
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
-pub use crate::gate::collector::{
-    IngestOutcome, LogsOutcome, MetricsOutcome, project_resource_logs, project_resource_metrics,
-    project_resource_spans, source_schema_fingerprint,
-};
-pub use crate::gate::error::{CatalogError, IngestError};
+pub use crate::gate::error::IngestError;
 pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{
     AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions, QueryStreamLifecycle,
 };
-use crate::schema::fingerprint::SchemaFingerprint;
+pub(crate) use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
-
-/// Catalog lookup capability required by Gate. Server integrations provide the
-/// adapter; Gate does not depend on a concrete catalog implementation.
-#[async_trait]
-pub trait Catalog: Send + Sync {
-    async fn ensure_builtin_for_table(
-        &self,
-        _namespace: BifrostNamespace,
-        _table: &str,
-        _tenant: DataTenantId,
-    ) -> Result<(), CatalogError> {
-        Ok(())
-    }
-
-    async fn table_schema_fingerprint(
-        &self,
-        namespace: BifrostNamespace,
-        table: &str,
-        tenant: DataTenantId,
-    ) -> Result<SchemaFingerprint, CatalogError>;
-}
-
-#[async_trait]
-impl Catalog for BifrostCatalog {
-    async fn ensure_builtin_for_table(
-        &self,
-        namespace: BifrostNamespace,
-        table: &str,
-        tenant: DataTenantId,
-    ) -> Result<(), CatalogError> {
-        let Some(definition) = crate::tables::builtin_table(
-            namespace.as_str().strip_prefix("vala.").unwrap_or_default(),
-            table,
-        ) else {
-            return Ok(());
-        };
-        self.ensure_builtin(tenant, definition)
-            .await
-            .map(|_| ())
-            .map_err(|error| CatalogError::Internal(error.to_string()))
-    }
-
-    async fn table_schema_fingerprint(
-        &self,
-        namespace: BifrostNamespace,
-        table: &str,
-        tenant: DataTenantId,
-    ) -> Result<SchemaFingerprint, CatalogError> {
-        let table_ref = TableRef::new(namespace, table);
-        BifrostCatalog::table_schema_fingerprint(self, &table_ref, tenant)
-            .await
-            .map_err(|error| match error {
-                BifrostCatalogError::TableNotFound(table) => CatalogError::TableNotFound(table),
-                BifrostCatalogError::FingerprintMismatch(table) => {
-                    CatalogError::FingerprintMismatch(table)
-                }
-                other => CatalogError::Internal(other.to_string()),
-            })
-    }
-}
 
 fn record_gate_event(event: &'static str) {
     metrics::counter!("bifrost_gate_events_total", "stage" => event).increment(1);
@@ -229,13 +163,7 @@ fn initialize_gate_metrics() {
 /// Gate owns authentication, request bounds, and transport response ordering.
 /// The Scribe dependency is mandatory at construction.
 #[derive(Clone)]
-pub struct Gate<
-    C: Catalog + 'static,
-    R: PermissionResolver + 'static,
-    I: IssuerConfigResolver + 'static,
-> {
-    /// Retains the server-selected catalog adapter type without owning it.
-    _catalog: std::marker::PhantomData<C>,
+pub struct Gate<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
     scribe: Option<Arc<dyn Scribe>>,
     /// Optional retained Oracle used by the server's stable local query dispatch.
     oracle: Option<Arc<Oracle>>,
@@ -244,9 +172,7 @@ pub struct Gate<
     closed: Arc<AtomicBool>,
 }
 
-impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-    Gate<C, R, I>
-{
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R, I> {
     /// Requests an exact root-backed decode child from Scribe for the adapter.
     ///
     /// # Errors
@@ -277,14 +203,12 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// Construct a Gate with a required Scribe capability.
     #[must_use]
     pub fn with_scribe(
-        _catalog: Arc<C>,
         scribe: Arc<crate::scribe::ScribeImpl>,
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
         initialize_gate_metrics();
         Self {
-            _catalog: std::marker::PhantomData,
             scribe: Some(scribe),
             oracle: None,
             limits,
@@ -296,14 +220,12 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// Constructs a Gate around one crate-local ingress test double.
     #[cfg(test)]
     fn with_test_scribe(
-        _catalog: Arc<C>,
         scribe: Arc<dyn Scribe>,
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
         initialize_gate_metrics();
         Self {
-            _catalog: std::marker::PhantomData,
             scribe: Some(scribe),
             oracle: None,
             limits,
@@ -318,14 +240,9 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// closed role check and receives the stable unavailable response without a
     /// WAL allocation.
     #[must_use]
-    pub fn without_scribe(
-        _catalog: Arc<C>,
-        auth: IngestAuthInterceptor<R, I>,
-        limits: IngestLimits,
-    ) -> Self {
+    pub fn without_scribe(auth: IngestAuthInterceptor<R, I>, limits: IngestLimits) -> Self {
         initialize_gate_metrics();
         Self {
-            _catalog: std::marker::PhantomData,
             scribe: None,
             oracle: None,
             limits,
@@ -788,8 +705,8 @@ fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError> {
 }
 
 #[wyrd_tonic::tonic::async_trait]
-impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-    BifrostIngestService for Gate<C, R, I>
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> BifrostIngestService
+    for Gate<R, I>
 {
     #[tracing::instrument(name = "bifrost.gate.write", skip_all, fields(operation = "write"))]
     async fn insert_batch(
@@ -921,12 +838,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::error::CatalogError;
     use super::limits::IngestLimits;
-    use super::{AuthContext, Catalog, Gate, IngestError};
+    use super::{AuthContext, Gate, IngestError};
     use crate::contracts::{DecodedOtlp, IngressPayload, ScribeOtlpOutcome};
-    use crate::namespaces::BifrostNamespace;
-    use crate::schema::fingerprint::SchemaFingerprint;
     use async_trait::async_trait;
     use wyrd_auth_oidc::IssuerConfigResolver;
     use wyrd_auth_verify::PermissionResolver;
@@ -1133,21 +1047,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestCatalog;
-
-    #[async_trait]
-    impl Catalog for TestCatalog {
-        async fn table_schema_fingerprint(
-            &self,
-            _namespace: BifrostNamespace,
-            _table: &str,
-            _tenant: DataTenantId,
-        ) -> Result<SchemaFingerprint, CatalogError> {
-            Ok(SchemaFingerprint([0; 32]))
-        }
-    }
-
-    #[derive(Debug)]
     struct TestPermissionResolver;
 
     impl PermissionResolver for TestPermissionResolver {
@@ -1263,20 +1162,6 @@ mod tests {
         }
     }
 
-    struct FailingCatalog;
-
-    #[async_trait]
-    impl Catalog for FailingCatalog {
-        async fn table_schema_fingerprint(
-            &self,
-            _namespace: BifrostNamespace,
-            table: &str,
-            _tenant: DataTenantId,
-        ) -> Result<SchemaFingerprint, CatalogError> {
-            Err(CatalogError::TableNotFound(table.to_owned()))
-        }
-    }
-
     fn auth_context(with_permission: bool) -> AuthContext {
         let tenant = DataTenantId::new_v7();
         let permissions = if with_permission {
@@ -1343,20 +1228,17 @@ mod tests {
                 Arc::new(TestPermissionResolver),
                 wyrd_auth_verify::WyrdAuthVerifySettings::default(),
             );
-        let _gate =
-            Gate::<TestCatalog, TestPermissionResolver, TestIssuerResolver>::with_test_scribe(
-                Arc::new(TestCatalog),
-                Arc::new(TestScribe),
-                crate::gate::auth::ingest_auth_interceptor(Arc::new(verifier)),
-                IngestLimits::default(),
-            );
+        let _gate = Gate::<TestPermissionResolver, TestIssuerResolver>::with_test_scribe(
+            Arc::new(TestScribe),
+            crate::gate::auth::ingest_auth_interceptor(Arc::new(verifier)),
+            IngestLimits::default(),
+        );
     }
 
     #[tokio::test]
     async fn gate_enforces_bifrost_record_write() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let gate = Gate::with_test_scribe(
-            Arc::new(TestCatalog),
             Arc::new(CountingScribe {
                 calls: Arc::clone(&scribe_calls),
             }),
@@ -1378,7 +1260,6 @@ mod tests {
     #[tokio::test]
     async fn gate_authenticates_before_reading_frames() {
         let gate = Gate::with_test_scribe(
-            Arc::new(TestCatalog),
             Arc::new(TestScribe),
             test_interceptor(),
             IngestLimits::default(),
@@ -1391,7 +1272,6 @@ mod tests {
     async fn gate_routes_logical_frame_without_catalog_resolution() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let gate = Gate::with_test_scribe(
-            Arc::new(FailingCatalog),
             Arc::new(CountingScribe {
                 calls: Arc::clone(&scribe_calls),
             }),
@@ -1414,7 +1294,6 @@ mod tests {
     async fn close_rejects_new_work_before_scribe_handoff() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let gate = Gate::with_test_scribe(
-            Arc::new(TestCatalog),
             Arc::new(CountingScribe {
                 calls: Arc::clone(&scribe_calls),
             }),
@@ -1437,7 +1316,6 @@ mod tests {
     #[tokio::test]
     async fn gate_rejects_ingest_when_scribe_recovery_is_incomplete() {
         let gate = Gate::with_test_scribe(
-            Arc::new(TestCatalog),
             Arc::new(NotReadyScribe),
             test_interceptor(),
             IngestLimits::default(),

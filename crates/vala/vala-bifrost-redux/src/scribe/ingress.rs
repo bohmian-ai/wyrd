@@ -41,59 +41,6 @@ fn validate_decoded_request_size(
     Ok(bytes)
 }
 
-/// Counts the exact scalable string payload constructed by a physical binding.
-///
-/// Container headers are fixed residuals; this count covers each owned string
-/// created by [`crate::catalog::TenantTableBinding::resolve`] plus the retained
-/// fully-qualified admission key.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::DecodedPayloadTooLarge`] if checked arithmetic cannot
-/// represent the binding's scalable string payload.
-fn physical_binding_string_bytes(frame: &ScribeIngressFrame) -> Result<usize, ScribeError> {
-    const TENANT_TEXT_BYTES: usize = 36;
-    let namespace = frame.table.namespace.as_str();
-    let segment = namespace
-        .strip_prefix("vala.")
-        .ok_or(ScribeError::InvalidFrame)?;
-    let name = frame.table.name.as_str();
-    let object_prefix = [
-        "tenants/".len(),
-        TENANT_TEXT_BYTES,
-        "/".len(),
-        segment.len(),
-        "/".len(),
-        name.len(),
-    ]
-    .into_iter()
-    .try_fold(0_usize, usize::checked_add)
-    .ok_or(ScribeError::DecodedPayloadTooLarge {
-        bytes: usize::MAX,
-        limit: usize::MAX,
-    })?;
-    [
-        name.len(),
-        TENANT_TEXT_BYTES,
-        "vala".len(),
-        "tenants".len(),
-        TENANT_TEXT_BYTES,
-        segment.len(),
-        name.len(),
-        namespace.len(),
-        object_prefix,
-        namespace.len(),
-        ".".len(),
-        name.len(),
-    ]
-    .into_iter()
-    .try_fold(0_usize, usize::checked_add)
-    .ok_or(ScribeError::DecodedPayloadTooLarge {
-        bytes: usize::MAX,
-        limit: usize::MAX,
-    })
-}
-
 /// Validates authenticated identity and the raw transport ceiling.
 ///
 /// # Errors
@@ -246,32 +193,36 @@ impl ScribeImpl {
         &self,
         frame: &ScribeIngressFrame,
         receipt_micros: i64,
+        physical_binding_peak_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        let name_bytes = physical_binding_string_bytes(frame)?;
         let planner = ScribeIngressPlanner::new(self.ingest_limits);
         let plan = match &frame.payload {
-            IngressPayload::ArrowIpc(bytes) => planner.plan_native(bytes, name_bytes),
+            IngressPayload::ArrowIpc(bytes) => {
+                planner.plan_native(bytes, physical_binding_peak_bytes)
+            }
             IngressPayload::OtlpTraces(request) => planner.plan_traces(
                 &request.request,
                 request.decode_bytes,
-                name_bytes,
+                physical_binding_peak_bytes,
                 receipt_micros,
             ),
             IngressPayload::OtlpMetrics(request) => planner.plan_metrics(
                 &request.request,
                 request.decode_bytes,
-                name_bytes,
+                physical_binding_peak_bytes,
                 receipt_micros,
             ),
             IngressPayload::OtlpLogs(request) => planner.plan_logs(
                 &request.request,
                 request.decode_bytes,
-                name_bytes,
+                physical_binding_peak_bytes,
                 receipt_micros,
             ),
-            IngressPayload::ProjectedArrow(batches) => {
-                planner.plan_projected(batches, frame.measured_wire_bytes, name_bytes)
-            }
+            IngressPayload::ProjectedArrow(batches) => planner.plan_projected(
+                batches,
+                frame.measured_wire_bytes,
+                physical_binding_peak_bytes,
+            ),
         }?;
         if matches!(&frame.payload, IngressPayload::ProjectedArrow(_)) {
             validate_decoded_request_size(
@@ -290,15 +241,13 @@ impl ScribeImpl {
     /// Returns [`ScribeError::InvalidFrame`] when logical identity cannot form
     /// the canonical tenant-qualified binding or its tenant tripwire fails.
     fn construct_physical_binding(
-        frame: &ScribeIngressFrame,
+        facts: crate::catalog::PhysicalBindingFacts<'_>,
+        principal_tenant: wyrd_spec::DataTenantId,
     ) -> Result<crate::catalog::TenantTableBinding, ScribeError> {
-        let binding = crate::catalog::TenantTableBinding::resolve((
-            frame.authenticated_tenant,
-            frame.table.clone(),
-        ))
-        .map_err(|_| ScribeError::InvalidFrame)?;
+        let binding = crate::catalog::TenantTableBinding::from_facts(facts)
+            .map_err(|_| ScribeError::InvalidFrame)?;
         binding
-            .validate_authenticated_tenant(frame.principal.tenant_id)
+            .validate_authenticated_tenant(principal_tenant)
             .map_err(|_| ScribeError::InvalidFrame)?;
         Ok(binding)
     }
@@ -427,7 +376,11 @@ impl ScribeImpl {
         let decode_owner = take_transport_decode_owner(&mut frame.payload)?;
         let expected_schema_fingerprint = self.resolve_logical_frame(frame).await?;
         let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
-        let material_plan = self.plan_transport_payload(frame, receipt_micros)?;
+        let binding_facts =
+            crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
+                .map_err(|_| ScribeError::InvalidFrame)?;
+        let material_plan =
+            self.plan_transport_payload(frame, receipt_micros, binding_facts.peak_bytes)?;
         lifecycle.planned(&material_plan);
         let mut memory = match decode_owner {
             Some(owner) => owner.complete(material_plan.root_bytes)?,
@@ -444,7 +397,7 @@ impl ScribeImpl {
             },
         };
         lifecycle.reserved(material_plan.root_bytes);
-        let binding = Self::construct_physical_binding(frame)?;
+        let binding = Self::construct_physical_binding(binding_facts, frame.principal.tenant_id)?;
         let table = binding.table_ref.fqn();
         let shard = shard_for(
             frame.principal.tenant_id,

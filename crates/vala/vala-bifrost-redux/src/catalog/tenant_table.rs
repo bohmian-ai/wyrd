@@ -33,6 +33,29 @@ pub enum TenantTableBindingError {
     /// A fixed namespace component could not be represented by Iceberg.
     #[error("invalid physical Iceberg namespace: {detail}")]
     InvalidPhysicalNamespace { detail: String },
+
+    /// Checked physical-name accounting exceeded the platform address space.
+    #[error("physical table binding size overflow")]
+    BindingSizeOverflow,
+}
+
+/// Checked physical-name facts shared by Scribe admission and materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PhysicalBindingFacts<'a> {
+    /// Authenticated tenant used in every physical tenant component.
+    pub(crate) tenant: &'a DataTenantId,
+    /// Validated logical table input retained until construction.
+    pub(crate) table_ref: &'a TableRef,
+    /// Bytes in the Iceberg namespace component vector.
+    pub(crate) input_bytes: usize,
+    /// Bytes in the object-store prefix.
+    pub(crate) output_bytes: usize,
+    /// Total owned string bytes in the resolved binding.
+    pub(crate) binding_bytes: usize,
+    /// Bytes in the retained fully-qualified logical table key.
+    pub(crate) file_prefix_bytes: usize,
+    /// Simultaneous physical binding construction peak admitted by Scribe.
+    pub(crate) peak_bytes: usize,
 }
 
 /// Canonical physical identity derived from `(DataTenantId, TableRef)`.
@@ -53,6 +76,110 @@ pub struct TenantTableBinding {
 }
 
 impl TenantTableBinding {
+    /// Computes the exact checked physical-name allocation facts without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity validation error or [`TenantTableBindingError::BindingSizeOverflow`]
+    /// when any exact byte total cannot be represented.
+    pub(crate) fn facts<'a>(
+        tenant: &'a DataTenantId,
+        table_ref: &'a TableRef,
+    ) -> Result<PhysicalBindingFacts<'a>, TenantTableBindingError> {
+        if tenant.as_uuid().is_nil() {
+            return Err(TenantTableBindingError::InvalidTenant);
+        }
+        if !is_safe_name(&table_ref.name) {
+            return Err(TenantTableBindingError::InvalidTableName {
+                table_name: table_ref.name.clone(),
+            });
+        }
+        let namespace = table_ref.namespace.as_str();
+        let segment = namespace
+            .strip_prefix("vala.")
+            .filter(|value| !value.is_empty() && !value.contains('.'))
+            .ok_or_else(|| TenantTableBindingError::InvalidPhysicalNamespace {
+                detail: format!("logical namespace `{namespace}` is not one segment"),
+            })?;
+        let add = |values: &[usize]| {
+            values
+                .iter()
+                .try_fold(0_usize, |total, value| total.checked_add(*value))
+        };
+        let tenant_bytes = 36;
+        let input_bytes = add(&[4, 7, tenant_bytes, segment.len()])
+            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+        let output_bytes = add(&[8, tenant_bytes, 1, segment.len(), 1, table_ref.name.len()])
+            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+        let binding_bytes = add(&[
+            table_ref.name.len(),
+            table_ref.name.len(),
+            namespace.len(),
+            input_bytes,
+            output_bytes,
+        ])
+        .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+        let file_prefix_bytes = add(&[namespace.len(), 1, table_ref.name.len()])
+            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+        let peak_bytes = add(&[tenant_bytes, binding_bytes, file_prefix_bytes])
+            .ok_or(TenantTableBindingError::BindingSizeOverflow)?;
+        Ok(PhysicalBindingFacts {
+            tenant,
+            table_ref,
+            input_bytes,
+            output_bytes,
+            binding_bytes,
+            file_prefix_bytes,
+            peak_bytes,
+        })
+    }
+
+    /// Materializes one binding using the capacities authorized by the same facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TenantTableBindingError::InvalidPhysicalNamespace`] if Iceberg
+    /// rejects the already validated physical namespace components.
+    pub(crate) fn from_facts(
+        facts: PhysicalBindingFacts<'_>,
+    ) -> Result<Self, TenantTableBindingError> {
+        debug_assert_eq!(
+            facts.peak_bytes,
+            36 + facts.binding_bytes + facts.file_prefix_bytes
+        );
+        debug_assert!(facts.input_bytes >= 4 + 7 + 36);
+        let tenant_string = facts.tenant.to_string();
+        let namespace = facts.table_ref.namespace.as_str();
+        let segment = namespace.strip_prefix("vala.").ok_or_else(|| {
+            TenantTableBindingError::InvalidPhysicalNamespace {
+                detail: format!("logical namespace `{namespace}` is not one segment"),
+            }
+        })?;
+        let iceberg_namespace =
+            NamespaceIdent::from_strs(["vala", "tenants", tenant_string.as_str(), segment])
+                .map_err(|error| TenantTableBindingError::InvalidPhysicalNamespace {
+                    detail: error.to_string(),
+                })?;
+        let mut object_prefix = String::with_capacity(facts.output_bytes);
+        object_prefix.push_str("tenants/");
+        object_prefix.push_str(&tenant_string);
+        object_prefix.push('/');
+        object_prefix.push_str(segment);
+        object_prefix.push('/');
+        object_prefix.push_str(&facts.table_ref.name);
+        let mut table_name = String::with_capacity(facts.table_ref.name.len());
+        table_name.push_str(&facts.table_ref.name);
+        let mut logical_namespace = String::with_capacity(namespace.len());
+        logical_namespace.push_str(namespace);
+        Ok(Self {
+            tenant: *facts.tenant,
+            table_ref: facts.table_ref.clone(),
+            iceberg_namespace,
+            table_name,
+            logical_namespace,
+            object_prefix,
+        })
+    }
     /// Resolve one organization-qualified physical identity.
     ///
     /// The logical table name is retained as a local name. The tenant is added
@@ -64,40 +191,8 @@ impl TenantTableBinding {
     /// [`TenantTableBindingError::InvalidPhysicalNamespace`] when the fixed
     /// namespace cannot be represented by Iceberg.
     pub fn resolve((tenant, table_ref): TenantTableKey) -> Result<Self, TenantTableBindingError> {
-        if tenant.as_uuid().is_nil() {
-            return Err(TenantTableBindingError::InvalidTenant);
-        }
-        if !is_safe_name(&table_ref.name) {
-            return Err(TenantTableBindingError::InvalidTableName {
-                table_name: table_ref.name,
-            });
-        }
-
-        let logical_namespace = table_ref.namespace.as_str().to_owned();
-        let logical_segment = logical_namespace
-            .strip_prefix("vala.")
-            .filter(|segment| !segment.is_empty() && !segment.contains('.'))
-            .ok_or_else(|| TenantTableBindingError::InvalidPhysicalNamespace {
-                detail: format!("logical namespace `{logical_namespace}` is not one segment"),
-            })?;
-        let tenant_string = tenant.to_string();
-        let iceberg_namespace =
-            NamespaceIdent::from_strs(["vala", "tenants", tenant_string.as_str(), logical_segment])
-                .map_err(|error| TenantTableBindingError::InvalidPhysicalNamespace {
-                    detail: error.to_string(),
-                })?;
-
-        Ok(Self {
-            tenant,
-            table_name: table_ref.name.clone(),
-            object_prefix: format!(
-                "tenants/{tenant_string}/{logical_segment}/{}",
-                table_ref.name
-            ),
-            logical_namespace,
-            iceberg_namespace,
-            table_ref,
-        })
+        let facts = Self::facts(&tenant, &table_ref)?;
+        Self::from_facts(facts)
     }
 
     /// Verify that a binding is used with the authenticated organization that created it.
@@ -168,6 +263,28 @@ mod tests {
 
     fn table() -> TableRef {
         TableRef::new(BifrostNamespace::Traces, "spans")
+    }
+
+    /// Proves the checked binding formulas and exact-capacity construction agree.
+    #[test]
+    fn physical_binding_facts_match_materialized_capacities() {
+        let tenant = DataTenantId::new_v7();
+        let table = table();
+        let facts = TenantTableBinding::facts(&tenant, &table).expect("binding facts");
+        assert_eq!(facts.input_bytes, 4 + 7 + 36 + 6);
+        assert_eq!(facts.output_bytes, 8 + 36 + 1 + 6 + 1 + 5);
+        assert_eq!(
+            facts.binding_bytes,
+            5 + 5 + "vala.traces".len() + facts.input_bytes + facts.output_bytes
+        );
+        assert_eq!(facts.file_prefix_bytes, "vala.traces".len() + 1 + 5);
+        assert_eq!(
+            facts.peak_bytes,
+            36 + facts.binding_bytes + facts.file_prefix_bytes
+        );
+        let binding = TenantTableBinding::from_facts(facts).expect("materialized binding");
+        assert_eq!(binding.object_prefix.len(), facts.output_bytes);
+        assert_eq!(binding.object_prefix.capacity(), facts.output_bytes);
     }
 
     #[test]

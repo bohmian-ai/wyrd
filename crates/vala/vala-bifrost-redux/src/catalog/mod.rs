@@ -20,4 +20,5 @@ pub(crate) use logical_table_identity::{
 };
 pub use partition_spec::{PartitionTransform, build_partition_spec};
 pub use table_ref::TableRef;
+pub(crate) use tenant_table::PhysicalBindingFacts;
 pub use tenant_table::{TenantTableBinding, TenantTableBindingError, TenantTableKey};

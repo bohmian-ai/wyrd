@@ -40,8 +40,7 @@ use crate::postgres::ServerPostgres;
 /// `AppState`, the boot path, and the test harness.
 pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolver>;
 /// Production Gate specialization used by AppState.
-pub type ServerGate =
-    vala_bifrost_redux::gate::Gate<BifrostCatalog, SqlPermissionResolver, PgIssuerResolver>;
+pub type ServerGate = vala_bifrost_redux::gate::Gate<SqlPermissionResolver, PgIssuerResolver>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +384,6 @@ impl BifrostIngestRuntime {
     #[must_use]
     pub fn new(
         scribe: Arc<ScribeImpl>,
-        catalog: Arc<BifrostCatalog>,
         verifier: Arc<WyrdTokenVerifier>,
         limits: IngestLimits,
         coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
@@ -396,7 +394,6 @@ impl BifrostIngestRuntime {
                 .expect("constructed Scribe must retain a valid UUID stream identity"),
         );
         let gate = Arc::new(ServerGate::with_scribe(
-            catalog,
             scribe.clone(),
             ingest_auth_interceptor(verifier),
             limits,

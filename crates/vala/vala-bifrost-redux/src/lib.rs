@@ -17,6 +17,7 @@ pub mod gate;
 pub mod maintenance;
 pub mod namespaces;
 pub mod oracle;
+mod otlp_contract;
 pub mod parquet;
 pub mod provider;
 pub mod resources;

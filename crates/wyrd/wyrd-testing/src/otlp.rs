@@ -262,7 +262,7 @@ fn kv(key: &str, value: any_value::Value) -> KeyValue {
 
 #[cfg(test)]
 mod tests {
-    use vala_bifrost_redux::gate::collector::project_resource_spans;
+    use vala_bifrost_redux::scribe::test_projection_oracle::project_resource_spans;
     use wyrd_tonic::prost::Message;
 
     use super::RandomTraceGenerator;

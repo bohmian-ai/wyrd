@@ -924,7 +924,6 @@ pub async fn build_state(
             return Err(error);
         }
     };
-    let bifrost = Arc::clone(&state.bifrost);
     let limits = config.bifrost.scribe.ingest_limits();
     let state = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_parts = bifrost_parts.scribe.ok_or_else(|| {
@@ -938,7 +937,6 @@ pub async fn build_state(
         let ingest = Arc::new(
             BifrostIngestRuntime::new(
                 scribe_parts.scribe,
-                Arc::clone(&bifrost),
                 Arc::clone(&verifier),
                 limits,
                 Some(
@@ -962,13 +960,11 @@ pub async fn build_state(
     };
     let mut gate = match &state.bifrost_ingest {
         Some(ingest) => vala_bifrost_redux::gate::Gate::with_scribe(
-            bifrost,
             ingest.scribe().clone(),
             vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
             limits,
         ),
         None => vala_bifrost_redux::gate::Gate::without_scribe(
-            bifrost,
             vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
             limits,
         ),
@@ -2735,7 +2731,6 @@ pub(crate) mod pg_tests {
             let ingest = Arc::new(
                 BifrostIngestRuntime::new(
                     scribe,
-                    Arc::clone(&redux),
                     verifier,
                     vala_bifrost_redux::gate::limits::IngestLimits::default(),
                     None,

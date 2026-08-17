@@ -27,6 +27,8 @@ pub mod shards;
 pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_projection_oracle;
 pub mod wal;
 
 #[cfg(test)]

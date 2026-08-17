@@ -784,7 +784,6 @@ mod pg_tests {
         ));
         let ingest = Arc::new(BifrostIngestRuntime::new(
             scribe,
-            Arc::clone(&redux_catalog),
             Arc::clone(&verifier),
             vala_bifrost_redux::gate::limits::IngestLimits::default(),
             None,

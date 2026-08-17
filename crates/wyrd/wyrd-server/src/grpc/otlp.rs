@@ -19,6 +19,7 @@ use wyrd_tonic::tonic::body::Body as TonicBody;
 use wyrd_tonic::tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use wyrd_tonic::tonic::codegen::http::{Request as HttpRequest, Response as HttpResponse};
 use wyrd_tonic::tonic::codegen::{Body, StdError};
+use wyrd_tonic::tonic::metadata::MetadataMap;
 use wyrd_tonic::tonic::server::{Grpc, NamedService, UnaryService};
 use wyrd_tonic::tonic::{Request, Response, Status};
 
@@ -85,8 +86,14 @@ where
         }
         let gate = Arc::clone(&self.gate);
         Box::pin(async move {
+            let metadata = MetadataMap::from_headers(request.headers().clone());
+            let auth = match gate.authenticate_otlp_metadata(&metadata).await {
+                Ok(auth) => auth,
+                Err(error) => return Ok(Status::from(error).into_http()),
+            };
             let method = TraceExportUnary {
                 gate: Arc::clone(&gate),
+                auth: Some(auth),
             };
             let maximum_message_size = gate.otlp_decoding_message_size();
             let codec = TraceOtlpCodec { gate };
@@ -103,6 +110,8 @@ where
 struct TraceExportUnary {
     /// Gate selected during server boot.
     gate: Arc<ServerGate>,
+    /// Call-scoped authentication consumed exactly once before routing.
+    auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
 impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
@@ -110,14 +119,12 @@ impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
     type Future =
         Pin<Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>>;
 
-    /// Authenticates metadata, routes the owned request, and returns OTLP partial success.
+    /// Consumes call-scoped authentication, routes the request, and returns partial success.
     fn call(&mut self, request: Request<DecodedOtlp<ExportTraceServiceRequest>>) -> Self::Future {
         let gate = Arc::clone(&self.gate);
+        let auth = self.auth.take();
         Box::pin(async move {
-            let auth = gate
-                .authenticate_otlp_metadata(request.metadata())
-                .await
-                .map_err(Status::from)?;
+            let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
             let outcome = gate
                 .ingest_decoded_resource_spans(&auth, request.into_inner())
                 .await
@@ -272,12 +279,23 @@ where
         }
         let gate = Arc::clone(&self.gate);
         Box::pin(async move {
+            let metadata = MetadataMap::from_headers(request.headers().clone());
+            let auth = match gate.authenticate_otlp_metadata(&metadata).await {
+                Ok(auth) => auth,
+                Err(error) => return Ok(Status::from(error).into_http()),
+            };
             let maximum_message_size = gate.otlp_decoding_message_size();
             let response = Grpc::new(MetricsOtlpCodec {
                 gate: Arc::clone(&gate),
             })
             .max_decoding_message_size(maximum_message_size)
-            .unary(MetricsExportUnary { gate }, request)
+            .unary(
+                MetricsExportUnary {
+                    gate,
+                    auth: Some(auth),
+                },
+                request,
+            )
             .await;
             Ok(response)
         })
@@ -288,6 +306,8 @@ where
 struct MetricsExportUnary {
     /// Gate selected during server boot.
     gate: Arc<ServerGate>,
+    /// Call-scoped authentication consumed exactly once before routing.
+    auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
 impl UnaryService<DecodedOtlp<ExportMetricsServiceRequest>> for MetricsExportUnary {
@@ -295,14 +315,12 @@ impl UnaryService<DecodedOtlp<ExportMetricsServiceRequest>> for MetricsExportUna
     type Future =
         Pin<Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>>;
 
-    /// Authenticates metadata and transfers the owned typed request to Scribe.
+    /// Consumes call-scoped authentication and transfers the typed request to Scribe.
     fn call(&mut self, request: Request<DecodedOtlp<ExportMetricsServiceRequest>>) -> Self::Future {
         let gate = Arc::clone(&self.gate);
+        let auth = self.auth.take();
         Box::pin(async move {
-            let auth = gate
-                .authenticate_otlp_metadata(request.metadata())
-                .await
-                .map_err(Status::from)?;
+            let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
             let outcome = gate
                 .ingest_decoded_resource_metrics(&auth, request.into_inner())
                 .await
@@ -421,12 +439,23 @@ where
         }
         let gate = Arc::clone(&self.gate);
         Box::pin(async move {
+            let metadata = MetadataMap::from_headers(request.headers().clone());
+            let auth = match gate.authenticate_otlp_metadata(&metadata).await {
+                Ok(auth) => auth,
+                Err(error) => return Ok(Status::from(error).into_http()),
+            };
             let maximum_message_size = gate.otlp_decoding_message_size();
             let response = Grpc::new(LogsOtlpCodec {
                 gate: Arc::clone(&gate),
             })
             .max_decoding_message_size(maximum_message_size)
-            .unary(LogsExportUnary { gate }, request)
+            .unary(
+                LogsExportUnary {
+                    gate,
+                    auth: Some(auth),
+                },
+                request,
+            )
             .await;
             Ok(response)
         })
@@ -437,6 +466,8 @@ where
 struct LogsExportUnary {
     /// Gate selected during server boot.
     gate: Arc<ServerGate>,
+    /// Call-scoped authentication consumed exactly once before routing.
+    auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
 impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {
@@ -444,14 +475,12 @@ impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {
     type Future =
         Pin<Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>>;
 
-    /// Authenticates metadata and transfers the owned typed request to Scribe.
+    /// Consumes call-scoped authentication and transfers the typed request to Scribe.
     fn call(&mut self, request: Request<DecodedOtlp<ExportLogsServiceRequest>>) -> Self::Future {
         let gate = Arc::clone(&self.gate);
+        let auth = self.auth.take();
         Box::pin(async move {
-            let auth = gate
-                .authenticate_otlp_metadata(request.metadata())
-                .await
-                .map_err(Status::from)?;
+            let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
             let outcome = gate
                 .ingest_decoded_resource_logs(&auth, request.into_inner())
                 .await

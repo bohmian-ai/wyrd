@@ -23,8 +23,8 @@ use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 
 use super::direct_traces::{ByteCounter, ExactStringColumn, write_attributes};
 use crate::contracts::ScribeError;
-use crate::gate::collector::MetricsOutcome;
 use crate::gate::collector::tables::{DomainTable, PointsTable};
+use crate::otlp_contract::MetricsOutcome;
 
 /// One borrowed metric point closed over the five OTLP point variants.
 #[derive(Clone, Copy)]

@@ -20,8 +20,8 @@ use wyrd_tonic::otlp::trace::v1::{ResourceSpans, Span, span, status::StatusCode}
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
 use crate::contracts::ScribeError;
-use crate::gate::collector::IngestOutcome;
 use crate::gate::collector::tables::{DomainTable, SpansTable};
+use crate::otlp_contract::IngestOutcome;
 
 /// Stable fallback used by the existing mapper for a missing or unnamed scope.
 const UNKNOWN_SCOPE: &str = "unknown_service";

@@ -7,18 +7,27 @@
 //! IO-free helpers remain only for reusable mapping and test or benchmark
 //! comparisons; they do not describe the production ownership boundary.
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod map;
 pub(crate) mod tables;
 
-use crate::schema::fingerprint::SchemaFingerprint;
-use arrow::datatypes::{Field, Schema};
+#[cfg(any(test, feature = "test-support"))]
 use arrow::record_batch::RecordBatch;
-use wyrd_tonic::otlp::logs_service::{ExportLogsPartialSuccess, ExportLogsServiceRequest};
-use wyrd_tonic::otlp::metrics_service::{ExportMetricsPartialSuccess, ExportMetricsServiceRequest};
-use wyrd_tonic::otlp::trace_service::{ExportTracePartialSuccess, ExportTraceServiceRequest};
+use wyrd_tonic::otlp::logs_service::ExportLogsPartialSuccess;
+#[cfg(any(test, feature = "test-support"))]
+use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+use wyrd_tonic::otlp::metrics_service::ExportMetricsPartialSuccess;
+#[cfg(any(test, feature = "test-support"))]
+use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
+use wyrd_tonic::otlp::trace_service::ExportTracePartialSuccess;
+#[cfg(any(test, feature = "test-support"))]
+use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+#[cfg(any(test, feature = "test-support"))]
 use wyrd_tonic::prost::Message;
 
+#[cfg(any(test, feature = "test-support"))]
 use super::error::IngestError;
+#[cfg(any(test, feature = "test-support"))]
 use map::{
     MappedLogs, MappedMetrics, MappedSpans, logs_to_record_batch, map_resource_logs,
     map_resource_metrics, map_resource_spans, metrics_to_record_batch, spans_to_record_batch,
@@ -29,30 +38,15 @@ use map::{
 /// Production Gate never constructs this value or dispatches its projected
 /// rows; Scribe performs the authoritative current-slice projection.
 #[derive(Debug)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ProjectedExport<T> {
     pub outcome: T,
     pub batch: Option<RecordBatch>,
     pub source_bytes: usize,
 }
 
-/// Fingerprint the user-owned columns before Scribe adds server correlation
-/// columns.
-pub fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
-    let fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .filter(|field| {
-            !matches!(
-                field.name().as_str(),
-                "card_ref" | "card_uid" | "principal_id" | "run_id" | "data_tenant_id"
-            ) && !field.name().starts_with("wyrd_")
-        })
-        .map(|field| field.as_ref().clone())
-        .collect();
-    SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
-}
-
 /// Projects one OTLP trace request for legacy/test parity without writing.
+#[cfg(any(test, feature = "test-support"))]
 pub fn project_resource_spans(
     request: &ExportTraceServiceRequest,
 ) -> Result<ProjectedExport<IngestOutcome>, IngestError> {
@@ -117,6 +111,7 @@ impl IngestOutcome {
 }
 
 /// Projects one OTLP metrics request for legacy/test parity without writing.
+#[cfg(any(test, feature = "test-support"))]
 pub fn project_resource_metrics(
     request: &ExportMetricsServiceRequest,
 ) -> Result<ProjectedExport<MetricsOutcome>, IngestError> {
@@ -177,6 +172,7 @@ impl MetricsOutcome {
 }
 
 /// Projects one OTLP logs request for legacy/test parity without writing.
+#[cfg(any(test, feature = "test-support"))]
 pub fn project_resource_logs(
     request: &ExportLogsServiceRequest,
 ) -> Result<ProjectedExport<LogsOutcome>, IngestError> {

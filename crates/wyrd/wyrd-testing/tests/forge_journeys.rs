@@ -21,7 +21,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
     MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
 };
-use vala_sdk::{BifrostGrpcTransport, IngestTransport};
+use vala_sdk::BifrostGrpcTransport;
 use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::row_types::forge_tasks::{
     FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeTaskEstimates, ForgeTaskLane,

@@ -28,6 +28,9 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::parquet::{
+    BifrostParquetMemoryEnvelope, bifrost_writer_properties_with_metadata,
+};
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
     SystemResourceSnapshot,
@@ -1932,12 +1935,15 @@ async fn seed_forge_group_with_resources(
             ]);
             let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns)
                 .expect("Forge fixture batch");
+            let path = format!("{}/journey-{file_number}.parquet", binding.object_prefix);
+            let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, &path)
+                .expect("Forge fixture writer-v2 metadata");
             let mut bytes = Vec::new();
-            let mut writer =
-                ArrowWriter::try_new(&mut bytes, batch.schema(), None).expect("Parquet writer");
+            let properties = bifrost_writer_properties_with_metadata(batch.num_rows(), metadata);
+            let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties))
+                .expect("Parquet writer");
             writer.write(&batch).expect("Parquet batch");
             writer.close().expect("Parquet close");
-            let path = format!("{}/journey-{file_number}.parquet", binding.object_prefix);
             let size = i64::try_from(bytes.len()).expect("Forge fixture file size");
             staging
                 .write(&path, Buffer::from(bytes))

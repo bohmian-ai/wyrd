@@ -18,12 +18,46 @@ Read the approved plan and every task completely. Read repository `AGENTS.md`,
 `references/controller-protocol.md`. Read the external plan repository's
 canonical task files without copying them into an execution cache.
 
-Require an approved, decision-complete plan. Route a material plan defect only
-through `$wyrd-plan-v3`; do not repair product or contract intent inside this
-controller. Invocation authorizes local branches, isolated worktrees, focused
+Require an approved, decision-complete plan. A defect that invalidates the
+overall V1 objective, task DAG, or cross-task ownership must return through
+`$wyrd-plan-v3`; do not silently repair that plan-wide intent inside this
+controller. A bounded unforeseen decision inside one proven impact cone follows
+the root advisory-revision protocol below. Invocation authorizes local branches, isolated worktrees, focused
 and integrated verification, task evidence updates, and local commits. It does
 not authorize push, PR creation, merge, history rewriting, identity changes,
 or destructive cleanup.
+
+The approved plan is an allowlist of intent as well as files. A candidate that
+adds speculative abstractions, upstream machinery, optional infrastructure, or
+behavior outside the task contract has failed even when it compiles or appears
+beneficial. Return reversible deviation to implementation; treat any deviation
+that requires a new product, durable, public, ownership, dependency, security,
+or acceptance decision as material.
+
+## Resolve material uncertainty
+
+Only the root controller may commission advice. When implementation, proof, or
+review exposes an unforeseen issue requiring a material decision, freeze its
+proven impact cone and spawn one fresh read-only agent using `$wyrd-advise`.
+The advisory request must name the exact accepted SHA, affected plan/task
+digests, issue, current evidence, applicable Wyrd authorities, and requested
+recommendation. The advisor investigates and recommends; it does not edit,
+implement, mutate controller state, or invoke another workflow. Run the advisor
+as `gpt-5.6-sol` with `low` reasoning.
+
+The root validates the recommendation against source and authorities and owns
+the decision. If the root agrees, record the evidence and rationale and author
+one digest-bound successor task revision for only the frozen cone, with exact
+contract, write-set, lock, dependency, proof, and escalation changes. Invalidate
+affected candidates, proofs, and reviews; validate the revised task request and
+resume through a fresh immutable candidate and independent review. Do not rerun
+plan-wide cold rehearsal for this bounded execution-time revision. Unaffected
+work may continue. If the decision changes the overall V1 objective, task DAG,
+or cross-task semantic ownership, stop and route the plan-wide change through
+`$wyrd-plan-v3`, including its normal rehearsal. If the root rejects the
+recommendation, record the source-backed reason and continue only when the
+existing approved contract unambiguously decides the issue. Advice never
+authorizes an implementor or reviewer to deviate from the current task.
 
 ## Establish durable state
 
@@ -92,8 +126,9 @@ The root validates every finding against source.
 
 A material finding freezes only its proven impact cone: the affected task and
 tasks whose contracts, write sets, dependencies, or acceptance proof could
-change. Independent work continues. Route the frozen cone through
-`$wyrd-plan-v3`; do not invoke an older planner. Reversible implementation
+change. Independent work continues. Use the root-only material-uncertainty
+protocol above for an unforeseen decision. Use `$wyrd-plan-v3` only when the
+decision crosses the bounded-revision threshold; do not invoke an older planner. Reversible implementation
 findings return to a fresh Sol-low implementor as a bounded successor
 candidate.
 

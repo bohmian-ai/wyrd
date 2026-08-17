@@ -181,3 +181,13 @@ Run cold rehearsal only after structural validation. Store its canonical
 and tasks become `Ready` only when the current digest-bound rehearsal returns
 `PASS`. Any material contract, semantic lock, task dependency, write set,
 acceptance proof, or source revision change invalidates that verdict.
+
+Treat every rehearsal `FAIL` as remediation input, not a terminal planning
+outcome. Fix every material finding in the canonical plan, packets, manifest,
+and evidence; recompute all affected digests; rerun structural validation; and
+run a fresh cold rehearsal. Repeat this validate-remediate-rehearse loop until
+the digest-bound verdict is `PASS`. Do not return a requested execution-ready
+plan as `Draft`, `Planned`, or `FAIL` merely because a rehearsal exposed
+repairable planning defects. Stop without approval only for a genuine missing
+authority or user decision that cannot be resolved from repository evidence,
+and report that exact blocker.

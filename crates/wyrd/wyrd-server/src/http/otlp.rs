@@ -50,11 +50,12 @@ use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsService
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
+use wyrd_tonic::otlp::trace_service::ExportTraceServiceResponse;
 use wyrd_tonic::prost::Message;
 
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
+use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
 use crate::state::AppState;
 
 /// The OTLP signal type handled by a specific export endpoint.
@@ -216,10 +217,22 @@ async fn export_traces(
                 details: serde_json::Value::Null,
             })
         })?;
+    let (decode_bytes, request) = match encoding {
+        OtlpEncoding::Protobuf => {
+            let plan = preflight_trace_protobuf(&body, gate.otlp_wire_limits())
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            let request = decode_trace_protobuf(&body)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            (plan.decode_bytes, request)
+        }
+        OtlpEncoding::Json => (
+            body.len(),
+            decode_request(encoding, &body)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?,
+        ),
+    };
     let owner = gate
-        .reserve_otlp_decode(body.len())
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-    let request: ExportTraceServiceRequest = decode_request(encoding, &body)
+        .reserve_otlp_decode(decode_bytes)
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
     let outcome = gate
         .ingest_decoded_resource_spans(&auth, DecodedOtlp::new(request, body.len(), owner))

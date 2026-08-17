@@ -18,7 +18,7 @@ use wyrd_tonic::tonic::codegen::{Body, StdError};
 use wyrd_tonic::tonic::server::{Grpc, NamedService, UnaryService};
 use wyrd_tonic::tonic::{Request, Response, Status};
 
-use crate::otlp_decode::preflight_trace_protobuf;
+use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
 use crate::state::ServerGate;
 
 /// Canonical OTLP trace export route retained from the generated service.
@@ -203,9 +203,8 @@ impl Decoder for TraceRequestDecoder {
             .gate
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
-        let request = ExportTraceServiceRequest::decode(source).map_err(|error| {
-            Status::invalid_argument(format!("OTLP protobuf decode failed: {error}"))
-        })?;
+        let request = decode_trace_protobuf(bytes).map_err(Status::from)?;
+        source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
     }
 }

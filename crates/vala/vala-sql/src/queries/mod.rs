@@ -21,3 +21,4 @@ pub mod monitor;
 pub mod olap_catalog;
 pub mod profiles;
 pub mod queues;
+pub mod scribe_batch_commits;

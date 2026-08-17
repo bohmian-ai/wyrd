@@ -7,6 +7,7 @@ pub mod file_list_writer;
 pub mod filename;
 mod ingress;
 pub mod manifest;
+mod material_plan;
 pub mod memory;
 pub mod memtable;
 pub mod parquet_writer;
@@ -964,6 +965,9 @@ impl ScribeImpl {
             persistence_cpu,
             wal_io,
         } = execution_pools;
+        let control_postgres = persistence_config
+            .as_ref()
+            .map(|config| Arc::clone(&config.postgres));
         let persistence = persistence_config.map(|config| {
             #[cfg(any(test, feature = "test-support"))]
             let faults = config.faults.clone();
@@ -993,6 +997,7 @@ impl ScribeImpl {
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
+                control_postgres,
                 stream,
                 memory_ownership: memory_ownership.clone(),
             },

@@ -1,16 +1,20 @@
 //! Write-Ahead Log (WAL) for Scribe — crash-consistent framed records.
 //!
-//! Every prepared day slice emits one self-describing WAL record. The record
-//! contains its tenant/table/day identity, canonical audit envelope, and Arrow
-//! IPC payload so replay does not depend on directory names or paired records.
+//! Every prepared day slice emits one self-describing v4 `SLICE` record. After
+//! all ordered slices are durable, one `COMMIT` record authenticates their
+//! complete digest before replay may restore any of them.
 //!
 //! Segment format per `scribe/00-architecture.md §Crash-consistent WAL format`:
 //! - Fixed 64-byte header with magic, version, `node_id`, `writer_epoch`, CRC
-//! - Variable-length framed records: `[len][lsn][kind][reserved][batch_id][slice][crc32c]`
+//! - Fixed 72-byte framed-record headers plus payload and CRC32C trailers
+//! - `SLICE` records carrying tenant/batch/ordinal identity and payload
+//! - `COMMIT` records carrying the closed slice-set digest
 //! - Atomic segment rollover: write-fsync-rename-fsync-parent
-//! - Torn tail truncation on replay at first CRC/length/monotonicity failure
+//! - Torn-tail truncation only for incomplete final writes; CRC, structure, and
+//!   monotonicity failures in a committed prefix fail closed
 //!
-//! Version 3 is the only accepted format. Older paired formats are rejected.
+//! Version 4 is the only accepted format. Earlier segment versions are rejected
+//! before replay.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
@@ -24,6 +28,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
@@ -123,7 +128,7 @@ impl std::fmt::Display for WalLsn {
 pub struct SegmentHeader {
     /// Magic bytes: 0x57415257 ("WRAW" — Wyrd Redux Arrow Wal).
     pub magic: u32,
-    /// Format version (3 is the only accepted implementation).
+    /// Format version (4 is the only accepted implementation).
     pub version: u16,
     /// Reserved field (must be zero).
     pub reserved: u16,
@@ -140,11 +145,21 @@ pub struct SegmentHeader {
 }
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
-const WAL_VERSION: u16 = 3;
+/// The only persisted WAL version accepted by this Scribe.
+const WAL_VERSION: u16 = 4;
 const SEGMENT_HEADER_SIZE: usize = 64;
 #[cfg(test)]
 const APPEND_FRAME_MAGIC_V3: [u8; 4] = *b"SWF3";
-const RECORD_RESERVED: [u8; 3] = *b"WYD";
+/// Fixed byte length of every v4 record header before its payload and CRC.
+const RECORD_HEADER_SIZE: usize = 72;
+/// `u16` wire encoding of the immutable v4 record-header length.
+const RECORD_HEADER_SIZE_U16: u16 = 72;
+/// Exact v4 record magic.
+const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL4";
+/// A record carrying one ordered batch slice.
+const RECORD_FLAG_SLICE: u32 = 1;
+/// A record carrying the digest that closes one ordered slice set.
+const RECORD_FLAG_COMMIT: u32 = 2;
 
 impl SegmentHeader {
     /// Construct a new segment header.
@@ -253,18 +268,25 @@ impl SegmentHeader {
     }
 }
 
-/// WAL record — variable length framed entry.
+/// WAL record — a v4 slice or commit framed entry.
 ///
-/// Layout: `[len:u32][lsn:u64][kind:u8][reserved:u8×3][batch_id:u8×16][payload][crc32c:u32]`.
+/// Its fixed 72-byte little-endian header is followed by its declared payload
+/// and a CRC32C trailer over both. A record never carries a mixed flag set.
 ///
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     /// LSN for this record (monotonic per stream).
     pub lsn: WalLsn,
-    /// Record kind. Version 3 uses `2` for one complete day slice.
-    pub record_kind: u8,
+    /// Exactly one of [`RECORD_FLAG_SLICE`] or [`RECORD_FLAG_COMMIT`].
+    pub flags: u32,
+    /// Authenticated tenant owning the record.
+    pub tenant_id: [u8; 16],
     /// Batch ID for deduplication of the complete audit-plus-data record.
     pub batch_id: [u8; 16],
+    /// Zero-based slice ordinal, or the closing slice count for a commit.
+    pub slice_index: u32,
+    /// Total slices in the batch's ordered slice set.
+    pub slice_count: u32,
     /// Self-describing slice payload.
     pub payload: Vec<u8>,
 }
@@ -324,6 +346,14 @@ pub(crate) struct PreparedWalAppend {
     pub(crate) seal_key: Option<SealKey>,
     pub(crate) schema_fingerprint: [u8; 32],
     pub(crate) shard_id: Option<u8>,
+    /// Ordered ordinal assigned by the preprocessor before WAL allocation.
+    pub(crate) slice_index: u32,
+    /// Total slices in this batch's closed set.
+    pub(crate) slice_count: u32,
+    /// Terminal digest when this prepared record closes a batch slice set.
+    pub(crate) commit_digest: Option<[u8; 32]>,
+    /// Authenticated tenant encoded by a terminal commit record.
+    pub(crate) commit_tenant: Option<[u8; 16]>,
 }
 
 /// Result of one append, including every segment whose bytes were touched.
@@ -333,6 +363,10 @@ pub(crate) struct WalAppendResult {
     #[cfg(feature = "bench-support")]
     pub(crate) encoded_bytes: u64,
     pub(crate) touched_segments: Vec<Arc<WalSegment>>,
+    /// Digest of the exact payload protected by this record's CRC.
+    pub(crate) payload_digest: [u8; 32],
+    /// Exact payload length represented by the digest.
+    pub(crate) payload_len: u32,
 }
 
 impl PreparedWalAppend {
@@ -345,6 +379,32 @@ impl PreparedWalAppend {
             seal_key: None,
             schema_fingerprint: [0; 32],
             shard_id: None,
+            slice_index: 0,
+            slice_count: 1,
+            commit_digest: None,
+            commit_tenant: None,
+        }
+    }
+
+    /// Builds a terminal v4 commit record without allocating a duplicate digest buffer.
+    pub(crate) fn commit(
+        batch_id: [u8; 16],
+        tenant_id: [u8; 16],
+        slice_count: u32,
+        digest: [u8; 32],
+    ) -> Self {
+        Self {
+            lsn: WalLsn::ZERO,
+            batch_id,
+            audit: Bytes::new(),
+            data: Bytes::new(),
+            seal_key: None,
+            schema_fingerprint: [0; 32],
+            shard_id: None,
+            slice_index: slice_count,
+            slice_count,
+            commit_digest: Some(digest),
+            commit_tenant: Some(tenant_id),
         }
     }
 
@@ -352,6 +412,12 @@ impl PreparedWalAppend {
         self.seal_key = Some(seal_key);
         self.schema_fingerprint = schema_fingerprint;
         self
+    }
+
+    /// Updates the ordinal after batch splitting fixes the complete slice count.
+    pub(crate) fn assign_slice_ordinal(&mut self, slice_index: u32, slice_count: u32) {
+        self.slice_index = slice_index;
+        self.slice_count = slice_count;
     }
 
     fn assign_lsn(&mut self, lsn: WalLsn) {
@@ -363,6 +429,18 @@ impl PreparedWalAppend {
         if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
             WAL_ENCODE_COUNT.with(|count| count.set(count.get() + 1));
         }
+        if let Some(digest) = self.commit_digest {
+            let tenant_id = self.commit_tenant.ok_or_else(|| ScribeError::Internal {
+                detail: "WAL v4 commit is missing its authenticated tenant".to_owned(),
+            })?;
+            return Ok(WalRecord::commit(
+                self.lsn,
+                tenant_id,
+                self.batch_id,
+                self.slice_count,
+                digest,
+            ));
+        }
         let seal_key = self
             .seal_key
             .as_ref()
@@ -371,10 +449,20 @@ impl PreparedWalAppend {
             })?;
         let payload =
             encode_slice_payload(seal_key, self.schema_fingerprint, &self.audit, &self.data)?;
-        Ok(WalRecord::new(self.lsn, 2, self.batch_id, payload))
+        Ok(WalRecord::slice(
+            self.lsn,
+            *seal_key.tenant.as_uuid().as_bytes(),
+            self.batch_id,
+            self.slice_index,
+            self.slice_count,
+            payload,
+        ))
     }
 
     pub(crate) fn encoded_len(&self) -> Result<usize, ScribeError> {
+        if self.commit_digest.is_some() {
+            return Ok(RECORD_HEADER_SIZE + 32 + 4);
+        }
         let seal_key = self
             .seal_key
             .as_ref()
@@ -410,7 +498,7 @@ impl PreparedWalAppend {
             .saturating_add(usize::try_from(audit_len).expect("invariant: u32 fits usize"))
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         payload_len
-            .checked_add(36)
+            .checked_add(RECORD_HEADER_SIZE + 4)
             .ok_or_else(|| ScribeError::Internal {
                 detail: "encoded WAL record length overflow".to_owned(),
             })
@@ -667,35 +755,92 @@ pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload
 }
 
 impl WalRecord {
-    /// Construct a new WAL record.
+    /// Construct a one-slice v4 record for a test or low-level caller.
+    ///
+    /// Production writers use [`Self::slice`] with the authenticated tenant.
     #[must_use]
-    pub fn new(lsn: WalLsn, record_kind: u8, batch_id: [u8; 16], payload: Vec<u8>) -> Self {
+    pub fn new(lsn: WalLsn, _record_kind: u8, batch_id: [u8; 16], payload: Vec<u8>) -> Self {
+        Self::slice(lsn, [0; 16], batch_id, 0, 1, payload)
+    }
+
+    /// Construct one ordered slice record.
+    #[must_use]
+    pub fn slice(
+        lsn: WalLsn,
+        tenant_id: [u8; 16],
+        batch_id: [u8; 16],
+        slice_index: u32,
+        slice_count: u32,
+        payload: Vec<u8>,
+    ) -> Self {
         Self {
             lsn,
-            record_kind,
+            flags: RECORD_FLAG_SLICE,
+            tenant_id,
             batch_id,
+            slice_index,
+            slice_count,
             payload,
         }
     }
 
-    /// Encode the record to bytes (including frame header and CRC).
+    /// Construct the terminal commit record for one complete ordered slice set.
     #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "WAL payload len constrained by record format"
-    )]
-    pub fn encode(&self) -> Vec<u8> {
-        let len = self.payload.len() as u32;
-        let mut buf = Vec::with_capacity(4 + 8 + 1 + 3 + 16 + self.payload.len() + 4);
+    pub fn commit(
+        lsn: WalLsn,
+        tenant_id: [u8; 16],
+        batch_id: [u8; 16],
+        slice_count: u32,
+        digest: [u8; 32],
+    ) -> Self {
+        Self {
+            lsn,
+            flags: RECORD_FLAG_COMMIT,
+            tenant_id,
+            batch_id,
+            slice_index: slice_count,
+            slice_count,
+            payload: digest.to_vec(),
+        }
+    }
 
-        buf.extend_from_slice(&len.to_le_bytes());
+    /// Returns whether this record is one payload-bearing slice.
+    #[must_use]
+    pub const fn is_slice(&self) -> bool {
+        self.flags == RECORD_FLAG_SLICE
+    }
+
+    /// Returns whether this record is a terminal slice-set commit.
+    #[must_use]
+    pub const fn is_commit(&self) -> bool {
+        self.flags == RECORD_FLAG_COMMIT
+    }
+
+    /// Encode the record to bytes (including frame header and CRC).
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internal caller violates the configured `u32` WAL
+    /// payload bound before this record is encoded.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let payload_len = u32::try_from(self.payload.len())
+            .expect("invariant: WAL payload is bounded by the configured Scribe request ceiling");
+        let mut buf = Vec::with_capacity(RECORD_HEADER_SIZE + self.payload.len() + 4);
+        buf.extend_from_slice(&RECORD_MAGIC);
+        buf.extend_from_slice(&WAL_VERSION.to_le_bytes());
+        buf.extend_from_slice(&RECORD_HEADER_SIZE_U16.to_le_bytes());
+        buf.extend_from_slice(&self.flags.to_le_bytes());
         buf.extend_from_slice(&self.lsn.as_u64().to_le_bytes());
-        buf.push(self.record_kind);
-        buf.extend_from_slice(&RECORD_RESERVED);
+        buf.extend_from_slice(&self.tenant_id);
         buf.extend_from_slice(&self.batch_id);
+        buf.extend_from_slice(&self.slice_index.to_le_bytes());
+        buf.extend_from_slice(&self.slice_count.to_le_bytes());
+        buf.extend_from_slice(&payload_len.to_le_bytes());
+        buf.extend_from_slice(&0_u32.to_le_bytes());
         buf.extend_from_slice(&self.payload);
 
-        // Compute CRC over len + lsn + kind + reserved + batch_id + payload
+        // Compute CRC over the complete v4 header followed by payload.
         let crc = crc32c_hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
@@ -706,72 +851,89 @@ impl WalRecord {
     ///
     /// Returns `None` at clean EOF (no bytes available).
     /// Returns `Err` on short read, CRC mismatch, or invalid record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for a torn final write, a CRC mismatch, an
+    /// unsupported version, or any invalid v4 header or payload bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed-size local header slicing invariant is broken.
     pub fn decode_from<R: Read>(reader: &mut R) -> Result<Option<Self>, ScribeError> {
-        // Read len
-        let mut len_buf = [0u8; 4];
-        match reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => {
+        let mut header = [0_u8; RECORD_HEADER_SIZE];
+        match reader.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => {
+                reader
+                    .read_exact(&mut header[1..])
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("WAL torn v4 record header: {error}"),
+                    })?;
+            }
+            Ok(_) => {
                 return Err(ScribeError::Internal {
-                    detail: format!("WAL record read error: {e}"),
+                    detail: "WAL one-byte header probe exceeded its buffer".to_owned(),
+                });
+            }
+            Err(error) => {
+                return Err(ScribeError::Internal {
+                    detail: format!("WAL record header read error: {error}"),
                 });
             }
         }
-        let len = u32::from_le_bytes(len_buf);
-
-        // Read lsn
-        let mut lsn_bytes = [0u8; 8];
-        reader
-            .read_exact(&mut lsn_bytes)
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL record LSN read error: {e}"),
-            })?;
-        let lsn = WalLsn::new(u64::from_le_bytes(lsn_bytes));
-
-        // Read kind
-        let mut kind_buf = [0u8; 1];
-        reader
-            .read_exact(&mut kind_buf)
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL record kind read error: {e}"),
-            })?;
-        let envelope_kind = kind_buf[0];
-
-        // Validate kind
-        if envelope_kind != 2 {
+        if header[..8] != RECORD_MAGIC {
             return Err(ScribeError::Internal {
-                detail: format!("invalid WAL record kind: {envelope_kind}"),
+                detail: "invalid WAL v4 record magic".to_owned(),
             });
         }
-
-        // Read reserved
-        let mut reserved_buf = [0u8; 3];
-        reader
-            .read_exact(&mut reserved_buf)
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL record reserved read error: {e}"),
-            })?;
-        if reserved_buf != RECORD_RESERVED {
+        let version = u16::from_le_bytes([header[8], header[9]]);
+        if version != WAL_VERSION {
+            return Err(ScribeError::UnsupportedWalVersion { version });
+        }
+        let header_len = u16::from_le_bytes([header[10], header[11]]);
+        if usize::from(header_len) != RECORD_HEADER_SIZE {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL record format marker".to_string(),
+                detail: "invalid WAL v4 record header length".to_owned(),
             });
         }
-
-        // Read batch_id
+        let flags = u32::from_le_bytes(header[12..16].try_into().expect("fixed record header"));
+        if !matches!(flags, RECORD_FLAG_SLICE | RECORD_FLAG_COMMIT) {
+            return Err(ScribeError::Internal {
+                detail: "invalid WAL v4 record flags".to_owned(),
+            });
+        }
+        let lsn = WalLsn::new(u64::from_le_bytes(
+            header[16..24].try_into().expect("fixed record header"),
+        ));
+        let mut tenant_id = [0_u8; 16];
+        tenant_id.copy_from_slice(&header[24..40]);
         let mut batch_id = [0u8; 16];
-        reader
-            .read_exact(&mut batch_id)
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL record batch_id read error: {e}"),
-            })?;
-
-        // Read payload
-        let mut payload = vec![0u8; len as usize];
+        batch_id.copy_from_slice(&header[40..56]);
+        let slice_index =
+            u32::from_le_bytes(header[56..60].try_into().expect("fixed record header"));
+        let slice_count =
+            u32::from_le_bytes(header[60..64].try_into().expect("fixed record header"));
+        let payload_len =
+            u32::from_le_bytes(header[64..68].try_into().expect("fixed record header"));
+        let reserved = u32::from_le_bytes(header[68..72].try_into().expect("fixed record header"));
+        if reserved != 0
+            || slice_count == 0
+            || slice_index > slice_count
+            || (flags == RECORD_FLAG_SLICE && slice_index >= slice_count)
+            || (flags == RECORD_FLAG_COMMIT && (slice_index != slice_count || payload_len != 32))
+        {
+            return Err(ScribeError::Internal {
+                detail: "invalid WAL v4 record bounds".to_owned(),
+            });
+        }
+        let payload_len =
+            usize::try_from(payload_len).expect("u32 fits usize on supported targets");
+        let mut payload = vec![0u8; payload_len];
         reader
             .read_exact(&mut payload)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL record payload read error: {e}"),
+                detail: format!("WAL torn v4 record payload: {e}"),
             })?;
 
         // Read CRC
@@ -779,17 +941,12 @@ impl WalRecord {
         reader
             .read_exact(&mut crc_buf)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL record CRC read error: {e}"),
+                detail: format!("WAL torn v4 record CRC: {e}"),
             })?;
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        // Verify CRC over [len][lsn][kind][reserved][batch_id][payload]
-        let mut crc_input = Vec::with_capacity(4 + 8 + 1 + 3 + 16 + payload.len());
-        crc_input.extend_from_slice(&len_buf);
-        crc_input.extend_from_slice(&lsn_bytes);
-        crc_input.extend_from_slice(&kind_buf);
-        crc_input.extend_from_slice(&reserved_buf);
-        crc_input.extend_from_slice(&batch_id);
+        let mut crc_input = Vec::with_capacity(RECORD_HEADER_SIZE + payload.len());
+        crc_input.extend_from_slice(&header);
         crc_input.extend_from_slice(&payload);
 
         let computed_crc = crc32c_hash(&crc_input);
@@ -803,8 +960,11 @@ impl WalRecord {
 
         Ok(Some(Self {
             lsn,
-            record_kind: envelope_kind,
+            flags,
+            tenant_id,
             batch_id,
+            slice_index,
+            slice_count,
             payload,
         }))
     }
@@ -1409,7 +1569,14 @@ impl WalSegment {
 
     /// Visit complete records incrementally, truncating a torn tail before
     /// returning. Replay uses this to avoid constructing a directory-wide
-    /// `Vec<(segment, record)>` before grouping state.
+    /// `Vec<(segment, record)>` before grouping state. Structural, CRC, and
+    /// non-monotonic committed-prefix failures are returned without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the segment cannot be read or synced, the
+    /// visitor fails, or a committed prefix violates the v4 frame or LSN
+    /// invariants. A short final record is the sole truncation case.
     pub(crate) fn for_each_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
     where
         F: FnMut(WalRecord) -> Result<(), ScribeError>,
@@ -1432,27 +1599,15 @@ impl WalSegment {
             match WalRecord::decode_from(&mut *file) {
                 Ok(Some(record)) => {
                     if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
-                        file.set_len(record_offset)
-                            .map_err(|error| ScribeError::Internal {
-                                detail: format!(
-                                    "WAL non-monotonic tail truncation failed: {error}"
-                                ),
-                            })?;
-                        let started = Instant::now();
-                        #[cfg(test)]
-                        WAL_RECOVERY_SYNC_COUNT.with(|count| count.set(count.get() + 1));
-                        let sync_result = file.sync_data().map_err(|error| ScribeError::Internal {
-                            detail: format!("WAL non-monotonic tail sync failed: {error}"),
+                        return Err(ScribeError::Internal {
+                            detail: "WAL v4 contains non-monotonic committed LSNs".to_owned(),
                         });
-                        record_wal_fsync(&sync_result, started);
-                        sync_result?;
-                        break;
                     }
                     previous_lsn = Some(record.lsn);
                     visit(record)?;
                 }
                 Ok(None) => break,
-                Err(_) => {
+                Err(error) if is_torn_tail_error(&error) => {
                     file.set_len(record_offset)
                         .map_err(|error| ScribeError::Internal {
                             detail: format!("WAL torn-tail truncation failed: {error}"),
@@ -1467,6 +1622,7 @@ impl WalSegment {
                     sync_result?;
                     break;
                 }
+                Err(error) => return Err(error),
             }
         }
 
@@ -1492,6 +1648,15 @@ impl WalSegment {
             path: self.path.clone(),
         }
     }
+}
+
+/// Identifies the only decode failures eligible for tail truncation.
+///
+/// A partially written final header, payload, or CRC is a recoverable torn
+/// tail. Structural violations and CRC mismatches in a complete frame are
+/// durable corruption and must fail-stop rather than silently discard data.
+fn is_torn_tail_error(error: &ScribeError) -> bool {
+    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v4"))
 }
 
 /// WAL writer — owns one fixed set of shard streams with automatic rollover.
@@ -1534,7 +1699,7 @@ impl WalHandle {
         &self,
         mut append: PreparedWalAppend,
     ) -> Result<WalAppendResult, ScribeError> {
-        if append.seal_key.is_none() {
+        if append.seal_key.is_none() && append.commit_digest.is_none() {
             return Err(ScribeError::Internal {
                 detail: "shard WAL append is missing its self-describing seal key".to_owned(),
             });
@@ -1754,7 +1919,7 @@ impl WalWriter {
         }
     }
 
-    /// Append one self-describing v3 record for deterministic test-tier probes.
+    /// Append one self-describing v4 slice record for test-tier probes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn append_and_fsync_for_test(
         &self,
@@ -1766,7 +1931,79 @@ impl WalWriter {
         self.append_and_fsync_for_key(seal_key, batch_id, audit_payload, data_payload)
     }
 
-    /// Append one prepared v3 record without syncing it.
+    /// Append, commit, and fsync one one-slice v4 batch for replay tests.
+    ///
+    /// This test-only helper deliberately models the production `SLICE` then
+    /// `COMMIT` ordering without changing lower-level WAL tests that need to
+    /// observe an individual record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when either append or the terminal fsync fails.
+    #[cfg(test)]
+    pub(crate) fn append_and_commit_for_replay_test(
+        &self,
+        seal_key: &SealKey,
+        batch_id: [u8; 16],
+        audit_payload: &[u8],
+        data_payload: &[u8],
+    ) -> Result<WalLsn, ScribeError> {
+        let mut prepared = PreparedWalAppend::new(
+            WalLsn::ZERO,
+            batch_id,
+            Bytes::copy_from_slice(audit_payload),
+            Bytes::copy_from_slice(data_payload),
+        )
+        .for_slice(seal_key.clone(), [0; 32]);
+        prepared.shard_id = Some(
+            u8::try_from(crate::scribe::routing::shard_for(
+                seal_key.tenant,
+                &seal_key.table,
+                uuid::Uuid::from_bytes(batch_id),
+            ))
+            .expect("fixed shard count fits in u8"),
+        );
+        let shard_id = prepared.shard_id;
+        let slice = self.append_prepared(prepared)?;
+        let mut digest = Sha256::new();
+        digest.update(0_u32.to_le_bytes());
+        digest.update(slice.payload_len.to_le_bytes());
+        digest.update(slice.payload_digest);
+        let mut commit = PreparedWalAppend::commit(
+            batch_id,
+            *seal_key.tenant.as_uuid().as_bytes(),
+            1,
+            digest.finalize().into(),
+        );
+        commit.shard_id = shard_id;
+        let terminal = self.append_prepared(commit)?;
+        let mut touched = slice.touched_segments;
+        touched.extend(terminal.touched_segments);
+        self.sync_segments_with_fault(&touched)?;
+        Ok(slice.lsn)
+    }
+
+    /// Decodes, commits, and fsyncs one legacy compact frame for replay tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when frame decoding or durable WAL writes fail.
+    #[cfg(test)]
+    pub(crate) fn append_frame_and_commit_for_replay_test(
+        &self,
+        frame: &[u8],
+        seal_key: &SealKey,
+    ) -> Result<WalLsn, ScribeError> {
+        let decoded = decode_append_frame(frame)?;
+        self.append_and_commit_for_replay_test(
+            seal_key,
+            decoded.batch_id,
+            decoded.audit,
+            decoded.data,
+        )
+    }
+
+    /// Append one prepared v4 record without syncing it.
     pub(crate) fn append_prepared(
         &self,
         mut prepared: PreparedWalAppend,
@@ -1808,7 +2045,13 @@ impl WalWriter {
             .map_err(resource_volume_error)?;
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
         prepared.assign_lsn(lsn);
-        let encoded = prepared.record()?.encode();
+        let record = prepared.record()?;
+        let payload_digest: [u8; 32] = Sha256::digest(&record.payload).into();
+        let payload_len =
+            u32::try_from(record.payload.len()).map_err(|_| ScribeError::Internal {
+                detail: "WAL v4 payload exceeds its u32 record bound".to_owned(),
+            })?;
+        let encoded = record.encode();
         debug_assert_eq!(
             usize::try_from(encoded_bytes).expect("invariant: encoded length fits usize"),
             encoded.len()
@@ -1882,6 +2125,8 @@ impl WalWriter {
             #[cfg(feature = "bench-support")]
             encoded_bytes,
             touched_segments: vec![segment],
+            payload_digest,
+            payload_len,
         })
     }
 
@@ -2474,6 +2719,7 @@ mod tests {
         ));
     }
 
+    /// Proves the v4 record header carries the required slice identity.
     #[test]
     fn wal_record_roundtrip() {
         let batch_id = [42u8; 16];
@@ -2486,9 +2732,26 @@ mod tests {
             .expect("non-empty");
 
         assert_eq!(decoded.lsn, WalLsn::new(5));
-        assert_eq!(decoded.record_kind, 2);
+        assert!(decoded.is_slice());
         assert_eq!(decoded.batch_id, batch_id);
         assert_eq!(decoded.payload, b"test data");
+    }
+
+    /// Proves a v4 commit has the exact fixed header fields and digest payload.
+    #[test]
+    fn wal_commit_record_uses_the_terminal_slice_identity() {
+        let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, [9; 32]);
+        let encoded = record.encode();
+
+        assert_eq!(&encoded[..8], b"WYRDWAL4");
+        assert_eq!(encoded.len(), RECORD_HEADER_SIZE + 32 + 4);
+        let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded))
+            .expect("decode terminal record")
+            .expect("terminal record exists");
+        assert!(decoded.is_commit());
+        assert_eq!(decoded.slice_index, 3);
+        assert_eq!(decoded.slice_count, 3);
+        assert_eq!(decoded.payload, vec![9; 32]);
     }
 
     #[test]
@@ -2542,7 +2805,7 @@ mod tests {
         let records = reader.read_all_records().expect("read records");
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].record_kind, 2);
+        assert!(records[0].is_slice());
         let decoded = decode_slice_payload(&records[0].payload).expect("slice");
         assert_eq!(decoded.audit, b"audit");
         assert_eq!(decoded.data, b"data");

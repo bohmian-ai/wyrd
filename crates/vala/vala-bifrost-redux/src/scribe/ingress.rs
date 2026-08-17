@@ -4,10 +4,11 @@ use super::ScribeImpl;
 use crate::contracts::{
     FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame, ScribeOtlpOutcome,
 };
-use crate::scribe::admission::{MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES};
+use crate::scribe::admission::MAX_REQUEST_BYTES;
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
+use crate::scribe::material_plan::{IngestMaterialPlan, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
-use crate::scribe::preprocess::AdmittedAppend;
+use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows};
 use crate::scribe::routing::shard_for;
 use std::time::Instant;
 
@@ -37,6 +38,59 @@ fn validate_decoded_request_size(
         return Err(ScribeError::DecodedPayloadTooLarge { bytes, limit });
     }
     Ok(bytes)
+}
+
+/// Counts the exact scalable string payload constructed by a physical binding.
+///
+/// Container headers are fixed residuals; this count covers each owned string
+/// created by [`crate::catalog::TenantTableBinding::resolve`] plus the retained
+/// fully-qualified admission key.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::DecodedPayloadTooLarge`] if checked arithmetic cannot
+/// represent the binding's scalable string payload.
+fn physical_binding_string_bytes(frame: &ScribeIngressFrame) -> Result<usize, ScribeError> {
+    const TENANT_TEXT_BYTES: usize = 36;
+    let namespace = frame.table.namespace.as_str();
+    let segment = namespace
+        .strip_prefix("vala.")
+        .ok_or(ScribeError::InvalidFrame)?;
+    let name = frame.table.name.as_str();
+    let object_prefix = [
+        "tenants/".len(),
+        TENANT_TEXT_BYTES,
+        "/".len(),
+        segment.len(),
+        "/".len(),
+        name.len(),
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, value| total.checked_add(value))
+    .ok_or(ScribeError::DecodedPayloadTooLarge {
+        bytes: usize::MAX,
+        limit: usize::MAX,
+    })?;
+    [
+        name.len(),
+        TENANT_TEXT_BYTES,
+        "vala".len(),
+        "tenants".len(),
+        TENANT_TEXT_BYTES,
+        segment.len(),
+        name.len(),
+        namespace.len(),
+        object_prefix,
+        namespace.len(),
+        ".".len(),
+        name.len(),
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, value| total.checked_add(value))
+    .ok_or(ScribeError::DecodedPayloadTooLarge {
+        bytes: usize::MAX,
+        limit: usize::MAX,
+    })
 }
 
 /// Validates authenticated identity and the raw transport ceiling.
@@ -83,13 +137,7 @@ impl ScribeImpl {
     async fn resolve_logical_frame(
         &self,
         frame: &ScribeIngressFrame,
-    ) -> Result<
-        (
-            crate::schema::fingerprint::SchemaFingerprint,
-            crate::catalog::TenantTableBinding,
-        ),
-        ScribeError,
-    > {
+    ) -> Result<crate::schema::fingerprint::SchemaFingerprint, ScribeError> {
         let expected = if let Some(expected) = frame.expected_schema_fingerprint {
             expected
         } else {
@@ -119,6 +167,54 @@ impl ScribeImpl {
                     detail: error.to_string(),
                 })?
         };
+        Ok(expected)
+    }
+
+    /// Computes one immutable material plan before root admission or binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable invalid, row, or material refusals when the borrowed
+    /// native or typed OTLP payload cannot satisfy the closed V1 limits.
+    fn plan_transport_payload(
+        &self,
+        frame: &ScribeIngressFrame,
+    ) -> Result<IngestMaterialPlan, ScribeError> {
+        let name_bytes = physical_binding_string_bytes(frame)?;
+        let planner = ScribeIngressPlanner;
+        let plan = match &frame.payload {
+            IngressPayload::ArrowIpc(bytes) => planner.plan_native(bytes, name_bytes),
+            IngressPayload::OtlpTraces(request) => {
+                planner.plan_traces(request, frame.measured_wire_bytes, name_bytes)
+            }
+            IngressPayload::OtlpMetrics(request) => {
+                planner.plan_metrics(request, frame.measured_wire_bytes, name_bytes)
+            }
+            IngressPayload::OtlpLogs(request) => {
+                planner.plan_logs(request, frame.measured_wire_bytes, name_bytes)
+            }
+            IngressPayload::ProjectedArrow(batches) => {
+                planner.plan_projected(batches, frame.measured_wire_bytes, name_bytes)
+            }
+        }?;
+        validate_decoded_request_size(
+            plan.current_material_bytes,
+            plan.request_bytes,
+            self.decoded_request_limit(),
+        )?;
+        Ok(plan)
+    }
+
+    /// Constructs and tenant-validates the physical binding after root admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] when logical identity cannot form
+    /// the canonical tenant-qualified binding or its tenant tripwire fails.
+    fn construct_physical_binding(
+        &self,
+        frame: &ScribeIngressFrame,
+    ) -> Result<crate::catalog::TenantTableBinding, ScribeError> {
         let binding = crate::catalog::TenantTableBinding::resolve((
             frame.authenticated_tenant,
             frame.table.clone(),
@@ -127,7 +223,7 @@ impl ScribeImpl {
         binding
             .validate_authenticated_tenant(frame.principal.tenant_id)
             .map_err(|_| ScribeError::InvalidFrame)?;
-        Ok((expected, binding))
+        Ok(binding)
     }
 
     /// Projects raw OTLP on Scribe's bounded CPU lane or forwards engine payloads.
@@ -221,7 +317,32 @@ impl ScribeImpl {
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
         validate_logical_transport_frame(&frame)?;
-        let (expected_schema_fingerprint, binding) = self.resolve_logical_frame(&frame).await?;
+        let expected_schema_fingerprint = self.resolve_logical_frame(&frame).await?;
+        let material_plan = self.plan_transport_payload(&frame)?;
+        let mut memory = match self
+            .memory
+            .try_reserve_ingress(MemoryCategory::Raw, material_plan.root_bytes)
+        {
+            Ok(reservation) => reservation,
+            Err(_) => self.reserve_ingress_after_pressure_seal(
+                MemoryCategory::Raw,
+                material_plan.root_bytes,
+                &frame.table.name,
+            )?,
+        };
+        let binding = self.construct_physical_binding(&frame)?;
+        let table = binding.table_ref.fqn();
+        let shard = shard_for(
+            frame.principal.tenant_id,
+            &binding.table_ref,
+            frame.batch_id,
+        );
+        let reservation = self
+            .admission
+            .try_reserve(table.clone(), material_plan.root_bytes)?;
+        memory.attach_shard(shard)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.pause_admitted_ingest_for_test().await;
         let (payload, otlp_outcome) = match self
             .project_transport_payload(frame.payload, frame.batch_id)
             .await?
@@ -232,52 +353,39 @@ impl ScribeImpl {
                 otlp_outcome,
             } => (payload, otlp_outcome),
         };
-        let table = binding.table_ref.fqn();
-        let shard = shard_for(
-            frame.principal.tenant_id,
-            &binding.table_ref,
-            frame.batch_id,
-        );
 
-        let initial_bytes = frame
-            .measured_wire_bytes
-            .saturating_add(REQUEST_OVERHEAD_BYTES);
-        let mut reservation = self.admission.try_reserve(table.clone(), initial_bytes)?;
-        let mut memory = match self
-            .memory
-            .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
-        {
-            Ok(reservation) => reservation,
-            Err(_) => self.reserve_ingress_after_pressure_seal(
-                MemoryCategory::Raw,
-                initial_bytes,
-                &table,
-            )?,
-        };
-        memory.attach_shard(shard)?;
-        #[cfg(any(test, feature = "test-support"))]
-        self.pause_admitted_ingest_for_test().await;
-
-        let rows = self
-            .ingress_cpu
-            .decode(
-                payload,
-                frame.principal.clone(),
+        let rows = match payload {
+            IngressPayload::ArrowIpc(bytes) => AdmittedRows::Native(NativeAdmittedRows {
+                bytes,
+                principal: frame.principal.clone(),
                 expected_schema_fingerprint,
-                frame.request_id.clone(),
-                frame.batch_id,
-                self.admission.config().event_time_window,
-            )
-            .await?;
-        let decoded_request_bytes = validate_decoded_request_size(
-            rows.get_array_memory_size(),
-            frame.measured_wire_bytes,
-            self.decoded_request_limit(),
-        )?;
+                request_id: frame.request_id.clone(),
+                batch_id: frame.batch_id,
+                event_time_window: self.admission.config().event_time_window,
+            }),
+            payload => {
+                let rows = self
+                    .ingress_cpu
+                    .decode(
+                        payload,
+                        frame.principal.clone(),
+                        expected_schema_fingerprint,
+                        frame.request_id.clone(),
+                        frame.batch_id,
+                        self.admission.config().event_time_window,
+                    )
+                    .await?;
+                let decoded_request_bytes = rows.get_array_memory_size();
+                if decoded_request_bytes > material_plan.current_material_bytes {
+                    return Err(ScribeError::DecodedPayloadTooLarge {
+                        bytes: decoded_request_bytes,
+                        limit: material_plan.current_material_bytes,
+                    });
+                }
+                AdmittedRows::Projected(rows)
+            }
+        };
         memory.transfer_category(MemoryCategory::Decode)?;
-        let estimated_bytes = decoded_request_bytes.saturating_add(REQUEST_OVERHEAD_BYTES);
-        reservation.resize(estimated_bytes)?;
-        self.resize_ingress_after_pressure_seal(&mut memory, estimated_bytes, &table)?;
         memory.transfer_category(MemoryCategory::Prepared)?;
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
@@ -286,7 +394,7 @@ impl ScribeImpl {
             audit_event: frame.audit_event,
             rows,
             measured_wire_bytes: frame.measured_wire_bytes,
-            admitted_bytes: reservation.bytes(),
+            admitted_bytes: material_plan.root_bytes,
             reservation,
             memory,
             tenant: frame.principal.tenant_id,
@@ -294,7 +402,7 @@ impl ScribeImpl {
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
         };
-        let rows_accepted = u64::try_from(admitted.rows.num_rows()).unwrap_or(u64::MAX);
+        let rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
         let prepared = match self
             .persistence_cpu
             .submit(ScribePersistenceCpuOp::Preprocess(Box::new(admitted)))
@@ -392,56 +500,6 @@ impl ScribeImpl {
             Ok(reservation) => return Ok(reservation),
             Err(_) => super::record_scribe_ceiling_rejection(
                 if self.memory.ingress_sublimit_exceeded(bytes) {
-                    crate::scribe::memory::ScribeRejectionCeiling::IngressSublimit
-                } else {
-                    crate::scribe::memory::ScribeRejectionCeiling::BifrostParent
-                },
-            ),
-        }
-        Err(ScribeError::IngestBusy {
-            table: table.to_owned(),
-        })
-    }
-
-    /// Grow an existing ingress reservation after one pressure seal and retry.
-    ///
-    /// The decode step raises the required ingress bytes from the pre-decode
-    /// estimate to the measured Arrow size, so the reservation must grow. This
-    /// mirrors [`Self::reserve_ingress_after_pressure_seal`] for the in-place
-    /// resize path: on an ingress ceiling rejection it requests a
-    /// shard-count-invariant pressure seal toward the low-water mark and retries
-    /// the resize exactly once, while the cgroup 90% tripwire stays an immediate
-    /// `IngestBusy` that a Scribe seal cannot relieve. A retry that still fails
-    /// records the rejection labelled by the ceiling that tripped (D84, via
-    /// [`super::record_scribe_ceiling_rejection`]) and returns `IngestBusy`,
-    /// deferring to D71 client backoff.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::IngestBusy`] when the cgroup tripwire is engaged or
-    /// when the single post-seal resize retry still exceeds the ingress ceiling.
-    fn resize_ingress_after_pressure_seal(
-        &self,
-        memory: &mut crate::resources::ScribeMemoryLease,
-        estimated_bytes: usize,
-        table: &str,
-    ) -> Result<(), ScribeError> {
-        if memory.resize_ingress(estimated_bytes).is_ok() {
-            return Ok(());
-        }
-        if self.memory.cgroup_tripwire_engaged() {
-            super::record_scribe_ceiling_rejection(
-                crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
-            );
-            return Err(ScribeError::IngestBusy {
-                table: table.to_owned(),
-            });
-        }
-        self.request_pressure_seal_toward_low_water();
-        match memory.resize_ingress(estimated_bytes) {
-            Ok(()) => return Ok(()),
-            Err(_) => super::record_scribe_ceiling_rejection(
-                if self.memory.ingress_sublimit_exceeded(estimated_bytes) {
                     crate::scribe::memory::ScribeRejectionCeiling::IngressSublimit
                 } else {
                     crate::scribe::memory::ScribeRejectionCeiling::BifrostParent

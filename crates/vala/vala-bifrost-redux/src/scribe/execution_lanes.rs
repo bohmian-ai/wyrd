@@ -384,6 +384,61 @@ fn decode(
     } else {
         arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?
     };
+    decode_rows(
+        rows,
+        principal,
+        expected_schema_fingerprint,
+        request_id,
+        batch_id,
+        native_payload,
+        window,
+    )
+}
+
+/// Validates and stamps one current native record batch.
+///
+/// This entry point lets persistence preprocessing consume a native stream one
+/// source at a time without collecting or concatenating its record batches.
+///
+/// # Errors
+///
+/// Returns the same schema, scope, event-time, row, and managed-column errors
+/// as the ordinary ingress decode path.
+pub(crate) fn decode_native_batch(
+    rows: RecordBatch,
+    principal: &Principal,
+    expected_schema_fingerprint: SchemaFingerprint,
+    request_id: &RequestId,
+    batch_id: uuid::Uuid,
+    window: EventTimeWindow,
+) -> Result<RecordBatch, ScribeError> {
+    decode_rows(
+        rows,
+        principal,
+        expected_schema_fingerprint,
+        request_id,
+        batch_id,
+        true,
+        window,
+    )
+}
+
+/// Applies source-contract validation and server-managed stamping to one batch.
+///
+/// # Errors
+///
+/// Returns a stable Scribe refusal for row overflow, reserved columns,
+/// fingerprint mismatch, card-scope failure, invalid event time, or managed
+/// column construction failure.
+fn decode_rows(
+    rows: RecordBatch,
+    principal: &Principal,
+    expected_schema_fingerprint: SchemaFingerprint,
+    request_id: &RequestId,
+    batch_id: uuid::Uuid,
+    native_payload: bool,
+    window: EventTimeWindow,
+) -> Result<RecordBatch, ScribeError> {
     if rows.num_rows() >= i32::MAX as usize {
         return Err(ScribeError::TooManyRows {
             rows: rows.num_rows() as u64,

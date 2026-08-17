@@ -115,7 +115,7 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
             (&key_b, &audit_b)
         };
         writer
-            .append_and_fsync_for_test(key, batch_id, audit, &data)
+            .append_and_commit_for_replay_test(key, batch_id, audit, &data)
             .expect("tenant append");
     }
     drop(writer);
@@ -159,7 +159,7 @@ async fn replay_splits_three_same_key_generations_in_wal_order() {
     let data = large_batch_bytes(7);
     for index in 0_u8..3 {
         writer
-            .append_and_fsync_for_test(&key, [index; 16], &audit, &data)
+            .append_and_commit_for_replay_test(&key, [index; 16], &audit, &data)
             .expect("same-key replay append");
     }
     drop(writer);
@@ -202,7 +202,7 @@ async fn replay_failure_keeps_scribe_unready() {
     let key = seal_key(tenant, "scribe_replay_failure");
     let audit = encode_audit_event(&audit_event("replay-failure", tenant)).expect("audit");
     writer
-        .append_and_fsync_for_test(&key, *Uuid::now_v7().as_bytes(), &audit, &[1, 2, 3])
+        .append_and_commit_for_replay_test(&key, *Uuid::now_v7().as_bytes(), &audit, &[1, 2, 3])
         .expect("invalid replay fixture append");
     drop(writer);
 

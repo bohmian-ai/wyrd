@@ -5,10 +5,11 @@
 //! dedupes by `AppendSliceId`, and reconstructs both the memtable state and the
 //! staged `AuditEvent` list per key.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
@@ -21,7 +22,9 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 #[cfg(test)]
 use crate::scribe::wal::WalConfig;
-use crate::scribe::wal::{WalLsn, WalReader, WalSegmentRef, decode_slice_payload};
+use crate::scribe::wal::{
+    DecodedSlicePayload, WalLsn, WalReader, WalRecord, WalSegmentRef, decode_slice_payload,
+};
 
 /// Maximum accounted decode memory held by one streamed replay batch.
 pub const REPLAY_BATCH_MEMORY_BYTES: usize = 8 * 1024 * 1024;
@@ -84,7 +87,7 @@ pub struct ReplayedAppendMeta {
 }
 
 /// Replay the WAL directory and reconstruct per-seal-key state from complete
-/// self-describing v3 slice records.
+/// self-describing v4 slice sets.
 ///
 /// Reads the manifest (if present), scans all segments, skips sealed LSNs,
 /// truncates torn tails, dedupes by `AppendSliceId`, and groups records by
@@ -219,6 +222,10 @@ struct ReplayAccumulator<'a> {
     sealed_lsn_map: HashMap<String, WalLsn>,
     /// Dedupe index that survives batch boundaries.
     seen_slices: HashSet<AppendSliceId>,
+    /// Incomplete v4 batches retained until their terminal COMMIT is read.
+    pending_batches: HashMap<[u8; 16], PendingBatch>,
+    /// Batch identities whose completed slice sets were already emitted.
+    committed_batches: HashSet<[u8; 16]>,
     /// In-flight replay state keyed by seal-key path.
     states: HashMap<String, ReplayedSealKey>,
     /// Optional memory governor supplied by the production WAL lane.
@@ -252,6 +259,8 @@ impl<'a> ReplayAccumulator<'a> {
             shard_id,
             sealed_lsn_map,
             seen_slices: HashSet::new(),
+            pending_batches: HashMap::new(),
+            committed_batches: HashSet::new(),
             states: HashMap::new(),
             governor,
             memory,
@@ -259,7 +268,7 @@ impl<'a> ReplayAccumulator<'a> {
         })
     }
 
-    /// Decodes and appends one indivisible WAL record to the current handoff.
+    /// Decodes one WAL record and releases slices only after their COMMIT.
     ///
     /// # Errors
     ///
@@ -279,9 +288,14 @@ impl<'a> ReplayAccumulator<'a> {
         if let Some(memory) = self.memory.as_mut() {
             memory.resize_ingress(previous_memory.saturating_add(record_memory_bytes))?;
         }
-        if record.record_kind != 2 {
+        if record.is_commit() {
+            self.commit(record)?;
+            self.resize_memory(previous_memory)?;
+            return Ok(());
+        }
+        if !record.is_slice() {
             return Err(ScribeError::Internal {
-                detail: "WAL v3 contains a non-slice record".to_owned(),
+                detail: "WAL v4 contains an unknown record flag".to_owned(),
             });
         }
         let decoded = decode_slice_payload(&record.payload)?;
@@ -291,53 +305,133 @@ impl<'a> ReplayAccumulator<'a> {
             seal_key: seal_key.clone(),
         };
         let seal_key_path = seal_key.as_path_components();
-        if !self.seen_slices.insert(append_slice_id.clone()) {
+        if record.tenant_id != *seal_key.tenant.as_uuid().as_bytes() {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 slice tenant does not match its self-describing seal key"
+                    .to_owned(),
+            });
+        }
+        let pending = self
+            .pending_batches
+            .entry(record.batch_id)
+            .or_insert_with(|| PendingBatch::new(record.tenant_id, record.slice_count));
+        if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 batch has contradictory slice-set identity".to_owned(),
+            });
+        }
+        if pending.slices.contains_key(&record.slice_index) {
             self.resize_memory(previous_memory)?;
             return Ok(());
         }
-        if self
-            .sealed_lsn_map
-            .get(&seal_key_path)
-            .is_some_and(|sealed_lsn| record.lsn <= *sealed_lsn)
+        pending.slices.insert(
+            record.slice_index,
+            PendingSlice {
+                segment_path,
+                record: record.clone(),
+                decoded,
+                append_slice_id,
+                seal_key_path,
+            },
+        );
+        self.memory_bytes = self.memory_bytes.saturating_add(record_memory_bytes);
+        Ok(())
+    }
+
+    /// Validates one terminal COMMIT and moves its complete slice set into replay state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the commit has no complete matching slice
+    /// set, its tenant or digest disagrees with the set, or a slice payload
+    /// cannot be decoded into replay state.
+    fn commit(&mut self, record: &WalRecord) -> Result<(), ScribeError> {
+        if self.committed_batches.contains(&record.batch_id) {
+            return Ok(());
+        }
+        let pending = self
+            .pending_batches
+            .remove(&record.batch_id)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "WAL v4 COMMIT has no preceding complete slice set".to_owned(),
+            })?;
+        if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 COMMIT identity does not match its slice set".to_owned(),
+            });
+        }
+        if usize::try_from(pending.slice_count).ok() != Some(pending.slices.len())
+            || pending
+                .slices
+                .keys()
+                .enumerate()
+                .any(|(index, slice_index)| usize::try_from(*slice_index).ok() != Some(index))
         {
-            self.resize_memory(previous_memory)?;
-            return Ok(());
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 COMMIT closes an incomplete or unordered slice set".to_owned(),
+            });
         }
-        let audit_event = decode_audit_event(&decoded.audit)?;
-        let shard_id = self.shard_id;
+        if slice_set_digest(pending.slices.values()) != record.payload.as_slice() {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 COMMIT digest does not match its slice set".to_owned(),
+            });
+        }
+        for slice in pending.slices.into_values() {
+            if self.seen_slices.insert(slice.append_slice_id.clone())
+                && self
+                    .sealed_lsn_map
+                    .get(&slice.seal_key_path)
+                    .is_none_or(|sealed_lsn| slice.record.lsn > *sealed_lsn)
+            {
+                self.release_slice(slice)?;
+            }
+        }
+        self.committed_batches.insert(record.batch_id);
+        Ok(())
+    }
+
+    /// Adds one commit-authorized slice to the per-seal-key replay handoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the durable audit envelope cannot be decoded.
+    fn release_slice(&mut self, slice: PendingSlice) -> Result<(), ScribeError> {
+        let audit_event = decode_audit_event(&slice.decoded.audit)?;
+        let seal_key = slice.decoded.seal_key;
         let state = self
             .states
-            .entry(seal_key_path)
+            .entry(slice.seal_key_path)
             .or_insert_with(|| ReplayedSealKey {
                 stream: self.stream,
                 seal_key: seal_key.clone(),
-                shard_id,
+                shard_id: self.shard_id,
                 audit_events: Vec::new(),
                 data_records: Vec::new(),
                 append_metas: Vec::new(),
                 wal_segments: Vec::new(),
             });
-        let segment = WalSegmentRef { path: segment_path };
+        let segment = WalSegmentRef {
+            path: slice.segment_path,
+        };
         if !state.wal_segments.contains(&segment) {
             state.wal_segments.push(segment);
         }
+        let rows_accepted = count_rows(&slice.decoded.data);
         state.audit_events.push(audit_event);
-        let rows_accepted = count_rows(&decoded.data);
-        state.data_records.push(decoded.data);
+        state.data_records.push(slice.decoded.data);
         state.append_metas.push(ReplayedAppendMeta {
-            batch_id: record.batch_id,
-            wal_lsn: record.lsn,
+            batch_id: slice.record.batch_id,
+            wal_lsn: slice.record.lsn,
             rows_accepted,
-            append_slice_id,
-            schema_fingerprint: decoded.schema_fingerprint,
+            append_slice_id: slice.append_slice_id,
+            schema_fingerprint: slice.decoded.schema_fingerprint,
         });
-        self.memory_bytes = self.memory_bytes.saturating_add(record_memory_bytes);
         Ok(())
     }
 
     /// Move the current batch into a handoff and start a fresh reservation.
     fn take_chunk(&mut self) -> Result<Option<ReplayChunk>, ScribeError> {
-        if self.states.is_empty() {
+        if self.states.is_empty() || !self.pending_batches.is_empty() {
             return Ok(None);
         }
         let next_memory = self
@@ -361,6 +455,64 @@ impl<'a> ReplayAccumulator<'a> {
         }
         Ok(())
     }
+}
+
+/// A v4 slice set held until its terminal WAL COMMIT proves it complete.
+#[derive(Debug)]
+struct PendingBatch {
+    /// Tenant copied from every slice and checked against the COMMIT header.
+    tenant_id: [u8; 16],
+    /// Required number of contiguous slice ordinals.
+    slice_count: u32,
+    /// Decoded slices keyed by their stable ordinal.
+    slices: BTreeMap<u32, PendingSlice>,
+}
+
+impl PendingBatch {
+    /// Starts a pending slice set using the first validated slice header.
+    #[must_use]
+    const fn new(tenant_id: [u8; 16], slice_count: u32) -> Self {
+        Self {
+            tenant_id,
+            slice_count,
+            slices: BTreeMap::new(),
+        }
+    }
+}
+
+/// One decoded but not yet commit-authorized replay slice.
+#[derive(Debug)]
+struct PendingSlice {
+    /// WAL segment that must remain pinned while this slice is replayed.
+    segment_path: std::path::PathBuf,
+    /// Original validated WAL header and CRC-protected payload identity.
+    record: WalRecord,
+    /// Self-describing payload decoded before it is admitted to replay state.
+    decoded: DecodedSlicePayload,
+    /// Exact retry identity for duplicate suppression after COMMIT.
+    append_slice_id: AppendSliceId,
+    /// Seal-key path used for manifest watermarks.
+    seal_key_path: String,
+}
+
+/// Computes the v4 COMMIT digest over one ordered slice set.
+///
+/// The write path and replay both bind the ordinal, exact payload length, and
+/// SHA-256 payload digest, so a reordered or substituted slice cannot be
+/// authorized by a valid terminal record.
+#[must_use]
+fn slice_set_digest<'a>(slices: impl Iterator<Item = &'a PendingSlice>) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for slice in slices {
+        digest.update(slice.record.slice_index.to_le_bytes());
+        digest.update(
+            u32::try_from(slice.record.payload.len())
+                .expect("invariant: decoded WAL payload length is bounded by its u32 header")
+                .to_le_bytes(),
+        );
+        digest.update(Sha256::digest(&slice.record.payload));
+    }
+    digest.finalize().into()
 }
 
 fn count_rows(data: &[u8]) -> usize {
@@ -486,7 +638,7 @@ mod tests {
             let data_bytes = format!("data-{i}").into_bytes();
             let batch_id = [i; 16];
 
-            wal.append_and_fsync_for_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
+            wal.append_and_commit_for_replay_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
                 .expect("append");
         }
 
@@ -534,9 +686,9 @@ mod tests {
             .expect("first audit");
         let second_audit = crate::scribe::audit_envelope::encode_audit_event(&event("second"))
             .expect("second audit");
-        wal.append_and_fsync_for_test(&first_key, [1; 16], &first_audit, b"first")
+        wal.append_and_commit_for_replay_test(&first_key, [1; 16], &first_audit, b"first")
             .expect("first append");
-        wal.append_and_fsync_for_test(&second_key, [2; 16], &second_audit, b"second")
+        wal.append_and_commit_for_replay_test(&second_key, [2; 16], &second_audit, b"second")
             .expect("second append");
         let stream = crate::scribe::stream_identity::StreamIdentity::new(
             node_id,
@@ -597,7 +749,7 @@ mod tests {
             )
             .expect("writer");
             writer
-                .append_and_fsync_for_test(&seal_key, [batch; 16], &audit, &[batch])
+                .append_and_commit_for_replay_test(&seal_key, [batch; 16], &audit, &[batch])
                 .expect("append");
         }
 
@@ -651,7 +803,7 @@ mod tests {
             crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode audit");
 
         for value in 0_u8..12 {
-            wal.append_and_fsync_for_test(&seal_key, [value; 16], &audit_bytes, &[value])
+            wal.append_and_commit_for_replay_test(&seal_key, [value; 16], &audit_bytes, &[value])
                 .expect("append");
         }
 
@@ -704,7 +856,7 @@ mod tests {
             id[..2].copy_from_slice(&batch_id);
             let frame =
                 crate::scribe::wal::encode_append_frame(id, &audit_bytes, &payload).expect("frame");
-            wal.append_frame_for_test(&frame, &seal_key)
+            wal.append_frame_and_commit_for_replay_test(&frame, &seal_key)
                 .expect("append");
         }
         let mut duplicate_id = [0_u8; 16];
@@ -712,7 +864,7 @@ mod tests {
         let duplicate =
             crate::scribe::wal::encode_append_frame(duplicate_id, &audit_bytes, &payload)
                 .expect("duplicate frame");
-        wal.append_frame_for_test(&duplicate, &seal_key)
+        wal.append_frame_and_commit_for_replay_test(&duplicate, &seal_key)
             .expect("duplicate append");
         wal.sync_data_for_test(&seal_key).expect("sync");
 
@@ -785,7 +937,7 @@ mod tests {
             let data_bytes = format!("data-{i}").into_bytes();
             let batch_id = [i; 16];
 
-            wal.append_and_fsync_for_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
+            wal.append_and_commit_for_replay_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
                 .expect("append");
         }
 
@@ -837,7 +989,7 @@ mod tests {
 
         let audit_bytes1 =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event1).expect("encode");
-        wal.append_and_fsync_for_test(&seal_key, shared_batch_id, &audit_bytes1, b"data-1")
+        wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, &audit_bytes1, b"data-1")
             .expect("append 1");
 
         // Write second append with same batch_id=42 (duplicate)
@@ -859,7 +1011,7 @@ mod tests {
 
         let audit_bytes2 =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event2).expect("encode");
-        wal.append_and_fsync_for_test(&seal_key, shared_batch_id, &audit_bytes2, b"data-2")
+        wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, &audit_bytes2, b"data-2")
             .expect("append 2");
 
         // Replay should deduplicate by batch_id
@@ -914,7 +1066,7 @@ mod tests {
                 format!("data-{sequence}").as_bytes(),
             )
             .expect("frame");
-            wal.append_frame_for_test(&frame, &seal_key)
+            wal.append_frame_and_commit_for_replay_test(&frame, &seal_key)
                 .expect("append");
         }
         wal.sync_data_for_test(&seal_key).expect("sync");
@@ -972,7 +1124,7 @@ mod tests {
         let audit_bytes =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode");
         let batch_id = [1u8; 16];
-        wal.append_and_fsync_for_test(&seal_key, batch_id, &audit_bytes, b"data")
+        wal.append_and_commit_for_replay_test(&seal_key, batch_id, &audit_bytes, b"data")
             .expect("append");
 
         // Replay doesn't directly expose writer_epoch in ReplayedAppendMeta yet,
@@ -1018,7 +1170,7 @@ mod tests {
         let frame =
             crate::scribe::wal::encode_append_frame([4_u8; 16], &audit, b"data").expect("frame");
         writer
-            .append_frame_for_test(&frame, &seal_key)
+            .append_frame_and_commit_for_replay_test(&frame, &seal_key)
             .expect("append");
         writer.sync_data_for_test(&seal_key).expect("sync");
 

@@ -173,10 +173,104 @@ impl std::fmt::Display for SealKey {
     }
 }
 
-/// Split a batch into deterministic UTC event-day slices.
+/// Maximum distinct UTC event days accepted in one ingest request.
+const MAX_EVENT_DAYS: usize = 32;
+
+/// Current-only iterator over deterministic UTC event-day slices.
+pub(crate) struct EventDaySlices<'a> {
+    /// Retained source whose buffers remain alive for one-day aliasing.
+    batch: &'a RecordBatch,
+    /// Sorted fixed-capacity day descriptors.
+    days: [Option<NaiveDate>; MAX_EVENT_DAYS],
+    /// Exact row count for each live day descriptor.
+    counts: [usize; MAX_EVENT_DAYS],
+    /// Number of live descriptors.
+    day_count: usize,
+    /// Descriptor produced by the next iterator call.
+    current: usize,
+}
+
+impl Iterator for EventDaySlices<'_> {
+    type Item = Result<(EventDay, RecordBatch), ScribeError>;
+
+    /// Materializes only the next day and drops its exact index workspace on
+    /// the following call.
+    fn next(&mut self) -> Option<Self::Item> {
+        let day = self.days.get(self.current).copied().flatten()?;
+        let expected_rows = self.counts[self.current];
+        self.current += 1;
+        if self.day_count == 1 {
+            return Some(Ok((EventDay::new(day), self.batch.clone())));
+        }
+        let result = (|| {
+            let ts_col = self
+                .batch
+                .column_by_name("wyrd_event_time")
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "missing wyrd_event_time column".to_owned(),
+                })?;
+            let ts_array = ts_col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "wyrd_event_time must be TimestampMicrosecond".to_owned(),
+                })?;
+            let mut indices = Vec::with_capacity(expected_rows);
+            for index in 0..ts_array.len() {
+                let timestamp = chrono::DateTime::from_timestamp_micros(ts_array.value(index))
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "invalid event timestamp during planned split".to_owned(),
+                    })?;
+                if timestamp.date_naive() == day {
+                    indices.push(u32::try_from(index).map_err(|_| ScribeError::Internal {
+                        detail: "record batch row index exceeds u32::MAX".to_owned(),
+                    })?);
+                }
+            }
+            if indices.len() != expected_rows || indices.capacity() != expected_rows {
+                return Err(ScribeError::Internal {
+                    detail: "event-day materialization diverged from its count pass".to_owned(),
+                });
+            }
+            let indices = UInt32Array::from(indices);
+            let columns = self
+                .batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    take(column.as_ref(), &indices, None).map_err(|error| ScribeError::Internal {
+                        detail: format!("Arrow day split failed: {error}"),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let sliced = RecordBatch::try_new(self.batch.schema(), columns).map_err(|error| {
+                ScribeError::Internal {
+                    detail: format!("Arrow day slice construction failed: {error}"),
+                }
+            })?;
+            Ok((EventDay::new(day), sliced))
+        })();
+        Some(result)
+    }
+
+    /// Reports the exact unmaterialized day count.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.day_count.saturating_sub(self.current);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for EventDaySlices<'_> {}
+
+/// Plans deterministic UTC event-day slices without per-day row collections.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] for a missing, null, mistyped, or invalid event-time
+/// column, a row index beyond `u32`, or more than 32 distinct days.
 pub(crate) fn split_batch_by_event_day(
     batch: &RecordBatch,
-) -> Result<Vec<(EventDay, RecordBatch)>, ScribeError> {
+) -> Result<EventDaySlices<'_>, ScribeError> {
     let ts_col = batch
         .column_by_name("wyrd_event_time")
         .ok_or_else(|| ScribeError::Internal {
@@ -189,7 +283,9 @@ pub(crate) fn split_batch_by_event_day(
             detail: "wyrd_event_time must be TimestampMicrosecond".to_string(),
         })?;
 
-    let mut day_indices = std::collections::BTreeMap::<NaiveDate, Vec<u32>>::new();
+    let mut days: [Option<NaiveDate>; MAX_EVENT_DAYS] = [None; MAX_EVENT_DAYS];
+    let mut counts = [0_usize; MAX_EVENT_DAYS];
+    let mut day_count = 0_usize;
     for index in 0..ts_array.len() {
         if ts_array.is_null(index) {
             return Err(ScribeError::Internal {
@@ -202,49 +298,42 @@ pub(crate) fn split_batch_by_event_day(
                 detail: format!("invalid timestamp micros: {micros}"),
             }
         })?;
-        day_indices
-            .entry(timestamp.date_naive())
-            .or_default()
-            .push(u32::try_from(index).map_err(|_| ScribeError::Internal {
-                detail: "record batch row index exceeds u32::MAX".to_string(),
-            })?);
-    }
-
-    if day_indices.len() == 1 {
-        return Ok(vec![(
-            EventDay::new(
-                *day_indices
-                    .keys()
-                    .next()
+        let day = timestamp.date_naive();
+        let position = days[..day_count]
+            .binary_search_by(|candidate| {
+                candidate.map_or(std::cmp::Ordering::Less, |v| v.cmp(&day))
+            })
+            .unwrap_or_else(|position| position);
+        if days.get(position).copied().flatten() == Some(day) {
+            counts[position] =
+                counts[position]
+                    .checked_add(1)
                     .ok_or_else(|| ScribeError::Internal {
-                        detail: "event-day index unexpectedly empty".to_owned(),
-                    })?,
-            ),
-            batch.clone(),
-        )]);
+                        detail: "event-day row count overflow".to_owned(),
+                    })?;
+            continue;
+        }
+        if day_count == MAX_EVENT_DAYS {
+            return Err(ScribeError::InvalidFrame);
+        }
+        for move_index in (position..day_count).rev() {
+            days[move_index + 1] = days[move_index];
+            counts[move_index + 1] = counts[move_index];
+        }
+        days[position] = Some(day);
+        counts[position] = 1;
+        day_count += 1;
     }
-
-    day_indices
-        .into_iter()
-        .map(|(day, indices)| {
-            let indices = UInt32Array::from(indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .map(|column| {
-                    take(column.as_ref(), &indices, None).map_err(|error| ScribeError::Internal {
-                        detail: format!("Arrow day split failed: {error}"),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let sliced = RecordBatch::try_new(batch.schema(), columns).map_err(|error| {
-                ScribeError::Internal {
-                    detail: format!("Arrow day slice construction failed: {error}"),
-                }
-            })?;
-            Ok((EventDay::new(day), sliced))
-        })
-        .collect()
+    if day_count == 0 {
+        return Err(ScribeError::InvalidFrame);
+    }
+    Ok(EventDaySlices {
+        batch,
+        days,
+        counts,
+        day_count,
+        current: 0,
+    })
 }
 
 #[cfg(test)]
@@ -358,7 +447,10 @@ mod tests {
         )
         .expect("one-day batch");
 
-        let slices = split_batch_by_event_day(&source).expect("split");
+        let slices = split_batch_by_event_day(&source)
+            .expect("split plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("split");
         assert_eq!(slices.len(), 1);
         assert!(Arc::ptr_eq(source.column(0), slices[0].1.column(0)));
         assert!(Arc::ptr_eq(source.column(1), slices[0].1.column(1)));
@@ -388,7 +480,10 @@ mod tests {
         )
         .expect("cross-day batch");
 
-        let slices = split_batch_by_event_day(&source).expect("split");
+        let slices = split_batch_by_event_day(&source)
+            .expect("split plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("split");
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0].1.num_rows(), 2);
         assert_eq!(slices[1].1.num_rows(), 2);

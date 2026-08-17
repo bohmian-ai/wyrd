@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
+
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, watch};
@@ -347,7 +349,6 @@ pub(crate) enum ShardCommand {
 /// indexes, pending generations, retained generations, and lifecycle signals.
 /// Keeping these values together makes FIFO, replay, memory release, and
 /// shutdown transitions occur only at the shard boundary.
-#[derive(Debug)]
 struct ShardOwner {
     /// Stable pod-local shard number used for routing and diagnostics.
     id: usize,
@@ -389,6 +390,8 @@ struct ShardOwner {
     wal_io: ScribeWalIoPool,
     /// Optional immutable-generation persistence runtime.
     persistence: Option<Arc<PersistenceRuntime>>,
+    /// Vala SQL pool retained only by the production batch-control fence.
+    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
     /// Completion sender routed back to this owner's command mailbox.
     completion_tx: mpsc::Sender<ShardCommand>,
     /// Typed WAL stream identity for generations and replay.
@@ -470,6 +473,8 @@ pub(crate) struct ScribeShardStartConfig {
     pub(crate) wal_io: ScribeWalIoPool,
     /// Optional immutable-generation persistence runtime.
     pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
+    /// Tenant-scoped SQL owner used to fence durable public batch ACKs.
+    pub(crate) control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
     /// Typed pod stream identity.
     pub(crate) stream: StreamIdentity,
     /// Shared active/immutable memory ledger.
@@ -572,6 +577,7 @@ impl ScribeShardRuntime {
             persistence_cpu,
             wal_io,
             persistence,
+            control_postgres,
             stream,
             memory_ownership,
         } = config;
@@ -614,6 +620,7 @@ impl ScribeShardRuntime {
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
+                control_postgres: control_postgres.clone(),
                 completion_tx: senders[id].sender.clone(),
                 stream,
                 wal_handle,
@@ -2014,6 +2021,14 @@ struct DurableSlice {
     batch_id: [u8; 16],
     /// WAL sequence number assigned to the durable append.
     lsn: crate::scribe::wal::WalLsn,
+    /// SHA-256 digest of this exact WAL slice payload.
+    payload_digest: [u8; 32],
+    /// Exact WAL slice payload length.
+    payload_len: u32,
+    /// Zero-based ordinal in the closed batch slice set.
+    slice_index: u32,
+    /// Total slices in the closed batch slice set.
+    slice_count: u32,
 }
 
 /// A WAL-synced slice whose Arrow rows have not yet reached the active
@@ -2050,6 +2065,14 @@ impl ShardOwner {
         if let Err(error) = self.sync_group(&state.touched).await {
             if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
                 tracing::error!(error = %cleanup_error, "active cleanup failed after group sync error");
+            }
+            self.mark_wal_error(&error);
+            Self::notify_prepared_error(&mut state.prepared, &error);
+            return Err(error);
+        }
+        if let Err(error) = self.append_and_sync_batch_commits(&mut state).await {
+            if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
+                tracing::error!(error = %cleanup_error, "active cleanup failed after batch commit error");
             }
             self.mark_wal_error(&error);
             Self::notify_prepared_error(&mut state.prepared, &error);
@@ -2096,6 +2119,130 @@ impl ShardOwner {
                 let _ = sender.send(Ok(rows));
             }
             drop(append.reservation);
+        }
+        Ok(())
+    }
+
+    /// Appends and fsyncs one v4 COMMIT record for every complete batch in a group.
+    ///
+    /// Each batch's SLICE records were fsynced before this method starts. The
+    /// terminal COMMIT therefore closes only a complete ordered slice set; no
+    /// ACK path can run before the commit's own segment is fsynced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a batch is incomplete, its digest cannot be
+    /// prepared, or the WAL lane cannot append or fsync its terminal record.
+    async fn append_and_sync_batch_commits(
+        &mut self,
+        state: &mut GroupWalState,
+    ) -> Result<(), ScribeError> {
+        for append in &state.prepared {
+            let mut slices = state
+                .durable
+                .iter()
+                .filter(|slice| slice.batch_id == *append.batch_id.as_bytes())
+                .collect::<Vec<_>>();
+            if slices.is_empty() {
+                continue;
+            }
+            slices.sort_by_key(|slice| slice.slice_index);
+            let slice_count = slices[0].slice_count;
+            if slice_count == 0
+                || usize::try_from(slice_count).ok() != Some(slices.len())
+                || slices.iter().enumerate().any(|(index, slice)| {
+                    slice.slice_count != slice_count
+                        || usize::try_from(slice.slice_index).ok() != Some(index)
+                })
+            {
+                return Err(ScribeError::Internal {
+                    detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
+                });
+            }
+            let mut digest = Sha256::new();
+            for slice in &slices {
+                digest.update(slice.slice_index.to_le_bytes());
+                digest.update(slice.payload_len.to_le_bytes());
+                digest.update(slice.payload_digest);
+            }
+            let digest: [u8; 32] = digest.finalize().into();
+            let result = match self
+                .wal_io
+                .submit(ScribeWalIoOp::WritePrepared {
+                    wal: self.wal_handle.clone(),
+                    append: crate::scribe::wal::PreparedWalAppend::commit(
+                        *append.batch_id.as_bytes(),
+                        *append.tenant.as_uuid().as_bytes(),
+                        slice_count,
+                        digest,
+                    ),
+                })
+                .await?
+            {
+                ScribeWalIoResult::WalWritten { result } => result,
+                _ => {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL IO lane returned the wrong batch commit result".to_owned(),
+                    });
+                }
+            };
+            let segment = result
+                .touched_segments
+                .first()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "WAL v4 batch commit did not retain its segment identity".to_owned(),
+                })?;
+            let header = segment.header().clone();
+            let commit_lsn = result.lsn;
+            for segment in result.touched_segments {
+                state
+                    .touched
+                    .insert(segment.path().to_path_buf(), Arc::clone(&segment));
+            }
+            self.sync_group(&state.touched).await?;
+            if let Some(postgres) = &self.control_postgres {
+                let request_id = uuid::Uuid::parse_str(slices[0].audit_event.request_id.as_str())
+                    .map_err(|error| ScribeError::Internal {
+                    detail: format!("Scribe audit request id is not a UUID: {error}"),
+                })?;
+                let mut conn = postgres.tenant_conn(append.tenant).await?;
+                vala_sql::queries::scribe_batch_commits::record(
+                    &mut conn,
+                    &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                        tenant: append.tenant,
+                        logical_table_fqn: append.table.fqn(),
+                        batch_id: append.batch_id,
+                        slice_set_digest: digest,
+                        slice_count: i32::try_from(slice_count).map_err(|_| {
+                            ScribeError::Internal {
+                                detail: "WAL v4 slice count exceeds SQL integer range".to_owned(),
+                            }
+                        })?,
+                        wal_node_id: uuid::Uuid::from_bytes(header.node_id),
+                        wal_writer_epoch: header.writer_epoch,
+                        wal_shard_id: i16::from(header.shard_id),
+                        wal_segment_sequence: i64::try_from(header.seg_seq).map_err(|_| {
+                            ScribeError::Internal {
+                                detail: "WAL segment sequence exceeds SQL bigint range".to_owned(),
+                            }
+                        })?,
+                        wal_lsn_min: i64::try_from(slices[0].lsn.as_u64()).map_err(|_| {
+                            ScribeError::Internal {
+                                detail: "WAL slice LSN exceeds SQL bigint range".to_owned(),
+                            }
+                        })?,
+                        wal_lsn_max: i64::try_from(commit_lsn.as_u64()).map_err(|_| {
+                            ScribeError::Internal {
+                                detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
+                            }
+                        })?,
+                        request_id,
+                    },
+                    &slices[0].audit_event,
+                )
+                .await?;
+                conn.commit().await?;
+            }
         }
         Ok(())
     }
@@ -2193,6 +2340,8 @@ impl ShardOwner {
             memtable_bytes,
             ..
         } = slice;
+        let slice_index = wal_append.slice_index;
+        let slice_count = wal_append.slice_count;
         self.admission
             .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
         let active_memory = if let Some(memory) = append.memory.as_mut() {
@@ -2256,6 +2405,10 @@ impl ShardOwner {
                 memtable_bytes,
                 batch_id: *append.batch_id.as_bytes(),
                 lsn: result.lsn,
+                payload_digest: result.payload_digest,
+                payload_len: result.payload_len,
+                slice_index,
+                slice_count,
             },
             result,
         ))
@@ -2329,12 +2482,18 @@ impl ShardOwner {
                 memtable_bytes,
                 batch_id: *append.batch_id.as_bytes(),
                 lsn,
+                payload_digest: [0; 32],
+                payload_len: 0,
+                slice_index: 0,
+                slice_count: 1,
             },
             crate::scribe::wal::WalAppendResult {
                 lsn,
                 #[cfg(feature = "bench-support")]
                 encoded_bytes: 0,
                 touched_segments: Vec::new(),
+                payload_digest: [0; 32],
+                payload_len: 0,
             },
         ))
     }
@@ -2886,6 +3045,7 @@ mod tests {
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             wal_io: ScribeWalIoPool::new(1),
             persistence: None,
+            control_postgres: None,
             completion_tx,
             stream,
             wal_handle,
@@ -2946,6 +3106,10 @@ mod tests {
                     memtable_bytes: rotation_bytes,
                     batch_id: next_id,
                     lsn: WalLsn::new(2),
+                    payload_digest: [0; 32],
+                    payload_len: 0,
+                    slice_index: 0,
+                    slice_count: 1,
                 }],
                 &mut HashMap::new(),
             )
@@ -3084,7 +3248,7 @@ mod tests {
     /// Builds one real prepared append with reservations owned by `owner`'s budget.
     ///
     /// The initial charge deliberately exceeds the small owner batch so normal
-    /// preprocessing exercises the production resize and category-transfer path
+    /// preprocessing exercises the production shrink and category-transfer path
     /// before `process_group` owns the append.
     fn prepared_append_for_group_test(
         owner: &ShardOwner,
@@ -3102,7 +3266,7 @@ mod tests {
         crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
             batch_id: uuid::Uuid::now_v7(),
             audit_event: owner_event(),
-            rows: owner_prepared_batch(),
+            rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
             measured_wire_bytes: initial_bytes,
             admitted_bytes: initial_bytes,
             reservation,

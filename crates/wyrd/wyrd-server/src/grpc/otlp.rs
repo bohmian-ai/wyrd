@@ -8,6 +8,10 @@ use std::task::{Context, Poll};
 
 use tower::Service;
 use vala_bifrost_redux::contracts::DecodedOtlp;
+use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
+use wyrd_tonic::otlp::metrics_service::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 use wyrd_tonic::prost::Message;
 use wyrd_tonic::prost::bytes::Buf;
@@ -19,12 +23,22 @@ use wyrd_tonic::tonic::server::{Grpc, NamedService, UnaryService};
 use wyrd_tonic::tonic::{Request, Response, Status};
 
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
+use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
+use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
 use crate::state::ServerGate;
 
 /// Canonical OTLP trace export route retained from the generated service.
 const TRACE_EXPORT_PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 /// Canonical OTLP trace service name used by tonic routing.
 const TRACE_SERVICE_NAME: &str = "opentelemetry.proto.collector.trace.v1.TraceService";
+/// Canonical OTLP metrics export route retained from the generated service.
+const METRICS_EXPORT_PATH: &str = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
+/// Canonical OTLP metrics service name used by tonic routing.
+const METRICS_SERVICE_NAME: &str = "opentelemetry.proto.collector.metrics.v1.MetricsService";
+/// Canonical OTLP logs export route retained from the generated service.
+const LOGS_EXPORT_PATH: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
+/// Canonical OTLP logs service name used by tonic routing.
+const LOGS_SERVICE_NAME: &str = "opentelemetry.proto.collector.logs.v1.LogsService";
 
 /// Server-owned trace service that installs the bounded decoder before prost.
 #[derive(Clone)]
@@ -203,6 +217,294 @@ impl Decoder for TraceRequestDecoder {
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
         let request = decode_trace_protobuf(bytes).map_err(Status::from)?;
+        source.advance(plan.wire_bytes);
+        Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
+    }
+}
+
+/// Server-owned metrics service that installs bounded decoding before Prost allocation.
+#[derive(Clone)]
+pub(super) struct MetricsOtlpGrpcService {
+    /// Gate retains authentication and routing authority after adapter decode.
+    gate: Arc<ServerGate>,
+}
+
+impl MetricsOtlpGrpcService {
+    /// Couples the metrics adapter to the process Gate selected during boot.
+    pub(super) fn new(gate: Arc<ServerGate>) -> Self {
+        Self { gate }
+    }
+}
+
+impl NamedService for MetricsOtlpGrpcService {
+    const NAME: &'static str = METRICS_SERVICE_NAME;
+}
+
+impl<B> Service<HttpRequest<B>> for MetricsOtlpGrpcService
+where
+    B: Body + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    type Response = HttpResponse<TonicBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    /// Reports immediate readiness because the retained Gate owns all state.
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// Routes only the canonical metrics export path through the bounded codec.
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        if request.uri().path() != METRICS_EXPORT_PATH {
+            return Box::pin(async move {
+                Ok(Status::unimplemented("unknown OTLP metrics RPC").into_http())
+            });
+        }
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            let maximum_message_size = gate.otlp_decoding_message_size();
+            let response = Grpc::new(MetricsOtlpCodec {
+                gate: Arc::clone(&gate),
+            })
+            .max_decoding_message_size(maximum_message_size)
+            .unary(MetricsExportUnary { gate }, request)
+            .await;
+            Ok(response)
+        })
+    }
+}
+
+/// Unary metrics handler preserving authentication and partial-success behavior.
+struct MetricsExportUnary {
+    /// Gate selected during server boot.
+    gate: Arc<ServerGate>,
+}
+
+impl UnaryService<DecodedOtlp<ExportMetricsServiceRequest>> for MetricsExportUnary {
+    type Response = ExportMetricsServiceResponse;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>>;
+
+    /// Authenticates metadata and transfers the owned typed request to Scribe.
+    fn call(&mut self, request: Request<DecodedOtlp<ExportMetricsServiceRequest>>) -> Self::Future {
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            let auth = gate
+                .authenticate_otlp_metadata(request.metadata())
+                .await
+                .map_err(Status::from)?;
+            let outcome = gate
+                .ingest_decoded_resource_metrics(&auth, request.into_inner())
+                .await
+                .map_err(Status::from)?;
+            Ok(Response::new(ExportMetricsServiceResponse {
+                partial_success: outcome.partial_success(),
+            }))
+        })
+    }
+}
+
+/// Metrics codec coupling the bounded request decoder to the standard response encoder.
+struct MetricsOtlpCodec {
+    /// Gate used to acquire the Scribe transport-decode child.
+    gate: Arc<ServerGate>,
+}
+
+impl Codec for MetricsOtlpCodec {
+    type Encode = ExportMetricsServiceResponse;
+    type Decode = DecodedOtlp<ExportMetricsServiceRequest>;
+    type Encoder = OtlpResponseEncoder<ExportMetricsServiceResponse>;
+    type Decoder = MetricsRequestDecoder;
+
+    /// Creates the standard bounded response encoder.
+    fn encoder(&mut self) -> Self::Encoder {
+        OtlpResponseEncoder::default()
+    }
+
+    /// Creates a metrics decoder from the shared boot-time limits owner.
+    fn decoder(&mut self) -> Self::Decoder {
+        MetricsRequestDecoder {
+            gate: Arc::clone(&self.gate),
+        }
+    }
+}
+
+/// Metrics protobuf decoder that preflights before acquiring typed capacity.
+struct MetricsRequestDecoder {
+    /// Gate used solely for limits and transport-decode ownership.
+    gate: Arc<ServerGate>,
+}
+
+impl Decoder for MetricsRequestDecoder {
+    type Item = DecodedOtlp<ExportMetricsServiceRequest>;
+    type Error = Status;
+
+    /// Constructs one fixed-capacity typed metrics request from a contiguous frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable invalid/capacity status for fragmented, malformed, or
+    /// over-limit frames before any generated scalable field can grow.
+    fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Status> {
+        let wire_bytes = source.remaining();
+        let bytes = source.chunk();
+        if bytes.len() != wire_bytes {
+            return Err(Status::invalid_argument(
+                "OTLP unary frame is not contiguous",
+            ));
+        }
+        let plan = preflight_metrics_protobuf(bytes, self.gate.otlp_wire_limits())
+            .map_err(Status::from)?;
+        let owner = self
+            .gate
+            .reserve_otlp_decode(plan.decode_bytes)
+            .map_err(Status::from)?;
+        let request = decode_metrics_protobuf(bytes, plan).map_err(Status::from)?;
+        source.advance(plan.wire_bytes);
+        Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
+    }
+}
+
+/// Server-owned logs service that installs bounded decoding before Prost allocation.
+#[derive(Clone)]
+pub(super) struct LogsOtlpGrpcService {
+    /// Gate retains authentication and routing authority after adapter decode.
+    gate: Arc<ServerGate>,
+}
+
+impl LogsOtlpGrpcService {
+    /// Couples the logs adapter to the process Gate selected during boot.
+    pub(super) fn new(gate: Arc<ServerGate>) -> Self {
+        Self { gate }
+    }
+}
+
+impl NamedService for LogsOtlpGrpcService {
+    const NAME: &'static str = LOGS_SERVICE_NAME;
+}
+
+impl<B> Service<HttpRequest<B>> for LogsOtlpGrpcService
+where
+    B: Body + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    type Response = HttpResponse<TonicBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    /// Reports immediate readiness because the retained Gate owns all state.
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// Routes only the canonical logs export path through the bounded codec.
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        if request.uri().path() != LOGS_EXPORT_PATH {
+            return Box::pin(async move {
+                Ok(Status::unimplemented("unknown OTLP logs RPC").into_http())
+            });
+        }
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            let maximum_message_size = gate.otlp_decoding_message_size();
+            let response = Grpc::new(LogsOtlpCodec {
+                gate: Arc::clone(&gate),
+            })
+            .max_decoding_message_size(maximum_message_size)
+            .unary(LogsExportUnary { gate }, request)
+            .await;
+            Ok(response)
+        })
+    }
+}
+
+/// Unary logs handler preserving authentication and partial-success behavior.
+struct LogsExportUnary {
+    /// Gate selected during server boot.
+    gate: Arc<ServerGate>,
+}
+
+impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {
+    type Response = ExportLogsServiceResponse;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Response<Self::Response>, Status>> + Send + 'static>>;
+
+    /// Authenticates metadata and transfers the owned typed request to Scribe.
+    fn call(&mut self, request: Request<DecodedOtlp<ExportLogsServiceRequest>>) -> Self::Future {
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            let auth = gate
+                .authenticate_otlp_metadata(request.metadata())
+                .await
+                .map_err(Status::from)?;
+            let outcome = gate
+                .ingest_decoded_resource_logs(&auth, request.into_inner())
+                .await
+                .map_err(Status::from)?;
+            Ok(Response::new(ExportLogsServiceResponse {
+                partial_success: outcome.partial_success(),
+            }))
+        })
+    }
+}
+
+/// Logs codec coupling the bounded request decoder to the standard response encoder.
+struct LogsOtlpCodec {
+    /// Gate used to acquire the Scribe transport-decode child.
+    gate: Arc<ServerGate>,
+}
+
+impl Codec for LogsOtlpCodec {
+    type Encode = ExportLogsServiceResponse;
+    type Decode = DecodedOtlp<ExportLogsServiceRequest>;
+    type Encoder = OtlpResponseEncoder<ExportLogsServiceResponse>;
+    type Decoder = LogsRequestDecoder;
+
+    /// Creates the standard bounded response encoder.
+    fn encoder(&mut self) -> Self::Encoder {
+        OtlpResponseEncoder::default()
+    }
+
+    /// Creates a logs decoder from the shared boot-time limits owner.
+    fn decoder(&mut self) -> Self::Decoder {
+        LogsRequestDecoder {
+            gate: Arc::clone(&self.gate),
+        }
+    }
+}
+
+/// Logs protobuf decoder that preflights before acquiring typed capacity.
+struct LogsRequestDecoder {
+    /// Gate used solely for limits and transport-decode ownership.
+    gate: Arc<ServerGate>,
+}
+
+impl Decoder for LogsRequestDecoder {
+    type Item = DecodedOtlp<ExportLogsServiceRequest>;
+    type Error = Status;
+
+    /// Constructs one fixed-capacity typed logs request from a contiguous frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable invalid/capacity status for fragmented, malformed, or
+    /// over-limit frames before any generated scalable field can grow.
+    fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Status> {
+        let wire_bytes = source.remaining();
+        let bytes = source.chunk();
+        if bytes.len() != wire_bytes {
+            return Err(Status::invalid_argument(
+                "OTLP unary frame is not contiguous",
+            ));
+        }
+        let plan =
+            preflight_logs_protobuf(bytes, self.gate.otlp_wire_limits()).map_err(Status::from)?;
+        let owner = self
+            .gate
+            .reserve_otlp_decode(plan.decode_bytes)
+            .map_err(Status::from)?;
+        let request = decode_logs_protobuf(bytes).map_err(Status::from)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
     }

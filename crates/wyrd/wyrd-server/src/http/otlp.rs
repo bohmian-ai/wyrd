@@ -56,6 +56,8 @@ use wyrd_tonic::prost::Message;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
+use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
+use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
 use crate::state::AppState;
 
 /// The OTLP signal type handled by a specific export endpoint.
@@ -217,23 +219,26 @@ async fn export_traces(
                 details: serde_json::Value::Null,
             })
         })?;
-    let (decode_bytes, request) = match encoding {
+    let (owner, request) = match encoding {
         OtlpEncoding::Protobuf => {
             let plan = preflight_trace_protobuf(&body, gate.otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            let owner = gate
+                .reserve_otlp_decode(plan.decode_bytes)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let request = decode_trace_protobuf(&body)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-            (plan.decode_bytes, request)
+            (owner, request)
         }
-        OtlpEncoding::Json => (
-            body.len(),
-            decode_request(encoding, &body)
-                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?,
-        ),
+        OtlpEncoding::Json => {
+            let owner = gate
+                .reserve_otlp_decode(body.len())
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            let request = decode_request(encoding, &body)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+            (owner, request)
+        }
     };
-    let owner = gate
-        .reserve_otlp_decode(decode_bytes)
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
     let outcome = gate
         .ingest_decoded_resource_spans(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
@@ -279,11 +284,26 @@ async fn export_metrics(
                 details: serde_json::Value::Null,
             })
         })?;
-    let owner = gate
-        .reserve_otlp_decode(body.len())
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
-    let request: ExportMetricsServiceRequest = decode_request(encoding, &body)
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+    let (owner, request) = match encoding {
+        OtlpEncoding::Protobuf => {
+            let plan = preflight_metrics_protobuf(&body, gate.otlp_wire_limits())
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            let owner = gate
+                .reserve_otlp_decode(plan.decode_bytes)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            let request = decode_metrics_protobuf(&body, plan)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            (owner, request)
+        }
+        OtlpEncoding::Json => {
+            let owner = gate
+                .reserve_otlp_decode(body.len())
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            let request: ExportMetricsServiceRequest = decode_request(encoding, &body)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+            (owner, request)
+        }
+    };
     let outcome = gate
         .ingest_decoded_resource_metrics(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
@@ -329,11 +349,26 @@ async fn export_logs(
                 details: serde_json::Value::Null,
             })
         })?;
-    let owner = gate
-        .reserve_otlp_decode(body.len())
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
-    let request: ExportLogsServiceRequest = decode_request(encoding, &body)
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+    let (owner, request) = match encoding {
+        OtlpEncoding::Protobuf => {
+            let plan = preflight_logs_protobuf(&body, gate.otlp_wire_limits())
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            let owner = gate
+                .reserve_otlp_decode(plan.decode_bytes)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            let request = decode_logs_protobuf(&body)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            (owner, request)
+        }
+        OtlpEncoding::Json => {
+            let owner = gate
+                .reserve_otlp_decode(body.len())
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            let request: ExportLogsServiceRequest = decode_request(encoding, &body)
+                .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+            (owner, request)
+        }
+    };
     let outcome = gate
         .ingest_decoded_resource_logs(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await

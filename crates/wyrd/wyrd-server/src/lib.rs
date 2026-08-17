@@ -12,6 +12,8 @@ pub mod http;
 pub mod openapi;
 pub mod oracle;
 mod otlp_decode;
+mod otlp_logs_decode;
+mod otlp_metrics_decode;
 pub mod postgres;
 pub mod query;
 pub mod state;

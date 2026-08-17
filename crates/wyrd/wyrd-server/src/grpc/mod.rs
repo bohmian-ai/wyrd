@@ -142,13 +142,8 @@ where
         .as_ref()
         .ok_or(GrpcError::MissingScribe)?;
     let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(ingest));
-    let metrics =
-        wyrd_tonic::otlp::metrics_service::metrics_service_server::MetricsServiceServer::new(
-            (**ingest).clone(),
-        );
-    let logs = wyrd_tonic::otlp::logs_service::logs_service_server::LogsServiceServer::new(
-        (**ingest).clone(),
-    );
+    let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(ingest));
+    let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(ingest));
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
     let transport = state

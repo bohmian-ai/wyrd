@@ -40,8 +40,11 @@ Next artifact: <none, existing task path, revised plan/task, or missing authorit
 | <wrong owner, duplicate path, unnecessary complexity, failed negative path, weak assertion, or missed consumer> | <authority and source> | Disproved / Finding <ID> |
 
 Record only meaningful probes for the changed surface. When material new
-structure was introduced, include the smallest repository-native alternative
-and why the implementation earns its additional cost or link the finding.
+structure was introduced, compare the smallest repository-native alternative
+only where observable behavior, ownership, safety, proof, or material
+reliability/performance/maintenance consequences differ. Do not prescribe
+private helper, type, adapter, fixture, or local-module design when multiple
+in-owner implementations satisfy the contract.
 
 ## Findings
 

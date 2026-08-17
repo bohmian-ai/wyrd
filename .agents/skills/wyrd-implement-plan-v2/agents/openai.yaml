@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Implement Plan v2"
+  short_description: "Run Wyrd plans with isolated task workers"
+  default_prompt: "Use $wyrd-implement-plan-v2 to execute this approved Wyrd plan with isolated task worktrees, independent reviews, and serial integration."

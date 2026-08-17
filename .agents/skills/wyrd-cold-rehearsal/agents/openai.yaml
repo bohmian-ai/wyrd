@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Cold Rehearsal"
+  short_description: "Adversarial implementation-readiness rehearsal"
+  default_prompt: "Use $wyrd-cold-rehearsal to prove this Wyrd task is executable without material decisions."

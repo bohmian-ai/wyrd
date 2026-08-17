@@ -39,9 +39,11 @@ After requirement conformance, challenge the implementation structure:
 - challenge unnecessary traits, indirection, services, registries, caches,
   state machines, dependencies, configuration, async propagation, and parallel
   paths;
-- construct the smallest repository-native implementation that preserves the
-  approved behavior and compare material complexity, reliability, performance,
-  ownership, and maintenance consequences;
+- compare against the smallest repository-native shape only to test observable
+  behavior, ownership, safety invariants, proof, or material reliability,
+  performance, and maintenance consequences; do not prescribe private helper,
+  type, adapter, fixture, or local-module design when multiple in-owner
+  implementations satisfy the contract;
 - try negative, failure, recovery, cleanup, cancellation, concurrency,
   tenancy, audit, projection, and downstream-consumer hypotheses relevant to
   the changed surface;
@@ -58,7 +60,11 @@ implementation.
 ## Plan-execution binding mode
 
 When `$wyrd-implement-plan` dispatches this skill for one task or the final
-integrated plan, this mode overrides conflicting standalone instructions:
+integrated plan, this mode overrides conflicting standalone instructions.
+When `$wyrd-implement-plan-v2` dispatches this skill, the reviewer is also the
+review coordinator: it performs the primary conformance and proof review
+itself, then spawns exactly one fresh Terra-medium code-quality specialist for
+every candidate commit and focused re-review:
 
 - Review the orchestrator-provided task delta from the last accepted commit,
   or the complete execution-baseline-through-branch delta for final review.
@@ -66,13 +72,35 @@ integrated plan, this mode overrides conflicting standalone instructions:
   verification evidence, and applicable repository authorities completely.
 - Perform static source, contract, caller, consumer, manifest, generated
   surface, and test analysis. Audit recorded verification semantically.
+- In the `$wyrd-implement-plan-v2` extension only, construct one immutable
+  `baseline-code-quality` assignment for a `code-reviewer` child using the
+  exact candidate commit, changed impact slice, task requirements and
+  acceptance criteria, hard gates, authorities, assigned symbols, reviewer
+  identity, prompt digest, and target SHA. Dispatch it with Terra-medium.
+- Require that child to read and apply `${HOME}/.agent-skills/review-core/`
+  `specialist-contract.md`, `adversarial-contract.md`,
+  `review-code-quality/review-code-quality.md`,
+  `references/clean-code-maintainability.md`, and
+  `references/solid-principles.md`; it also reads `references/rust-quality.md`
+  when Rust changes. It returns the exact specialist-report sections and
+  namespaced `code-quality/CNNN` candidates through the agent-result channel
+  only; plan-execution binding omits the contract's durable report path.
+- In the `$wyrd-implement-plan-v2` extension only, independently validate each
+  code-quality candidate using `validation/validate-findings.md` and
+  `validation/maintainer-gate.md`: re-read its source, owner, callers,
+  consumers, tests, and local precedents; reject preference-only claims;
+  preserve assignment and reviewer identity; and consolidate only candidates
+  with the same root cause before assigning a verdict.
 - Do not run project tests, builds, lints, formatters, generators, migrations,
   services, repository gates, or any other independent verification. The sole
   permitted execution is the narrow static plan-artifact semantic validator
-  required by **Establish the review contract** below.
+  required by **Establish the review contract** below. Only the
+  `$wyrd-implement-plan-v2` extension permits spawning the required static
+  code-quality specialist; neither reviewer may run project verification.
 - Load the progressive references required by the affected surface.
 - Return a requirement/acceptance traceability matrix, findings, evidence
-  audit, inspected surfaces, and material static-analysis limits.
+  audit, inspected surfaces, code-quality coverage and evidence, and
+  material static-analysis limits.
 - Use only these verdicts:
   - `APPROVE`: implementation and proof satisfy the reviewed task or plan.
   - `RESUME_IMPLEMENTATION`: reversible implementation or evidence work
@@ -83,8 +111,9 @@ integrated plan, this mode overrides conflicting standalone instructions:
   - `REVIEW_BLOCKED`: the review target or mandatory evidence cannot be
     resolved well enough for static review.
 - Do not write `review.md`, modify source or plan artifacts, assign task
-  status, invoke another skill, create a remediation plan, or communicate with
-  the user.
+  status, invoke another workflow, create a remediation plan, or communicate
+  with the user. In the `$wyrd-implement-plan-v2` extension, the code-quality
+  specialist is the sole permitted child agent.
 
 For every finding, provide the violated requirement and invariant, affected
 owners and consumers, observable required outcome, and the source condition
@@ -95,7 +124,9 @@ must compile the selected fix before implementation resumes.
 
 For first review, operate as a fresh independent agent. For focused re-review,
 verify prior findings first and inspect affected seams without reopening
-accepted decisions absent new evidence. The `$wyrd-implement-plan`
+accepted decisions absent new evidence. In the
+`$wyrd-implement-plan-v2` extension, spawn a fresh code-quality specialist for
+the revised candidate after that inspection. The `$wyrd-implement-plan`
 orchestrator is the only controller, writer, committer, and router.
 
 ## Terminal integration-binding mode
@@ -188,6 +219,18 @@ Always read:
 - `references/conformance-and-adaptation.md`
 - `architecture/references/languages/implementation-execution.md`
 
+In the `$wyrd-implement-plan-v2` extension, read
+`${HOME}/.agent-skills/review-core/orchestration-contract.md`,
+`packet.md`, `specialist-contract.md`, `adversarial-contract.md`,
+`review-code-quality/review-code-quality.md`,
+`references/clean-code-maintainability.md`, and
+`references/solid-principles.md`; when Rust changes also read
+`references/rust-quality.md`. Read
+`validation/validate-findings.md`, and `validation/maintainer-gate.md` before
+dispatching the code-quality specialist. The child reads those required core
+references plus only the repository authorities and progressive surface
+references needed for its assigned delta.
+
 Read `references/verification-evidence.md` when commands, test results,
 environment setup, coverage, or completion evidence are in scope. Read
 `references/review-format.md` before writing the review.
@@ -219,6 +262,11 @@ by the affected surface:
 
 State which conditional references were loaded and the decision each governs.
 Do not duplicate their repository rules in this skill.
+
+Review readiness claims only for the explicitly named language/runtime
+surfaces and journeys. Evidence for Rust or another single runtime cannot imply
+Python, TypeScript, Node.js, PyO3, N-API, or any omitted surface; omitted
+surfaces remain unproved rather than blocking an intentionally scoped review.
 
 ## Review conformance and adaptations
 

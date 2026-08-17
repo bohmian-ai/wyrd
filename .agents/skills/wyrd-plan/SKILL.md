@@ -69,6 +69,34 @@ Trace the primary workflow and nearest precedent. Establish:
 Separate verified facts, assumptions, unknowns, and unresolved choices.
 Discover repository facts before asking the user.
 
+### Use bounded evidence scouts when breadth exceeds symbol tracing
+
+CodeGraph remains the first choice for locating named symbols, reading exact
+implementations, and tracing callers or dispatch. It is not a substitute for
+broad repository inventory or comparative summarization.
+
+When a concrete evidence gap spans an unfamiliar or multi-owner surface, the
+planner may dispatch one through three read-only Luna agents at medium
+reasoning effort. Dispatch only when the result has a clear deliverable, such
+as:
+
+- inventorying current owners, entry points, manifests, tests, and fixtures;
+- finding the nearest two or three implementation precedents;
+- mapping public projections and generated artifacts across Rust, Python,
+  TypeScript, HTTP, CLI, MCP, or UI; or
+- summarizing configuration, feature, migration, or verification conventions.
+
+Give each scout one bounded question and an explicit repository scope. Require
+an evidence-only report: verified facts with file or symbol references,
+relevant tests or commands, contradictions, and unknowns. Scouts do not edit,
+propose architecture, assign tasks, or resolve material decisions.
+
+The parent planner synthesizes scout outputs, verifies every fact that affects
+a contract, ownership boundary, security, tenancy, persistence, or acceptance
+criterion, and remains solely responsible for the impact graph and plan. Do
+not dispatch scouts for a single named-symbol question, a localized change
+with an obvious precedent, or judgment-heavy design work.
+
 ## Build the change-impact graph
 
 Every implementation plan includes a repository-specific Mermaid graph under
@@ -110,6 +138,10 @@ concurrency, cancellation, or error mapping affect correctness.
 
 Before marking a task `Ready`:
 
+Per-task command preflight is necessary, but material readiness is granted only
+by the current cohesive-milestone rehearsal; local preflight alone never makes
+a task dispatchable.
+
 1. Inspect every proposed `mise`, Cargo, package, or script command.
 2. Require named tests or journeys, explicit affected packages, and default
    features or exact non-default features earned by the behavior under test.
@@ -138,22 +170,45 @@ the task. See `references/verification-planning.md`.
 
 ## Rehearse implementation cold
 
-After drafting a task, run a read-only cold rehearsal using only the task
-packet, repository, and normal repository authorities. Use a fresh agent when
-the environment supports it. When fresh-agent delegation is unavailable,
-perform and document the same cold pass yourself rather than blocking task
-readiness. The rehearsal must:
+After drafting or materially revising a cohesive milestone's material
+contracts or dependency order, invoke `$wyrd-cold-rehearsal` in a fresh
+subagent using only the milestone task packets, parent plan, repository,
+accepted source/predecessor identities, and normal authorities. An evidence
+scout is not a rehearsal agent. Do not provide planning conclusions, suspected
+omissions, prior rehearsal findings, or the intended solution.
 
-- locate every target owner and symbol;
-- trace callers, consumers, dispatch, and test seams;
-- inspect every verification command and its setup;
-- walk the first implementation and test steps;
-- identify missing dependencies, unreachable fixtures, or material decisions.
+The rehearsal must simulate material construction and lifecycle, not review
+prose or prescribe private implementation. For production allocations that can
+scale materially with input, workload, concurrency, retries, or elapsed work,
+it proves the pre-allocation facts or configured ceiling, authoritative owner,
+simultaneous-live-set bound, transfer and terminal release semantics,
+observable enforcement, and verification. Plans need not choose private guard
+types, helpers, containers, iterators, or allocation APIs when multiple
+repository-native implementations enforce the same invariant. A guessed
+production bound, unbounded workload-scaled path, hidden material copy, or
+missing authority is `FAIL`; bounded metadata and test-harness mechanics are
+implementation work.
 
-Do not give a fresh rehearsal agent the intended answer or planning
-conclusions. Revise and repeat until the rehearsal can begin implementation
-without making a material decision. Document-only architecture review does not
-replace this gate.
+Revise the affected milestone and rerun the skill from fresh context until it
+returns `PASS` for the current material packet/plan digests and accepted
+predecessors. Tasks in that milestone cannot become `Ready` with missing,
+stale, self-authored, conditional, or failed milestone rehearsal evidence.
+Private helper, adapter, fixture, local-layout, or equivalent non-weaker
+command corrections do not trigger a rerun. Document-only architecture review
+and the structural validator do not replace this gate.
+
+Readiness, qualification, sealing, and promotion claims are limited to the
+explicitly named language/runtime surfaces and journeys. Evidence for one
+runtime never implies readiness for an omitted projection; omitted surfaces
+remain unproved rather than blocking a deliberately scoped milestone.
+
+After a `FAIL`, do not patch only the first cited line and immediately rerun.
+First perform a bounded remediation audit of the entire root-cause cluster:
+the affected owner and constructor, sibling allocations and phase guards,
+direct callers and cross-crate handoffs, exhaustive error projections,
+cancellation/retry/partial/shutdown/restart paths, dependent packet contracts,
+and the commands intended to prove them. Resolve every concrete issue in that
+cluster, validate the revised artifacts, and only then start a fresh rehearsal.
 
 ## Compile decisions into tasks
 
@@ -205,7 +260,8 @@ Load both format references and confirm:
 - the impact graph covers the affected dependency cone;
 - all material choices have one answer;
 - every command and setup requirement was execution-checked;
-- every task passed a documented cold rehearsal, fresh-agent when available;
+- every cohesive milestone passed a fresh `$wyrd-cold-rehearsal` bound to its
+  current material packet digests, source revision, and predecessor contracts;
 - task dependencies leave coherent repository states;
 - required independent review passed for risk-gated changes.
 
@@ -223,4 +279,5 @@ In non-mutating contexts, return one `<proposed_plan>` block with complete
 artifact markers. When authorized, save the plan under
 `$PLAN_PATH` and each task under `$(dirname "$PLAN_PATH")/tasks/`.
 Use `Approved` only after readiness and required review; use `Ready` only for
-tasks in an approved plan that passed executable preflight and cold rehearsal.
+tasks in an approved plan whose cohesive milestone passed executable preflight
+and cold rehearsal.

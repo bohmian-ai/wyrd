@@ -95,31 +95,31 @@ Assign Luna to mechanical, low-risk work with one established repository
 pattern. Assign Terra to ordinary implementation and review work. Assign Sol
 to security, public or persisted contracts, migrations, concurrency,
 cross-owner or cross-language changes, and other materially high-risk work.
+This routing applies to implementation tasks. During planning investigation,
+the parent planner may instead use bounded, read-only Luna scouts at medium
+reasoning effort for broad, evidence-only repository scans and structured
+summaries; they do not make planning decisions or replace cold rehearsal.
 Reasoning effort never exceeds `high`.
 
 ## Cold implementation rehearsal
 
-Before marking a task `Ready`, run a read-only cold rehearsal. Use a fresh
-agent when the environment supports it and give that agent only the task
-packet, repository, and normal repository authorities. Do not provide the
-intended solution, suspected omissions, or prior planning conclusions.
+Before marking tasks in a cohesive milestone `Ready`, dispatch a fresh
+subagent with `$wyrd-cold-rehearsal`. Give it only the milestone packets,
+parent plan, repository, accepted source/predecessor identities, and normal
+authorities. Never provide the intended solution, suspected omission, earlier
+findings, planning conclusions, or evidence-scout output.
 
-When fresh-agent delegation is unavailable, perform the same cold pass
-yourself from the task packet and document why an independent agent was
-unavailable. Unavailable delegation does not by itself block `Ready`.
+The rehearsal skill chooses one through three fresh Luna-high specialists based
+on risk and requires compile-shaped interface, allocation/lifecycle, and
+verification proof. Its parent issues the sole `PASS`, `FAIL`, or `STALE`
+verdict. Revise and repeat every material failure; a material contract,
+dependency, acceptance, or predecessor change invalidates the prior result.
+Private helpers, adapters, fixtures, local layout, and equivalent non-weaker
+command corrections do not. Missing fresh-agent capability blocks `Ready`
+rather than permitting the planner to certify its own milestone.
 
-Require the rehearsal to:
-
-- locate every owner, target symbol, caller, and consumer;
-- trace trait and runtime dispatch where applicable;
-- confirm named fixtures, support exports, features, and explicit test targets;
-- inspect proposed commands and repository-managed setup;
-- walk the first implementation and test steps;
-- report any decision it would have to make while coding.
-
-Revise and repeat when the rehearsal finds a nonexistent seam, invalid command,
-missing impacted surface, or material choice. A document-only architecture
-review does not satisfy this gate.
+A document-only architecture review, embedded self-authored record, structural
+validator, or command-name audit does not satisfy this gate.
 
 ## Example decomposition
 
@@ -160,8 +160,8 @@ Before finalizing:
 - every task has one cohesive outcome;
 - task order follows contract and migration dependencies;
 - every task fits its assigned Luna, Terra, or Sol context and reasoning level;
-- every task passed a documented cold read-only implementation rehearsal,
-  fresh-agent when available;
+- every cohesive milestone passed a current, fresh-agent
+  `$wyrd-cold-rehearsal`;
 - no task must reconstruct the full plan;
 - sequential overlap is explicit;
 - parallel tasks have non-overlapping write sets;

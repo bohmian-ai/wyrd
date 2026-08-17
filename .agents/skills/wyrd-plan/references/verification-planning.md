@@ -25,6 +25,10 @@ Cargo only for a narrower pure test that needs no repository setup.
 
 Before a task becomes `Ready`, execution-check every proposed command:
 
+Per-task command preflight is necessary, but material readiness is granted only
+by the current cohesive-milestone rehearsal; local preflight alone never makes
+a task dispatchable.
+
 1. inspect the actual task or script body;
 2. confirm package, feature, explicit target, filter, fixture, and support
    export names against current source and manifests;

@@ -68,6 +68,11 @@ impl JsonDecodeError {
 
 impl fmt::Display for JsonDecodeError {
     /// Formats the malformed-input location without echoing request contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`fmt::Error`] when the destination formatter rejects the
+    /// formatted error text.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{} at byte {}", self.message, self.offset)
     }
@@ -163,6 +168,12 @@ pub(crate) fn preflight_logs_json(
 }
 
 /// Executes the common allocation-free schema walk for one signal root.
+///
+/// # Errors
+///
+/// Returns [`IngestError::Decode`] when the request exceeds its byte limit,
+/// contains malformed or trailing JSON, violates the signal schema or a
+/// cardinality/depth limit, or overflows a checked capacity fact.
 fn preflight_signal_json(
     input: &[u8],
     limits: OtlpWireLimits,
@@ -310,6 +321,11 @@ impl JsonFacts {
     }
 
     /// Adds a checked amount and enforces its configured ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the addition overflows or the resulting
+    /// counter exceeds `limit`.
     fn add_bounded(
         value: &mut usize,
         amount: usize,
@@ -329,6 +345,11 @@ impl JsonFacts {
     }
 
     /// Charges exact retained public-layout/backing bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the material-byte total overflows or
+    /// exceeds the configured material ceiling.
     fn add_decode(&mut self, amount: usize) -> Result<(), JsonDecodeError> {
         Self::add_bounded(
             &mut self.decode_bytes,
@@ -339,6 +360,11 @@ impl JsonFacts {
     }
 
     /// Charges retained variable-width bytes and their backing allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when value or material bytes overflow or
+    /// exceed their configured ceilings.
     fn add_value(&mut self, amount: usize) -> Result<(), JsonDecodeError> {
         Self::add_bounded(
             &mut self.value_bytes,
@@ -355,6 +381,11 @@ impl JsonFacts {
     }
 
     /// Charges a resource, scope, record, or attribute cardinality.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the applicable resource, scope, record,
+    /// or attribute count overflows or exceeds its configured ceiling.
     fn count_kind(&mut self, kind: MessageKind) -> Result<(), JsonDecodeError> {
         match kind {
             MessageKind::ResourceSpans
@@ -474,6 +505,11 @@ pub(crate) enum Field {
 }
 
 /// Resolves one validated field token without allocating, including escaped names.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when a field name is not valid UTF-8 or contains
+/// a malformed, overflowing, or out-of-capacity JSON escape.
 fn field_from_token(token: JsonStringToken<'_>) -> Result<Field, JsonDecodeError> {
     if !token.escaped {
         let text = std::str::from_utf8(token.raw)
@@ -577,6 +613,12 @@ fn field_from_str(value: &str) -> Field {
 }
 
 /// Decodes an escaped string into caller-owned fixed storage.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed or truncated escapes, invalid
+/// Unicode, checked offset/length overflow, or output storage too small for
+/// the decoded key.
 fn decode_escaped_into(
     raw: &[u8],
     offset: usize,
@@ -809,6 +851,12 @@ fn field_spec(kind: MessageKind, field: Field) -> FieldSpec {
 }
 
 /// Walks one generated-message object and charges its retained backing facts.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, malformed field
+/// names, duplicate fields or oneof variants, invalid nested values, depth or
+/// cardinality excess, or checked capacity overflow.
 fn scan_message(
     cursor: &mut JsonCursor<'_>,
     kind: MessageKind,
@@ -874,6 +922,12 @@ fn is_oneof_field(kind: MessageKind, field: Field) -> bool {
 }
 
 /// Scans one field according to its generated-message value shape.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the value does not match its schema shape,
+/// contains malformed syntax or encoded bytes, exceeds nesting or configured
+/// limits, or overflows a checked capacity fact.
 fn scan_field(
     cursor: &mut JsonCursor<'_>,
     spec: FieldSpec,
@@ -905,6 +959,11 @@ fn scan_field(
 }
 
 /// Scans one scalar accepted by generated protobuf fields.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the next token is not a valid JSON
+/// boolean, string, or number scalar.
 fn scan_scalar(cursor: &mut JsonCursor<'_>) -> Result<(), JsonDecodeError> {
     match cursor.peek() {
         Some(b't') => cursor.literal(b"true"),
@@ -916,6 +975,11 @@ fn scan_scalar(cursor: &mut JsonCursor<'_>) -> Result<(), JsonDecodeError> {
 }
 
 /// Scans a quoted or unquoted integer and records quoted-string scratch.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the integer token is not a valid JSON
+/// string or number.
 fn scan_integer(cursor: &mut JsonCursor<'_>, facts: &mut JsonFacts) -> Result<(), JsonDecodeError> {
     if cursor.peek() == Some(b'"') {
         let token = cursor.string_token()?;
@@ -926,6 +990,12 @@ fn scan_integer(cursor: &mut JsonCursor<'_>, facts: &mut JsonFacts) -> Result<()
 }
 
 /// Validates one hex ID and charges its exact byte-vector capacity.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed string syntax, odd-length or
+/// non-ASCII/non-hex identifiers, invalid escapes, or value/material capacity
+/// overflow or limit excess.
 fn scan_hex(cursor: &mut JsonCursor<'_>, facts: &mut JsonFacts) -> Result<(), JsonDecodeError> {
     let token = cursor.string_token()?;
     if token.decoded_len % 2 != 0 {
@@ -943,6 +1013,12 @@ fn scan_hex(cursor: &mut JsonCursor<'_>, facts: &mut JsonFacts) -> Result<(), Js
 }
 
 /// Validates ordinary padded/unpadded base64 and charges generated capacities.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed string syntax, invalid base64
+/// alphabet, padding, or trailing bits, invalid escapes, or value/material
+/// capacity overflow or limit excess.
 fn scan_base64(cursor: &mut JsonCursor<'_>, facts: &mut JsonFacts) -> Result<(), JsonDecodeError> {
     let token = cursor.string_token()?;
     let capacity = base64_token_decoded_len(token)
@@ -954,6 +1030,12 @@ fn scan_base64(cursor: &mut JsonCursor<'_>, facts: &mut JsonFacts) -> Result<(),
 }
 
 /// Scans one repeated generated-message field with exact element layout.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed array framing or separators,
+/// invalid nested messages, cardinality excess, or checked layout/capacity
+/// overflow.
 fn scan_message_array(
     cursor: &mut JsonCursor<'_>,
     kind: MessageKind,
@@ -981,6 +1063,12 @@ fn scan_message_array(
 }
 
 /// Scans repeated strings and charges both element layouts and exact backing.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed array or string syntax, invalid
+/// Unicode/escapes, separators, or checked value/material capacity overflow or
+/// limit excess.
 fn scan_string_array(
     cursor: &mut JsonCursor<'_>,
     facts: &mut JsonFacts,
@@ -1005,6 +1093,12 @@ fn scan_string_array(
 }
 
 /// Scans a repeated primitive field and charges exact vector backing.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed array framing or separators,
+/// invalid integer/scalar elements, or checked material capacity overflow or
+/// limit excess.
 fn scan_primitive_array(
     cursor: &mut JsonCursor<'_>,
     layout: usize,
@@ -1034,6 +1128,12 @@ fn scan_primitive_array(
 }
 
 /// Scans an `AnyValue` with last-known-field-wins semantics and depth eight.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for nesting above the configured limit,
+/// malformed object framing or syntax, a missing known value, invalid selected
+/// value range/type, or propagated scalar/message/capacity failure.
 fn scan_any_value(
     cursor: &mut JsonCursor<'_>,
     value_depth: usize,
@@ -1094,6 +1194,11 @@ fn scan_any_value(
 }
 
 /// Decodes a repeated message field with one exact allocation.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed array framing or separators,
+/// array-length overflow, or an element decoder failure.
 pub(crate) fn decode_message_array<T>(
     cursor: &mut JsonCursor<'_>,
     mut decode: impl FnMut(&mut JsonCursor<'_>) -> Result<T, JsonDecodeError>,
@@ -1113,6 +1218,11 @@ pub(crate) fn decode_message_array<T>(
 }
 
 /// Marks one ordinary generated field and rejects duplicates like serde derive.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the field discriminator cannot fit the
+/// fixed seen-field bitmap or the field was already observed.
 pub(crate) fn mark_seen(seen: &mut u128, field: Field) -> Result<(), JsonDecodeError> {
     if field == Field::Unknown {
         return Ok(());
@@ -1128,6 +1238,11 @@ pub(crate) fn mark_seen(seen: &mut u128, field: Field) -> Result<(), JsonDecodeE
 }
 
 /// Advances between object fields, returning false after the closing brace.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object separators, field names,
+/// escapes, Unicode, or the required key/value colon.
 pub(crate) fn next_object_field(
     cursor: &mut JsonCursor<'_>,
     first: &mut bool,
@@ -1144,6 +1259,12 @@ pub(crate) fn next_object_field(
 }
 
 /// Decodes a shared OTLP Resource directly into exact-capacity generated storage.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid attributes/entity references, out-of-range counts, or
+/// malformed skipped values.
 pub(crate) fn decode_resource(cursor: &mut JsonCursor<'_>) -> Result<Resource, JsonDecodeError> {
     let mut output = Resource::default();
     let mut first = true;
@@ -1174,6 +1295,12 @@ pub(crate) fn decode_resource(cursor: &mut JsonCursor<'_>) -> Result<Resource, J
 }
 
 /// Decodes a shared instrumentation scope directly.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid strings/attributes, out-of-range counts, or malformed
+/// skipped values.
 pub(crate) fn decode_scope(
     cursor: &mut JsonCursor<'_>,
 ) -> Result<InstrumentationScope, JsonDecodeError> {
@@ -1204,6 +1331,11 @@ pub(crate) fn decode_scope(
 }
 
 /// Decodes one shared entity reference directly.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid strings or string arrays, or malformed skipped values.
 fn decode_entity_ref(cursor: &mut JsonCursor<'_>) -> Result<EntityRef, JsonDecodeError> {
     let mut output = EntityRef::default();
     let mut first = true;
@@ -1230,11 +1362,23 @@ fn decode_entity_ref(cursor: &mut JsonCursor<'_>) -> Result<EntityRef, JsonDecod
 }
 
 /// Decodes one shared key/value pair directly.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid key text, malformed nested values, excessive value depth,
+/// or malformed skipped values.
 pub(crate) fn decode_key_value(cursor: &mut JsonCursor<'_>) -> Result<KeyValue, JsonDecodeError> {
     decode_key_value_at(cursor, 0)
 }
 
 /// Decodes one shared key/value pair at its enclosing recursive value depth.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object framing, duplicate known
+/// fields, invalid key text, malformed nested values, excessive value depth,
+/// or malformed skipped values.
 fn decode_key_value_at(
     cursor: &mut JsonCursor<'_>,
     depth: usize,
@@ -1261,6 +1405,12 @@ fn decode_key_value_at(
 }
 
 /// Decodes one recursive `AnyValue` with depth-eight and last-known-field-wins semantics.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for depth above eight, malformed object or
+/// selected-value framing, a missing known value, invalid scalar/base64
+/// content, malformed nested arrays/key-value lists, or trailing selected data.
 pub(crate) fn decode_any_value(
     cursor: &mut JsonCursor<'_>,
     depth: usize,
@@ -1314,6 +1464,12 @@ pub(crate) fn decode_any_value(
 }
 
 /// Decodes an `ArrayValue` wrapper directly.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed object/array framing, duplicate
+/// `values`, malformed nested values, excessive value depth, or malformed
+/// skipped values.
 fn decode_array_value(
     cursor: &mut JsonCursor<'_>,
     depth: usize,
@@ -1340,6 +1496,12 @@ fn decode_array_value(
 }
 
 /// Decodes a `KeyValueList` wrapper directly.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for depth above eight, malformed object/array
+/// framing, duplicate `values`, malformed nested key/value entries, or
+/// malformed skipped values.
 fn decode_key_value_list(
     cursor: &mut JsonCursor<'_>,
     depth: usize,
@@ -1369,6 +1531,11 @@ fn decode_key_value_list(
 }
 
 /// Decodes an optional generated message, accepting JSON null as absent.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the null literal is malformed or `decode`
+/// rejects a present value.
 pub(crate) fn decode_optional<T>(
     cursor: &mut JsonCursor<'_>,
     decode: impl FnOnce(&mut JsonCursor<'_>) -> Result<T, JsonDecodeError>,
@@ -1382,26 +1549,51 @@ pub(crate) fn decode_optional<T>(
 }
 
 /// Decodes a repeated string field with exact element and backing capacities.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed array framing or separators,
+/// invalid Unicode/escapes, or array-length overflow.
 fn decode_string_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<String>, JsonDecodeError> {
     decode_message_array(cursor, |cursor| cursor.owned_string())
 }
 
 /// Decodes repeated quoted-or-unquoted uint64 values with exact capacity.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed array framing or separators,
+/// invalid or out-of-range unsigned integers, or array-length overflow.
 pub(crate) fn decode_u64_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<u64>, JsonDecodeError> {
     decode_message_array(cursor, |cursor| cursor.u64())
 }
 
 /// Decodes repeated double values with exact capacity.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for malformed array framing or separators,
+/// invalid floating-point values, or array-length overflow.
 pub(crate) fn decode_f64_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<f64>, JsonDecodeError> {
     decode_message_array(cursor, |cursor| cursor.f64())
 }
 
 /// Decodes a protobuf uint32 with checked range conversion.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the quoted or unquoted integer is malformed
+/// or outside the protobuf uint32 range.
 pub(crate) fn decode_u32(cursor: &mut JsonCursor<'_>) -> Result<u32, JsonDecodeError> {
     u32::try_from(cursor.u64()?).map_err(|_| JsonDecodeError::at(0, "OTLP uint32 out of range"))
 }
 
 /// Decodes a protobuf int32 with checked range conversion.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when the quoted or unquoted integer is malformed
+/// or outside the protobuf int32 range.
 pub(crate) fn decode_i32(cursor: &mut JsonCursor<'_>) -> Result<i32, JsonDecodeError> {
     i32::try_from(cursor.i64()?).map_err(|_| JsonDecodeError::at(0, "OTLP int32 out of range"))
 }
@@ -1745,6 +1937,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Consumes one expected punctuation byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the next non-whitespace byte is not
+    /// `expected`.
     pub(crate) fn expect(&mut self, expected: u8) -> Result<(), JsonDecodeError> {
         self.skip_ws();
         if self.input.get(self.offset) == Some(&expected) {
@@ -1756,6 +1953,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Consumes an exact ASCII literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the literal range overflows or the
+    /// input does not contain the requested literal at the current position.
     pub(crate) fn literal(&mut self, literal: &[u8]) -> Result<(), JsonDecodeError> {
         self.skip_ws();
         let end = self
@@ -1771,6 +1973,12 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Validates and borrows one string token without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for missing quotes, unterminated strings,
+    /// unescaped control bytes, invalid UTF-8/Unicode/escapes, or checked string
+    /// offset/length overflow.
     fn string_token(&mut self) -> Result<JsonStringToken<'de>, JsonDecodeError> {
         self.expect(b'"')?;
         let start = self.offset;
@@ -1812,6 +2020,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Borrows an unescaped string or constructs one exact-capacity decoded string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string framing, invalid
+    /// UTF-8, Unicode, or escapes, or checked decoded-length overflow.
     #[cfg(test)]
     fn string(&mut self) -> Result<Cow<'de, str>, JsonDecodeError> {
         let token = self.string_token()?;
@@ -1825,6 +2038,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes one generated string into exactly sized owned storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string framing, invalid
+    /// UTF-8, Unicode, or escapes, or checked decoded-length overflow.
     pub(crate) fn owned_string(&mut self) -> Result<String, JsonDecodeError> {
         let token = self.string_token()?;
         if token.escaped {
@@ -1840,6 +2058,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes the next lower-camel OTLP object key and its colon without allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed key framing, invalid
+    /// UTF-8/Unicode/escapes, an oversized escaped key, or a missing colon.
     pub(crate) fn field(&mut self) -> Result<Field, JsonDecodeError> {
         let field = field_from_token(self.string_token()?)?;
         self.expect(b':')?;
@@ -1847,6 +2070,10 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Verifies that the cursor consumed the complete document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when non-whitespace trailing input remains.
     pub(crate) fn finish(mut self) -> Result<(), JsonDecodeError> {
         self.skip_ws();
         if self.offset == self.input.len() {
@@ -1857,6 +2084,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes a quoted or unquoted signed 64-bit integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax or a
+    /// value outside the signed 64-bit range.
     pub(crate) fn i64(&mut self) -> Result<i64, JsonDecodeError> {
         if self.peek() == Some(b'"') {
             return self
@@ -1870,6 +2102,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes a quoted or unquoted unsigned 64-bit integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax, a
+    /// negative value, or a value outside the unsigned 64-bit range.
     pub(crate) fn u64(&mut self) -> Result<u64, JsonDecodeError> {
         if self.peek() == Some(b'"') {
             return self
@@ -1883,6 +2120,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes one JSON number as `f64`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed number syntax, invalid
+    /// special-double text, or an escaped quoted special double.
     pub(crate) fn f64(&mut self) -> Result<f64, JsonDecodeError> {
         if self.peek() == Some(b'"') {
             let token = self.string_token()?;
@@ -1900,6 +2142,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes one JSON boolean.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the next token is neither `true` nor
+    /// `false`.
     pub(crate) fn bool(&mut self) -> Result<bool, JsonDecodeError> {
         if self.peek() == Some(b't') {
             self.literal(b"true")?;
@@ -1911,6 +2158,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes one hex identifier into an exactly sized vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string syntax, invalid
+    /// UTF-8/Unicode/escapes, odd decoded length, or a non-hex digit.
     pub(crate) fn hex_bytes(&mut self) -> Result<Vec<u8>, JsonDecodeError> {
         let token = self.string_token()?;
         if token.decoded_len % 2 != 0 {
@@ -1933,6 +2185,12 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Decodes ordinary base64 into an exactly sized vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string syntax, invalid
+    /// UTF-8/Unicode/escapes, noncanonical alphabet/padding/trailing bits, or a
+    /// preflight/decode length mismatch.
     pub(crate) fn base64_bytes(&mut self) -> Result<Vec<u8>, JsonDecodeError> {
         let token = self.string_token()?;
         let decoded_len = base64_token_decoded_len(token)
@@ -1948,6 +2206,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Borrows the next complete JSON number lexeme.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed sign, integer, fraction, or
+    /// exponent syntax, an invalid token range, or non-UTF-8 number bytes.
     pub(crate) fn number(&mut self) -> Result<&'de str, JsonDecodeError> {
         self.skip_ws();
         let start = self.offset;
@@ -1995,6 +2258,12 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Skips one complete value with an actual fixed 128-entry syntax stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed value/container syntax,
+    /// invalid strings, literals, or numbers, unexpected end of input, or
+    /// container nesting above 128.
     pub(crate) fn skip_value(&mut self, _depth: usize) -> Result<(), JsonDecodeError> {
         let mut stack = [SyntaxFrame::EMPTY; MAX_JSON_SYNTAX_DEPTH];
         let mut stack_len = 0usize;
@@ -2089,6 +2358,11 @@ impl<'de> JsonCursor<'de> {
     }
 
     /// Counts elements in the next array without modifying this cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed array framing, separators, or
+    /// nested values, nesting above 128, or checked element-count overflow.
     pub(crate) fn array_len(&self) -> Result<usize, JsonDecodeError> {
         let mut lookahead = self.clone();
         lookahead.expect(b'[')?;
@@ -2142,6 +2416,11 @@ impl SyntaxFrame {
 }
 
 /// Decodes one escaped JSON string with an exact output allocation.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for invalid UTF-8, malformed/truncated escapes
+/// or Unicode surrogates, or checked decoded-length overflow.
 fn decode_escaped_string(raw: &[u8], offset: usize) -> Result<String, JsonDecodeError> {
     let decoded_len = escaped_string_len(raw, offset)?;
     let mut output = String::with_capacity(decoded_len);
@@ -2189,6 +2468,11 @@ fn decode_escaped_string(raw: &[u8], offset: usize) -> Result<String, JsonDecode
 }
 
 /// Counts decoded UTF-8 bytes for one escaped string without allocating.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for invalid UTF-8, malformed/truncated escapes
+/// or Unicode surrogates, or checked decoded-length overflow.
 fn escaped_string_len(raw: &[u8], offset: usize) -> Result<usize, JsonDecodeError> {
     let mut length = 0usize;
     let mut index = 0usize;
@@ -2232,6 +2516,12 @@ fn escaped_string_len(raw: &[u8], offset: usize) -> Result<usize, JsonDecodeErro
 }
 
 /// Decodes one `\uXXXX` escape, including a required low surrogate when needed.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] for truncated or non-hex escape digits,
+/// missing/invalid surrogate pairs, unpaired low surrogates, or an invalid
+/// Unicode scalar.
 fn decode_unicode_escape(input: &[u8], offset: usize) -> Result<(char, usize), JsonDecodeError> {
     let high = decode_hex_quad(input, offset)?;
     if (0xd800..=0xdbff).contains(&high) {
@@ -2259,6 +2549,11 @@ fn decode_unicode_escape(input: &[u8], offset: usize) -> Result<(char, usize), J
 }
 
 /// Decodes four hexadecimal digits without allocating.
+///
+/// # Errors
+///
+/// Returns [`JsonDecodeError`] when fewer than four digits remain or a digit
+/// is not hexadecimal.
 fn decode_hex_quad(input: &[u8], offset: usize) -> Result<u16, JsonDecodeError> {
     let digits = input
         .get(..4)
@@ -2312,6 +2607,11 @@ impl<'de> SeqAccess<'de> for JsonSeqAccess<'_, 'de> {
     type Error = JsonDecodeError;
 
     /// Decodes the next array element and consumes its separator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the closing bracket or separator is
+    /// malformed or the element seed rejects the next value.
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
     where
         T: DeserializeSeed<'de>,
@@ -2350,6 +2650,11 @@ impl<'de> MapAccess<'de> for JsonMapAccess<'_, 'de> {
     type Error = JsonDecodeError;
 
     /// Decodes the next object key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed object framing, separators,
+    /// key strings, Unicode/escapes, or a key seed rejection.
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
     where
         K: DeserializeSeed<'de>,
@@ -2375,6 +2680,11 @@ impl<'de> MapAccess<'de> for JsonMapAccess<'_, 'de> {
     }
 
     /// Decodes the value corresponding to the preceding key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the value seed rejects the next JSON
+    /// value.
     fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
     where
         V: DeserializeSeed<'de>,
@@ -2388,6 +2698,12 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     type Error = JsonDecodeError;
 
     /// Dispatches based on the next JSON token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for an invalid token, malformed number,
+    /// object, array, string, boolean, or null, numeric range failure, or a
+    /// visitor rejection.
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2413,6 +2729,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a boolean literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the boolean literal is malformed or
+    /// the visitor rejects it.
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2427,6 +2748,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a signed integer, accepting a quoted protobuf integer too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax, a value
+    /// outside the signed 64-bit range, or visitor rejection.
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2440,6 +2766,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes an unsigned integer, accepting a quoted protobuf integer too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax, a
+    /// negative or out-of-range value, or visitor rejection.
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2453,6 +2784,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a floating-point value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax, invalid
+    /// floating-point text, or visitor rejection.
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2466,6 +2802,12 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a character from a one-scalar JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string syntax, invalid
+    /// UTF-8/Unicode/escapes, zero or multiple Unicode scalars, or visitor
+    /// rejection.
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2482,6 +2824,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a string, also exposing number lexemes as strings for protobuf int64 helpers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string or number syntax,
+    /// invalid UTF-8/Unicode/escapes, or visitor rejection.
     fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2497,6 +2844,12 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes an owned string through the same exact lexical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax, invalid
+    /// UTF-8/Unicode/escapes, checked decoded-length overflow, or visitor
+    /// rejection.
     fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2505,6 +2858,12 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes byte visitors from an ordinary JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string syntax, invalid
+    /// UTF-8/Unicode/escapes, checked decoded-length overflow, or visitor
+    /// rejection.
     fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2516,6 +2875,12 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes an owned byte buffer from an ordinary JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string syntax, invalid
+    /// UTF-8/Unicode/escapes, checked decoded-length overflow, or visitor
+    /// rejection.
     fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2524,6 +2889,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes nullable optional fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when a null literal is malformed or the
+    /// visitor rejects the absent or present value.
     fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2537,6 +2907,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a unit from JSON null.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the null literal is malformed or the
+    /// visitor rejects the unit.
     fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2546,6 +2921,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a unit struct from JSON null.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the null literal is malformed or the
+    /// visitor rejects the unit struct.
     fn deserialize_unit_struct<V>(
         self,
         _name: &'static str,
@@ -2558,6 +2938,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a newtype through its wrapped visitor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the visitor rejects the wrapped value
+    /// or its nested deserialization fails.
     fn deserialize_newtype_struct<V>(
         self,
         _name: &'static str,
@@ -2570,6 +2955,12 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes an array after computing its exact element count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed array/nested-value syntax,
+    /// nesting or count overflow, a missing opening bracket, or visitor
+    /// rejection.
     fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2583,6 +2974,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a fixed tuple from a JSON array.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed array/nested-value syntax,
+    /// nesting or count overflow, or visitor rejection.
     fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2591,6 +2987,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a tuple struct from a JSON array.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed array/nested-value syntax,
+    /// nesting or count overflow, or visitor rejection.
     fn deserialize_tuple_struct<V>(
         self,
         _name: &'static str,
@@ -2604,6 +3005,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes an object and delegates field behavior to the generated visitor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when the opening brace is missing or the
+    /// visitor rejects malformed keys, values, separators, or object closure.
     fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2617,6 +3023,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes a generated message struct from a JSON object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] when object framing is malformed or the
+    /// generated visitor rejects a field, duplicate, type, or nested value.
     fn deserialize_struct<V>(
         self,
         _name: &'static str,
@@ -2630,6 +3041,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes an enum using either its string name or integer representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax, invalid
+    /// UTF-8/Unicode/escapes, numeric range failure, or visitor rejection.
     fn deserialize_enum<V>(
         self,
         _name: &'static str,
@@ -2648,6 +3064,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Decodes an identifier as a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed string/number syntax, invalid
+    /// UTF-8/Unicode/escapes, or visitor rejection.
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
@@ -2656,6 +3077,11 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     }
 
     /// Skips one unknown value without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonDecodeError`] for malformed skipped syntax, unexpected
+    /// end of input, nesting above 128, or visitor rejection.
     fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,

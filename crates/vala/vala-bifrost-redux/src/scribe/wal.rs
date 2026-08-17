@@ -2166,6 +2166,21 @@ impl WalHandle {
         self.writer.retain_segments(segments)
     }
 
+    /// Releases a reader pin, deleting the closed file only at a proven safe boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the retirement-reference lock or durable deletion error from
+    /// the shared writer.
+    fn release_replay_pin(
+        &self,
+        segment: &WalSegmentRef,
+        delete_if_unreferenced: bool,
+    ) -> Result<(), ScribeError> {
+        self.writer
+            .release_replay_pin(segment, delete_if_unreferenced)
+    }
+
     /// Closes this shard's current segment when no active bucket owns it.
     ///
     /// # Errors
@@ -2837,6 +2852,41 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Releases one replay-reader reference without making unread bytes deletable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when retirement ownership is poisoned
+    /// or a safe, closed segment cannot be deleted durably.
+    fn release_replay_pin(
+        &self,
+        segment: &WalSegmentRef,
+        delete_if_unreferenced: bool,
+    ) -> Result<(), ScribeError> {
+        let mut references = self
+            .retirement_refs
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL retirement reference lock poisoned".to_owned(),
+            })?;
+        let mut releasable = false;
+        if let Some(count) = references.get_mut(&segment.path) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                references.remove(&segment.path);
+                releasable = delete_if_unreferenced;
+            }
+        } else {
+            releasable = delete_if_unreferenced;
+        }
+        drop(references);
+        if releasable {
+            self.delete_closed_segments(std::slice::from_ref(&segment.path))?;
+        }
+        Ok(())
+    }
+
     /// Close a current segment after its final active bucket is detached.
     ///
     /// The segment remains on disk while its immutable generation is pending;
@@ -3022,12 +3072,55 @@ struct ShardRecordCursor {
     header: Option<DecodedWalRecordHeader>,
     /// Last consumed LSN, spanning every ordered segment in this shard chain.
     previous_lsn: Option<WalLsn>,
+    /// Existing WAL handle used to pin each segment while it is being read.
+    pin_wal: Option<WalHandle>,
+    /// Current segment pin retained until the reader proves the file complete.
+    segment_pin: Option<ReplaySegmentPin>,
+    /// Whether the final visited record left no unpublished group in this segment.
+    segment_retirement_safe: bool,
+}
+
+/// Pins one replay segment in the existing WAL retirement reference owner.
+///
+/// A failed or cancelled scan deliberately drops this object without releasing
+/// its reference, preserving unread WAL until process restart. Successful EOF
+/// consumes the pin through [`Self::release`].
+#[derive(Debug)]
+struct ReplaySegmentPin {
+    /// Existing shard WAL handle that owns the retirement reference map.
+    wal: WalHandle,
+    /// Exact segment protected while its reader may still consume records.
+    segment: WalSegmentRef,
+}
+
+impl ReplaySegmentPin {
+    /// Acquires one reader-owned reference before a segment file is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the existing WAL reference owner cannot
+    /// retain the segment.
+    fn acquire(wal: WalHandle, segment: WalSegmentRef) -> Result<Self, ScribeError> {
+        wal.retain_segments(std::slice::from_ref(&segment))?;
+        Ok(Self { wal, segment })
+    }
+
+    /// Releases the reader reference after the segment reaches a safe EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when retirement reference settlement or durable
+    /// closed-file deletion fails.
+    fn release(self, delete_if_unreferenced: bool) -> Result<(), ScribeError> {
+        self.wal
+            .release_replay_pin(&self.segment, delete_if_unreferenced)
+    }
 }
 
 impl ShardRecordCursor {
     /// Creates a lazy cursor for one ordered shard segment chain.
     #[must_use]
-    fn new(mut segments: Vec<Arc<WalSegment>>) -> Self {
+    fn new(mut segments: Vec<Arc<WalSegment>>, wal: Option<WalHandle>) -> Self {
         segments.sort_by(|left, right| {
             left.header()
                 .seg_seq
@@ -3042,6 +3135,9 @@ impl ShardRecordCursor {
             record_offset: SEGMENT_HEADER_SIZE as u64,
             header: None,
             previous_lsn: None,
+            pin_wal: wal,
+            segment_pin: None,
+            segment_retirement_safe: false,
         }
     }
 
@@ -3140,6 +3236,10 @@ impl ShardRecordCursor {
                 Ok(None) => {
                     self.file = None;
                     self.path = None;
+                    if let Some(pin) = self.segment_pin.take() {
+                        pin.release(self.segment_retirement_safe)?;
+                    }
+                    self.segment_retirement_safe = false;
                 }
                 Err(error) if is_torn_tail_error(&error) => self.repair_torn_tail()?,
                 Err(error) => return Err(error),
@@ -3159,6 +3259,10 @@ impl ShardRecordCursor {
             return Ok(false);
         };
         self.next_segment = self.next_segment.saturating_add(1);
+        self.segment_retirement_safe = false;
+        if let Some(wal) = self.pin_wal.as_ref() {
+            self.segment_pin = Some(ReplaySegmentPin::acquire(wal.clone(), segment.reference())?);
+        }
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -3199,6 +3303,10 @@ impl ShardRecordCursor {
         self.file = None;
         self.path = None;
         self.header = None;
+        if let Some(pin) = self.segment_pin.take() {
+            pin.release(self.segment_retirement_safe)?;
+        }
+        self.segment_retirement_safe = false;
         Ok(())
     }
 }
@@ -3392,7 +3500,10 @@ impl WalReader {
     where
         F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
-        self.for_each_stream_record_accounted(None, visit)
+        let mut visit = visit;
+        self.for_each_stream_record_accounted(None, None, |stream, shard, path, record| {
+            visit(stream, shard, path, record).map(|()| false)
+        })
     }
 
     /// Visits records while reserving each declared payload before allocation.
@@ -3400,7 +3511,9 @@ impl WalReader {
     /// The reservation is derived only from a validated fixed header and stays
     /// live until the visitor returns. Replay therefore holds at most one
     /// separately accounted encoded record while it constructs the current
-    /// decoded batch.
+    /// decoded batch. When `pin_writer` is present, the visitor returns `true`
+    /// only after the current record's complete group is durably settled; EOF
+    /// may unlink the pinned segment only when its final callback returned true.
     ///
     /// # Errors
     ///
@@ -3409,10 +3522,11 @@ impl WalReader {
     pub(crate) fn for_each_stream_record_accounted<F>(
         &self,
         governor: Option<&ScribeResources>,
+        pin_writer: Option<&WalWriter>,
         mut visit: F,
     ) -> Result<(), ScribeError>
     where
-        F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
+        F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<bool, ScribeError>,
     {
         let mut streams: WalStreams = BTreeMap::new();
         for segment in &self.segments {
@@ -3431,8 +3545,14 @@ impl WalReader {
             );
             let mut cursors = shards
                 .into_iter()
-                .map(|(shard_id, segments)| (shard_id, ShardRecordCursor::new(segments)))
-                .collect::<Vec<_>>();
+                .map(|(shard_id, segments)| {
+                    let pin_wal = pin_writer
+                        .as_ref()
+                        .map(|writer| writer.handle_for_shard(usize::from(shard_id)))
+                        .transpose()?;
+                    Ok((shard_id, ShardRecordCursor::new(segments, pin_wal)))
+                })
+                .collect::<Result<Vec<_>, ScribeError>>()?;
             let mut previous_lsn = None;
             loop {
                 let mut selected: Option<(usize, WalLsn)> = None;
@@ -3458,7 +3578,7 @@ impl WalReader {
                     });
                 }
                 previous_lsn = Some(record.lsn);
-                visit(stream, *shard_id, path, record)?;
+                cursor.segment_retirement_safe = visit(stream, *shard_id, path, record)?;
                 drop(payload_memory);
             }
         }
@@ -4203,6 +4323,114 @@ mod tests {
             .retire_segments(std::slice::from_ref(&first))
             .expect("second generation retires");
         assert!(!first.path.exists());
+    }
+
+    /// A cancelled replay keeps a shared segment until a restart publishes its final group.
+    #[test]
+    fn replay_segment_pin_preserves_unread_group_across_restart() {
+        let temp_dir = TempDir::new().expect("WAL root");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let seal_key = test_seal_key(crate::test_support::tenant());
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            *node.as_bytes(),
+            1,
+            WalConfig::new(16 * 1024 * 1024).expect("single-segment config"),
+        )
+        .expect("first writer");
+        let first_batch = [1_u8; 16];
+        let shard = crate::scribe::routing::shard_for(
+            seal_key.tenant,
+            &seal_key.table,
+            uuid::Uuid::from_bytes(first_batch),
+        );
+        let second_batch = (2_u8..=u8::MAX)
+            .map(|value| [value; 16])
+            .find(|batch_id| {
+                crate::scribe::routing::shard_for(
+                    seal_key.tenant,
+                    &seal_key.table,
+                    uuid::Uuid::from_bytes(*batch_id),
+                ) == shard
+            })
+            .expect("a second batch routes to the same fixed shard");
+        for batch_id in [first_batch, second_batch] {
+            writer
+                .append_and_commit_for_replay_test(&seal_key, batch_id, b"audit", b"payload")
+                .expect("append replay group");
+        }
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+        assert_eq!(reader.segments.len(), 1, "both groups share one segment");
+        let segment = reader.segments[0].reference();
+        writer
+            .close_segments_if_unowned(
+                std::slice::from_ref(&segment),
+                &std::collections::HashSet::new(),
+            )
+            .expect("close shared segment");
+        writer
+            .retain_segments(&[segment.clone(), segment.clone()])
+            .expect("retain both generation references");
+        let writer = Arc::new(writer);
+        let mut commits = 0_usize;
+        let cancelled = reader
+            .for_each_stream_record_accounted(None, Some(writer.as_ref()), |_, _, _, record| {
+                if record.is_commit() {
+                    commits = commits.saturating_add(1);
+                    writer.retire_segments(std::slice::from_ref(&segment))?;
+                    return Err(ScribeError::Internal {
+                        detail: "injected replay cancellation".to_owned(),
+                    });
+                }
+                Ok(false)
+            })
+            .expect_err("first group cancellation");
+        assert!(cancelled.to_string().contains("cancellation"));
+        assert_eq!(commits, 1);
+        assert!(segment.path.exists(), "unread group remains durable");
+
+        drop(reader);
+        drop(writer);
+        let restarted = Arc::new(
+            WalWriter::new(
+                temp_dir.path(),
+                *node.as_bytes(),
+                2,
+                WalConfig::new(16 * 1024 * 1024).expect("restart config"),
+            )
+            .expect("restart writer"),
+        );
+        let current = crate::scribe::stream_identity::StreamIdentity::new(
+            node,
+            crate::scribe::stream_identity::WriterEpoch::new(2),
+        );
+        let replay = WalReader::open_directory_for_recovery(temp_dir.path(), current)
+            .expect("restart reader");
+        let mut restart_commits = 0_usize;
+        replay
+            .for_each_stream_record_accounted(None, Some(restarted.as_ref()), |_, _, _, record| {
+                if record.is_commit() {
+                    restart_commits = restart_commits.saturating_add(1);
+                    if restart_commits == 2 {
+                        let wal = restarted.handle_for_shard(shard)?;
+                        wal.retain_segments(std::slice::from_ref(&segment))?;
+                        wal.retire_segments(std::slice::from_ref(&segment))?;
+                        assert!(segment.path.exists(), "reader pin precedes final unlink");
+                    }
+                }
+                Ok(restart_commits == 2)
+            })
+            .expect("restart replay");
+        assert_eq!(
+            restart_commits, 2,
+            "restart recovers the unread second group"
+        );
+        assert!(!segment.path.exists(), "final EOF releases the segment pin");
+        restarted
+            .handle_for_shard(shard)
+            .expect("retry handle")
+            .retire_segments(std::slice::from_ref(&segment))
+            .expect("retirement retry is idempotent");
     }
 
     /// A filesystem retirement failure preserves the source path for a later retry.

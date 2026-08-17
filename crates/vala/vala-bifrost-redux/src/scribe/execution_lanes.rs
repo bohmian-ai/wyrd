@@ -2,7 +2,7 @@
 
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -1431,6 +1431,8 @@ pub(crate) enum ScribeWalIoOp {
     },
     ReplayDirectoryStream {
         path: PathBuf,
+        /// Existing WAL writer whose retirement references pin the segment being read.
+        wal: Arc<crate::scribe::wal::WalWriter>,
         /// Replacement actor stream whose lower same-node epochs are eligible.
         recovery_stream: StreamIdentity,
         shard_senders: Vec<mpsc::Sender<crate::scribe::shards::ShardCommand>>,
@@ -1464,8 +1466,8 @@ pub(crate) enum ScribeWalIoResult {
     ReplayStreamCompleted {
         /// Number of restored immutable generations.
         restored: usize,
-        /// WAL references retained until the replay reader releases this worker.
-        retirements: Vec<crate::scribe::shards::ReplayRetirement>,
+        /// Maximum completed retirements awaiting settlement at one time.
+        retirement_high_water: usize,
     },
 }
 
@@ -1731,12 +1733,14 @@ fn execute_wal_io(
         }
         ScribeWalIoOp::ReplayDirectoryStream {
             path,
+            wal,
             recovery_stream,
             shard_senders,
             memory,
             cancelled,
         } => execute_replay_directory_stream(
-            path,
+            &path,
+            wal.as_ref(),
             recovery_stream,
             &shard_senders,
             &memory,
@@ -1760,22 +1764,25 @@ fn execute_wal_io(
 /// Returns [`ScribeError`] for discovery, admission, corruption, cancellation,
 /// channel closure, or shard restoration failure.
 fn execute_replay_directory_stream(
-    path: PathBuf,
+    path: &Path,
+    wal: &crate::scribe::wal::WalWriter,
     recovery_stream: StreamIdentity,
     shard_senders: &[mpsc::Sender<crate::scribe::shards::ShardCommand>],
     memory: &ScribeResources,
     cancelled: &AtomicBool,
 ) -> Result<ScribeWalIoResult, ScribeError> {
     let mut restored = 0_usize;
-    let mut retirements = Vec::new();
+    let mut retirement_settlement = ReplayRetirementSettlement::new(path);
     crate::scribe::replay::replay_wal_directory_stream_accounted(
         path,
         Some(recovery_stream),
         Some(memory),
+        Some(wal),
         Some(cancelled),
         |chunk| {
             let crate::scribe::replay::ReplayChunk { states, memory } = chunk;
             drop(memory);
+            let mut every_state_retired = true;
             for state in states.into_values() {
                 if cancelled.load(Ordering::Acquire) {
                     return Err(ScribeError::Internal {
@@ -1799,17 +1806,75 @@ fn execute_replay_directory_stream(
                             detail: "replay owner dropped its completion response".to_owned(),
                         })??
                 {
-                    retirements.push(retirement);
+                    retirement_settlement.settle(&retirement)?;
+                } else {
+                    every_state_retired = false;
                 }
                 restored = restored.saturating_add(1);
             }
-            Ok(())
+            Ok(every_state_retired)
         },
     )?;
     Ok(ScribeWalIoResult::ReplayStreamCompleted {
         restored,
-        retirements,
+        retirement_high_water: retirement_settlement.high_water(),
     })
+}
+
+/// Settles one completed replay publication before accepting another response.
+struct ReplayRetirementSettlement<'a> {
+    /// Root containing the recovered stream manifests.
+    wal_dir: &'a Path,
+    /// Completed retirements currently awaiting durable settlement.
+    pending: usize,
+    /// Maximum pending count observed during this replay operation.
+    high_water: usize,
+}
+
+impl<'a> ReplayRetirementSettlement<'a> {
+    /// Creates an empty settlement owner for one WAL root.
+    #[must_use]
+    const fn new(wal_dir: &'a Path) -> Self {
+        Self {
+            wal_dir,
+            pending: 0,
+            high_water: 0,
+        }
+    }
+
+    /// Durably advances one replay watermark before releasing its generation references.
+    ///
+    /// The replay reader pins its current segment independently, so releasing a
+    /// completed generation cannot unlink a segment that still has unread records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when manifest publication or WAL retirement fails.
+    fn settle(
+        &mut self,
+        retirement: &crate::scribe::shards::ReplayRetirement,
+    ) -> Result<(), ScribeError> {
+        self.pending = self.pending.saturating_add(1);
+        self.high_water = self.high_water.max(self.pending);
+        let manifest_path =
+            crate::scribe::replay::stream_directory(self.wal_dir, retirement.stream)
+                .join("manifest");
+        let result = (|| {
+            let mut manifest = crate::scribe::manifest::read_manifest(&manifest_path)?
+                .unwrap_or_else(|| crate::scribe::manifest::Manifest::new(retirement.stream));
+            manifest.update_sealed_lsn(&retirement.seal_key, retirement.sealed_lsn);
+            replace_manifest(&manifest_path, &manifest.serialize()?)?;
+            retirement.wal.retire_segments(&retirement.segments)
+        })();
+        self.pending = self.pending.saturating_sub(1);
+        result
+    }
+
+    /// Returns the maximum number of completed retirements retained simultaneously.
+    #[must_use]
+    const fn high_water(&self) -> usize {
+        self.high_water
+    }
 }
 
 fn replace_manifest(path: &PathBuf, contents: &[u8]) -> Result<(), ScribeError> {
@@ -1864,8 +1929,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ScribeIngressCpuPool, ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribeWalIoPool,
-        decode, record_lane_saturation, source_schema_fingerprint, stamp_correlation_columns,
+        ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
+        ScribePersistenceCpuPool, ScribeWalIoPool, decode, record_lane_saturation,
+        source_schema_fingerprint, stamp_correlation_columns,
     };
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
@@ -2194,6 +2260,53 @@ mod tests {
                 chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid test day"),
             ),
         )
+    }
+
+    /// Incremental replay settlement never retains more than one completed group.
+    #[test]
+    fn replay_retirement_settlement_has_one_pending_group() {
+        let root = tempfile::tempdir().expect("WAL root");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let writer = crate::scribe::wal::WalWriter::new(
+            root.path(),
+            *node.as_bytes(),
+            1,
+            crate::scribe::wal::WalConfig::default(),
+        )
+        .expect("WAL writer");
+        let wal = writer.handle_for_shard(0).expect("WAL handle");
+        let stream_dir = crate::scribe::replay::stream_directory(root.path(), stream);
+        std::fs::create_dir_all(&stream_dir).expect("stream directory");
+        let seal_key = idle_seal_key();
+        let mut settlement = ReplayRetirementSettlement::new(root.path());
+        for index in 1_u64..=2 {
+            let path = stream_dir.join(format!("retirement-{index}.wal"));
+            std::fs::write(&path, index.to_le_bytes()).expect("retirement fixture");
+            let segment = crate::scribe::wal::WalSegmentRef { path };
+            wal.retain_segments(std::slice::from_ref(&segment))
+                .expect("generation reference");
+            let retirement = crate::scribe::shards::ReplayRetirement {
+                wal: wal.clone(),
+                segments: vec![segment.clone()],
+                stream,
+                seal_key: seal_key.clone(),
+                sealed_lsn: crate::scribe::wal::WalLsn::new(index),
+            };
+            settlement.settle(&retirement).expect("settlement");
+            assert!(!segment.path.exists(), "settled segment retires");
+            settlement
+                .settle(&retirement)
+                .expect("settlement retry is idempotent");
+        }
+        assert_eq!(settlement.high_water(), 1);
+        assert_eq!(
+            crate::scribe::manifest::read_manifest(stream_dir.join("manifest"))
+                .expect("manifest read")
+                .expect("manifest")
+                .get_sealed_lsn(&seal_key),
+            Some(crate::scribe::wal::WalLsn::new(2))
+        );
     }
 
     /// Projected payloads retain their caller-provided run identifier as the

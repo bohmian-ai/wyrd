@@ -164,13 +164,19 @@ pub fn replay_wal_directory_stream(
     wal_dir: impl AsRef<Path>,
     emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
-    replay_wal_directory_stream_accounted(wal_dir, None, None, None, emit)
+    let mut emit = emit;
+    replay_wal_directory_stream_accounted(wal_dir, None, None, None, None, |chunk| {
+        emit(chunk).map(|()| false)
+    })
 }
 
 /// Replay the WAL directory with a bounded decode reservation on each emitted
 /// batch. The production WAL lane supplies the governor and a shutdown flag;
-/// unit tests may omit them for isolated parsing or deduplication. Cancellation
-/// is observed between records and only after a started callback has settled.
+/// unit tests may omit them for isolated parsing or deduplication. The callback
+/// returns whether its chunk reached durable retirement settlement, which lets
+/// the reader release a completed segment pin without exposing later records.
+/// Cancellation is observed between records and only after a started callback
+/// has settled.
 ///
 /// # Errors
 ///
@@ -180,8 +186,9 @@ pub(crate) fn replay_wal_directory_stream_accounted(
     wal_dir: impl AsRef<Path>,
     recovery_stream: Option<StreamIdentity>,
     governor: Option<&ScribeResources>,
+    wal: Option<&crate::scribe::wal::WalWriter>,
     cancelled: Option<&AtomicBool>,
-    mut emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
+    mut emit: impl FnMut(ReplayChunk) -> Result<bool, ScribeError>,
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
     let reader = if let Some(current) = recovery_stream {
@@ -195,6 +202,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
 
     reader.for_each_stream_record_accounted(
         governor,
+        wal,
         |stream, shard_id, segment_path, record| {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                 return Err(ScribeError::Internal {
@@ -204,7 +212,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             if recovery_stream.is_some_and(|current| {
                 stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
             }) {
-                return Ok(());
+                return Ok(false);
             }
             let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
             let key = (stream, shard_id);
@@ -226,15 +234,16 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             // so partial accumulators from other shard streams cannot retain decode
             // reservations while publication owns immutable and encoding workspace.
             // The existing synchronous callback supplies the required backpressure.
+            let mut emitted_settled = false;
             if let Some(chunk) = accumulator.take_chunk()? {
-                emit(chunk)?;
+                emitted_settled = emit(chunk)?;
                 if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                     return Err(ScribeError::Internal {
                         detail: "WAL replay cancelled".to_owned(),
                     });
                 }
             }
-            Ok(())
+            Ok(emitted_settled && accumulator.segment_retirement_safe())
         },
     )?;
 
@@ -245,7 +254,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             });
         }
         if let Some(chunk) = accumulator.take_chunk()? {
-            emit(chunk)?;
+            let _ = emit(chunk)?;
         }
     }
 
@@ -612,6 +621,15 @@ impl<'a> ReplayAccumulator<'a> {
             memory.resize_ingress(bytes)?;
         }
         Ok(())
+    }
+
+    /// Returns whether the current record left no unpublished replay group.
+    ///
+    /// The WAL reader uses this only for its completed-segment pin: a false
+    /// value preserves the source file even after clean EOF.
+    #[must_use]
+    fn segment_retirement_safe(&self) -> bool {
+        self.pending_batches.is_empty() && self.states.is_empty()
     }
 }
 
@@ -1098,9 +1116,10 @@ mod tests {
             Some(current),
             None,
             None,
+            None,
             |chunk| {
                 recovered.extend(chunk.states.into_values().map(|state| state.stream));
-                Ok(())
+                Ok(false)
             },
         )
         .expect("recovery");
@@ -1269,9 +1288,10 @@ mod tests {
             None,
             Some(&budget),
             None,
+            None,
             |chunk| {
                 chunks.push(chunk);
-                Ok(())
+                Ok(false)
             },
         )
         .expect("streamed replay");
@@ -1343,6 +1363,7 @@ mod tests {
             Some(current),
             None,
             None,
+            None,
             |chunk| {
                 restored = restored.saturating_add(
                     chunk
@@ -1351,7 +1372,7 @@ mod tests {
                         .map(|state| state.append_metas.len())
                         .sum::<usize>(),
                 );
-                Ok(())
+                Ok(false)
             },
         )
         .expect("replay");
@@ -1388,7 +1409,8 @@ mod tests {
             Some(current),
             Some(&budget),
             None,
-            |_| Ok(()),
+            None,
+            |_| Ok(false),
         )
         .expect_err("payload admission must refuse");
         assert!(
@@ -1434,11 +1456,12 @@ mod tests {
             temp_dir.path(),
             None,
             None,
+            None,
             Some(&cancelled),
             |chunk| {
                 settled = settled.saturating_add(chunk.states.len());
                 cancelled.store(true, Ordering::Release);
-                Ok(())
+                Ok(false)
             },
         )
         .expect_err("replay must observe cancellation");

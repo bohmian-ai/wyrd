@@ -88,8 +88,12 @@ Validate before substantive review:
   `diff_sha256` and the implementation report;
 - the report identifies the same request, artifact, task, revision, accepted
   SHA, candidate, parent, predecessor, changed paths, and every AC;
-- actual changed paths equal the report and fall wholly within `write_set`,
-  with none in `prohibited_writes`;
+- actual changed paths equal the report and fall within `write_set` or the
+  implementation report's incidental repair closure, with none in
+  `prohibited_writes`; every incidental path must be candidate-caused,
+  mechanical, bound to an exact repository diagnostic, and add no behavior,
+  dependency, owner, public or durable contract, acceptance scope, unrelated
+  cleanup, or broad formatting;
 - the state projection names this candidate as current; no successor is
   inferred from chat, branches, worktrees, or other hidden context;
 - authoritative proof, when present, binds the same candidate, has zero or one
@@ -97,8 +101,10 @@ Validate before substantive review:
   the implementation report's diagnostic `development_checks`.
 
 Identity, digest, ancestry, missing-artifact, or supersession failures produce
-`REVIEW_BLOCKED`. An actual forbidden/out-of-scope diff is a reversible
-implementation defect and produces `RESUME_IMPLEMENTATION`.
+`REVIEW_BLOCKED`. An unjustified out-of-scope diff or any prohibited write is a
+reversible implementation defect and produces `RESUME_IMPLEMENTATION`.
+Do not reject a valid reported incidental repair merely because its path was
+not enumerated in the original write set.
 
 ## Review adversarially
 

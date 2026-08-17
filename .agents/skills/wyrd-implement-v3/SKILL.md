@@ -68,11 +68,10 @@ alone are not authority to edit.
    `git -C <worktree> rev-parse HEAD` equals `parent_sha`, the worktree is
    clean, and every supplied SHA resolves as a commit.
 3. When `.codegraph/` exists, use CodeGraph before grep/find for code discovery.
-4. Treat `write_set` as an allowlist. Reading elsewhere is allowed; adding,
-   deleting, renaming, formatting, generating, or modifying anything outside
-   it is forbidden. `prohibited_writes` wins. Do not edit the canonical task,
-   plan, orchestration state, or review artifacts unless they are explicitly
-   in the write set—and even then never change task status.
+4. Treat `write_set` as the behavioral ownership allowlist, with the incidental
+   repair closure defined below. `prohibited_writes` always wins. Do not edit
+   the canonical task, plan, orchestration state, or review artifacts unless
+   they are explicitly in the write set—and even then never change task status.
 5. Refuse unrelated dirty state instead of absorbing it. Never amend, rebase,
    merge, cherry-pick, integrate, or push.
 
@@ -85,10 +84,25 @@ test-integrity, and user-journey rules. Do not redesign a material contract,
 resolve a material conflict, expand scope, or implement later tasks.
 
 Compiler, formatter, lint, test, fixture, and repository-managed local setup
-failures are development feedback. Diagnose and repair in-scope failures. A
-required material decision, unavailable authority, ambiguous acceptance
-outcome, forbidden write, or genuinely unavailable mandatory external proof is
-`BLOCKED`; difficulty, elapsed time, and a failing first attempt are not.
+failures are development feedback. Diagnose and repair them without refusing
+the task, requesting user authorization, or requiring a task revision.
+
+The task automatically authorizes the smallest candidate-caused mechanical
+repair needed to make repository-required compile, format, Clippy, rustdoc,
+codegen, fixture, or focused-test checks pass, even when the exact adjacent file
+was omitted from `write_set`. This incidental repair closure includes imports,
+call-site type adjustments, generated outputs, test fixtures, rustdoc, and lint
+cleanup. It does not authorize new behavior, dependencies, owners, public or
+durable contracts, acceptance criteria, unrelated cleanup, broad formatting,
+or any `prohibited_writes` path. Record every such path and its diagnostic in
+`incidental_repair_paths`. If the repair cannot satisfy these limits, stop
+because of the material choice or prohibited path—not merely because the path
+was absent from `write_set`.
+
+A required material decision, unavailable authority, ambiguous acceptance
+outcome, prohibited write, or genuinely unavailable mandatory external proof
+is `BLOCKED`; difficulty, elapsed time, a failing first attempt, and a
+mechanical out-of-list repair are not.
 
 ## Verify and seal
 
@@ -104,8 +118,8 @@ skip, ignore, or mask a gate.
 
 Before committing:
 
-1. Audit tracked and untracked paths against `write_set` and
-   `prohibited_writes`.
+1. Audit tracked and untracked paths against `write_set`, the documented
+   incidental repair closure, and `prohibited_writes`.
 2. Run `git diff --check` and map every changed path and AC to evidence.
 3. Confirm the Git identity already matches repository policy; never alter it.
 4. Create exactly one normal commit whose sole parent is `parent_sha`.
@@ -133,6 +147,9 @@ candidate_sha: <40-hex immutable commit>
 parent_sha: <input parent_sha>
 diff_sha256: <lowercase 64-hex digest>
 changed_paths: [<sorted repository-relative paths>]
+incidental_repair_paths:
+  - path: <changed path outside write_set; use [] when none>
+    diagnostic: <exact compile/lint/rustdoc/codegen/fixture/test reason>
 acceptance_trace:
   - ac_id: <every input AC exactly once>
     implementation: [<path:symbol or path:line evidence>]

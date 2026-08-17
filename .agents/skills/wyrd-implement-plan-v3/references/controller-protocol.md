@@ -131,6 +131,22 @@ schedule when an implementor slot exists. Validate this report with
 
 ## Material-decision guard
 
+Apply a presumption of local repair before entering this guard. Compiler,
+formatter, Clippy, rustdoc, generated-drift, fixture, and focused-test failures
+produce a successor implementation generation. They do not create an
+escalation record. `$wyrd-implement-v3` directly applies and reports a
+task-local mechanical path correction outside the original write set when the
+candidate caused the diagnostic and the change adds no behavior, owner,
+dependency, public contract, acceptance scope, unrelated cleanup, or prohibited
+path. The root validates the reported path and diagnostic with the candidate;
+it does not revise the task or request user authorization. Mere write-set
+omission is not evidence of a material decision.
+
+Enter the material-decision state machine only when source evidence identifies
+an unresolved choice among materially different behaviors or a change to
+product, durability, public contract, ownership, dependency, security, DAG, or
+acceptance authority.
+
 Keep one escalation record per frozen cone. Its phase advances only through:
 
 ```text

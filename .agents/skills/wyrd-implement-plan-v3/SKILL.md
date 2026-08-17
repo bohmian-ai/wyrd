@@ -34,6 +34,34 @@ beneficial. Return reversible deviation to implementation; treat any deviation
 that requires a new product, durable, public, ownership, dependency, security,
 or acceptance decision as material.
 
+## Exercise repair judgment
+
+Treat ordinary development failures as implementation feedback, not planning
+failures. Formatting, Clippy, rustdoc, compiler diagnostics, imports, type
+errors, warnings-as-errors, generated drift, fixture drift, and focused test
+failures are presumptively reversible and task-local. Return them immediately
+to a fresh implementor generation with the exact diagnostic and rerun the
+focused proof. Do not freeze, advise, or invoke `$wyrd-plan-v3` merely because
+a repair is inconvenient, crosses modules already in the declared write set,
+or was not predicted line-by-line by the task packet.
+
+Use the smallest obvious repair consistent with existing repository patterns.
+The root still does not edit delegated source. Every implementation request
+implicitly includes the `$wyrd-implement-v3` incidental repair closure: the
+smallest candidate-caused mechanical consumer update, import, generated
+artifact, fixture, type adjustment, or lint/rustdoc correction required by a
+repository gate. The implementor fixes and reports these paths directly; the
+root validates them with the candidate. Do not request user authorization,
+freeze the task, or create a task revision solely because such a path was
+omitted from the declared write set. This closure cannot add behavior,
+ownership, dependencies, public contracts, acceptance scope, unrelated cleanup,
+or a prohibited path.
+
+Escalate only when source evidence proves that no compliant repair exists
+without choosing among materially different behaviors or changing a product,
+durability, public-contract, ownership, dependency, security, task-DAG, or
+acceptance decision. “Outside the current write set” alone is not material.
+
 ## Resolve material uncertainty
 
 Only the root controller may commission advice. When implementation, proof, or
@@ -157,6 +185,11 @@ classification, and artifact digest. Only classified infrastructure/setup
 failure may be retried in the same proof stream on the same candidate; source
 or test failure requires a successor candidate. Implementor test runs are
 diagnostic only. Static review may overlap eligible focused verification.
+
+For a source or test failure, capture the actionable diagnostic, classify it
+using the repair judgment above, and dispatch the successor implementor without
+waiting for user intervention. Replanning is not a substitute for ordinary
+debugging.
 
 Dispatch at most two simultaneous fresh Sol-low task reviewers. Reviewers are
 read-only and receive the approved task, authorities, exact base and candidate

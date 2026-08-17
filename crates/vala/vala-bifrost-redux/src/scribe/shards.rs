@@ -2424,18 +2424,18 @@ impl ShardOwner {
                 let error = ScribeError::Internal {
                     detail: "WAL IO lane returned the wrong shard append result".to_owned(),
                 };
-                return Err(self.preserve_primary_after_active_cleanup(
-                    error,
-                    memtable_bytes,
-                    true,
-                ));
+                return Err(if retain_rows {
+                    self.preserve_primary_after_active_cleanup(error, memtable_bytes, true)
+                } else {
+                    error
+                });
             }
             Err(error) => {
-                return Err(self.preserve_primary_after_active_cleanup(
-                    error,
-                    memtable_bytes,
-                    true,
-                ));
+                return Err(if retain_rows {
+                    self.preserve_primary_after_active_cleanup(error, memtable_bytes, true)
+                } else {
+                    error
+                });
             }
         };
         Ok((
@@ -2456,9 +2456,6 @@ impl ShardOwner {
         ))
     }
 
-    /// Reuse a slice whose WAL record was already synced before a prior memtable
-    /// insertion failed. The retry supplies the Arrow rows again, but it must not
-    /// append a second WAL record.
     /// Reuses a WAL-synced slice after a prior memtable insertion failure.
     ///
     /// No second WAL record is written, preserving replay deduplication and

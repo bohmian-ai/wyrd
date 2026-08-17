@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Cold Rehearsal v3"
-  short_description: "Rehearse Wyrd plans independently"
-  default_prompt: "Use $wyrd-cold-rehearsal-v3 to independently prove that a v3 milestone is executable and return PASS, FAIL, or STALE."
+  short_description: "Rehearse execution and concurrency"
+  default_prompt: "Use $wyrd-cold-rehearsal-v3 to independently prove that a v3 milestone is executable, correctly parallelized, and return PASS, FAIL, or STALE."

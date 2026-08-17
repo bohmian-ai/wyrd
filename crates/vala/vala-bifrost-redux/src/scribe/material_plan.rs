@@ -10,7 +10,7 @@ use std::mem::size_of;
 
 use arrow::ipc::writer::StreamWriter;
 use arrow::ipc::{
-    DateUnit, Endianness, IntervalUnit, MessageHeader, MetadataVersion, Precision, Type,
+    DateUnit, Endianness, IntervalUnit, MessageHeader, MetadataVersion, Precision, TimeUnit, Type,
     root_as_message,
 };
 use arrow::record_batch::RecordBatch;
@@ -41,6 +41,14 @@ pub(crate) struct SourceMaterialPlan {
     pub(crate) body_bytes: usize,
     /// Buffer range count validated for this source.
     pub(crate) buffers: usize,
+    /// Start of this record-batch framing word in retained transport bytes.
+    pub(crate) frame_start: usize,
+    /// Start of this record-batch body after framed metadata and padding.
+    pub(crate) body_start: usize,
+    /// Exclusive end of the declared record-batch body.
+    pub(crate) body_end: usize,
+    /// Exclusive end including public eight-byte stream padding.
+    pub(crate) frame_end: usize,
 }
 
 /// Closed ingress path represented by a plan.
@@ -65,6 +73,14 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) name_bytes: usize,
     /// Admitted overlap for a native aligned source copy.
     pub(crate) aligned_copy_bytes: usize,
+    /// Start of the canonical schema message framing word.
+    pub(crate) native_schema_start: usize,
+    /// Exclusive end of the schema message including metadata padding.
+    pub(crate) native_schema_end: usize,
+    /// Exact public Arrow schema ownership decoded after root admission.
+    pub(crate) native_schema_material_bytes: usize,
+    /// Largest current framed-metadata scratch retained by `StreamDecoder`.
+    pub(crate) native_metadata_scratch_bytes: usize,
     /// Fixed-capacity source descriptors.
     pub(crate) sources: [SourceMaterialPlan; MAX_SOURCE_PLANS],
     /// Live prefix length in `sources`.
@@ -201,6 +217,10 @@ impl ScribeIngressPlanner {
                 rows,
                 body_bytes: total_bytes,
                 buffers: 0,
+                frame_start: 0,
+                body_start: 0,
+                body_end: 0,
+                frame_end: 0,
             };
         }
         let managed_bytes = managed_projection_bytes(rows, 36)?;
@@ -236,6 +256,10 @@ impl ScribeIngressPlanner {
             planner_bytes: size_of::<IngestMaterialPlan>(),
             name_bytes,
             aligned_copy_bytes: 0,
+            native_schema_start: 0,
+            native_schema_end: 0,
+            native_schema_material_bytes: 0,
+            native_metadata_scratch_bytes: 0,
             sources,
             source_count: usize::from(rows != 0),
             rows,
@@ -266,17 +290,22 @@ impl ScribeIngressPlanner {
         }
         let mut cursor = 0_usize;
         let mut schema_seen = false;
+        let mut native_schema_start = 0_usize;
+        let mut native_schema_end = 0_usize;
         let mut eos_seen = false;
         let mut fields = 0_usize;
         let mut field_layouts = [NativeFieldLayout::Null; MAX_NATIVE_FIELDS];
+        let mut field_nullable = [false; MAX_NATIVE_FIELDS];
         let mut source_count = 0_usize;
         let mut rows = 0_usize;
         let mut max_source_rows = 0_usize;
         let mut max_body_bytes = 0_usize;
-        let mut max_buffer_bytes = 0_usize;
+        let mut max_metadata_bytes = 0_usize;
+        let mut schema_material_bytes = size_of::<arrow::datatypes::Schema>();
         let mut active_output_bytes = 0_usize;
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
         while cursor < bytes.len() {
+            let frame_start = cursor;
             let prefix = read_u32(bytes, cursor)?;
             cursor = cursor.checked_add(4).ok_or(ScribeError::InvalidFrame)?;
             let metadata_len = if prefix == u32::MAX {
@@ -331,8 +360,32 @@ impl ScribeIngressPlanner {
                     }
                     for (index, field) in schema_fields.into_iter().enumerate() {
                         field_layouts[index] = native_field_layout(field)?;
+                        field_nullable[index] = field.nullable();
+                        schema_material_bytes = schema_material_bytes
+                            .checked_add(size_of::<arrow::datatypes::Field>())
+                            .and_then(|value| {
+                                value.checked_add(
+                                    size_of::<std::sync::Arc<arrow::datatypes::Field>>(),
+                                )
+                            })
+                            .and_then(|value| value.checked_add(field.name().map_or(0, str::len)))
+                            .and_then(|value| {
+                                value.checked_add(
+                                    field
+                                        .type_as_timestamp()
+                                        .and_then(|timestamp| timestamp.timezone())
+                                        .map_or(0, str::len),
+                                )
+                            })
+                            .ok_or(ScribeError::DecodedPayloadTooLarge {
+                                bytes: usize::MAX,
+                                limit: self.limits.otlp.material_bytes,
+                            })?;
                     }
                     schema_seen = true;
+                    native_schema_start = frame_start;
+                    native_schema_end = cursor;
+                    max_metadata_bytes = max_metadata_bytes.max(cursor - frame_start);
                 }
                 MessageHeader::RecordBatch
                     if schema_seen && source_count < self.limits.native_sources =>
@@ -359,10 +412,13 @@ impl ScribeIngressPlanner {
                     }
                     let nodes = batch.nodes().ok_or(ScribeError::InvalidFrame)?;
                     if nodes.len() != fields
-                        || nodes.into_iter().any(|node| {
+                        || nodes.into_iter().enumerate().any(|(index, node)| {
                             node.length() != batch.length()
                                 || node.null_count() < 0
                                 || node.null_count() > node.length()
+                                || (!field_nullable[index] && node.null_count() != 0)
+                                || (field_layouts[index] == NativeFieldLayout::Null
+                                    && node.null_count() != node.length())
                         })
                     {
                         return Err(ScribeError::InvalidFrame);
@@ -392,11 +448,15 @@ impl ScribeIngressPlanner {
                         rows: batch_rows,
                         body_bytes: buffer_bytes,
                         buffers: buffers.len(),
+                        frame_start,
+                        body_start: cursor,
+                        body_end,
+                        frame_end: align_eight(body_end)?,
                     };
                     source_count += 1;
                     max_source_rows = max_source_rows.max(batch_rows);
                     max_body_bytes = max_body_bytes.max(body_len);
-                    max_buffer_bytes = max_buffer_bytes.max(buffer_bytes);
+                    max_metadata_bytes = max_metadata_bytes.max(cursor - frame_start);
                 }
                 _ => return Err(ScribeError::InvalidFrame),
             }
@@ -406,12 +466,13 @@ impl ScribeIngressPlanner {
             return Err(ScribeError::InvalidFrame);
         }
         let managed_bytes = managed_projection_bytes(max_source_rows, 36)?;
-        let decoded_bytes = max_buffer_bytes.checked_add(managed_bytes).ok_or(
-            ScribeError::DecodedPayloadTooLarge {
+        let decoded_bytes = schema_material_bytes
+            .checked_add(max_metadata_bytes)
+            .and_then(|value| value.checked_add(managed_bytes))
+            .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
                 limit: self.limits.otlp.material_bytes,
-            },
-        )?;
+            })?;
         let encoded_bytes = max_body_bytes
             .checked_add(managed_bytes)
             .and_then(|value| value.checked_add(self.limits.wal_workspace_bytes))
@@ -436,7 +497,20 @@ impl ScribeIngressPlanner {
             request_bytes: bytes.len(),
             planner_bytes: size_of::<IngestMaterialPlan>(),
             name_bytes,
-            aligned_copy_bytes: max_body_bytes,
+            aligned_copy_bytes: sources[..source_count]
+                .iter()
+                .filter(|source| {
+                    (bytes.as_ptr() as usize)
+                        .checked_add(source.body_start)
+                        .is_none_or(|address| address & 7 != 0)
+                })
+                .map(|source| source.body_end - source.body_start)
+                .max()
+                .unwrap_or(0),
+            native_schema_start,
+            native_schema_end,
+            native_schema_material_bytes: schema_material_bytes,
+            native_metadata_scratch_bytes: max_metadata_bytes,
             sources,
             source_count,
             rows,
@@ -727,19 +801,36 @@ fn native_field_layout(field: arrow::ipc::Field<'_>) -> Result<NativeFieldLayout
         },
         Type::Binary | Type::Utf8 => Ok(NativeFieldLayout::Variable(4)),
         Type::LargeBinary | Type::LargeUtf8 => Ok(NativeFieldLayout::Variable(8)),
-        Type::Decimal => match field.type_as_decimal().map(|value| value.bitWidth()) {
-            Some(bits @ (128 | 256)) => fixed(bits),
-            _ => Err(ScribeError::InvalidFrame),
-        },
+        Type::Decimal => {
+            let decimal = field.type_as_decimal().ok_or(ScribeError::InvalidFrame)?;
+            let maximum_precision = match decimal.bitWidth() {
+                128 => 38,
+                256 => 76,
+                _ => return Err(ScribeError::InvalidFrame),
+            };
+            let precision = decimal.precision();
+            let scale = decimal.scale();
+            if precision < 1
+                || precision > maximum_precision
+                || scale.unsigned_abs() > u32::try_from(precision).unwrap_or(0)
+            {
+                return Err(ScribeError::InvalidFrame);
+            }
+            fixed(decimal.bitWidth())
+        }
         Type::Date => match field.type_as_date().map(|value| value.unit()) {
             Some(DateUnit::DAY) => Ok(NativeFieldLayout::Fixed(4)),
             Some(DateUnit::MILLISECOND) => Ok(NativeFieldLayout::Fixed(8)),
             _ => Err(ScribeError::InvalidFrame),
         },
-        Type::Time => match field.type_as_time().map(|value| value.bitWidth()) {
-            Some(bits @ (32 | 64)) => fixed(bits),
-            _ => Err(ScribeError::InvalidFrame),
-        },
+        Type::Time => {
+            let time = field.type_as_time().ok_or(ScribeError::InvalidFrame)?;
+            match (time.unit(), time.bitWidth()) {
+                (TimeUnit::SECOND | TimeUnit::MILLISECOND, 32) => fixed(32),
+                (TimeUnit::MICROSECOND | TimeUnit::NANOSECOND, 64) => fixed(64),
+                _ => Err(ScribeError::InvalidFrame),
+            }
+        }
         Type::Timestamp | Type::Duration => Ok(NativeFieldLayout::Fixed(8)),
         Type::Interval => match field.type_as_interval().map(|value| value.unit()) {
             Some(IntervalUnit::YEAR_MONTH) => Ok(NativeFieldLayout::Fixed(4)),
@@ -1142,6 +1233,10 @@ impl OtlpCounts {
                 rows: self.records,
                 body_bytes: projected_floor,
                 buffers: 0,
+                frame_start: 0,
+                body_start: 0,
+                body_end: 0,
+                frame_end: 0,
             };
         }
         IngestMaterialPlan {
@@ -1150,6 +1245,10 @@ impl OtlpCounts {
             planner_bytes: size_of::<IngestMaterialPlan>(),
             name_bytes,
             aligned_copy_bytes: 0,
+            native_schema_start: 0,
+            native_schema_end: 0,
+            native_schema_material_bytes: 0,
+            native_metadata_scratch_bytes: 0,
             sources,
             source_count: usize::from(self.records != 0),
             rows: self.records,
@@ -1348,7 +1447,15 @@ mod tests {
             .expect("canonical stream plan");
         assert_eq!(plan.source_count, 1);
         assert_eq!(plan.rows, 2);
-        assert!(plan.root_bytes >= bytes.len() * 2);
+        assert!(plan.sources[0].body_end > plan.sources[0].body_start);
+        let reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)
+            .expect("schema observation reader");
+        let schema = reader.schema();
+        assert_eq!(
+            plan.native_schema_material_bytes,
+            std::mem::size_of::<Schema>() + schema.fields.size()
+        );
+        assert!(plan.native_metadata_scratch_bytes > 0);
     }
 
     /// Missing EOS is refused before Arrow decode.

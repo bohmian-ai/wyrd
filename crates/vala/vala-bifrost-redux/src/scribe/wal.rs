@@ -544,6 +544,82 @@ impl PreparedWalAppend {
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
     }
+
+    /// Computes the exact v4 payload identity without materializing a payload copy.
+    ///
+    /// This is used to bind post-COMMIT native regeneration to the bytes that
+    /// were durably accepted. The digest covers the same ordered fields as the
+    /// production borrowed writer while the returned length is the checked
+    /// self-describing payload length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal invariant error when required slice metadata is
+    /// absent, a fixed-width field overflows, or checked payload sizing fails.
+    pub(crate) fn payload_identity(&self) -> Result<([u8; 32], u32), ScribeError> {
+        let payload_len =
+            u32::try_from(self.payload_len()?).map_err(|_| ScribeError::Internal {
+                detail: "WAL v4 payload exceeds its u32 record bound".to_owned(),
+            })?;
+        let mut digest = Sha256::new();
+        if let Some(commit_digest) = self.commit_digest.as_ref() {
+            digest.update(commit_digest);
+            return Ok((digest.finalize().into(), payload_len));
+        }
+        let seal_key = self
+            .seal_key
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
+            })?;
+        let namespace = seal_key.table.namespace.as_str().as_bytes();
+        let name = seal_key.table.name.as_bytes();
+        let tenant_id = *seal_key.tenant.as_uuid().as_bytes();
+        let table_len = u16::try_from(namespace.len() + 1 + name.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
+        let mut day = FixedText::<16>::new();
+        write!(day, "{}", seal_key.day.as_date().format("%Y-%m-%d")).map_err(|_| {
+            ScribeError::Internal {
+                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
+            }
+        })?;
+        let day_len = [
+            u8::try_from(day.as_bytes().len()).map_err(|_| ScribeError::Internal {
+                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
+            })?,
+        ];
+        let audit_len = u32::try_from(self.audit.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
+        let data_len = u32::try_from(self.data.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
+        for part in [
+            SLICE_PAYLOAD_MAGIC.as_slice(),
+            tenant_id.as_slice(),
+            table_len.as_slice(),
+            namespace,
+            b".".as_slice(),
+            name,
+            day_len.as_slice(),
+            day.as_bytes(),
+            self.schema_fingerprint.as_slice(),
+            audit_len.as_slice(),
+            self.audit.as_ref(),
+            data_len.as_slice(),
+            self.data.as_ref(),
+        ] {
+            digest.update(part);
+        }
+        Ok((digest.finalize().into(), payload_len))
+    }
 }
 
 /// Streams one prepared record from borrowed payload owners into its segment.

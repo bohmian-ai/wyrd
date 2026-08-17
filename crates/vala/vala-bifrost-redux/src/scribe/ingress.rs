@@ -375,6 +375,10 @@ impl ScribeImpl {
                 batch_id: frame.batch_id,
                 event_time_window: self.admission.config().event_time_window,
                 receipt_micros: crate::scribe::execution_lanes::current_receipt_micros()?,
+                schema_start: material_plan.native_schema_start,
+                schema_end: material_plan.native_schema_end,
+                sources: material_plan.sources,
+                source_count: material_plan.source_count,
             }),
             payload => {
                 let rows = self

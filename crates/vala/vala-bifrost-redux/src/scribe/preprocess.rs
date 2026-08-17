@@ -68,6 +68,15 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) event_time_window: EventTimeWindow,
     /// One receipt instant reused by WAL and post-COMMIT regeneration.
     pub(crate) receipt_micros: i64,
+    /// Start of the preflighted schema frame in retained transport bytes.
+    pub(crate) schema_start: usize,
+    /// Exclusive end of the preflighted schema frame including padding.
+    pub(crate) schema_end: usize,
+    /// Fixed preflight descriptors for each record-batch message.
+    pub(crate) sources: [crate::scribe::material_plan::SourceMaterialPlan;
+        crate::scribe::material_plan::MAX_SOURCE_PLANS],
+    /// Live prefix length within `sources`.
+    pub(crate) source_count: usize,
 }
 
 /// A request after deterministic event-day splitting and serialization.
@@ -99,8 +108,8 @@ pub(crate) struct NativeSliceProducer {
     source: NativeAdmittedRows,
     /// Push decoder retaining only its schema and current scratch.
     decoder: arrow::ipc::reader::StreamDecoder,
-    /// Unconsumed transport bytes advanced by the decoder.
-    input: Buffer,
+    /// Index of the next preflighted source descriptor.
+    source_index: usize,
     /// Current decoded source retained only across its day slices.
     current: Option<NativeCurrentSource>,
     /// Zero-based ordinal assigned to the next slice.
@@ -143,11 +152,12 @@ impl NativeSliceProducer {
         wal_workspace_bytes: usize,
     ) -> Result<Self, ScribeError> {
         let slice_count = count_native_slices(&source)?;
-        let input = Buffer::from(source.bytes.clone());
+        let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
+        feed_native_schema(&mut decoder, &source)?;
         Ok(Self {
             source,
-            decoder: arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true),
-            input,
+            decoder,
+            source_index: 0,
             current: None,
             slice_index: 0,
             slice_count,
@@ -194,7 +204,9 @@ impl NativeSliceProducer {
                 }
                 self.current = None;
             }
-            let Some(rows) = decode_next_native_source(&mut self.decoder, &mut self.input)? else {
+            let Some(rows) =
+                decode_planned_native_source(&mut self.decoder, &self.source, self.source_index)?
+            else {
                 if self.slice_index != self.slice_count {
                     return Err(ScribeError::Internal {
                         detail: "native slice production diverged from count pass".to_owned(),
@@ -202,6 +214,7 @@ impl NativeSliceProducer {
                 }
                 return Ok(None);
             };
+            self.source_index += 1;
             let rows = stamp_native_source(rows, &self.source)?;
             let days = plan_event_days(&rows)?;
             self.current = Some(NativeCurrentSource {
@@ -216,11 +229,13 @@ impl NativeSliceProducer {
     ///
     /// The same root continues to own the aliased bytes; this operation only
     /// replaces fixed decoder state and resets ordinals.
-    pub(crate) fn restart(&mut self) {
+    pub(crate) fn restart(&mut self) -> Result<(), ScribeError> {
         self.decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
-        self.input = Buffer::from(self.source.bytes.clone());
+        feed_native_schema(&mut self.decoder, &self.source)?;
+        self.source_index = 0;
         self.current = None;
         self.slice_index = 0;
+        Ok(())
     }
 }
 
@@ -232,9 +247,11 @@ impl NativeSliceProducer {
 /// slice-count conversion fails.
 fn count_native_slices(source: &NativeAdmittedRows) -> Result<u32, ScribeError> {
     let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
-    let mut input = Buffer::from(source.bytes.clone());
+    feed_native_schema(&mut decoder, source)?;
     let mut slices = 0_usize;
-    while let Some(rows) = decode_next_native_source(&mut decoder, &mut input)? {
+    for source_index in 0..source.source_count {
+        let rows = decode_planned_native_source(&mut decoder, source, source_index)?
+            .ok_or(ScribeError::InvalidFrame)?;
         let rows = stamp_native_source(rows, source)?;
         slices = slices
             .checked_add(plan_event_days(&rows)?.len())
@@ -242,6 +259,7 @@ fn count_native_slices(source: &NativeAdmittedRows) -> Result<u32, ScribeError> 
                 detail: "native slice count overflow".to_owned(),
             })?;
     }
+    decoder.finish().map_err(|_| ScribeError::InvalidFrame)?;
     u32::try_from(slices).map_err(|_| ScribeError::Internal {
         detail: "native slice count exceeds WAL v4 range".to_owned(),
     })
@@ -253,22 +271,83 @@ fn count_native_slices(source: &NativeAdmittedRows) -> Result<u32, ScribeError> 
 ///
 /// Returns [`ScribeError::InvalidFrame`] when Arrow decoding or final stream
 /// completion diverges from the accepted metadata plan.
-fn decode_next_native_source(
+fn feed_native_schema(
     decoder: &mut arrow::ipc::reader::StreamDecoder,
-    input: &mut Buffer,
-) -> Result<Option<RecordBatch>, ScribeError> {
-    loop {
-        if input.is_empty() {
-            decoder.finish().map_err(|_| ScribeError::InvalidFrame)?;
-            return Ok(None);
-        }
-        if let Some(rows) = decoder
-            .decode(input)
-            .map_err(|_| ScribeError::InvalidFrame)?
-        {
-            return Ok(Some(rows));
-        }
+    source: &NativeAdmittedRows,
+) -> Result<(), ScribeError> {
+    source
+        .bytes
+        .get(source.schema_start..source.schema_end)
+        .ok_or(ScribeError::InvalidFrame)?;
+    let mut input = Buffer::from(source.bytes.slice(source.schema_start..source.schema_end));
+    if decoder
+        .decode(&mut input)
+        .map_err(|_| ScribeError::InvalidFrame)?
+        .is_some()
+        || !input.is_empty()
+    {
+        return Err(ScribeError::InvalidFrame);
     }
+    Ok(())
+}
+
+/// Decodes one descriptor-selected native batch with an admitted current-body copy.
+///
+/// Aligned transport bodies alias the retained request bytes. An unaligned body
+/// is copied once into an exactly sized Arrow allocation while the retained raw
+/// owner remains live; the next source cannot begin until this batch is dropped.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when a descriptor range diverges from
+/// retained bytes or Arrow does not produce exactly one batch.
+fn decode_planned_native_source(
+    decoder: &mut arrow::ipc::reader::StreamDecoder,
+    source: &NativeAdmittedRows,
+    source_index: usize,
+) -> Result<Option<RecordBatch>, ScribeError> {
+    let Some(plan) = source
+        .sources
+        .get(source_index)
+        .filter(|_| source_index < source.source_count)
+    else {
+        return Ok(None);
+    };
+    source
+        .bytes
+        .get(plan.frame_start..plan.body_start)
+        .ok_or(ScribeError::InvalidFrame)?;
+    let mut metadata = Buffer::from(source.bytes.slice(plan.frame_start..plan.body_start));
+    if decoder
+        .decode(&mut metadata)
+        .map_err(|_| ScribeError::InvalidFrame)?
+        .is_some()
+        || !metadata.is_empty()
+    {
+        return Err(ScribeError::InvalidFrame);
+    }
+    let raw_body = source
+        .bytes
+        .get(plan.body_start..plan.body_end)
+        .ok_or(ScribeError::InvalidFrame)?;
+    let aligned = (source.bytes.as_ptr() as usize)
+        .checked_add(plan.body_start)
+        .is_some_and(|address| address & 7 == 0);
+    let mut body = if aligned {
+        Buffer::from(source.bytes.slice(plan.body_start..plan.body_end))
+    } else {
+        let mut copied = arrow::buffer::MutableBuffer::new(raw_body.len());
+        copied.extend_from_slice(raw_body);
+        Buffer::from(copied)
+    };
+    let rows = decoder
+        .decode(&mut body)
+        .map_err(|_| ScribeError::InvalidFrame)?
+        .ok_or(ScribeError::InvalidFrame)?;
+    if !body.is_empty() {
+        return Err(ScribeError::InvalidFrame);
+    }
+    Ok(Some(rows))
 }
 
 /// Applies deterministic native contract validation and managed stamping.
@@ -550,5 +629,107 @@ fn notify_completion(
 ) {
     if let Some(sender) = completion.take() {
         let _ = sender.send(Err(error.completion_copy()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use bytes::Bytes;
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::ids::DataTenantId;
+    use wyrd_spec::request_id::RequestId;
+
+    use super::{
+        EventTimeWindow, NativeAdmittedRows, decode_planned_native_source, feed_native_schema,
+    };
+    use crate::schema::SchemaFingerprint;
+    use crate::scribe::material_plan::ScribeIngressPlanner;
+
+    /// Encodes one scalar native stream whose body can be shifted off alignment.
+    fn native_stream() -> (Bytes, SchemaFingerprint) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+        )
+        .expect("native batch");
+        let fingerprint = SchemaFingerprint::from_arrow_schema(schema.as_ref());
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("stream writer");
+        writer.write(&batch).expect("stream batch");
+        writer.finish().expect("stream finish");
+        (Bytes::from(bytes), fingerprint)
+    }
+
+    /// Builds the retained owner required by the descriptor-driven decoder.
+    fn planned_source(bytes: Bytes, fingerprint: SchemaFingerprint) -> NativeAdmittedRows {
+        let plan = ScribeIngressPlanner::default()
+            .plan_native(&bytes, 0)
+            .expect("native plan");
+        let tenant = DataTenantId::new_v7();
+        NativeAdmittedRows {
+            bytes,
+            principal: Principal {
+                id: PrincipalId::new(uuid::Uuid::now_v7()),
+                kind: PrincipalKind::User,
+                tenant_id: tenant,
+                roles: Vec::new(),
+                effective_permissions: PermissionSet::new(),
+            },
+            expected_schema_fingerprint: fingerprint,
+            request_id: RequestId::now_v7(),
+            batch_id: uuid::Uuid::now_v7(),
+            event_time_window: EventTimeWindow::default(),
+            receipt_micros: 0,
+            schema_start: plan.native_schema_start,
+            schema_end: plan.native_schema_end,
+            sources: plan.sources,
+            source_count: plan.source_count,
+        }
+    }
+
+    /// Proves aligned bodies alias raw bytes while unaligned bodies copy one current body.
+    #[test]
+    fn native_descriptor_decoder_accepts_aligned_and_unaligned_transport() {
+        let (aligned, fingerprint) = native_stream();
+        let aligned_plan = ScribeIngressPlanner::default()
+            .plan_native(&aligned, 0)
+            .expect("aligned plan");
+        assert_eq!(aligned_plan.aligned_copy_bytes, 0);
+
+        let mut shifted = Vec::with_capacity(aligned.len() + 1);
+        shifted.push(0);
+        shifted.extend_from_slice(&aligned);
+        let unaligned = Bytes::from(shifted).slice(1..);
+        let unaligned_plan = ScribeIngressPlanner::default()
+            .plan_native(&unaligned, 0)
+            .expect("unaligned plan");
+        assert_eq!(
+            unaligned_plan.aligned_copy_bytes,
+            unaligned_plan.sources[0].body_end - unaligned_plan.sources[0].body_start
+        );
+
+        for source in [
+            planned_source(aligned, fingerprint),
+            planned_source(unaligned, fingerprint),
+        ] {
+            let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
+            feed_native_schema(&mut decoder, &source).expect("schema");
+            let batch = decode_planned_native_source(&mut decoder, &source, 0)
+                .expect("decode")
+                .expect("batch");
+            assert_eq!(batch.num_rows(), 2);
+        }
     }
 }

@@ -948,7 +948,12 @@ fn append_managed_columns(
 pub(crate) enum ScribePersistenceCpuOp {
     Preprocess(Box<AdmittedAppend>),
     /// Advance one root-owned native producer by at most one slice.
-    ProduceNativeSlice(Box<NativeSliceProducer>),
+    ProduceNativeSlice {
+        /// Current-only producer state moved into the detached Rayon job.
+        producer: Box<NativeSliceProducer>,
+        /// Root-backed owner that must outlive every allocation in the job.
+        memory: crate::resources::ScribeMemoryLease,
+    },
     EncodeParquet(Box<EncodeParquetOp>),
     RestoreReplay {
         replayed: Box<ReplayedSealKey>,
@@ -982,6 +987,8 @@ pub(crate) enum ScribePersistenceCpuResult {
         producer: Box<NativeSliceProducer>,
         /// Current slice, or `None` after exact exhaustion.
         slice: Option<PreparedSlice>,
+        /// Root-backed owner returned only after the detached job completes.
+        memory: crate::resources::ScribeMemoryLease,
     },
     ParquetEncoded(ParquetEncoded),
     ReplayRestored(Box<FrozenMemtable>),
@@ -1108,9 +1115,16 @@ impl ScribePersistenceCpuPool {
                     }
                     prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
                 }
-                ScribePersistenceCpuOp::ProduceNativeSlice(mut producer) => {
+                ScribePersistenceCpuOp::ProduceNativeSlice {
+                    mut producer,
+                    memory,
+                } => {
                     let slice = producer.next_slice()?;
-                    Ok(ScribePersistenceCpuResult::NativeSliceProduced { producer, slice })
+                    Ok(ScribePersistenceCpuResult::NativeSliceProduced {
+                        producer,
+                        slice,
+                        memory,
+                    })
                 }
                 ScribePersistenceCpuOp::EncodeParquet(operation) => {
                     let EncodeParquetOp {

@@ -2031,15 +2031,25 @@ struct DurableSlice {
     slice_index: u32,
     /// Total slices in the closed batch slice set.
     slice_count: u32,
+    /// Whether this slice belongs to a batch whose COMMIT was already fsynced.
+    commit_already_synced: bool,
 }
 
 /// A WAL-synced slice whose Arrow rows have not yet reached the active
 /// memtable. Successful insertion removes the entry, so this bounded index
 /// only covers the fsync-success/memtable-failure retry window.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct WalSliceState {
     /// WAL sequence number that can be reused without another append.
     lsn: crate::scribe::wal::WalLsn,
+    /// SHA-256 digest of the exact durable slice payload.
+    payload_digest: [u8; 32],
+    /// Exact durable slice payload length.
+    payload_len: u32,
+    /// Stable ordinal in the committed batch slice set.
+    slice_index: u32,
+    /// Complete committed batch slice count.
+    slice_count: u32,
 }
 
 /// Intermediate state shared by the WAL write, sync, and insert stages.
@@ -2087,7 +2097,13 @@ impl ShardOwner {
                     seal_key: slice.seal_key.clone(),
                     slice_index: slice.slice_index,
                 },
-                WalSliceState { lsn: slice.lsn },
+                WalSliceState {
+                    lsn: slice.lsn,
+                    payload_digest: slice.payload_digest,
+                    payload_len: slice.payload_len,
+                    slice_index: slice.slice_index,
+                    slice_count: slice.slice_count,
+                },
             );
         }
         #[cfg(any(test, feature = "test-support"))]
@@ -2151,6 +2167,18 @@ impl ShardOwner {
                 .collect::<Vec<_>>();
             if slices.is_empty() {
                 continue;
+            }
+            let committed_retries = slices
+                .iter()
+                .filter(|slice| slice.commit_already_synced)
+                .count();
+            if committed_retries == slices.len() {
+                continue;
+            }
+            if committed_retries != 0 {
+                return Err(ScribeError::Internal {
+                    detail: "WAL retry mixed committed and uncommitted slices".to_owned(),
+                });
             }
             slices.sort_by_key(|slice| slice.slice_index);
             let slice_count = slices[0].slice_count;
@@ -2303,9 +2331,9 @@ impl ShardOwner {
                 }
                 let slice_id = slice.id.clone();
                 let (slice, result) = match if let Some(previous) =
-                    self.synced_not_inserted.get(&slice_id)
+                    self.synced_not_inserted.get(&slice_id).copied()
                 {
-                    self.reuse_synced_slice(append, slice, previous.lsn)
+                    self.reuse_synced_slice(append, slice, &previous)
                 } else {
                     self.write_prepared_slice(append, slice).await
                 } {
@@ -2363,19 +2391,23 @@ impl ShardOwner {
                 let producer = producer_slot.take().ok_or_else(|| ScribeError::Internal {
                     detail: "native prepared-slice producer owner is missing".to_owned(),
                 })?;
+                let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
+                    detail: "native root owner missing before CPU dispatch".to_owned(),
+                })?;
                 match persistence_cpu
-                    .submit(
-                        crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceNativeSlice(
-                            producer,
-                        ),
-                    )
+                    .submit(crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceNativeSlice {
+                        producer,
+                        memory,
+                    })
                     .await?
                 {
                     crate::scribe::execution_lanes::ScribePersistenceCpuResult::NativeSliceProduced {
                         producer: returned,
                         slice,
+                        memory,
                     } => {
                         *producer_slot = Some(returned);
+                        append.memory = Some(memory);
                         Ok(slice)
                     }
                     _ => Err(ScribeError::Internal {
@@ -2452,6 +2484,7 @@ impl ShardOwner {
                 payload_len: result.payload_len,
                 slice_index,
                 slice_count,
+                commit_already_synced: false,
             },
             result,
         ))
@@ -2469,7 +2502,7 @@ impl ShardOwner {
         &mut self,
         append: &mut PreparedAppend,
         slice: PreparedSlice,
-        lsn: crate::scribe::wal::WalLsn,
+        previous: &WalSliceState,
     ) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
         let retain_rows = matches!(&append.slices, PreparedSliceSet::Materialized(_));
         let PreparedSlice {
@@ -2490,19 +2523,20 @@ impl ShardOwner {
                 memtable_bytes,
                 active_reserved: retain_rows,
                 batch_id: *append.batch_id.as_bytes(),
-                lsn,
-                payload_digest: [0; 32],
-                payload_len: 0,
-                slice_index: 0,
-                slice_count: 1,
+                lsn: previous.lsn,
+                payload_digest: previous.payload_digest,
+                payload_len: previous.payload_len,
+                slice_index: previous.slice_index,
+                slice_count: previous.slice_count,
+                commit_already_synced: true,
             },
             crate::scribe::wal::WalAppendResult {
-                lsn,
+                lsn: previous.lsn,
                 #[cfg(feature = "bench-support")]
                 encoded_bytes: 0,
                 touched_segments: Vec::new(),
-                payload_digest: [0; 32],
-                payload_len: 0,
+                payload_digest: previous.payload_digest,
+                payload_len: previous.payload_len,
             },
         ))
     }
@@ -2555,7 +2589,7 @@ impl ShardOwner {
         for append in &mut state.prepared {
             let is_native = match &mut append.slices {
                 PreparedSliceSet::Native(Some(producer)) => {
-                    producer.restart();
+                    producer.restart()?;
                     true
                 }
                 PreparedSliceSet::Native(None) => {
@@ -2579,7 +2613,13 @@ impl ShardOwner {
                     continue;
                 };
                 let mut durable = state.durable.remove(position);
-                if durable.seal_key != produced.seal_key {
+                let (payload_digest, payload_len) = produced.wal_append.payload_identity()?;
+                if durable.seal_key != produced.seal_key
+                    || durable.slice_index != produced.wal_append.slice_index
+                    || durable.slice_count != produced.wal_append.slice_count
+                    || durable.payload_digest != payload_digest
+                    || durable.payload_len != payload_len
+                {
                     return Err(ScribeError::Internal {
                         detail: "regenerated native slice identity diverged after COMMIT"
                             .to_owned(),
@@ -3261,6 +3301,7 @@ mod tests {
                     payload_len: 0,
                     slice_index: 0,
                     slice_count: 1,
+                    commit_already_synced: false,
                 }],
                 &mut HashMap::new(),
             )

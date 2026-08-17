@@ -1126,6 +1126,7 @@ impl AdmittedQueryGuard {
     pub(super) fn release(mut self) {
         self.cancellation.cancel();
         self.live_reservations.clear();
+        self.physical_projections.clear();
         if let Some(permit) = self.local_permit.take() {
             permit.release_inner();
         }
@@ -1357,6 +1358,45 @@ mod tests {
         assert_eq!(pool.reserved(), baseline + expected_bytes);
         drop(admitted);
         assert_eq!(pool.reserved(), 0);
+    }
+
+    /// Explicit release drops physical projection children before the query root.
+    #[tokio::test]
+    async fn oracle_explicit_release_clears_projection_without_poisoning_root() {
+        let owner = owner(OracleAdmissionConfig::default());
+        let tenant = DataTenantId::new_v7();
+        let mut admitted = owner
+            .admit(PreparedAdmission {
+                tenant,
+                query_class: QueryClass::Interactive,
+                local_ratio: 0.0,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("query admission");
+        let table =
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans");
+        let binding = crate::catalog::TenantTableBinding::resolve((tenant, table))
+            .expect("tenant table binding");
+        let pool = admitted.memory_pool().expect("admitted query memory pool");
+
+        admitted
+            .retain_physical_bindings(std::iter::once(&binding))
+            .expect("projection child split from admitted query");
+        assert!(pool.reserved() > 0);
+        admitted.release();
+
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            owner
+                .shared
+                .resources
+                .snapshot()
+                .expect("explicit release leaves root accounting healthy")
+                .oracle_memory_used_bytes,
+            0
+        );
     }
 
     /// Local admission capacity never exceeds the independent class ceiling.

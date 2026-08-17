@@ -541,6 +541,39 @@ impl SealedFragmentExecutor {
                     .map_err(|_| ExecutorError::Capacity)
             })
             .transpose()?;
+        Ok(self.execute_validated(fragment, query_class, worker_resources))
+    }
+
+    /// Opens an incremental fragment attempt beneath an already-retained capacity owner.
+    ///
+    /// Dispatcher callers use this path only after the remote worker quantum or
+    /// leader-local admitted query has been retained for the complete stream.
+    /// Validation remains identical to [`Self::execute`], but this method never
+    /// reacquires root Oracle capacity.
+    ///
+    /// # Errors
+    /// Returns a closed validation error before any IO. Storage, decode, schema,
+    /// size, and deadline errors are emitted by the returned stream.
+    pub(crate) fn execute_under_retained_owner(
+        &self,
+        fragment: &SealedScanFragment,
+        query_class: QueryClass,
+    ) -> Result<WorkerFrameStream, ExecutorError> {
+        self.validate(fragment)?;
+        Ok(self.execute_validated(fragment, query_class, None))
+    }
+
+    /// Builds the lazy attempt stream after validation and capacity selection.
+    ///
+    /// `worker_resources` is present only for standalone execution. Dispatcher
+    /// execution passes `None` because its surrounding worker stream owns the
+    /// applicable remote or leader-local capacity for the same lifetime.
+    fn execute_validated(
+        &self,
+        fragment: &SealedScanFragment,
+        query_class: QueryClass,
+        worker_resources: Option<crate::resources::OracleWorkerResources>,
+    ) -> WorkerFrameStream {
         let fragment = fragment.clone();
         let executor = self.clone();
         let metrics = WorkerScanCollector::new(query_class);
@@ -572,7 +605,7 @@ impl SealedFragmentExecutor {
             }
             yield encoder.finish(&fragment)?;
         };
-        Ok(Box::pin(output))
+        Box::pin(output)
     }
 
     /// Executes one file from a fragment for narrow filesystem tests.

@@ -683,7 +683,10 @@ impl OraclePeerWorker {
             security_audit: Arc::clone(&self.security_audit),
             tenant_id,
         };
-        let frames = match self.executor.execute(&fragment, running.query_class) {
+        let frames = match self
+            .executor
+            .execute_under_retained_owner(&fragment, running.query_class)
+        {
             Ok(frames) => frames,
             Err(error) => return Err(mapper.classify(error).await),
         };
@@ -1902,15 +1905,129 @@ impl From<PeerSecurityError> for DispatchError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use iceberg::io::FileIO;
+    use parquet::arrow::ArrowWriter;
+    use tempfile::NamedTempFile;
+
     use super::super::fragment::{SealedScanFile, SealedSourceTier};
-    use super::super::peer::DeterministicTestSigner;
+    use super::super::peer::{DeterministicTestSigner, NoopPeerSecurityAudit, VerifiedClaimsBytes};
     use super::*;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use wyrd_spec::vala::api::{
         ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, OracleCapabilitiesV1,
     };
+
+    /// Deterministic verifier that preserves the already encoded claims bytes.
+    struct ClaimsPassthroughVerifier;
+
+    #[async_trait]
+    impl PeerTicketVerifier for ClaimsPassthroughVerifier {
+        /// Returns the ticket claims after the test constructs matching audience and fence values.
+        ///
+        /// # Errors
+        ///
+        /// This deterministic verifier does not fail; worker-side typed claim
+        /// validation still runs before reservation transition and fragment IO.
+        async fn verify_peer_ticket(
+            &self,
+            ticket: &wyrd_spec::vala::api::SignedPeerTicket,
+            _expected_worker: NodeId,
+            _expected_worker_fence: u64,
+            _now: DateTime<Utc>,
+        ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
+            Ok(VerifiedClaimsBytes(ticket.claims_bytes.clone()))
+        }
+    }
+
+    /// Writes one real Parquet file and plans its immutable sealed fragment.
+    fn dispatcher_parquet_fragment() -> (NamedTempFile, SealedScanFragment) {
+        let mut file = NamedTempFile::new().expect("temporary Parquet file");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("fixture batch");
+        let mut writer = ArrowWriter::try_new(file.as_file_mut(), Arc::clone(&schema), None)
+            .expect("Parquet writer");
+        writer.write(&batch).expect("Parquet batch");
+        writer.close().expect("Parquet close");
+        let size_bytes = file.as_file().metadata().expect("file metadata").len();
+        let location = file.path().to_string_lossy().into_owned();
+        let leaf = crate::oracle::fragment::PreparedSealedLeaf {
+            binding: Path::new(&location)
+                .parent()
+                .expect("fixture parent")
+                .to_string_lossy()
+                .into_owned(),
+            tier: SealedSourceTier::Iceberg,
+            pinned_digest: "dispatcher-test-digest".to_owned(),
+            files: vec![SealedScanFile {
+                location,
+                row_groups: vec![0],
+                size_bytes,
+                estimated_rows: 3,
+            }],
+            projection: vec!["value".to_owned()],
+            predicates: Vec::new(),
+            schema_fingerprint: crate::oracle::sealed_fragment_schema_fingerprint(&schema),
+            deadline_unix_ms: Utc::now().timestamp_millis() + 60_000,
+        };
+        let fragment = crate::oracle::fragment::FragmentPlanner
+            .plan(&leaf, &crate::oracle::fragment::FragmentConfig::default())
+            .expect("validated fragment")
+            .into_iter()
+            .next()
+            .expect("one fragment");
+        (file, fragment)
+    }
+
+    /// Encodes one matching worker request for a retained reservation.
+    fn worker_request(
+        fragment: &SealedScanFragment,
+        reservation_id: ReservationId,
+        node: NodeId,
+        fence: FencingToken,
+        query_id: QueryId,
+        tenant: DataTenantId,
+    ) -> ExecuteFragmentRequest {
+        let claims = PeerTicketClaims {
+            protocol_version: PEER_PROTOCOL_VERSION,
+            audience: node.as_uuid().as_bytes().to_vec(),
+            worker_fence: fence,
+            leader_node_id: node.as_uuid().as_bytes().to_vec(),
+            leader_fence: fence,
+            query_id: query_id.as_uuid().as_bytes().to_vec(),
+            tenant_id: tenant.as_uuid().as_bytes().to_vec(),
+            nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            expires_at_ms: fragment.deadline_unix_ms,
+            binding: fragment.binding.clone(),
+            fragment_digest: fragment.fragment_id.clone(),
+            manifest_digest: fragment.pinned_digest.clone(),
+            projection_digest: projection_digest(&fragment.projection),
+            permission_digest: "permission".to_owned(),
+        };
+        let ticket = DeterministicTestSigner {
+            key_id: "test".to_owned(),
+        }
+        .mint_peer_ticket(&claims)
+        .expect("deterministic ticket");
+        ExecuteFragmentRequest {
+            ticket,
+            fragment_bytes: fragment.encode().expect("fragment encoding"),
+            reservation_id,
+        }
+    }
 
     /// Builds one Oracle lease for deterministic topology resolution cases.
     fn topology_lease(
@@ -2506,6 +2623,138 @@ mod tests {
         drop(leader_slot);
         assert!(slots.try_pending().is_ok());
         assert!(slots.try_running(1).is_ok());
+    }
+
+    /// Leader-admitted execution reaches a frame while the exclusive query owns the root.
+    #[tokio::test]
+    async fn oracle_peer_leader_admitted_executes_under_active_query_owner() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let query_owner = oracle
+            .try_acquire_query(crate::resources::OracleResourceRequest { local_ratio: 1.0 })
+            .expect("exclusive query owner");
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let tenant = DataTenantId::new_v7();
+        let fence = 31;
+        let reservations = Arc::new(ReservationRegistry::new(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            1,
+        ));
+        let (_file, fragment) = dispatcher_parquet_fragment();
+        let worker = OraclePeerWorker::new_with_resources(
+            node,
+            fence,
+            Arc::new(ClaimsPassthroughVerifier),
+            Arc::new(NoopPeerSecurityAudit),
+            Arc::clone(&reservations),
+            SealedFragmentExecutor::with_resources(FileIO::new_with_fs(), oracle.clone()),
+            oracle.clone(),
+        );
+        let now = Utc::now();
+        let pending = reservations
+            .reserve_local(
+                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("leader-local pending reservation");
+        let request = worker_request(
+            &fragment,
+            pending.reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+        );
+
+        let mut execution = worker
+            .execute_local(request)
+            .await
+            .expect("leader-admitted execution");
+        let frame = execution
+            .stream
+            .next()
+            .await
+            .expect("leader-admitted stream reaches a frame")
+            .expect("leader-admitted frame succeeds");
+        assert!(matches!(frame, WorkerAttemptFrame::Schema(_)));
+        drop(execution);
+        drop(query_owner);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("healthy root after leader-admitted execution")
+                .oracle_memory_used_bytes,
+            0
+        );
+    }
+
+    /// Remote worker execution retains exactly one root quantum until stream drop.
+    #[tokio::test]
+    async fn oracle_peer_remote_execution_owns_one_worker_quantum() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let tenant = DataTenantId::new_v7();
+        let fence = 37;
+        let reservations = Arc::new(ReservationRegistry::new(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            1,
+        ));
+        let (_file, fragment) = dispatcher_parquet_fragment();
+        let worker = OraclePeerWorker::new_with_resources(
+            node,
+            fence,
+            Arc::new(ClaimsPassthroughVerifier),
+            Arc::new(NoopPeerSecurityAudit),
+            Arc::clone(&reservations),
+            SealedFragmentExecutor::with_resources(FileIO::new_with_fs(), oracle.clone()),
+            oracle.clone(),
+        );
+        let now = Utc::now();
+        let pending = reservations
+            .reserve(
+                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("remote pending reservation");
+        let request = worker_request(
+            &fragment,
+            pending.reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+        );
+
+        let mut execution = worker.execute(request).await.expect("remote execution");
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("healthy remote worker snapshot")
+                .oracle_memory_used_bytes,
+            crate::resources::ORACLE_PARTITION_MEMORY_BYTES
+        );
+        while let Some(frame) = execution.stream.next().await {
+            frame.expect("remote worker frame");
+        }
+        drop(execution);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("healthy root after remote stream completion")
+                .oracle_memory_used_bytes,
+            0
+        );
     }
 
     /// Expiry cleanup releases pending capacity and release is fenced and idempotent.

@@ -86,7 +86,8 @@ impl ExistingScribeBatchCommit {
 /// # Errors
 ///
 /// Returns [`SqlError`] when the tenant does not match `conn`, the insert or
-/// audit write fails, or an existing commit has contradictory durable identity.
+/// audit write fails, the audit request identity differs from the durable
+/// fence, or an existing commit has contradictory durable identity.
 pub async fn record(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
@@ -95,6 +96,13 @@ pub async fn record(
     if conn.data_tenant_id() != commit.tenant {
         return Err(invariant(
             "scribe batch commit tenant does not match TenantConn",
+        ));
+    }
+    let audit_request_id = uuid::Uuid::parse_str(audit_event.request_id.as_str())
+        .map_err(|_| invariant("scribe ingest audit request identity is not a UUID"))?;
+    if audit_request_id != commit.request_id {
+        return Err(invariant(
+            "scribe ingest audit request identity does not match its control fence",
         ));
     }
     let inserted: Option<bool> = sqlx::query_scalar(

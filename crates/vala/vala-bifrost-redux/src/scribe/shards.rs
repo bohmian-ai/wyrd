@@ -2085,6 +2085,7 @@ impl ShardOwner {
                 AppendSliceId {
                     batch_id: uuid::Uuid::from_bytes(slice.batch_id),
                     seal_key: slice.seal_key.clone(),
+                    slice_index: slice.slice_index,
                 },
                 WalSliceState { lsn: slice.lsn },
             );
@@ -2650,6 +2651,7 @@ impl ShardOwner {
         self.synced_not_inserted.remove(&AppendSliceId {
             batch_id: uuid::Uuid::from_bytes(slice.batch_id),
             seal_key: slice.seal_key,
+            slice_index: slice.slice_index,
         });
         let entry = rows_by_append.entry(slice.batch_id).or_default();
         *entry = entry.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
@@ -3418,6 +3420,7 @@ mod tests {
             rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
             measured_wire_bytes: initial_bytes,
             admitted_bytes: initial_bytes,
+            wal_workspace_bytes: crate::gate::limits::BIFROST_WAL_WORKSPACE_LIMIT_BYTES,
             reservation,
             memory,
             tenant: key.tenant,

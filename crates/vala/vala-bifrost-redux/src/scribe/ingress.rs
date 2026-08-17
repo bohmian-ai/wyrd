@@ -408,6 +408,7 @@ impl ScribeImpl {
             rows,
             measured_wire_bytes: frame.measured_wire_bytes,
             admitted_bytes: material_plan.root_bytes,
+            wal_workspace_bytes: material_plan.wal_workspace_bytes,
             reservation,
             memory,
             tenant: frame.principal.tenant_id,

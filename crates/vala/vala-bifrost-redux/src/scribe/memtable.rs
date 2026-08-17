@@ -1518,7 +1518,11 @@ mod tests {
                 batch_id: *batch_id.as_bytes(),
                 wal_lsn: WalLsn::new(1),
                 rows_accepted,
-                append_slice_id: AppendSliceId { batch_id, seal_key },
+                append_slice_id: AppendSliceId {
+                    batch_id,
+                    seal_key,
+                    slice_index: 0,
+                },
                 schema_fingerprint: [0; 32],
             }],
             wal_segments: Vec::new(),

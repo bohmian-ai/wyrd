@@ -16,7 +16,7 @@
 //! Version 4 is the only accepted format. Earlier segment versions are rejected
 //! before replay.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -216,6 +216,11 @@ impl SegmentHeader {
                 detail: format!("invalid WAL shard id: {shard_id}"),
             });
         }
+        if buf[33..40].iter().any(|byte| *byte != 0) || buf[48..60].iter().any(|byte| *byte != 0) {
+            return Err(ScribeError::Internal {
+                detail: "segment header reserved bytes non-zero".to_owned(),
+            });
+        }
         let seg_seq = u64::from_le_bytes([
             buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
         ]);
@@ -289,6 +294,31 @@ pub struct WalRecord {
     pub slice_count: u32,
     /// Self-describing slice payload.
     pub payload: Vec<u8>,
+}
+
+/// Validated fixed v4 record header retained while replay selects the next LSN.
+///
+/// The header contains no scalable payload allocation. Replay can therefore
+/// peek across the fixed shard set, choose the stream-wide next record, and
+/// allocate only that record's declared payload.
+#[derive(Debug)]
+struct DecodedWalRecordHeader {
+    /// Exact header bytes included in the frame CRC.
+    encoded: [u8; RECORD_HEADER_SIZE],
+    /// Stream-wide log sequence number.
+    lsn: WalLsn,
+    /// Validated SLICE or COMMIT flag.
+    flags: u32,
+    /// Authenticated tenant identity.
+    tenant_id: [u8; 16],
+    /// Stable logical batch identity.
+    batch_id: [u8; 16],
+    /// Slice ordinal or terminal slice count.
+    slice_index: u32,
+    /// Closed slice-set cardinality.
+    slice_count: u32,
+    /// Checked payload length declared by the frame.
+    payload_len: u32,
 }
 
 /// Explicit WAL sizing used by every Scribe writer.
@@ -424,6 +454,7 @@ impl PreparedWalAppend {
         self.lsn = lsn;
     }
 
+    #[cfg(test)]
     fn record(&self) -> Result<WalRecord, ScribeError> {
         #[cfg(test)]
         if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
@@ -460,8 +491,22 @@ impl PreparedWalAppend {
     }
 
     pub(crate) fn encoded_len(&self) -> Result<usize, ScribeError> {
+        self.payload_len()?
+            .checked_add(RECORD_HEADER_SIZE + 4)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "encoded WAL record length overflow".to_owned(),
+            })
+    }
+
+    /// Returns the exact payload length without materializing the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal invariant error when a self-describing field exceeds
+    /// its fixed WAL width or checked length arithmetic overflows.
+    fn payload_len(&self) -> Result<usize, ScribeError> {
         if self.commit_digest.is_some() {
-            return Ok(RECORD_HEADER_SIZE + 32 + 4);
+            return Ok(32);
         }
         let seal_key = self
             .seal_key
@@ -497,12 +542,118 @@ impl PreparedWalAppend {
             .saturating_add(usize::from(day_len))
             .saturating_add(usize::try_from(audit_len).expect("invariant: u32 fits usize"))
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
-        payload_len
-            .checked_add(RECORD_HEADER_SIZE + 4)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "encoded WAL record length overflow".to_owned(),
-            })
+        Ok(payload_len)
     }
+}
+
+/// Streams one prepared record from borrowed payload owners into its segment.
+///
+/// # Errors
+///
+/// Returns an invariant error for invalid fixed-width metadata or an IO error
+/// from the segment. No request-sized WAL payload or frame allocation occurs.
+fn append_prepared_borrowed(
+    segment: &WalSegment,
+    prepared: &PreparedWalAppend,
+    encoded_len: usize,
+) -> Result<([u8; 32], u32), ScribeError> {
+    let payload_len =
+        u32::try_from(prepared.payload_len()?).map_err(|_| ScribeError::Internal {
+            detail: "WAL v4 payload exceeds its u32 record bound".to_owned(),
+        })?;
+    let (flags, tenant_id) = if prepared.commit_digest.is_some() {
+        (
+            RECORD_FLAG_COMMIT,
+            prepared
+                .commit_tenant
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "WAL v4 commit is missing its authenticated tenant".to_owned(),
+                })?,
+        )
+    } else {
+        let seal_key = prepared
+            .seal_key
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
+            })?;
+        (RECORD_FLAG_SLICE, *seal_key.tenant.as_uuid().as_bytes())
+    };
+    let header = encode_record_header(
+        prepared.lsn,
+        flags,
+        tenant_id,
+        prepared.batch_id,
+        prepared.slice_index,
+        prepared.slice_count,
+        payload_len,
+    );
+    let write_parts = |parts: &[&[u8]]| -> Result<[u8; 32], ScribeError> {
+        let mut digest = Sha256::new();
+        let mut crc = crc32c::crc32c(&header);
+        for part in parts {
+            digest.update(part);
+            crc = crc32c::crc32c_append(crc, part);
+        }
+        segment.append_borrowed(&header, parts, crc.to_le_bytes(), encoded_len)?;
+        Ok(digest.finalize().into())
+    };
+    let payload_digest = if let Some(digest) = prepared.commit_digest.as_ref() {
+        write_parts(&[digest.as_slice()])?
+    } else {
+        let seal_key = prepared
+            .seal_key
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
+            })?;
+        let namespace = seal_key.table.namespace.as_str().as_bytes();
+        let name = seal_key.table.name.as_bytes();
+        let tenant_id = *seal_key.tenant.as_uuid().as_bytes();
+        let table_len = u16::try_from(namespace.len() + 1 + name.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
+        let mut day = FixedText::<16>::new();
+        write!(day, "{}", seal_key.day.as_date().format("%Y-%m-%d")).map_err(|_| {
+            ScribeError::Internal {
+                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
+            }
+        })?;
+        let day_len = [
+            u8::try_from(day.as_bytes().len()).map_err(|_| ScribeError::Internal {
+                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
+            })?,
+        ];
+        let audit_len = u32::try_from(prepared.audit.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
+        let data_len = u32::try_from(prepared.data.len())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
+            })?
+            .to_le_bytes();
+        let parts: [&[u8]; 13] = [
+            &SLICE_PAYLOAD_MAGIC,
+            &tenant_id,
+            &table_len,
+            namespace,
+            b".",
+            name,
+            &day_len,
+            day.as_bytes(),
+            &prepared.schema_fingerprint,
+            &audit_len,
+            &prepared.audit,
+            &data_len,
+            &prepared.data,
+        ];
+        write_parts(&parts)?
+    };
+    Ok((payload_digest, payload_len))
 }
 
 const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S3SL";
@@ -516,6 +667,45 @@ impl FmtWrite for CountWriter<'_> {
     }
 }
 
+/// Stack-backed formatter for the fixed-width partition-day field.
+struct FixedText<const N: usize> {
+    /// Inline bytes written so far.
+    bytes: [u8; N],
+    /// Live prefix length within `bytes`.
+    len: usize,
+}
+
+impl<const N: usize> FixedText<N> {
+    /// Constructs an empty inline formatter.
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    /// Returns the initialized inline prefix.
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl<const N: usize> FmtWrite for FixedText<N> {
+    /// Copies one formatted fragment into the fixed inline capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::fmt::Error`] when the fragment exceeds remaining space.
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(std::fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        destination.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn encode_slice_payload(
     seal_key: &SealKey,
     schema_fingerprint: [u8; 32],
@@ -532,6 +722,7 @@ fn encode_slice_payload(
     )
 }
 
+#[cfg(test)]
 fn encode_slice_payload_parts(
     tenant: &[u8; 16],
     table_fqn: &str,
@@ -861,6 +1052,25 @@ impl WalRecord {
     ///
     /// Panics only if the fixed-size local header slicing invariant is broken.
     pub fn decode_from<R: Read>(reader: &mut R) -> Result<Option<Self>, ScribeError> {
+        let Some(header) = Self::decode_header_from(reader)? else {
+            return Ok(None);
+        };
+        Self::decode_payload_from(reader, header).map(Some)
+    }
+
+    /// Reads and validates one fixed record header without allocating payload memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for a torn header, unsupported version, invalid
+    /// flags, non-zero reserved field, or inconsistent slice bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed-size local header slicing invariant is broken.
+    fn decode_header_from<R: Read>(
+        reader: &mut R,
+    ) -> Result<Option<DecodedWalRecordHeader>, ScribeError> {
         let mut header = [0_u8; RECORD_HEADER_SIZE];
         match reader.read(&mut header[..1]) {
             Ok(0) => return Ok(None),
@@ -927,8 +1137,35 @@ impl WalRecord {
                 detail: "invalid WAL v4 record bounds".to_owned(),
             });
         }
+        Ok(Some(DecodedWalRecordHeader {
+            encoded: header,
+            lsn,
+            flags,
+            tenant_id,
+            batch_id,
+            slice_index,
+            slice_count,
+            payload_len,
+        }))
+    }
+
+    /// Reads and authenticates the payload declared by a validated header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the payload or CRC is torn, or when the
+    /// complete frame CRC does not match.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the public `u32` payload bound does not fit `usize` on a
+    /// supported target.
+    fn decode_payload_from<R: Read>(
+        reader: &mut R,
+        header: DecodedWalRecordHeader,
+    ) -> Result<Self, ScribeError> {
         let payload_len =
-            usize::try_from(payload_len).expect("u32 fits usize on supported targets");
+            usize::try_from(header.payload_len).expect("u32 fits usize on supported targets");
         let mut payload = vec![0u8; payload_len];
         reader
             .read_exact(&mut payload)
@@ -946,7 +1183,7 @@ impl WalRecord {
         let expected_crc = u32::from_le_bytes(crc_buf);
 
         let mut crc_input = Vec::with_capacity(RECORD_HEADER_SIZE + payload.len());
-        crc_input.extend_from_slice(&header);
+        crc_input.extend_from_slice(&header.encoded);
         crc_input.extend_from_slice(&payload);
 
         let computed_crc = crc32c_hash(&crc_input);
@@ -958,16 +1195,40 @@ impl WalRecord {
             });
         }
 
-        Ok(Some(Self {
-            lsn,
-            flags,
-            tenant_id,
-            batch_id,
-            slice_index,
-            slice_count,
+        Ok(Self {
+            lsn: header.lsn,
+            flags: header.flags,
+            tenant_id: header.tenant_id,
+            batch_id: header.batch_id,
+            slice_index: header.slice_index,
+            slice_count: header.slice_count,
             payload,
-        }))
+        })
     }
+}
+
+/// Encodes the fixed WAL record header into caller-owned stack storage.
+fn encode_record_header(
+    lsn: WalLsn,
+    flags: u32,
+    tenant_id: [u8; 16],
+    batch_id: [u8; 16],
+    slice_index: u32,
+    slice_count: u32,
+    payload_len: u32,
+) -> [u8; RECORD_HEADER_SIZE] {
+    let mut header = [0_u8; RECORD_HEADER_SIZE];
+    header[0..8].copy_from_slice(&RECORD_MAGIC);
+    header[8..10].copy_from_slice(&WAL_VERSION.to_le_bytes());
+    header[10..12].copy_from_slice(&RECORD_HEADER_SIZE_U16.to_le_bytes());
+    header[12..16].copy_from_slice(&flags.to_le_bytes());
+    header[16..24].copy_from_slice(&lsn.as_u64().to_le_bytes());
+    header[24..40].copy_from_slice(&tenant_id);
+    header[40..56].copy_from_slice(&batch_id);
+    header[56..60].copy_from_slice(&slice_index.to_le_bytes());
+    header[60..64].copy_from_slice(&slice_count.to_le_bytes());
+    header[64..68].copy_from_slice(&payload_len.to_le_bytes());
+    header
 }
 
 /// Encode a compact test fixture that is decoded into a normal v3 slice append.
@@ -1446,34 +1707,53 @@ impl WalSegment {
         result
     }
 
-    fn append_encoded(&self, encoded: &[u8]) -> Result<(), ScribeError> {
+    /// Streams one fixed header and borrowed payload parts without a frame copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a WAL IO error when any part cannot be written. The caller owns
+    /// rollback to the measured pre-append file length.
+    fn append_borrowed(
+        &self,
+        header: &[u8; RECORD_HEADER_SIZE],
+        payload_parts: &[&[u8]],
+        crc: [u8; 4],
+        encoded_len: usize,
+    ) -> Result<(), ScribeError> {
         let span =
             tracing::info_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
         let _entered = span.enter();
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
-            detail: "WAL segment file lock poisoned (append)".to_string(),
+            detail: "WAL segment file lock poisoned (borrowed append)".to_owned(),
         })?;
         #[cfg(test)]
         if WAL_PARTIAL_WRITE.with(|flag| flag.replace(false)) {
-            let prefix = encoded.len().max(1) / 2;
             let started = Instant::now();
+            let prefix = header.len().max(1) / 2;
             let result = file
-                .write_all(&encoded[..prefix])
-                .map_err(|e| wal_io_error("WAL partial record write failed", &e))
+                .write_all(&header[..prefix])
+                .map_err(|error| wal_io_error("WAL partial record write failed", &error))
                 .and_then(|()| {
                     Err(ScribeError::Internal {
                         detail: "injected partial WAL write".to_owned(),
                     })
                 });
-            record_wal_append(&result, encoded.len(), started);
+            record_wal_append(&result, encoded_len, started);
             span.record("outcome", "failed");
             return result;
         }
         let started = Instant::now();
-        let result = file
-            .write_all(encoded)
-            .map_err(|e| wal_io_error("WAL record write failed", &e));
-        record_wal_append(&result, encoded.len(), started);
+        let result = (|| -> Result<(), ScribeError> {
+            file.write_all(header)
+                .map_err(|error| wal_io_error("WAL record header write failed", &error))?;
+            for part in payload_parts {
+                file.write_all(part)
+                    .map_err(|error| wal_io_error("WAL record payload write failed", &error))?;
+            }
+            file.write_all(&crc)
+                .map_err(|error| wal_io_error("WAL record CRC write failed", &error))
+        })();
+        record_wal_append(&result, encoded_len, started);
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
     }
@@ -2045,17 +2325,6 @@ impl WalWriter {
             .map_err(resource_volume_error)?;
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
         prepared.assign_lsn(lsn);
-        let record = prepared.record()?;
-        let payload_digest: [u8; 32] = Sha256::digest(&record.payload).into();
-        let payload_len =
-            u32::try_from(record.payload.len()).map_err(|_| ScribeError::Internal {
-                detail: "WAL v4 payload exceeds its u32 record bound".to_owned(),
-            })?;
-        let encoded = record.encode();
-        debug_assert_eq!(
-            usize::try_from(encoded_bytes).expect("invariant: encoded length fits usize"),
-            encoded.len()
-        );
         if rolls_segment {
             state.current_segment = None;
             state.current_segment_size = 0;
@@ -2082,36 +2351,43 @@ impl WalWriter {
         let prior_file_len = std::fs::metadata(segment.path())
             .map_err(|error| wal_io_error("failed to measure WAL before append", &error))?
             .len();
-        if let Err(error) = segment.append_encoded(&encoded) {
-            if let Err(rollback_error) = segment.rollback_failed_append(prior_file_len) {
-                if let Some(volume) = &self.volume {
-                    volume.poison_divergence();
-                }
-                return Err(rollback_error);
-            }
-            if new_segment_bytes > 0 {
-                state.current_segment = None;
-                state.current_segment_size = 0;
-                state.current_segment_records = 0;
-                if let Err(cleanup_error) = remove_failed_segment(segment.path()) {
+        let encoded_len = usize::try_from(encoded_bytes).map_err(|_| ScribeError::Internal {
+            detail: "encoded WAL record length does not fit memory addressing".to_owned(),
+        })?;
+        let append_result = append_prepared_borrowed(&segment, &prepared, encoded_len);
+        let (payload_digest, payload_len) = match append_result {
+            Ok(identity) => identity,
+            Err(error) => {
+                if let Err(rollback_error) = segment.rollback_failed_append(prior_file_len) {
                     if let Some(volume) = &self.volume {
                         volume.poison_divergence();
                     }
-                    return Err(cleanup_error);
+                    return Err(rollback_error);
                 }
-                if let Some(volume) = &self.volume {
-                    volume
-                        .retire(new_segment_bytes)
-                        .map_err(resource_volume_error)?;
+                if new_segment_bytes > 0 {
+                    state.current_segment = None;
+                    state.current_segment_size = 0;
+                    state.current_segment_records = 0;
+                    if let Err(cleanup_error) = remove_failed_segment(segment.path()) {
+                        if let Some(volume) = &self.volume {
+                            volume.poison_divergence();
+                        }
+                        return Err(cleanup_error);
+                    }
+                    if let Some(volume) = &self.volume {
+                        volume
+                            .retire(new_segment_bytes)
+                            .map_err(resource_volume_error)?;
+                    }
                 }
+                if matches!(error, ScribeError::WalDiskFull) {
+                    self.disk.mark_hard_failed();
+                }
+                drop(state);
+                self.disk.reconcile();
+                return Err(error);
             }
-            if matches!(error, ScribeError::WalDiskFull) {
-                self.disk.mark_hard_failed();
-            }
-            drop(state);
-            self.disk.reconcile();
-            return Err(error);
-        }
+        };
         if let Some(growth) = record_growth {
             segment.retain_volume_growth(growth)?;
         }
@@ -2505,6 +2781,189 @@ pub struct WalReader {
     segments: Vec<Arc<WalSegment>>,
 }
 
+/// Lazy record cursor over one shard's ordered segment chain.
+///
+/// The cursor retains only a fixed record header while participating in the
+/// stream-wide LSN merge. It allocates a payload only after that record is
+/// selected as the next record in the stream.
+#[derive(Debug)]
+struct ShardRecordCursor {
+    /// Segments for one `(node, epoch, shard)` ordered by segment sequence.
+    segments: Vec<Arc<WalSegment>>,
+    /// Index of the next segment that has not yet been opened.
+    next_segment: usize,
+    /// Independently opened current segment used for replay and tail repair.
+    file: Option<File>,
+    /// Current segment path returned with the selected record.
+    path: Option<PathBuf>,
+    /// Byte offset at which the peeked record begins.
+    record_offset: u64,
+    /// Validated header waiting for stream-wide LSN selection.
+    header: Option<DecodedWalRecordHeader>,
+    /// Last consumed LSN, spanning every ordered segment in this shard chain.
+    previous_lsn: Option<WalLsn>,
+}
+
+impl ShardRecordCursor {
+    /// Creates a lazy cursor for one ordered shard segment chain.
+    #[must_use]
+    fn new(mut segments: Vec<Arc<WalSegment>>) -> Self {
+        segments.sort_by(|left, right| {
+            left.header()
+                .seg_seq
+                .cmp(&right.header().seg_seq)
+                .then_with(|| left.path().cmp(right.path()))
+        });
+        Self {
+            segments,
+            next_segment: 0,
+            file: None,
+            path: None,
+            record_offset: SEGMENT_HEADER_SIZE as u64,
+            header: None,
+            previous_lsn: None,
+        }
+    }
+
+    /// Returns the next validated LSN without allocating its payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a segment cannot be opened or positioned,
+    /// a complete header is invalid, or torn-tail repair cannot be persisted.
+    fn peek_lsn(&mut self) -> Result<Option<WalLsn>, ScribeError> {
+        self.ensure_header()?;
+        Ok(self.header.as_ref().map(|header| header.lsn))
+    }
+
+    /// Consumes the selected record and authenticates its payload and CRC.
+    ///
+    /// A torn final payload or CRC is truncated and returns `None`; the caller
+    /// can continue with the next segment. Complete corruption fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for payload corruption, non-monotonic shard LSN,
+    /// filesystem errors, or a failed durable torn-tail repair.
+    fn take_record(&mut self) -> Result<Option<(PathBuf, WalRecord)>, ScribeError> {
+        self.ensure_header()?;
+        let Some(header) = self.header.take() else {
+            return Ok(None);
+        };
+        let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
+            detail: "WAL replay cursor lost its current segment".to_owned(),
+        })?;
+        let record = match WalRecord::decode_payload_from(file, header) {
+            Ok(record) => record,
+            Err(error) if is_torn_tail_error(&error) => {
+                self.repair_torn_tail()?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if self
+            .previous_lsn
+            .is_some_and(|previous| record.lsn <= previous)
+        {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 contains non-monotonic committed LSNs across ordered segments"
+                    .to_owned(),
+            });
+        }
+        self.previous_lsn = Some(record.lsn);
+        let path = self.path.clone().ok_or_else(|| ScribeError::Internal {
+            detail: "WAL replay cursor lost its segment path".to_owned(),
+        })?;
+        Ok(Some((path, record)))
+    }
+
+    /// Advances through clean segment ends until one header or stream EOF exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for open, seek, header validation, or torn-tail
+    /// repair failures.
+    fn ensure_header(&mut self) -> Result<(), ScribeError> {
+        while self.header.is_none() {
+            if self.file.is_none() && !self.open_next_segment()? {
+                return Ok(());
+            }
+            let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
+                detail: "WAL replay cursor failed to retain an opened segment".to_owned(),
+            })?;
+            self.record_offset = file
+                .stream_position()
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("WAL record position failed: {error}"),
+                })?;
+            match WalRecord::decode_header_from(file) {
+                Ok(Some(header)) => self.header = Some(header),
+                Ok(None) => {
+                    self.file = None;
+                    self.path = None;
+                }
+                Err(error) if is_torn_tail_error(&error) => self.repair_torn_tail()?,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens and positions the next segment in this shard chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the segment cannot be opened or positioned
+    /// immediately after its already-validated prologue.
+    fn open_next_segment(&mut self) -> Result<bool, ScribeError> {
+        let Some(segment) = self.segments.get(self.next_segment) else {
+            return Ok(false);
+        };
+        self.next_segment = self.next_segment.saturating_add(1);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(segment.path())
+            .map_err(|error| wal_io_error("failed to open WAL segment for replay", &error))?;
+        file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))
+            .map_err(|error| wal_io_error("failed to seek WAL segment for replay", &error))?;
+        self.path = Some(segment.path().to_path_buf());
+        self.file = Some(file);
+        Ok(true)
+    }
+
+    /// Truncates and fsyncs the current incomplete final record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a later segment proves the torn record is
+    /// not the stream tail, or when truncation or the repair fsync fails.
+    fn repair_torn_tail(&mut self) -> Result<(), ScribeError> {
+        if self.next_segment < self.segments.len() {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 contains a torn record before a later shard segment".to_owned(),
+            });
+        }
+        let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
+            detail: "WAL torn-tail repair lost its current segment".to_owned(),
+        })?;
+        file.set_len(self.record_offset)
+            .map_err(|error| wal_io_error("WAL torn-tail truncation failed", &error))?;
+        let started = Instant::now();
+        #[cfg(test)]
+        WAL_RECOVERY_SYNC_COUNT.with(|count| count.set(count.get() + 1));
+        let result = file
+            .sync_data()
+            .map_err(|error| wal_io_error("WAL torn-tail sync failed", &error));
+        record_wal_fsync(&result, started);
+        result?;
+        self.file = None;
+        self.path = None;
+        self.header = None;
+        Ok(())
+    }
+}
+
 impl WalReader {
     /// Open only segments belonging to `stream`.
     ///
@@ -2579,10 +3038,10 @@ impl WalReader {
     /// Read all records from all segments.
     pub fn read_all_records(&self) -> Result<Vec<WalRecord>, ScribeError> {
         let mut all_records = Vec::new();
-        for segment in &self.segments {
-            let records = segment.read_records()?;
-            all_records.extend(records);
-        }
+        self.for_each_stream_record(|_stream, _shard_id, _path, record| {
+            all_records.push(record);
+            Ok(())
+        })?;
         Ok(all_records)
     }
 
@@ -2602,15 +3061,53 @@ impl WalReader {
     where
         F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
+        let mut streams: BTreeMap<([u8; 16], i64), BTreeMap<u8, Vec<Arc<WalSegment>>>> =
+            BTreeMap::new();
         for segment in &self.segments {
             let header = segment.header();
+            streams
+                .entry((header.node_id, header.writer_epoch))
+                .or_default()
+                .entry(header.shard_id)
+                .or_default()
+                .push(Arc::clone(segment));
+        }
+        for ((node_id, writer_epoch), shards) in streams {
             let stream = StreamIdentity::new(
-                crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_bytes(header.node_id)),
-                crate::scribe::stream_identity::WriterEpoch::new(header.writer_epoch),
+                crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_bytes(node_id)),
+                crate::scribe::stream_identity::WriterEpoch::new(writer_epoch),
             );
-            let shard_id = header.shard_id;
-            let path = segment.path().to_path_buf();
-            segment.for_each_record(|record| visit(stream, shard_id, path.clone(), record))?;
+            let mut cursors = shards
+                .into_iter()
+                .map(|(shard_id, segments)| (shard_id, ShardRecordCursor::new(segments)))
+                .collect::<Vec<_>>();
+            let mut previous_lsn = None;
+            loop {
+                let mut selected: Option<(usize, WalLsn)> = None;
+                for (index, (_shard_id, cursor)) in cursors.iter_mut().enumerate() {
+                    let Some(lsn) = cursor.peek_lsn()? else {
+                        continue;
+                    };
+                    if selected.is_none_or(|(_, selected_lsn)| lsn < selected_lsn) {
+                        selected = Some((index, lsn));
+                    }
+                }
+                let Some((index, _)) = selected else {
+                    break;
+                };
+                let (shard_id, cursor) = &mut cursors[index];
+                let Some((path, record)) = cursor.take_record()? else {
+                    continue;
+                };
+                if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL v4 contains non-monotonic stream-wide committed LSNs"
+                            .to_owned(),
+                    });
+                }
+                previous_lsn = Some(record.lsn);
+                visit(stream, *shard_id, path, record)?;
+            }
         }
         Ok(())
     }
@@ -2676,6 +3173,128 @@ mod tests {
         assert!(WalLsn::new(100) > WalLsn::new(99));
     }
 
+    /// Proves directory replay merges shard segments by the pod-global LSN.
+    #[test]
+    fn wal_reader_orders_records_by_stream_wide_lsn_across_shards() {
+        let directory = TempDir::new().expect("temporary WAL directory");
+        let writer = WalWriter::new(directory.path(), [31_u8; 16], 1, WalConfig::default())
+            .expect("WAL writer");
+        let tenant = crate::test_support::tenant();
+        let seal_key = test_seal_key(tenant);
+        let shard_zero = writer.handle_for_shard(0).expect("shard zero");
+        let shard_five = writer.handle_for_shard(5).expect("shard five");
+
+        for (handle, batch, data) in [
+            (&shard_zero, [1_u8; 16], b"zero".as_slice()),
+            (&shard_five, [2_u8; 16], b"one".as_slice()),
+            (&shard_zero, [3_u8; 16], b"two".as_slice()),
+        ] {
+            let append = PreparedWalAppend::new(
+                WalLsn::ZERO,
+                batch,
+                Bytes::new(),
+                Bytes::copy_from_slice(data),
+            )
+            .for_slice(seal_key.clone(), [7_u8; 32]);
+            let result = handle.append_prepared(append).expect("append shard record");
+            handle
+                .sync_segments(&result.touched_segments)
+                .expect("sync shard record");
+        }
+
+        let reader = WalReader::open_directory_unfiltered(directory.path()).expect("WAL reader");
+        let lsns = reader
+            .read_all_records()
+            .expect("stream-wide ordered records")
+            .into_iter()
+            .map(|record| record.lsn.as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(lsns, vec![0, 1, 2]);
+    }
+
+    /// Proves duplicate LSNs in different shard segments fail the stream.
+    #[test]
+    fn wal_reader_rejects_duplicate_stream_wide_lsn_across_shards() {
+        let directory = TempDir::new().expect("temporary WAL directory");
+        for shard_id in [0_u8, 1] {
+            let shard_dir = directory.path().join(format!("shard-{shard_id:02}"));
+            std::fs::create_dir_all(&shard_dir).expect("shard directory");
+            let segment = WalSegment::create(
+                shard_dir.join("0.wal"),
+                SegmentHeader::new([32_u8; 16], 1, 0, shard_id),
+            )
+            .expect("WAL segment");
+            segment
+                .append_and_fsync(&WalRecord::new(
+                    WalLsn::new(7),
+                    0,
+                    [shard_id; 16],
+                    vec![shard_id],
+                ))
+                .expect("duplicate-LSN fixture");
+        }
+
+        let reader = WalReader::open_directory_unfiltered(directory.path()).expect("WAL reader");
+        let error = reader
+            .read_all_records()
+            .expect_err("duplicate stream-wide LSN must fail closed");
+        assert!(matches!(
+            error,
+            ScribeError::Internal { detail }
+                if detail == "WAL v4 contains non-monotonic stream-wide committed LSNs"
+        ));
+    }
+
+    /// Proves a torn record before a later shard segment fails without repair.
+    #[test]
+    fn wal_reader_rejects_torn_nonfinal_segment_without_truncation() {
+        let directory = TempDir::new().expect("temporary WAL directory");
+        let shard_dir = directory.path().join("shard-00");
+        std::fs::create_dir_all(&shard_dir).expect("shard directory");
+        let first_path = shard_dir.join("0.wal");
+        let first = WalSegment::create(&first_path, SegmentHeader::new([33_u8; 16], 1, 0, 0))
+            .expect("first WAL segment");
+        first
+            .append_and_fsync(&WalRecord::new(WalLsn::new(0), 0, [1_u8; 16], vec![1_u8]))
+            .expect("first durable record");
+        drop(first);
+        OpenOptions::new()
+            .append(true)
+            .open(&first_path)
+            .expect("open first segment tail")
+            .write_all(b"torn")
+            .expect("append torn record header");
+        let torn_len = std::fs::metadata(&first_path)
+            .expect("first segment metadata")
+            .len();
+
+        let second = WalSegment::create(
+            shard_dir.join("1.wal"),
+            SegmentHeader::new([33_u8; 16], 1, 1, 0),
+        )
+        .expect("second WAL segment");
+        second
+            .append_and_fsync(&WalRecord::new(WalLsn::new(1), 0, [2_u8; 16], vec![2_u8]))
+            .expect("later durable record");
+
+        let reader = WalReader::open_directory_unfiltered(directory.path()).expect("WAL reader");
+        let error = reader
+            .read_all_records()
+            .expect_err("torn non-final record must fail closed");
+        assert!(matches!(
+            error,
+            ScribeError::Internal { detail }
+                if detail == "WAL v4 contains a torn record before a later shard segment"
+        ));
+        assert_eq!(
+            std::fs::metadata(first_path)
+                .expect("first segment metadata after rejection")
+                .len(),
+            torn_len,
+            "fail-stop must not truncate a non-final segment"
+        );
+    }
+
     #[test]
     fn slice_tenant_decoder_rejects_nil_and_non_v7() {
         assert!(decode_slice_tenant(&[0; 16]).is_err());
@@ -2702,6 +3321,26 @@ mod tests {
         assert_eq!(decoded.writer_epoch, 42);
         assert_eq!(decoded.seg_seq, 7);
         assert_eq!(decoded.shard_id, 3);
+    }
+
+    /// Proves both reserved byte ranges in the v4 segment prologue fail closed.
+    #[test]
+    fn segment_header_rejects_nonzero_reserved_byte_ranges() {
+        for reserved_index in [33_usize, 39, 48, 59] {
+            let header = SegmentHeader::new([1_u8; 16], 42, 7, 3);
+            let mut encoded = header.encode();
+            encoded[reserved_index] = 1;
+            let crc = crc32c_hash(&encoded[..60]);
+            encoded[60..64].copy_from_slice(&crc.to_le_bytes());
+
+            let error = SegmentHeader::decode(&encoded)
+                .expect_err("non-zero reserved segment byte must fail closed");
+            assert!(matches!(
+                error,
+                ScribeError::Internal { detail }
+                    if detail == "segment header reserved bytes non-zero"
+            ));
+        }
     }
 
     #[test]
@@ -3376,8 +4015,9 @@ mod tests {
         assert_eq!(writer.bytes_on_disk(), directory_bytes(temp_dir.path()));
     }
 
+    /// Proves production append streams borrowed payloads without frame copies or scans.
     #[test]
-    fn append_encodes_once_and_does_not_walk_unrelated_wal_files() {
+    fn append_streams_without_frame_encoding_or_unrelated_wal_walks() {
         let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
@@ -3395,7 +4035,7 @@ mod tests {
         writer
             .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
             .expect("append");
-        assert_eq!(WAL_ENCODE_COUNT.with(std::cell::Cell::get), 1);
+        assert_eq!(WAL_ENCODE_COUNT.with(std::cell::Cell::get), 0);
         assert_eq!(WAL_WALK_COUNT.with(std::cell::Cell::get), 0);
         let _ = writer.disk_pressure();
         assert!(WAL_WALK_COUNT.with(std::cell::Cell::get) > 0);

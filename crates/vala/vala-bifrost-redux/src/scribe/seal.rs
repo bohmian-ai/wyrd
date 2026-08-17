@@ -724,6 +724,8 @@ impl SealDriver {
             )
             .await?;
         encoded.artifacts.attach_scratch(scratch)?;
+        encoded.audit_events =
+            crate::scribe::audit_envelope::publication_audit_events(&encoded.audit_events);
         let encoded_bytes = encoded
             .artifacts
             .iter()

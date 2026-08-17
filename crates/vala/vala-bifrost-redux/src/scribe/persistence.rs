@@ -1253,6 +1253,8 @@ impl PersistenceWorker {
             )
             .await?;
         encoded.artifacts.attach_scratch(scratch)?;
+        encoded.audit_events =
+            crate::scribe::audit_envelope::publication_audit_events(&encoded.audit_events);
         let source_node_id = generation.stream.node_id.to_string();
         let file_size = encoded
             .artifacts

@@ -18,7 +18,7 @@ use crate::schema::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
-use crate::scribe::audit_envelope::encode_audit_event;
+use crate::scribe::audit_envelope::encode_audit_event_bounded;
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::seal_key::{EventDayPlan, SealKey, plan_event_days, split_batch_by_event_day};
 use crate::scribe::wal::PreparedWalAppend;
@@ -32,6 +32,8 @@ pub(crate) struct AdmittedAppend {
     pub rows: AdmittedRows,
     pub measured_wire_bytes: usize,
     pub admitted_bytes: usize,
+    /// Admitted exact-capacity ceiling for one current audit JSON payload.
+    pub wal_workspace_bytes: usize,
     pub reservation: InflightFrameReservation,
     pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
@@ -111,6 +113,8 @@ pub(crate) struct NativeSliceProducer {
     tenant: DataTenantId,
     /// Logical table used by every produced seal key.
     table: TableRef,
+    /// Exact-capacity audit JSON ceiling retained from the root plan.
+    wal_workspace_bytes: usize,
 }
 
 /// One decoded native source and its fixed event-day cursor.
@@ -136,6 +140,7 @@ impl NativeSliceProducer {
         audit_event: AuditEvent,
         tenant: DataTenantId,
         table: TableRef,
+        wal_workspace_bytes: usize,
     ) -> Result<Self, ScribeError> {
         let slice_count = count_native_slices(&source)?;
         let input = Buffer::from(source.bytes.clone());
@@ -149,6 +154,7 @@ impl NativeSliceProducer {
             audit_event,
             tenant,
             table,
+            wal_workspace_bytes,
         })
     }
 
@@ -172,10 +178,12 @@ impl NativeSliceProducer {
                         &self.table,
                         event_day,
                         rows,
+                        self.wal_workspace_bytes,
                     )?;
                     slice
                         .wal_append
                         .assign_slice_ordinal(self.slice_index, self.slice_count);
+                    slice.id.slice_index = self.slice_index;
                     self.slice_index =
                         self.slice_index
                             .checked_add(1)
@@ -295,11 +303,15 @@ pub(crate) struct PreparedSlice {
     pub memtable_bytes: usize,
 }
 
-/// Idempotency identity for one batch routed to one seal-key.
+/// Idempotency identity for one logical slice within a routed batch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AppendSliceId {
+    /// Stable logical batch identity supplied by the caller.
     pub batch_id: Uuid,
+    /// Canonical event-day route for this slice.
     pub seal_key: SealKey,
+    /// Canonical zero-based ordinal within the complete logical batch.
+    pub slice_index: u32,
 }
 
 /// Split and serialize an admitted append on the bounded pre-ACK CPU lane.
@@ -310,6 +322,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
         admitted_bytes: _admitted_bytes,
+        wal_workspace_bytes,
         reservation,
         mut memory,
         tenant,
@@ -325,18 +338,28 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         match rows {
             AdmittedRows::Projected(rows) => {
                 let mut slices = Vec::new();
-                append_prepared_slices(&mut slices, batch_id, &audit_event, tenant, &table, &rows)?;
+                append_prepared_slices(
+                    &mut slices,
+                    batch_id,
+                    &audit_event,
+                    tenant,
+                    &table,
+                    &rows,
+                    wal_workspace_bytes,
+                )?;
                 let slice_count =
                     u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
                         detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
                     })?;
                 for (slice_index, slice) in slices.iter_mut().enumerate() {
-                    slice.wal_append.assign_slice_ordinal(
+                    let slice_index =
                         u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
                             detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
-                        })?,
-                        slice_count,
-                    );
+                        })?;
+                    slice
+                        .wal_append
+                        .assign_slice_ordinal(slice_index, slice_count);
+                    slice.id.slice_index = slice_index;
                 }
                 let prepared_bytes = prepared_slice_bytes(&slices, memory.bytes())?;
                 Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
@@ -347,6 +370,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
                     audit_event,
                     tenant,
                     table.clone(),
+                    wal_workspace_bytes,
                 )?))),
                 memory.bytes(),
             )),
@@ -424,6 +448,7 @@ fn append_prepared_slices(
     tenant: DataTenantId,
     table: &TableRef,
     rows: &RecordBatch,
+    wal_workspace_bytes: usize,
 ) -> Result<(), ScribeError> {
     for slice in split_batch_by_event_day(rows)? {
         let (event_day, day_rows) = slice?;
@@ -434,6 +459,7 @@ fn append_prepared_slices(
             table,
             event_day,
             day_rows,
+            wal_workspace_bytes,
         )?);
     }
     Ok(())
@@ -451,11 +477,12 @@ fn prepare_slice(
     table: &TableRef,
     event_day: crate::scribe::seal_key::EventDay,
     rows: RecordBatch,
+    wal_workspace_bytes: usize,
 ) -> Result<PreparedSlice, ScribeError> {
     let seal_key = SealKey::new(tenant, table.clone(), event_day);
     let mut day_audit = audit_event.clone();
     day_audit.payload_summary = format!("{} rows", rows.num_rows());
-    let audit_payload = encode_audit_event(&day_audit)?;
+    let audit_payload = encode_audit_event_bounded(&day_audit, wal_workspace_bytes)?;
     let data_payload = encode_ipc_fixed(&rows)?;
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
@@ -472,6 +499,7 @@ fn prepare_slice(
         id: AppendSliceId {
             batch_id,
             seal_key: seal_key.clone(),
+            slice_index: 0,
         },
         seal_key,
         audit_event: day_audit,

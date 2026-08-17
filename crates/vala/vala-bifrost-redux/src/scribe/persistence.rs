@@ -434,8 +434,8 @@ pub struct PersistenceRuntime {
     output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
     /// Operator-backed owner for caller-commit ambiguity reconciliation.
     reconciler: Option<ScribePublicationReconciler>,
-    /// Unbounded ownership-transfer seam for already-admitted ambiguous attempts.
-    reconciliation_sender: Option<mpsc::UnboundedSender<ScribeReconciliationJob>>,
+    /// Bounded ownership-transfer seam for already-admitted ambiguous attempts.
+    reconciliation_sender: Option<mpsc::Sender<ScribeReconciliationJob>>,
 }
 
 /// Runtime-owned ambiguous caller publication and optional completion waiter.
@@ -511,7 +511,7 @@ impl PersistenceRuntime {
     /// Spawns the cancellation-independent reconciliation queue owner.
     fn spawn_reconciliation_worker(
         runtime: &Handle,
-        mut receiver: mpsc::UnboundedReceiver<ScribeReconciliationJob>,
+        mut receiver: mpsc::Receiver<ScribeReconciliationJob>,
         reconciler: ScribePublicationReconciler,
     ) -> tokio::task::JoinHandle<()> {
         runtime.spawn(async move {
@@ -611,7 +611,7 @@ impl PersistenceRuntime {
                 config.faults.clone(),
             )
         });
-        let (reconciliation_sender, reconciliation_receiver) = mpsc::unbounded_channel();
+        let (reconciliation_sender, reconciliation_receiver) = mpsc::channel(config.queue_items);
         let runtime_state = Arc::new(Self {
             sender: Arc::new(Mutex::new(Some(sender))),
             queued: Arc::new(AtomicUsize::new(0)),
@@ -817,11 +817,11 @@ impl PersistenceRuntime {
         };
         let (completion, receiver) = oneshot::channel();
         sender
-            .send(ScribeReconciliationJob::Caller {
+            .try_send(ScribeReconciliationJob::Caller {
                 attempt,
                 completion,
             })
-            .map_err(|error| match error.0 {
+            .map_err(|error| match error.into_inner() {
                 ScribeReconciliationJob::Caller { attempt, .. } => Box::new(attempt),
                 ScribeReconciliationJob::Persistence { .. } => {
                     unreachable!("caller submission cannot return a persistence job")
@@ -860,7 +860,7 @@ struct PersistenceWorker {
     /// Generation-owned scratch authority required before writer creation.
     output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
     /// Runtime-owned queue shielding ambiguous publication from worker cancellation.
-    reconciliation_sender: mpsc::UnboundedSender<ScribeReconciliationJob>,
+    reconciliation_sender: mpsc::Sender<ScribeReconciliationJob>,
     /// Test-only fault points for deterministic persistence-path coverage.
     #[cfg(any(test, feature = "test-support"))]
     faults: PersistenceFaults,
@@ -963,7 +963,7 @@ impl PersistenceWorker {
         failures: Arc<Mutex<Vec<String>>>,
         context: PersistenceRuntimeContext,
         output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
-        reconciliation_sender: mpsc::UnboundedSender<ScribeReconciliationJob>,
+        reconciliation_sender: mpsc::Sender<ScribeReconciliationJob>,
     ) -> Self {
         Self {
             operator_pool,
@@ -1311,25 +1311,25 @@ impl PersistenceWorker {
         parquet_owner: ScribeMemoryLease,
     ) -> Result<FileListCommitKey, ScribeError> {
         let (completion, receiver) = oneshot::channel();
-        if let Err(error) = self
-            .reconciliation_sender
-            .send(ScribeReconciliationJob::Persistence {
-                worker: self.clone(),
-                generation: Arc::clone(generation),
-                binding: binding.clone(),
-                defer_manifest_advance,
-                rows,
-                events: encoded.audit_events,
-                artifacts: encoded.artifacts,
-                parquet_owner,
-                completion,
-            })
+        if let Err(error) =
+            self.reconciliation_sender
+                .try_send(ScribeReconciliationJob::Persistence {
+                    worker: self.clone(),
+                    generation: Arc::clone(generation),
+                    binding: binding.clone(),
+                    defer_manifest_advance,
+                    rows,
+                    events: encoded.audit_events,
+                    artifacts: encoded.artifacts,
+                    parquet_owner,
+                    completion,
+                })
         {
             if let ScribeReconciliationJob::Persistence {
                 artifacts,
                 parquet_owner,
                 ..
-            } = error.0
+            } = error.into_inner()
             {
                 artifacts.retain_for_reconciliation();
                 std::mem::forget(parquet_owner);
@@ -1871,6 +1871,8 @@ mod tests {
         _database: wyrd_dev_fixtures::pg::PgFixture,
         /// WAL directory retained until worker shutdown completes.
         _wal_root: tempfile::TempDir,
+        /// Scratch namespace roots retained until worker shutdown completes.
+        _scratch_root: tempfile::TempDir,
     }
 
     #[cfg(feature = "test-support")]
@@ -1882,9 +1884,26 @@ mod tests {
                 .expect("Postgres fixture");
             let tenant = database.data_tenant_id();
             let wal_root = tempfile::tempdir().expect("WAL directory");
+            let scratch_root = tempfile::tempdir().expect("scratch directory");
+            let scribe_output = scratch_root.path().join("scribe-output");
+            let forge_scratch = scratch_root.path().join("forge");
+            let oracle_scratch = scratch_root.path().join("oracle");
+            for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
+                std::fs::create_dir(root).expect("test volume root");
+            }
             let node_id = crate::scribe::stream_identity::NodeId::generate();
             let stream =
                 StreamIdentity::new(node_id, crate::scribe::stream_identity::WriterEpoch::new(1));
+            let superuser = database.superuser_pool().await.expect("superuser pool");
+            sqlx::query(
+                "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now()) ON CONFLICT (data_tenant_id,node_id,role) DO UPDATE SET fencing_token=EXCLUDED.fencing_token,heartbeat_at=now()",
+            )
+            .bind(wyrd_spec::DataTenantId::SYSTEM_OWNER.as_uuid())
+            .bind(node_id.as_uuid())
+            .bind(1_i64)
+            .execute(&superuser)
+            .await
+            .expect("register Scribe publication fence");
             let wal = Arc::new(
                 WalWriter::new(
                     wal_root.path(),
@@ -1899,11 +1918,42 @@ mod tests {
                 stream,
             ))
             .expect("WAL stream directory");
-            let memory = crate::scribe::embedded_scribe_resources(
-                &crate::scribe::AdmissionConfig::default(),
-            );
+            let runtime_resources = crate::resources::BifrostRuntimeResources::from_snapshot(
+                crate::resources::SystemResourceSnapshot {
+                    memory_limit_bytes: 1024 * 1024 * 1024,
+                    effective_cpu: 2,
+                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+                    memory_source: crate::resources::ResourceSource::Injected,
+                    cpu_source: crate::resources::ResourceSource::Injected,
+                },
+                crate::resources::BifrostResourcePolicy {
+                    roles: std::collections::BTreeSet::from([
+                        crate::resources::BifrostRole::Scribe,
+                    ]),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: None,
+                    effective_cpu: None,
+                    scratch_root: scratch_root.path().to_owned(),
+                    volume_roots: Some(crate::resources::BifrostVolumeRoots {
+                        wal: wal_root.path().to_owned(),
+                        scribe_output_scratch: scribe_output,
+                        forge_scratch,
+                        oracle_scratch,
+                    }),
+                },
+            )
+            .expect("test Bifrost resources");
+            let roles = runtime_resources
+                .compose_roles()
+                .expect("test role resources");
+            let memory = roles.scribe().expect("test Scribe resources");
+            let (_, output_scratch) = memory.volume_capabilities().expect("test Scribe volumes");
             let runtime = PersistenceRuntime::start(
-                ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 1, 1),
+                ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 1, 1)
+                    .with_operator_pool(database.operator_pool().clone())
+                    .with_output_scratch(output_scratch),
                 PersistenceRuntimeContext {
                     operator: Arc::new(
                         opendal::Operator::new(opendal::services::Memory::default())
@@ -1927,6 +1977,7 @@ mod tests {
                 tenant,
                 _database: database,
                 _wal_root: wal_root,
+                _scratch_root: scratch_root,
             }
         }
 

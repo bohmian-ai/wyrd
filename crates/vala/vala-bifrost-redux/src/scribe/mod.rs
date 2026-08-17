@@ -2202,6 +2202,7 @@ impl ScribeImpl {
             ingress_low_water_memory: memory.ingress_low_water_bytes,
             wal_disk_bytes: self.wal.bytes_on_disk(),
             ingress_lifecycle: self.ingress_lifecycle.snapshot(),
+            generation_lifecycle: self.memory_ownership.lifecycle_snapshot(),
         })
     }
 

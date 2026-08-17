@@ -377,17 +377,25 @@ mod tests {
             row_group_stats: Vec::new(),
         }])
         .expect("nonempty artifact set");
+        let retained_bytes = 4_096;
+        let parquet_owner = memory
+            .try_reserve_maintenance(
+                crate::scribe::memory::MemoryCategory::Persistence,
+                retained_bytes,
+            )
+            .expect("ambiguous Parquet owner");
         drop(super::ScribeCommitAttempt {
             token: Some(token),
             rows: Vec::new(),
             audit_events: Vec::new(),
             artifacts: Some(artifacts),
             memory: Some(memory.clone()),
-            parquet_owner: None,
+            parquet_owner: Some(parquet_owner),
             completion: None,
             settled: false,
         });
         assert!(memory.is_poisoned());
+        assert_eq!(memory.memory_snapshot().total_bytes(), retained_bytes);
     }
 }
 
@@ -556,6 +564,13 @@ impl Drop for ScribeCommitAttempt {
         }
         if let Some(artifacts) = self.artifacts.take() {
             artifacts.retain_for_reconciliation();
+        }
+        if let Some(parquet_owner) = self.parquet_owner.take() {
+            // An unavailable reconciliation queue is fail-stop, not a release
+            // boundary. The process restart path reconstructs the durable
+            // generation from WAL; until then this exact scalable owner must
+            // remain charged rather than becoming reusable admission capacity.
+            std::mem::forget(parquet_owner);
         }
         if let Some(memory) = &self.memory {
             memory.poison();

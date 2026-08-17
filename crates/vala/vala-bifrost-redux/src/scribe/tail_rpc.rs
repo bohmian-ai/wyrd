@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
 use chrono::Utc;
 use wyrd_spec::ids::DataTenantId;
@@ -21,7 +20,7 @@ use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
-use crate::scribe::memtable::Memtable;
+use crate::scribe::memtable::{Memtable, ReadableBatchLimits};
 use crate::scribe::routing::shard_for;
 use crate::scribe::seal_key::EventDay;
 use crate::scribe::shards::ScribeShardRuntime;
@@ -1255,25 +1254,44 @@ fn cursor_cmp(
     )))
 }
 
-/// Encodes one shallow row only to prove that the page byte ceiling is respected.
+/// Counts one shallow row's exact canonical IPC stream before page admission.
 ///
 /// # Errors
 ///
-/// Returns [`TailReadError::Encode`] when Arrow cannot encode the row.
-fn encode_record_batch(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, TailReadError> {
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).map_err(|error| {
+/// Returns [`TailReadError::Encode`] when the row is outside the canonical
+/// scalar IPC subset or its exact stream length cannot be represented.
+fn encoded_record_batch_bytes(
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<usize, TailReadError> {
+    crate::scribe::fixed_ipc::FixedIpcPlan::count(batch)
+        .map(|plan| plan.encoded_bytes())
+        .map_err(|error| TailReadError::Encode {
+            detail: error.to_string(),
+        })
+}
+
+/// Encodes one admitted tail batch directly into one exact-capacity IPC owner.
+///
+/// The same fixed plan used by local page admission is recomputed from the
+/// shallow batch and consumed by the transport adapter. No growable counting
+/// or output buffer is created, and encoder divergence fails closed.
+///
+/// # Errors
+///
+/// Returns [`TailReadError::Encode`] when the batch is outside the canonical
+/// scalar IPC subset, exact size planning fails, or materialized buffers no
+/// longer match the immutable plan.
+pub fn encode_tail_batch_exact(
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<Vec<u8>, TailReadError> {
+    let plan = crate::scribe::fixed_ipc::FixedIpcPlan::count(batch).map_err(|error| {
         TailReadError::Encode {
             detail: error.to_string(),
         }
     })?;
-    writer.write(batch).map_err(|error| TailReadError::Encode {
+    plan.encode(batch).map_err(|error| TailReadError::Encode {
         detail: error.to_string(),
-    })?;
-    writer.finish().map_err(|error| TailReadError::Encode {
-        detail: error.to_string(),
-    })?;
-    Ok(bytes)
+    })
 }
 
 #[derive(Debug)]
@@ -1285,6 +1303,37 @@ struct FenceRegistry {
     released: HashMap<tail::TailFenceId, (Instant, tail::TailReadFence)>,
     /// Aggregate Arrow array bytes retained by every live fence.
     retained_bytes: usize,
+    /// Fixed scalar lifecycle observations emitted by this enforcing registry.
+    lifecycle: TailOwnershipSnapshot,
+}
+
+/// Fixed-size live-tail ownership facts from plan through retirement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TailOwnershipSnapshot {
+    /// Fence snapshots planned from source-derived Arrow bytes.
+    pub plans: u64,
+    /// Source-derived bytes represented by those plans.
+    pub planned_bytes: usize,
+    /// Fence reservations admitted by configured limits.
+    pub reservations: u64,
+    /// Arrow bytes retained by admitted reservations.
+    pub reserved_bytes: usize,
+    /// Shallow immutable snapshots materialized under admitted fences.
+    pub materializations: u64,
+    /// Arrow bytes represented by those snapshots.
+    pub materialized_bytes: usize,
+    /// Page batches transferred to a local or remote transport.
+    pub transfers: u64,
+    /// Exact canonical IPC bytes represented by transferred pages.
+    pub transferred_bytes: usize,
+    /// Explicit or expiry-driven fence releases.
+    pub releases: u64,
+    /// Arrow bytes released by fence retirement.
+    pub released_bytes: usize,
+    /// Fences currently retaining shallow Arrow ownership.
+    pub active_reservations: usize,
+    /// Arrow bytes currently retained by live fences.
+    pub active_reserved_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -1313,19 +1362,22 @@ impl ScribeTailReader {
     /// Creates one bounded reader over the supplied pod-local Scribe source.
     #[must_use]
     pub fn new(source: Arc<FetchLiveTailService>, config: TailFenceConfig) -> Self {
+        let max_fences = config.max_fences.max(1);
+        let tombstone_capacity = max_fences.saturating_mul(4);
         Self {
             source,
             config: TailFenceConfig {
                 ttl: config.ttl.min(Duration::from_secs(30)),
-                max_fences: config.max_fences.max(1),
+                max_fences,
                 max_retained_bytes: config.max_retained_bytes.max(1),
                 max_page_rows: config.max_page_rows.max(1),
                 max_page_encoded_bytes: config.max_page_encoded_bytes.max(1),
             },
             fences: Mutex::new(FenceRegistry {
-                retained: HashMap::new(),
-                released: HashMap::new(),
+                retained: HashMap::with_capacity(max_fences),
+                released: HashMap::with_capacity(tombstone_capacity),
                 retained_bytes: 0,
+                lifecycle: TailOwnershipSnapshot::default(),
             }),
         }
     }
@@ -1343,7 +1395,7 @@ impl ScribeTailReader {
     ///
     /// # Errors
     /// Returns [`TailReadError::State`] when the fence registry lock is poisoned.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn active_fence_count_for_test(&self) -> Result<u64, TailReadError> {
         let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
             detail: format!("tail fence registry lock poisoned: {error}"),
@@ -1352,6 +1404,20 @@ impl ScribeTailReader {
         u64::try_from(registry.retained.len()).map_err(|error| TailReadError::State {
             detail: format!("active tail fence count does not fit u64: {error}"),
         })
+    }
+
+    /// Returns bounded live-tail lifecycle facts after opportunistic expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TailReadError::State`] when the fence registry lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ownership_snapshot_for_test(&self) -> Result<TailOwnershipSnapshot, TailReadError> {
+        let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
+            detail: format!("tail fence registry lock poisoned: {error}"),
+        })?;
+        Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
+        Ok(registry.lifecycle)
     }
 
     /// Returns retained immutable metadata for capability verification.
@@ -1481,6 +1547,8 @@ impl ScribeTailReader {
                 end_day: event_day,
                 after_lsn: WalLsn::ZERO,
                 required_columns: Vec::new(),
+                max_batches: self.config.max_page_rows as usize,
+                max_retained_bytes: self.config.max_retained_bytes,
             })
             .await
             .map_err(|error| TailReadError::State {
@@ -1499,10 +1567,13 @@ impl ScribeTailReader {
         batches.sort_by_key(|batch| (batch.lsn, batch.batch_id));
         validate_schema(&batches, &request.schema_fingerprint)?;
         let inclusive_live = inclusive_cursor(&request.exclusive_sealed, stream_epoch, &batches)?;
-        let retained_bytes = batches
-            .iter()
-            .map(|batch| batch.rows.get_array_memory_size())
-            .sum::<usize>();
+        let retained_bytes = batches.iter().try_fold(0_usize, |total, batch| {
+            total
+                .checked_add(batch.rows.get_array_memory_size())
+                .ok_or_else(|| TailReadError::State {
+                    detail: "tail fence retained byte count overflow".to_owned(),
+                })
+        })?;
         let expires_at =
             now + chrono::Duration::from_std(ttl).map_err(|_| TailReadError::DeadlineElapsed)?;
         let fence = tail::TailReadFence {
@@ -1519,22 +1590,60 @@ impl ScribeTailReader {
             tail_protocol_version: TAIL_PROTOCOL_VERSION,
             expires_at,
         };
+        self.retain_fence(fence, batches, ttl, retained_bytes)
+    }
+
+    /// Reserves registry capacity and transfers one prepared snapshot into a fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TailReadError::Capacity`] when the fixed fence or retained-byte
+    /// ceiling is exhausted, or [`TailReadError::State`] when the registry lock
+    /// is poisoned.
+    fn retain_fence(
+        &self,
+        fence: tail::TailReadFence,
+        batches: Vec<RetainedBatch>,
+        ttl: Duration,
+        retained_bytes: usize,
+    ) -> Result<tail::TailReadFence, TailReadError> {
         let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
             detail: format!("tail fence registry lock poisoned: {error}"),
         })?;
         Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
-        // Live admission is bounded by retained (live) fences only. Release
-        // tombstones no longer consume ownership capacity: they exist solely to
-        // make a duplicate release idempotent for their original TTL, and are
-        // purged by `reclaim_expired`. Counting them against admission turned an
-        // acquire/release churn within one TTL into a self-inflicted capacity DoS.
+        registry.lifecycle.plans = registry.lifecycle.plans.saturating_add(1);
+        registry.lifecycle.planned_bytes = registry
+            .lifecycle
+            .planned_bytes
+            .saturating_add(retained_bytes);
+        // Live admission is bounded by retained fences only. Release tombstones
+        // exist solely to make duplicate release idempotent for the original TTL.
+        let next_retained_bytes = registry
+            .retained_bytes
+            .checked_add(retained_bytes)
+            .ok_or(TailReadError::Capacity)?;
         if registry.retained.len() >= self.config.max_fences
-            || registry.retained_bytes.saturating_add(retained_bytes)
-                > self.config.max_retained_bytes
+            || next_retained_bytes > self.config.max_retained_bytes
         {
             return Err(TailReadError::Capacity);
         }
-        registry.retained_bytes = registry.retained_bytes.saturating_add(retained_bytes);
+        registry.retained_bytes = next_retained_bytes;
+        registry.lifecycle.reservations = registry.lifecycle.reservations.saturating_add(1);
+        registry.lifecycle.reserved_bytes = registry
+            .lifecycle
+            .reserved_bytes
+            .saturating_add(retained_bytes);
+        registry.lifecycle.materializations = registry.lifecycle.materializations.saturating_add(1);
+        registry.lifecycle.materialized_bytes = registry
+            .lifecycle
+            .materialized_bytes
+            .saturating_add(retained_bytes);
+        registry.lifecycle.active_reservations =
+            registry.lifecycle.active_reservations.saturating_add(1);
+        registry.lifecycle.active_reserved_bytes = registry
+            .lifecycle
+            .active_reserved_bytes
+            .saturating_add(retained_bytes);
         registry.retained.insert(
             fence.fence_id,
             RetainedFence {
@@ -1617,7 +1726,7 @@ impl ScribeTailReader {
             .min(self.config.max_page_encoded_bytes)
             .max(1) as usize;
         let after = after.as_ref().unwrap_or(&retained.fence.exclusive_sealed);
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(row_limit);
         let mut encoded_bytes = 0_usize;
         let mut next = None;
         for batch in &retained.batches {
@@ -1645,11 +1754,19 @@ impl ScribeTailReader {
                     continue;
                 }
                 let row = Arc::new(batch.rows.slice(row_index, 1));
-                let row_bytes = encode_record_batch(row.as_ref())?.len();
+                let row_bytes = encoded_record_batch_bytes(row.as_ref())?;
                 if rows.is_empty() && row_bytes > byte_limit {
                     return Err(TailReadError::OversizeRow);
                 }
                 if rows.len() == row_limit || encoded_bytes.saturating_add(row_bytes) > byte_limit {
+                    registry.lifecycle.transfers = registry
+                        .lifecycle
+                        .transfers
+                        .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+                    registry.lifecycle.transferred_bytes = registry
+                        .lifecycle
+                        .transferred_bytes
+                        .saturating_add(encoded_bytes);
                     return Ok(LocalTailPage {
                         batches: rows,
                         next,
@@ -1661,6 +1778,14 @@ impl ScribeTailReader {
                 rows.push(row);
             }
         }
+        registry.lifecycle.transfers = registry
+            .lifecycle
+            .transfers
+            .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+        registry.lifecycle.transferred_bytes = registry
+            .lifecycle
+            .transferred_bytes
+            .saturating_add(encoded_bytes);
         Ok(LocalTailPage {
             batches: rows,
             next,
@@ -1730,6 +1855,17 @@ impl ScribeTailReader {
         registry.retained_bytes = registry
             .retained_bytes
             .saturating_sub(retained.retained_bytes);
+        registry.lifecycle.releases = registry.lifecycle.releases.saturating_add(1);
+        registry.lifecycle.released_bytes = registry
+            .lifecycle
+            .released_bytes
+            .saturating_add(retained.retained_bytes);
+        registry.lifecycle.active_reservations =
+            registry.lifecycle.active_reservations.saturating_sub(1);
+        registry.lifecycle.active_reserved_bytes = registry
+            .lifecycle
+            .active_reserved_bytes
+            .saturating_sub(retained.retained_bytes);
         // Tombstones no longer bound live admission, so cap the map purely as a
         // memory backstop at `max_fences * 4`. At capacity, evict the entry with
         // the earliest `expires_at` (the soonest to be purged anyway) via a linear
@@ -1785,6 +1921,17 @@ impl ScribeTailReader {
                 registry.retained_bytes = registry
                     .retained_bytes
                     .saturating_sub(retained.retained_bytes);
+                registry.lifecycle.releases = registry.lifecycle.releases.saturating_add(1);
+                registry.lifecycle.released_bytes = registry
+                    .lifecycle
+                    .released_bytes
+                    .saturating_add(retained.retained_bytes);
+                registry.lifecycle.active_reservations =
+                    registry.lifecycle.active_reservations.saturating_sub(1);
+                registry.lifecycle.active_reserved_bytes = registry
+                    .lifecycle
+                    .active_reserved_bytes
+                    .saturating_sub(retained.retained_bytes);
             }
         }
         let expired_tombstones = registry
@@ -1819,6 +1966,10 @@ pub struct FetchLiveTailRequest {
     pub after_lsn: WalLsn,
     /// Columns required by Oracle filters, ordering, tripwire, and projection.
     pub required_columns: Vec<String>,
+    /// Maximum shallow Arrow batches materialized by the snapshot.
+    pub max_batches: usize,
+    /// Maximum source-derived Arrow bytes retained by the snapshot.
+    pub max_retained_bytes: usize,
 }
 
 impl FetchLiveTailRequest {
@@ -1926,6 +2077,12 @@ impl FetchLiveTailService {
     }
 
     /// Return direct local Arrow handles for Oracle's `MemoryExec` path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when stream/range validation fails, the bounded
+    /// snapshot exceeds its count or retained-byte ceiling, or the owning
+    /// memtable/shard cannot produce the requested projection.
     pub async fn fetch_hot_batches(
         &self,
         request: FetchLiveTailRequest,
@@ -1956,6 +2113,10 @@ impl FetchLiveTailService {
                 request.start_day,
                 request.end_day,
                 &request.required_columns,
+                ReadableBatchLimits {
+                    max_batches: request.max_batches,
+                    max_retained_bytes: request.max_retained_bytes,
+                },
             )?
             .into_iter()
             .map(|readable| HotBatch {
@@ -2194,6 +2355,42 @@ mod tests {
         assert_eq!(registry.retained.len(), 1);
         assert!(!registry.retained.contains_key(&first.fence_id));
         assert!(registry.retained.contains_key(&second.fence_id));
+    }
+
+    /// Tail lifecycle inspection reconciles one admitted fence through release.
+    #[tokio::test]
+    async fn tail_lifecycle_reconciles_plan_reservation_and_release() {
+        let tenant = DataTenantId::new_v7();
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let reader = ScribeTailReader::new(
+            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            TailFenceConfig::default(),
+        );
+        let fence = reader
+            .acquire_fence(empty_fence_request(tenant))
+            .await
+            .expect("empty fence admission");
+        let active = reader
+            .ownership_snapshot_for_test()
+            .expect("active ownership snapshot");
+        assert_eq!(active.plans, 1);
+        assert_eq!(active.reservations, 1);
+        assert_eq!(active.materializations, 1);
+        assert_eq!(active.releases, 0);
+        assert_eq!(active.active_reservations, 1);
+        assert_eq!(active.active_reserved_bytes, 0);
+
+        reader
+            .release_fence(fence.fence_id)
+            .expect("explicit fence release");
+        let released = reader
+            .ownership_snapshot_for_test()
+            .expect("released ownership snapshot");
+        assert_eq!(released.releases, 1);
+        assert_eq!(released.active_reservations, 0);
+        assert_eq!(released.active_reserved_bytes, 0);
+        assert_eq!(released.planned_bytes, released.reserved_bytes);
+        assert_eq!(released.reserved_bytes, released.released_bytes);
     }
 
     /// Bounds the release-tombstone map by memory only, never by live admission.

@@ -377,6 +377,8 @@ pub struct ScribeInspectionSnapshot {
     pub wal_disk_bytes: u64,
     /// Bounded pod-global ingress ownership lifecycle observations.
     pub ingress_lifecycle: ScribeIngressLifecycleSnapshot,
+    /// Bounded generation, replay, persistence-transfer, and retirement observations.
+    pub generation_lifecycle: crate::scribe::memory::ScribeGenerationLifecycleSnapshot,
 }
 
 /// Point-in-time health and queue metrics for the fixed shard owners.

@@ -5,7 +5,7 @@
 //! dedupes by `AppendSliceId`, and reconstructs both the memtable state and the
 //! staged `AuditEvent` list per key.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -28,9 +28,20 @@ use crate::scribe::wal::{
     DecodedSlicePayload, WalLsn, WalReader, WalRecord, WalSegmentRef, decode_slice_payload,
 };
 
-/// Maximum accounted decode memory held by one streamed replay batch.
-pub const REPLAY_BATCH_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 const REPLAY_RECORD_OVERHEAD_BYTES: usize = 1024;
+/// Maximum accounted decode memory held by one streamed replay batch.
+///
+/// One accepted native request can produce at most one slice for each
+/// canonical source/day pair. Replay simultaneously retains the validated WAL
+/// payload and its decoded audit/IPC fields until the terminal COMMIT arrives,
+/// so the envelope is twice the admitted projection ceiling plus one fixed
+/// metadata allowance for every possible source/day slice.
+pub const REPLAY_BATCH_MEMORY_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.material_bytes
+    * 2
+    + REPLAY_RECORD_OVERHEAD_BYTES
+        * crate::gate::limits::BIFROST_NATIVE_SOURCE_LIMIT
+        * crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
+const REPLAY_COMMITTED_IDENTITY_CAPACITY: usize = 4_096;
 
 /// Replayed state for one seal-key.
 ///
@@ -222,18 +233,18 @@ struct ReplayAccumulator<'a> {
     shard_id: u8,
     /// Per-seal-key manifest watermarks below which records are skipped.
     sealed_lsn_map: HashMap<String, WalLsn>,
-    /// Dedupe index that survives batch boundaries.
-    seen_slices: HashSet<AppendSliceId>,
     /// Incomplete v4 batches retained until their terminal COMMIT is read.
     pending_batches: HashMap<[u8; 16], PendingBatch>,
-    /// Canonical identities of completed slice sets already emitted.
-    committed_batches: HashMap<[u8; 16], CommittedBatchIdentity>,
+    /// Fixed-capacity canonical identities of completed slice sets already emitted.
+    committed_batches: Vec<CommittedBatchEntry>,
     /// In-flight replay state keyed by seal-key path.
     states: HashMap<String, ReplayedSealKey>,
     /// Optional memory governor supplied by the production WAL lane.
     governor: Option<&'a ScribeResources>,
     /// Current memory reservation for the in-flight batch.
     memory: Option<ScribeMemoryLease>,
+    /// Fixed replay-history reservation retained until this stream scan ends.
+    identity_memory: Option<ScribeMemoryLease>,
     /// Accounted bytes for the in-flight batch.
     memory_bytes: usize,
 }
@@ -256,16 +267,32 @@ impl<'a> ReplayAccumulator<'a> {
         let memory = governor
             .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
             .transpose()?;
+        let identity_bytes = REPLAY_COMMITTED_IDENTITY_CAPACITY
+            .checked_mul(std::mem::size_of::<CommittedBatchEntry>())
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay committed-identity capacity overflow".to_owned(),
+            })?;
+        let identity_memory = governor
+            .map(|governor| {
+                governor.try_reserve_maintenance(MemoryCategory::Decode, identity_bytes)
+            })
+            .transpose()?;
+        let committed_batches = Vec::with_capacity(REPLAY_COMMITTED_IDENTITY_CAPACITY);
+        if committed_batches.capacity() != REPLAY_COMMITTED_IDENTITY_CAPACITY {
+            return Err(ScribeError::Internal {
+                detail: "replay committed-identity allocation changed capacity".to_owned(),
+            });
+        }
         Ok(Self {
             stream,
             shard_id,
             sealed_lsn_map,
-            seen_slices: HashSet::new(),
             pending_batches: HashMap::new(),
-            committed_batches: HashMap::new(),
+            committed_batches,
             states: HashMap::new(),
             governor,
             memory,
+            identity_memory,
             memory_bytes: 0,
         })
     }
@@ -281,14 +308,31 @@ impl<'a> ReplayAccumulator<'a> {
         segment_path: std::path::PathBuf,
         record: &crate::scribe::wal::WalRecord,
     ) -> Result<(), ScribeError> {
+        // The WAL reader retains one validated payload while replay owns at
+        // most one exact record clone plus decoded variable fields whose total
+        // cannot exceed that payload. The fixed metadata ceiling covers the
+        // owned seal-key/path and descriptor layouts.
         let record_memory_bytes = record
             .payload
             .len()
-            .saturating_mul(2)
-            .saturating_add(REPLAY_RECORD_OVERHEAD_BYTES);
+            .checked_add(record.payload.len())
+            .and_then(|bytes| bytes.checked_add(REPLAY_RECORD_OVERHEAD_BYTES))
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay record ownership plan overflow".to_owned(),
+            })?;
         let previous_memory = self.memory_bytes;
+        let next_memory = previous_memory
+            .checked_add(record_memory_bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay batch ownership plan overflow".to_owned(),
+            })?;
+        if next_memory > REPLAY_BATCH_MEMORY_BYTES {
+            return Err(ScribeError::IngestBusy {
+                table: "WAL replay batch".to_owned(),
+            });
+        }
         if let Some(memory) = self.memory.as_mut() {
-            memory.resize_ingress(previous_memory.saturating_add(record_memory_bytes))?;
+            memory.resize_ingress(next_memory)?;
         }
         if record.is_commit() {
             self.commit(record)?;
@@ -342,7 +386,7 @@ impl<'a> ReplayAccumulator<'a> {
                 seal_key_path,
             },
         );
-        self.memory_bytes = self.memory_bytes.saturating_add(record_memory_bytes);
+        self.memory_bytes = next_memory;
         Ok(())
     }
 
@@ -354,15 +398,24 @@ impl<'a> ReplayAccumulator<'a> {
     /// set, its tenant or digest disagrees with the set, or a slice payload
     /// cannot be decoded into replay state.
     fn commit(&mut self, record: &WalRecord) -> Result<(), ScribeError> {
-        if let Some(committed) = self.committed_batches.get(&record.batch_id) {
-            if !committed.matches(record) {
+        if let Some(committed) = self
+            .committed_batches
+            .iter()
+            .find(|committed| committed.batch_id == record.batch_id)
+        {
+            if !committed.identity.matches(record) {
                 return Err(ScribeError::Internal {
                     detail: "WAL v4 batch has a contradictory duplicate COMMIT".to_owned(),
                 });
             }
             if let Some(pending) = self.pending_batches.remove(&record.batch_id) {
                 validate_pending_batch(&pending, record)?;
-                self.memory_bytes = self.memory_bytes.saturating_sub(pending.memory_bytes());
+                self.memory_bytes = self
+                    .memory_bytes
+                    .checked_sub(pending.memory_bytes()?)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "replay duplicate settlement underflow".to_owned(),
+                    })?;
             }
             return Ok(());
         }
@@ -374,17 +427,23 @@ impl<'a> ReplayAccumulator<'a> {
             })?;
         validate_pending_batch(&pending, record)?;
         for slice in pending.slices.into_values() {
-            if self.seen_slices.insert(slice.append_slice_id.clone())
-                && self
-                    .sealed_lsn_map
-                    .get(&slice.seal_key_path)
-                    .is_none_or(|sealed_lsn| slice.record.lsn > *sealed_lsn)
+            if self
+                .sealed_lsn_map
+                .get(&slice.seal_key_path)
+                .is_none_or(|sealed_lsn| slice.record.lsn > *sealed_lsn)
             {
                 self.release_slice(slice)?;
             }
         }
-        self.committed_batches
-            .insert(record.batch_id, CommittedBatchIdentity::from_commit(record));
+        if self.committed_batches.len() == REPLAY_COMMITTED_IDENTITY_CAPACITY {
+            return Err(ScribeError::IngestBusy {
+                table: "WAL replay identity index".to_owned(),
+            });
+        }
+        self.committed_batches.push(CommittedBatchEntry {
+            batch_id: record.batch_id,
+            identity: CommittedBatchIdentity::from_commit(record),
+        });
         Ok(())
     }
 
@@ -448,6 +507,7 @@ impl<'a> ReplayAccumulator<'a> {
         };
         self.memory = next_memory;
         self.memory_bytes = 0;
+        debug_assert!(self.identity_memory.is_some() || self.governor.is_none());
         Ok(Some(chunk))
     }
 
@@ -493,6 +553,15 @@ struct CommittedBatchIdentity {
     slice_set_digest: [u8; 32],
 }
 
+/// Fixed-layout lookup entry retained for exact retry validation during replay.
+#[derive(Debug)]
+struct CommittedBatchEntry {
+    /// Stable logical batch key within this WAL stream and shard.
+    batch_id: [u8; 16],
+    /// Canonical terminal identity authenticated by WAL v4.
+    identity: CommittedBatchIdentity,
+}
+
 impl CommittedBatchIdentity {
     /// Retains the bounded identity needed to validate a later duplicate COMMIT.
     ///
@@ -533,12 +602,22 @@ impl PendingBatch {
     }
 
     /// Returns the replay decode reservation owned by this pending slice set.
-    #[must_use]
-    fn memory_bytes(&self) -> usize {
-        self.slices.values().fold(0_usize, |bytes, slice| {
+    fn memory_bytes(&self) -> Result<usize, ScribeError> {
+        self.slices.values().try_fold(0_usize, |bytes, slice| {
+            let slice_bytes = slice
+                .record
+                .payload
+                .len()
+                .checked_add(slice.record.payload.len())
+                .and_then(|bytes| bytes.checked_add(REPLAY_RECORD_OVERHEAD_BYTES))
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay pending-slice ownership plan overflow".to_owned(),
+                })?;
             bytes
-                .saturating_add(slice.record.payload.len().saturating_mul(2))
-                .saturating_add(REPLAY_RECORD_OVERHEAD_BYTES)
+                .checked_add(slice_bytes)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay pending-batch ownership plan overflow".to_owned(),
+                })
         })
     }
 }

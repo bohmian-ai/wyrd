@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use crate::oracle::ScribeTailAuthority;
-use arrow::ipc::writer::StreamWriter;
-use thiserror::Error;
-use vala_bifrost_redux::scribe::tail_rpc::{ScribeTailReader, TailReadError};
+use vala_bifrost_redux::scribe::tail_rpc::{
+    ScribeTailReader, TailReadError, encode_tail_batch_exact,
+};
 use vala_bifrost_redux::scribe::tail_rpc::{
     TailTicketAudience, TailTicketBinding, TailTicketMinter, TailTicketVerifier,
 };
@@ -21,29 +21,6 @@ use wyrd_tonic::wyrd::v1::{
 };
 
 use crate::AppState;
-
-/// Reports a bounded Arrow IPC encoding stage without retaining tonic state.
-#[derive(Debug, Error)]
-enum TailBatchEncodingError {
-    /// Arrow rejected creation of the stream writer for the batch schema.
-    #[error("failed to initialize Arrow IPC tail-batch writer: {detail}")]
-    Initialize {
-        /// Scrubbed Arrow diagnostic retained until the handler maps the error.
-        detail: String,
-    },
-    /// Arrow rejected the batch while writing the owned stream payload.
-    #[error("failed to write Arrow IPC tail batch: {detail}")]
-    Write {
-        /// Scrubbed Arrow diagnostic retained until the handler maps the error.
-        detail: String,
-    },
-    /// Arrow rejected finalization of the owned stream payload.
-    #[error("failed to finish Arrow IPC tail batch: {detail}")]
-    Finish {
-        /// Scrubbed Arrow diagnostic retained until the handler maps the error.
-        detail: String,
-    },
-}
 
 /// Private gRPC adapter that validates a workload caller before touching a tail fence.
 pub struct ScribeTailGrpc {
@@ -300,9 +277,9 @@ impl ScribeTailService for ScribeTailGrpc {
         let batches = page
             .batches
             .iter()
-            .map(|batch| encode_batch(batch.as_ref()))
+            .map(|batch| encode_tail_batch_exact(batch.as_ref()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(encoding_status)?;
+            .map_err(tail_status)?;
         Ok(Response::new(proto::TailPage {
             arrow_ipc_batches: batches,
             next_cursor: page
@@ -407,39 +384,6 @@ fn tail_status(error: TailReadError) -> Status {
     }
 }
 
-/// Maps a local Arrow IPC encoding failure at the tonic handler boundary.
-fn encoding_status(error: TailBatchEncodingError) -> Status {
-    Status::internal(error.to_string())
-}
-
-/// Encodes one local shallow batch into the private transport's owned Arrow IPC bytes.
-///
-/// # Errors
-///
-/// Returns a local encoding error when Arrow cannot initialize, write, or
-/// finish the bounded IPC stream.
-fn encode_batch(
-    batch: &arrow::record_batch::RecordBatch,
-) -> Result<Vec<u8>, TailBatchEncodingError> {
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).map_err(|error| {
-        TailBatchEncodingError::Initialize {
-            detail: error.to_string(),
-        }
-    })?;
-    writer
-        .write(batch)
-        .map_err(|error| TailBatchEncodingError::Write {
-            detail: error.to_string(),
-        })?;
-    writer
-        .finish()
-        .map_err(|error| TailBatchEncodingError::Finish {
-            detail: error.to_string(),
-        })?;
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -451,7 +395,9 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use wyrd_tonic::tonic::Code;
 
-    use super::{TailBatchEncodingError, encode_batch, encoding_status};
+    use vala_bifrost_redux::scribe::tail_rpc::{TailReadError, encode_tail_batch_exact};
+
+    use super::tail_status;
 
     /// Proves the local encoder produces a complete owned Arrow IPC stream.
     ///
@@ -469,7 +415,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])
             .expect("valid tail batch fixture");
 
-        let bytes = encode_batch(&batch).expect("tail batch encodes");
+        let bytes = encode_tail_batch_exact(&batch).expect("tail batch encodes");
+        assert_eq!(bytes.len(), bytes.capacity());
         let decoded = StreamReader::try_new(Cursor::new(bytes), None)
             .expect("encoded stream initializes")
             .next()
@@ -486,7 +433,7 @@ mod tests {
     /// Panics when the boundary mapper exposes a non-internal tonic status.
     #[test]
     fn tail_batch_encoding_error_maps_to_internal_status() {
-        let status = encoding_status(TailBatchEncodingError::Finish {
+        let status = tail_status(TailReadError::Encode {
             detail: "fixture failure".to_owned(),
         });
 

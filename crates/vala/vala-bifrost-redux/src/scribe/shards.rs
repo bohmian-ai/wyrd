@@ -19,7 +19,8 @@ use crate::scribe::execution_lanes::{
 };
 use crate::scribe::memory::{MemoryCategory, ScribeOwnership};
 use crate::scribe::memtable::{
-    BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, SealTriggerReason,
+    BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, ReadableBatchLimits,
+    SealTriggerReason,
 };
 use crate::scribe::persistence::{
     ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
@@ -380,6 +381,13 @@ struct ShardOwner {
     seal_retry: HashSet<crate::scribe::seal_key::SealKey>,
     /// Published generations retained until grace-ordered WAL retirement.
     retained_generations: HashMap<u64, RetainedGeneration>,
+    /// The sole in-flight group retained after unresolved SQL COMMIT ambiguity.
+    ///
+    /// A shard processes one group at a time. Once this slot is populated the
+    /// shared governor is poisoned and the owner stops advancing its scheduler,
+    /// so the current group plus already-admitted scheduler entries remain the
+    /// complete bounded ambiguity set until process restart.
+    retained_commit_ambiguity: Option<GroupWalState>,
     /// Admission controller shared by all shard owners.
     admission: AdmissionController,
     /// Mutable memtable owned exclusively by this shard task.
@@ -615,6 +623,7 @@ impl ScribeShardRuntime {
                 pending_generations: PendingGenerationsByKey::new(),
                 seal_retry: HashSet::new(),
                 retained_generations: HashMap::new(),
+                retained_commit_ambiguity: None,
                 admission: admission.clone(),
                 memtable: Memtable::new_with_config(rotation_bytes, seal_max_age),
                 persistence_cpu: persistence_cpu.clone(),
@@ -728,7 +737,8 @@ impl ScribeShardRuntime {
         if self.closed.load(Ordering::Acquire) {
             return Err(ScribeError::IngressClosed);
         }
-        let mut merged = Vec::new();
+        let mut merged = Vec::with_capacity(request.max_batches);
+        let mut retained_bytes = 0_usize;
         for sender in &self.senders {
             let (response, result) = tokio::sync::oneshot::channel();
             let command = ShardCommand::Snapshot {
@@ -747,6 +757,26 @@ impl ScribeShardRuntime {
             let batches = result.await.map_err(|_| ScribeError::Internal {
                 detail: "shard dropped live-tail snapshot response".to_owned(),
             })??;
+            let batch_bytes = batches.iter().try_fold(0_usize, |bytes, batch| {
+                bytes
+                    .checked_add(batch.rows.get_array_memory_size())
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "live-tail retained byte count overflow".to_owned(),
+                    })
+            })?;
+            retained_bytes =
+                retained_bytes
+                    .checked_add(batch_bytes)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "live-tail retained byte count overflow".to_owned(),
+                    })?;
+            if merged.len().saturating_add(batches.len()) > request.max_batches
+                || retained_bytes > request.max_retained_bytes
+            {
+                return Err(ScribeError::IngestBusy {
+                    table: request.binding.table_ref.fqn(),
+                });
+            }
             merged.extend(batches);
         }
         Ok(merged)
@@ -1088,6 +1118,18 @@ impl ShardOwner {
     async fn run(mut self) {
         self.publish_snapshot();
         loop {
+            if self.memory_ownership.is_poisoned() {
+                match self.receiver.recv().await {
+                    Some(ShardCommand::Shutdown) | None => break,
+                    Some(command) => {
+                        if self.handle_command(command).await {
+                            break;
+                        }
+                        self.publish_snapshot();
+                    }
+                }
+                continue;
+            }
             if self.pressure_receiver.has_changed().unwrap_or(false) {
                 let signal = self.pressure_receiver.borrow_and_update().clone();
                 if let Some(signal) = signal {
@@ -1236,6 +1278,10 @@ impl ShardOwner {
             request.start_day,
             request.end_day,
             &request.required_columns,
+            ReadableBatchLimits {
+                max_batches: request.max_batches,
+                max_retained_bytes: request.max_retained_bytes,
+            },
         )?;
         Ok(readable
             .into_iter()
@@ -2110,6 +2156,14 @@ impl ShardOwner {
             return Err(error);
         }
         if let Err(error) = self.append_and_sync_batch_commits(&mut state).await {
+            if self.memory_ownership.is_poisoned() {
+                debug_assert!(
+                    self.retained_commit_ambiguity.is_none(),
+                    "one serial shard group may hold COMMIT ambiguity"
+                );
+                self.retained_commit_ambiguity = Some(state);
+                return Err(error);
+            }
             if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
                 tracing::error!(error = %cleanup_error, "active cleanup failed after batch commit error");
             }
@@ -2299,45 +2353,96 @@ impl ShardOwner {
                 .map_err(|error| ScribeError::Internal {
                     detail: format!("Scribe audit request id is not a UUID: {error}"),
                 })?;
-                let mut conn = postgres.tenant_conn(append.tenant).await?;
-                vala_sql::queries::scribe_batch_commits::record(
-                    &mut conn,
-                    &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
-                        tenant: append.tenant,
-                        logical_table_fqn: append.table.fqn(),
-                        batch_id: append.batch_id,
-                        slice_set_digest: digest,
-                        slice_count: i32::try_from(slice_count).map_err(|_| {
-                            ScribeError::Internal {
-                                detail: "WAL v4 slice count exceeds SQL integer range".to_owned(),
-                            }
-                        })?,
-                        wal_node_id: uuid::Uuid::from_bytes(header.node_id),
-                        wal_writer_epoch: header.writer_epoch,
-                        wal_shard_id: i16::from(header.shard_id),
-                        wal_segment_sequence: i64::try_from(header.seg_seq).map_err(|_| {
-                            ScribeError::Internal {
-                                detail: "WAL segment sequence exceeds SQL bigint range".to_owned(),
-                            }
-                        })?,
-                        wal_lsn_min: i64::try_from(state.durable[first_index].lsn.as_u64())
-                            .map_err(|_| ScribeError::Internal {
-                                detail: "WAL slice LSN exceeds SQL bigint range".to_owned(),
-                            })?,
-                        wal_lsn_max: i64::try_from(commit_lsn.as_u64()).map_err(|_| {
-                            ScribeError::Internal {
-                                detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
-                            }
-                        })?,
-                        request_id,
-                    },
+                let commit = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                    tenant: append.tenant,
+                    logical_table_fqn: append.table.fqn(),
+                    batch_id: append.batch_id,
+                    slice_set_digest: digest,
+                    slice_count: i32::try_from(slice_count).map_err(|_| ScribeError::Internal {
+                        detail: "WAL v4 slice count exceeds SQL integer range".to_owned(),
+                    })?,
+                    wal_node_id: uuid::Uuid::from_bytes(header.node_id),
+                    wal_writer_epoch: header.writer_epoch,
+                    wal_shard_id: i16::from(header.shard_id),
+                    wal_segment_sequence: i64::try_from(header.seg_seq).map_err(|_| {
+                        ScribeError::Internal {
+                            detail: "WAL segment sequence exceeds SQL bigint range".to_owned(),
+                        }
+                    })?,
+                    wal_lsn_min: i64::try_from(state.durable[first_index].lsn.as_u64()).map_err(
+                        |_| ScribeError::Internal {
+                            detail: "WAL slice LSN exceeds SQL bigint range".to_owned(),
+                        },
+                    )?,
+                    wal_lsn_max: i64::try_from(commit_lsn.as_u64()).map_err(|_| {
+                        ScribeError::Internal {
+                            detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
+                        }
+                    })?,
+                    request_id,
+                };
+                self.commit_batch_control_fence(
+                    postgres,
+                    &commit,
                     &state.durable[first_index].audit_event,
                 )
                 .await?;
-                conn.commit().await?;
             }
         }
         Ok(())
+    }
+
+    /// Commits or durably reconciles one exact WAL batch-control fence.
+    ///
+    /// A `PostgreSQL` COMMIT error is always ambiguous. The method opens a fresh
+    /// tenant transaction and compares every durable identity field. An exact
+    /// row completes once; an absent row retries the identical insert and audit
+    /// transaction. An unavailable or contradictory lookup poisons the shared
+    /// governor so [`Self::process_group`] retains the complete admitted owner
+    /// without ACK or cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for a known pre-COMMIT SQL failure or when exact
+    /// durable reconciliation is unavailable or contradictory. The latter
+    /// failures poison admission and retain the group until restart.
+    async fn commit_batch_control_fence(
+        &self,
+        postgres: &vala_sql::ValaPostgres,
+        commit: &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit,
+        audit_event: &wyrd_spec::vala::api::AuditEvent,
+    ) -> Result<(), ScribeError> {
+        loop {
+            let mut conn = postgres.tenant_conn(commit.tenant).await?;
+            vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, audit_event).await?;
+            if conn.commit().await.is_ok() {
+                return Ok(());
+            }
+
+            let mut reconciliation = match postgres.tenant_conn(commit.tenant).await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    self.memory_ownership.poison();
+                    return Err(error.into());
+                }
+            };
+            match vala_sql::queries::scribe_batch_commits::resolve(&mut reconciliation, commit)
+                .await
+            {
+                Ok(
+                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
+                ) => {
+                    return Ok(());
+                }
+                Ok(
+                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Absent,
+                ) => {}
+                Err(error) => {
+                    self.memory_ownership.poison();
+                    return Err(error.into());
+                }
+            }
+        }
     }
 
     /// Prepares one group for WAL synchronization without acknowledging it.
@@ -3428,6 +3533,7 @@ mod tests {
             pending_generations: PendingGenerationsByKey::new(),
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
+            retained_commit_ambiguity: None,
             admission: AdmissionController::with_config_and_memory(
                 crate::scribe::admission::AdmissionConfig::default(),
                 budget.clone(),

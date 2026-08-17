@@ -696,13 +696,20 @@ impl Memtable {
     /// selected columns are then projected before the detached snapshot is
     /// returned, so a snapshot never exposes an unrelated bucket or an
     /// unrequested Arrow column.
-    pub fn readable_batches_for_range(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] before projection when the batch or
+    /// retained-byte ceiling is exhausted, or an internal error when locks,
+    /// checked arithmetic, column selection, or Arrow projection fail.
+    pub(crate) fn readable_batches_for_range(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
         start_day: crate::scribe::seal_key::EventDay,
         end_day: crate::scribe::seal_key::EventDay,
         required_columns: &[String],
+        limits: ReadableBatchLimits,
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         if start_day > end_day {
             return Err(ScribeError::Internal {
@@ -715,14 +722,15 @@ impl Memtable {
         let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
-        let mut batches = Vec::new();
+        let mut batches =
+            ReadableBatchCollector::new(limits.max_batches, limits.max_retained_bytes);
 
         for (seal_key, bucket) in writable.iter() {
             if seal_key.tenant == tenant
                 && seal_key.table == *table
                 && (start_day..=end_day).contains(&seal_key.day)
             {
-                batches.extend(bucket.readable_batches(required_columns)?);
+                bucket.append_readable_batches(required_columns, &mut batches)?;
             }
         }
         for (seal_key, entries) in immutable.iter() {
@@ -731,11 +739,13 @@ impl Memtable {
                 && (start_day..=end_day).contains(&seal_key.day)
             {
                 for entry in entries {
-                    batches.extend(entry.frozen.readable_batches(required_columns)?);
+                    entry
+                        .frozen
+                        .append_readable_batches(required_columns, &mut batches)?;
                 }
             }
         }
-        Ok(batches)
+        Ok(batches.finish())
     }
 
     /// Return all readable batches for a table, preserving the old unit-test
@@ -746,12 +756,17 @@ impl Memtable {
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let stats = self.stats()?;
         self.readable_batches_for_range(
             tenant,
             table,
             crate::scribe::seal_key::EventDay::new(chrono::NaiveDate::MIN),
             crate::scribe::seal_key::EventDay::new(chrono::NaiveDate::MAX),
             &[],
+            ReadableBatchLimits {
+                max_batches: stats.writable_rows.saturating_add(stats.immutable_rows),
+                max_retained_bytes: stats.writable_bytes.saturating_add(stats.immutable_bytes),
+            },
         )
     }
 
@@ -1174,28 +1189,24 @@ impl MemtableBucket {
         }
     }
 
-    fn readable_batches(
+    /// Appends this active bucket through the bounded shallow collector.
+    ///
+    /// # Errors
+    ///
+    /// Returns the collector capacity or Arrow projection error unchanged.
+    fn append_readable_batches(
         &self,
         required_columns: &[String],
-    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        output: &mut ReadableBatchCollector,
+    ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required_columns)?;
-        self.batches
-            .iter()
-            .cloned()
-            .zip(self.metas.iter().cloned())
-            .map(|(batch, meta)| {
-                let batch = batch
-                    .project(&projection)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: format!("live-tail Arrow projection failed: {error}"),
-                    })?;
-                Ok(ReadableBatch {
-                    partition_day: self.seal_key.day,
-                    meta,
-                    batch,
-                })
-            })
-            .collect()
+        append_projected_batches(
+            &self.batches,
+            &self.metas,
+            self.seal_key.day,
+            &projection,
+            output,
+        )
     }
 }
 
@@ -1294,6 +1305,15 @@ pub struct ReadableBatch {
     pub batch: RecordBatch,
 }
 
+/// Immutable count and byte ceilings for one shallow live-tail snapshot.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadableBatchLimits {
+    /// Maximum number of projected batch descriptors returned to the caller.
+    pub(crate) max_batches: usize,
+    /// Maximum source-derived Arrow bytes retained by the returned batches.
+    pub(crate) max_retained_bytes: usize,
+}
+
 /// Inclusive WAL range eligible for retirement after a committed sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalRange {
@@ -1360,28 +1380,117 @@ impl FrozenMemtable {
         self.batches.iter().map(RecordBatch::num_rows).sum()
     }
 
-    fn readable_batches(
+    /// Appends this immutable generation through the bounded shallow collector.
+    ///
+    /// # Errors
+    ///
+    /// Returns the collector capacity or Arrow projection error unchanged.
+    fn append_readable_batches(
         &self,
         required_columns: &[String],
-    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        output: &mut ReadableBatchCollector,
+    ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required_columns)?;
-        self.batches
-            .iter()
-            .cloned()
-            .zip(self.metas.iter().cloned())
-            .map(|(batch, meta)| {
-                let batch = batch
-                    .project(&projection)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: format!("live-tail Arrow projection failed: {error}"),
-                    })?;
-                Ok(ReadableBatch {
-                    partition_day: self.seal_key.day,
-                    meta,
-                    batch,
-                })
-            })
-            .collect()
+        append_projected_batches(
+            &self.batches,
+            &self.metas,
+            self.seal_key.day,
+            &projection,
+            output,
+        )
+    }
+}
+
+/// Appends shallow projected batches only after source-derived capacity checks.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::IngestBusy`] before projection when the configured
+/// batch or retained-byte ceiling would be exceeded, or an internal error when
+/// byte arithmetic or Arrow projection fails.
+fn append_projected_batches(
+    batches: &[RecordBatch],
+    metas: &[ScribeAppendMeta],
+    partition_day: crate::scribe::seal_key::EventDay,
+    projection: &[usize],
+    output: &mut ReadableBatchCollector,
+) -> Result<(), ScribeError> {
+    for (batch, meta) in batches.iter().zip(metas) {
+        output.preflight(batch.get_array_memory_size())?;
+        let batch = batch
+            .project(projection)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("live-tail Arrow projection failed: {error}"),
+            })?;
+        output.push(ReadableBatch {
+            partition_day,
+            meta: meta.clone(),
+            batch,
+        });
+    }
+    Ok(())
+}
+
+/// Owns one exact-capacity shallow live-tail snapshot under configured bounds.
+struct ReadableBatchCollector {
+    /// Maximum number of shallow batches accepted by this snapshot.
+    max_batches: usize,
+    /// Maximum source-derived Arrow bytes retained by this snapshot.
+    max_retained_bytes: usize,
+    /// Source-derived bytes accepted so far.
+    retained_bytes: usize,
+    /// Exact-capacity result backing filled only after each preflight.
+    output: Vec<ReadableBatch>,
+}
+
+impl ReadableBatchCollector {
+    /// Creates an empty collector with its complete batch descriptor capacity.
+    fn new(max_batches: usize, max_retained_bytes: usize) -> Self {
+        Self {
+            max_batches,
+            max_retained_bytes,
+            retained_bytes: 0,
+            output: Vec::with_capacity(max_batches),
+        }
+    }
+
+    /// Refuses a candidate before Arrow projection when either ceiling is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the candidate exceeds a
+    /// configured ceiling, or [`ScribeError::Internal`] when byte arithmetic
+    /// overflows.
+    fn preflight(&mut self, source_bytes: usize) -> Result<(), ScribeError> {
+        if self.output.len() == self.max_batches {
+            return Err(ScribeError::IngestBusy {
+                table: "live-tail snapshot".to_owned(),
+            });
+        }
+        let next_bytes = self
+            .retained_bytes
+            .checked_add(source_bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "live-tail retained byte count overflow".to_owned(),
+            })?;
+        if next_bytes > self.max_retained_bytes {
+            return Err(ScribeError::IngestBusy {
+                table: "live-tail snapshot".to_owned(),
+            });
+        }
+        self.retained_bytes = next_bytes;
+        Ok(())
+    }
+
+    /// Appends one post-preflight shallow projection without growing capacity.
+    fn push(&mut self, batch: ReadableBatch) {
+        debug_assert!(self.output.len() < self.output.capacity());
+        self.output.push(batch);
+    }
+
+    /// Consumes the collector and returns its bounded shallow snapshot.
+    fn finish(self) -> Vec<ReadableBatch> {
+        self.output
     }
 }
 
@@ -1650,6 +1759,69 @@ mod tests {
             .map(|batch| batch.meta.wal_lsn_max)
             .collect();
         assert_eq!(lsns, vec![WalLsn::new(10), WalLsn::new(20)]);
+    }
+
+    /// Live-tail snapshots refuse count and byte overflow before projection growth.
+    #[test]
+    fn live_tail_snapshot_enforces_preallocated_count_and_byte_bounds() {
+        let memtable = Memtable::new();
+        let seal_key = make_test_seal_key();
+        for lsn in [10, 20] {
+            memtable
+                .insert(
+                    &seal_key,
+                    make_test_event(),
+                    make_test_meta(lsn),
+                    make_test_batch(1),
+                )
+                .expect("bounded fixture insert");
+        }
+        let tenant = crate::test_support::tenant();
+        let rows = memtable
+            .readable_batches_for_range(
+                tenant,
+                &seal_key.table,
+                seal_key.day,
+                seal_key.day,
+                &[],
+                ReadableBatchLimits {
+                    max_batches: 2,
+                    max_retained_bytes: usize::MAX,
+                },
+            )
+            .expect("exact batch ceiling");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.capacity(), 2);
+
+        assert!(matches!(
+            memtable.readable_batches_for_range(
+                tenant,
+                &seal_key.table,
+                seal_key.day,
+                seal_key.day,
+                &[],
+                ReadableBatchLimits {
+                    max_batches: 1,
+                    max_retained_bytes: usize::MAX,
+                },
+            ),
+            Err(ScribeError::IngestBusy { .. })
+        ));
+        let first_bytes = rows[0].batch.get_array_memory_size();
+        assert!(matches!(
+            memtable.readable_batches_for_range(
+                tenant,
+                &seal_key.table,
+                seal_key.day,
+                seal_key.day,
+                &[],
+                ReadableBatchLimits {
+                    max_batches: 2,
+                    max_retained_bytes: first_bytes.saturating_sub(1),
+                },
+            ),
+            Err(ScribeError::IngestBusy { .. })
+        ));
     }
 
     /// Verifies that a committed generation retires on the first sweep after commit,

@@ -3121,8 +3121,11 @@ impl ScribeMemoryLease {
         self.root.poison("Scribe lease invariant failed");
     }
 
-    /// Reports root poison for ownership tests.
-    #[cfg(test)]
+    /// Reports whether this lease's sole root has entered fail-stop health.
+    ///
+    /// Shard owners use this observation to stop advancing admitted work after
+    /// an unresolved durable-control ambiguity while retaining the exact
+    /// generation owner for restart reconciliation.
     #[must_use]
     pub(crate) fn is_poisoned(&self) -> bool {
         self.root.inner.health.reason().is_some()

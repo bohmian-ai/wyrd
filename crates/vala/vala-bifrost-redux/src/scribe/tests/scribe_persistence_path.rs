@@ -125,6 +125,8 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         end_day: EventDay::new(day),
         after_lsn: WalLsn::ZERO,
         required_columns: vec!["value".to_owned()],
+        max_batches: 64,
+        max_retained_bytes: 64 * 1024 * 1024,
     };
     let hot = scribe
         .tail_service()
@@ -230,6 +232,8 @@ async fn assert_pointer_identity(
             end_day: EventDay::new(day),
             after_lsn: WalLsn::ZERO,
             required_columns: vec!["value".to_owned()],
+            max_batches: 64,
+            max_retained_bytes: 64 * 1024 * 1024,
         })
         .await
         .expect("pointer hot snapshot");
@@ -282,6 +286,8 @@ async fn assert_cross_day_materialization(
         end_day: EventDay::new(day),
         after_lsn: WalLsn::ZERO,
         required_columns: vec!["value".to_owned()],
+        max_batches: 64,
+        max_retained_bytes: 64 * 1024 * 1024,
     };
     let day_one_hot = scribe
         .tail_service()
@@ -333,6 +339,8 @@ async fn assert_other_tenant_isolated(
             end_day: EventDay::new(day),
             after_lsn: WalLsn::ZERO,
             required_columns: vec!["value".to_owned()],
+            max_batches: 64,
+            max_retained_bytes: 64 * 1024 * 1024,
         })
         .await
         .expect("other tenant snapshot");

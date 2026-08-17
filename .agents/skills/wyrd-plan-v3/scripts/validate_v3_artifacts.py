@@ -185,6 +185,7 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
     if plan_rs != manifest_rs: errors.append("requirements are not bidirectionally traceable")
     if plan_ds != manifest_ds: errors.append("decisions are not bidirectionally traceable")
     graph: dict[str,list[str]] = {}
+    proof_prerequisites: dict[str,set[str]] = {}
     writes: dict[str,set[str]] = {}
     all_task_acs: set[str] = set()
     for tid, task in tasks.items():
@@ -201,6 +202,7 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
         if metadata(text,"Repository revision") != revision: errors.append(f"{tid} revision metadata mismatch")
         if metadata(text,"Status") not in {"Planned","Ready","Complete","Blocked"}: errors.append(f"{tid} invalid status")
         deps = task.get("depends_on", []); graph[str(tid)] = deps if isinstance(deps,list) else []
+        proof_prerequisites[str(tid)] = set()
         packet_deps = metadata(text,"Depends on"); packet_dep_set = set() if packet_deps == "None" else ids(packet_deps,"T")
         if set(graph[str(tid)]) != packet_dep_set: errors.append(f"{tid} dependency mismatch")
         for field,prefix in (("requirements","R"),("decisions","D"),("acceptance","AC")):
@@ -243,8 +245,12 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
         failure_body=task_sections.get("Failure and edge-case matrix","")
         if stateful and not re.search(r"^\|[^\n]+\|[^\n]+\|[^\n]+\|\s*$",failure_body,re.M): errors.append(f"{tid} stateful task requires exact failure-matrix row")
         for proof in task.get("proofs",[]):
-            required={"acceptance","coverage","package","target","features","selector","test_kind","test_path","test_name","expected_selected_count","setup","lane","expected_result","preflight_command","acceptance_command","preflight"}
+            required={"id","requires_integrated","acceptance","coverage","package","target","features","selector","test_kind","test_path","test_name","expected_selected_count","setup","lane","expected_result","preflight_command","acceptance_command","preflight"}
             if set(proof)!=required or proof.get("acceptance") not in task.get("acceptance",[]): errors.append(f"{tid} invalid proof schema")
+            proof_id=str(proof.get("id","")); prerequisites=proof.get("requires_integrated",[])
+            if not re.fullmatch(rf"{re.escape(str(tid))}-P[1-9][0-9]*",proof_id): errors.append(f"{tid} invalid proof id")
+            if not isinstance(prerequisites,list) or len(prerequisites)!=len(set(prerequisites)) or any(value not in tasks or value==tid for value in prerequisites): errors.append(f"{tid} invalid proof prerequisites")
+            if isinstance(prerequisites,list): proof_prerequisites[str(tid)].update(str(value) for value in prerequisites)
             command=str(proof.get("preflight_command","")); acceptance_command=str(proof.get("acceptance_command","")); selector=str(proof.get("selector",""))
             kind=proof.get("test_kind")
             if kind not in {"existing","new","command"} or not safe_path(str(proof.get("test_path",""))) or proof.get("test_name")!=selector or not isinstance(proof.get("expected_selected_count"),int) or proof.get("expected_selected_count",0)<=0: errors.append(f"{tid} invalid planned test identity")
@@ -261,8 +267,13 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
             if not safe_path(str(pre.get("path",""))) or not ep.is_file() or sha256(ep)!=pre.get("digest"): errors.append(f"{tid} preflight evidence digest invalid"); continue
             try: evidence=json.loads(ep.read_text())
             except Exception: errors.append(f"{tid} preflight evidence invalid JSON"); continue
-            base_valid=evidence.get("command")==command and evidence.get("exit_code")==0 and isinstance(evidence.get("selected_count"),int) and bool(str(evidence.get("output","")).strip()) and evidence.get("repository")=={"origin":origin,"revision":revision} and evidence.get("package")==proof.get("package") and evidence.get("target")==proof.get("target")
-            if not base_valid or (kind=="existing" and evidence.get("selected_count",0)<=0) or (kind=="new" and evidence.get("selected_count")!=0) or (kind=="command" and evidence.get("selected_count") not in {0,1}): errors.append(f"{tid} preflight evidence violates {kind}-proof contract")
+            common_valid=evidence.get("command")==command and isinstance(evidence.get("exit_code"),int) and isinstance(evidence.get("selected_count"),int) and bool(str(evidence.get("output","")).strip()) and evidence.get("repository")=={"origin":origin,"revision":revision} and evidence.get("package")==proof.get("package") and evidence.get("target")==proof.get("target")
+            blocked=evidence.get("classification")=="prerequisite" and evidence.get("requires_integrated")==prerequisites and bool(prerequisites) and evidence.get("exit_code")!=0 and evidence.get("selected_count")==0
+            passed=evidence.get("exit_code")==0 and evidence.get("classification") in {None,"pass"}
+            selection_valid=(kind=="existing" and evidence.get("selected_count",0)>0) or (kind=="new" and evidence.get("selected_count")==0) or (kind=="command" and evidence.get("selected_count") in {0,1})
+            if not common_valid or not ((passed and selection_valid) or blocked): errors.append(f"{tid} preflight evidence violates {kind}-proof contract")
+        proof_ids=[p.get("id") for p in task.get("proofs",[])]
+        if len(proof_ids)!=len(set(proof_ids)): errors.append(f"{tid} proof ids must be unique")
         proof_acs=[p.get("acceptance") for p in task.get("proofs",[])]
         if set(proof_acs)!=set(task.get("acceptance",[])): errors.append(f"{tid} every acceptance criterion requires proof")
         required_coverage={value for item in task.get("write_set",[]) for value in item.get("coverage",[])}
@@ -280,6 +291,16 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
             else: visit(dep)
         visiting.remove(n); visited.add(n)
     for n in graph: visit(n)
+    combined={task:list(set(graph.get(task,[]))|proof_prerequisites.get(task,set())) for task in graph}
+    combined_visiting:set[str]=set(); combined_visited:set[str]=set()
+    def visit_combined(task_id:str)->None:
+        if task_id in combined_visiting: errors.append(f"combined implementation/proof cycle at {task_id}"); return
+        if task_id in combined_visited:return
+        combined_visiting.add(task_id)
+        for prerequisite in combined.get(task_id,[]):
+            if prerequisite in combined: visit_combined(prerequisite)
+        combined_visiting.remove(task_id); combined_visited.add(task_id)
+    for task_id in combined: visit_combined(task_id)
     def ordered(a:str,b:str,seen:set[str]|None=None)->bool:
         seen=set() if seen is None else seen
         if a in seen:return False

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from validate_controller_state import commit_diff, digest, validate
+from validate_controller_state import commit_diff, digest, validate, validate_projection
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -17,6 +17,7 @@ SHA_C = "c" * 40
 DIGEST_D = "d" * 64
 DIGEST_E = "e" * 64
 DIGEST_F = "f" * 64
+PROOF_FOCUSED = "focused"
 
 
 def task(status: str = "ready") -> dict:
@@ -34,21 +35,25 @@ def task(status: str = "ready") -> dict:
         "candidate_parent": SHA_B if status in {"candidate", "accepted", "integrated"} else None,
         "diff_digest": DIGEST_E if status in {"candidate", "accepted", "integrated"} else None,
         "patch_id": SHA_C if status in {"candidate", "accepted", "integrated"} else None,
-        "proof_attempts": [],
-        "accepted_proof": None,
+        "proof_requirements": {PROOF_FOCUSED: {"prerequisites": []}},
+        "proof_attempts": {PROOF_FOCUSED: []},
+        "accepted_proofs": {},
         "review": None,
         "integrated_commit": None,
         "integrated_parent": None,
         "evidence_commit": None,
     }
     if status in {"accepted", "integrated"}:
-        value["proof_attempts"] = [{
-            "ordinal": 1, "candidate_sha": SHA_A, "generation": 1,
+        value["proof_attempts"][PROOF_FOCUSED] = [{
+            "proof_id": PROOF_FOCUSED, "ordinal": 1, "candidate_sha": SHA_A, "generation": 1,
+            "integration_head": SHA_B,
             "command": ["mise", "run", "test:focused"], "cargo_lane": "cargo-1",
             "stateful": False, "exit_code": 0, "selected_count": 3,
             "classification": "pass", "artifact_digest": DIGEST_F,
         }]
-        value["accepted_proof"] = {"ordinal": 1, "artifact_digest": DIGEST_F}
+        value["accepted_proofs"][PROOF_FOCUSED] = {
+            "proof_id": PROOF_FOCUSED, "ordinal": 1, "artifact_digest": DIGEST_F,
+        }
     if status == "integrated":
         value["integrated_commit"] = SHA_C
         value["integrated_parent"] = SHA_B
@@ -99,7 +104,7 @@ def valid_state(lane_count: int = 2) -> dict:
     accepted = copy.deepcopy(candidate)
     accepted["tasks"]["T1"] = task("accepted")
     if lane_count == 0:
-        accepted["tasks"]["T1"]["proof_attempts"][0]["cargo_lane"] = None
+        accepted["tasks"]["T1"]["proof_attempts"][PROOF_FOCUSED][0]["cargo_lane"] = None
     accepted["tasks"]["T1"]["review"] = {
         "verdict": "APPROVE", "candidate_sha": SHA_A, "generation": 1,
         "controller_event_hash": third["hash"], "result_digest": DIGEST_E,
@@ -202,18 +207,18 @@ class ControllerStateTests(unittest.TestCase):
         state["mutable"]["tasks"]["T1"]["generation"] = 2
         project(state)
         errors = validate(state)
-        self.assertIn("T1: proof attempt has stale candidate generation", errors)
+        self.assertIn("T1/focused: proof attempt has stale candidate generation", errors)
         self.assertIn("T1: review has stale candidate generation", errors)
 
     def test_missing_proof_and_review_are_rejected(self) -> None:
         """Reject integrated work without both acceptance gates."""
         state = valid_state()
         current = state["mutable"]["tasks"]["T1"]
-        current["accepted_proof"] = None
+        current["accepted_proofs"] = {}
         current["review"] = None
         project(state)
         errors = validate(state)
-        self.assertIn("T1: missing accepted proof", errors)
+        self.assertIn("T1/focused: missing accepted proof", errors)
         self.assertIn("T1: missing exact APPROVE review", errors)
 
     def test_review_controller_identity_is_rejected(self) -> None:
@@ -226,22 +231,142 @@ class ControllerStateTests(unittest.TestCase):
     def test_source_failure_rerun_is_rejected(self) -> None:
         """Require a successor candidate after a source/test failure."""
         state = valid_state()
-        attempts = state["mutable"]["tasks"]["T1"]["proof_attempts"]
-        attempts.insert(0, {**attempts[0], "ordinal": 1, "exit_code": 1, "selected_count": 1, "classification": "test", "artifact_digest": DIGEST_D})
-        attempts[1]["ordinal"] = 2
-        state["mutable"]["tasks"]["T1"]["accepted_proof"] = {"ordinal": 2, "artifact_digest": DIGEST_F}
+        accepted_event = state["events"][3]["mutable"]["tasks"]["T1"]
+        passing = copy.deepcopy(accepted_event["proof_attempts"][PROOF_FOCUSED][0])
+        failure = {**passing, "exit_code": 1, "classification": "test", "artifact_digest": DIGEST_D}
+        accepted_event["status"] = "candidate"
+        accepted_event["proof_attempts"][PROOF_FOCUSED] = [failure]
+        accepted_event["accepted_proofs"] = {}
+        accepted_event["review"] = None
+        integrated_event = state["events"][4]["mutable"]["tasks"]["T1"]
+        passing["ordinal"] = 2
+        integrated_event["proof_attempts"][PROOF_FOCUSED] = [failure, passing]
+        integrated_event["accepted_proofs"][PROOF_FOCUSED] = {
+            "proof_id": PROOF_FOCUSED, "ordinal": 2, "artifact_digest": DIGEST_F,
+        }
+        reseal_with_review_identity(state)
+        self.assertTrue(any("T1 source/test failure was rerun without successor candidate" in error for error in validate(state)))
+
+    def test_proof_attempt_history_is_append_only(self) -> None:
+        """Reject rewriting an earlier proof attempt in a later event projection."""
+        state = valid_state()
+        attempts = state["mutable"]["tasks"]["T1"]["proof_attempts"][PROOF_FOCUSED]
+        attempts[0]["command"] = ["mise", "run", "rewritten-proof"]
         project(state)
-        self.assertIn("T1: source/test failure was rerun without successor candidate", validate(state))
+        self.assertTrue(any("proof attempts are not append-only" in error for error in validate(state)))
 
     def test_infrastructure_retry_then_one_pass_is_valid(self) -> None:
         """Allow auditable setup failure before the sole accepted PASS."""
         state = valid_state()
-        attempts = state["mutable"]["tasks"]["T1"]["proof_attempts"]
-        attempts.insert(0, {**attempts[0], "ordinal": 1, "exit_code": 2, "selected_count": 0, "classification": "infrastructure", "artifact_digest": DIGEST_D})
-        attempts[1]["ordinal"] = 2
-        state["mutable"]["tasks"]["T1"]["accepted_proof"] = {"ordinal": 2, "artifact_digest": DIGEST_F}
-        project(state)
+        for event in state["events"]:
+            current = event["mutable"]["tasks"]["T1"]
+            if current["status"] in {"accepted", "integrated"}:
+                attempts = current["proof_attempts"][PROOF_FOCUSED]
+                attempts.insert(0, {**attempts[0], "ordinal": 1, "exit_code": 2, "selected_count": 0, "classification": "infrastructure", "artifact_digest": DIGEST_D})
+                attempts[1]["ordinal"] = 2
+                current["accepted_proofs"][PROOF_FOCUSED] = {
+                    "proof_id": PROOF_FOCUSED, "ordinal": 2, "artifact_digest": DIGEST_F,
+                }
+        reseal_with_review_identity(state)
         self.assertEqual(validate(state), [])
+
+    def test_multiple_required_proof_streams_are_accepted_independently(self) -> None:
+        """Require and accept one sole PASS in each stable proof stream."""
+        state = valid_state()
+        for event in state["events"]:
+            current = event["mutable"]["tasks"]["T1"]
+            current["proof_requirements"]["contracts"] = {"prerequisites": []}
+            current["proof_attempts"]["contracts"] = []
+            if current["status"] in {"accepted", "integrated"}:
+                attempt = copy.deepcopy(current["proof_attempts"][PROOF_FOCUSED][0])
+                attempt.update({"proof_id": "contracts", "command": ["mise", "run", "codegen:check"], "artifact_digest": DIGEST_D})
+                current["proof_attempts"]["contracts"] = [attempt]
+                current["accepted_proofs"]["contracts"] = {
+                    "proof_id": "contracts", "ordinal": 1, "artifact_digest": DIGEST_D,
+                }
+        reseal_with_review_identity(state)
+        self.assertEqual(validate(state), [])
+
+    def test_missing_one_of_multiple_required_proofs_is_rejected(self) -> None:
+        """Reject acceptance when any declared proof stream lacks its PASS."""
+        state = valid_state()
+        for event in state["events"]:
+            current = event["mutable"]["tasks"]["T1"]
+            current["proof_requirements"]["contracts"] = {"prerequisites": []}
+            current["proof_attempts"]["contracts"] = []
+        reseal_with_review_identity(state)
+        self.assertIn("T1/contracts: missing accepted proof", validate(state))
+
+    def test_proof_prerequisites_do_not_block_implementation_dispatch(self) -> None:
+        """Keep proof ordering separate from implementation dependency readiness."""
+        projection = valid_state()["events"][1]["mutable"]
+        projection["tasks"]["T2"] = task("ready")
+        projection["tasks"]["T2"]["write_set"] = ["crates/b"]
+        projection["tasks"]["T1"]["proof_requirements"][PROOF_FOCUSED]["prerequisites"] = ["T2"]
+        self.assertEqual(validate_projection(projection, "dispatch"), [])
+
+    def test_proof_requires_integrated_prerequisite_and_fresh_base(self) -> None:
+        """Reject proof recorded before its prerequisite or against an older base."""
+        state = valid_state()
+        state["mutable"]["tasks"]["T2"] = task("ready")
+        current = state["mutable"]["tasks"]["T1"]
+        current["proof_requirements"][PROOF_FOCUSED]["prerequisites"] = ["T2"]
+        current["proof_attempts"][PROOF_FOCUSED][0]["integration_head"] = SHA_C
+        project(state)
+        errors = validate(state)
+        self.assertIn("T1/focused: proof prerequisite is not integrated", errors)
+        self.assertIn("T1/focused: candidate predates proof prerequisite integration", errors)
+
+    def test_unknown_proof_stream_is_rejected(self) -> None:
+        """Reject attempts that are not declared by stable proof requirements."""
+        state = valid_state()
+        state["mutable"]["tasks"]["T1"]["proof_attempts"]["unknown"] = []
+        project(state)
+        self.assertIn("T1: unknown proof ID unknown", validate(state))
+
+    def test_multiple_passes_in_one_stream_are_rejected(self) -> None:
+        """Keep each required proof stream bound to exactly one PASS."""
+        state = valid_state()
+        attempts = state["mutable"]["tasks"]["T1"]["proof_attempts"][PROOF_FOCUSED]
+        attempts.append({**attempts[0], "ordinal": 2, "artifact_digest": DIGEST_D})
+        project(state)
+        self.assertIn("T1/focused: proof stream has multiple PASS attempts", validate(state))
+
+    def test_candidate_refresh_cycle_clears_evidence_and_uses_current_head(self) -> None:
+        """Allow the mandated candidate-to-active-to-successor refresh cycle."""
+        state = valid_state()
+        state["events"] = state["events"][:3]
+        stale = state["events"][-1]["mutable"]
+        stale["lanes"]["review_owners"] = []
+        active = copy.deepcopy(stale)
+        current = active["tasks"]["T1"]
+        current.update({
+            "status": "active", "generation": 2, "base_sha": SHA_B,
+            "candidate_sha": None, "candidate_parent": None,
+            "diff_digest": None, "patch_id": None, "review": None,
+        })
+        current["proof_attempts"] = {PROOF_FOCUSED: []}
+        current["accepted_proofs"] = {}
+        state["events"].append({"sequence": 4, "transition": "refresh", "task_id": "T1", "mutable": active})
+        successor = copy.deepcopy(active)
+        successor["tasks"]["T1"].update({
+            "status": "candidate", "candidate_sha": SHA_C,
+            "candidate_parent": SHA_B, "diff_digest": DIGEST_E, "patch_id": SHA_A,
+        })
+        state["events"].append({"sequence": 5, "transition": "successor", "task_id": "T1", "mutable": successor})
+        seal(state)
+        state["mutable"] = copy.deepcopy(successor)
+        self.assertEqual(validate(state), [])
+
+    def test_successor_candidate_must_clear_all_proof_and_review_evidence(self) -> None:
+        """Reject a fresh generation that retained evidence from its predecessor."""
+        state = valid_state()
+        accepted = state["events"][3]["mutable"]["tasks"]["T1"]
+        accepted["candidate_sha"] = SHA_C
+        accepted["generation"] = 2
+        accepted["base_sha"] = SHA_B
+        seal(state)
+        self.assertIn("event 4: successor candidate retained proof or review evidence", validate(state))
 
     def test_write_and_semantic_lock_conflicts_are_rejected(self) -> None:
         """Reject simultaneously allocated tasks sharing paths or locks."""
@@ -271,6 +396,17 @@ class ControllerStateTests(unittest.TestCase):
         errors = validate(state)
         self.assertTrue(any("dependency cycle" in error for error in errors))
         self.assertTrue(any("integration order violates" in error for error in errors))
+
+    def test_combined_dependency_and_proof_cycle_is_rejected(self) -> None:
+        """Reject deadlock cycles spanning source and proof prerequisite edges."""
+        state = valid_state()
+        second = task("ready")
+        second["dependencies"] = ["T1"]
+        second["write_set"] = ["crates/b"]
+        state["mutable"]["tasks"]["T2"] = second
+        state["mutable"]["tasks"]["T1"]["proof_requirements"][PROOF_FOCUSED]["prerequisites"] = ["T2"]
+        project(state)
+        self.assertTrue(any("combined dependency/proof cycle" in error for error in validate(state)))
 
     def test_lane_conflicts_are_rejected(self) -> None:
         """Reject duplicate worktrees, targets, and owners."""
@@ -317,7 +453,7 @@ class ControllerStateTests(unittest.TestCase):
                     current["candidate_parent"] = base
                     current["diff_digest"] = diff_digest
                     current["patch_id"] = patch_id
-                    for attempt in current["proof_attempts"]:
+                    for attempt in current["proof_attempts"][PROOF_FOCUSED]:
                         attempt["candidate_sha"] = candidate
                     if current["review"]:
                         current["review"]["candidate_sha"] = candidate
@@ -332,6 +468,15 @@ class ControllerStateTests(unittest.TestCase):
             seal(state)
             state["mutable"] = copy.deepcopy(state["events"][-1]["mutable"])
             self.assertEqual(validate(state), [])
+
+            candidate_state = copy.deepcopy(state)
+            candidate_state["events"] = candidate_state["events"][:3]
+            seal(candidate_state)
+            candidate_state["mutable"] = copy.deepcopy(candidate_state["events"][-1]["mutable"])
+            self.assertEqual(validate(candidate_state), [])
+            candidate_state["mutable"]["tasks"]["T1"]["diff_digest"] = hashlib.sha256(b"candidate-wrong").hexdigest()
+            project(candidate_state)
+            self.assertIn("T1: candidate diff identity mismatch", validate(candidate_state))
 
             serial_state = copy.deepcopy(state)
             for event in serial_state["events"]:

@@ -146,6 +146,15 @@ the exact resulting surface. Never claim an enclosing library test proves a
 binary `main`, manifest registration, mise task, or workflow. The
 manifest's zero-to-two Cargo lanes constrain execution
 only; they never authorize parallel preflight.
+
+Give every proof a stable task-local ID such as `T15-P2` and an explicit
+`requires_integrated` list. This list applies only when the exact candidate
+must be reconstructed on a base containing an integrated peer repair or build
+prerequisite; it never creates an implementation `depends_on` edge. When the
+pinned source cannot compile that proof until the prerequisite lands, capture
+the real failing preflight with `classification: prerequisite` and the exact
+matching prerequisite IDs instead of fabricating success. Cold rehearsal must
+prove the predecessor's exact change closes that failure.
 For Postgres-backed acceptance, use only the audited repository wrapper form
 `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo test ... <selector> ...'`.
 Do not use arbitrary scripts or shell wrappers.

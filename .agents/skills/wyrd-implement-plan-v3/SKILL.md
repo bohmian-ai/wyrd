@@ -65,12 +65,23 @@ candidate worktree after publication.
 
 ## Prove and review candidates
 
-Run one accepted authoritative focused verification PASS against the candidate
-SHA in its assigned isolated lane. The root records every attempt's full argv,
-lane, result, selected-test count, classification, and artifact digest. Only
-classified infrastructure/setup failure may be retried on the same candidate;
-source or test failure requires a successor candidate. Implementor test runs
-are diagnostic only. Static review may overlap focused verification.
+Run every task-declared proof stream against the candidate SHA in its assigned
+isolated lane. Keep stable proof IDs, exact proof-specific integrated
+prerequisites, separate ordered attempts per proof ID, and exactly one accepted
+authoritative PASS per required proof. A proof attempt is eligible only after
+all prerequisites for that proof are integrated. Proof prerequisites never
+gate implementation dispatch; only implementation dependencies do.
+
+If a candidate predates integration of any proof prerequisite, return it from
+`candidate` to `active` and produce a fresh descendant candidate from the
+current integration head. Increment generation, replay only the scoped patch,
+and clear every proof attempt, accepted proof, and review before publishing the
+successor. Never merely rebase, re-prove, or reuse review for the stale
+candidate. Record every attempt's full argv, lane, result, selected-test count,
+classification, and artifact digest. Only classified infrastructure/setup
+failure may be retried in the same proof stream on the same candidate; source
+or test failure requires a successor candidate. Implementor test runs are
+diagnostic only. Static review may overlap eligible focused verification.
 
 Dispatch at most two simultaneous fresh Sol-low task reviewers. Reviewers are
 read-only and receive the approved task, authorities, exact base and candidate
@@ -88,13 +99,14 @@ candidate.
 
 ## Integrate serially
 
-Before integration require: candidate SHA unchanged, authoritative focused
-proof passed for that SHA, task review approved for that SHA, root validation
-complete, dependencies integrated, and no active write-set overlap. Perform a
-semantic-staleness check against every sibling candidate produced from an
-older integration head. Re-dispatch or re-prove a sibling when integrated
-changes alter its assumptions, owners, consumers, contracts, or acceptance
-proof; a clean cherry-pick is not semantic proof.
+Before integration require: candidate SHA unchanged, one accepted PASS for
+every required proof ID on that SHA, every proof-specific prerequisite
+integrated before its attempt, task review approved for that SHA, root
+validation complete, dependencies integrated, and no active write-set overlap.
+Perform a semantic-staleness check against every sibling candidate produced
+from an older integration head. Re-dispatch or re-prove a sibling when
+integrated changes alter its assumptions, owners, consumers, contracts, or
+acceptance proof; a clean cherry-pick is not semantic proof.
 
 Cherry-pick exactly one accepted candidate into the root worktree. Run any
 declared post-integration check, record root-only canonical task evidence in

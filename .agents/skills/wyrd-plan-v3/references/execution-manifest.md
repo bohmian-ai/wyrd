@@ -41,6 +41,7 @@ their IDs and binds their files.
       "recovery": {"applicable": false, "behavior": "task section explains no partial progress", "proof": "AC1"}
     },
     "proofs": [{
+      "id": "T1-P1", "requires_integrated": [],
       "acceptance": "AC1", "coverage": ["owner-lib"], "package": "owner", "target": "lib",
       "features": [], "selector": "tests::owner_runs", "test_kind": "new",
       "test_path": "src/lib.rs", "test_name": "tests::owner_runs",
@@ -71,7 +72,13 @@ exact binary, Cargo registration, mise task, validator, or workflow and
 report zero when the command identity is planned-new, but acceptance runs an
 exact `mise`, `uv`, or `pnpm` command containing that identity. Command proofs
 are distinct from test proofs and cannot be replaced by enclosing library
-compilation.
+compilation. Every proof has a unique ID matching its task and an explicit
+`requires_integrated` list. Proof prerequisites do not appear in `depends_on`:
+they allow source implementation to proceed concurrently but require a fresh
+successor candidate on an integration base containing those tasks before the
+proof runs. A source preflight blocked solely by a planned prerequisite records
+its real nonzero result, `classification: prerequisite`, and the same
+`requires_integrated` list. All other preflights pass normally.
 Every written path declares coverage identities consumed by one or more proofs.
 Multiple proofs may cover one AC, but every AC has proof and every affected
 package/target, manifest, mise task, binary registration, construction path,

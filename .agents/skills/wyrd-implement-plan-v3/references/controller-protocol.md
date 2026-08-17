@@ -21,7 +21,9 @@ Every task projection records:
 - `dependencies`, semantic `locks`, declared `write_set`, and `status`;
 - dispatch `base_sha`, immutable `candidate_sha`, `candidate_parent`, and
   `diff_digest`/stable `patch_id`;
-- complete proof attempts and one optional `accepted_proof`;
+- stable `proof_requirements` keyed by proof ID, each with its exact integrated
+  `prerequisites`; `proof_attempts` keyed by proof ID; and `accepted_proofs`
+  keyed by proof ID with exactly one PASS for every required proof;
 - exact review `verdict`, candidate binding, controller-state event hash, and
   content-addressed `result_digest`;
 - optional `integrated_commit`, its declared direct `integrated_parent`, and
@@ -56,16 +58,31 @@ any non-integrated state -> frozen -> ready
 
 `frozen -> ready` requires a larger task `revision` or `generation` and a new
 canonical digest. A candidate successor increments `generation`, receives a
-new immutable SHA/diff identity, and clears proof, review, and integration
-fields.
+new immutable SHA/diff identity and current `integration_head` as `base_sha`,
+replays only the scoped patch, and clears every proof stream, review, and
+integration field.
 
-Each proof attempt records ordinal, candidate SHA and generation, full command
-as an argument array, Cargo/stateful lane identity, exit code, selected-test
-count, classification, and artifact digest. A final accepted proof is exactly
-one passing attempt for the current candidate with exit zero and selected count
-greater than zero. Failed `infrastructure` or `setup` attempts may precede it.
-A `source` or `test` failure forbids another attempt for that candidate: create
-a successor candidate first. Never accept more than one passing attempt.
+Each required proof ID has an independent ordered attempt stream. Each attempt
+records its proof ID, ordinal, candidate SHA and generation, full command as an
+argument array, Cargo/stateful lane identity, exit code, selected-test count,
+classification, artifact digest, and the current `integration_head`. Before
+recording an attempt, every task named by that proof's `prerequisites` must be
+integrated. Proof prerequisites do not participate in dispatch readiness or
+the implementation dependency DAG.
+
+If a candidate's `base_sha` is not the current `integration_head` after a proof
+prerequisite integrates, transition `candidate -> active`, increment
+`generation`, create a fresh descendant candidate from the current integration
+head by replaying the scoped patch, and clear all proof attempts, accepted
+proofs, and review. This refresh is mandatory even when the old candidate
+cherry-picks cleanly.
+
+An accepted proof is exactly one passing attempt in its proof stream for the
+current candidate with exit zero and selected count greater than zero. Failed
+`infrastructure` or `setup` attempts may precede it. A `source` or `test`
+failure forbids another attempt for that candidate in any stream: create a
+successor candidate first. Every required proof ID has exactly one accepted
+PASS; unknown proof IDs and duplicate PASS attempts are invalid.
 
 Review records exact `APPROVE`, `RESUME_IMPLEMENTATION`,
 `ORCHESTRATOR_DECISION_REQUIRED`, or `REVIEW_BLOCKED`; acceptance requires
@@ -75,16 +92,19 @@ used the same controller-state identity the root later accepts.
 
 ## Scheduling and integration
 
-- Dependencies form a DAG. A task becomes active only after every dependency
-  is integrated. Integration order is dependency-respecting and duplicate-free.
+- Implementation dependencies form a DAG. A task becomes active only after
+  every implementation dependency is integrated. Proof prerequisites never
+  affect dispatch. Integration order is dependency-respecting and
+  duplicate-free.
 - At most three tasks are active/candidate/accepted implementor allocations and
   at most two are under review.
 - Active/candidate/accepted tasks may not overlap write paths or semantic locks.
   Equal paths and ancestor/descendant paths overlap.
 - Candidate identity must match its current generation. A changed SHA creates
   a successor generation and invalidates all old proof and review.
-- Accepted/integrated tasks require accepted proof and approved review for the
-  current candidate, plus matching patch identity.
+- Accepted/integrated tasks require one accepted PASS for every required proof
+  ID and approved review for the current candidate, plus matching patch
+  identity.
 - The first integrated commit's direct parent is `initial_head`; every later
   integrated commit's direct parent is the preceding integrated commit. No
   unrelated source commit may intervene. Where `repo_root` is supplied, validate Git

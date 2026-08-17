@@ -133,6 +133,7 @@ def validate(state: dict[str, Any]) -> list[str]:
     previous_hash = "0" * 64
     prior_projection: dict[str, Any] | None = None
     initial_head: str | None = None
+    failed_candidates: set[tuple[str, Any, Any]] = set()
     for sequence, event in enumerate(events, 1):
         if event.get("sequence") != sequence:
             errors.append(f"event sequence must be contiguous at {sequence}")
@@ -159,11 +160,58 @@ def validate(state: dict[str, Any]) -> list[str]:
                 before_task = before_tasks.get(task_id, {})
                 after_task = after_tasks.get(task_id, {})
                 before, after = before_task.get("status"), after_task.get("status")
+                requirements_revised = (
+                    before == "frozen" and after == "ready"
+                    and after_task.get("revision", 0) > before_task.get("revision", 0)
+                )
+                if before_task.get("proof_requirements") != after_task.get("proof_requirements") and not requirements_revised:
+                    errors.append(f"event {sequence}: {task_id} proof requirements changed")
                 if before != after and (before, after) not in TRANSITIONS:
                     errors.append(f"event {sequence}: invalid transition {before}->{after}")
                 if before_task.get("candidate_sha") is not None and before_task.get("candidate_sha") != after_task.get("candidate_sha"):
                     if after_task.get("generation", 0) <= before_task.get("generation", 0):
                         errors.append(f"event {sequence}: candidate changed without successor generation")
+                    attempts = after_task.get("proof_attempts", {})
+                    retained_attempts = isinstance(attempts, dict) and any(attempts.values())
+                    if retained_attempts or after_task.get("accepted_proofs") or after_task.get("review") is not None:
+                        errors.append(f"event {sequence}: successor candidate retained proof or review evidence")
+                if before == "candidate" and after == "active" and after_task.get("candidate_sha") is not None:
+                    errors.append(f"event {sequence}: stale candidate was not cleared before refresh")
+                if before == "active" and after == "candidate" and before_task.get("candidate_sha") is None:
+                    if after_task.get("base_sha") != projection.get("integration_head"):
+                        errors.append(f"event {sequence}: successor candidate does not use current integration head")
+                    attempts = after_task.get("proof_attempts", {})
+                    if (isinstance(attempts, dict) and any(attempts.values())) or after_task.get("accepted_proofs") or after_task.get("review") is not None:
+                        errors.append(f"event {sequence}: fresh successor candidate retained proof or review evidence")
+                before_attempts = before_task.get("proof_attempts", {})
+                after_attempts = after_task.get("proof_attempts", {})
+                requirements = after_task.get("proof_requirements", {})
+                if isinstance(before_attempts, dict) and isinstance(after_attempts, dict) and isinstance(requirements, dict):
+                    for proof_id in set(before_attempts) | set(after_attempts):
+                        proof_attempts = after_attempts.get(proof_id, [])
+                        old_attempts = before_attempts.get(proof_id, [])
+                        if not isinstance(proof_attempts, list) or not isinstance(old_attempts, list):
+                            continue
+                        same_candidate = (
+                            before_task.get("candidate_sha") == after_task.get("candidate_sha")
+                            and before_task.get("generation") == after_task.get("generation")
+                        )
+                        if same_candidate and (
+                            len(proof_attempts) < len(old_attempts)
+                            or proof_attempts[:len(old_attempts)] != old_attempts
+                        ):
+                            errors.append(f"event {sequence}: {task_id}/{proof_id} proof attempts are not append-only")
+                        for attempt in proof_attempts[len(old_attempts):]:
+                            candidate_key = (task_id, after_task.get("candidate_sha"), after_task.get("generation"))
+                            if candidate_key in failed_candidates:
+                                errors.append(f"event {sequence}: {task_id} source/test failure was rerun without successor candidate")
+                            if attempt.get("classification") in {"source", "test"} and attempt.get("exit_code") != 0:
+                                failed_candidates.add(candidate_key)
+                            prerequisites = requirements.get(proof_id, {}).get("prerequisites", [])
+                            if any(after_tasks.get(item, {}).get("status") != "integrated" for item in prerequisites):
+                                errors.append(f"event {sequence}: {task_id}/{proof_id} proof prerequisite is not integrated")
+                            if prerequisites and attempt.get("integration_head") != projection.get("integration_head"):
+                                errors.append(f"event {sequence}: {task_id}/{proof_id} proof did not use current integration head")
                 if before == "frozen" and after == "ready":
                     if (after_task.get("revision", 0), after_task.get("generation", 0)) <= (before_task.get("revision", 0), before_task.get("generation", 0)):
                         errors.append(f"event {sequence}: frozen task resumed without canonical revision")
@@ -184,16 +232,29 @@ def validate(state: dict[str, Any]) -> list[str]:
     if len(integration_order) != len(set(integration_order)):
         errors.append("integration_order contains duplicates")
 
-    def visit(task_id: str, trail: set[str]) -> None:
+    def visit(task_id: str, trail: set[str], combined: bool = False) -> None:
         if task_id in trail:
-            errors.append(f"dependency cycle includes {task_id}")
+            label = "combined dependency/proof cycle" if combined else "dependency cycle"
+            errors.append(f"{label} includes {task_id}")
             return
-        for dependency in tasks.get(task_id, {}).get("dependencies", []):
+        task = tasks.get(task_id, {})
+        edges = list(task.get("dependencies", []))
+        if combined:
+            requirements = task.get("proof_requirements", {})
+            if isinstance(requirements, dict):
+                edges.extend(
+                    prerequisite
+                    for requirement in requirements.values()
+                    if isinstance(requirement, dict)
+                    for prerequisite in requirement.get("prerequisites", [])
+                )
+        for dependency in edges:
             if dependency in tasks:
-                visit(dependency, trail | {task_id})
+                visit(dependency, trail | {task_id}, combined)
 
     for task_id in tasks:
         visit(task_id, set())
+        visit(task_id, set(), True)
 
     active: list[tuple[str, dict[str, Any]]] = []
     for task_id, task in tasks.items():
@@ -223,44 +284,83 @@ def validate(state: dict[str, Any]) -> list[str]:
             if not is_digest(task.get("diff_digest")) or not is_git_sha(task.get("patch_id")):
                 errors.append(f"{task_id}: invalid diff identity")
 
-        attempts = task.get("proof_attempts", [])
-        passing = []
-        terminal_source_failure = False
-        for ordinal, attempt in enumerate(attempts, 1):
-            if attempt.get("ordinal") != ordinal:
-                errors.append(f"{task_id}: proof attempt ordinals are not contiguous")
-            if attempt.get("candidate_sha") != candidate or attempt.get("generation") != generation:
-                errors.append(f"{task_id}: proof attempt has stale candidate generation")
-            if not isinstance(attempt.get("command"), list) or not attempt["command"] or not all(isinstance(arg, str) for arg in attempt["command"]):
-                errors.append(f"{task_id}: proof attempt lacks full command argv")
-            if not is_digest(attempt.get("artifact_digest")):
-                errors.append(f"{task_id}: invalid proof artifact digest")
-            classification = attempt.get("classification")
-            if classification not in {"pass", "infrastructure", "setup", "source", "test"}:
-                errors.append(f"{task_id}: invalid proof classification")
-            if "cargo_lane" not in attempt or not isinstance(attempt.get("stateful"), bool):
-                errors.append(f"{task_id}: proof attempt lacks lane identity")
-            if terminal_source_failure:
-                errors.append(f"{task_id}: source/test failure was rerun without successor candidate")
-            if classification in {"source", "test"} and attempt.get("exit_code") != 0:
-                terminal_source_failure = True
-            if classification == "pass" and attempt.get("exit_code") != 0:
-                errors.append(f"{task_id}: PASS proof has nonzero exit")
-            if classification != "pass" and attempt.get("exit_code") == 0:
-                errors.append(f"{task_id}: failed proof classification has zero exit")
-            if attempt.get("exit_code") == 0 and classification == "pass":
-                passing.append(ordinal)
-        accepted_proof = task.get("accepted_proof")
-        if accepted_proof is not None:
-            ordinal = accepted_proof.get("ordinal")
-            if len(passing) != 1 or passing != [ordinal]:
-                errors.append(f"{task_id}: accepted proof is not the sole final PASS")
-            elif attempts[ordinal - 1].get("selected_count", 0) <= 0:
-                errors.append(f"{task_id}: accepted proof selected no tests")
-            if accepted_proof.get("artifact_digest") != attempts[ordinal - 1].get("artifact_digest"):
-                errors.append(f"{task_id}: accepted proof digest mismatch")
-        if status in {"accepted", "integrated"} and accepted_proof is None:
-            errors.append(f"{task_id}: missing accepted proof")
+        requirements = task.get("proof_requirements")
+        attempts_by_proof = task.get("proof_attempts")
+        accepted_by_proof = task.get("accepted_proofs")
+        if not isinstance(requirements, dict) or not requirements:
+            errors.append(f"{task_id}: proof_requirements must be a nonempty object")
+            requirements = {}
+        if not isinstance(attempts_by_proof, dict):
+            errors.append(f"{task_id}: proof_attempts must be keyed by proof ID")
+            attempts_by_proof = {}
+        if not isinstance(accepted_by_proof, dict):
+            errors.append(f"{task_id}: accepted_proofs must be keyed by proof ID")
+            accepted_by_proof = {}
+        unknown_streams = (set(attempts_by_proof) | set(accepted_by_proof)) - set(requirements)
+        for proof_id in sorted(unknown_streams):
+            errors.append(f"{task_id}: unknown proof ID {proof_id}")
+        for proof_id, requirement in requirements.items():
+            if not isinstance(proof_id, str) or not proof_id:
+                errors.append(f"{task_id}: proof ID must be nonempty")
+            prerequisites = requirement.get("prerequisites") if isinstance(requirement, dict) else None
+            if not isinstance(prerequisites, list) or len(prerequisites) != len(set(prerequisites)):
+                errors.append(f"{task_id}/{proof_id}: prerequisites must be a duplicate-free list")
+                prerequisites = []
+            for prerequisite in prerequisites:
+                if prerequisite not in tasks:
+                    errors.append(f"{task_id}/{proof_id}: unknown proof prerequisite {prerequisite}")
+                elif prerequisite == task_id:
+                    errors.append(f"{task_id}/{proof_id}: proof prerequisite cannot name its own task")
+            attempts = attempts_by_proof.get(proof_id, [])
+            if not isinstance(attempts, list):
+                errors.append(f"{task_id}/{proof_id}: proof attempts must be a list")
+                attempts = []
+            passing = []
+            if attempts and status not in {"candidate", "accepted", "integrated"}:
+                errors.append(f"{task_id}/{proof_id}: proof attempts exist without a candidate")
+            for ordinal, attempt in enumerate(attempts, 1):
+                if attempt.get("proof_id") != proof_id:
+                    errors.append(f"{task_id}/{proof_id}: attempt proof ID mismatch")
+                if attempt.get("ordinal") != ordinal:
+                    errors.append(f"{task_id}/{proof_id}: proof attempt ordinals are not contiguous")
+                if attempt.get("candidate_sha") != candidate or attempt.get("generation") != generation:
+                    errors.append(f"{task_id}/{proof_id}: proof attempt has stale candidate generation")
+                if not is_git_sha(attempt.get("integration_head")):
+                    errors.append(f"{task_id}/{proof_id}: proof attempt lacks integration-head identity")
+                if any(tasks.get(item, {}).get("status") != "integrated" for item in prerequisites):
+                    errors.append(f"{task_id}/{proof_id}: proof prerequisite is not integrated")
+                if prerequisites and attempt.get("integration_head") != task.get("base_sha"):
+                    errors.append(f"{task_id}/{proof_id}: candidate predates proof prerequisite integration")
+                if not isinstance(attempt.get("command"), list) or not attempt["command"] or not all(isinstance(arg, str) for arg in attempt["command"]):
+                    errors.append(f"{task_id}/{proof_id}: proof attempt lacks full command argv")
+                if not is_digest(attempt.get("artifact_digest")):
+                    errors.append(f"{task_id}/{proof_id}: invalid proof artifact digest")
+                classification = attempt.get("classification")
+                if classification not in {"pass", "infrastructure", "setup", "source", "test"}:
+                    errors.append(f"{task_id}/{proof_id}: invalid proof classification")
+                if "cargo_lane" not in attempt or not isinstance(attempt.get("stateful"), bool):
+                    errors.append(f"{task_id}/{proof_id}: proof attempt lacks lane identity")
+                if classification == "pass" and attempt.get("exit_code") != 0:
+                    errors.append(f"{task_id}/{proof_id}: PASS proof has nonzero exit")
+                if classification != "pass" and attempt.get("exit_code") == 0:
+                    errors.append(f"{task_id}/{proof_id}: failed proof classification has zero exit")
+                if attempt.get("exit_code") == 0 and classification == "pass":
+                    passing.append(ordinal)
+            if len(passing) > 1:
+                errors.append(f"{task_id}/{proof_id}: proof stream has multiple PASS attempts")
+            accepted = accepted_by_proof.get(proof_id)
+            if accepted is not None:
+                ordinal = accepted.get("ordinal")
+                if accepted.get("proof_id") != proof_id:
+                    errors.append(f"{task_id}/{proof_id}: accepted proof ID mismatch")
+                if len(passing) != 1 or passing != [ordinal]:
+                    errors.append(f"{task_id}/{proof_id}: accepted proof is not the sole PASS")
+                elif attempts[ordinal - 1].get("selected_count", 0) <= 0:
+                    errors.append(f"{task_id}/{proof_id}: accepted proof selected no tests")
+                if ordinal not in range(1, len(attempts) + 1) or accepted.get("artifact_digest") != attempts[ordinal - 1].get("artifact_digest"):
+                    errors.append(f"{task_id}/{proof_id}: accepted proof digest mismatch")
+            if status in {"accepted", "integrated"} and accepted is None:
+                errors.append(f"{task_id}/{proof_id}: missing accepted proof")
 
         review = task.get("review")
         if review is not None:
@@ -324,10 +424,15 @@ def validate(state: dict[str, Any]) -> list[str]:
             errors.append(f"Cargo lane owner {owner} is not active")
     lane_names = {lane.get("name") for lane in cargo}
     for task_id, task in tasks.items():
-        for attempt in task.get("proof_attempts", []):
-            cargo_lane = attempt.get("cargo_lane")
-            if cargo_lane is not None and cargo_lane not in lane_names:
-                errors.append(f"{task_id}: proof references unknown Cargo lane {cargo_lane}")
+        attempts_by_proof = task.get("proof_attempts", {})
+        if isinstance(attempts_by_proof, dict):
+            for attempts in attempts_by_proof.values():
+                if not isinstance(attempts, list):
+                    continue
+                for attempt in attempts:
+                    cargo_lane = attempt.get("cargo_lane")
+                    if cargo_lane is not None and cargo_lane not in lane_names:
+                        errors.append(f"{task_id}: proof references unknown Cargo lane {cargo_lane}")
     stateful_owner = lanes.get("stateful_owner") if isinstance(lanes, dict) else None
     if stateful_owner and (stateful_owner not in tasks or tasks[stateful_owner].get("status") not in ACTIVE):
         errors.append(f"stateful lane owner {stateful_owner} is not active")
@@ -347,16 +452,29 @@ def validate(state: dict[str, Any]) -> list[str]:
     repo = state.get("repo_root")
     if repo:
         try:
-            prior_commit = mutable["initial_head"]
-            for task_id in integration_order:
-                task = tasks[task_id]
-                candidate, parent = task["candidate_sha"], task["candidate_parent"]
+            for task_id, task in tasks.items():
+                if task.get("status") not in {"candidate", "accepted", "integrated"}:
+                    continue
+                candidate, parent, base = task["candidate_sha"], task["candidate_parent"], task["base_sha"]
                 actual_parent = git(repo, "rev-parse", f"{candidate}^")
-                if actual_parent != parent or git(repo, "merge-base", "--is-ancestor", task["base_sha"], candidate) != "":
+                if actual_parent != parent or parent != base:
                     errors.append(f"{task_id}: candidate ancestry mismatch")
                 diff_digest, patch_id = commit_diff(repo, parent, candidate)
                 if diff_digest != task["diff_digest"] or patch_id != task["patch_id"]:
                     errors.append(f"{task_id}: candidate diff identity mismatch")
+                requirements = task.get("proof_requirements", {})
+                attempts_by_proof = task.get("proof_attempts", {})
+                for proof_id, requirement in requirements.items():
+                    if not attempts_by_proof.get(proof_id):
+                        continue
+                    for prerequisite in requirement.get("prerequisites", []):
+                        prerequisite_commit = tasks.get(prerequisite, {}).get("integrated_commit")
+                        if prerequisite_commit:
+                            git(repo, "merge-base", "--is-ancestor", prerequisite_commit, candidate)
+            prior_commit = mutable["initial_head"]
+            for task_id in integration_order:
+                task = tasks[task_id]
+                patch_id = task["patch_id"]
                 integrated_commit = task["integrated_commit"]
                 integrated_parent = git(repo, "rev-parse", f"{integrated_commit}^")
                 if integrated_parent != prior_commit:

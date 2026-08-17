@@ -619,22 +619,21 @@ fn stamp_correlation_columns(
         .map(|index| Arc::clone(rows.column(index)));
     let native_run_id = if native_payload {
         let schema = rows.schema();
-        let matches = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.name() == "run_id")
-            .collect::<Vec<_>>();
-        if matches.len() > 1 {
-            return Err(ScribeError::InvalidFrame);
+        let mut matched = None;
+        for (index, field) in schema.fields().iter().enumerate() {
+            if field.name() != "run_id" {
+                continue;
+            }
+            if matched.replace((index, field)).is_some() {
+                return Err(ScribeError::InvalidFrame);
+            }
         }
-        matches
-            .first()
+        matched
             .map(|(index, field)| {
                 if field.data_type() != &DataType::Utf8 {
                     return Err(ScribeError::InvalidFrame);
                 }
-                Ok(Arc::clone(rows.column(*index)))
+                Ok(Arc::clone(rows.column(index)))
             })
             .transpose()?
     } else {
@@ -693,16 +692,17 @@ fn stamp_correlation_columns(
 /// `Timestamp(Microsecond, UTC)`, or contains any null value.
 fn validate_native_event_time(rows: &RecordBatch) -> Result<(), ScribeError> {
     let schema = rows.schema();
-    let matches = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| field.name() == WYRD_EVENT_TIME)
-        .collect::<Vec<_>>();
-    let (index, field) = match matches.as_slice() {
-        [] => return Ok(()),
-        [single] => *single,
-        _ => return Err(ScribeError::InvalidFrame),
+    let mut matched = None;
+    for (index, field) in schema.fields().iter().enumerate() {
+        if field.name() != WYRD_EVENT_TIME {
+            continue;
+        }
+        if matched.replace((index, field)).is_some() {
+            return Err(ScribeError::InvalidFrame);
+        }
+    }
+    let Some((index, field)) = matched else {
+        return Ok(());
     };
     let expected = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     if field.data_type() != &expected {
@@ -812,22 +812,42 @@ fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
 }
 
 fn user_fields(rows: &RecordBatch, server_owned: &[&str]) -> Vec<Field> {
-    rows.schema()
+    let schema = rows.schema();
+    let capacity = schema
         .fields()
         .iter()
         .filter(|field| !server_owned.contains(&field.name().as_str()))
-        .map(|field| field.as_ref().clone())
-        .collect()
+        .count();
+    let mut fields = Vec::with_capacity(capacity);
+    fields.extend(
+        schema
+            .fields()
+            .iter()
+            .filter(|field| !server_owned.contains(&field.name().as_str()))
+            .map(|field| field.as_ref().clone()),
+    );
+    debug_assert_eq!(fields.capacity(), capacity);
+    fields
 }
 
 fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
-    rows.schema()
+    let schema = rows.schema();
+    let capacity = schema
         .fields()
         .iter()
-        .enumerate()
-        .filter(|(_, field)| !server_owned.contains(&field.name().as_str()))
-        .map(|(index, _)| Arc::clone(rows.column(index)))
-        .collect()
+        .filter(|field| !server_owned.contains(&field.name().as_str()))
+        .count();
+    let mut columns = Vec::with_capacity(capacity);
+    columns.extend(
+        schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !server_owned.contains(&field.name().as_str()))
+            .map(|(index, _)| Arc::clone(rows.column(index))),
+    );
+    debug_assert_eq!(columns.capacity(), capacity);
+    columns
 }
 
 fn resolve_card_uids(
@@ -845,22 +865,30 @@ fn resolve_card_uids(
         .ok_or(ScribeError::CardUnresolved)?;
     let bound = principal.card_ref().ok_or(ScribeError::CardUnresolved)?;
     let bound_card_uid = bound.uid.as_ref().map(ToString::to_string);
-    (0..row_count)
-        .map(|row| {
+    let mut resolved = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        resolved.push({
             if cards.is_null(row) {
-                return Ok(None);
+                None
+            } else {
+                let raw = cards.value(row);
+                let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardUnresolved)?;
+                if !bound.same_identity(&card) {
+                    return Err(ScribeError::CardUnresolved);
+                }
+                bound_card_uid
+                    .clone()
+                    .map(Some)
+                    .ok_or(ScribeError::CardUnresolved)?
             }
-            let raw = cards.value(row);
-            let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardUnresolved)?;
-            if !bound.same_identity(&card) {
-                return Err(ScribeError::CardUnresolved);
-            }
-            bound_card_uid
-                .clone()
-                .map(Some)
-                .ok_or(ScribeError::CardUnresolved)
-        })
-        .collect()
+        });
+    }
+    if resolved.capacity() != row_count {
+        return Err(ScribeError::Internal {
+            detail: "card UID projection exceeded exact row capacity".to_owned(),
+        });
+    }
+    Ok(resolved)
 }
 
 /// Appends the always-server-owned managed columns to a partially-stamped batch.

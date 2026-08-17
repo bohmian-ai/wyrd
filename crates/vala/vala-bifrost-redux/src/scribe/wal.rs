@@ -3705,6 +3705,9 @@ mod tests {
     use super::*;
     use crate::scribe::seal_key::EventDay;
     use tempfile::TempDir;
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
     fn test_seal_key(tenant: DataTenantId) -> SealKey {
         SealKey::new(
@@ -3712,6 +3715,26 @@ mod tests {
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "wal-test"),
             EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("test date")),
         )
+    }
+
+    /// Encodes one valid audit envelope for replay identity reconstruction.
+    fn replay_audit() -> Vec<u8> {
+        crate::scribe::audit_envelope::encode_audit_event(&AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "scribe.replay".to_owned(),
+            resource: "vala.bifrost.replay".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "bifrost:write".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 row".to_owned(),
+            detail: None,
+        })
+        .expect("audit envelope")
     }
 
     #[test]
@@ -4431,6 +4454,117 @@ mod tests {
             .expect("retry handle")
             .retire_segments(std::slice::from_ref(&segment))
             .expect("retirement retry is idempotent");
+    }
+
+    /// Fresh replay removes a closed segment whose groups are already watermarked.
+    #[test]
+    fn replay_segment_pin_retires_fully_watermarked_segment() {
+        let temp_dir = TempDir::new().expect("WAL root");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let seal_key = test_seal_key(crate::test_support::tenant());
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            *node.as_bytes(),
+            1,
+            WalConfig::new(16 * 1024 * 1024).expect("single-segment config"),
+        )
+        .expect("first writer");
+        let first_batch = [3_u8; 16];
+        let shard = crate::scribe::routing::shard_for(
+            seal_key.tenant,
+            &seal_key.table,
+            uuid::Uuid::from_bytes(first_batch),
+        );
+        let second_batch = (4_u8..=u8::MAX)
+            .map(|value| [value; 16])
+            .find(|batch_id| {
+                crate::scribe::routing::shard_for(
+                    seal_key.tenant,
+                    &seal_key.table,
+                    uuid::Uuid::from_bytes(*batch_id),
+                ) == shard
+            })
+            .expect("a second batch routes to the same fixed shard");
+        let audit = replay_audit();
+        for batch_id in [first_batch, second_batch] {
+            writer
+                .append_and_commit_for_replay_test(&seal_key, batch_id, &audit, b"payload")
+                .expect("append replay group");
+        }
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+        assert_eq!(reader.segments.len(), 1, "both groups share one segment");
+        let segment = reader.segments[0].reference();
+        let records = reader.read_all_records().expect("read records");
+        for record in records.iter().filter(|record| record.is_slice()) {
+            assert_eq!(
+                decode_slice_payload(&record.payload)
+                    .expect("slice payload")
+                    .seal_key,
+                seal_key
+            );
+        }
+        let sealed_lsn = records
+            .into_iter()
+            .map(|record| record.lsn)
+            .max()
+            .expect("terminal commit LSN");
+        writer
+            .close_segments_if_unowned(
+                std::slice::from_ref(&segment),
+                &std::collections::HashSet::new(),
+            )
+            .expect("close shared segment");
+        let stream = crate::scribe::stream_identity::StreamIdentity::new(
+            node,
+            crate::scribe::stream_identity::WriterEpoch::new(1),
+        );
+        let mut manifest = crate::scribe::manifest::Manifest::new(stream);
+        manifest.update_sealed_lsn(&seal_key, sealed_lsn);
+        crate::scribe::manifest::write_atomic(
+            crate::scribe::replay::stream_directory(temp_dir.path(), stream).join("manifest"),
+            &manifest,
+        )
+        .expect("sealed manifest");
+        assert_eq!(
+            crate::scribe::manifest::read_manifest(
+                crate::scribe::replay::stream_directory(temp_dir.path(), stream).join("manifest")
+            )
+            .expect("manifest read")
+            .expect("manifest exists")
+            .get_sealed_lsn(&seal_key),
+            Some(sealed_lsn)
+        );
+        assert!(
+            segment.path.exists(),
+            "crash leaves the sealed segment behind"
+        );
+        drop(reader);
+        drop(writer);
+
+        let restarted = WalWriter::new(
+            temp_dir.path(),
+            *node.as_bytes(),
+            2,
+            WalConfig::new(16 * 1024 * 1024).expect("restart config"),
+        )
+        .expect("restart writer");
+        let current = crate::scribe::stream_identity::StreamIdentity::new(
+            node,
+            crate::scribe::stream_identity::WriterEpoch::new(2),
+        );
+        crate::scribe::replay::replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            Some(current),
+            None,
+            Some(&restarted),
+            None,
+            |_| panic!("fully watermarked groups must not be republished"),
+        )
+        .expect("sealed replay cleanup");
+        assert!(
+            !segment.path.exists(),
+            "safe EOF removes the fully watermarked closed segment"
+        );
     }
 
     /// A filesystem retirement failure preserves the source path for a later retry.

@@ -234,16 +234,17 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             // so partial accumulators from other shard streams cannot retain decode
             // reservations while publication owns immutable and encoding workspace.
             // The existing synchronous callback supplies the required backpressure.
-            let mut emitted_settled = false;
             if let Some(chunk) = accumulator.take_chunk()? {
-                emitted_settled = emit(chunk)?;
+                if !emit(chunk)? {
+                    accumulator.mark_current_segment_unsettled();
+                }
                 if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                     return Err(ScribeError::Internal {
                         detail: "WAL replay cancelled".to_owned(),
                     });
                 }
             }
-            Ok(emitted_settled && accumulator.segment_retirement_safe())
+            Ok(accumulator.segment_retirement_safe())
         },
     )?;
 
@@ -311,6 +312,10 @@ struct ReplayAccumulator<'a> {
     identity_memory: Option<ScribeMemoryLease>,
     /// Accounted bytes for the in-flight batch.
     memory_bytes: usize,
+    /// Segment currently contributing records to this shard accumulator.
+    current_segment_path: Option<std::path::PathBuf>,
+    /// Whether a group from the current segment failed to reach retirement settlement.
+    current_segment_unsettled: bool,
 }
 
 impl<'a> ReplayAccumulator<'a> {
@@ -345,6 +350,8 @@ impl<'a> ReplayAccumulator<'a> {
             memory,
             identity_memory,
             memory_bytes: 0,
+            current_segment_path: None,
+            current_segment_unsettled: false,
         })
     }
 
@@ -359,6 +366,10 @@ impl<'a> ReplayAccumulator<'a> {
         segment_path: std::path::PathBuf,
         record: &crate::scribe::wal::WalRecord,
     ) -> Result<(), ScribeError> {
+        if self.current_segment_path.as_ref() != Some(&segment_path) {
+            self.current_segment_path = Some(segment_path.clone());
+            self.current_segment_unsettled = false;
+        }
         // The WAL reader retains one validated payload while replay owns at
         // most one exact record clone plus decoded variable fields whose total
         // cannot exceed that payload. The fixed metadata ceiling covers the
@@ -629,7 +640,12 @@ impl<'a> ReplayAccumulator<'a> {
     /// value preserves the source file even after clean EOF.
     #[must_use]
     fn segment_retirement_safe(&self) -> bool {
-        self.pending_batches.is_empty() && self.states.is_empty()
+        self.pending_batches.is_empty() && self.states.is_empty() && !self.current_segment_unsettled
+    }
+
+    /// Marks the current segment non-retirable after a handoff remains unpublished.
+    fn mark_current_segment_unsettled(&mut self) {
+        self.current_segment_unsettled = true;
     }
 }
 

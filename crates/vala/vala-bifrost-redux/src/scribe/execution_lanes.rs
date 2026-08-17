@@ -1429,6 +1429,8 @@ pub(crate) enum ScribeWalIoOp {
         seal_key: SealKey,
         sealed_lsn: crate::scribe::wal::WalLsn,
     },
+    /// Replays one recovery inventory while pinning the current segment in the
+    /// existing WAL owner; an error or cancellation retains unread source bytes.
     ReplayDirectoryStream {
         path: PathBuf,
         /// Existing WAL writer whose retirement references pin the segment being read.
@@ -1463,6 +1465,8 @@ pub(crate) enum ScribeWalIoResult {
     },
     WalSynced,
     Completed,
+    /// Reports a fully settled in-worker replay after each manifest was durably
+    /// advanced before generation retirement and all safe reader pins closed.
     ReplayStreamCompleted {
         /// Number of restored immutable generations.
         restored: usize,

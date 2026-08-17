@@ -699,6 +699,14 @@ impl WyrdTestServer {
         } else {
             !matches!(self.mode, Mode::Bound { .. })
         };
+        if let Some(query) = self.inner.state.bifrost_query() {
+            // The production supervisor owns the graceful shutdown attempt. If
+            // its shared drain deadline expires, the audit writer and relay can
+            // still retain their publisher after the supervisor joins. Finish
+            // those test-owned tasks here so a restart can recover the same
+            // exclusive audit WAL root without racing a detached predecessor.
+            query.abort_audit_tasks_for_test().await;
+        }
         if let Some(scribe) = self.inner.state.bifrost_scribe_for_test() {
             scribe
                 .shutdown(std::time::Instant::now() + Duration::from_secs(60))

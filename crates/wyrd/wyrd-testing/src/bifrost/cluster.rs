@@ -2122,8 +2122,9 @@ impl WyrdTestCluster {
             ClusterError::Resource(format!("node {} is already stopped", node_id.as_uuid()))
         })?;
         server
-            .shutdown()
+            .shutdown_and_inspect()
             .await
+            .map(|_| ())
             .map_err(|error| ClusterError::Shutdown(error.to_string()))
     }
 
@@ -2708,7 +2709,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_restart_rederives_same_plan_from_retained_snapshot() {
         let observation = SystemResourceSnapshot {
-            memory_limit_bytes: 768 * 1024 * 1024,
+            memory_limit_bytes: 1024 * 1024 * 1024,
             effective_cpu: 3,
             scratch_capacity_bytes: 1280 * 1024 * 1024,
             scratch_available_bytes: 1280 * 1024 * 1024,

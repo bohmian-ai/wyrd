@@ -1,9 +1,9 @@
 //! Blocking preprocessing for admitted appends.
 
+use arrow::buffer::Buffer;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use std::io::Cursor;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -20,7 +20,7 @@ use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::memory::MemoryCategory;
-use crate::scribe::seal_key::{SealKey, split_batch_by_event_day};
+use crate::scribe::seal_key::{EventDayPlan, SealKey, plan_event_days, split_batch_by_event_day};
 use crate::scribe::wal::PreparedWalAppend;
 use wyrd_spec::ids::DataTenantId;
 
@@ -50,7 +50,7 @@ pub(crate) enum AdmittedRows {
 }
 
 /// Retained native source and immutable stamping context.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NativeAdmittedRows {
     /// Transport bytes retained until the final planned source is decoded.
     pub(crate) bytes: Bytes,
@@ -64,6 +64,8 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) batch_id: Uuid,
     /// Immutable event-time acceptance window.
     pub(crate) event_time_window: EventTimeWindow,
+    /// One receipt instant reused by WAL and post-COMMIT regeneration.
+    pub(crate) receipt_micros: i64,
 }
 
 /// A request after deterministic event-day splitting and serialization.
@@ -73,10 +75,213 @@ pub(crate) struct PreparedAppend {
     pub tenant: DataTenantId,
     pub table: TableRef,
     pub prepared_bytes: usize,
-    pub slices: Vec<PreparedSlice>,
+    pub slices: PreparedSliceSet,
     pub reservation: InflightFrameReservation,
     pub memory: Option<ScribeMemoryLease>,
     pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
+}
+
+/// Closed prepared-slice source used by the shard owner.
+#[derive(Debug)]
+pub(crate) enum PreparedSliceSet {
+    /// Existing projected/test path with already materialized slices.
+    Materialized(Vec<PreparedSlice>),
+    /// Native path producing exactly one current slice per CPU-lane turn.
+    Native(Option<Box<NativeSliceProducer>>),
+}
+
+/// Stateful current-only native slice producer.
+#[derive(Debug)]
+pub(crate) struct NativeSliceProducer {
+    /// Deterministic retained source and stamping context.
+    source: NativeAdmittedRows,
+    /// Push decoder retaining only its schema and current scratch.
+    decoder: arrow::ipc::reader::StreamDecoder,
+    /// Unconsumed transport bytes advanced by the decoder.
+    input: Buffer,
+    /// Current decoded source retained only across its day slices.
+    current: Option<NativeCurrentSource>,
+    /// Zero-based ordinal assigned to the next slice.
+    slice_index: u32,
+    /// Exact count established by the non-retaining first pass.
+    slice_count: u32,
+    /// Canonical batch audit cloned only into the current durable slice.
+    audit_event: AuditEvent,
+    /// Authenticated tenant used by every produced seal key.
+    tenant: DataTenantId,
+    /// Logical table used by every produced seal key.
+    table: TableRef,
+}
+
+/// One decoded native source and its fixed event-day cursor.
+#[derive(Debug)]
+struct NativeCurrentSource {
+    /// Stamped current source rows.
+    rows: RecordBatch,
+    /// Immutable current-source day descriptors.
+    days: EventDayPlan,
+    /// Next day descriptor to materialize.
+    next_day: usize,
+}
+
+impl NativeSliceProducer {
+    /// Builds a producer after a non-retaining pass fixes the total slice count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when native decoding, stamping, day planning, or
+    /// slice-count arithmetic fails during the first pass.
+    fn new(
+        source: NativeAdmittedRows,
+        audit_event: AuditEvent,
+        tenant: DataTenantId,
+        table: TableRef,
+    ) -> Result<Self, ScribeError> {
+        let slice_count = count_native_slices(&source)?;
+        let input = Buffer::from(source.bytes.clone());
+        Ok(Self {
+            source,
+            decoder: arrow::ipc::reader::StreamDecoder::new(),
+            input,
+            current: None,
+            slice_index: 0,
+            slice_count,
+            audit_event,
+            tenant,
+            table,
+        })
+    }
+
+    /// Produces one exact-capacity current slice and advances its owner state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when decoding diverges from preflight, stamping
+    /// or day materialization fails, or fixed-capacity IPC encoding fails.
+    pub(crate) fn next_slice(&mut self) -> Result<Option<PreparedSlice>, ScribeError> {
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                if current.next_day < current.days.len() {
+                    let (event_day, rows) =
+                        current.days.materialize(&current.rows, current.next_day)?;
+                    current.next_day += 1;
+                    let mut slice = prepare_slice(
+                        self.source.batch_id,
+                        &self.audit_event,
+                        self.tenant,
+                        &self.table,
+                        event_day,
+                        rows,
+                    )?;
+                    slice
+                        .wal_append
+                        .assign_slice_ordinal(self.slice_index, self.slice_count);
+                    self.slice_index =
+                        self.slice_index
+                            .checked_add(1)
+                            .ok_or_else(|| ScribeError::Internal {
+                                detail: "native slice ordinal overflow".to_owned(),
+                            })?;
+                    return Ok(Some(slice));
+                }
+                self.current = None;
+            }
+            let Some(rows) = decode_next_native_source(&mut self.decoder, &mut self.input)? else {
+                if self.slice_index != self.slice_count {
+                    return Err(ScribeError::Internal {
+                        detail: "native slice production diverged from count pass".to_owned(),
+                    });
+                }
+                return Ok(None);
+            };
+            let rows = stamp_native_source(rows, &self.source)?;
+            let days = plan_event_days(&rows)?;
+            self.current = Some(NativeCurrentSource {
+                rows,
+                days,
+                next_day: 0,
+            });
+        }
+    }
+
+    /// Rewinds the retained source for deterministic post-COMMIT regeneration.
+    ///
+    /// The same root continues to own the aliased bytes; this operation only
+    /// replaces fixed decoder state and resets ordinals.
+    pub(crate) fn restart(&mut self) {
+        self.decoder = arrow::ipc::reader::StreamDecoder::new();
+        self.input = Buffer::from(self.source.bytes.clone());
+        self.current = None;
+        self.slice_index = 0;
+    }
+}
+
+/// Counts native slices while retaining only one decoded source at a time.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] when decoding, stamping, day planning, or checked
+/// slice-count conversion fails.
+fn count_native_slices(source: &NativeAdmittedRows) -> Result<u32, ScribeError> {
+    let mut decoder = arrow::ipc::reader::StreamDecoder::new();
+    let mut input = Buffer::from(source.bytes.clone());
+    let mut slices = 0_usize;
+    while let Some(rows) = decode_next_native_source(&mut decoder, &mut input)? {
+        let rows = stamp_native_source(rows, source)?;
+        slices = slices
+            .checked_add(plan_event_days(&rows)?.len())
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "native slice count overflow".to_owned(),
+            })?;
+    }
+    u32::try_from(slices).map_err(|_| ScribeError::Internal {
+        detail: "native slice count exceeds WAL v4 range".to_owned(),
+    })
+}
+
+/// Decodes the next record batch from a preflighted native source.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when Arrow decoding or final stream
+/// completion diverges from the accepted metadata plan.
+fn decode_next_native_source(
+    decoder: &mut arrow::ipc::reader::StreamDecoder,
+    input: &mut Buffer,
+) -> Result<Option<RecordBatch>, ScribeError> {
+    loop {
+        if input.is_empty() {
+            decoder.finish().map_err(|_| ScribeError::InvalidFrame)?;
+            return Ok(None);
+        }
+        if let Some(rows) = decoder
+            .decode(input)
+            .map_err(|_| ScribeError::InvalidFrame)?
+        {
+            return Ok(Some(rows));
+        }
+    }
+}
+
+/// Applies deterministic native contract validation and managed stamping.
+///
+/// # Errors
+///
+/// Returns the stable fingerprint, scope, event-time, or managed-column error
+/// produced by the native decode contract.
+fn stamp_native_source(
+    rows: RecordBatch,
+    source: &NativeAdmittedRows,
+) -> Result<RecordBatch, ScribeError> {
+    crate::scribe::execution_lanes::decode_native_batch(
+        rows,
+        &source.principal,
+        source.expected_schema_fingerprint,
+        &source.request_id,
+        source.batch_id,
+        source.event_time_window,
+        source.receipt_micros,
+    )
 }
 
 /// One event-day slice ready for ordered WAL and memtable processing.
@@ -116,73 +321,39 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     metrics::histogram!("bifrost_scribe_queue_wait_seconds")
         .record(queued_at.elapsed().as_secs_f64());
 
-    let slices_result = (|| -> Result<Vec<PreparedSlice>, ScribeError> {
-        let mut slices = Vec::new();
+    let slices_result = (|| -> Result<(PreparedSliceSet, usize), ScribeError> {
         match rows {
             AdmittedRows::Projected(rows) => {
-                append_prepared_slices(&mut slices, batch_id, &audit_event, tenant, &table, &rows)?
-            }
-            AdmittedRows::Native(native) => {
-                let reader =
-                    arrow::ipc::reader::StreamReader::try_new(Cursor::new(native.bytes), None)
-                        .map_err(|_| ScribeError::InvalidFrame)?;
-                for source in reader {
-                    let source = source.map_err(|_| ScribeError::InvalidFrame)?;
-                    let rows = crate::scribe::execution_lanes::decode_native_batch(
-                        source,
-                        &native.principal,
-                        native.expected_schema_fingerprint,
-                        &native.request_id,
-                        native.batch_id,
-                        native.event_time_window,
-                    )?;
-                    append_prepared_slices(
-                        &mut slices,
-                        batch_id,
-                        &audit_event,
-                        tenant,
-                        &table,
-                        &rows,
-                    )?;
+                let mut slices = Vec::new();
+                append_prepared_slices(&mut slices, batch_id, &audit_event, tenant, &table, &rows)?;
+                let slice_count =
+                    u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
+                        detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
+                    })?;
+                for (slice_index, slice) in slices.iter_mut().enumerate() {
+                    slice.wal_append.assign_slice_ordinal(
+                        u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
+                            detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
+                        })?,
+                        slice_count,
+                    );
                 }
+                let prepared_bytes = prepared_slice_bytes(&slices, memory.bytes())?;
+                Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
             }
+            AdmittedRows::Native(native) => Ok((
+                PreparedSliceSet::Native(Some(Box::new(NativeSliceProducer::new(
+                    native,
+                    audit_event,
+                    tenant,
+                    table.clone(),
+                )?))),
+                memory.bytes(),
+            )),
         }
-        let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-            detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
-        })?;
-        for (slice_index, slice) in slices.iter_mut().enumerate() {
-            slice.wal_append.assign_slice_ordinal(
-                u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
-                    detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
-                })?,
-                slice_count,
-            );
-        }
-        Ok(slices)
     })();
-    let slices = match slices_result {
-        Ok(slices) => slices,
-        Err(error) => {
-            notify_completion(&mut durable_ack, &error);
-            return Err(error);
-        }
-    };
-
-    let prepared_bytes = slices.iter().try_fold(
-        REQUEST_OVERHEAD_BYTES,
-        |total, slice| -> Result<usize, ScribeError> {
-            total
-                .checked_add(slice.memtable_bytes)
-                .and_then(|value| value.checked_add(slice.wal_append.audit.len()))
-                .and_then(|value| value.checked_add(slice.wal_append.data.len()))
-                .ok_or(ScribeError::DecodedPayloadTooLarge {
-                    bytes: usize::MAX,
-                    limit: memory.bytes(),
-                })
-        },
-    );
-    let prepared_bytes = match prepared_bytes {
-        Ok(bytes) => bytes,
+    let (slices, prepared_bytes) = match slices_result {
+        Ok(result) => result,
         Err(error) => {
             notify_completion(&mut durable_ack, &error);
             return Err(error);
@@ -217,6 +388,28 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     })
 }
 
+/// Computes retained bytes for the existing materialized projected path.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::DecodedPayloadTooLarge`] on checked arithmetic
+/// overflow.
+fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize, ScribeError> {
+    slices.iter().try_fold(
+        REQUEST_OVERHEAD_BYTES,
+        |total, slice| -> Result<usize, ScribeError> {
+            total
+                .checked_add(slice.memtable_bytes)
+                .and_then(|value| value.checked_add(slice.wal_append.audit.len()))
+                .and_then(|value| value.checked_add(slice.wal_append.data.len()))
+                .ok_or(ScribeError::DecodedPayloadTooLarge {
+                    bytes: usize::MAX,
+                    limit,
+                })
+        },
+    )
+}
+
 /// Splits and serializes only the current decoded source batch.
 ///
 /// # Errors
@@ -234,35 +427,58 @@ fn append_prepared_slices(
 ) -> Result<(), ScribeError> {
     for slice in split_batch_by_event_day(rows)? {
         let (event_day, day_rows) = slice?;
-        let seal_key = SealKey::new(tenant, table.clone(), event_day);
-        let mut day_audit = audit_event.clone();
-        day_audit.payload_summary = format!("{} rows", day_rows.num_rows());
-        let audit_payload = encode_audit_event(&day_audit)?;
-        let data_payload = encode_ipc_fixed(&day_rows)?;
-        let wal_append = PreparedWalAppend::new(
-            crate::scribe::wal::WalLsn::ZERO,
-            *batch_id.as_bytes(),
-            Bytes::from(audit_payload),
-            data_payload,
-        )
-        .for_slice(
-            seal_key.clone(),
-            SchemaFingerprint::from_arrow_schema(&day_rows.schema()).0,
-        );
-        let memtable_bytes = day_rows.get_array_memory_size();
-        slices.push(PreparedSlice {
-            id: AppendSliceId {
-                batch_id,
-                seal_key: seal_key.clone(),
-            },
-            seal_key,
-            audit_event: day_audit,
-            rows: day_rows,
-            wal_append,
-            memtable_bytes,
-        });
+        slices.push(prepare_slice(
+            batch_id,
+            audit_event,
+            tenant,
+            table,
+            event_day,
+            day_rows,
+        )?);
     }
     Ok(())
+}
+
+/// Builds one fixed-capacity WAL slice from the current materialized day.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] when audit encoding or fixed IPC encoding fails.
+fn prepare_slice(
+    batch_id: Uuid,
+    audit_event: &AuditEvent,
+    tenant: DataTenantId,
+    table: &TableRef,
+    event_day: crate::scribe::seal_key::EventDay,
+    rows: RecordBatch,
+) -> Result<PreparedSlice, ScribeError> {
+    let seal_key = SealKey::new(tenant, table.clone(), event_day);
+    let mut day_audit = audit_event.clone();
+    day_audit.payload_summary = format!("{} rows", rows.num_rows());
+    let audit_payload = encode_audit_event(&day_audit)?;
+    let data_payload = encode_ipc_fixed(&rows)?;
+    let wal_append = PreparedWalAppend::new(
+        crate::scribe::wal::WalLsn::ZERO,
+        *batch_id.as_bytes(),
+        Bytes::from(audit_payload),
+        data_payload,
+    )
+    .for_slice(
+        seal_key.clone(),
+        SchemaFingerprint::from_arrow_schema(&rows.schema()).0,
+    );
+    let memtable_bytes = rows.get_array_memory_size();
+    Ok(PreparedSlice {
+        id: AppendSliceId {
+            batch_id,
+            seal_key: seal_key.clone(),
+        },
+        seal_key,
+        audit_event: day_audit,
+        rows,
+        wal_append,
+        memtable_bytes,
+    })
 }
 
 /// Encodes one current day into a capacity-frozen IPC payload.

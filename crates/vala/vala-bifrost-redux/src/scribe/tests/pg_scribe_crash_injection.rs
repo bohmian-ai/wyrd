@@ -87,7 +87,7 @@ fn torn_wal_tail_is_truncated_and_prior_records_replay() {
         .expect("WAL writer");
     let key = key();
     writer
-        .append_and_fsync_for_test(&key, [1_u8; 16], &audit(), &data_bytes(1))
+        .append_and_commit_for_replay_test(&key, [1_u8; 16], &audit(), &data_bytes(1))
         .expect("append");
     // The shard for this WAL path is determined by the batch_id [1u8; 16]
     // used in the append above.
@@ -129,7 +129,7 @@ fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
         .expect("WAL writer");
     let key = key();
     writer
-        .append_and_fsync_for_test(&key, [1_u8; 16], &audit(), &data_bytes(1))
+        .append_and_commit_for_replay_test(&key, [1_u8; 16], &audit(), &data_bytes(1))
         .expect("acknowledged prefix append");
     // The shard for this WAL path is determined by the batch_id [1u8; 16]
     // used in the append above.
@@ -180,7 +180,12 @@ fn segment_roll_keeps_all_complete_records_replayable() {
     let key = key();
     for value in 0_u8..4 {
         writer
-            .append_and_fsync_for_test(&key, [value; 16], &audit(), &data_bytes(i64::from(value)))
+            .append_and_commit_for_replay_test(
+                &key,
+                [value; 16],
+                &audit(),
+                &data_bytes(i64::from(value)),
+            )
             .expect("append");
     }
     let replayed = replay_wal_directory(temp_dir.path()).expect("replay rolled segments");
@@ -230,7 +235,12 @@ fn replay_restores_multi_shard_seal_key_to_recorded_lanes() {
     for byte in 0_u8..=15_u8 {
         let batch_id = [byte; 16];
         writer
-            .append_and_fsync_for_test(&key, batch_id, &audit(), &data_bytes(i64::from(byte)))
+            .append_and_commit_for_replay_test(
+                &key,
+                batch_id,
+                &audit(),
+                &data_bytes(i64::from(byte)),
+            )
             .expect("append");
         let shard = u8::try_from(shard_for(
             key.tenant,

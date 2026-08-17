@@ -176,16 +176,99 @@ impl std::fmt::Display for SealKey {
 /// Maximum distinct UTC event days accepted in one ingest request.
 const MAX_EVENT_DAYS: usize = 32;
 
+/// Immutable fixed-capacity event-day count plan for one current source.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EventDayPlan {
+    /// Sorted day descriptors.
+    days: [Option<NaiveDate>; MAX_EVENT_DAYS],
+    /// Exact rows assigned to each descriptor.
+    counts: [usize; MAX_EVENT_DAYS],
+    /// Live descriptor count.
+    day_count: usize,
+}
+
+impl EventDayPlan {
+    /// Returns the exact number of distinct planned days.
+    #[must_use]
+    pub(crate) const fn len(&self) -> usize {
+        self.day_count
+    }
+
+    /// Materializes one planned day from its retained source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when `index` is outside the plan, the source no
+    /// longer matches the count pass, or Arrow cannot take the planned rows.
+    pub(crate) fn materialize(
+        &self,
+        batch: &RecordBatch,
+        index: usize,
+    ) -> Result<(EventDay, RecordBatch), ScribeError> {
+        let day = self
+            .days
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or(ScribeError::InvalidFrame)?;
+        let expected_rows = self.counts[index];
+        if self.day_count == 1 {
+            return Ok((EventDay::new(day), batch.clone()));
+        }
+        let ts_col =
+            batch
+                .column_by_name("wyrd_event_time")
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "missing wyrd_event_time column".to_owned(),
+                })?;
+        let ts_array = ts_col
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "wyrd_event_time must be TimestampMicrosecond".to_owned(),
+            })?;
+        let mut indices = Vec::with_capacity(expected_rows);
+        for row in 0..ts_array.len() {
+            let timestamp = chrono::DateTime::from_timestamp_micros(ts_array.value(row))
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "invalid event timestamp during planned split".to_owned(),
+                })?;
+            if timestamp.date_naive() == day {
+                indices.push(u32::try_from(row).map_err(|_| ScribeError::Internal {
+                    detail: "record batch row index exceeds u32::MAX".to_owned(),
+                })?);
+            }
+        }
+        if indices.len() != expected_rows || indices.capacity() != expected_rows {
+            return Err(ScribeError::Internal {
+                detail: "event-day materialization diverged from its count pass".to_owned(),
+            });
+        }
+        let indices = UInt32Array::from(indices);
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                take(column.as_ref(), &indices, None).map_err(|error| ScribeError::Internal {
+                    detail: format!("Arrow day split failed: {error}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sliced = RecordBatch::try_new(batch.schema(), columns).map_err(|error| {
+            ScribeError::Internal {
+                detail: format!("Arrow day slice construction failed: {error}"),
+            }
+        })?;
+        Ok((EventDay::new(day), sliced))
+    }
+}
+
 /// Current-only iterator over deterministic UTC event-day slices.
 pub(crate) struct EventDaySlices<'a> {
     /// Retained source whose buffers remain alive for one-day aliasing.
     batch: &'a RecordBatch,
-    /// Sorted fixed-capacity day descriptors.
-    days: [Option<NaiveDate>; MAX_EVENT_DAYS],
-    /// Exact row count for each live day descriptor.
-    counts: [usize; MAX_EVENT_DAYS],
-    /// Number of live descriptors.
-    day_count: usize,
+    /// Immutable descriptors shared with lazy native production.
+    plan: EventDayPlan,
     /// Descriptor produced by the next iterator call.
     current: usize,
 }
@@ -196,66 +279,17 @@ impl Iterator for EventDaySlices<'_> {
     /// Materializes only the next day and drops its exact index workspace on
     /// the following call.
     fn next(&mut self) -> Option<Self::Item> {
-        let day = self.days.get(self.current).copied().flatten()?;
-        let expected_rows = self.counts[self.current];
-        self.current += 1;
-        if self.day_count == 1 {
-            return Some(Ok((EventDay::new(day), self.batch.clone())));
+        if self.current >= self.plan.len() {
+            return None;
         }
-        let result = (|| {
-            let ts_col = self
-                .batch
-                .column_by_name("wyrd_event_time")
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "missing wyrd_event_time column".to_owned(),
-                })?;
-            let ts_array = ts_col
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "wyrd_event_time must be TimestampMicrosecond".to_owned(),
-                })?;
-            let mut indices = Vec::with_capacity(expected_rows);
-            for index in 0..ts_array.len() {
-                let timestamp = chrono::DateTime::from_timestamp_micros(ts_array.value(index))
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "invalid event timestamp during planned split".to_owned(),
-                    })?;
-                if timestamp.date_naive() == day {
-                    indices.push(u32::try_from(index).map_err(|_| ScribeError::Internal {
-                        detail: "record batch row index exceeds u32::MAX".to_owned(),
-                    })?);
-                }
-            }
-            if indices.len() != expected_rows || indices.capacity() != expected_rows {
-                return Err(ScribeError::Internal {
-                    detail: "event-day materialization diverged from its count pass".to_owned(),
-                });
-            }
-            let indices = UInt32Array::from(indices);
-            let columns = self
-                .batch
-                .columns()
-                .iter()
-                .map(|column| {
-                    take(column.as_ref(), &indices, None).map_err(|error| ScribeError::Internal {
-                        detail: format!("Arrow day split failed: {error}"),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let sliced = RecordBatch::try_new(self.batch.schema(), columns).map_err(|error| {
-                ScribeError::Internal {
-                    detail: format!("Arrow day slice construction failed: {error}"),
-                }
-            })?;
-            Ok((EventDay::new(day), sliced))
-        })();
+        let result = self.plan.materialize(self.batch, self.current);
+        self.current += 1;
         Some(result)
     }
 
     /// Reports the exact unmaterialized day count.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.day_count.saturating_sub(self.current);
+        let remaining = self.plan.len().saturating_sub(self.current);
         (remaining, Some(remaining))
     }
 }
@@ -271,6 +305,20 @@ impl ExactSizeIterator for EventDaySlices<'_> {}
 pub(crate) fn split_batch_by_event_day(
     batch: &RecordBatch,
 ) -> Result<EventDaySlices<'_>, ScribeError> {
+    Ok(EventDaySlices {
+        batch,
+        plan: plan_event_days(batch)?,
+        current: 0,
+    })
+}
+
+/// Counts one current source into an owned fixed-capacity day plan.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] for a missing, null, mistyped, or invalid event-time
+/// column, checked row-count overflow, or more than 32 distinct days.
+pub(crate) fn plan_event_days(batch: &RecordBatch) -> Result<EventDayPlan, ScribeError> {
     let ts_col = batch
         .column_by_name("wyrd_event_time")
         .ok_or_else(|| ScribeError::Internal {
@@ -327,12 +375,10 @@ pub(crate) fn split_batch_by_event_day(
     if day_count == 0 {
         return Err(ScribeError::InvalidFrame);
     }
-    Ok(EventDaySlices {
-        batch,
+    Ok(EventDayPlan {
         days,
         counts,
         day_count,
-        current: 0,
     })
 }
 

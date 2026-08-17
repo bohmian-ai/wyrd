@@ -856,6 +856,9 @@ impl SealDriver {
             ScribePersistenceCpuResult::Prepared(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned the wrong seal result".to_owned(),
             }),
+            ScribePersistenceCpuResult::NativeSliceProduced { .. } => Err(ScribeError::Internal {
+                detail: "persistence lane returned native slice during seal".to_owned(),
+            }),
             ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned replay output during seal".to_owned(),
             }),

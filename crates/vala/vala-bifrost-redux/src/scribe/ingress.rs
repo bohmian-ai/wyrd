@@ -362,6 +362,7 @@ impl ScribeImpl {
                 request_id: frame.request_id.clone(),
                 batch_id: frame.batch_id,
                 event_time_window: self.admission.config().event_time_window,
+                receipt_micros: crate::scribe::execution_lanes::current_receipt_micros()?,
             }),
             payload => {
                 let rows = self
@@ -409,7 +410,8 @@ impl ScribeImpl {
             .await?
         {
             ScribePersistenceCpuResult::Prepared(value) => value,
-            ScribePersistenceCpuResult::ParquetEncoded(_)
+            ScribePersistenceCpuResult::NativeSliceProduced { .. }
+            | ScribePersistenceCpuResult::ParquetEncoded(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong preparation result".to_owned(),

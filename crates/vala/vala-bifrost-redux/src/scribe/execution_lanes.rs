@@ -22,7 +22,9 @@ use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
-use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
+use crate::scribe::preprocess::{
+    AdmittedAppend, NativeSliceProducer, PreparedAppend, PreparedSlice, prepare_append,
+};
 use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -392,6 +394,7 @@ fn decode(
         batch_id,
         native_payload,
         window,
+        None,
     )
 }
 
@@ -411,6 +414,7 @@ pub(crate) fn decode_native_batch(
     request_id: &RequestId,
     batch_id: uuid::Uuid,
     window: EventTimeWindow,
+    receipt_micros: i64,
 ) -> Result<RecordBatch, ScribeError> {
     decode_rows(
         rows,
@@ -420,6 +424,7 @@ pub(crate) fn decode_native_batch(
         batch_id,
         true,
         window,
+        Some(receipt_micros),
     )
 }
 
@@ -438,6 +443,7 @@ fn decode_rows(
     batch_id: uuid::Uuid,
     native_payload: bool,
     window: EventTimeWindow,
+    receipt_micros: Option<i64>,
 ) -> Result<RecordBatch, ScribeError> {
     if rows.num_rows() >= i32::MAX as usize {
         return Err(ScribeError::TooManyRows {
@@ -482,6 +488,7 @@ fn decode_rows(
         batch_id,
         native_payload,
         window,
+        receipt_micros,
     )
 }
 
@@ -498,6 +505,25 @@ fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
         .map(|field| field.as_ref().clone())
         .collect();
     SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
+}
+
+/// Captures one deterministic receipt timestamp for planning and regeneration.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the system clock precedes the UNIX
+/// epoch or the microsecond count exceeds Arrow's signed timestamp range.
+pub(crate) fn current_receipt_micros() -> Result<i64, ScribeError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("system clock is before UNIX epoch: {error}"),
+        })?
+        .as_micros()
+        .try_into()
+        .map_err(|_| ScribeError::Internal {
+            detail: "receipt timestamp exceeds Arrow range".to_owned(),
+        })
 }
 
 fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), ScribeError> {
@@ -564,20 +590,12 @@ fn stamp_correlation_columns(
     batch_id: uuid::Uuid,
     native_payload: bool,
     window: EventTimeWindow,
+    receipt_micros: Option<i64>,
 ) -> Result<RecordBatch, ScribeError> {
     let row_count = rows.num_rows();
     // Compute one receipt instant for the whole batch so clock ticks mid-batch
     // cannot split the verdict.
-    let receipt_micros: i64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("system clock is before UNIX epoch: {error}"),
-        })?
-        .as_micros()
-        .try_into()
-        .map_err(|_| ScribeError::Internal {
-            detail: "receipt timestamp exceeds Arrow range".to_owned(),
-        })?;
+    let receipt_micros = receipt_micros.map_or_else(current_receipt_micros, Ok)?;
     // Native type/null/duplicate checks come first (T38). A malformed column
     // stays `InvalidFrame` regardless of window membership.
     if native_payload {
@@ -648,6 +666,7 @@ fn stamp_correlation_columns(
         batch_id,
         row_count,
         caller_event_time,
+        receipt_micros,
     )?;
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|_| ScribeError::InvalidFrame)
@@ -869,6 +888,7 @@ fn append_managed_columns(
     batch_id: uuid::Uuid,
     row_count: usize,
     caller_event_time: Option<ArrayRef>,
+    receipt_micros: i64,
 ) -> Result<(), ScribeError> {
     fields.extend([
         Field::new(CARD_UID, DataType::Utf8, true),
@@ -888,19 +908,9 @@ fn append_managed_columns(
         Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false),
         Field::new(DATA_TENANT_ID, DataType::Utf8, false),
     ]);
-    let timestamp: i64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("system clock is before UNIX epoch: {error}"),
-        })?
-        .as_micros()
-        .try_into()
-        .map_err(|_| ScribeError::Internal {
-            detail: "ingestion timestamp exceeds Arrow range".to_owned(),
-        })?;
-    let timestamp_array =
-        Arc::new(TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"))
-            as ArrayRef;
+    let timestamp_array = Arc::new(
+        TimestampMicrosecondArray::from(vec![receipt_micros; row_count]).with_timezone("UTC"),
+    ) as ArrayRef;
     // Event time lands in the canonical slot exactly once: the caller's array
     // verbatim when supplied, otherwise the server receipt instant.
     columns.push(caller_event_time.unwrap_or_else(|| Arc::clone(&timestamp_array)));
@@ -937,8 +947,12 @@ fn append_managed_columns(
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuOp {
     Preprocess(Box<AdmittedAppend>),
+    /// Advance one root-owned native producer by at most one slice.
+    ProduceNativeSlice(Box<NativeSliceProducer>),
     EncodeParquet(Box<EncodeParquetOp>),
-    RestoreReplay { replayed: Box<ReplayedSealKey> },
+    RestoreReplay {
+        replayed: Box<ReplayedSealKey>,
+    },
 }
 
 /// Move-only inputs for one bounded Parquet encoding lane operation.
@@ -962,6 +976,13 @@ pub(crate) struct EncodeParquetOp {
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuResult {
     Prepared(PreparedAppend),
+    /// Native producer state returned with its optional current slice.
+    NativeSliceProduced {
+        /// Producer to retain for the next bounded turn.
+        producer: Box<NativeSliceProducer>,
+        /// Current slice, or `None` after exact exhaustion.
+        slice: Option<PreparedSlice>,
+    },
     ParquetEncoded(ParquetEncoded),
     ReplayRestored(Box<FrozenMemtable>),
 }
@@ -1086,6 +1107,10 @@ impl ScribePersistenceCpuPool {
                         std::thread::sleep(delay);
                     }
                     prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
+                }
+                ScribePersistenceCpuOp::ProduceNativeSlice(mut producer) => {
+                    let slice = producer.next_slice()?;
+                    Ok(ScribePersistenceCpuResult::NativeSliceProduced { producer, slice })
                 }
                 ScribePersistenceCpuOp::EncodeParquet(operation) => {
                     let EncodeParquetOp {
@@ -1608,6 +1633,7 @@ mod tests {
             Uuid::now_v7(),
             false,
             EventTimeWindow::default(),
+            None,
         )
         .expect("stamp");
         let value_index = stamped.schema().index_of("value").expect("value column");
@@ -1629,6 +1655,7 @@ mod tests {
             Uuid::now_v7(),
             true,
             EventTimeWindow::default(),
+            None,
         )
         .expect("stamp native batch");
 

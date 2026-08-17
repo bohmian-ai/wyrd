@@ -929,11 +929,20 @@ fn managed_projection_bytes(rows: usize, request_id_bytes: usize) -> Result<usiz
     let fixed_values = rows
         .checked_mul(size_of::<i64>() + 16 + size_of::<i32>())
         .ok_or_else(overflow)?;
+    let array_owners = size_of::<arrow::array::StringArray>()
+        .checked_mul(5)
+        .and_then(|value| {
+            value.checked_add(size_of::<arrow::array::TimestampMicrosecondArray>() * 2)
+        })
+        .and_then(|value| value.checked_add(size_of::<arrow::array::FixedSizeBinaryArray>()))
+        .and_then(|value| value.checked_add(size_of::<arrow::array::Int32Array>()))
+        .ok_or_else(overflow)?;
     offsets
         .checked_mul(5)
         .and_then(|value| value.checked_add(validity.checked_mul(2)?))
         .and_then(|value| value.checked_add(repeated_values))
         .and_then(|value| value.checked_add(fixed_values))
+        .and_then(|value| value.checked_add(array_owners))
         .ok_or_else(overflow)
 }
 

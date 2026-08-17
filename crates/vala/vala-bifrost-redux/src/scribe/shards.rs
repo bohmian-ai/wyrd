@@ -24,7 +24,7 @@ use crate::scribe::memtable::{
 use crate::scribe::persistence::{
     ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
 };
-use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice};
+use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice, PreparedSliceSet};
 use crate::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, HotBatch};
@@ -2014,9 +2014,11 @@ struct DurableSlice {
     /// Audit event paired with the data rows.
     audit_event: wyrd_spec::vala::api::AuditEvent,
     /// Arrow rows awaiting memtable insertion.
-    rows: arrow::record_batch::RecordBatch,
+    rows: Option<arrow::record_batch::RecordBatch>,
     /// Active-memory bytes reserved for this slice.
     memtable_bytes: usize,
+    /// Whether active admission and ownership have already transferred.
+    active_reserved: bool,
     /// Batch identity used for retry deduplication.
     batch_id: [u8; 16],
     /// WAL sequence number assigned to the durable append.
@@ -2099,9 +2101,12 @@ impl ShardOwner {
             Self::notify_prepared_error(&mut state.prepared, &error);
             return Err(error);
         }
-        let touched_keys = match self.insert_group(state.durable, &mut state.rows_by_append) {
+        let touched_keys = match self.insert_committed_group(&mut state).await {
             Ok(keys) => keys,
             Err(error) => {
+                if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
+                    tracing::error!(error = %cleanup_error, "active cleanup failed after visibility error");
+                }
                 Self::notify_prepared_error(&mut state.prepared, &error);
                 return Err(error);
             }
@@ -2265,8 +2270,18 @@ impl ShardOwner {
                 memory.transfer_category(MemoryCategory::Prepared)?;
             }
             let batch_id = *append.batch_id.as_bytes();
-            let slices = std::mem::take(&mut append.slices);
-            for slice in slices {
+            loop {
+                let slice = match Self::next_prepared_slice(&self.persistence_cpu, append).await {
+                    Ok(Some(slice)) => slice,
+                    Ok(None) => break,
+                    Err(error) => {
+                        if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                            tracing::error!(error = %cleanup_error, "active cleanup failed after slice production error");
+                        }
+                        Self::notify_prepared_error(&mut prepared, &error);
+                        return Err(error);
+                    }
+                };
                 match self
                     .memtable
                     .retained_batch_rows(&slice.seal_key, *slice.id.batch_id.as_bytes())
@@ -2321,6 +2336,56 @@ impl ShardOwner {
         })
     }
 
+    /// Advances one materialized or lazy prepared-slice source.
+    ///
+    /// Native production runs on the bounded persistence CPU lane and returns
+    /// the producer owner with every result so cancellation cannot orphan its
+    /// retained raw source or decoder state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the producer owner is missing, the CPU lane
+    /// refuses/fails, or it returns a result for a different operation.
+    async fn next_prepared_slice(
+        persistence_cpu: &crate::scribe::execution_lanes::ScribePersistenceCpuPool,
+        append: &mut PreparedAppend,
+    ) -> Result<Option<PreparedSlice>, ScribeError> {
+        match &mut append.slices {
+            PreparedSliceSet::Materialized(slices) => {
+                if slices.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(slices.remove(0)))
+                }
+            }
+            PreparedSliceSet::Native(producer_slot) => {
+                let producer = producer_slot.take().ok_or_else(|| ScribeError::Internal {
+                    detail: "native prepared-slice producer owner is missing".to_owned(),
+                })?;
+                match persistence_cpu
+                    .submit(
+                        crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceNativeSlice(
+                            producer,
+                        ),
+                    )
+                    .await?
+                {
+                    crate::scribe::execution_lanes::ScribePersistenceCpuResult::NativeSliceProduced {
+                        producer: returned,
+                        slice,
+                    } => {
+                        *producer_slot = Some(returned);
+                        Ok(slice)
+                    }
+                    _ => Err(ScribeError::Internal {
+                        detail: "persistence lane returned the wrong native slice result"
+                            .to_owned(),
+                    }),
+                }
+            }
+        }
+    }
+
     /// Reserves active memory and appends one prepared slice to the shard WAL lane.
     ///
     /// # Errors
@@ -2332,6 +2397,7 @@ impl ShardOwner {
         append: &mut PreparedAppend,
         slice: PreparedSlice,
     ) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
+        let retain_rows = matches!(&append.slices, PreparedSliceSet::Materialized(_));
         let PreparedSlice {
             seal_key,
             audit_event,
@@ -2342,33 +2408,8 @@ impl ShardOwner {
         } = slice;
         let slice_index = wal_append.slice_index;
         let slice_count = wal_append.slice_count;
-        self.admission
-            .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
-        let active_memory = if let Some(memory) = append.memory.as_mut() {
-            memory.split(memtable_bytes)
-        } else {
-            let error = ScribeError::Internal {
-                detail: "prepared append lost its memory reservation".to_owned(),
-            };
-            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
-        };
-        let mut active_memory = match active_memory {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(self.preserve_primary_after_active_cleanup(
-                    ScribeError::Internal {
-                        detail: error.to_string(),
-                    },
-                    memtable_bytes,
-                    false,
-                ));
-            }
-        };
-        if let Err(error) = active_memory.transfer_category(MemoryCategory::Active) {
-            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
-        }
-        if let Err(error) = self.memory_ownership.absorb_active(active_memory) {
-            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
+        if retain_rows {
+            self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
         }
         let wal_result = self
             .wal_io
@@ -2401,8 +2442,9 @@ impl ShardOwner {
             DurableSlice {
                 seal_key,
                 audit_event,
-                rows,
+                rows: retain_rows.then_some(rows),
                 memtable_bytes,
+                active_reserved: retain_rows,
                 batch_id: *append.batch_id.as_bytes(),
                 lsn: result.lsn,
                 payload_digest: result.payload_digest,
@@ -2431,6 +2473,7 @@ impl ShardOwner {
         slice: PreparedSlice,
         lsn: crate::scribe::wal::WalLsn,
     ) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
+        let retain_rows = matches!(&append.slices, PreparedSliceSet::Materialized(_));
         let PreparedSlice {
             seal_key,
             audit_event,
@@ -2438,48 +2481,16 @@ impl ShardOwner {
             memtable_bytes,
             ..
         } = slice;
-        self.admission
-            .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
-        let active_memory = if let Some(memory) = append.memory.as_mut() {
-            memory.split(memtable_bytes)
-        } else {
-            let error = ScribeError::Internal {
-                detail: "prepared append lost its memory reservation during WAL retry".to_owned(),
-            };
-            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
-        };
-        let active_memory = match active_memory {
-            Ok(mut value) => {
-                if let Err(error) = value.transfer_category(MemoryCategory::Active) {
-                    return Err(self.preserve_primary_after_active_cleanup(
-                        ScribeError::Internal {
-                            detail: error.to_string(),
-                        },
-                        memtable_bytes,
-                        false,
-                    ));
-                }
-                value
-            }
-            Err(error) => {
-                return Err(self.preserve_primary_after_active_cleanup(
-                    ScribeError::Internal {
-                        detail: error.to_string(),
-                    },
-                    memtable_bytes,
-                    false,
-                ));
-            }
-        };
-        if let Err(error) = self.memory_ownership.absorb_active(active_memory) {
-            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
+        if retain_rows {
+            self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
         }
         Ok((
             DurableSlice {
                 seal_key,
                 audit_event,
-                rows,
+                rows: retain_rows.then_some(rows),
                 memtable_bytes,
+                active_reserved: retain_rows,
                 batch_id: *append.batch_id.as_bytes(),
                 lsn,
                 payload_digest: [0; 32],
@@ -2526,6 +2537,128 @@ impl ShardOwner {
         }
     }
 
+    /// Regenerates native rows one slice at a time after every durable fence.
+    ///
+    /// Native WAL payload rows are deliberately dropped after each SLICE write.
+    /// Once COMMIT fsync and the SQL control/audit transaction succeed, this
+    /// method rewinds the retained source under the same root, regenerates one
+    /// deterministic slice, inserts it, and drops it before advancing. Projected
+    /// slices use their existing retained rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when regeneration diverges from durable slice
+    /// identity, the CPU lane fails, or memtable insertion/rotation fails.
+    async fn insert_committed_group(
+        &mut self,
+        state: &mut GroupWalState,
+    ) -> Result<HashSet<crate::scribe::seal_key::SealKey>, ScribeError> {
+        let mut touched_keys = HashSet::new();
+        for append in &mut state.prepared {
+            let is_native = match &mut append.slices {
+                PreparedSliceSet::Native(Some(producer)) => {
+                    producer.restart();
+                    true
+                }
+                PreparedSliceSet::Native(None) => {
+                    return Err(ScribeError::Internal {
+                        detail: "native producer owner missing before visibility".to_owned(),
+                    });
+                }
+                PreparedSliceSet::Materialized(_) => false,
+            };
+            if !is_native {
+                continue;
+            }
+            while let Some(produced) =
+                Self::next_prepared_slice(&self.persistence_cpu, append).await?
+            {
+                let position = state.durable.iter().position(|durable| {
+                    durable.batch_id == *append.batch_id.as_bytes()
+                        && durable.slice_index == produced.wal_append.slice_index
+                });
+                let Some(position) = position else {
+                    continue;
+                };
+                let mut durable = state.durable.remove(position);
+                if durable.seal_key != produced.seal_key {
+                    return Err(ScribeError::Internal {
+                        detail: "regenerated native slice identity diverged after COMMIT"
+                            .to_owned(),
+                    });
+                }
+                durable.rows = Some(produced.rows);
+                durable.audit_event = produced.audit_event;
+                self.reserve_slice_active(append, &durable.seal_key, durable.memtable_bytes)?;
+                durable.active_reserved = true;
+                self.insert_committed_slice(durable, &mut state.rows_by_append, &mut touched_keys)?;
+            }
+        }
+        while !state.durable.is_empty() {
+            let slice = state.durable.remove(0);
+            self.insert_committed_slice(slice, &mut state.rows_by_append, &mut touched_keys)?;
+        }
+        Ok(touched_keys)
+    }
+
+    /// Inserts one post-fence slice and transfers its active owner to memtable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when rows are missing, rotation inspection or
+    /// flushing fails, or memtable insertion fails. Active ownership for the
+    /// refused current slice is released before returning.
+    fn insert_committed_slice(
+        &mut self,
+        mut slice: DurableSlice,
+        rows_by_append: &mut HashMap<[u8; 16], u64>,
+        touched_keys: &mut HashSet<crate::scribe::seal_key::SealKey>,
+    ) -> Result<(), ScribeError> {
+        let rows = slice.rows.take().ok_or_else(|| ScribeError::Internal {
+            detail: "durable slice rows were not regenerated before visibility".to_owned(),
+        })?;
+        let row_count = rows.num_rows();
+        let pre_insert = self.memtable.would_cross_rotation(&slice.seal_key, &rows);
+        let pre_insert = match pre_insert {
+            Ok(true) => {
+                self.flush_keys(vec![slice.seal_key.clone()], Some(SealTriggerReason::Size))
+            }
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = pre_insert {
+            return Err(self.preserve_primary_after_active_cleanup(
+                error,
+                slice.memtable_bytes,
+                true,
+            ));
+        }
+        self.memtable
+            .insert(
+                &slice.seal_key,
+                slice.audit_event,
+                crate::scribe::wal::ScribeAppendMeta {
+                    batch_id: slice.batch_id,
+                    rows_accepted: row_count,
+                    wal_lsn_min: slice.lsn,
+                    wal_lsn_max: slice.lsn,
+                    seal_key: slice.seal_key.as_path_components(),
+                },
+                rows,
+            )
+            .map_err(|error| {
+                self.preserve_primary_after_active_cleanup(error, slice.memtable_bytes, true)
+            })?;
+        touched_keys.insert(slice.seal_key.clone());
+        self.synced_not_inserted.remove(&AppendSliceId {
+            batch_id: uuid::Uuid::from_bytes(slice.batch_id),
+            seal_key: slice.seal_key,
+        });
+        let entry = rows_by_append.entry(slice.batch_id).or_default();
+        *entry = entry.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
     /// Inserts WAL-synced slices into this owner's memtable and clears retry state.
     ///
     /// Before each insert, the owner seals a non-empty bucket that the incoming
@@ -2539,6 +2672,7 @@ impl ShardOwner {
     /// fails. A required pre-insert flush also propagates failures from bucket
     /// freezing or generation preparation, table binding, WAL retention, and
     /// active-to-immutable accounting transfer.
+    #[cfg(test)]
     fn insert_group(
         &mut self,
         durable: Vec<DurableSlice>,
@@ -2547,45 +2681,12 @@ impl ShardOwner {
         let mut touched_keys = HashSet::new();
         let mut slices = durable.into_iter();
         while let Some(slice) = slices.next() {
-            touched_keys.insert(slice.seal_key.clone());
-            let rows = slice.rows.num_rows();
-            let pre_insert_flush = self
-                .memtable
-                .would_cross_rotation(&slice.seal_key, &slice.rows);
-            let pre_insert_result = match pre_insert_flush {
-                Ok(true) => {
-                    self.flush_keys(vec![slice.seal_key.clone()], Some(SealTriggerReason::Size))
-                }
-                Ok(false) => Ok(()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = pre_insert_result {
-                let bytes = std::iter::once(slice.memtable_bytes)
-                    .chain(slices.map(|remaining| remaining.memtable_bytes));
+            if let Err(error) =
+                self.insert_committed_slice(slice, rows_by_append, &mut touched_keys)
+            {
+                let bytes = slices.map(|remaining| remaining.memtable_bytes);
                 return Err(self.preserve_primary_after_active_cleanups(error, bytes));
             }
-            if let Err(error) = self.memtable.insert(
-                &slice.seal_key,
-                slice.audit_event,
-                crate::scribe::wal::ScribeAppendMeta {
-                    batch_id: slice.batch_id,
-                    rows_accepted: rows,
-                    wal_lsn_min: slice.lsn,
-                    wal_lsn_max: slice.lsn,
-                    seal_key: slice.seal_key.as_path_components(),
-                },
-                slice.rows,
-            ) {
-                let bytes = std::iter::once(slice.memtable_bytes)
-                    .chain(slices.map(|remaining| remaining.memtable_bytes));
-                return Err(self.preserve_primary_after_active_cleanups(error, bytes));
-            }
-            self.synced_not_inserted.remove(&AppendSliceId {
-                batch_id: uuid::Uuid::from_bytes(slice.batch_id),
-                seal_key: slice.seal_key.clone(),
-            });
-            let entry = rows_by_append.entry(slice.batch_id).or_default();
-            *entry = entry.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
         }
         Ok(touched_keys)
     }
@@ -2620,6 +2721,9 @@ impl ShardOwner {
     fn release_active_reservations(&self, durable: &[DurableSlice]) -> Result<(), ScribeError> {
         let mut first_error = None;
         for slice in durable {
+            if !slice.active_reserved {
+                continue;
+            }
             if let Err(error) = self.release_active_ownership(slice.memtable_bytes, true) {
                 tracing::error!(error = %error, "active cleanup failed; accounting is poisoned");
                 if first_error.is_none() {
@@ -2628,6 +2732,52 @@ impl ShardOwner {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Transfers one current slice from the admitted root into active ownership.
+    ///
+    /// Native callers invoke this only after COMMIT and SQL fencing, immediately
+    /// before visibility. Materialized callers retain the historical pre-WAL
+    /// transfer because their rows remain live throughout the durable sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when active admission refuses the slice, the root
+    /// cannot supply its exact child, or the ownership ledger refuses transfer.
+    fn reserve_slice_active(
+        &mut self,
+        append: &mut PreparedAppend,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        memtable_bytes: usize,
+    ) -> Result<(), ScribeError> {
+        self.admission
+            .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
+        let active_memory = append
+            .memory
+            .as_mut()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared append lost its memory reservation".to_owned(),
+            })?
+            .split(memtable_bytes);
+        let mut active_memory = match active_memory {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.preserve_primary_after_active_cleanup(
+                    ScribeError::Internal {
+                        detail: error.to_string(),
+                    },
+                    memtable_bytes,
+                    false,
+                ));
+            }
+        };
+        if let Err(error) = active_memory.transfer_category(MemoryCategory::Active) {
+            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
+        }
+        if let Err(error) = self.memory_ownership.absorb_active(active_memory) {
+            return Err(self.preserve_primary_after_active_cleanup(error, memtable_bytes, false));
+        }
+        Ok(())
     }
 
     /// Preserves one primary group failure while containing an adjacent cleanup failure.
@@ -2649,6 +2799,7 @@ impl ShardOwner {
     }
 
     /// Releases every still-owned absorbed slice while preserving one primary failure.
+    #[cfg(test)]
     fn preserve_primary_after_active_cleanups(
         &self,
         primary: ScribeError,
@@ -3102,8 +3253,9 @@ mod tests {
                 vec![DurableSlice {
                     seal_key: key.clone(),
                     audit_event: owner_event(),
-                    rows: next_batch,
+                    rows: Some(next_batch),
                     memtable_bytes: rotation_bytes,
+                    active_reserved: true,
                     batch_id: next_id,
                     lsn: WalLsn::new(2),
                     payload_digest: [0; 32],

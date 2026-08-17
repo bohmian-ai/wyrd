@@ -15,7 +15,7 @@ mod pg_tests {
 
     use crate::otlp_support::{
         assert_grpc_otlp_limit, assert_http_otlp_limit, assert_otlp_owner_settled,
-        export_and_flush, public_otlp_limits,
+        capture_otlp_material_snapshot, export_and_flush, public_otlp_limits,
     };
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
@@ -291,6 +291,41 @@ mod pg_tests {
         srv.shutdown().await.expect("shutdown");
     }
 
+    /// OTLP/HTTP JSON logs reach the same durable public read path as protobuf.
+    #[tokio::test]
+    async fn logs_http_json_success_and_readback() {
+        const TRACE_ID_JSON: [u8; 16] = [0x5a; 16];
+        const SPAN_ID_JSON: [u8; 8] = [0x6b; 8];
+
+        let srv = WyrdTestServer::start_bound().await.expect("bound server");
+        let jwt = bootstrap_writer(&srv, "otlp-logs-http-json").await;
+        let base_url = srv.base_url().expect("http base url").to_owned();
+
+        let response = export_and_flush(
+            &srv,
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/logs"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .json(&export_request(TRACE_ID_JSON, SPAN_ID_JSON))
+                .send(),
+        )
+        .await;
+        assert_eq!(response.status(), 200, "JSON export must be accepted");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next()),
+            Some("application/json"),
+            "JSON request must get a JSON response"
+        );
+
+        let grpc = srv.grpc_url().expect("gRPC URL");
+        read_back_log(connect(&grpc).await, &jwt, TRACE_ID_JSON, SPAN_ID_JSON).await;
+        srv.shutdown().await.expect("shutdown");
+    }
+
     /// Public logs transports accept exact caps, reject cap plus one, and settle owners.
     #[tokio::test]
     async fn logs_http_and_grpc_enforce_bounded_decode_projection() {
@@ -370,6 +405,78 @@ mod pg_tests {
             assert_otlp_owner_settled(&srv);
         }
 
+        srv.shutdown().await.expect("shutdown");
+    }
+
+    /// A representative logs cap refusal leaves no WAL or durable mutation.
+    #[tokio::test]
+    async fn logs_refusal_preserves_material_and_durable_baseline() {
+        let srv = WyrdTestServer::builder()
+            .with_scribe_ingest_limits_for_test(public_otlp_limits(1, 2))
+            .start_bound()
+            .await
+            .expect("bounded logs server");
+        let jwt = bootstrap_writer(&srv, "logs-refusal-baseline").await;
+        let grpc = srv.grpc_url().expect("gRPC URL");
+        let channel = connect(&grpc).await;
+        let mut logs = LogsServiceClient::new(channel.clone());
+
+        export_and_flush(
+            &srv,
+            logs.export(with_token(
+                Request::new(bounded_export_request(1, 2, 0x61)),
+                &jwt,
+            )),
+        )
+        .await;
+        assert_otlp_owner_settled(&srv);
+        let baseline = capture_otlp_material_snapshot(&srv, 0).await;
+
+        const REFUSED_MARKER: u8 = 0x62;
+        let error = logs
+            .export(with_token(
+                Request::new(bounded_export_request(2, 1, REFUSED_MARKER)),
+                &jwt,
+            ))
+            .await
+            .expect_err("logs cap plus one must fail");
+        assert_grpc_otlp_limit(&error);
+        srv.flush_bifrost()
+            .await
+            .expect("refused logs flush barrier");
+        assert_otlp_owner_settled(&srv);
+        let after_refusal = capture_otlp_material_snapshot(&srv, 0).await;
+
+        let mut query = ValaQueryServiceClient::new(channel);
+        let rows = query
+            .query_logs(with_token(
+                Request::new(QueryLogsRequest {
+                    window: Some(QueryWindow {
+                        since: String::new(),
+                        until: String::new(),
+                        limit: 100,
+                        page_token: String::new(),
+                    }),
+                    severity_number_min: 0,
+                    trace_id: hex16(&[REFUSED_MARKER; 16]),
+                    event_name: String::new(),
+                }),
+                &jwt,
+            ))
+            .await
+            .expect("public logs marker query succeeds")
+            .into_inner()
+            .rows;
+        let refused_trace_id = hex16(&[REFUSED_MARKER; 16]);
+        let marker_rows = rows
+            .iter()
+            .filter(|row| row.trace_id == refused_trace_id)
+            .count();
+        assert_eq!(
+            after_refusal.with_public_marker_rows(marker_rows),
+            baseline,
+            "refused log must not change owners, durable state, or public rows: {rows:?}"
+        );
         srv.shutdown().await.expect("shutdown");
     }
 }

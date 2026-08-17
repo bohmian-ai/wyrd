@@ -14,7 +14,7 @@ mod pg_tests {
 
     use crate::otlp_support::{
         assert_grpc_otlp_limit, assert_http_otlp_limit, assert_otlp_owner_settled,
-        export_and_flush, public_otlp_limits,
+        capture_otlp_material_snapshot, export_and_flush, public_otlp_limits,
     };
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
@@ -369,6 +369,73 @@ mod pg_tests {
             assert_otlp_owner_settled(&srv);
         }
 
+        srv.shutdown().await.expect("shutdown");
+    }
+
+    /// A representative trace cap refusal leaves no WAL or durable mutation.
+    #[tokio::test]
+    async fn trace_refusal_preserves_material_and_durable_baseline() {
+        let srv = WyrdTestServer::builder()
+            .with_scribe_ingest_limits_for_test(public_otlp_limits(1, 2))
+            .start_bound()
+            .await
+            .expect("bounded trace server");
+        let jwt = match srv
+            .bootstrap_user("trace-refusal-baseline", &["admin"])
+            .await
+            .expect("bootstrap bounded trace writer")
+        {
+            Bootstrap::User { jwt, .. } => jwt,
+            other => panic!("expected user bootstrap, got {other:?}"),
+        };
+        let grpc = srv.grpc_url().expect("gRPC URL");
+        let channel = connect(&grpc).await;
+        let mut traces = TraceServiceClient::new(channel.clone());
+
+        export_and_flush(
+            &srv,
+            traces.export(with_token(
+                Request::new(bounded_export_request(1, 2, 0x71)),
+                &jwt,
+            )),
+        )
+        .await;
+        assert_otlp_owner_settled(&srv);
+        let baseline = capture_otlp_material_snapshot(&srv, 0).await;
+
+        const REFUSED_MARKER: u8 = 0x72;
+        let error = traces
+            .export(with_token(
+                Request::new(bounded_export_request(2, 1, REFUSED_MARKER)),
+                &jwt,
+            ))
+            .await
+            .expect_err("trace cap plus one must fail");
+        assert_grpc_otlp_limit(&error);
+        srv.flush_bifrost()
+            .await
+            .expect("refused trace flush barrier");
+        assert_otlp_owner_settled(&srv);
+        let after_refusal = capture_otlp_material_snapshot(&srv, 0).await;
+
+        let mut query = ValaQueryServiceClient::new(channel);
+        let response = query
+            .get_trace(with_token(
+                Request::new(GetTraceRequest {
+                    window: None,
+                    trace_id: hex16(&[REFUSED_MARKER; 16]),
+                }),
+                &jwt,
+            ))
+            .await
+            .expect("public trace marker query succeeds")
+            .into_inner();
+        let marker_rows = response.trace.map_or(0, |trace| trace.spans.len());
+        assert_eq!(
+            after_refusal.with_public_marker_rows(marker_rows),
+            baseline,
+            "refused trace must not change owners, durable state, or public rows"
+        );
         srv.shutdown().await.expect("shutdown");
     }
 }

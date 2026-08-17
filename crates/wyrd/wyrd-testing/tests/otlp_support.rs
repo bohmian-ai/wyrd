@@ -8,6 +8,107 @@ use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::tonic::{Code, Status};
 use wyrd_tonic::tonic_types::StatusExt;
 
+/// Durable and request-owner state surrounding one rejected OTLP marker.
+///
+/// The public marker count is supplied by the signal-specific query surface;
+/// every other field comes from the production Scribe and tenant-scoped SQL
+/// owners. Comparing snapshots proves a bounded refusal did not reach WAL or
+/// durable publication while still checking the result through the public API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OtlpMaterialSnapshot {
+    /// Request-scoped admission items still owned by Scribe.
+    admission_items: usize,
+    /// Request-scoped admission bytes still owned by Scribe.
+    admission_bytes: usize,
+    /// Requests still queued in the Scribe ingress lanes.
+    queued_items: usize,
+    /// Active Scribe ingest attempts.
+    active_attempts: usize,
+    /// Active root reservations.
+    active_reservations: usize,
+    /// Active materializations.
+    active_materializations: usize,
+    /// Active shard transfers.
+    active_shard_transfers: usize,
+    /// WAL bytes retained on disk.
+    wal_disk_bytes: u64,
+    /// Tenant-scoped committed Scribe batches.
+    batch_commits: i64,
+    /// Tenant-scoped audit outbox rows.
+    audit_rows: i64,
+    /// Tenant-scoped published file-list rows.
+    file_rows: i64,
+    /// Rows matching the refusal's unique marker through the public query API.
+    public_marker_rows: usize,
+}
+
+impl OtlpMaterialSnapshot {
+    /// Attach the signal-specific public query result to this refusal snapshot.
+    ///
+    /// The public query runs after durable counters are sampled because Oracle
+    /// may audit reads independently; keeping that audit out of the mutation
+    /// comparison prevents the proof itself from changing the measured state.
+    #[must_use]
+    pub(crate) fn with_public_marker_rows(mut self, rows: usize) -> Self {
+        self.public_marker_rows = rows;
+        self
+    }
+}
+
+/// Capture the existing OTLP lifecycle and durable owners for one public marker.
+///
+/// The caller obtains `public_marker_rows` from the signal's public query API.
+/// SQL reads use `TenantConn`, so RLS supplies the tenant boundary without
+/// duplicated predicates.
+///
+/// # Panics
+///
+/// Panics when Scribe inspection or a tenant-scoped durable-state query fails.
+pub(crate) async fn capture_otlp_material_snapshot(
+    srv: &WyrdTestServer,
+    public_marker_rows: usize,
+) -> OtlpMaterialSnapshot {
+    let scribe = srv
+        .bifrost_scribe()
+        .expect("bound OTLP fixture owns Scribe");
+    let runtime = scribe.runtime_snapshot();
+    let inspection = scribe
+        .inspection_snapshot()
+        .expect("coherent OTLP owner inspection");
+    let lifecycle = inspection.ingress_lifecycle;
+    let mut conn = srv
+        .tenant_conn_for(srv.data_tenant_id())
+        .await
+        .expect("tenant connection for OTLP material snapshot");
+    let (batch_commits, audit_rows, file_rows): (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT count(*) FROM vala.scribe_batch_commits),
+             (SELECT count(*) FROM vala.audit_outbox),
+             (SELECT count(*) FROM vala.file_list)",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("tenant-scoped OTLP material snapshot query");
+    conn.commit()
+        .await
+        .expect("OTLP material snapshot transaction commits");
+
+    OtlpMaterialSnapshot {
+        admission_items: runtime.admission.items,
+        admission_bytes: runtime.admission.bytes,
+        queued_items: inspection.queued_items,
+        active_attempts: lifecycle.active_attempts,
+        active_reservations: lifecycle.active_reservations,
+        active_materializations: lifecycle.active_materializations,
+        active_shard_transfers: lifecycle.active_shard_transfers,
+        wal_disk_bytes: inspection.wal_disk_bytes,
+        batch_commits,
+        audit_rows,
+        file_rows,
+        public_marker_rows,
+    }
+}
+
 /// Build a small, production-shaped limits snapshot for public OTLP boundaries.
 ///
 /// The snapshot lowers only operator-configurable ceilings. One event day is

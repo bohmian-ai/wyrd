@@ -15,7 +15,7 @@ mod pg_tests {
 
     use crate::otlp_support::{
         assert_grpc_otlp_limit, assert_http_otlp_limit, assert_otlp_owner_settled,
-        export_and_flush, public_otlp_limits,
+        capture_otlp_material_snapshot, export_and_flush, public_otlp_limits,
     };
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
@@ -294,6 +294,39 @@ mod pg_tests {
         srv.shutdown().await.expect("shutdown");
     }
 
+    /// OTLP/HTTP JSON metrics reach the same durable public read path as protobuf.
+    #[tokio::test]
+    async fn metrics_http_json_success_and_readback() {
+        let srv = WyrdTestServer::start_bound().await.expect("bound server");
+        let jwt = bootstrap_writer(&srv, "otlp-metrics-http-json").await;
+        let base_url = srv.base_url().expect("http base url").to_owned();
+        let metric_name = "http.server.requests.http_json";
+
+        let response = export_and_flush(
+            &srv,
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/metrics"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .json(&export_request(metric_name))
+                .send(),
+        )
+        .await;
+        assert_eq!(response.status(), 200, "JSON export must be accepted");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next()),
+            Some("application/json"),
+            "JSON request must get a JSON response"
+        );
+
+        let grpc = srv.grpc_url().expect("gRPC URL");
+        read_back_metric(connect(&grpc).await, &jwt, metric_name).await;
+        srv.shutdown().await.expect("shutdown");
+    }
+
     /// Public metrics transports accept exact caps, reject cap plus one, and settle owners.
     #[tokio::test]
     async fn metrics_http_and_grpc_enforce_bounded_decode_projection() {
@@ -376,6 +409,72 @@ mod pg_tests {
             assert_otlp_owner_settled(&srv);
         }
 
+        srv.shutdown().await.expect("shutdown");
+    }
+
+    /// A representative metrics cap refusal leaves no WAL or durable mutation.
+    #[tokio::test]
+    async fn metrics_refusal_preserves_material_and_durable_baseline() {
+        let srv = WyrdTestServer::builder()
+            .with_scribe_ingest_limits_for_test(public_otlp_limits(1, 2))
+            .start_bound()
+            .await
+            .expect("bounded metrics server");
+        let jwt = bootstrap_writer(&srv, "metrics-refusal-baseline").await;
+        let grpc = srv.grpc_url().expect("gRPC URL");
+        let channel = connect(&grpc).await;
+        let mut metrics = MetricsServiceClient::new(channel.clone());
+
+        export_and_flush(
+            &srv,
+            metrics.export(with_token(
+                Request::new(bounded_export_request(1, 2, "baseline")),
+                &jwt,
+            )),
+        )
+        .await;
+        assert_otlp_owner_settled(&srv);
+        let baseline = capture_otlp_material_snapshot(&srv, 0).await;
+
+        let marker = "cap-plus-one";
+        let error = metrics
+            .export(with_token(
+                Request::new(bounded_export_request(2, 1, marker)),
+                &jwt,
+            ))
+            .await
+            .expect_err("metrics cap plus one must fail");
+        assert_grpc_otlp_limit(&error);
+        srv.flush_bifrost()
+            .await
+            .expect("refused metrics flush barrier");
+        assert_otlp_owner_settled(&srv);
+        let after_refusal = capture_otlp_material_snapshot(&srv, 0).await;
+
+        let mut query = ValaQueryServiceClient::new(channel);
+        let rows = query
+            .query_metrics(with_token(
+                Request::new(QueryMetricsRequest {
+                    window: Some(QueryWindow {
+                        since: String::new(),
+                        until: String::new(),
+                        limit: 100,
+                        page_token: String::new(),
+                    }),
+                    metric_name: format!("bounded.metric.{marker}"),
+                    metric_type: "sum".to_owned(),
+                }),
+                &jwt,
+            ))
+            .await
+            .expect("public metrics marker query succeeds")
+            .into_inner()
+            .rows;
+        assert_eq!(
+            after_refusal.with_public_marker_rows(rows.len()),
+            baseline,
+            "refused metric must not change owners, durable state, or public rows"
+        );
         srv.shutdown().await.expect("shutdown");
     }
 }

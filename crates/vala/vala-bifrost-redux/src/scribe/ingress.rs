@@ -114,6 +114,39 @@ fn validate_logical_transport_frame(frame: &ScribeIngressFrame) -> Result<(), Sc
     Ok(())
 }
 
+/// Takes the adapter-decode owner required by an OTLP transport payload.
+///
+/// Native IPC and engine-only projected rows do not have an adapter typed-
+/// decode allocation, so they deliberately return no owner and acquire their
+/// one root through the normal Scribe admission branch.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when any typed OTLP payload arrives
+/// without the move-only owner created before adapter construction.
+fn take_transport_decode_owner(
+    payload: &mut IngressPayload,
+) -> Result<Option<crate::contracts::OtlpDecodeOwner>, ScribeError> {
+    match payload {
+        IngressPayload::OtlpTraces(decoded) => decoded
+            .owner
+            .take()
+            .map(Some)
+            .ok_or(ScribeError::InvalidFrame),
+        IngressPayload::OtlpMetrics(decoded) => decoded
+            .owner
+            .take()
+            .map(Some)
+            .ok_or(ScribeError::InvalidFrame),
+        IngressPayload::OtlpLogs(decoded) => decoded
+            .owner
+            .take()
+            .map(Some)
+            .ok_or(ScribeError::InvalidFrame),
+        IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_) => Ok(None),
+    }
+}
+
 /// Move-only context required to form one admitted row source.
 struct AdmittedRowContext {
     /// Authenticated principal moved into the retained source.
@@ -388,17 +421,14 @@ impl ScribeImpl {
     async fn admit_transport_frame(
         &self,
         frame: &mut ScribeIngressFrame,
+        lifecycle: &mut crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     ) -> Result<RootAdmission, ScribeError> {
         validate_logical_transport_frame(frame)?;
+        let decode_owner = take_transport_decode_owner(&mut frame.payload)?;
         let expected_schema_fingerprint = self.resolve_logical_frame(frame).await?;
         let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
         let material_plan = self.plan_transport_payload(frame, receipt_micros)?;
-        let decode_owner = match &mut frame.payload {
-            IngressPayload::OtlpTraces(decoded) => decoded.owner.take(),
-            IngressPayload::OtlpMetrics(decoded) => decoded.owner.take(),
-            IngressPayload::OtlpLogs(decoded) => decoded.owner.take(),
-            IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_) => None,
-        };
+        lifecycle.planned(&material_plan);
         let mut memory = match decode_owner {
             Some(owner) => owner.complete(material_plan.root_bytes)?,
             None => match self
@@ -413,6 +443,7 @@ impl ScribeImpl {
                 )?,
             },
         };
+        lifecycle.reserved(material_plan.root_bytes);
         let binding = Self::construct_physical_binding(frame)?;
         let table = binding.table_ref.fqn();
         let shard = shard_for(
@@ -458,6 +489,7 @@ impl ScribeImpl {
         mut frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
+        let mut lifecycle = self.ingress_lifecycle.begin();
         let RootAdmission {
             expected_schema_fingerprint,
             receipt_micros,
@@ -465,10 +497,16 @@ impl ScribeImpl {
             mut memory,
             binding,
             reservation,
-        } = self.admit_transport_frame(&mut frame).await?;
+        } = match self.admit_transport_frame(&mut frame, &mut lifecycle).await {
+            Ok(admission) => admission,
+            Err(error) => {
+                lifecycle.refuse();
+                return Err(error);
+            }
+        };
         let otlp_outcome = Arc::new(OnceLock::new());
         let tenant = frame.principal.tenant_id;
-        let rows = self
+        let rows = match self
             .prepare_admitted_rows(
                 frame.payload,
                 AdmittedRowContext {
@@ -486,9 +524,22 @@ impl ScribeImpl {
                     native_source_count: material_plan.source_count,
                 },
             )
-            .await?;
-        memory.transfer_category(MemoryCategory::Decode)?;
-        memory.transfer_category(MemoryCategory::Prepared)?;
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                lifecycle.refuse();
+                return Err(error);
+            }
+        };
+        if let Err(error) = memory.transfer_category(MemoryCategory::Decode) {
+            lifecycle.refuse();
+            return Err(error);
+        }
+        if let Err(error) = memory.transfer_category(MemoryCategory::Prepared) {
+            lifecycle.refuse();
+            return Err(error);
+        }
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
         let admitted = AdmittedAppend {
@@ -504,6 +555,7 @@ impl ScribeImpl {
             table: binding.table_ref,
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
+            lifecycle,
         };
         let planned_rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
         let prepared = match self
@@ -659,9 +711,9 @@ fn record_accepted_frame(rows_accepted: u64, elapsed: std::time::Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScribeImpl, validate_decoded_request_size};
+    use super::{ScribeImpl, take_transport_decode_owner, validate_decoded_request_size};
     use crate::catalog::TableRef;
-    use crate::contracts::{ScribeAppend, ScribeError};
+    use crate::contracts::{DecodedOtlp, IngressPayload, ScribeAppend, ScribeError};
     use crate::namespaces::BifrostNamespace;
     use crate::schema::SchemaFingerprint;
     use crate::scribe::memory::MemoryCategory;
@@ -674,6 +726,53 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
+    use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+    use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
+    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+
+    /// Every typed OTLP payload fails closed without its adapter decode owner.
+    #[test]
+    fn otlp_transport_requires_one_decode_owner() {
+        let mut payloads = [
+            IngressPayload::OtlpTraces(DecodedOtlp {
+                request: Box::new(ExportTraceServiceRequest::default()),
+                wire_bytes: 0,
+                decode_bytes: 0,
+                owner: None,
+            }),
+            IngressPayload::OtlpMetrics(DecodedOtlp {
+                request: Box::new(ExportMetricsServiceRequest::default()),
+                wire_bytes: 0,
+                decode_bytes: 0,
+                owner: None,
+            }),
+            IngressPayload::OtlpLogs(DecodedOtlp {
+                request: Box::new(ExportLogsServiceRequest::default()),
+                wire_bytes: 0,
+                decode_bytes: 0,
+                owner: None,
+            }),
+        ];
+        for payload in &mut payloads {
+            assert!(matches!(
+                take_transport_decode_owner(payload),
+                Err(ScribeError::InvalidFrame)
+            ));
+        }
+
+        let mut native = IngressPayload::ArrowIpc(bytes::Bytes::new());
+        assert!(
+            take_transport_decode_owner(&mut native)
+                .expect("native owner branch")
+                .is_none()
+        );
+        let mut projected = IngressPayload::ProjectedArrow(Vec::new());
+        assert!(
+            take_transport_decode_owner(&mut projected)
+                .expect("projected owner branch")
+                .is_none()
+        );
+    }
 
     /// The admission memory path rejects with `IngestBusy` **only** when the
     /// coordinated pressure seal cannot free ingress capacity (the D83

@@ -15,15 +15,9 @@ use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::PermissionCheck;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_tonic::otlp::logs_service::logs_service_server::LogsService;
-use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
-use wyrd_tonic::otlp::metrics_service::metrics_service_server::MetricsService;
-use wyrd_tonic::otlp::metrics_service::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
-};
-use wyrd_tonic::otlp::trace_service::trace_service_server::TraceService;
-use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
-use wyrd_tonic::prost::Message;
+use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
+use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use wyrd_tonic::tonic::metadata::MetadataMap;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
@@ -521,12 +515,16 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         oracle.query_plan(context, plan, options).await
     }
 
-    /// Routes one bounded OTLP trace export to Scribe without projecting it.
+    /// Routes one adapter-decoded trace export and its move-only owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns authorization, request-limit, Scribe, or outcome-shape errors.
     #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
-    pub async fn ingest_resource_spans(
+    pub async fn ingest_decoded_resource_spans(
         &self,
         auth: &AuthContext,
-        request: ExportTraceServiceRequest,
+        decoded: DecodedOtlp<ExportTraceServiceRequest>,
     ) -> Result<IngestOutcome, IngestError> {
         self.ensure_open()?;
         record_gate_event("otlp_export");
@@ -534,41 +532,6 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        let measured_wire_bytes = request.encoded_len();
-        let outcome = self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Traces, "spans"),
-                measured_wire_bytes,
-                IngressPayload::OtlpTraces(DecodedOtlp {
-                    request: Box::new(request),
-                    wire_bytes: measured_wire_bytes,
-                    decode_bytes: measured_wire_bytes,
-                    owner: None,
-                }),
-            )
-            .await?;
-        let ScribeOtlpOutcome::Traces(outcome) = outcome else {
-            return Err(IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            ));
-        };
-        record_gate_rows(outcome.accepted_spans, outcome.rejected_spans);
-        Ok(outcome)
-    }
-
-    /// Routes one adapter-decoded trace export and its move-only owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns authorization, request-limit, Scribe, or outcome-shape errors.
-    pub async fn ingest_decoded_resource_spans(
-        &self,
-        auth: &AuthContext,
-        decoded: DecodedOtlp<ExportTraceServiceRequest>,
-    ) -> Result<IngestOutcome, IngestError> {
-        self.ensure_open()?;
-        authorize_record_write(auth)?;
         let wire_bytes = decoded.wire_bytes;
         let outcome = self
             .dispatch_otlp(
@@ -579,47 +542,14 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             )
             .await?;
         match outcome {
-            ScribeOtlpOutcome::Traces(outcome) => Ok(outcome),
+            ScribeOtlpOutcome::Traces(outcome) => {
+                record_gate_rows(outcome.accepted_spans, outcome.rejected_spans);
+                Ok(outcome)
+            }
             _ => Err(IngestError::Internal(
                 "Scribe returned the wrong OTLP outcome".to_owned(),
             )),
         }
-    }
-
-    /// Routes one bounded OTLP metrics export to Scribe without projecting it.
-    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
-    pub async fn ingest_resource_metrics(
-        &self,
-        auth: &AuthContext,
-        request: ExportMetricsServiceRequest,
-    ) -> Result<MetricsOutcome, IngestError> {
-        self.ensure_open()?;
-        record_gate_event("otlp_export");
-        if let Err(error) = authorize_record_write(auth) {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
-        let measured_wire_bytes = request.encoded_len();
-        let outcome = self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Metrics, "points"),
-                measured_wire_bytes,
-                IngressPayload::OtlpMetrics(DecodedOtlp {
-                    request: Box::new(request),
-                    wire_bytes: measured_wire_bytes,
-                    decode_bytes: measured_wire_bytes,
-                    owner: None,
-                }),
-            )
-            .await?;
-        let ScribeOtlpOutcome::Metrics(outcome) = outcome else {
-            return Err(IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            ));
-        };
-        record_gate_rows(outcome.accepted_points, outcome.rejected_points);
-        Ok(outcome)
     }
 
     /// Routes one adapter-decoded metrics export and its move-only owner.
@@ -627,13 +557,18 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// # Errors
     ///
     /// Returns authorization, request-limit, Scribe, or outcome-shape errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
     pub async fn ingest_decoded_resource_metrics(
         &self,
         auth: &AuthContext,
         decoded: DecodedOtlp<ExportMetricsServiceRequest>,
     ) -> Result<MetricsOutcome, IngestError> {
         self.ensure_open()?;
-        authorize_record_write(auth)?;
+        record_gate_event("otlp_export");
+        if let Err(error) = authorize_record_write(auth) {
+            record_gate_event("otlp_rejection");
+            return Err(error);
+        }
         let wire_bytes = decoded.wire_bytes;
         let outcome = self
             .dispatch_otlp(
@@ -644,47 +579,14 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             )
             .await?;
         match outcome {
-            ScribeOtlpOutcome::Metrics(outcome) => Ok(outcome),
+            ScribeOtlpOutcome::Metrics(outcome) => {
+                record_gate_rows(outcome.accepted_points, outcome.rejected_points);
+                Ok(outcome)
+            }
             _ => Err(IngestError::Internal(
                 "Scribe returned the wrong OTLP outcome".to_owned(),
             )),
         }
-    }
-
-    /// Routes one bounded OTLP logs export to Scribe without projecting it.
-    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
-    pub async fn ingest_resource_logs(
-        &self,
-        auth: &AuthContext,
-        request: ExportLogsServiceRequest,
-    ) -> Result<LogsOutcome, IngestError> {
-        self.ensure_open()?;
-        record_gate_event("otlp_export");
-        if let Err(error) = authorize_record_write(auth) {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
-        let measured_wire_bytes = request.encoded_len();
-        let outcome = self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Logs, "records"),
-                measured_wire_bytes,
-                IngressPayload::OtlpLogs(DecodedOtlp {
-                    request: Box::new(request),
-                    wire_bytes: measured_wire_bytes,
-                    decode_bytes: measured_wire_bytes,
-                    owner: None,
-                }),
-            )
-            .await?;
-        let ScribeOtlpOutcome::Logs(outcome) = outcome else {
-            return Err(IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            ));
-        };
-        record_gate_rows(outcome.accepted_records, outcome.rejected_records);
-        Ok(outcome)
     }
 
     /// Routes one adapter-decoded log export and its move-only owner.
@@ -692,13 +594,18 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// # Errors
     ///
     /// Returns authorization, request-limit, Scribe, or outcome-shape errors.
+    #[tracing::instrument(skip_all, fields(tenant = %auth.tenant, request_id = %auth.request_id))]
     pub async fn ingest_decoded_resource_logs(
         &self,
         auth: &AuthContext,
         decoded: DecodedOtlp<ExportLogsServiceRequest>,
     ) -> Result<LogsOutcome, IngestError> {
         self.ensure_open()?;
-        authorize_record_write(auth)?;
+        record_gate_event("otlp_export");
+        if let Err(error) = authorize_record_write(auth) {
+            record_gate_event("otlp_rejection");
+            return Err(error);
+        }
         let wire_bytes = decoded.wire_bytes;
         let outcome = self
             .dispatch_otlp(
@@ -709,7 +616,10 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             )
             .await?;
         match outcome {
-            ScribeOtlpOutcome::Logs(outcome) => Ok(outcome),
+            ScribeOtlpOutcome::Logs(outcome) => {
+                record_gate_rows(outcome.accepted_records, outcome.rejected_records);
+                Ok(outcome)
+            }
             _ => Err(IngestError::Internal(
                 "Scribe returned the wrong OTLP outcome".to_owned(),
             )),
@@ -876,10 +786,6 @@ fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError> {
         .ok_or_else(|| IngestError::RequestValidation(format!("unrecognized table fqn: {fqn}")))
 }
 
-fn map_otlp_error(error: IngestError) -> Status {
-    error.into_status()
-}
-
 #[wyrd_tonic::tonic::async_trait]
 impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
     BifrostIngestService for Gate<C, R, I>
@@ -1008,72 +914,6 @@ fn validate_batch(frame: &InsertBatchRequest, limits: &IngestLimits) -> Result<(
     Ok(())
 }
 
-#[wyrd_tonic::tonic::async_trait]
-impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-    TraceService for Gate<C, R, I>
-{
-    async fn export(
-        &self,
-        request: Request<ExportTraceServiceRequest>,
-    ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        let auth = self
-            .authenticate(request.metadata())
-            .await
-            .map_err(Status::from)?;
-        let outcome = self
-            .ingest_resource_spans(&auth, request.into_inner())
-            .await
-            .map_err(map_otlp_error)?;
-        Ok(Response::new(ExportTraceServiceResponse {
-            partial_success: outcome.partial_success(),
-        }))
-    }
-}
-
-#[wyrd_tonic::tonic::async_trait]
-impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-    MetricsService for Gate<C, R, I>
-{
-    async fn export(
-        &self,
-        request: Request<ExportMetricsServiceRequest>,
-    ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        let auth = self
-            .authenticate(request.metadata())
-            .await
-            .map_err(Status::from)?;
-        let outcome = self
-            .ingest_resource_metrics(&auth, request.into_inner())
-            .await
-            .map_err(map_otlp_error)?;
-        Ok(Response::new(ExportMetricsServiceResponse {
-            partial_success: outcome.partial_success(),
-        }))
-    }
-}
-
-#[wyrd_tonic::tonic::async_trait]
-impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-    LogsService for Gate<C, R, I>
-{
-    async fn export(
-        &self,
-        request: Request<ExportLogsServiceRequest>,
-    ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        let auth = self
-            .authenticate(request.metadata())
-            .await
-            .map_err(Status::from)?;
-        let outcome = self
-            .ingest_resource_logs(&auth, request.into_inner())
-            .await
-            .map_err(map_otlp_error)?;
-        Ok(Response::new(ExportLogsServiceResponse {
-            partial_success: outcome.partial_success(),
-        }))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1083,7 +923,7 @@ mod tests {
     use super::error::CatalogError;
     use super::limits::IngestLimits;
     use super::{AuthContext, Catalog, Gate, IngestError};
-    use crate::contracts::{IngressPayload, ScribeOtlpOutcome};
+    use crate::contracts::{DecodedOtlp, IngressPayload, ScribeOtlpOutcome};
     use crate::namespaces::BifrostNamespace;
     use crate::schema::fingerprint::SchemaFingerprint;
     use async_trait::async_trait;
@@ -1394,7 +1234,10 @@ mod tests {
             assert_eq!(frame.authenticated_tenant, frame.principal.tenant_id);
             assert_eq!(frame.table.fqn(), "vala.traces.spans");
             assert!(frame.expected_schema_fingerprint.is_none());
-            assert!(matches!(frame.payload, IngressPayload::OtlpTraces(_)));
+            assert!(matches!(
+                frame.payload,
+                IngressPayload::OtlpTraces(crate::contracts::DecodedOtlp { owner: Some(_), .. })
+            ));
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
@@ -1440,6 +1283,11 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
         }
+    }
+
+    /// Couples one trace fixture to a real root-backed decode owner.
+    fn decoded_trace(request: ExportTraceServiceRequest) -> DecodedOtlp<ExportTraceServiceRequest> {
+        DecodedOtlp::new(request, 0, crate::scribe::otlp_decode_owner_for_test(1))
     }
 
     fn test_interceptor()
@@ -1504,7 +1352,10 @@ mod tests {
         );
 
         let error = gate
-            .ingest_resource_spans(&auth_context(false), ExportTraceServiceRequest::default())
+            .ingest_decoded_resource_spans(
+                &auth_context(false),
+                decoded_trace(ExportTraceServiceRequest::default()),
+            )
             .await
             .expect_err("permission must be denied");
         assert!(matches!(error, IngestError::RbacDenied { .. }));
@@ -1536,7 +1387,10 @@ mod tests {
         );
 
         let outcome = gate
-            .ingest_resource_spans(&auth_context(true), ExportTraceServiceRequest::default())
+            .ingest_decoded_resource_spans(
+                &auth_context(true),
+                decoded_trace(ExportTraceServiceRequest::default()),
+            )
             .await
             .expect("Gate must route without consulting its catalog adapter");
         assert_eq!(outcome.accepted_spans, 0);
@@ -1557,7 +1411,10 @@ mod tests {
         gate.close();
 
         let error = gate
-            .ingest_resource_spans(&auth_context(true), ExportTraceServiceRequest::default())
+            .ingest_decoded_resource_spans(
+                &auth_context(true),
+                decoded_trace(ExportTraceServiceRequest::default()),
+            )
             .await
             .expect_err("closed Gate must reject new work");
         assert!(matches!(error, IngestError::IngressClosed));
@@ -1574,7 +1431,10 @@ mod tests {
         );
 
         let error = gate
-            .ingest_resource_spans(&auth_context(true), ExportTraceServiceRequest::default())
+            .ingest_decoded_resource_spans(
+                &auth_context(true),
+                decoded_trace(ExportTraceServiceRequest::default()),
+            )
             .await
             .expect_err("Gate must fail closed while Scribe recovery is incomplete");
         assert!(matches!(error, IngestError::IngressClosed));

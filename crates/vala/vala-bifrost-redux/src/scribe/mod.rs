@@ -63,7 +63,8 @@ pub use crate::scribe::tail_rpc::{
     TonicTailReadTransport,
 };
 use crate::scribe::telemetry::{
-    ScribeBucketMemorySnapshot, ScribeInspectionSnapshot, ScribeRuntimeSnapshot,
+    ScribeBucketMemorySnapshot, ScribeIngressLifecycle, ScribeInspectionSnapshot,
+    ScribeRuntimeSnapshot,
 };
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
@@ -237,6 +238,8 @@ pub struct ScribeImpl {
     ingress_cpu: ScribeIngressCpuPool,
     /// Fixed sixteen-lane shard owners for the live ingest path.
     shards: Arc<shards::ScribeShardRuntime>,
+    /// Fixed-size lifecycle ledger shared by move-only ingress root owners.
+    ingress_lifecycle: Arc<ScribeIngressLifecycle>,
     /// Lifecycle gate closed before shard draining begins.
     closed: AtomicBool,
     /// Coordinates the recoverable running/draining/finalizing/stopped lifecycle.
@@ -601,6 +604,22 @@ fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::Scri
         .expect("embedded Scribe role must be enabled")
 }
 
+/// Acquires one real root-backed decode owner for crate-local routing tests.
+///
+/// # Panics
+///
+/// Panics when the embedded test resource floor cannot admit `bytes`, which
+/// indicates the fixture requested more capacity than its production-shaped
+/// Scribe root can own.
+#[cfg(test)]
+pub(crate) fn otlp_decode_owner_for_test(bytes: usize) -> crate::contracts::OtlpDecodeOwner {
+    let resources = embedded_scribe_resources(&AdmissionConfig::default());
+    let memory = resources
+        .try_reserve_ingress(memory::MemoryCategory::Decode, bytes)
+        .expect("test OTLP decode owner must fit the embedded Scribe root");
+    crate::contracts::OtlpDecodeOwner { memory }
+}
+
 impl ScribeImpl {
     /// Admits one native IPC fixture through the crate-private logical seam.
     ///
@@ -940,6 +959,21 @@ impl ScribeImpl {
         Self::build(config)
     }
 
+    /// Replaces the immutable ingest-limit snapshot for one test-support Scribe.
+    ///
+    /// Public journey fixtures use this builder before wrapping Scribe in an
+    /// `Arc`, ensuring the server adapter, Gate, and Scribe observe one exact
+    /// lowerable limits snapshot without changing production defaults.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_ingest_limits_for_test(
+        mut self,
+        ingest_limits: crate::gate::limits::IngestLimits,
+    ) -> Self {
+        self.ingest_limits = ingest_limits;
+        self
+    }
+
     /// Builds the complete Scribe ownership graph from server-provisioned dependencies.
     ///
     /// This is the single internal construction path used by production and
@@ -1032,6 +1066,7 @@ impl ScribeImpl {
             wal_io,
             ingress_cpu,
             shards,
+            ingress_lifecycle: Arc::new(ScribeIngressLifecycle::default()),
             closed: AtomicBool::new(false),
             shutdown_state: std::sync::atomic::AtomicU8::new(SHUTDOWN_RUNNING),
             shutdown_notify: tokio::sync::Notify::new(),
@@ -2155,6 +2190,7 @@ impl ScribeImpl {
             ingress_high_water_memory: memory.ingress_high_water_bytes,
             ingress_low_water_memory: memory.ingress_low_water_bytes,
             wal_disk_bytes: self.wal.bytes_on_disk(),
+            ingress_lifecycle: self.ingress_lifecycle.snapshot(),
         })
     }
 

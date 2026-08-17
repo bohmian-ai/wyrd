@@ -999,6 +999,8 @@ pub(crate) enum ScribePersistenceCpuOp {
         producer: Box<NativeSliceProducer>,
         /// Root-backed owner that must outlive every allocation in the job.
         memory: crate::resources::ScribeMemoryLease,
+        /// Lifecycle owner moved with the root through detached execution.
+        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     },
     /// Advance the root-owned one-shot OTLP producer.
     ProduceOtlpSlice {
@@ -1006,6 +1008,8 @@ pub(crate) enum ScribePersistenceCpuOp {
         producer: Box<OtlpSliceProducer>,
         /// Root-backed owner that must outlive every allocation in the job.
         memory: crate::resources::ScribeMemoryLease,
+        /// Lifecycle owner moved with the root through detached execution.
+        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     },
     EncodeParquet(Box<EncodeParquetOp>),
     RestoreReplay {
@@ -1016,6 +1020,8 @@ pub(crate) enum ScribePersistenceCpuOp {
     HoldMemory {
         /// Root-backed bytes that must remain charged through job completion.
         memory: crate::resources::ScribeMemoryLease,
+        /// Lifecycle owner that must remain active through job completion.
+        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
         /// Deterministic signal emitted after the detached job owns the lease.
         started: std::sync::mpsc::SyncSender<()>,
         /// Deterministic release gate controlled by the cancellation test.
@@ -1052,6 +1058,8 @@ pub(crate) enum ScribePersistenceCpuResult {
         slice: Option<PreparedSlice>,
         /// Root-backed owner returned only after the detached job completes.
         memory: crate::resources::ScribeMemoryLease,
+        /// Lifecycle owner returned only after detached execution completes.
+        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     },
     /// OTLP producer state returned with its optional current slice.
     OtlpSliceProduced {
@@ -1061,6 +1069,8 @@ pub(crate) enum ScribePersistenceCpuResult {
         slice: Option<PreparedSlice>,
         /// Root-backed owner returned only after the detached job completes.
         memory: crate::resources::ScribeMemoryLease,
+        /// Lifecycle owner returned only after detached execution completes.
+        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     },
     ParquetEncoded(ParquetEncoded),
     ReplayRestored(Box<FrozenMemtable>),
@@ -1090,23 +1100,43 @@ fn execute_persistence_operation(
         ScribePersistenceCpuOp::ProduceNativeSlice {
             mut producer,
             memory,
+            mut lifecycle,
         } => {
-            let slice = producer.next_slice()?;
+            let slice = producer.next_slice().inspect_err(|_| lifecycle.refuse())?;
+            if let Some(materialized) = &slice {
+                lifecycle.materialized(
+                    materialized
+                        .memtable_bytes
+                        .saturating_add(materialized.wal_append.audit.len())
+                        .saturating_add(materialized.wal_append.data.len()),
+                );
+            }
             Ok(ScribePersistenceCpuResult::NativeSliceProduced {
                 producer,
                 slice,
                 memory,
+                lifecycle,
             })
         }
         ScribePersistenceCpuOp::ProduceOtlpSlice {
             mut producer,
             memory,
+            mut lifecycle,
         } => {
-            let slice = producer.next_slice()?;
+            let slice = producer.next_slice().inspect_err(|_| lifecycle.refuse())?;
+            if let Some(materialized) = &slice {
+                lifecycle.materialized(
+                    materialized
+                        .memtable_bytes
+                        .saturating_add(materialized.wal_append.audit.len())
+                        .saturating_add(materialized.wal_append.data.len()),
+                );
+            }
             Ok(ScribePersistenceCpuResult::OtlpSliceProduced {
                 producer,
                 slice,
                 memory,
+                lifecycle,
             })
         }
         ScribePersistenceCpuOp::EncodeParquet(operation) => {
@@ -1135,9 +1165,11 @@ fn execute_persistence_operation(
         #[cfg(test)]
         ScribePersistenceCpuOp::HoldMemory {
             memory,
+            mut lifecycle,
             started,
             release,
         } => {
+            lifecycle.materialized(1024);
             started.send(()).map_err(|error| ScribeError::Internal {
                 detail: format!("stalled ownership test could not signal start: {error}"),
             })?;
@@ -1145,6 +1177,7 @@ fn execute_persistence_operation(
                 detail: format!("stalled ownership test release failed: {error}"),
             })?;
             drop(memory);
+            drop(lifecycle);
             Err(ScribeError::Internal {
                 detail: "stalled ownership test completed".to_owned(),
             })
@@ -1351,6 +1384,19 @@ impl ScribePersistenceCpuPool {
 /// Closed set of filesystem work permitted on the WAL IO lane.
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoOp {
+    /// Writes one current ingress slice while retaining its complete root owner.
+    WriteIngressSlice {
+        /// Fixed shard WAL handle receiving the prepared slice.
+        wal: WalHandle,
+        /// Move-only current IPC payload and framing facts.
+        append: PreparedWalAppend,
+        /// Root lease retained until the detached WAL write returns.
+        memory: crate::resources::ScribeMemoryLease,
+        /// Lifecycle owner retained beside the root lease.
+        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
+        /// Exact current-material bytes transferred by a successful WAL append.
+        materialized_bytes: usize,
+    },
     WritePrepared {
         wal: WalHandle,
         append: PreparedWalAppend,
@@ -1386,6 +1432,15 @@ pub(crate) enum ScribeWalIoOp {
 /// Results produced by [`ScribeWalIoPool`].
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoResult {
+    /// One ingress slice was accepted by its WAL owner.
+    IngressSliceWritten {
+        /// Durable WAL append identity.
+        result: WalAppendResult,
+        /// Root lease returned after detached WAL work completed.
+        memory: crate::resources::ScribeMemoryLease,
+        /// Lifecycle owner returned beside the root lease.
+        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
+    },
     WalWritten {
         result: WalAppendResult,
     },
@@ -1608,6 +1663,23 @@ fn execute_wal_io(
     delay: std::time::Duration,
 ) -> Result<ScribeWalIoResult, ScribeError> {
     match operation {
+        ScribeWalIoOp::WriteIngressSlice {
+            wal,
+            append,
+            memory,
+            mut lifecycle,
+            materialized_bytes,
+        } => {
+            let result = wal
+                .append_prepared(append)
+                .inspect_err(|_| lifecycle.refuse())?;
+            lifecycle.transferred_to_wal(materialized_bytes);
+            Ok(ScribeWalIoResult::IngressSliceWritten {
+                result,
+                memory,
+                lifecycle,
+            })
+        }
         ScribeWalIoOp::WritePrepared { wal, append } => {
             let result = wal.append_prepared(append)?;
             Ok(ScribeWalIoResult::WalWritten { result })
@@ -1898,6 +1970,9 @@ mod tests {
         let memory = scribe
             .try_reserve_ingress(ScribeMemoryCategory::Raw, 4096)
             .expect("root-backed test lease");
+        let lifecycle = Arc::new(crate::scribe::telemetry::ScribeIngressLifecycle::default());
+        let mut lifecycle_owner = lifecycle.begin();
+        lifecycle_owner.reserved(4096);
         let pool = ScribePersistenceCpuPool::new(1);
         let submitted = pool.clone();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -1906,6 +1981,7 @@ mod tests {
             submitted
                 .submit(ScribePersistenceCpuOp::HoldMemory {
                     memory,
+                    lifecycle: lifecycle_owner,
                     started: started_tx,
                     release: release_rx,
                 })
@@ -1923,6 +1999,15 @@ mod tests {
                 .scribe_memory_used_bytes,
             4096
         );
+        let active = lifecycle.snapshot();
+        assert_eq!(active.active_attempts, 1);
+        assert_eq!(active.active_reservations, 1);
+        assert_eq!(active.active_reserved_bytes, 4096);
+        assert_eq!(active.materializations, 1);
+        assert_eq!(active.materialized_bytes, 1024);
+        assert_eq!(active.active_materializations, 1);
+        assert_eq!(active.active_materialized_bytes, 1024);
+        assert_eq!(active.releases, 0);
         release_tx.send(()).expect("release detached job");
         pool.drain().await;
         assert_eq!(
@@ -1932,6 +2017,15 @@ mod tests {
                 .scribe_memory_used_bytes,
             0
         );
+        let settled = lifecycle.snapshot();
+        assert_eq!(settled.active_attempts, 0);
+        assert_eq!(settled.active_reservations, 0);
+        assert_eq!(settled.active_reserved_bytes, 0);
+        assert_eq!(settled.active_materializations, 0);
+        assert_eq!(settled.active_materialized_bytes, 0);
+        assert_eq!(settled.releases, 1);
+        assert_eq!(settled.released_bytes, 4096);
+        assert_eq!(settled.cancelled, 1);
     }
 
     #[test]

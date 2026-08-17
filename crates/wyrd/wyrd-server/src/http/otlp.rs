@@ -30,8 +30,8 @@
 //!
 //! `/v1/metrics` and `/v1/logs` share the same three-step shape as `/v1/traces`:
 //! Content-Type decode, the shared decode→write core
-//! (`vala_bifrost_redux::gate::Gate::ingest_resource_metrics` /
-//! `Gate::ingest_resource_logs`),
+//! (`vala_bifrost_redux::gate::Gate::ingest_decoded_resource_metrics` /
+//! `Gate::ingest_decoded_resource_logs`),
 //! then a response encoded in the request's encoding with `partial_success` for
 //! per-item rejections.
 

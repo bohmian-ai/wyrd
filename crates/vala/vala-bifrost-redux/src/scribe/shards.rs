@@ -664,6 +664,9 @@ impl ScribeShardRuntime {
     /// [`ScribeError::IngestBusy`] when the target shard mailbox is full.
     pub(crate) fn try_send(&self, mut append: PreparedAppend) -> Result<(), ScribeError> {
         if self.closed.load(Ordering::Acquire) {
+            if let Some(lifecycle) = append.lifecycle.as_mut() {
+                lifecycle.settle_shutdown();
+            }
             return Err(ScribeError::IngressClosed);
         }
         let shard = shard_for(append.tenant, &append.table, append.batch_id);
@@ -671,14 +674,32 @@ impl ScribeShardRuntime {
         if let Some(memory) = append.memory.as_mut() {
             memory.transfer_category(MemoryCategory::Queued)?;
         }
+        append
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared append lost its lifecycle owner".to_owned(),
+            })?
+            .shard_transferred();
         self.pending.fetch_add(1, Ordering::AcqRel);
         let result = self.senders[shard].try_send(ShardCommand::Append(Box::new(append)));
         if let Err(error) = result {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             self.drained.notify_waiters();
             return Err(match error {
-                mpsc::error::TrySendError::Full(ShardCommand::Append(_)) => {
+                mpsc::error::TrySendError::Full(ShardCommand::Append(mut append)) => {
+                    if let Some(lifecycle) = append.lifecycle.as_mut() {
+                        lifecycle.revert_shard_transfer();
+                        lifecycle.refuse();
+                    }
                     ScribeError::IngestBusy { table: table_name }
+                }
+                mpsc::error::TrySendError::Closed(ShardCommand::Append(mut append)) => {
+                    if let Some(lifecycle) = append.lifecycle.as_mut() {
+                        lifecycle.revert_shard_transfer();
+                        lifecycle.settle_shutdown();
+                    }
+                    ScribeError::IngressClosed
                 }
                 mpsc::error::TrySendError::Closed(_) | mpsc::error::TrySendError::Full(_) => {
                     ScribeError::IngressClosed
@@ -2137,7 +2158,10 @@ impl ShardOwner {
         if let Err(error) = self.rotate_group(touched_keys) {
             tracing::warn!(error = %error, "durable append completed but bucket rotation was deferred");
         }
-        for append in state.prepared {
+        for mut append in state.prepared {
+            if let Some(lifecycle) = append.lifecycle.as_mut() {
+                lifecycle.succeed();
+            }
             if let Some(sender) = append.durable_ack {
                 let rows = state
                     .rows_by_append
@@ -2361,6 +2385,19 @@ impl ShardOwner {
                     Ok(Some(rows)) => {
                         let entry = rows_by_append.entry(batch_id).or_default();
                         *entry = entry.saturating_add(rows);
+                        let materialized_bytes = slice
+                            .memtable_bytes
+                            .saturating_add(slice.wal_append.audit.len())
+                            .saturating_add(slice.wal_append.data.len());
+                        append
+                            .lifecycle
+                            .as_mut()
+                            .ok_or_else(|| ScribeError::Internal {
+                                detail:
+                                    "prepared append lost lifecycle while dropping retained slice"
+                                        .to_owned(),
+                            })?
+                            .released_materialization(materialized_bytes);
                         continue;
                     }
                     Ok(None) => {}
@@ -2442,10 +2479,17 @@ impl ShardOwner {
                 let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
                     detail: "native root owner missing before CPU dispatch".to_owned(),
                 })?;
+                let lifecycle = append
+                    .lifecycle
+                    .take()
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "native lifecycle owner missing before CPU dispatch".to_owned(),
+                    })?;
                 match persistence_cpu
                     .submit(crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceNativeSlice {
                         producer,
                         memory,
+                        lifecycle,
                     })
                     .await?
                 {
@@ -2453,9 +2497,11 @@ impl ShardOwner {
                         producer: returned,
                         slice,
                         memory,
+                        lifecycle,
                     } => {
                         *producer_slot = Some(returned);
                         append.memory = Some(memory);
+                        append.lifecycle = Some(lifecycle);
                         Ok(slice)
                     }
                     _ => Err(ScribeError::Internal {
@@ -2471,10 +2517,17 @@ impl ShardOwner {
                 let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
                     detail: "OTLP root owner missing before CPU dispatch".to_owned(),
                 })?;
+                let lifecycle = append
+                    .lifecycle
+                    .take()
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "OTLP lifecycle owner missing before CPU dispatch".to_owned(),
+                    })?;
                 match persistence_cpu
                     .submit(crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceOtlpSlice {
                         producer,
                         memory,
+                        lifecycle,
                     })
                     .await?
                 {
@@ -2482,9 +2535,11 @@ impl ShardOwner {
                         producer: returned,
                         slice,
                         memory,
+                        lifecycle,
                     } => {
                         *producer_slot = Some(returned);
                         append.memory = Some(memory);
+                        append.lifecycle = Some(lifecycle);
                         Ok(slice)
                     }
                     _ => Err(ScribeError::Internal {
@@ -2517,18 +2572,41 @@ impl ShardOwner {
         } = slice;
         let slice_index = wal_append.slice_index;
         let slice_count = wal_append.slice_count;
+        let materialized_bytes = memtable_bytes
+            .saturating_add(wal_append.audit.len())
+            .saturating_add(wal_append.data.len());
         if retain_rows {
             self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
         }
+        let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
+            detail: "ingress root owner missing before WAL dispatch".to_owned(),
+        })?;
+        let lifecycle = append
+            .lifecycle
+            .take()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "ingress lifecycle owner missing before WAL dispatch".to_owned(),
+            })?;
         let wal_result = self
             .wal_io
-            .submit(ScribeWalIoOp::WritePrepared {
+            .submit(ScribeWalIoOp::WriteIngressSlice {
                 wal: self.wal_handle.clone(),
                 append: wal_append,
+                memory,
+                lifecycle,
+                materialized_bytes,
             })
             .await;
         let result = match wal_result {
-            Ok(ScribeWalIoResult::WalWritten { result }) => result,
+            Ok(ScribeWalIoResult::IngressSliceWritten {
+                result,
+                memory,
+                lifecycle,
+            }) => {
+                append.memory = Some(memory);
+                append.lifecycle = Some(lifecycle);
+                result
+            }
             Ok(_) => {
                 let error = ScribeError::Internal {
                     detail: "WAL IO lane returned the wrong shard append result".to_owned(),
@@ -2585,12 +2663,23 @@ impl ShardOwner {
             seal_key,
             audit_event,
             rows,
+            wal_append,
             memtable_bytes,
             ..
         } = slice;
+        let materialized_bytes = memtable_bytes
+            .saturating_add(wal_append.audit.len())
+            .saturating_add(wal_append.data.len());
         if retain_rows {
             self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
         }
+        append
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared append lost lifecycle while reusing synced slice".to_owned(),
+            })?
+            .released_materialization(materialized_bytes);
         Ok((
             DurableSlice {
                 seal_key,
@@ -2690,11 +2779,23 @@ impl ShardOwner {
             while let Some(produced) =
                 Self::next_prepared_slice(&self.persistence_cpu, append).await?
             {
+                let materialized_bytes = produced
+                    .memtable_bytes
+                    .saturating_add(produced.wal_append.audit.len())
+                    .saturating_add(produced.wal_append.data.len());
                 let position = state.durable.iter().position(|durable| {
                     durable.batch_id == *append.batch_id.as_bytes()
                         && durable.slice_index == produced.wal_append.slice_index
                 });
                 let Some(position) = position else {
+                    append
+                        .lifecycle
+                        .as_mut()
+                        .ok_or_else(|| ScribeError::Internal {
+                            detail: "prepared append lost lifecycle while dropping unmatched regenerated slice"
+                                .to_owned(),
+                        })?
+                        .released_materialization(materialized_bytes);
                     continue;
                 };
                 let mut durable = state.durable.remove(position);
@@ -2714,6 +2815,14 @@ impl ShardOwner {
                 self.reserve_slice_active(append, &durable.seal_key, durable.memtable_bytes)?;
                 durable.active_reserved = true;
                 self.insert_committed_slice(durable, &mut state.rows_by_append, &mut touched_keys)?;
+                append
+                    .lifecycle
+                    .as_mut()
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "prepared append lost lifecycle after visibility transfer"
+                            .to_owned(),
+                    })?
+                    .released_materialization(materialized_bytes);
             }
         }
         while !state.durable.is_empty() {
@@ -2817,6 +2926,9 @@ impl ShardOwner {
     /// Completes every prepared ACK waiter with one group failure.
     fn notify_prepared_error(prepared: &mut [PreparedAppend], error: &ScribeError) {
         for append in prepared {
+            if let Some(lifecycle) = append.lifecycle.as_mut() {
+                lifecycle.refuse();
+            }
             if let Some(sender) = append.durable_ack.take() {
                 let _ = sender.send(Err(error.completion_copy()));
             }
@@ -3538,6 +3650,9 @@ mod tests {
         let memory = budget
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
             .expect("ingress memory");
+        let lifecycle = Arc::new(crate::scribe::telemetry::ScribeIngressLifecycle::default());
+        let mut lifecycle = lifecycle.begin();
+        lifecycle.reserved(initial_bytes);
         let key = owner_key();
         crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
             batch_id: uuid::Uuid::now_v7(),
@@ -3552,6 +3667,7 @@ mod tests {
             table: key.table,
             queued_at: std::time::Instant::now(),
             durable_ack: None,
+            lifecycle,
         })
         .expect("prepared append")
     }

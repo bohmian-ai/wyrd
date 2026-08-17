@@ -40,6 +40,8 @@ pub(crate) struct AdmittedAppend {
     pub table: TableRef,
     pub queued_at: Instant,
     pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    /// Move-only lifecycle observation retained beside the admitted root.
+    pub lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
 }
 
 /// Root-owned row source entering current-only persistence preprocessing.
@@ -124,6 +126,8 @@ pub(crate) struct PreparedAppend {
     pub reservation: InflightFrameReservation,
     pub memory: Option<ScribeMemoryLease>,
     pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    /// Move-only lifecycle observation retained beside the admitted root.
+    pub lifecycle: Option<crate::scribe::telemetry::ScribeIngressLifecycleOwner>,
 }
 
 /// Closed prepared-slice source used by the shard owner.
@@ -704,6 +708,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         table,
         queued_at,
         mut durable_ack,
+        mut lifecycle,
     } = admitted;
 
     metrics::histogram!("bifrost_scribe_queue_wait_seconds")
@@ -723,23 +728,36 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     let (slices, prepared_bytes) = match slices_result {
         Ok(result) => result,
         Err(error) => {
+            lifecycle.refuse();
             notify_completion(&mut durable_ack, &error);
             return Err(error);
         }
     };
+    if let PreparedSliceSet::Materialized(materialized) = &slices {
+        for slice in materialized {
+            let bytes = slice
+                .memtable_bytes
+                .saturating_add(slice.wal_append.audit.len())
+                .saturating_add(slice.wal_append.data.len());
+            lifecycle.materialized(bytes);
+        }
+    }
     if prepared_bytes > memory.bytes() {
         let error = ScribeError::DecodedPayloadTooLarge {
             bytes: prepared_bytes,
             limit: memory.bytes(),
         };
+        lifecycle.refuse();
         notify_completion(&mut durable_ack, &error);
         return Err(error);
     }
     if let Err(error) = memory.resize_ingress(prepared_bytes) {
+        lifecycle.refuse();
         notify_completion(&mut durable_ack, &error);
         return Err(error);
     }
     if let Err(error) = memory.transfer_category(MemoryCategory::Prepared) {
+        lifecycle.refuse();
         notify_completion(&mut durable_ack, &error);
         return Err(error);
     }
@@ -753,6 +771,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         reservation,
         memory: Some(memory),
         durable_ack,
+        lifecycle: Some(lifecycle),
     })
 }
 

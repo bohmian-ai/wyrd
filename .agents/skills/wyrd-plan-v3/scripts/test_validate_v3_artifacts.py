@@ -23,8 +23,8 @@ class Fixtures(unittest.TestCase):
             return "R1 D1 AC1 exact behavior, repository boundary, and named proof."
         self.task_text=f"# T1\nStatus: Planned\nRepository revision: {self.rev}\nDepends on: None\n\n"+"\n\n".join(f"## {h}\n\n{task_body(h)}" for h in validator.TASK_HEADINGS)
         (self.plan/"plan.md").write_text(self.plan_text); (self.plan/"tasks/01-owner.md").write_text(self.task_text)
-        command="mise exec -- cargo test --locked -p owner --lib --no-run"; evidence={"command":command,"exit_code":0,"selected_count":0,"output":"compiled test target"}; ep=self.plan/"evidence/T1-AC1.json"; ep.write_text(json.dumps(evidence))
-        self.data={"schema_version":3,"plan_id":"p","repository":{"origin":"https://example.com/wyrd.git","revision":self.rev},"artifacts":{},"delegation":{"model":"gpt-5.6-sol","reasoning_effort":"low","cargo_execution_lanes":1},"requirements":{"R1":["T1"]},"decisions":["D1"],"locks":[{"category":"contracts","key":"Owner::run","owners":["T1"]}],"tasks":[{"id":"T1","packet":"tasks/01-owner.md","depends_on":[],"write_set":[{"path":"src/lib.rs","kind":"existing","why":"add locked owner operation","symbols":[{"name":"Owner::run","kind":"new"}]}],"requirements":["R1"],"decisions":["D1"],"acceptance":["AC1"],"lifecycle":{d:{"applicable":d=="construction","behavior":"canonical packet names exact behavior and boundary","proof":"AC1"} for d in validator.LIFECYCLE},"proofs":[{"acceptance":"AC1","package":"owner","target":"lib","features":[],"selector":"tests::owner_runs","test_kind":"new","test_path":"src/lib.rs","test_name":"tests::owner_runs","expected_selected_count":1,"setup":"none","lane":"cargo-1","expected_result":"one test passes","command":command,"preflight":{"path":"evidence/T1-AC1.json","digest":validator.sha256(ep)}}]}]}
+        command="mise exec -- cargo test --locked -p owner --lib --no-run"; evidence={"command":command,"exit_code":0,"selected_count":0,"output":"compiled test target","repository":{"origin":"https://example.com/wyrd.git","revision":self.rev},"package":"owner","target":"lib"}; ep=self.plan/"evidence/T1-AC1.json"; ep.write_text(json.dumps(evidence))
+        self.data={"schema_version":3,"plan_id":"p","repository":{"origin":"https://example.com/wyrd.git","revision":self.rev},"artifacts":{},"delegation":{"model":"gpt-5.6-sol","reasoning_effort":"low","cargo_execution_lanes":1},"requirements":{"R1":["T1"]},"decisions":["D1"],"locks":[{"category":"contracts","key":"Owner::run","owners":["T1"]}],"tasks":[{"id":"T1","packet":"tasks/01-owner.md","depends_on":[],"write_set":[{"path":"src/lib.rs","kind":"existing","why":"add locked owner operation","coverage":["owner-lib"],"symbols":[{"name":"Owner::run","kind":"new"}]}],"requirements":["R1"],"decisions":["D1"],"acceptance":["AC1"],"lifecycle":{d:{"applicable":d=="construction","behavior":"canonical packet names exact behavior and boundary","proof":"AC1"} for d in validator.LIFECYCLE},"proofs":[{"acceptance":"AC1","coverage":["owner-lib"],"package":"owner","target":"lib","features":[],"selector":"tests::owner_runs","test_kind":"new","test_path":"src/lib.rs","test_name":"tests::owner_runs","expected_selected_count":1,"setup":"none","lane":"cargo-1","expected_result":"one test passes","preflight_command":command,"acceptance_command":"mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact","preflight":{"path":"evidence/T1-AC1.json","digest":validator.sha256(ep)}}]}]}
         self.write()
     def tearDown(self)->None:
         """Remove fixture storage."""
@@ -62,18 +62,49 @@ class Fixtures(unittest.TestCase):
         (self.plan/"plan.md").write_text(self.plan_text.replace("Status: Draft","Status: Approved")); (self.plan/"tasks/01-owner.md").write_text(self.task_text.replace("Status: Planned","Status: Ready")); self.write(); self.assert_error("require rehearsal")
         record={"verdict":"PASS","manifest_digest":validator.sha256(self.plan/"execution-manifest.json"),"artifact_digests":self.data["artifacts"],"repository":self.data["repository"]}; (self.plan/"rehearsal.json").write_text(json.dumps(record)); self.assertEqual([],self.errors())
 
-    def test_one_to_one_proof_and_task_owned_lifecycle(self)->None:
-        """Reject duplicate acceptance proof and foreign lifecycle proof IDs."""
-        self.data["tasks"][0]["proofs"].append(json.loads(json.dumps(self.data["tasks"][0]["proofs"][0]))); self.data["tasks"][0]["lifecycle"]["shutdown"]["proof"]="AC9"; self.write(); self.assert_error("one-to-one"); self.assert_error("another task")
+    def test_every_ac_has_proof_and_task_owned_lifecycle(self)->None:
+        """Reject missing acceptance proof and foreign lifecycle proof IDs."""
+        self.data["tasks"][0]["proofs"]=[]; self.data["tasks"][0]["lifecycle"]["shutdown"]["proof"]="AC9"; self.write(); self.assert_error("every acceptance criterion"); self.assert_error("another task")
 
     def test_derived_manifest_lock_is_required(self)->None:
         """Reject omitted shared-artifact ownership inferred from write paths."""
         old=self.rev; (self.repo/"Cargo.toml").write_text("[workspace]\n"); subprocess.run(["git","add","Cargo.toml"],cwd=self.repo,check=True); subprocess.run(["git","commit","-qm","manifest"],cwd=self.repo,check=True); self.rev=subprocess.check_output(["git","rev-parse","HEAD"],cwd=self.repo,text=True).strip(); self.data["repository"]["revision"]=self.rev
-        (self.plan/"plan.md").write_text(self.plan_text.replace(old,self.rev)); (self.plan/"tasks/01-owner.md").write_text(self.task_text.replace(old,self.rev).replace("`src/lib.rs`","`Cargo.toml`").replace("`Owner::run`","`workspace`").replace("new | add locked owner operation","existing | update workspace manifest")); self.data["tasks"][0]["write_set"]=[{"path":"Cargo.toml","kind":"existing","why":"update workspace manifest","symbols":[{"name":"workspace","kind":"existing"}]}]; self.write(); self.assert_error("omitted derived manifests lock")
+        (self.plan/"plan.md").write_text(self.plan_text.replace(old,self.rev)); (self.plan/"tasks/01-owner.md").write_text(self.task_text.replace(old,self.rev).replace("`src/lib.rs`","`Cargo.toml`").replace("`Owner::run`","`workspace`").replace("new | add locked owner operation","existing | update workspace manifest")); self.data["tasks"][0]["write_set"]=[{"path":"Cargo.toml","kind":"existing","why":"update workspace manifest","coverage":["workspace-manifest"],"symbols":[{"name":"workspace","kind":"existing"}]}]; self.data["tasks"][0]["proofs"][0]["coverage"]=["workspace-manifest"]; self.write(); self.assert_error("omitted derived manifests lock")
 
     def test_rejects_skeletal_t6_packet(self)->None:
         """Reject a heading-complete packet whose content remains generic and ownerless."""
         skeletal=f"# T1\nStatus: Planned\nRepository revision: {self.rev}\nDepends on: None\n\n"+"\n\n".join(f"## {h}\n\nadd a concrete owner and proof" for h in validator.TASK_HEADINGS)
         (self.plan/"tasks/01-owner.md").write_text(skeletal); self.write(); self.assert_error("section is empty or generic"); self.assert_error("target path/symbol/why mismatch")
+
+    def test_missing_server_boot_proof(self)->None:
+        """Reject a server task whose construction/boot surface has no proof coverage."""
+        self.data["tasks"][0]["write_set"][0]["coverage"].append("server-boot"); self.write(); self.assert_error("proof coverage does not match affected surfaces")
+
+    def test_missing_binary_and_mise_proof(self)->None:
+        """Reject omitted binary registration and mise-lane acceptance coverage."""
+        self.data["tasks"][0]["write_set"][0]["coverage"].extend(["binary-registration","mise-task"]); self.write(); self.assert_error("proof coverage does not match affected surfaces")
+
+    def test_compile_only_packet_lacks_acceptance_command(self)->None:
+        """Reject a packet that supplies preflight compilation but no executable acceptance command."""
+        self.data["tasks"][0]["proofs"][0]["acceptance_command"]=""; self.write(); self.assert_error("acceptance command must select named test")
+
+    def test_modified_caller_must_be_in_write_set(self)->None:
+        """Reject a modified caller omitted from manifest write ownership."""
+        packet=self.plan/"tasks/01-owner.md"; packet.write_text(packet.read_text().replace("`tests::owner_runs` | `Owner`","modified:src/server.rs | `Owner`")); self.write(); self.assert_error("modified caller/consumer absent from write_set")
+
+    def test_accepts_audited_postgres_wrapper(self)->None:
+        """Accept the canonical wrapper with migration followed by the exact selected test."""
+        proof=self.data["tasks"][0]["proofs"][0]
+        proof["setup"]="scripts/postgres/with-test-postgres.sh"
+        proof["acceptance_command"]="scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact'"
+        self.write(); self.assertEqual([],self.errors())
+
+    def test_rejects_unaudited_or_incomplete_postgres_wrapper(self)->None:
+        """Reject wrapper payloads missing migration and the exact selector."""
+        proof=self.data["tasks"][0]["proofs"][0]; proof["setup"]="scripts/postgres/with-test-postgres.sh"
+        proof["acceptance_command"]="scripts/postgres/with-test-postgres.sh -- bash -lc 'mise exec -- cargo test --locked -p owner --lib'"
+        self.write(); self.assert_error("audited lane")
+        proof["acceptance_command"]="scripts/custom.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo test -p owner tests::owner_runs'"
+        self.write(); self.assert_error("audited lane")
 
 if __name__=="__main__": unittest.main()

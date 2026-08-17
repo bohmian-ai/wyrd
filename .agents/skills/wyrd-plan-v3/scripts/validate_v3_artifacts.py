@@ -87,6 +87,19 @@ def derived_lock(path: str) -> str | None:
     if any(token in lowered for token in ("config",".github/","dockerfile","compose")): return "config"
     return None
 
+def audited_acceptance(command: str, selector: str) -> bool:
+    """Accept direct lanes or the one repository-audited Postgres wrapper."""
+    if command.startswith(("mise ","uv ","pnpm ")):
+        return selector in command
+    prefix="scripts/postgres/with-test-postgres.sh -- bash -lc "
+    if not command.startswith(prefix) or selector not in command:
+        return False
+    payload=command[len(prefix):].strip()
+    if len(payload)<2 or payload[0] not in "'\"" or payload[-1]!=payload[0]:
+        return False
+    inner=payload[1:-1]
+    return inner.startswith("mise run db:migrate:inner && mise exec -- cargo test ")
+
 def validate(plan_dir: Path, repo: Path) -> list[str]:
     """Return every artifact, source, traceability, scheduling, and proof error."""
     errors: list[str] = []
@@ -155,6 +168,8 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
         for item in task.get("write_set",[]):
             path=str(item.get("path","")); kind=item.get("kind"); why=str(item.get("why","")).strip()
             if not why or GENERIC.search(why): errors.append(f"{tid} write identity lacks exact why")
+            coverage=item.get("coverage",[])
+            if not isinstance(coverage,list) or not coverage or any(not str(value).strip() for value in coverage): errors.append(f"{tid} write identity lacks declared proof coverage")
             if not safe_path(path) or kind not in {"existing","new"}: errors.append(f"{tid} invalid write path identity")
             elif kind=="existing" and git(repo,"cat-file","-e",f"{revision}:{path}").returncode: errors.append(f"{tid} existing path absent at source commit: {path}")
             elif kind=="new" and git(repo,"cat-file","-e",f"{revision}:{PurePosixPath(path).parent}").returncode: errors.append(f"{tid} new path parent absent at source commit: {path}")
@@ -170,19 +185,25 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
             if row["callers"].lower() in {"none","n/a"} or row["consumers"].lower() in {"none","n/a"}:
                 if "evidence:" not in row["callers"].lower()+row["consumers"].lower(): errors.append(f"{tid} callers/consumers require names or evidence-backed none")
             if "/" not in row["path"] and "." not in row["path"]: errors.append(f"{tid} target uses only a broad crate label")
+            for cell in (row["callers"],row["consumers"]):
+                for modified in re.findall(r"modified:([^,;\s]+)",cell):
+                    if modified not in task_writes: errors.append(f"{tid} modified caller/consumer absent from write_set: {modified}")
         type_body=task_sections.get("Required types and interfaces","")
         if has_new_or_cross and not re.search(r"```(?:rust|python|typescript|ts)\s+.*?\b(?:fn|struct|enum|class|interface|type|def)\b.*?```",type_body,re.S): errors.append(f"{tid} new/cross-owner symbols require typed signature block")
         stateful=any(task.get("lifecycle",{}).get(d,{}).get("applicable") for d in ("shutdown","cancellation","concurrency","recovery"))
         failure_body=task_sections.get("Failure and edge-case matrix","")
         if stateful and not re.search(r"^\|[^\n]+\|[^\n]+\|[^\n]+\|\s*$",failure_body,re.M): errors.append(f"{tid} stateful task requires exact failure-matrix row")
         for proof in task.get("proofs",[]):
-            required={"acceptance","package","target","features","selector","test_kind","test_path","test_name","expected_selected_count","setup","lane","expected_result","command","preflight"}
+            required={"acceptance","coverage","package","target","features","selector","test_kind","test_path","test_name","expected_selected_count","setup","lane","expected_result","preflight_command","acceptance_command","preflight"}
             if set(proof)!=required or proof.get("acceptance") not in task.get("acceptance",[]): errors.append(f"{tid} invalid proof schema")
-            command=str(proof.get("command","")); selector=str(proof.get("selector",""))
+            command=str(proof.get("preflight_command","")); acceptance_command=str(proof.get("acceptance_command","")); selector=str(proof.get("selector",""))
             kind=proof.get("test_kind")
             if kind not in {"existing","new"} or not safe_path(str(proof.get("test_path",""))) or proof.get("test_name")!=selector or not isinstance(proof.get("expected_selected_count"),int) or proof.get("expected_selected_count",0)<=0: errors.append(f"{tid} invalid planned test identity")
             if not (command.startswith("mise ") or command.startswith("uv ") or command.startswith("pnpm ")): errors.append(f"{tid} command is not exact/auditable")
-            if kind=="existing" and selector not in command: errors.append(f"{tid} existing-test command lacks selector")
+            if not audited_acceptance(acceptance_command,selector): errors.append(f"{tid} acceptance command must select named test through an audited lane")
+            if proof.get("features") and not all(str(feature) in acceptance_command for feature in proof.get("features",[])): errors.append(f"{tid} acceptance command omits declared features")
+            if proof.get("setup") != "none" and str(proof.get("setup")) not in acceptance_command: errors.append(f"{tid} acceptance command omits wrapper/setup")
+            if kind=="existing" and selector not in command: errors.append(f"{tid} existing-test preflight lacks selector")
             if kind=="new" and "--no-run" not in command: errors.append(f"{tid} new-test preflight must compile with --no-run")
             test_at_source=git(repo,"show",f"{revision}:{proof.get('test_path','')}")
             if kind=="existing" and (test_at_source.returncode or selector.split("::")[-1] not in test_at_source.stdout): errors.append(f"{tid} existing test identity absent at source commit")
@@ -191,10 +212,13 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
             if not safe_path(str(pre.get("path",""))) or not ep.is_file() or sha256(ep)!=pre.get("digest"): errors.append(f"{tid} preflight evidence digest invalid"); continue
             try: evidence=json.loads(ep.read_text())
             except Exception: errors.append(f"{tid} preflight evidence invalid JSON"); continue
-            base_valid=evidence.get("command")==command and evidence.get("exit_code")==0 and isinstance(evidence.get("selected_count"),int) and bool(str(evidence.get("output","")).strip())
+            base_valid=evidence.get("command")==command and evidence.get("exit_code")==0 and isinstance(evidence.get("selected_count"),int) and bool(str(evidence.get("output","")).strip()) and evidence.get("repository")=={"origin":origin,"revision":revision} and evidence.get("package")==proof.get("package") and evidence.get("target")==proof.get("target")
             if not base_valid or (kind=="existing" and evidence.get("selected_count",0)<=0) or (kind=="new" and evidence.get("selected_count")!=0): errors.append(f"{tid} preflight evidence violates {kind}-test contract")
         proof_acs=[p.get("acceptance") for p in task.get("proofs",[])]
-        if sorted(proof_acs)!=sorted(task.get("acceptance",[])) or len(proof_acs)!=len(set(proof_acs)): errors.append(f"{tid} acceptance must map one-to-one to proofs")
+        if set(proof_acs)!=set(task.get("acceptance",[])): errors.append(f"{tid} every acceptance criterion requires proof")
+        required_coverage={value for item in task.get("write_set",[]) for value in item.get("coverage",[])}
+        actual_coverage={value for proof in task.get("proofs",[]) for value in proof.get("coverage",[])}
+        if required_coverage != actual_coverage: errors.append(f"{tid} proof coverage does not match affected surfaces")
         if any(entry.get("proof") not in task.get("acceptance",[]) for entry in task.get("lifecycle",{}).values() if isinstance(entry,dict)): errors.append(f"{tid} lifecycle proof belongs to another task")
     if all_task_acs != plan_acs: errors.append("acceptance criteria are not bidirectionally traceable")
     visiting:set[str]=set(); visited:set[str]=set()

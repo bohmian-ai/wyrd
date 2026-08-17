@@ -90,12 +90,26 @@ construct raw pools or invent database lifecycle.
 
 Preflight each exact command locally and serially against the pinned revision.
 Capture command, output, exit status, and selected count in a digest-bound
-evidence JSON file. Existing tests require a positive executed selection. A
+evidence JSON file bound to repository origin/revision and exact package/target.
+Each proof separately carries the exact post-implementation acceptance command
+that selects the named test with its wrapper, setup, features, lane, and
+`--ignored` behavior. Existing tests require a positive executed selection. A
 newly planned test declares `test_kind: new`, its exact path/name and expected
 post-implementation count, and preflights the existing package/target with
 `--no-run` and selected count zero; never fabricate a positive count. The
 manifest's zero-to-two Cargo lanes constrain execution
 only; they never authorize parallel preflight.
+For Postgres-backed acceptance, use only the audited repository wrapper form
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo test ... <selector> ...'`.
+Do not use arbitrary scripts or shell wrappers.
+
+Declare proof coverage identities on every write-set entry and proof. Cover
+every affected package/target plus each manifest, mise task, binary
+registration, construction site, entrypoint, and acceptance workflow. Multiple
+proofs may serve one AC; every AC requires at least one proof and the union of
+proof coverage must exactly equal affected write coverage. Include every
+modified caller, consumer, construction site, and entrypoint in the write set;
+mark modified caller/consumer paths explicitly in the target table.
 
 ## Validation and approval
 

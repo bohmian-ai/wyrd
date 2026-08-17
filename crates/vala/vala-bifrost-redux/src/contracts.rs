@@ -1,8 +1,9 @@
 //! Scribe contracts per CONTRACTS §5.
 //!
 //! The `Scribe` trait is the boundary between the Gate (dispatch) and the
-//! Scribe (WAL + memtable + seal). Every method is async; every error is
-//! `ScribeError`.
+//! Scribe (WAL + memtable + seal). Resource reservation and readiness checks
+//! are synchronous; logical-frame ingestion is asynchronous through its
+//! durability boundary. Fallible operations return `ScribeError`.
 //!
 //! `Scribe::ingest_frame` returns a `FrameAdmission` only after the batch has
 //! been WAL-synced and inserted into the active memtable. Idempotency is
@@ -66,7 +67,8 @@ pub(crate) struct ScribeIngressFrame {
     pub(crate) audit_event: AuditEvent,
     /// Server-measured bytes after transport decompression.
     pub(crate) measured_wire_bytes: usize,
-    /// Native Arrow IPC, raw OTLP request, or engine-only projected Arrow.
+    /// Native Arrow IPC, engine-only projected Arrow, or a fixed-capacity
+    /// typed OTLP request paired with its move-only transport-decode owner.
     pub(crate) payload: IngressPayload,
 }
 
@@ -92,17 +94,21 @@ pub struct ScribeAppend {
 }
 
 /// Payload forms accepted by the transport-neutral Scribe boundary.
+///
+/// Public OTLP adapters transfer typed, fixed-capacity requests and their
+/// decode owners through Gate; they do not project Arrow before Scribe.
 #[derive(Debug)]
 pub(crate) enum IngressPayload {
     /// One self-contained Arrow IPC stream from the native transport.
     ArrowIpc(Bytes),
-    /// Arrow batches projected by a protocol adapter such as OTLP.
+    /// Engine-internal preprojected Arrow batches used outside public OTLP
+    /// adapter and Gate routing.
     ProjectedArrow(Vec<RecordBatch>),
-    /// Raw bounded OTLP trace transport payload.
+    /// Fixed-capacity typed OTLP trace request plus its move-only decode owner.
     OtlpTraces(DecodedOtlp<wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest>),
-    /// Raw bounded OTLP metric transport payload.
+    /// Fixed-capacity typed OTLP metrics request plus its move-only decode owner.
     OtlpMetrics(DecodedOtlp<wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest>),
-    /// Raw bounded OTLP log transport payload.
+    /// Fixed-capacity typed OTLP logs request plus its move-only decode owner.
     OtlpLogs(DecodedOtlp<wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest>),
 }
 
@@ -136,7 +142,7 @@ impl<T> DecodedOtlp<T> {
 /// Opaque move-only ownership of server-side OTLP decode capacity.
 #[derive(Debug)]
 pub struct OtlpDecodeOwner {
-    /// Sole Scribe root lease retained across Gate routing.
+    /// Move-only transport-decode child adopted into Scribe's complete root.
     pub(crate) memory: crate::resources::ScribeMemoryLease,
 }
 
@@ -355,7 +361,9 @@ impl From<vala_sql::SqlError> for ScribeError {
 ///
 /// `FrameAdmission` is the durable Scribe acknowledgment. It is returned only
 /// after WAL append, grouped `sync_data`, and active memtable insertion. Its
-/// private visibility keeps the owned logical frame inside Redux.
+/// private visibility keeps the owned logical frame inside Redux. Decode
+/// reservation and readiness are synchronous; ingest performs asynchronous
+/// durability work.
 #[async_trait]
 pub(crate) trait Scribe: Send + Sync {
     /// Acquires exact root-backed capacity before an OTLP adapter decodes.

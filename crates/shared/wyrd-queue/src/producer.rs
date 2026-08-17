@@ -25,8 +25,10 @@ const DRAINING: u8 = 1;
 const DRAINED: u8 = 2;
 /// One pending control is allowed for each producer's dedicated command channel.
 const CONTROL_SLOTS_PER_PRODUCER: usize = 1;
-/// Bounded delay between dropped-handle ambiguity resolution attempts.
-const DROPPED_HANDLE_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+/// Initial ceiling for one retained ambiguity backoff.
+const RETRY_BACKOFF_INITIAL_MS: u64 = 10;
+/// Maximum ceiling for one retained ambiguity backoff.
+const RETRY_BACKOFF_MAX_MS: u64 = 1_000;
 
 /// Charged queue slots selected before one producer allocates its fixed buffers.
 #[derive(Debug, Clone, Copy)]
@@ -881,14 +883,41 @@ impl Task {
     /// no pending work and permits task cleanup.
     async fn drain_dropped_handle(&mut self) {
         self.drain_channel().await;
+        let mut attempt = 0_u32;
         while self.queue.has_pending() {
             match self.queue.seal_and_send().await {
-                Ok(_) => {}
+                Ok(_) => attempt = 0,
                 Err(_) if !self.queue.has_pending() => break,
-                Err(_) => tokio::time::sleep(DROPPED_HANDLE_RETRY_BACKOFF).await,
+                Err(_) => {
+                    let batch_id = self.queue.retry_batch_id().unwrap_or([0; 16]);
+                    tokio::time::sleep(retry_backoff(batch_id, attempt)).await;
+                    attempt = attempt.saturating_add(1);
+                }
             }
         }
     }
+}
+
+/// Derives deterministic equal jitter from a stable batch and attempt number.
+///
+/// The exponential ceiling starts at 10 ms and caps at one second. The stable
+/// mixer chooses within the inclusive upper half of that ceiling, avoiding
+/// global randomness while preventing every retained batch from retrying in
+/// lockstep.
+#[must_use]
+fn retry_backoff(batch_id: [u8; 16], attempt: u32) -> Duration {
+    let shift = attempt.min(63);
+    let ceiling = RETRY_BACKOFF_INITIAL_MS
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX)
+        .min(RETRY_BACKOFF_MAX_MS);
+    let floor = ceiling / 2;
+    let mut mixed = u64::from(attempt).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for byte in batch_id {
+        mixed ^= u64::from(byte);
+        mixed = mixed.wrapping_mul(0x100_0000_01b3);
+    }
+    Duration::from_millis(floor + mixed % (ceiling - floor + 1))
 }
 
 /// Creates the optional interval only after entering the shared Tokio runtime.
@@ -1211,7 +1240,7 @@ mod tests {
 
     /// Retains task-owned capacity after a producer handle drops with an ambiguous batch.
     #[test]
-    fn dropped_timeout_task_holds_capacity_until_terminal_cleanup() {
+    fn dropped_handle_shutdown_remains_control_aware() {
         let sink = Arc::new(TimeoutSink::default());
         let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
         let config = QueueConfig {
@@ -1235,6 +1264,20 @@ mod tests {
             producer.flush(),
             Err(WyrdQueueError::FlushTimeout)
         ));
+        let second_started = Instant::now();
+        assert!(matches!(
+            producer.shutdown(),
+            Err(WyrdQueueError::FlushTimeout)
+        ));
+        assert!(
+            second_started.elapsed() < Duration::from_millis(250),
+            "later shutdown control is serviced within its bounded deadline"
+        );
+        assert_eq!(
+            budget.metrics().retry_entries,
+            1,
+            "later control moves the existing retry permit"
+        );
         drop(producer);
         let retained = budget.metrics();
         assert_eq!(
@@ -1387,9 +1430,9 @@ mod tests {
 
     /// Retries one exact sealed owner identity after an ambiguous sink result.
     #[test]
-    fn bounded_retry_retains_the_same_batch_identity() {
+    fn retry_full_cardinality() {
         let sink = Arc::new(MockSink::new());
-        sink.fail_next(1);
+        sink.fail_next(2);
         let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
             "vala.bifrost.queue",
@@ -1409,10 +1452,27 @@ mod tests {
             producer.flush().is_err(),
             "first transport result is ambiguous"
         );
+        let saturated = (1..QueueConfig::MAX_LIVE_ENTRIES)
+            .map(|_| budget.reserve_retry().expect("remaining retry slot fits"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            budget.metrics().retry_entries,
+            QueueConfig::MAX_LIVE_ENTRIES
+        );
+        assert!(
+            producer.flush().is_err(),
+            "reattempt remains ambiguous without reacquiring its occupied slot"
+        );
+        assert_eq!(
+            budget.metrics().retry_entries,
+            QueueConfig::MAX_LIVE_ENTRIES
+        );
+        drop(saturated);
         producer.flush().expect("retained batch retries");
         let attempts = sink.attempted();
-        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts.len(), 3);
         assert_eq!(attempts[0], attempts[1]);
+        assert_eq!(attempts[1], attempts[2]);
         let settled = budget.metrics();
         assert_eq!(
             settled.owned_bytes, 0,
@@ -1486,5 +1546,28 @@ mod tests {
         assert_eq!(settled.retry_entries, 0, "ACK releases retry slot");
         producer.shutdown().expect("timeout producer shutdown");
         assert_eq!(budget.used_bytes(), 0, "shutdown releases fixed storage");
+    }
+
+    /// Deterministic equal jitter stays in each exponential window and caps at one second.
+    #[test]
+    fn retained_retry_backoff_is_deterministic_and_capped() {
+        let batch_id = uuid::Uuid::now_v7().into_bytes();
+        let delays = (0..12)
+            .map(|attempt| super::retry_backoff(batch_id, attempt))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            (0..12)
+                .map(|attempt| super::retry_backoff(batch_id, attempt))
+                .collect::<Vec<_>>()
+        );
+        for (attempt, delay) in delays.iter().enumerate() {
+            let ceiling = 10_u64
+                .checked_shl((attempt as u32).min(63))
+                .unwrap_or(u64::MAX)
+                .min(1_000);
+            assert!(*delay >= Duration::from_millis(ceiling / 2));
+            assert!(*delay <= Duration::from_millis(ceiling));
+        }
     }
 }

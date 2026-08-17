@@ -80,6 +80,9 @@ pub fn wyrd_error_response_from_parts(
             | WyrdError::Vala {
                 error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
             }
+            | WyrdError::Vala {
+                error: wyrd_spec::vala::error::BifrostError::IngestBusy { .. },
+            }
     );
     let mut body = error.as_problem_json();
     if let (serde_json::Value::Object(map), Some(id)) = (&mut body, request_id) {
@@ -378,7 +381,7 @@ mod error_mapper_tests {
     }
 
     #[tokio::test]
-    async fn http_retry_after_only_for_retryable_capacity() {
+    async fn ingest_busy_http_retry_metadata() {
         let retryable = WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
             message: "resolver unavailable".to_owned(),
             details: serde_json::json!({}),
@@ -386,6 +389,19 @@ mod error_mapper_tests {
         .into_response();
         assert_eq!(
             retryable
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let ingest_busy = WyrdErrorResponse::from(WyrdError::from(
+            wyrd_spec::vala::error::BifrostError::IngestBusy {
+                table: "vala.traces.spans".to_owned(),
+            },
+        ))
+        .into_response();
+        assert_eq!(
+            ingest_busy
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
@@ -414,6 +430,8 @@ mod error_mapper_tests {
             },
             wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge.into(),
             wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
+            wyrd_spec::vala::error::BifrostError::PayloadTooLarge { bytes: 1 }.into(),
+            wyrd_spec::vala::error::BifrostError::WalDiskFull.into(),
         ] {
             let response = WyrdErrorResponse::from(error).into_response();
             assert!(

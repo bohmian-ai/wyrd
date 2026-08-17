@@ -38,6 +38,41 @@ struct RetryEntry {
     _permit: RetryPermit,
 }
 
+/// One send attempt whose ownership state determines retry-slot admission.
+#[derive(Debug)]
+enum SendEntry {
+    /// A newly sealed batch that has not consumed retry cardinality.
+    Fresh(SealedBatch<ClientByteGuard>),
+    /// An ambiguous batch moving with its already-reserved retry permit.
+    Retained(RetryEntry),
+}
+
+impl SendEntry {
+    /// Borrows the stable batch identity and allocation for one sink attempt.
+    fn batch(&self) -> &SealedBatch<ClientByteGuard> {
+        match self {
+            Self::Fresh(batch) => batch,
+            Self::Retained(entry) => &entry.batch,
+        }
+    }
+
+    /// Retains ambiguity, reserving cardinality only for a fresh batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns backpressure only when a fresh ambiguity cannot reserve its
+    /// first retry slot. A retained attempt reuses its existing permit.
+    fn into_retry(self, budget: &ClientByteBudget) -> Result<RetryEntry, WyrdQueueError> {
+        match self {
+            Self::Fresh(batch) => Ok(RetryEntry {
+                batch,
+                _permit: budget.reserve_retry()?,
+            }),
+            Self::Retained(entry) => Ok(entry),
+        }
+    }
+}
+
 /// Result of one sealing pass.
 #[derive(Debug, Default, Clone)]
 pub struct FlushOutcome {
@@ -115,6 +150,16 @@ impl RecordQueue {
                 .is_empty()
     }
 
+    /// Returns the oldest retained batch identity for deterministic retry scheduling.
+    #[must_use]
+    pub(crate) fn retry_batch_id(&self) -> Option<[u8; 16]> {
+        self.retry
+            .lock()
+            .expect("retry lock is not poisoned")
+            .front()
+            .map(|entry| entry.batch.batch_id)
+    }
+
     /// Transfers one row to staging or records visible backpressure after one seal.
     pub(crate) async fn ingest(&self, row: Row) {
         if let Some(row) = self.push(row) {
@@ -164,16 +209,18 @@ impl RecordQueue {
         builder.finish_ipc()
     }
 
-    /// Adds one ambiguous batch to the bounded retry set before retaining it.
-    fn retain_retry(&self, batch: SealedBatch<ClientByteGuard>) -> Result<(), WyrdQueueError> {
-        let permit = self.budget.reserve_retry()?;
+    /// Adds one ambiguous attempt to the bounded retry set without replacing its permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns backpressure only when a fresh ambiguity cannot reserve its
+    /// first retry slot.
+    fn retain_retry(&self, entry: SendEntry) -> Result<(), WyrdQueueError> {
+        let entry = entry.into_retry(&self.budget)?;
         self.retry
             .lock()
             .expect("retry lock is not poisoned")
-            .push_back(RetryEntry {
-                batch,
-                _permit: permit,
-            });
+            .push_back(entry);
         Ok(())
     }
 
@@ -190,22 +237,23 @@ impl RecordQueue {
     /// backpressure if the bounded retry state cannot retain the batch.
     async fn send_one(
         &self,
-        batch: SealedBatch<ClientByteGuard>,
+        entry: SendEntry,
         outcome: &mut FlushOutcome,
     ) -> Result<(), WyrdQueueError> {
-        match tokio::time::timeout(self.config.flush_timeout(), self.sink.send(&batch)).await {
+        match tokio::time::timeout(self.config.flush_timeout(), self.sink.send(entry.batch())).await
+        {
             Ok(Ok(DurableBatchAck { batch_id, rows })) => {
                 outcome.batch_ids.push(batch_id);
                 outcome.rows_flushed += rows as usize;
                 Ok(())
             }
             Ok(Err(SinkError::Retryable(error))) => {
-                self.retain_retry(batch)?;
+                self.retain_retry(entry)?;
                 Err(WyrdQueueError::Sink(error))
             }
             Ok(Err(SinkError::Terminal(error))) => Err(WyrdQueueError::Sink(error)),
             Err(_) => {
-                self.retain_retry(batch)?;
+                self.retain_retry(entry)?;
                 Err(WyrdQueueError::FlushTimeout)
             }
         }
@@ -226,7 +274,8 @@ impl RecordQueue {
                 .expect("retry lock is not poisoned")
                 .pop_front();
             if let Some(retry) = retry {
-                self.send_one(retry.batch, &mut outcome).await?;
+                self.send_one(SendEntry::Retained(retry), &mut outcome)
+                    .await?;
                 continue;
             }
             break;
@@ -234,20 +283,54 @@ impl RecordQueue {
 
         let mut rows = self.drain();
         let chunk_size = self.config.flush_max_rows();
+        let mut chunks = VecDeque::new();
         while !rows.is_empty() {
             let rest = if rows.len() > chunk_size {
                 rows.split_off(chunk_size)
             } else {
                 Vec::new()
             };
-            let chunk = std::mem::replace(&mut rows, rest);
-            let frame_guard = self.budget.reserve(self.config.max_message_bytes)?;
-            let frame = self.build_frame(&chunk)?;
-            if frame.len() > self.config.max_message_bytes {
-                return Err(WyrdQueueError::PayloadTooLarge);
+            chunks.push_back(std::mem::replace(&mut rows, rest));
+        }
+        while let Some(mut chunk) = chunks.pop_front() {
+            let frame_guard = match self.budget.reserve(self.config.max_message_bytes) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    chunk.extend(chunks.into_iter().flatten());
+                    self.restore_unsealed(chunk);
+                    return Err(error);
+                }
+            };
+            let frame = self.build_frame(&chunk);
+            let oversized = frame
+                .as_ref()
+                .is_ok_and(|frame| frame.len() > self.config.max_message_bytes);
+            if frame.is_err() || oversized {
+                drop(frame_guard);
+                if chunk.len() > 1 {
+                    let right = chunk.split_off(chunk.len() / 2);
+                    chunks.push_front(right);
+                    chunks.push_front(chunk);
+                    continue;
+                }
+                self.counters.dropped.fetch_add(1, Ordering::AcqRel);
+                let later = chunks.into_iter().flatten().collect();
+                self.restore_unsealed(later);
+                return match frame {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(WyrdQueueError::PayloadTooLarge),
+                };
             }
+            let frame = frame.expect("successful frame result checked above");
             let frame_guard = frame_guard.resize(frame.len());
-            let frame_guard = frame_guard.attach_batch()?;
+            let frame_guard = match frame_guard.attach_batch() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    chunk.extend(chunks.into_iter().flatten());
+                    self.restore_unsealed(chunk);
+                    return Err(error);
+                }
+            };
             let batch = SealedBatch {
                 table: self.table.clone(),
                 batch_id: Uuid::now_v7().into_bytes(),
@@ -255,8 +338,8 @@ impl RecordQueue {
                 rows: chunk.len() as u64,
             };
             drop(chunk);
-            if let Err(error) = self.send_one(batch, &mut outcome).await {
-                self.restore_unsealed(rows);
+            if let Err(error) = self.send_one(SendEntry::Fresh(batch), &mut outcome).await {
+                self.restore_unsealed(chunks.into_iter().flatten().collect());
                 return Err(error);
             }
         }
@@ -270,5 +353,139 @@ impl Flushable for RecordQueue {
         self.seal_and_send()
             .await
             .map(|outcome| outcome.rows_flushed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Settlement tests for sealing, splitting, and restoration.
+
+    use std::io::Cursor;
+
+    use arrow::array::Int64Array;
+    use arrow::ipc::reader::StreamReader;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+    use crate::sink::MockSink;
+
+    /// Builds one charged queue row for a split-settlement test.
+    fn row(budget: &ClientByteBudget, id: i64) -> Row {
+        let json = format!(r#"{{"id":{id}}}"#).into_bytes();
+        Row {
+            _guard: budget.reserve(json.capacity()).expect("row bytes fit"),
+            json,
+            card_ref: "prod/Service/queue@1.0.0".parse().expect("valid test card"),
+            run_id: None,
+        }
+    }
+
+    /// Reads user IDs from an ordered sequence of IPC receipts.
+    fn receipt_ids(receipts: &[crate::sink::BatchReceipt]) -> Vec<i64> {
+        receipts
+            .iter()
+            .flat_map(|receipt| {
+                StreamReader::try_new(Cursor::new(&receipt.bytes), None)
+                    .expect("receipt is valid IPC")
+                    .map(|batch| {
+                        let batch = batch.expect("receipt batch decodes");
+                        let ids = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("id column is int64");
+                        (0..ids.len())
+                            .map(|index| ids.value(index))
+                            .collect::<Vec<_>>()
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Aggregate oversize bisects left-first and preserves every row exactly once.
+    #[tokio::test]
+    async fn oversize_split_preserves_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let staging = Arc::new(ArrayQueue::new(8));
+        let sink = Arc::new(MockSink::new());
+        let counters = Arc::new(Counters::default());
+        let probe = RecordQueue::new(
+            "events".to_owned(),
+            schema.clone(),
+            staging.clone(),
+            sink.clone(),
+            QueueConfig::default(),
+            budget.clone(),
+            counters.clone(),
+        );
+        let singleton_bytes = probe
+            .build_frame(&[row(&budget, 1)])
+            .expect("singleton builds")
+            .len();
+        let aggregate_rows = (1..=4).map(|id| row(&budget, id)).collect::<Vec<_>>();
+        let aggregate_bytes = probe
+            .build_frame(&aggregate_rows)
+            .expect("aggregate builds")
+            .len();
+        drop(aggregate_rows);
+        assert!(aggregate_bytes > singleton_bytes);
+        drop(probe);
+
+        let queue = RecordQueue::new(
+            "events".to_owned(),
+            schema,
+            staging,
+            sink.clone(),
+            QueueConfig {
+                max_message_bytes: singleton_bytes,
+                flush_max_rows: 4,
+                ..QueueConfig::default()
+            },
+            budget,
+            counters,
+        );
+        for id in 1..=4 {
+            assert!(queue.push(row(&queue.budget, id)).is_none());
+        }
+        let outcome = queue.seal_and_send().await.expect("split leaves settle");
+        assert_eq!(outcome.rows_flushed, 4);
+        assert_eq!(receipt_ids(&sink.received()), vec![1, 2, 3, 4]);
+        assert_eq!(queue.counters.dropped.load(Ordering::Acquire), 0);
+
+        let poison_sink = Arc::new(MockSink::new());
+        let poison_budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let poison_counters = Arc::new(Counters::default());
+        let poison_queue = RecordQueue::new(
+            "events".to_owned(),
+            queue.schema.clone(),
+            Arc::new(ArrayQueue::new(3)),
+            poison_sink.clone(),
+            QueueConfig {
+                flush_max_rows: 3,
+                ..QueueConfig::default()
+            },
+            poison_budget.clone(),
+            poison_counters.clone(),
+        );
+        assert!(poison_queue.push(row(&poison_budget, 1)).is_none());
+        let mut poison = row(&poison_budget, 2);
+        poison.json = vec![0xff];
+        assert!(poison_queue.push(poison).is_none());
+        assert!(poison_queue.push(row(&poison_budget, 3)).is_none());
+        assert!(matches!(
+            poison_queue.seal_and_send().await,
+            Err(WyrdQueueError::SchemaParse(_))
+        ));
+        assert_eq!(receipt_ids(&poison_sink.received()), vec![1]);
+        assert_eq!(poison_queue.staging_len(), 1, "later row restored");
+        assert_eq!(poison_counters.dropped.load(Ordering::Acquire), 1);
+        poison_queue
+            .seal_and_send()
+            .await
+            .expect("restored later row settles");
+        assert_eq!(receipt_ids(&poison_sink.received()), vec![1, 3]);
     }
 }

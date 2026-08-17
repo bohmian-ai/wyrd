@@ -272,7 +272,12 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
                 batch_id: batch.batch_id,
                 rows: batch.rows,
             }),
-            Err(error @ WyrdError::ServiceUnavailable { .. }) => Err(SinkError::Retryable(error)),
+            Err(error @ WyrdError::ServiceUnavailable { .. })
+            | Err(
+                error @ WyrdError::Vala {
+                    error: wyrd_spec::vala::error::BifrostError::IngestBusy { .. },
+                },
+            ) => Err(SinkError::Retryable(error)),
             Err(error) => Err(SinkError::Terminal(error)),
         }
     }
@@ -280,11 +285,14 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
 
 #[derive(Debug)]
 struct AttemptError {
+    /// Typed stable error returned to the caller when retries stop.
     error: WyrdError,
+    /// Whether this attempt is ambiguous or carries stable ingest-busy identity.
     retryable: bool,
 }
 
 impl AttemptError {
+    /// Wraps a failure that must settle without another transport attempt.
     fn terminal(error: WyrdError) -> Self {
         Self {
             error,
@@ -292,14 +300,21 @@ impl AttemptError {
         }
     }
 
+    /// Classifies a gRPC failure by stable reason before considering transport loss.
     fn from_status(status: Status) -> Self {
-        if retryable_status(&status) {
+        let stable = from_grpc_status(&status);
+        if stable.code() == "WYRD_VALA_429_INGEST_BUSY" {
+            Self {
+                error: stable,
+                retryable: true,
+            }
+        } else if retryable_status(&status) {
             Self {
                 error: transport_unavailable("unary ingest transport failed before ACK"),
                 retryable: true,
             }
         } else {
-            Self::terminal(from_grpc_status(&status))
+            Self::terminal(stable)
         }
     }
 }
@@ -330,6 +345,7 @@ fn validate_frame(table: &str, batch_id: [u8; 16], arrow_bytes: usize) -> Result
     Ok(())
 }
 
+/// Returns whether a status represents ambiguous transport loss before ACK.
 fn retryable_status(status: &Status) -> bool {
     matches!(
         status.code(),
@@ -389,5 +405,37 @@ mod tests {
             Code::InvalidArgument,
             "bad batch"
         )));
+    }
+
+    /// Stable busy retries while every other capacity status terminalizes.
+    #[test]
+    fn ingest_busy_retries_same_batch_and_permanent_capacity_is_terminal() {
+        use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
+
+        let busy = Status::with_error_details(
+            Code::ResourceExhausted,
+            "ingest coordinator busy for table events — local buffer full",
+            ErrorDetails::with_error_info(
+                "WYRD_VALA_429_INGEST_BUSY",
+                "wyrd.dev",
+                [] as [(String, String); 0],
+            ),
+        );
+        let busy = AttemptError::from_status(busy);
+        assert!(busy.retryable);
+        assert_eq!(busy.error.code(), "WYRD_VALA_429_INGEST_BUSY");
+
+        for reason in [
+            "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+            "WYRD_VALA_413_INGEST_OVERSIZED",
+            "WYRD_VALA_507_WAL_DISK_FULL",
+        ] {
+            let status = Status::with_error_details(
+                Code::ResourceExhausted,
+                "permanent capacity refusal",
+                ErrorDetails::with_error_info(reason, "wyrd.dev", [] as [(String, String); 0]),
+            );
+            assert!(!AttemptError::from_status(status).retryable, "{reason}");
+        }
     }
 }

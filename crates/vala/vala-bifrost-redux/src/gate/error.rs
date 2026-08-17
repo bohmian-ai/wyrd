@@ -291,12 +291,21 @@ impl IngestError {
     #[must_use]
     pub fn into_status(self) -> Status {
         let public = self.to_wyrd_error("unknown");
+        let retryable_busy = public.code() == "WYRD_VALA_429_INGEST_BUSY";
         let details = ErrorDetails::with_error_info(
             public.code(),
             WYRD_ERROR_DOMAIN,
             [] as [(String, String); 0],
         );
-        Status::with_error_details(grpc_code_for_wyrd(&public), public.to_string(), details)
+        let mut status =
+            Status::with_error_details(grpc_code_for_wyrd(&public), public.to_string(), details);
+        if retryable_busy {
+            status.metadata_mut().insert(
+                "retry-after-ms",
+                "1000".parse().expect("static metadata is valid"),
+            );
+        }
+        status
     }
 
     /// Map an RBAC verdict denial into the reused RBAC code.
@@ -545,6 +554,32 @@ mod tests {
                 .get_details_error_info()
                 .expect("canonical ingest status carries ErrorInfo");
             assert_eq!(info.reason, expected_code, "ErrorInfo drift for {public}");
+        }
+    }
+
+    /// Stable ingest saturation alone carries the exact gRPC retry marker.
+    #[test]
+    fn ingest_busy_grpc_retry_metadata() {
+        let busy = IngestError::IngestBusy {
+            table: "vala.traces.spans".to_owned(),
+        }
+        .into_status();
+        assert_eq!(busy.code(), Code::ResourceExhausted);
+        assert_eq!(
+            busy.metadata()
+                .get("retry-after-ms")
+                .and_then(|value| value.to_str().ok()),
+            Some("1000")
+        );
+        for permanent in capacity_cases() {
+            assert!(
+                permanent
+                    .0
+                    .into_status()
+                    .metadata()
+                    .get("retry-after-ms")
+                    .is_none()
+            );
         }
     }
 

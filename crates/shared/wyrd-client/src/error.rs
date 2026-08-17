@@ -158,6 +158,7 @@ fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -
     }
 }
 
+/// Reconstructs Bifrost's typed error variants from their stable wire identity.
 fn bifrost_error_from_code(
     code: &str,
     message: &str,
@@ -173,6 +174,11 @@ fn bifrost_error_from_code(
             .to_owned()
     };
     let error = match code {
+        "WYRD_VALA_429_INGEST_BUSY" => BifrostError::IngestBusy {
+            table: table_from_message("ingest coordinator busy for table ")
+                .trim_end_matches(" — local buffer full")
+                .to_owned(),
+        },
         "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND" => BifrostError::TableNotFound {
             table: table_from_message("bifrost table not found: "),
         },

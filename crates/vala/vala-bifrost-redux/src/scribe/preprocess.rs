@@ -138,6 +138,12 @@ struct NativeCurrentSource {
 }
 
 impl NativeSliceProducer {
+    /// Returns the immutable complete slice count established before production.
+    #[must_use]
+    pub(crate) const fn slice_count(&self) -> u32 {
+        self.slice_count
+    }
+
     /// Builds a producer after a non-retaining pass fixes the total slice count.
     ///
     /// # Errors
@@ -236,6 +242,28 @@ impl NativeSliceProducer {
         self.current = None;
         self.slice_index = 0;
         Ok(())
+    }
+}
+
+impl PreparedSliceSet {
+    /// Returns the exact remaining closed-set size without advancing the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the native producer owner is absent or
+    /// its fixed count cannot be represented by the current platform.
+    pub(crate) fn exact_slice_capacity(&self) -> Result<usize, ScribeError> {
+        match self {
+            Self::Materialized(slices) => Ok(slices.len()),
+            Self::Native(Some(producer)) => {
+                usize::try_from(producer.slice_count()).map_err(|_| ScribeError::Internal {
+                    detail: "native slice count exceeds platform capacity".to_owned(),
+                })
+            }
+            Self::Native(None) => Err(ScribeError::Internal {
+                detail: "native producer owner missing during capacity planning".to_owned(),
+            }),
+        }
     }
 }
 

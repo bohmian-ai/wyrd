@@ -958,6 +958,16 @@ pub(crate) enum ScribePersistenceCpuOp {
     RestoreReplay {
         replayed: Box<ReplayedSealKey>,
     },
+    /// Test-only stalled work proving a detached job retains its root owner.
+    #[cfg(test)]
+    HoldMemory {
+        /// Root-backed bytes that must remain charged through job completion.
+        memory: crate::resources::ScribeMemoryLease,
+        /// Deterministic signal emitted after the detached job owns the lease.
+        started: std::sync::mpsc::SyncSender<()>,
+        /// Deterministic release gate controlled by the cancellation test.
+        release: std::sync::mpsc::Receiver<()>,
+    },
 }
 
 /// Move-only inputs for one bounded Parquet encoding lane operation.
@@ -1148,6 +1158,23 @@ impl ScribePersistenceCpuPool {
                 ScribePersistenceCpuOp::RestoreReplay { replayed } => {
                     let frozen = crate::scribe::memtable::Memtable::decode_replayed(&replayed)?;
                     Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
+                }
+                #[cfg(test)]
+                ScribePersistenceCpuOp::HoldMemory {
+                    memory,
+                    started,
+                    release,
+                } => {
+                    started.send(()).map_err(|error| ScribeError::Internal {
+                        detail: format!("stalled ownership test could not signal start: {error}"),
+                    })?;
+                    release.recv().map_err(|error| ScribeError::Internal {
+                        detail: format!("stalled ownership test release failed: {error}"),
+                    })?;
+                    drop(memory);
+                    Err(ScribeError::Internal {
+                        detail: "stalled ownership test completed".to_owned(),
+                    })
                 }
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
@@ -1613,6 +1640,7 @@ mod tests {
         decode, record_lane_saturation, source_schema_fingerprint, stamp_correlation_columns,
     };
     use crate::contracts::{IngressPayload, ScribeError};
+    use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
     use crate::schema::SchemaFingerprint;
     use crate::scribe::admission::EventTimeWindow;
     use crate::scribe::replay::ReplayedSealKey;
@@ -1744,6 +1772,54 @@ mod tests {
             ScribePersistenceCpuPool::new(1)
                 .worker_name()
                 .starts_with("wyrd-scribe-persistence-cpu-")
+        );
+    }
+
+    /// Canceling an awaiter cannot release bytes still owned by detached Rayon work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_persistence_waiter_retains_memory_until_job_exit() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [BifrostRole::Scribe],
+        );
+        let scribe = roles.scribe().expect("Scribe role");
+        let memory = scribe
+            .try_reserve_ingress(ScribeMemoryCategory::Raw, 4096)
+            .expect("root-backed test lease");
+        let pool = ScribePersistenceCpuPool::new(1);
+        let submitted = pool.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = tokio::spawn(async move {
+            submitted
+                .submit(ScribePersistenceCpuOp::HoldMemory {
+                    memory,
+                    started: started_tx,
+                    release: release_rx,
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .expect("start waiter")
+            .expect("detached job started");
+        waiter.abort();
+        assert_eq!(
+            scribe
+                .snapshot()
+                .expect("charged snapshot")
+                .scribe_memory_used_bytes,
+            4096
+        );
+        release_tx.send(()).expect("release detached job");
+        pool.drain().await;
+        assert_eq!(
+            scribe
+                .snapshot()
+                .expect("settled snapshot")
+                .scribe_memory_used_bytes,
+            0
         );
     }
 

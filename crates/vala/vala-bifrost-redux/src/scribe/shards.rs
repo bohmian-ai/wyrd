@@ -2160,19 +2160,26 @@ impl ShardOwner {
         state: &mut GroupWalState,
     ) -> Result<(), ScribeError> {
         for append in &state.prepared {
-            let mut slices = state
+            let batch_id = *append.batch_id.as_bytes();
+            let Some(first_index) = state
                 .durable
                 .iter()
-                .filter(|slice| slice.batch_id == *append.batch_id.as_bytes())
-                .collect::<Vec<_>>();
-            if slices.is_empty() {
+                .position(|slice| slice.batch_id == batch_id)
+            else {
                 continue;
-            }
-            let committed_retries = slices
+            };
+            let slice_count = state.durable[first_index].slice_count;
+            let batch_slice_len = state
+                .durable
                 .iter()
-                .filter(|slice| slice.commit_already_synced)
+                .filter(|slice| slice.batch_id == batch_id)
                 .count();
-            if committed_retries == slices.len() {
+            let committed_retries = state
+                .durable
+                .iter()
+                .filter(|slice| slice.batch_id == batch_id && slice.commit_already_synced)
+                .count();
+            if committed_retries == batch_slice_len {
                 continue;
             }
             if committed_retries != 0 {
@@ -2180,21 +2187,25 @@ impl ShardOwner {
                     detail: "WAL retry mixed committed and uncommitted slices".to_owned(),
                 });
             }
-            slices.sort_by_key(|slice| slice.slice_index);
-            let slice_count = slices[0].slice_count;
-            if slice_count == 0
-                || usize::try_from(slice_count).ok() != Some(slices.len())
-                || slices.iter().enumerate().any(|(index, slice)| {
-                    slice.slice_count != slice_count
-                        || usize::try_from(slice.slice_index).ok() != Some(index)
-                })
-            {
+            if slice_count == 0 || usize::try_from(slice_count).ok() != Some(batch_slice_len) {
                 return Err(ScribeError::Internal {
                     detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
                 });
             }
             let mut digest = Sha256::new();
-            for slice in &slices {
+            for slice_index in 0..slice_count {
+                let slice = state
+                    .durable
+                    .iter()
+                    .find(|slice| slice.batch_id == batch_id && slice.slice_index == slice_index)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
+                    })?;
+                if slice.slice_count != slice_count {
+                    return Err(ScribeError::Internal {
+                        detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
+                    });
+                }
                 digest.update(slice.slice_index.to_le_bytes());
                 digest.update(slice.payload_len.to_le_bytes());
                 digest.update(slice.payload_digest);
@@ -2235,8 +2246,10 @@ impl ShardOwner {
             }
             self.sync_group(&state.touched).await?;
             if let Some(postgres) = &self.control_postgres {
-                let request_id = uuid::Uuid::parse_str(slices[0].audit_event.request_id.as_str())
-                    .map_err(|error| ScribeError::Internal {
+                let request_id = uuid::Uuid::parse_str(
+                    state.durable[first_index].audit_event.request_id.as_str(),
+                )
+                .map_err(|error| ScribeError::Internal {
                     detail: format!("Scribe audit request id is not a UUID: {error}"),
                 })?;
                 let mut conn = postgres.tenant_conn(append.tenant).await?;
@@ -2260,11 +2273,10 @@ impl ShardOwner {
                                 detail: "WAL segment sequence exceeds SQL bigint range".to_owned(),
                             }
                         })?,
-                        wal_lsn_min: i64::try_from(slices[0].lsn.as_u64()).map_err(|_| {
-                            ScribeError::Internal {
+                        wal_lsn_min: i64::try_from(state.durable[first_index].lsn.as_u64())
+                            .map_err(|_| ScribeError::Internal {
                                 detail: "WAL slice LSN exceeds SQL bigint range".to_owned(),
-                            }
-                        })?,
+                            })?,
                         wal_lsn_max: i64::try_from(commit_lsn.as_u64()).map_err(|_| {
                             ScribeError::Internal {
                                 detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
@@ -2272,7 +2284,7 @@ impl ShardOwner {
                         })?,
                         request_id,
                     },
-                    &slices[0].audit_event,
+                    &state.durable[first_index].audit_event,
                 )
                 .await?;
                 conn.commit().await?;
@@ -2291,7 +2303,15 @@ impl ShardOwner {
         &mut self,
         mut prepared: Vec<PreparedAppend>,
     ) -> Result<GroupWalState, ScribeError> {
-        let mut durable = Vec::new();
+        let durable_capacity = prepared.iter().try_fold(0_usize, |total, append| {
+            total
+                .checked_add(append.slices.exact_slice_capacity()?)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "WAL durable slice metadata capacity overflow".to_owned(),
+                })
+        })?;
+        let mut durable = Vec::with_capacity(durable_capacity);
+        let fixed_durable_capacity = durable.capacity();
         let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
         let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
         for append in &mut prepared {
@@ -2355,6 +2375,11 @@ impl ShardOwner {
                         .insert(segment.path().to_path_buf(), Arc::clone(segment));
                 }
                 durable.push(slice);
+                if durable.capacity() != fixed_durable_capacity {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL durable slice metadata exceeded its exact capacity".to_owned(),
+                    });
+                }
             }
         }
         Ok(GroupWalState {

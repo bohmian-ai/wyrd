@@ -124,7 +124,7 @@ cargo test --locked -p wyrd-testing --test journeys -- unhealthy_scratch_volume_
 cargo test --locked -p wyrd-testing --test journeys -- pg_bifrost_forge_small_files_converges_without_query_dependency --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- supervised_forge_panic_fails_stop_and_recovers_exactly_once --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- public_ack_restart_read_exact_once_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test otlp -- bifrost_ingest_runtime_journey --test-threads=1
+cargo test --locked -p wyrd-testing --test otlp -- --test-threads=1
 cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_published_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_fused_reconcile_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_role_separated_journey --ignored --test-threads=1
@@ -141,8 +141,8 @@ cargo test --locked -p wyrd-testing --test oracle -- typed_vala_route_uses_oracl
 cargo test --locked -p wyrd-mcp --test bifrost_rbac -- bifrost_query_zero_rows_returns_authoritative_schema --ignored --test-threads=1
 cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --test integration -- pg_bifrost_oracle_recovery_terminal_journey --test-threads=1
 cargo test --locked -p wyrd-testing --test oracle -- oracle_production_telemetry_contract --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_two_server_scribe_tail_boundary_journey --ignored --test-threads=1
 cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --test integration -- pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_stale_file_replan --test-threads=1
-cargo test --locked -p wyrd-testing --test otlp -- otlp_negative_journeys --test-threads=1
 """
 
 [tasks."test:fuzz:bifrost"]

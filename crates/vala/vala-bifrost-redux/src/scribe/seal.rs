@@ -746,6 +746,12 @@ impl SealDriver {
 
     /// Execute seal stages after the owning shard has detached the frozen
     /// generation from its writable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for tenant/binding mismatch, invalid WAL or
+    /// schema identity, Parquet planning/encoding/upload failure, capacity
+    /// refusal, or an unavailable/ambiguous `PostgreSQL` publication outcome.
     #[tracing::instrument(skip(self, frozen, conn), fields(seal_key = %seal_key))]
     pub async fn pre_commit_frozen(
         &self,
@@ -856,6 +862,12 @@ impl SealDriver {
         })
     }
 
+    /// Encodes one frozen generation through the admitted persistence CPU lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when CPU admission, Parquet encoding, footer
+    /// ownership, or detached task completion fails.
     async fn encode_parquet(
         &self,
         frozen: &FrozenMemtable,

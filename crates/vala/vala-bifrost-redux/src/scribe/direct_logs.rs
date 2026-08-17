@@ -449,6 +449,12 @@ fn visit(
 }
 
 /// Validates the current log mapper's per-record rejection conditions.
+///
+/// # Errors
+///
+/// Returns `()` when timestamps exceed the physical range, trace/span IDs are
+/// malformed or inconsistent, or body/attribute material violates the direct
+/// log projection contract.
 fn validate(record: &LogRecord) -> Result<(), ()> {
     if i64::try_from(record.observed_time_unix_nano).is_err()
         && i64::try_from(record.time_unix_nano).is_err()

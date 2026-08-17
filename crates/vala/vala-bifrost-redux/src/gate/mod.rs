@@ -1179,6 +1179,12 @@ mod tests {
             true
         }
 
+        /// Records one owner-backed frame accepted by the Gate test double.
+        ///
+        /// # Errors
+        ///
+        /// This test implementation is infallible after its frame assertions;
+        /// assertion failures panic rather than returning [`ScribeError`].
         async fn ingest_frame(
             &self,
             frame: crate::contracts::ScribeIngressFrame,
@@ -1226,6 +1232,12 @@ mod tests {
             true
         }
 
+        /// Records one owner-backed frame accepted by the counting test double.
+        ///
+        /// # Errors
+        ///
+        /// This implementation returns no error after the frame invariants
+        /// succeed; invariant violations panic in the test that owns it.
         async fn ingest_frame(
             &self,
             frame: crate::contracts::ScribeIngressFrame,

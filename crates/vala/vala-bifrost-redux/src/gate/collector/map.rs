@@ -492,6 +492,12 @@ fn micros(ts: DateTime<Utc>) -> i64 {
     ts.timestamp_micros()
 }
 
+/// Serializes span attributes into one exact-capacity compact JSON value.
+///
+/// # Errors
+///
+/// Returns an error when JSON counting or serialization fails, the count and
+/// write passes diverge, or the resulting bytes are not UTF-8.
 fn attrs_json(attributes: &serde_json::Map<String, serde_json::Value>) -> Result<String, String> {
     exact_json_string(attributes)
 }
@@ -1076,6 +1082,12 @@ fn metric_scalar_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
     ]
 }
 
+/// Materializes the metric columns whose physical representation is compact JSON.
+///
+/// # Errors
+///
+/// Returns an error when any opaque metric value cannot be counted,
+/// serialized into its exact allocation, or converted to UTF-8.
 fn metric_opaque_columns(records: &[MetricRecord]) -> Result<Vec<ArrayRef>, String> {
     let bucket_counts = json_col(
         records
@@ -1403,6 +1415,10 @@ fn ts_micros_col(values: impl Iterator<Item = Option<DateTime<Utc>>>) -> ArrayRe
 }
 
 /// Build a `Utf8` column from an iterator of optional JSON strings.
+///
+/// # Errors
+///
+/// Returns the first JSON serialization error yielded by `values`.
 fn json_col(
     values: impl Iterator<Item = Option<Result<String, String>>>,
 ) -> Result<ArrayRef, String> {
@@ -1414,6 +1430,11 @@ fn json_col(
 
 /// Serialize a value to its compact JSON string form for an opaque `Utf8`
 /// column.
+///
+/// # Errors
+///
+/// Returns an error when JSON counting or serialization fails, the count and
+/// write passes diverge, or the resulting bytes are not UTF-8.
 fn json_of<T: serde::Serialize>(value: &T) -> Result<String, String> {
     exact_json_string(value)
 }
@@ -1454,6 +1475,11 @@ impl Write for JsonByteCounter {
 /// The first pass retains only a checked byte count. The second pass writes to
 /// that exact allocation and reports any serializer divergence instead of
 /// silently replacing the domain value.
+///
+/// # Errors
+///
+/// Returns an error when either serializer pass fails, the emitted length or
+/// capacity differs from the count pass, or the emitted bytes are not UTF-8.
 fn exact_json_string<T: serde::Serialize>(value: &T) -> Result<String, String> {
     let mut counter = JsonByteCounter::default();
     serde_json::to_writer(&mut counter, value).map_err(|error| error.to_string())?;

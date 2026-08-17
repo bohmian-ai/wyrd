@@ -428,6 +428,11 @@ impl<'a> ReplayAccumulator<'a> {
     }
 
     /// Move the current batch into a handoff and start a fresh reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Capacity`] when the next replay decode owner
+    /// cannot be reserved from the maintenance envelope.
     fn take_chunk(&mut self) -> Result<Option<ReplayChunk>, ScribeError> {
         if self.states.is_empty() || !self.pending_batches.is_empty() {
             return Ok(None);
@@ -447,6 +452,11 @@ impl<'a> ReplayAccumulator<'a> {
 
     /// Resize the current batch after a record is rejected by deduplication or
     /// the manifest watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Capacity`] when the replay decode reservation
+    /// cannot be resized to the remaining bounded batch.
     fn resize_memory(&mut self, bytes: usize) -> Result<(), ScribeError> {
         if let Some(memory) = self.memory.as_mut() {
             memory.resize_ingress(bytes)?;

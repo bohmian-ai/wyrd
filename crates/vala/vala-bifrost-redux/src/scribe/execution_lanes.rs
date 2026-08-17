@@ -868,6 +868,13 @@ fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
     columns
 }
 
+/// Resolves row card references against the authenticated principal.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::CardUnresolved`] when the card column has the wrong
+/// type, a row reference is malformed or differs from the bound card, or the
+/// principal does not provide the required card identity.
 fn resolve_card_uids(
     rows: &RecordBatch,
     principal: &Principal,
@@ -1229,6 +1236,12 @@ impl ScribePersistenceCpuPool {
         Self::with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
     }
 
+    /// Builds the bounded persistence pool with an optional test delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`rayon::ThreadPoolBuildError`] when Rayon cannot construct the
+    /// configured fixed worker pool.
     fn with_capacity_and_delay(
         worker_count: usize,
         capacity: usize,
@@ -1658,6 +1671,12 @@ impl ScribeWalIoPool {
     }
 }
 
+/// Executes one detached WAL operation while retaining its admitted owners.
+///
+/// # Errors
+///
+/// Returns the WAL append, synchronization, retirement, or lifecycle
+/// settlement error produced by the selected operation.
 fn execute_wal_io(
     operation: ScribeWalIoOp,
     delay: std::time::Duration,

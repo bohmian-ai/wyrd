@@ -359,6 +359,12 @@ impl From<vala_sql::SqlError> for ScribeError {
 #[async_trait]
 pub(crate) trait Scribe: Send + Sync {
     /// Acquires exact root-backed capacity before an OTLP adapter decodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Capacity`] when the requested decode child does
+    /// not fit the Scribe root, or [`ScribeError::Internal`] when an
+    /// implementation does not expose transport-decode ownership.
     fn reserve_otlp_decode(&self, _bytes: usize) -> Result<OtlpDecodeOwner, ScribeError> {
         Err(ScribeError::Internal {
             detail: "test Scribe does not expose decode ownership".to_owned(),

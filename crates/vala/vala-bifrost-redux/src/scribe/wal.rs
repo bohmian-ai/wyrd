@@ -195,6 +195,11 @@ impl SegmentHeader {
     }
 
     /// Decode a segment header from bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the magic, version, reserved
+    /// fields, shard identifier, or header checksum violates WAL v4 framing.
     pub fn decode(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, ScribeError> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != WAL_MAGIC {
@@ -455,6 +460,12 @@ impl PreparedWalAppend {
     }
 
     #[cfg(test)]
+    /// Materializes the prepared record for bounded replay and framing tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when required tenant/seal identity is
+    /// absent or self-describing payload encoding fails.
     fn record(&self) -> Result<WalRecord, ScribeError> {
         #[cfg(test)]
         if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
@@ -490,6 +501,12 @@ impl PreparedWalAppend {
         ))
     }
 
+    /// Returns the exact framed WAL record length without materializing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when payload sizing fails or framed
+    /// length arithmetic overflows.
     pub(crate) fn encoded_len(&self) -> Result<usize, ScribeError> {
         self.payload_len()?
             .checked_add(RECORD_HEADER_SIZE + 4)
@@ -737,6 +754,12 @@ const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S3SL";
 struct CountWriter<'a>(&'a mut usize);
 
 impl FmtWrite for CountWriter<'_> {
+    /// Adds one fragment's byte length to the saturating count.
+    ///
+    /// # Errors
+    ///
+    /// This counting implementation is infallible and saturates at
+    /// [`usize::MAX`].
     fn write_str(&mut self, value: &str) -> std::fmt::Result {
         *self.0 = self.0.saturating_add(value.len());
         Ok(())
@@ -1008,6 +1031,11 @@ fn decode_slice_bodies(
 /// bytes. Structural decoding is kept separate from replay's deduplication
 /// and audit/Arrow reconstruction so this function only validates and returns
 /// the one-record representation.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the payload magic, version,
+/// metadata, lengths, or trailing-byte boundary is malformed.
 pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload, ScribeError> {
     let mut reader = SlicePayloadReader::new(payload);
     let metadata = decode_slice_metadata(&mut reader)?;
@@ -1759,6 +1787,12 @@ impl WalSegment {
     }
 
     /// Append a record to the segment without forcing it to stable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::WalDiskFull`] when the filesystem refuses the
+    /// write for capacity, or [`ScribeError::Internal`] when the segment lock
+    /// is poisoned or another write failure occurs.
     pub fn append(&self, record: &WalRecord) -> Result<(), ScribeError> {
         let span =
             tracing::info_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
@@ -1914,6 +1948,11 @@ impl WalSegment {
     }
 
     /// Read all records from the segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns the framing, checksum, ordering, lock, seek, read, or torn-tail
+    /// repair error reported while visiting the segment.
     pub fn read_records(&self) -> Result<Vec<WalRecord>, ScribeError> {
         let mut records: Vec<WalRecord> = Vec::new();
         self.for_each_record(|record| {
@@ -2051,6 +2090,13 @@ impl WalHandle {
         Self { writer, shard_id }
     }
 
+    /// Appends one prepared record through this handle's fixed shard identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the record lacks required
+    /// self-describing identity, or propagates any writer append/capacity/IO
+    /// failure.
     pub(crate) fn append_prepared(
         &self,
         mut append: PreparedWalAppend,
@@ -2081,14 +2127,31 @@ impl WalHandle {
         self.writer.take_post_sync_failure_for_test()
     }
 
+    /// Releases this handle's retained references to closed WAL segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns the retirement-reference lock or segment-deletion error from
+    /// the shared writer.
     pub(crate) fn retire_segments(&self, segments: &[WalSegmentRef]) -> Result<(), ScribeError> {
         self.writer.retire_segments(segments)
     }
 
+    /// Retains closed WAL segments for one pending immutable generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the retirement-reference lock error, or the injected retention
+    /// failure used by focused tests.
     pub(crate) fn retain_segments(&self, segments: &[WalSegmentRef]) -> Result<(), ScribeError> {
         self.writer.retain_segments(segments)
     }
 
+    /// Closes this shard's current segment when no active bucket owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the writer state-lock or segment synchronization error.
     pub(crate) fn close_segments_if_unowned(
         &self,
         segments: &[WalSegmentRef],
@@ -2284,6 +2347,11 @@ impl WalWriter {
     }
 
     /// Return the single WAL handle owned by one fixed shard task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when `shard_id` cannot be represented
+    /// by the fixed WAL topology or lies outside the configured shard set.
     pub(crate) fn handle_for_shard(&self, shard_id: usize) -> Result<WalHandle, ScribeError> {
         let shard_id = u8::try_from(shard_id).map_err(|_| ScribeError::Internal {
             detail: format!("invalid WAL shard index: {shard_id}"),
@@ -2403,6 +2471,12 @@ impl WalWriter {
     }
 
     /// Append one prepared v4 record without syncing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for invalid record identity or length,
+    /// poisoned writer state, WAL capacity/disk refusal, segment creation or
+    /// append failure, or rollback/accounting divergence.
     pub(crate) fn append_prepared(
         &self,
         mut prepared: PreparedWalAppend,
@@ -2687,6 +2761,11 @@ impl WalWriter {
 
     /// Retire only closed segments. The active segment remains until rollover
     /// makes every record in it eligible for the next persistence transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when retirement ownership is poisoned
+    /// or when a releasable segment cannot be deleted durably.
     pub(crate) fn retire_segments(&self, segments: &[WalSegmentRef]) -> Result<(), ScribeError> {
         let mut releasable = Vec::new();
         let mut references = self
@@ -2712,6 +2791,11 @@ impl WalWriter {
     }
 
     /// Retain segment references for one pending immutable generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the retirement-reference lock is
+    /// poisoned or the focused retention-failure seam is armed.
     pub(crate) fn retain_segments(&self, segments: &[WalSegmentRef]) -> Result<(), ScribeError> {
         #[cfg(test)]
         if WAL_FAIL_RETAIN.with(|flag| flag.replace(false)) {
@@ -2740,6 +2824,11 @@ impl WalWriter {
     /// the normal grace-period retirement then removes it. Closing here avoids
     /// retaining a low-volume current file forever when no later append causes
     /// a size rollover.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a shard state lock is poisoned or
+    /// returns the segment synchronization error before ownership is cleared.
     pub(crate) fn close_segments_if_unowned(
         &self,
         segments: &[WalSegmentRef],
@@ -2828,6 +2917,12 @@ impl WalWriter {
         self.disk.pressure(bytes, 0)
     }
 
+    /// Returns the current shard segment or creates its next ordered segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the shard directory or segment
+    /// cannot be created, or propagates segment-header persistence failures.
     fn ensure_segment_locked(
         &self,
         state: &mut WalState,
@@ -3094,6 +3189,13 @@ impl WalReader {
         Self::open_directory_filtered(dir, None)
     }
 
+    /// Opens and orders every segment admitted by the optional stream filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the directory traversal, segment open/header validation,
+    /// duplicate-sequence, or stream-ordering error encountered while building
+    /// the reader.
     fn open_directory_filtered(
         dir: impl AsRef<Path>,
         stream: Option<StreamIdentity>,
@@ -3142,6 +3244,11 @@ impl WalReader {
     }
 
     /// Read all records from all segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when segment framing, CRC, ordering, identity,
+    /// payload decoding, or torn-tail recovery validation fails.
     pub fn read_all_records(&self) -> Result<Vec<WalRecord>, ScribeError> {
         let mut all_records = Vec::new();
         self.for_each_stream_record(|_stream, _shard_id, _path, record| {

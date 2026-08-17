@@ -26,7 +26,8 @@ use crate::otlp_json::{
 ///
 /// Returns [`IngestError::Decode`] when JSON framing, a known field shape,
 /// numeric range, identifier encoding, recursive value depth, duplicate field,
-/// or trailing input violates the OTLP JSON contract.
+/// trailing input, or a preflight-versus-materialized retained-capacity
+/// mismatch violates the OTLP JSON contract.
 pub(crate) fn decode_logs_json(
     input: &[u8],
     expected_decode_bytes: usize,

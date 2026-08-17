@@ -264,6 +264,12 @@ impl PersistenceFixture {
         .expect("replay")
     }
 
+    /// Starts a multi-table persistence fixture after seeding restart WAL state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when replay seeding, Scribe construction,
+    /// recovery, table registration, or configured persistence setup fails.
     async fn start_after_wal_restart_with_keys<T: AsRef<str>>(
         fail_replay_write: bool,
         table_names: &[T],

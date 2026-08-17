@@ -1742,6 +1742,11 @@ impl ScribeImpl {
 #[async_trait]
 impl Scribe for ScribeImpl {
     /// Acquires the adapter-decode child from the sole Scribe root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Capacity`] when the exact decode reservation
+    /// cannot be acquired from the Scribe ingress root.
     fn reserve_otlp_decode(
         &self,
         bytes: usize,
@@ -2123,6 +2128,11 @@ impl ScribeImpl {
     /// attribution is retried for coherence, but under uninterrupted writes the
     /// method returns the latest independently sampled attribution rather than
     /// failing an otherwise valid operational inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when memtable statistics or per-shard owner
+    /// snapshots cannot be collected.
     pub fn inspection_snapshot(&self) -> Result<ScribeInspectionSnapshot, ScribeError> {
         let stats = self.memtable_stats()?;
         let mut coherent = None;

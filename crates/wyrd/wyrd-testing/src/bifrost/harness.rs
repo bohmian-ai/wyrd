@@ -123,6 +123,13 @@ impl BifrostHarness {
         }
     }
 
+    /// Constructs every Scribe pod and tenant fixture for the retained cluster.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarnessError`] when tenant creation, writer-epoch conversion,
+    /// WAL/Scribe construction, catalog registration, or recovery startup
+    /// fails.
     async fn start_with_cluster(
         cluster: &WyrdTestCluster,
         tenant_count: usize,

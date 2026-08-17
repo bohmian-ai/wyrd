@@ -19,7 +19,9 @@ use crate::otlp_json::{
 ///
 /// # Errors
 ///
-/// Returns a stable decode error for malformed JSON or protobuf-JSON semantics.
+/// Returns a stable decode error for malformed JSON or protobuf-JSON semantics,
+/// trailing input, or a preflight-versus-materialized retained-capacity
+/// mismatch.
 pub(crate) fn decode_trace_json(
     input: &[u8],
     expected_decode_bytes: usize,

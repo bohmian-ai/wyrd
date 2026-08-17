@@ -179,6 +179,12 @@ where
 ///
 /// Accepts protobuf and protobuf-JSON, replies in the request's encoding, and
 /// surfaces per-span rejections as OTLP `partial_success`.
+///
+/// # Errors
+///
+/// Returns [`WyrdErrorResponse`] when Gate is unavailable, protobuf/JSON
+/// preflight or fixed-capacity decode fails, decode ownership cannot be
+/// reserved/adopted, or Gate/Scribe rejects admission or durable ingest.
 #[tracing::instrument(
     name = "otlp.http.trace.export",
     skip_all,
@@ -260,6 +266,12 @@ async fn export_traces(
 ///
 /// Accepts protobuf and protobuf-JSON, replies in the request's encoding, and
 /// surfaces per-point rejections as OTLP `partial_success`.
+///
+/// # Errors
+///
+/// Returns [`WyrdErrorResponse`] when Gate is unavailable, protobuf/JSON
+/// preflight or fixed-capacity decode fails, decode ownership cannot be
+/// reserved/adopted, or Gate/Scribe rejects admission or durable ingest.
 #[tracing::instrument(
     name = "otlp.http.metrics.export",
     skip_all,
@@ -342,6 +354,12 @@ async fn export_metrics(
 ///
 /// Accepts protobuf and protobuf-JSON, replies in the request's encoding, and
 /// surfaces per-record rejections as OTLP `partial_success`.
+///
+/// # Errors
+///
+/// Returns [`WyrdErrorResponse`] when Gate is unavailable, protobuf/JSON
+/// preflight or fixed-capacity decode fails, decode ownership cannot be
+/// reserved/adopted, or Gate/Scribe rejects admission or durable ingest.
 #[tracing::instrument(
     name = "otlp.http.logs.export",
     skip_all,

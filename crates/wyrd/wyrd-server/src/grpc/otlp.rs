@@ -68,6 +68,10 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     /// The adapter has no independent readiness state beyond its retained Gate.
+    ///
+    /// # Errors
+    ///
+    /// This method is infallible because [`Self::Error`] is [`Infallible`].
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
@@ -250,6 +254,10 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     /// Reports immediate readiness because the retained Gate owns all state.
+    ///
+    /// # Errors
+    ///
+    /// This method is infallible because [`Self::Error`] is [`Infallible`].
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
@@ -394,6 +402,10 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     /// Reports immediate readiness because the retained Gate owns all state.
+    ///
+    /// # Errors
+    ///
+    /// This method is infallible because [`Self::Error`] is [`Infallible`].
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }

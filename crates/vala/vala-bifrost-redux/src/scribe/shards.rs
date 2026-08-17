@@ -2953,6 +2953,11 @@ impl ShardOwner {
     }
 
     /// Release active reservations after a failed group stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first admission or memory-ledger release error after
+    /// attempting to settle every active durable slice.
     fn release_active_reservations(&self, durable: &[DurableSlice]) -> Result<(), ScribeError> {
         let mut first_error = None;
         for slice in durable {

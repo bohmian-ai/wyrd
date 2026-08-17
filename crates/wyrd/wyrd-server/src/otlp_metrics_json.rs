@@ -22,7 +22,9 @@ use crate::otlp_json::{
 ///
 /// # Errors
 ///
-/// Returns a stable decode error for malformed or invalid protobuf-JSON input.
+/// Returns a stable decode error for malformed or invalid protobuf-JSON input,
+/// trailing input, or a preflight-versus-materialized retained-capacity
+/// mismatch.
 pub(crate) fn decode_metrics_json(
     input: &[u8],
     expected_decode_bytes: usize,

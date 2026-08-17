@@ -410,6 +410,11 @@ impl NativeSliceProducer {
     ///
     /// The same root continues to own the aliased bytes; this operation only
     /// replaces fixed decoder state and resets ordinals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] when the retained native schema
+    /// cannot be fed back into the alignment-enforcing decoder.
     pub(crate) fn restart(&mut self) -> Result<(), ScribeError> {
         self.decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
         feed_native_schema(&mut self.decoder, &self.source)?;

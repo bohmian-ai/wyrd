@@ -1100,6 +1100,12 @@ impl<'a> Point<'a> {
 }
 
 /// Validates point and exemplar invariants without allocation.
+///
+/// # Errors
+///
+/// Returns `()` for out-of-range timestamps, absent scalar values, malformed
+/// histogram buckets/quantiles, or invalid exemplar identifiers and filtered
+/// attributes.
 fn validate(point: Point<'_>) -> Result<(), ()> {
     if i64::try_from(point.time()).is_err()
         || matches!(point, Point::Gauge(v) | Point::Sum(v, ..) if v.value.is_none())
@@ -1187,6 +1193,11 @@ fn service_name(resource: &wyrd_tonic::otlp::metrics::v1::ResourceMetrics) -> &s
 }
 
 /// Counts one optional direct string.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the planned UTF-8 byte count
+/// overflows.
 fn count_text(plan: &mut TextCapacity, value: Option<&str>) -> Result<(), ScribeError> {
     match value {
         Some(v) => plan.bytes = add(plan.bytes, v.len())?,
@@ -1195,6 +1206,11 @@ fn count_text(plan: &mut TextCapacity, value: Option<&str>) -> Result<(), Scribe
     Ok(())
 }
 /// Counts one optional direct writer.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when `write` rejects the value or the
+/// resulting exact byte count overflows.
 fn count_writer(
     plan: &mut TextCapacity,
     present: bool,
@@ -1210,6 +1226,11 @@ fn count_writer(
     Ok(())
 }
 /// Counts one optional borrowed JSON value.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when JSON counting fails or the
+/// resulting exact byte count overflows.
 fn count_optional_writer<T: ?Sized>(
     plan: &mut TextCapacity,
     value: Option<&T>,
@@ -1223,6 +1244,11 @@ fn count_optional_writer<T: ?Sized>(
     }
 }
 /// Appends one optional JSON value.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when JSON writing fails or the
+/// materialized nullable-text storage diverges from its planned capacity.
 fn append_json<T: ?Sized>(
     column: &mut NullableText,
     value: Option<&T>,
@@ -1234,6 +1260,11 @@ fn append_json<T: ?Sized>(
     }
 }
 /// Writes any serde-compatible borrowed slice as compact JSON.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when compact JSON serialization or
+/// the destination writer fails.
 fn write_json<T: serde::Serialize + ?Sized>(
     writer: &mut impl Write,
     value: &T,
@@ -1241,6 +1272,11 @@ fn write_json<T: serde::Serialize + ?Sized>(
     serde_json::to_writer(writer, value).map_err(|_| ScribeError::InvalidFrame)
 }
 /// Writes exponential buckets in domain DTO field order.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the destination rejects bytes
+/// or a bucket field cannot be serialized.
 fn write_buckets(
     writer: &mut impl Write,
     value: &wyrd_tonic::otlp::metrics::v1::exponential_histogram_data_point::Buckets,
@@ -1258,6 +1294,11 @@ fn write_buckets(
         .map_err(|_| ScribeError::InvalidFrame)
 }
 /// Writes summary quantiles in domain DTO field order.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the destination rejects bytes
+/// or a quantile/value field cannot be serialized.
 fn write_quantiles(
     writer: &mut impl Write,
     values: &[wyrd_tonic::otlp::metrics::v1::summary_data_point::ValueAtQuantile],
@@ -1288,6 +1329,12 @@ fn write_quantiles(
         .map_err(|_| ScribeError::InvalidFrame)
 }
 /// Writes exemplars without an intermediate DTO vector.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for out-of-range exemplar timestamps,
+/// missing values, invalid identifiers/attributes, serialization failure, or
+/// destination-write failure.
 fn write_exemplars(writer: &mut impl Write, values: &[Exemplar]) -> Result<(), ScribeError> {
     writer
         .write_all(b"[")
@@ -1355,6 +1402,11 @@ fn write_exemplars(writer: &mut impl Write, values: &[Exemplar]) -> Result<(), S
         .map_err(|_| ScribeError::InvalidFrame)
 }
 /// Converts one accepted timestamp to Arrow microseconds.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the microsecond value exceeds
+/// the physical signed 64-bit range.
 fn nanos(value: u64) -> Result<i64, ScribeError> {
     i64::try_from(value / 1_000).map_err(|_| ScribeError::InvalidFrame)
 }
@@ -1406,6 +1458,10 @@ fn signed(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 /// Checked capacity addition.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the capacity sum overflows.
 fn add(left: usize, right: usize) -> Result<usize, ScribeError> {
     left.checked_add(right).ok_or(ScribeError::InvalidFrame)
 }

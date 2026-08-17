@@ -65,6 +65,13 @@ Evidence JSON also carries exact repository `origin`, `revision`, `package`, and
 require a source-bound planned path/name, a compilable existing package/target,
 a successful `--no-run` preflight, and a positive expected post-implementation
 selected count; they never fabricate a pre-implementation positive count.
+Non-test executable surfaces use `test_kind: command`. `selector` names the
+exact binary, Cargo registration, mise task, validator, or workflow and
+`test_path` names its owning entrypoint or registration file. Preflight may
+report zero when the command identity is planned-new, but acceptance runs an
+exact `mise`, `uv`, or `pnpm` command containing that identity. Command proofs
+are distinct from test proofs and cannot be replaced by enclosing library
+compilation.
 Every written path declares coverage identities consumed by one or more proofs.
 Multiple proofs may cover one AC, but every AC has proof and every affected
 package/target, manifest, mise task, binary registration, construction path,

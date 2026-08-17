@@ -133,11 +133,17 @@ Preflight each exact command locally and serially against the pinned revision.
 Capture command, output, exit status, and selected count in a digest-bound
 evidence JSON file bound to repository origin/revision and exact package/target.
 Each proof separately carries the exact post-implementation acceptance command
-that selects the named test with its wrapper, setup, features, lane, and
+that selects the named test or command identity with its wrapper, setup, features, lane, and
 `--ignored` behavior. Existing tests require a positive executed selection. A
 newly planned test declares `test_kind: new`, its exact path/name and expected
 post-implementation count, and preflights the existing package/target with
-`--no-run` and selected count zero; never fabricate a positive count. The
+`--no-run` and selected count zero; never fabricate a positive count. Non-test
+binary builds, Cargo registrations, mise entrypoints, validators, and
+executable workflows use `test_kind: command`: their selector is the exact
+binary/task/command identity, their preflight honestly records whether that
+identity exists at the pinned revision, and their acceptance command executes
+the exact resulting surface. Never claim an enclosing library test proves a
+binary `main`, manifest registration, mise task, or workflow. The
 manifest's zero-to-two Cargo lanes constrain execution
 only; they never authorize parallel preflight.
 For Postgres-backed acceptance, use only the audited repository wrapper form

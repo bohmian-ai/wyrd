@@ -247,7 +247,7 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
             if set(proof)!=required or proof.get("acceptance") not in task.get("acceptance",[]): errors.append(f"{tid} invalid proof schema")
             command=str(proof.get("preflight_command","")); acceptance_command=str(proof.get("acceptance_command","")); selector=str(proof.get("selector",""))
             kind=proof.get("test_kind")
-            if kind not in {"existing","new"} or not safe_path(str(proof.get("test_path",""))) or proof.get("test_name")!=selector or not isinstance(proof.get("expected_selected_count"),int) or proof.get("expected_selected_count",0)<=0: errors.append(f"{tid} invalid planned test identity")
+            if kind not in {"existing","new","command"} or not safe_path(str(proof.get("test_path",""))) or proof.get("test_name")!=selector or not isinstance(proof.get("expected_selected_count"),int) or proof.get("expected_selected_count",0)<=0: errors.append(f"{tid} invalid planned test identity")
             if not (command.startswith("mise ") or command.startswith("uv ") or command.startswith("pnpm ")): errors.append(f"{tid} command is not exact/auditable")
             if not audited_acceptance(acceptance_command,selector): errors.append(f"{tid} acceptance command must select named test through an audited lane")
             if proof.get("features") and not all(str(feature) in acceptance_command for feature in proof.get("features",[])): errors.append(f"{tid} acceptance command omits declared features")
@@ -256,13 +256,13 @@ def validate(plan_dir: Path, repo: Path) -> list[str]:
             if kind=="new" and "--no-run" not in command: errors.append(f"{tid} new-test preflight must compile with --no-run")
             test_at_source=git(repo,"show",f"{revision}:{proof.get('test_path','')}")
             if kind=="existing" and (test_at_source.returncode or selector.split("::")[-1] not in test_at_source.stdout): errors.append(f"{tid} existing test identity absent at source commit")
-            if kind=="new" and git(repo,"cat-file","-e",f"{revision}:{PurePosixPath(str(proof.get('test_path',''))).parent}").returncode: errors.append(f"{tid} planned test parent absent at source commit")
+            if kind in {"new","command"} and git(repo,"cat-file","-e",f"{revision}:{PurePosixPath(str(proof.get('test_path',''))).parent}").returncode: errors.append(f"{tid} planned test/command parent absent at source commit")
             pre=proof.get("preflight",{}); ep=plan_dir/str(pre.get("path",""))
             if not safe_path(str(pre.get("path",""))) or not ep.is_file() or sha256(ep)!=pre.get("digest"): errors.append(f"{tid} preflight evidence digest invalid"); continue
             try: evidence=json.loads(ep.read_text())
             except Exception: errors.append(f"{tid} preflight evidence invalid JSON"); continue
             base_valid=evidence.get("command")==command and evidence.get("exit_code")==0 and isinstance(evidence.get("selected_count"),int) and bool(str(evidence.get("output","")).strip()) and evidence.get("repository")=={"origin":origin,"revision":revision} and evidence.get("package")==proof.get("package") and evidence.get("target")==proof.get("target")
-            if not base_valid or (kind=="existing" and evidence.get("selected_count",0)<=0) or (kind=="new" and evidence.get("selected_count")!=0): errors.append(f"{tid} preflight evidence violates {kind}-test contract")
+            if not base_valid or (kind=="existing" and evidence.get("selected_count",0)<=0) or (kind=="new" and evidence.get("selected_count")!=0) or (kind=="command" and evidence.get("selected_count") not in {0,1}): errors.append(f"{tid} preflight evidence violates {kind}-proof contract")
         proof_acs=[p.get("acceptance") for p in task.get("proofs",[])]
         if set(proof_acs)!=set(task.get("acceptance",[])): errors.append(f"{tid} every acceptance criterion requires proof")
         required_coverage={value for item in task.get("write_set",[]) for value in item.get("coverage",[])}

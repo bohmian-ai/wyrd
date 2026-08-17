@@ -111,6 +111,15 @@ class Fixtures(unittest.TestCase):
         proof["acceptance_command"]="scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo test --locked -p owner --lib tests::owner_runs -- --exact'"
         self.write(); self.assertEqual([],self.errors())
 
+    def test_accepts_distinct_planned_command_proof(self)->None:
+        """Allow an exact planned executable proof without pretending it is a library test."""
+        proof=self.data["tasks"][0]["proofs"][0]
+        proof["test_kind"]="command"
+        proof["selector"]="owner-command"
+        proof["test_name"]="owner-command"
+        proof["acceptance_command"]="mise run owner-command"
+        self.write(); self.assertEqual([],self.errors())
+
     def test_rejects_unaudited_or_incomplete_postgres_wrapper(self)->None:
         """Reject wrapper payloads missing migration and the exact selector."""
         proof=self.data["tasks"][0]["proofs"][0]; proof["setup"]="scripts/postgres/with-test-postgres.sh"

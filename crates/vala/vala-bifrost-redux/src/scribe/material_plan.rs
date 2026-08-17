@@ -39,6 +39,8 @@ pub(crate) const MAX_OTLP_ATTRIBUTES: usize = 1_048_576;
 pub(crate) const MAX_OTLP_VALUE_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum nested OTLP value depth.
 pub(crate) const MAX_OTLP_VALUE_DEPTH: usize = 8;
+/// Maximum distinct event days in one request.
+pub(crate) const MAX_EVENT_DAYS: usize = 32;
 /// Maximum projected Arrow and IPC bytes in one request.
 pub(crate) const MAX_PROJECTED_BYTES: usize = 64 * 1024 * 1024;
 /// Fixed WAL header and digest workspace.
@@ -83,6 +85,10 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) source_count: usize,
     /// Total logical rows counted without materialization.
     pub(crate) rows: usize,
+    /// Sorted-free fixed set of OTLP event-day ordinals encountered by count pass.
+    pub(crate) event_days: [u64; MAX_EVENT_DAYS],
+    /// Live prefix length in `event_days`.
+    pub(crate) event_day_count: usize,
     /// Largest current-only decoded or projected source.
     pub(crate) current_material_bytes: usize,
     /// Aggregate native rows transferred into active memtable ownership.
@@ -229,6 +235,8 @@ impl ScribeIngressPlanner {
             sources,
             source_count: usize::from(rows != 0),
             rows,
+            event_days: [0; MAX_EVENT_DAYS],
+            event_day_count: 0,
             current_material_bytes,
             active_output_bytes: 0,
             wal_workspace_bytes: WAL_WORKSPACE_BYTES,
@@ -426,6 +434,8 @@ impl ScribeIngressPlanner {
             sources,
             source_count,
             rows,
+            event_days: [0; MAX_EVENT_DAYS],
+            event_day_count: 0,
             current_material_bytes,
             active_output_bytes,
             wal_workspace_bytes: WAL_WORKSPACE_BYTES,
@@ -464,6 +474,7 @@ impl ScribeIngressPlanner {
                 )?;
                 for span in &scope.spans {
                     counts.add_records(1)?;
+                    counts.add_event_time(span.start_time_unix_nano)?;
                     counts.add_bytes(span.name.len().saturating_add(span.trace_state.len()))?;
                     count_attributes(&span.attributes, &mut counts)?;
                     for event in &span.events {
@@ -539,6 +550,7 @@ impl ScribeIngressPlanner {
                         )?,
                         None => {}
                     }
+                    count_metric_days(metric, &mut counts)?;
                 }
             }
         }
@@ -575,6 +587,7 @@ impl ScribeIngressPlanner {
                 )?;
                 for record in &scope.log_records {
                     counts.add_records(1)?;
+                    counts.add_event_time(record.time_unix_nano)?;
                     counts.add_bytes(record.severity_text.len())?;
                     count_attributes(&record.attributes, &mut counts)?;
                     if let Some(body) = &record.body {
@@ -976,6 +989,10 @@ struct OtlpCounts {
     attributes: usize,
     /// Cumulative borrowed key/value/body bytes.
     value_bytes: usize,
+    /// Fixed set of nonzero Unix-day ordinals.
+    event_days: [u64; MAX_EVENT_DAYS],
+    /// Live prefix length in `event_days`.
+    event_day_count: usize,
 }
 
 impl OtlpCounts {
@@ -1043,6 +1060,28 @@ impl OtlpCounts {
         Ok(())
     }
 
+    /// Adds one nonzero Unix timestamp to the fixed distinct-day set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] when a request spans more than the
+    /// closed 32-day limit.
+    fn add_event_time(&mut self, unix_nanos: u64) -> Result<(), ScribeError> {
+        if unix_nanos == 0 {
+            return Ok(());
+        }
+        let day = unix_nanos / 86_400_000_000_000;
+        if self.event_days[..self.event_day_count].contains(&day) {
+            return Ok(());
+        }
+        if self.event_day_count == MAX_EVENT_DAYS {
+            return Err(ScribeError::InvalidFrame);
+        }
+        self.event_days[self.event_day_count] = day;
+        self.event_day_count += 1;
+        Ok(())
+    }
+
     /// Freezes counters into one conservative fixed-capacity material plan.
     ///
     /// # Errors
@@ -1090,6 +1129,8 @@ impl OtlpCounts {
             sources,
             source_count: usize::from(self.records != 0),
             rows: self.records,
+            event_days: self.event_days,
+            event_day_count: self.event_day_count,
             current_material_bytes: projected_floor,
             active_output_bytes: 0,
             wal_workspace_bytes: WAL_WORKSPACE_BYTES,
@@ -1097,6 +1138,46 @@ impl OtlpCounts {
         }
         .finish()
     }
+}
+
+/// Counts event days across the closed metric point variants.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the distinct-day cap is exceeded.
+fn count_metric_days(
+    metric: &wyrd_tonic::otlp::metrics::v1::Metric,
+    counts: &mut OtlpCounts,
+) -> Result<(), ScribeError> {
+    match metric.data.as_ref() {
+        Some(metric::Data::Gauge(value)) => {
+            for point in &value.data_points {
+                counts.add_event_time(point.time_unix_nano)?;
+            }
+        }
+        Some(metric::Data::Sum(value)) => {
+            for point in &value.data_points {
+                counts.add_event_time(point.time_unix_nano)?;
+            }
+        }
+        Some(metric::Data::Histogram(value)) => {
+            for point in &value.data_points {
+                counts.add_event_time(point.time_unix_nano)?;
+            }
+        }
+        Some(metric::Data::ExponentialHistogram(value)) => {
+            for point in &value.data_points {
+                counts.add_event_time(point.time_unix_nano)?;
+            }
+        }
+        Some(metric::Data::Summary(value)) => {
+            for point in &value.data_points {
+                counts.add_event_time(point.time_unix_nano)?;
+            }
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// Adds one bounded counter.

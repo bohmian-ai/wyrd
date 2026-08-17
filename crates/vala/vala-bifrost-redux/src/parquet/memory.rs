@@ -1177,8 +1177,10 @@ fn parquet_schema_elements(schema: &parquet::schema::types::Type) -> Result<usiz
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, StringArray, StringDictionaryBuilder, StructArray};
-    use arrow::datatypes::{DataType, Field, Int8Type, Schema};
+    use arrow::array::{
+        Int64Array, StringArray, StringDictionaryBuilder, StructArray, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int8Type, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -1636,6 +1638,48 @@ mod tests {
             )
             .is_err(),
             "caller schema mismatch must refuse"
+        );
+    }
+
+    /// Writer-v2 footer identity remains exact across UTC spelling aliases.
+    #[test]
+    fn bifrost_footer_fingerprint_does_not_alias_utc_spellings() {
+        let utc_schema = Arc::new(Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&utc_schema),
+            vec![Arc::new(
+                TimestampMicrosecondArray::from(vec![1]).with_timezone("UTC"),
+            )],
+        )
+        .expect("UTC writer-v2 batch");
+        let object = "tenants/test/table/day=2026-08-17/source.parquet";
+        let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, object)
+            .expect("UTC writer-v2 metadata");
+        let (_directory, footer) = footer_with_metadata(&batch, metadata);
+        let offset_schema = Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            false,
+        )]);
+
+        BifrostParquetMemoryEnvelope::from_footer(
+            footer.file_metadata(),
+            utc_schema.as_ref(),
+            object,
+        )
+        .expect("footer matches its exact source schema");
+        assert!(
+            BifrostParquetMemoryEnvelope::from_footer(
+                footer.file_metadata(),
+                &offset_schema,
+                object,
+            )
+            .is_err(),
+            "footer fingerprint must not alias a different Arrow schema spelling"
         );
     }
 

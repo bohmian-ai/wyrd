@@ -2593,9 +2593,10 @@ impl StagingParquetExec {
         let builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+        let source_schema = builder.schema();
         BifrostParquetMemoryEnvelope::from_footer(
             builder.metadata().file_metadata(),
-            self.schema.as_ref(),
+            source_schema.as_ref(),
             &file.object_path,
         )
         .map_err(|detail| {
@@ -2603,6 +2604,13 @@ impl StagingParquetExec {
                 detail,
             }))
         })?;
+        if !crate::catalog::schema_shape_matches(self.schema.as_ref(), source_schema.as_ref()) {
+            return Err(datafusion::error::DataFusionError::External(Box::new(
+                ForgeError::DataRefusal {
+                    detail: "writer-v2 source schema does not match the catalog schema".to_owned(),
+                },
+            )));
+        }
         validate_writer_v2_structure(builder.metadata())
             .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
         drop(footer_phase);

@@ -848,7 +848,12 @@ impl BifrostCatalog {
     }
 }
 
-fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
+/// Compares physical schema shapes across Arrow and Iceberg representations.
+///
+/// The sole spelling alias is the UTC timestamp timezone emitted as `UTC` by
+/// Arrow and `+00:00` by Iceberg. Field order, names, nullability, units, and
+/// every other data-type detail remain exact.
+pub(crate) fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
     expected.fields().len() == actual.fields().len()
         && expected
             .fields()
@@ -895,4 +900,46 @@ async fn acquire_table_advisory_lock(
         .map(|_| ())
         .map_err(vala_sql::SqlError::from)
         .map_err(BifrostCatalogError::Sql)
+}
+
+#[cfg(test)]
+mod schema_shape_tests {
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    use super::schema_shape_matches;
+
+    /// UTC and Iceberg's equivalent offset spelling have the same physical shape.
+    #[test]
+    fn schema_shape_accepts_utc_offset_alias() {
+        let utc = Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]);
+        let offset = Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            false,
+        )]);
+
+        assert!(schema_shape_matches(&utc, &offset));
+        assert!(schema_shape_matches(&offset, &utc));
+    }
+
+    /// A non-UTC timezone remains a different physical schema shape.
+    #[test]
+    fn schema_shape_rejects_non_utc_timezone() {
+        let utc = Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]);
+        let other = Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
+            false,
+        )]);
+
+        assert!(!schema_shape_matches(&utc, &other));
+    }
 }

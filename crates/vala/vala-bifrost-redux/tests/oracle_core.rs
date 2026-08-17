@@ -2568,7 +2568,11 @@ fn live_only_tail_directory(fixture: &OracleFixture) -> Arc<TailTransportDirecto
         )
         .expect("live append");
     let reader = Arc::new(ScribeTailReader::new(
-        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        Arc::new(FetchLiveTailService::new(
+            stream,
+            memtable,
+            vala_bifrost_redux::scribe::tail_resources_for_test(),
+        )),
         TailFenceConfig::default(),
     ));
     let tails = Arc::new(TailTransportDirectory::default());

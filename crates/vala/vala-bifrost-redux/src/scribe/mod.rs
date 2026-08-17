@@ -620,6 +620,17 @@ pub(crate) fn otlp_decode_owner_for_test(bytes: usize) -> crate::contracts::Otlp
     crate::contracts::OtlpDecodeOwner { memory }
 }
 
+/// Builds one production-shaped Scribe root for direct tail fixtures.
+///
+/// Integration tests pass this capability into the same fence owner used by
+/// production readers, so pre-materialization admission and terminal release
+/// cannot be bypassed by the direct-memtable adapter.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn tail_resources_for_test() -> crate::resources::ScribeResources {
+    embedded_scribe_resources(&AdmissionConfig::default())
+}
+
 impl ScribeImpl {
     /// Admits one native IPC fixture through the crate-private logical seam.
     ///
@@ -2724,6 +2735,7 @@ impl ScribeImpl {
         Ok(FetchLiveTailService::with_runtime(
             stream,
             Arc::clone(&self.shards),
+            self.memory.clone(),
         ))
     }
 

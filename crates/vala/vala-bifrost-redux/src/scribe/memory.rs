@@ -385,8 +385,11 @@ impl ScribeRejectionCeiling {
 /// Shared active/immutable ownership ledger for shard-owned Arrow buffers.
 #[derive(Debug, Clone)]
 pub struct ScribeOwnership {
+    /// Root-backed lease owning writable-generation Arrow bytes.
     active: Arc<Mutex<crate::resources::ScribeMemoryLease>>,
+    /// Root-backed lease owning frozen and replay-generation Arrow bytes.
     immutable: Arc<Mutex<crate::resources::ScribeMemoryLease>>,
+    /// Scalar observations emitted only after the corresponding lease transition.
     lifecycle: Arc<Mutex<ScribeGenerationLifecycleSnapshot>>,
 }
 
@@ -427,6 +430,12 @@ pub struct ScribeGenerationLifecycleSnapshot {
 
 impl ScribeOwnership {
     /// Create zero-sized active and immutable reservations on one governor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the shared Scribe root refuses
+    /// either zero-sized category lease, or [`ScribeError::Internal`] when root
+    /// accounting is poisoned and cannot issue a trustworthy owner.
     pub fn new(governor: &crate::resources::ScribeResources) -> Result<Self, ScribeError> {
         Ok(Self {
             active: Arc::new(Mutex::new(

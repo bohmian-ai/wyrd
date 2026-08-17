@@ -41,6 +41,12 @@ pub const REPLAY_BATCH_MEMORY_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMI
     + REPLAY_RECORD_OVERHEAD_BYTES
         * crate::gate::limits::BIFROST_NATIVE_SOURCE_LIMIT
         * crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
+/// Fixed number of terminal batch identities retained by one replay accumulator.
+///
+/// Each entry is preallocated and root-charged before replay begins. Reaching
+/// this bound refuses more terminal identities instead of growing the replay
+/// index or discarding the exact tenant-scoped identity needed to validate a
+/// duplicate COMMIT.
 const REPLAY_COMMITTED_IDENTITY_CAPACITY: usize = 4_096;
 
 /// Replayed state for one seal-key.
@@ -602,6 +608,11 @@ impl PendingBatch {
     }
 
     /// Returns the replay decode reservation owned by this pending slice set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when checked payload or aggregate
+    /// ownership arithmetic overflows.
     fn memory_bytes(&self) -> Result<usize, ScribeError> {
         self.slices.values().try_fold(0_usize, |bytes, slice| {
             let slice_bytes = slice

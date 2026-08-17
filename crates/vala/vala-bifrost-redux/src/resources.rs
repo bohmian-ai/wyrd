@@ -2655,6 +2655,25 @@ impl ScribeMemoryLease {
         self.bytes
     }
 
+    /// Returns unused bytes from a maintenance owner without reacquiring capacity.
+    ///
+    /// This is used after a configured-ceiling reservation has protected a
+    /// bounded materialization. The surviving owner retains only the exact
+    /// materialized live set and preserves its original root/category lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-plan error when `bytes` would grow the owner, or a
+    /// poison error when the root cannot reconcile the exact shrink.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) -> Result<(), BifrostResourceError> {
+        if bytes > self.bytes {
+            return Err(BifrostResourceError::InvalidPlan {
+                detail: "Scribe lease shrink target exceeds owned bytes".to_owned(),
+            });
+        }
+        self.resize_with_limit(bytes, None)
+    }
+
     /// Splits exact bytes into a second owner without new capacity admission.
     ///
     /// # Errors

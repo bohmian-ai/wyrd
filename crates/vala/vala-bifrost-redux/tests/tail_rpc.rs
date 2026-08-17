@@ -23,6 +23,11 @@ use wyrd_spec::vala::api::{
     TailPageRequest, TenantTableBinding as WireBinding,
 };
 
+/// Returns the production-shaped root capability used by direct tail fixtures.
+fn tail_resources() -> vala_bifrost_redux::resources::ScribeResources {
+    vala_bifrost_redux::scribe::tail_resources_for_test()
+}
+
 fn batch(tenant: DataTenantId, value: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("data_tenant_id", DataType::Utf8, false),
@@ -154,7 +159,11 @@ async fn page_continuation_is_row_precise() {
     append(&memtable, tenant, &table, 1, 1);
     append(&memtable, tenant, &table, 2, 2);
     let reader = ScribeTailReader::new(
-        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        Arc::new(FetchLiveTailService::new(
+            stream,
+            memtable,
+            tail_resources(),
+        )),
         TailFenceConfig::default(),
     );
     let fence = reader
@@ -191,7 +200,11 @@ async fn capacity_rejection_leaves_no_fence() {
     let (memtable, stream, tenant, table, binding) = setup();
     append(&memtable, tenant, &table, 1, 1);
     let reader = ScribeTailReader::new(
-        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        Arc::new(FetchLiveTailService::new(
+            stream,
+            memtable,
+            tail_resources(),
+        )),
         TailFenceConfig {
             max_fences: 1,
             ..TailFenceConfig::default()
@@ -226,8 +239,14 @@ async fn capacity_rejection_leaves_no_fence() {
 async fn release_and_expiry_race_reclaims_once() {
     let (memtable, stream, tenant, table, binding) = setup();
     append(&memtable, tenant, &table, 1, 1);
+    let resources = tail_resources();
+    let baseline = resources.snapshot().expect("baseline Scribe root snapshot");
     let reader = ScribeTailReader::new(
-        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        Arc::new(FetchLiveTailService::new(
+            stream,
+            memtable,
+            resources.clone(),
+        )),
         TailFenceConfig {
             ttl: StdDuration::from_millis(1),
             ..TailFenceConfig::default()
@@ -237,8 +256,22 @@ async fn release_and_expiry_race_reclaims_once() {
         .acquire_fence(fence_request(&binding, stream))
         .await
         .expect("fence acquires");
+    assert!(
+        resources
+            .snapshot()
+            .expect("retained-fence root snapshot")
+            .scribe_memory_used_bytes
+            > baseline.scribe_memory_used_bytes
+    );
     let expiry = reader.expire_due(Instant::now() + StdDuration::from_secs(1), 1);
     assert_eq!(expiry.released, 1);
+    assert_eq!(
+        resources
+            .snapshot()
+            .expect("expired-fence root snapshot")
+            .scribe_memory_used_bytes,
+        baseline.scribe_memory_used_bytes
+    );
     assert!(
         !reader
             .release_fence(fence.fence_id)
@@ -253,7 +286,11 @@ async fn single_oversize_row_fails_empty() {
     let (memtable, stream, tenant, table, binding) = setup();
     append(&memtable, tenant, &table, 1, 1);
     let reader = ScribeTailReader::new(
-        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        Arc::new(FetchLiveTailService::new(
+            stream,
+            memtable,
+            tail_resources(),
+        )),
         TailFenceConfig {
             max_page_encoded_bytes: 1,
             ..TailFenceConfig::default()
@@ -287,8 +324,14 @@ async fn seal_and_rotation_preserve_fence() {
     let (memtable, stream, tenant, table, binding) = setup();
     append(&memtable, tenant, &table, 1, 1);
     append(&memtable, tenant, &table, 2, 2);
+    let resources = tail_resources();
+    let baseline = resources.snapshot().expect("baseline Scribe root snapshot");
     let reader = ScribeTailReader::new(
-        Arc::new(FetchLiveTailService::new(stream, Arc::clone(&memtable))),
+        Arc::new(FetchLiveTailService::new(
+            stream,
+            Arc::clone(&memtable),
+            resources.clone(),
+        )),
         TailFenceConfig::default(),
     );
     let fence = reader
@@ -333,6 +376,13 @@ async fn seal_and_rotation_preserve_fence() {
         .sweep_once()
         .expect("committed generation retires from the memtable");
     assert_eq!(retired.len(), 1);
+    let retained = resources
+        .snapshot()
+        .expect("retained-fence root snapshot after source retirement");
+    assert!(
+        retained.scribe_memory_used_bytes > baseline.scribe_memory_used_bytes,
+        "source retirement cannot make the fence-held Arrow handles ownerless"
+    );
 
     let second = reader
         .read_page(&TailPageRequest {
@@ -351,5 +401,12 @@ async fn seal_and_rotation_preserve_fence() {
             .release_fence(fence.fence_id)
             .expect("release reclaims retained shallow handles")
             .released
+    );
+    assert_eq!(
+        resources
+            .snapshot()
+            .expect("released-fence root snapshot")
+            .scribe_memory_used_bytes,
+        baseline.scribe_memory_used_bytes
     );
 }

@@ -361,7 +361,7 @@ mod pg_tests {
                 .await
                 .expect("audit count");
         assert_eq!(file_count, 1);
-        assert_eq!(audit_count, 1);
+        assert_eq!(audit_count, 2);
         let objects = operator
             .list(&format!("tenants/{tenant}/"))
             .await
@@ -431,7 +431,7 @@ mod pg_tests {
                 .fetch_one(&fixture.superuser_pool().await.expect("superuser pool"))
                 .await
                 .expect("audit count");
-        assert_eq!(audit_count, 1);
+        assert_eq!(audit_count, 2);
     }
 
     /// Proves the caller-owned seal driver emits writer-v2 at the 832 MiB floor.
@@ -606,12 +606,13 @@ mod pg_tests {
         assert!(footer_bytes <= 8 * 1024 * 1024);
     }
 
+    /// Persists exactly one canonical ingest audit for each accepted append.
     #[tokio::test]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
         let (fixture, tenant, scribe, _operator) = setup().await;
         let base_time = Utc::now().timestamp_micros();
         for i in 0..3 {
-            let batch = make_batch(1000, base_time + (i * 1_000_000));
+            let batch = make_batch(100, base_time + (i * 1_000_000));
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7());
             let fingerprint = schema_fingerprint(&batch);
@@ -819,6 +820,7 @@ mod pg_tests {
         assert!(rows.iter().all(|row| objects.contains(&row.2)));
     }
 
+    /// A rolled-back seal publishes neither a file nor a visibility audit.
     #[tokio::test]
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
         let (fixture, tenant, scribe, _operator) = setup().await;
@@ -859,15 +861,24 @@ mod pg_tests {
         .fetch_one(&mut **tx)
         .await
         .expect("file count");
-        let audit_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource LIKE $2",
+        let publication_audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = $2",
         )
         .bind(tenant.as_uuid())
-        .bind("%events%")
+        .bind("bifrost.scribe.visibility.publish")
         .fetch_one(&mut **tx)
         .await
-        .expect("audit count");
+        .expect("publication audit count");
+        let ingest_audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind("bifrost.append")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("ingest audit count");
         assert_eq!(file_count, 0);
-        assert_eq!(audit_count, 0);
+        assert_eq!(publication_audit_count, 0);
+        assert_eq!(ingest_audit_count, 1);
     }
 }

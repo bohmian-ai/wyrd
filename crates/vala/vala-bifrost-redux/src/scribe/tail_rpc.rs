@@ -30,6 +30,16 @@ use crate::scribe::wal::WalLsn;
 /// The only tail protocol revision understood by the Scribe v1 reader.
 pub const TAIL_PROTOCOL_VERSION: u16 = 1;
 
+/// Simultaneous descriptor backing reserved for each planned hot batch.
+///
+/// A shard result vector coexists with the runtime's merged hot vector; the
+/// merged vector later coexists with its retained-fence replacement. The
+/// larger of those two second vectors is charged with the hot source layout
+/// before any descriptor vector is allocated.
+const TAIL_BATCH_DESCRIPTOR_BYTES: usize = std::mem::size_of::<HotBatch>() * 2;
+/// Ensures the charged second hot vector also covers its retained replacement.
+const _: () = assert!(std::mem::size_of::<HotBatch>() >= std::mem::size_of::<RetainedBatch>());
+
 /// Operation audience carried by a private Scribe-tail ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailTicketAudience {
@@ -1294,6 +1304,13 @@ pub fn encode_tail_batch_exact(
     })
 }
 
+/// Bounded owner of pending and retained live-tail fences.
+///
+/// A pending slot excludes both its configured payload ceiling and its
+/// root-backed lease before materialization. Successful acquisition atomically
+/// moves that lease into `retained`; cancellation returns the pending slot and
+/// lease once. `retained_bytes` is an admission fact only—the lease stored by
+/// each [`RetainedFence`] is the authoritative owner through release or expiry.
 #[derive(Debug)]
 struct FenceRegistry {
     /// Fences currently retaining shallow Scribe Arrow arrays.
@@ -1303,6 +1320,10 @@ struct FenceRegistry {
     released: HashMap<tail::TailFenceId, (Instant, tail::TailReadFence)>,
     /// Aggregate Arrow array bytes retained by every live fence.
     retained_bytes: usize,
+    /// Fence acquisitions that own a slot while materialization is in flight.
+    pending_fences: usize,
+    /// Aggregate payload ceiling reserved by in-flight acquisitions.
+    pending_payload_bytes: usize,
     /// Fixed scalar lifecycle observations emitted by this enforcing registry.
     lifecycle: TailOwnershipSnapshot,
 }
@@ -1336,6 +1357,7 @@ pub struct TailOwnershipSnapshot {
     pub active_reserved_bytes: usize,
 }
 
+/// One retained fence together with its sole root-backed capacity owner.
 #[derive(Debug)]
 struct RetainedFence {
     /// Immutable metadata returned by this fence acquisition.
@@ -1346,6 +1368,25 @@ struct RetainedFence {
     batches: Vec<RetainedBatch>,
     /// Bytes charged to this fence when releasing registry capacity.
     retained_bytes: usize,
+    /// Sole root-backed capacity owner retained with the shallow snapshot.
+    owner: crate::resources::ScribeMemoryLease,
+}
+
+/// Cancellation-safe pre-material fence slot and root-backed capacity owner.
+///
+/// The reservation is created under the fence registry lock before any shard
+/// snapshot descriptor or Arrow handle is materialized. Dropping it before
+/// transfer returns the pending slot, payload ceiling, and root lease exactly
+/// once; successful transfer moves the lease into [`RetainedFence`].
+struct PendingFence<'a> {
+    /// Reader whose registry owns this pending slot.
+    reader: &'a ScribeTailReader,
+    /// Root-backed configured-ceiling reservation protecting materialization.
+    owner: Option<crate::resources::ScribeMemoryLease>,
+    /// Aggregate Arrow payload ceiling excluded from concurrent acquisitions.
+    payload_limit: usize,
+    /// Whether a snapshot completed and the lease was shrunk to its live set.
+    materialized: bool,
 }
 
 #[derive(Debug)]
@@ -1356,6 +1397,163 @@ struct RetainedBatch {
     batch_id: uuid::Uuid,
     /// Shared Arrow arrays retained without copying row payloads.
     rows: Arc<arrow::record_batch::RecordBatch>,
+}
+
+impl PendingFence<'_> {
+    /// Records a completed snapshot and shrinks its ceiling owner to the live set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TailReadError::Capacity`] when the materialized payload exceeds
+    /// the pre-admitted payload ceiling, or [`TailReadError::State`] when exact
+    /// descriptor arithmetic, root shrink, or registry accounting fails.
+    fn materialized(
+        &mut self,
+        payload_bytes: usize,
+        descriptor_bytes: usize,
+    ) -> Result<(), TailReadError> {
+        if payload_bytes > self.payload_limit {
+            return Err(TailReadError::Capacity);
+        }
+        let live_bytes =
+            payload_bytes
+                .checked_add(descriptor_bytes)
+                .ok_or_else(|| TailReadError::State {
+                    detail: "tail fence live owner byte count overflow".to_owned(),
+                })?;
+        let owner = self.owner.as_mut().ok_or_else(|| TailReadError::State {
+            detail: "tail fence reservation lost its root owner".to_owned(),
+        })?;
+        let released =
+            owner
+                .bytes()
+                .checked_sub(live_bytes)
+                .ok_or_else(|| TailReadError::State {
+                    detail: "tail fence materialization exceeded its root owner".to_owned(),
+                })?;
+        owner
+            .shrink_to(live_bytes)
+            .map_err(|error| TailReadError::State {
+                detail: format!("tail fence owner shrink failed: {error}"),
+            })?;
+        let mut registry = self
+            .reader
+            .fences
+            .lock()
+            .map_err(|error| TailReadError::State {
+                detail: format!("tail fence registry lock poisoned: {error}"),
+            })?;
+        registry.lifecycle.materializations = registry.lifecycle.materializations.saturating_add(1);
+        registry.lifecycle.materialized_bytes = registry
+            .lifecycle
+            .materialized_bytes
+            .saturating_add(live_bytes);
+        registry.lifecycle.released_bytes =
+            registry.lifecycle.released_bytes.saturating_add(released);
+        registry.lifecycle.active_reserved_bytes = registry
+            .lifecycle
+            .active_reserved_bytes
+            .saturating_sub(released);
+        self.materialized = true;
+        Ok(())
+    }
+
+    /// Transfers this pending slot and its root owner into the retained registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TailReadError::State`] when materialization did not complete,
+    /// the registry lock is poisoned, or pending accounting diverges.
+    fn retain(
+        mut self,
+        fence: tail::TailReadFence,
+        batches: Vec<RetainedBatch>,
+        ttl: Duration,
+        payload_bytes: usize,
+    ) -> Result<tail::TailReadFence, TailReadError> {
+        if !self.materialized {
+            return Err(TailReadError::State {
+                detail: "tail fence cannot retain an unmaterialized reservation".to_owned(),
+            });
+        }
+        let mut registry = self
+            .reader
+            .fences
+            .lock()
+            .map_err(|error| TailReadError::State {
+                detail: format!("tail fence registry lock poisoned: {error}"),
+            })?;
+        let pending_fences =
+            registry
+                .pending_fences
+                .checked_sub(1)
+                .ok_or_else(|| TailReadError::State {
+                    detail: "tail pending fence count underflow".to_owned(),
+                })?;
+        let pending_payload_bytes = registry
+            .pending_payload_bytes
+            .checked_sub(self.payload_limit)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail pending payload bytes underflow".to_owned(),
+            })?;
+        let retained_bytes = registry
+            .retained_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail retained payload byte count overflow".to_owned(),
+            })?;
+        if registry.retained.contains_key(&fence.fence_id) {
+            return Err(TailReadError::State {
+                detail: "tail fence identity collision".to_owned(),
+            });
+        }
+        let owner = self.owner.take().ok_or_else(|| TailReadError::State {
+            detail: "tail fence reservation lost its root owner".to_owned(),
+        })?;
+        registry.pending_fences = pending_fences;
+        registry.pending_payload_bytes = pending_payload_bytes;
+        registry.retained_bytes = retained_bytes;
+        registry.retained.insert(
+            fence.fence_id,
+            RetainedFence {
+                fence: fence.clone(),
+                expires_at: Instant::now() + ttl,
+                batches,
+                retained_bytes: payload_bytes,
+                owner,
+            },
+        );
+        metrics::counter!("bifrost_tail_fences_total", "outcome" => "acquired").increment(1);
+        Ok(fence)
+    }
+}
+
+impl Drop for PendingFence<'_> {
+    /// Returns an untransferred pending slot and root owner exactly once.
+    fn drop(&mut self) {
+        let Some(owner) = self.owner.take() else {
+            return;
+        };
+        let owner_bytes = owner.bytes();
+        if let Ok(mut registry) = self.reader.fences.lock() {
+            registry.pending_fences = registry.pending_fences.saturating_sub(1);
+            registry.pending_payload_bytes = registry
+                .pending_payload_bytes
+                .saturating_sub(self.payload_limit);
+            registry.lifecycle.releases = registry.lifecycle.releases.saturating_add(1);
+            registry.lifecycle.released_bytes = registry
+                .lifecycle
+                .released_bytes
+                .saturating_add(owner_bytes);
+            registry.lifecycle.active_reservations =
+                registry.lifecycle.active_reservations.saturating_sub(1);
+            registry.lifecycle.active_reserved_bytes = registry
+                .lifecycle
+                .active_reserved_bytes
+                .saturating_sub(owner_bytes);
+        }
+        drop(owner);
+    }
 }
 
 impl ScribeTailReader {
@@ -1377,6 +1575,8 @@ impl ScribeTailReader {
                 retained: HashMap::with_capacity(max_fences),
                 released: HashMap::with_capacity(tombstone_capacity),
                 retained_bytes: 0,
+                pending_fences: 0,
+                pending_payload_bytes: 0,
                 lifecycle: TailOwnershipSnapshot::default(),
             }),
         }
@@ -1502,8 +1702,10 @@ impl ScribeTailReader {
 
     /// Acquires metadata for one exact `(exclusive, inclusive]` shallow interval.
     ///
-    /// The source snapshot is taken before retention capacity is reserved, so a
-    /// rejected capacity request cannot create a partial fence or leak retained rows.
+    /// A pending registry slot and root-backed configured ceiling are acquired
+    /// before the shard request can allocate snapshot descriptors or shallow
+    /// Arrow handles. Cancellation moves through the pending owner's `Drop`,
+    /// while success transfers the same owner into the retained fence.
     ///
     /// # Errors
     ///
@@ -1538,6 +1740,7 @@ impl ScribeTailReader {
         if request.exclusive_sealed.writer_epoch != stream_epoch {
             return Err(TailReadError::WriterEpochMismatch);
         }
+        let mut pending = self.reserve_pending_fence()?;
         let hot = self
             .source
             .fetch_hot_batches(FetchLiveTailRequest {
@@ -1548,7 +1751,7 @@ impl ScribeTailReader {
                 after_lsn: WalLsn::ZERO,
                 required_columns: Vec::new(),
                 max_batches: self.config.max_page_rows as usize,
-                max_retained_bytes: self.config.max_retained_bytes,
+                max_retained_bytes: pending.payload_limit,
             })
             .await
             .map_err(|error| TailReadError::State {
@@ -1574,6 +1777,13 @@ impl ScribeTailReader {
                     detail: "tail fence retained byte count overflow".to_owned(),
                 })
         })?;
+        let descriptor_bytes = batches
+            .capacity()
+            .checked_mul(std::mem::size_of::<RetainedBatch>())
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail retained descriptor byte count overflow".to_owned(),
+            })?;
+        pending.materialized(retained_bytes, descriptor_bytes)?;
         let expires_at =
             now + chrono::Duration::from_std(ttl).map_err(|_| TailReadError::DeadlineElapsed)?;
         let fence = tail::TailReadFence {
@@ -1590,71 +1800,102 @@ impl ScribeTailReader {
             tail_protocol_version: TAIL_PROTOCOL_VERSION,
             expires_at,
         };
-        self.retain_fence(fence, batches, ttl, retained_bytes)
+        pending.retain(fence, batches, ttl, retained_bytes)
     }
 
-    /// Reserves registry capacity and transfers one prepared snapshot into a fence.
+    /// Reserves one bounded registry slot and root-backed materialization ceiling.
     ///
     /// # Errors
     ///
-    /// Returns [`TailReadError::Capacity`] when the fixed fence or retained-byte
-    /// ceiling is exhausted, or [`TailReadError::State`] when the registry lock
-    /// is poisoned.
-    fn retain_fence(
-        &self,
-        fence: tail::TailReadFence,
-        batches: Vec<RetainedBatch>,
-        ttl: Duration,
-        retained_bytes: usize,
-    ) -> Result<tail::TailReadFence, TailReadError> {
+    /// Returns [`TailReadError::Capacity`] before materialization when the fixed
+    /// fence/aggregate payload ceiling is exhausted or the Scribe root refuses
+    /// the complete payload-plus-descriptor ceiling. Returns
+    /// [`TailReadError::State`] when checked arithmetic or the registry lock
+    /// fails.
+    fn reserve_pending_fence(&self) -> Result<PendingFence<'_>, TailReadError> {
         let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
             detail: format!("tail fence registry lock poisoned: {error}"),
         })?;
         Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
-        registry.lifecycle.plans = registry.lifecycle.plans.saturating_add(1);
-        registry.lifecycle.planned_bytes = registry
-            .lifecycle
-            .planned_bytes
-            .saturating_add(retained_bytes);
-        // Live admission is bounded by retained fences only. Release tombstones
-        // exist solely to make duplicate release idempotent for the original TTL.
-        let next_retained_bytes = registry
-            .retained_bytes
-            .checked_add(retained_bytes)
-            .ok_or(TailReadError::Capacity)?;
-        if registry.retained.len() >= self.config.max_fences
-            || next_retained_bytes > self.config.max_retained_bytes
+        if registry
+            .retained
+            .len()
+            .checked_add(registry.pending_fences)
+            .is_none_or(|count| count >= self.config.max_fences)
         {
             return Err(TailReadError::Capacity);
         }
-        registry.retained_bytes = next_retained_bytes;
+        let committed_payload = registry
+            .retained_bytes
+            .checked_add(registry.pending_payload_bytes)
+            .ok_or(TailReadError::Capacity)?;
+        let configured_payload_limit = self
+            .config
+            .max_retained_bytes
+            .checked_sub(committed_payload)
+            .filter(|bytes| *bytes > 0)
+            .ok_or(TailReadError::Capacity)?;
+        let descriptor_bytes = (self.config.max_page_rows as usize)
+            .checked_mul(TAIL_BATCH_DESCRIPTOR_BYTES)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail descriptor reservation byte count overflow".to_owned(),
+            })?;
+        let available_bytes = self.source.available_fence_bytes()?;
+        let available_payload = available_bytes
+            .checked_sub(descriptor_bytes)
+            .filter(|bytes| *bytes > 0)
+            .ok_or(TailReadError::Capacity)?;
+        let payload_limit = configured_payload_limit.min(available_payload);
+        let owner_bytes =
+            payload_limit
+                .checked_add(descriptor_bytes)
+                .ok_or_else(|| TailReadError::State {
+                    detail: "tail fence owner byte count overflow".to_owned(),
+                })?;
+        let pending_fences =
+            registry
+                .pending_fences
+                .checked_add(1)
+                .ok_or_else(|| TailReadError::State {
+                    detail: "tail pending fence count overflow".to_owned(),
+                })?;
+        let pending_payload_bytes = registry
+            .pending_payload_bytes
+            .checked_add(payload_limit)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail pending payload byte count overflow".to_owned(),
+            })?;
+        let owner = self
+            .source
+            .reserve_fence_owner(owner_bytes)
+            .map_err(|error| match error {
+                ScribeError::IngestBusy { .. } => TailReadError::Capacity,
+                other => TailReadError::State {
+                    detail: other.to_string(),
+                },
+            })?;
+        registry.lifecycle.plans = registry.lifecycle.plans.saturating_add(1);
+        registry.lifecycle.planned_bytes =
+            registry.lifecycle.planned_bytes.saturating_add(owner_bytes);
         registry.lifecycle.reservations = registry.lifecycle.reservations.saturating_add(1);
         registry.lifecycle.reserved_bytes = registry
             .lifecycle
             .reserved_bytes
-            .saturating_add(retained_bytes);
-        registry.lifecycle.materializations = registry.lifecycle.materializations.saturating_add(1);
-        registry.lifecycle.materialized_bytes = registry
-            .lifecycle
-            .materialized_bytes
-            .saturating_add(retained_bytes);
+            .saturating_add(owner_bytes);
         registry.lifecycle.active_reservations =
             registry.lifecycle.active_reservations.saturating_add(1);
         registry.lifecycle.active_reserved_bytes = registry
             .lifecycle
             .active_reserved_bytes
-            .saturating_add(retained_bytes);
-        registry.retained.insert(
-            fence.fence_id,
-            RetainedFence {
-                fence: fence.clone(),
-                expires_at: Instant::now() + ttl,
-                batches,
-                retained_bytes,
-            },
-        );
-        metrics::counter!("bifrost_tail_fences_total", "outcome" => "acquired").increment(1);
-        Ok(fence)
+            .saturating_add(owner_bytes);
+        registry.pending_fences = pending_fences;
+        registry.pending_payload_bytes = pending_payload_bytes;
+        Ok(PendingFence {
+            reader: self,
+            owner: Some(owner),
+            payload_limit,
+            materialized: false,
+        })
     }
 
     /// Reads one row-precise shallow page from a retained fence.
@@ -1852,6 +2093,7 @@ impl ScribeTailReader {
             .retained
             .remove(&fence_id)
             .expect("retained fence remains present while registry lock is held");
+        let owner_bytes = retained.owner.bytes();
         registry.retained_bytes = registry
             .retained_bytes
             .saturating_sub(retained.retained_bytes);
@@ -1859,13 +2101,13 @@ impl ScribeTailReader {
         registry.lifecycle.released_bytes = registry
             .lifecycle
             .released_bytes
-            .saturating_add(retained.retained_bytes);
+            .saturating_add(owner_bytes);
         registry.lifecycle.active_reservations =
             registry.lifecycle.active_reservations.saturating_sub(1);
         registry.lifecycle.active_reserved_bytes = registry
             .lifecycle
             .active_reserved_bytes
-            .saturating_sub(retained.retained_bytes);
+            .saturating_sub(owner_bytes);
         // Tombstones no longer bound live admission, so cap the map purely as a
         // memory backstop at `max_fences * 4`. At capacity, evict the entry with
         // the earliest `expires_at` (the soonest to be purged anyway) via a linear
@@ -1918,6 +2160,7 @@ impl ScribeTailReader {
             .collect::<Vec<_>>();
         for fence_id in &expired {
             if let Some(retained) = registry.retained.remove(fence_id) {
+                let owner_bytes = retained.owner.bytes();
                 registry.retained_bytes = registry
                     .retained_bytes
                     .saturating_sub(retained.retained_bytes);
@@ -1925,13 +2168,13 @@ impl ScribeTailReader {
                 registry.lifecycle.released_bytes = registry
                     .lifecycle
                     .released_bytes
-                    .saturating_add(retained.retained_bytes);
+                    .saturating_add(owner_bytes);
                 registry.lifecycle.active_reservations =
                     registry.lifecycle.active_reservations.saturating_sub(1);
                 registry.lifecycle.active_reserved_bytes = registry
                     .lifecycle
                     .active_reserved_bytes
-                    .saturating_sub(retained.retained_bytes);
+                    .saturating_sub(owner_bytes);
             }
         }
         let expired_tombstones = registry
@@ -2010,8 +2253,13 @@ pub struct HotBatch {
 /// Pod-local live-tail service over the Scribe memtable.
 #[derive(Debug)]
 pub struct FetchLiveTailService {
+    /// Existing Scribe root capability used for authoritative fence ownership.
+    resources: crate::resources::ScribeResources,
+    /// Exact pod-local WAL stream incarnation served by this source.
     stream: StreamIdentity,
+    /// Direct in-process memtable used only by narrow fixtures.
     memtable: Option<Arc<Memtable>>,
+    /// Production shard runtime that owns live generation state.
     shards: Option<Arc<ScribeShardRuntime>>,
 }
 
@@ -2022,8 +2270,13 @@ impl FetchLiveTailService {
     /// unit tests; production readers submit shard snapshots through
     /// `FetchLiveTailService::with_runtime`.
     #[must_use]
-    pub fn new(stream: StreamIdentity, memtable: Arc<Memtable>) -> Self {
+    pub fn new(
+        stream: StreamIdentity,
+        memtable: Arc<Memtable>,
+        resources: crate::resources::ScribeResources,
+    ) -> Self {
         Self {
+            resources,
             stream,
             memtable: Some(memtable),
             shards: None,
@@ -2033,8 +2286,13 @@ impl FetchLiveTailService {
     /// Construct a production reader that submits snapshots to the owning
     /// shard command queue instead of traversing Scribe state directly.
     #[must_use]
-    pub(crate) fn with_runtime(stream: StreamIdentity, shards: Arc<ScribeShardRuntime>) -> Self {
+    pub(crate) fn with_runtime(
+        stream: StreamIdentity,
+        shards: Arc<ScribeShardRuntime>,
+        resources: crate::resources::ScribeResources,
+    ) -> Self {
         Self {
+            resources,
             stream,
             memtable: None,
             shards: Some(shards),
@@ -2045,6 +2303,55 @@ impl FetchLiveTailService {
     #[must_use]
     pub fn stream(&self) -> StreamIdentity {
         self.stream
+    }
+
+    /// Acquires one root-backed fence owner before snapshot materialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable Scribe capacity/internal error when the existing
+    /// process root cannot admit the configured materialization ceiling.
+    fn reserve_fence_owner(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
+        self.resources
+            .try_reserve_maintenance(crate::scribe::memory::MemoryCategory::Immutable, bytes)
+    }
+
+    /// Returns the capacity the existing Scribe root can assign to a fence now.
+    ///
+    /// The value includes unused protected-floor bytes and currently free
+    /// elastic bytes. It is only a planning ceiling: the subsequent root
+    /// reservation remains authoritative if another owner races this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TailReadError::State`] when the shared root cannot provide a
+    /// trustworthy snapshot or the free-capacity arithmetic overflows.
+    fn available_fence_bytes(&self) -> Result<usize, TailReadError> {
+        let snapshot = self
+            .resources
+            .snapshot()
+            .map_err(|error| TailReadError::State {
+                detail: format!("tail fence root snapshot failed: {error}"),
+            })?;
+        let free_floor = snapshot
+            .plan
+            .scribe_floor_bytes
+            .saturating_sub(snapshot.scribe_memory_used_bytes);
+        let free_elastic = snapshot
+            .plan
+            .elastic_memory_bytes
+            .checked_sub(snapshot.elastic_memory_used_bytes)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail fence root elastic ownership exceeds its plan".to_owned(),
+            })?;
+        free_floor
+            .checked_add(free_elastic)
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail fence free-capacity arithmetic overflow".to_owned(),
+            })
     }
 
     /// Lists the tenant-owned table/day scopes that still have live Scribe
@@ -2149,6 +2456,11 @@ mod tests {
         TenantTableBinding,
     };
 
+    /// Builds one production-shaped Scribe root for direct tail-reader tests.
+    fn tail_resources() -> crate::resources::ScribeResources {
+        crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default())
+    }
+
     /// Builds one valid empty-interval request for opportunistic registry tests.
     fn empty_fence_request(tenant: DataTenantId) -> AcquireTailFenceRequest {
         AcquireTailFenceRequest {
@@ -2241,7 +2553,11 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let reader = Arc::new(ScribeTailReader::new(
-            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                tail_resources(),
+            )),
             TailFenceConfig::default(),
         ));
         let claims = TailTicketClaims {
@@ -2326,7 +2642,11 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let reader = ScribeTailReader::new(
-            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                tail_resources(),
+            )),
             TailFenceConfig {
                 max_fences: 1,
                 ..TailFenceConfig::default()
@@ -2363,7 +2683,11 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let reader = ScribeTailReader::new(
-            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                tail_resources(),
+            )),
             TailFenceConfig::default(),
         );
         let fence = reader
@@ -2378,7 +2702,11 @@ mod tests {
         assert_eq!(active.materializations, 1);
         assert_eq!(active.releases, 0);
         assert_eq!(active.active_reservations, 1);
-        assert_eq!(active.active_reserved_bytes, 0);
+        assert_eq!(
+            active.active_reserved_bytes, active.materialized_bytes,
+            "the retained descriptor backing remains root-owned even for an empty fence"
+        );
+        assert!(active.active_reserved_bytes > 0);
 
         reader
             .release_fence(fence.fence_id)
@@ -2393,6 +2721,72 @@ mod tests {
         assert_eq!(released.reserved_bytes, released.released_bytes);
     }
 
+    /// Refuses a concurrent fence before materialization and settles cancellation once.
+    #[tokio::test]
+    async fn pending_fence_bounds_concurrency_and_cancellation() {
+        let tenant = DataTenantId::new_v7();
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let resources = tail_resources();
+        let reader = ScribeTailReader::new(
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                resources.clone(),
+            )),
+            TailFenceConfig {
+                max_fences: 1,
+                ..TailFenceConfig::default()
+            },
+        );
+        let baseline = resources.snapshot().expect("baseline root snapshot");
+        let pending = reader
+            .reserve_pending_fence()
+            .expect("first acquisition owns the only fence slot");
+        assert!(matches!(
+            reader.acquire_fence(empty_fence_request(tenant)).await,
+            Err(TailReadError::Capacity)
+        ));
+        let before_materialization = reader
+            .ownership_snapshot_for_test()
+            .expect("pending ownership snapshot");
+        assert_eq!(before_materialization.reservations, 1);
+        assert_eq!(before_materialization.materializations, 0);
+        assert_eq!(before_materialization.active_reservations, 1);
+        assert!(before_materialization.active_reserved_bytes > 0);
+        drop(pending);
+        let cancelled_before = reader
+            .ownership_snapshot_for_test()
+            .expect("pre-material cancellation snapshot");
+        assert_eq!(cancelled_before.releases, 1);
+        assert_eq!(cancelled_before.materializations, 0);
+        assert_eq!(cancelled_before.active_reservations, 0);
+
+        let mut pending = reader
+            .reserve_pending_fence()
+            .expect("a settled cancellation returns the slot");
+
+        pending
+            .materialized(0, 0)
+            .expect("empty materialization shrinks to no live bytes");
+        drop(pending);
+        let cancelled = reader
+            .ownership_snapshot_for_test()
+            .expect("cancelled ownership snapshot");
+        assert_eq!(cancelled.reservations, 2);
+        assert_eq!(cancelled.materializations, 1);
+        assert_eq!(cancelled.releases, 2);
+        assert_eq!(cancelled.active_reservations, 0);
+        assert_eq!(cancelled.active_reserved_bytes, 0);
+        assert_eq!(cancelled.reserved_bytes, cancelled.released_bytes);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("settled root snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
+    }
+
     /// Bounds the release-tombstone map by memory only, never by live admission.
     ///
     /// Tombstones no longer consume ownership capacity, so accumulating them never
@@ -2403,7 +2797,11 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let reader = ScribeTailReader::new(
-            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                tail_resources(),
+            )),
             TailFenceConfig {
                 max_fences: 2,
                 ..TailFenceConfig::default()
@@ -2516,7 +2914,11 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let reader = Arc::new(ScribeTailReader::new(
-            Arc::new(FetchLiveTailService::new(stream, Arc::new(Memtable::new()))),
+            Arc::new(FetchLiveTailService::new(
+                stream,
+                Arc::new(Memtable::new()),
+                tail_resources(),
+            )),
             TailFenceConfig::default(),
         ));
         let fence = reader

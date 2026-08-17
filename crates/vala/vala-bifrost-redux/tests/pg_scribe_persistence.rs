@@ -1621,8 +1621,10 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
         Err(error) => error,
     };
     match &error {
-        ScribeError::IngestBusy { table } => assert_eq!(table, "memory"),
-        ScribeError::Internal { detail } => assert_eq!(detail, "ingest busy for table: memory"),
+        ScribeError::IngestBusy { table } => assert_eq!(table, "WAL replay batch"),
+        ScribeError::Internal { detail } => {
+            assert_eq!(detail, "ingest busy for table: WAL replay batch")
+        }
         _ => panic!("replay refusal must retain its structural capacity error: {error:?}"),
     }
     assert_eq!(

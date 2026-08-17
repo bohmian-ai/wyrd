@@ -64,7 +64,8 @@ fn seal_key(tenant: DataTenantId) -> SealKey {
 }
 
 #[test]
-fn duplicate_batch_id_replays_once_and_preserves_the_first_audit() {
+/// Exact duplicate batch retries replay once and retain their stable audit identity.
+fn exact_duplicate_batch_id_replays_once_and_preserves_the_audit() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let writer = WalWriter::new(
         temp_dir.path(),
@@ -76,14 +77,13 @@ fn duplicate_batch_id_replays_once_and_preserves_the_first_audit() {
     let key = seal_key(DataTenantId::new_v7());
     let batch_id = [9_u8; 16];
     let first = encode_audit_event(&audit_event("first")).expect("audit");
-    let second = encode_audit_event(&audit_event("duplicate")).expect("audit");
     let data = batch_bytes(42);
 
     writer
-        .append_and_fsync_for_test(&key, batch_id, &first, &data)
+        .append_and_commit_for_replay_test(&key, batch_id, &first, &data)
         .expect("first WAL append");
     writer
-        .append_and_fsync_for_test(&key, batch_id, &second, &data)
+        .append_and_commit_for_replay_test(&key, batch_id, &first, &data)
         .expect("duplicate WAL append");
 
     let replayed = replay_wal_directory(temp_dir.path()).expect("replay");

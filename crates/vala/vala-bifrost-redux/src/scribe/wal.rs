@@ -2296,8 +2296,8 @@ impl WalWriter {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when either append or the terminal fsync fails.
-    #[cfg(test)]
-    pub(crate) fn append_and_commit_for_replay_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn append_and_commit_for_replay_test(
         &self,
         seal_key: &SealKey,
         batch_id: [u8; 16],

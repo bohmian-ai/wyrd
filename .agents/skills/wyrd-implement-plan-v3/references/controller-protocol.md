@@ -90,6 +90,18 @@ failure forbids another attempt for that candidate in any stream: create a
 successor candidate first. Every required proof ID has exactly one accepted
 PASS; unknown proof IDs and duplicate PASS attempts are invalid.
 
+Implementor runs of a repeatable task-focused proof command are development
+diagnostics, not attempts in this proof stream. They do not consume the
+controller's authoritative attempt or qualify the candidate. The controller
+runs the proof fresh after sealing. Destructive, non-repeatable, measurement,
+source-bound reporting, cross-task, and terminal qualification commands remain
+controller-only because an earlier run could mutate or contaminate evidence.
+
+A reversible diagnostic, proof, or review failure advances candidate
+`generation` without changing task `revision`. Increase task `revision` only
+when contract, write-set authority, dependencies, acceptance criteria, or proof
+authority changes.
+
 Review records exact `APPROVE`, `RESUME_IMPLEMENTATION`,
 `ORCHESTRATOR_DECISION_REQUIRED`, or `REVIEW_BLOCKED`; acceptance requires
 `APPROVE`, the current candidate/generation, an immutable result digest, and the

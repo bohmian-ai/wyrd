@@ -191,6 +191,11 @@ using the repair judgment above, and dispatch the successor implementor without
 waiting for user intervention. Replanning is not a substitute for ordinary
 debugging.
 
+A reversible proof or review failure creates a new immutable candidate
+generation under the same task revision. Do not revise the task packet unless
+its contract, write-set authority, dependencies, acceptance criteria, or proof
+authority actually changes.
+
 Dispatch at most two simultaneous fresh Sol-low task reviewers. Reviewers are
 read-only and receive the approved task, authorities, exact base and candidate
 SHAs, complete diff, and available proof. They inspect correctness, contract

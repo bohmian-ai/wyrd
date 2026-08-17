@@ -54,8 +54,11 @@ is not `Ready`, the artifact digest differs, the task/revision or verbatim ACs
 do not match the artifact, a supplied SHA is not a commit, `parent_sha` is not
 `base_sha` for initial work or the named predecessor for remediation, the
 worktree is not dedicated and clean, or the write boundaries are ambiguous or
-overlapping with a prohibition. A remediation request is a new task revision; review findings
-alone are not authority to edit.
+overlapping with a prohibition. A reversible implementation or review finding
+produces a successor candidate generation under the same task revision. Require
+a new task revision only when contract, write-set authority, dependencies,
+acceptance criteria, or proof authority materially changes; review findings
+alone do not authorize such changes.
 
 ## Establish the execution boundary
 
@@ -107,14 +110,25 @@ mechanical out-of-list repair are not.
 ## Verify and seal
 
 Run `development_checks` after inspecting what they execute. They are worker
-diagnostics only and can never satisfy controller proof. Never run an
-`authoritative_checks` command: the controller runs each authoritative proof
-exactly once in its isolated verification lane. A stale, invalid, unsafe, or
-unavailable declared command is an authority defect; return
-`BLOCKED/AUTHORITY_REQUIRED` so the root can issue a new digest-bound task
-revision. Never replace or reinterpret it unilaterally. Add only diagnostics
-already required by repository policy for the actual diff. Do not weaken,
-skip, ignore, or mask a gate.
+diagnostics only and can never satisfy controller proof. Before sealing, also
+run each repeatable task-focused `authoritative_checks` command diagnostically
+when its required lane and repository-managed state are available. Iterate on
+ordinary failures until it passes. Record these runs as development checks;
+they do not consume, replace, or predict the controller's authoritative attempt.
+
+Do not run an authoritative command diagnostically when it is destructive,
+non-repeatable, consumes unique external state, measures performance that a
+prior run would contaminate, emits a source-SHA-bound final report, requires
+cross-task integration, or is a terminal qualification gate. Report that exact
+reason as a diagnostic limitation and continue only when the remaining checks
+still justify sealing. The controller runs every authoritative proof fresh
+against the immutable candidate in its isolated lane.
+
+A stale, invalid, unsafe, or unavailable declared command is an authority
+defect; return `BLOCKED/AUTHORITY_REQUIRED` only when its authority must change.
+Never replace or reinterpret it unilaterally. Add only diagnostics already
+required by repository policy or the task's repeatable focused proof. Do not
+weaken, skip, ignore, or mask a gate.
 
 Before committing:
 
@@ -155,7 +169,7 @@ acceptance_trace:
     implementation: [<path:symbol or path:line evidence>]
     tests: [<test or static proof>]
 development_checks:
-  - id: <input development check or repository-required diagnostic id>
+  - id: <input development check, diagnostic authoritative check, or repository-required diagnostic id>
     command: <command actually run>
     result: PASS
     evidence: <concise result>

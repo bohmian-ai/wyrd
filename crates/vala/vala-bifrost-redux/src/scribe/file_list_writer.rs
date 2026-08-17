@@ -109,11 +109,115 @@ pub struct FileListArtifactSetOutcome {
     pub replayed: bool,
 }
 
+/// Database projection used to validate one ordered writer-v2 artifact row.
+type ExistingArtifactRow = (
+    i16,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    chrono::NaiveDate,
+    Option<String>,
+);
+
+/// Validates that rows form one contiguous generation-scoped artifact set.
+///
+/// # Errors
+///
+/// Returns an invariant error when the set is empty, crosses a generation
+/// boundary, contains a malformed artifact, or belongs to another tenant.
+fn validate_artifact_set<'a>(
+    rows: &'a [FileListArtifactInsert],
+    tenant: Option<DataTenantId>,
+    empty_detail: &'static str,
+    invalid_detail: &'static str,
+) -> Result<&'a FileListArtifactInsert, SqlError> {
+    let first = rows.first().ok_or_else(|| SqlError::InvariantViolation {
+        detail: empty_detail.to_owned(),
+    })?;
+    if tenant.is_some_and(|tenant| tenant != first.data_tenant_id)
+        || rows.iter().enumerate().any(|(ordinal, row)| {
+            usize::try_from(row.file_ordinal).ok() != Some(ordinal)
+                || row.data_tenant_id != first.data_tenant_id
+                || row.node_id != first.node_id
+                || row.writer_epoch != first.writer_epoch
+                || row.wal_lsn_min != first.wal_lsn_min
+                || row.wal_lsn_max != first.wal_lsn_max
+                || !valid_artifact_identity(row)
+        })
+    {
+        return Err(SqlError::InvariantViolation {
+            detail: invalid_detail.to_owned(),
+        });
+    }
+    Ok(first)
+}
+
+/// Confirms that selected database rows match the complete requested set.
+fn artifact_replay_matches(
+    existing: &[ExistingArtifactRow],
+    rows: &[FileListArtifactInsert],
+) -> bool {
+    existing.len() == rows.len()
+        && existing.iter().zip(rows).all(|(actual, expected)| {
+            actual.0 == expected.file_ordinal
+                && actual.1 == expected.namespace
+                && actual.2 == expected.table_name
+                && actual.3 == expected.file_path
+                && actual.4 == expected.file_size
+                && actual.5 == expected.row_count
+                && actual.6 == expected.min_event_time
+                && actual.7 == expected.max_event_time
+                && actual.8 == expected.partition_day
+                && actual.9.as_deref() == Some(expected.file_checksum.as_str())
+        })
+}
+
+/// Builds the deterministic publication outcome after SQL identity validation.
+///
+/// # Errors
+///
+/// Returns an invariant error when the artifact count exceeds its durable
+/// `u16` representation.
+fn artifact_set_outcome(
+    first: &FileListArtifactInsert,
+    rows: &[FileListArtifactInsert],
+    inserted: u64,
+) -> Result<FileListArtifactSetOutcome, SqlError> {
+    let mut digest = Sha256::new();
+    for row in rows {
+        digest.update(row.file_ordinal.to_be_bytes());
+        digest.update((row.file_path.len() as u64).to_be_bytes());
+        digest.update(row.file_path.as_bytes());
+        digest.update(row.file_size.to_be_bytes());
+        digest.update(row.file_checksum.as_bytes());
+    }
+    Ok(FileListArtifactSetOutcome {
+        commit_key: FileListCommitKey {
+            data_tenant_id: first.data_tenant_id,
+            namespace: first.namespace.clone(),
+            table_name: first.table_name.clone(),
+            node_id: first.node_id,
+            writer_epoch: first.writer_epoch,
+            wal_lsn_min: first.wal_lsn_min,
+            wal_lsn_max: first.wal_lsn_max,
+        },
+        artifact_count: u16::try_from(rows.len()).map_err(|_| SqlError::InvariantViolation {
+            detail: "writer-v2 artifact count exceeds u16".to_owned(),
+        })?,
+        artifact_set_digest: hex::encode(digest.finalize()),
+        replayed: inserted == 0,
+    })
+}
+
 /// Builds the ordered writer-v2 SQL rows for one sealed artifact set.
 ///
 /// # Errors
 /// Returns a Scribe invariant error for an empty/noncontiguous set, malformed
-/// checksum, identity mismatch, or values outside PostgreSQL integer domains.
+/// checksum, identity mismatch, or values outside `PostgreSQL` integer domains.
 pub fn build_artifact_inserts(
     frozen: &FrozenMemtable,
     encoded: &ParquetEncoded,
@@ -473,22 +577,12 @@ pub async fn insert_artifact_set_and_audit_fenced(
     rows: &[FileListArtifactInsert],
     events: &[AuditEvent],
 ) -> Result<FileListArtifactSetOutcome, SqlError> {
-    let first = rows.first().ok_or_else(|| SqlError::InvariantViolation {
-        detail: "writer-v2 publication set is empty".to_owned(),
-    })?;
-    if rows.iter().enumerate().any(|(ordinal, row)| {
-        usize::try_from(row.file_ordinal).ok() != Some(ordinal)
-            || row.data_tenant_id != first.data_tenant_id
-            || row.node_id != first.node_id
-            || row.writer_epoch != first.writer_epoch
-            || row.wal_lsn_min != first.wal_lsn_min
-            || row.wal_lsn_max != first.wal_lsn_max
-            || !valid_artifact_identity(row)
-    }) {
-        return Err(SqlError::InvariantViolation {
-            detail: "writer-v2 publication set is noncontiguous or crosses generations".to_owned(),
-        });
-    }
+    let first = validate_artifact_set(
+        rows,
+        None,
+        "writer-v2 publication set is empty",
+        "writer-v2 publication set is noncontiguous or crosses generations",
+    )?;
     let mut transaction = operator_pool.begin().await.map_err(SqlError::from)?;
     let actor_live: bool =
         sqlx::query_scalar("SELECT vala.assert_scribe_publication_fence($1, $2, $3)")
@@ -537,18 +631,7 @@ pub async fn insert_artifact_set_and_audit_fenced(
             detail: "writer-v2 publication observed a partial replay set".to_owned(),
         });
     }
-    let existing: Vec<(
-        i16,
-        String,
-        String,
-        String,
-        i64,
-        i64,
-        chrono::DateTime<chrono::Utc>,
-        chrono::DateTime<chrono::Utc>,
-        chrono::NaiveDate,
-        Option<String>,
-    )> = sqlx::query_as(
+    let existing: Vec<ExistingArtifactRow> = sqlx::query_as(
         "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,file_checksum FROM vala.file_list \
          WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 AND wal_lsn_min=$4 AND wal_lsn_max=$5 \
          ORDER BY file_ordinal FOR UPDATE",
@@ -561,20 +644,7 @@ pub async fn insert_artifact_set_and_audit_fenced(
     .fetch_all(&mut *transaction)
     .await
     .map_err(SqlError::from)?;
-    if existing.len() != rows.len()
-        || existing.iter().zip(rows).any(|(actual, expected)| {
-            actual.0 != expected.file_ordinal
-                || actual.1 != expected.namespace
-                || actual.2 != expected.table_name
-                || actual.3 != expected.file_path
-                || actual.4 != expected.file_size
-                || actual.5 != expected.row_count
-                || actual.6 != expected.min_event_time
-                || actual.7 != expected.max_event_time
-                || actual.8 != expected.partition_day
-                || actual.9.as_deref() != Some(expected.file_checksum.as_str())
-        })
-    {
+    if !artifact_replay_matches(&existing, rows) {
         return Err(SqlError::InvariantViolation {
             detail: "writer-v2 replay identity does not match the complete artifact set".to_owned(),
         });
@@ -588,31 +658,8 @@ pub async fn insert_artifact_set_and_audit_fenced(
             audit.append(event).await?;
         }
     }
-    let mut digest = Sha256::new();
-    for row in rows {
-        digest.update(row.file_ordinal.to_be_bytes());
-        digest.update((row.file_path.len() as u64).to_be_bytes());
-        digest.update(row.file_path.as_bytes());
-        digest.update(row.file_size.to_be_bytes());
-        digest.update(row.file_checksum.as_bytes());
-    }
     transaction.commit().await.map_err(SqlError::from)?;
-    Ok(FileListArtifactSetOutcome {
-        commit_key: FileListCommitKey {
-            data_tenant_id: first.data_tenant_id,
-            namespace: first.namespace.clone(),
-            table_name: first.table_name.clone(),
-            node_id: first.node_id,
-            writer_epoch: first.writer_epoch,
-            wal_lsn_min: first.wal_lsn_min,
-            wal_lsn_max: first.wal_lsn_max,
-        },
-        artifact_count: u16::try_from(rows.len()).map_err(|_| SqlError::InvariantViolation {
-            detail: "writer-v2 artifact count exceeds u16".to_owned(),
-        })?,
-        artifact_set_digest: hex::encode(digest.finalize()),
-        replayed: inserted == 0,
-    })
+    artifact_set_outcome(first, rows, inserted)
 }
 
 /// Deterministic test barrier reached while the publication transaction owns its fence lock.
@@ -913,24 +960,12 @@ pub async fn insert_artifact_set_and_audit(
     rows: &[FileListArtifactInsert],
     events: &[AuditEvent],
 ) -> Result<FileListArtifactSetOutcome, SqlError> {
-    let first = rows.first().ok_or_else(|| SqlError::InvariantViolation {
-        detail: "writer-v2 tenant publication set is empty".to_owned(),
-    })?;
-    if first.data_tenant_id != conn.data_tenant_id()
-        || rows.iter().enumerate().any(|(ordinal, row)| {
-            usize::try_from(row.file_ordinal).ok() != Some(ordinal)
-                || row.data_tenant_id != first.data_tenant_id
-                || row.node_id != first.node_id
-                || row.writer_epoch != first.writer_epoch
-                || row.wal_lsn_min != first.wal_lsn_min
-                || row.wal_lsn_max != first.wal_lsn_max
-                || !valid_artifact_identity(row)
-        })
-    {
-        return Err(SqlError::InvariantViolation {
-            detail: "writer-v2 tenant publication set crosses identity boundaries".to_owned(),
-        });
-    }
+    let first = validate_artifact_set(
+        rows,
+        Some(conn.data_tenant_id()),
+        "writer-v2 tenant publication set is empty",
+        "writer-v2 tenant publication set crosses identity boundaries",
+    )?;
     let mut inserted = 0_u64;
     for row in rows {
         inserted += sqlx::query(
@@ -964,18 +999,7 @@ pub async fn insert_artifact_set_and_audit(
             detail: "writer-v2 tenant publication observed a partial replay set".to_owned(),
         });
     }
-    let existing: Vec<(
-        i16,
-        String,
-        String,
-        String,
-        i64,
-        i64,
-        chrono::DateTime<chrono::Utc>,
-        chrono::DateTime<chrono::Utc>,
-        chrono::NaiveDate,
-        Option<String>,
-    )> = sqlx::query_as(
+    let existing: Vec<ExistingArtifactRow> = sqlx::query_as(
         "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,file_checksum FROM vala.file_list \
          WHERE data_tenant_id=wyrd.current_tenant() AND node_id=$1 AND writer_epoch=$2 AND wal_lsn_min=$3 AND wal_lsn_max=$4 \
          ORDER BY file_ordinal FOR UPDATE",
@@ -986,20 +1010,7 @@ pub async fn insert_artifact_set_and_audit(
     .bind(first.wal_lsn_max)
     .fetch_all(&mut **conn.transaction())
     .await?;
-    if existing.len() != rows.len()
-        || existing.iter().zip(rows).any(|(actual, expected)| {
-            actual.0 != expected.file_ordinal
-                || actual.1 != expected.namespace
-                || actual.2 != expected.table_name
-                || actual.3 != expected.file_path
-                || actual.4 != expected.file_size
-                || actual.5 != expected.row_count
-                || actual.6 != expected.min_event_time
-                || actual.7 != expected.max_event_time
-                || actual.8 != expected.partition_day
-                || actual.9.as_deref() != Some(expected.file_checksum.as_str())
-        })
-    {
+    if !artifact_replay_matches(&existing, rows) {
         return Err(SqlError::InvariantViolation {
             detail: "writer-v2 tenant replay identity does not match the complete set".to_owned(),
         });
@@ -1009,30 +1020,7 @@ pub async fn insert_artifact_set_and_audit(
             vala_sql::queries::audit_outbox::append_audit(conn, event).await?;
         }
     }
-    let mut digest = Sha256::new();
-    for row in rows {
-        digest.update(row.file_ordinal.to_be_bytes());
-        digest.update((row.file_path.len() as u64).to_be_bytes());
-        digest.update(row.file_path.as_bytes());
-        digest.update(row.file_size.to_be_bytes());
-        digest.update(row.file_checksum.as_bytes());
-    }
-    Ok(FileListArtifactSetOutcome {
-        commit_key: FileListCommitKey {
-            data_tenant_id: first.data_tenant_id,
-            namespace: first.namespace.clone(),
-            table_name: first.table_name.clone(),
-            node_id: first.node_id,
-            writer_epoch: first.writer_epoch,
-            wal_lsn_min: first.wal_lsn_min,
-            wal_lsn_max: first.wal_lsn_max,
-        },
-        artifact_count: u16::try_from(rows.len()).map_err(|_| SqlError::InvariantViolation {
-            detail: "writer-v2 artifact count exceeds u16".to_owned(),
-        })?,
-        artifact_set_digest: hex::encode(digest.finalize()),
-        replayed: inserted == 0,
-    })
+    artifact_set_outcome(first, rows, inserted)
 }
 
 /// Validates one writer-v2 object's nonempty physical and checksum identity.

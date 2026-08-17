@@ -655,21 +655,7 @@ impl OraclePeerWorker {
             }
             Err(error) => return Err(error),
         };
-        let worker_resources = match capacity {
-            WorkerCapacity::ReserveRunning => self
-                .resources
-                .as_ref()
-                .map(|resources| {
-                    let class = match running.query_class {
-                        QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
-                        QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
-                    };
-                    resources.try_acquire_worker(class)
-                })
-                .transpose()
-                .map_err(|_| DispatchError::Capacity)?,
-            WorkerCapacity::LeaderAdmitted => None,
-        };
+        let worker_resources = self.acquire_worker_resources(capacity, running.query_class)?;
         let Ok(fragment) = SealedScanFragment::decode(&request.fragment_bytes) else {
             self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFragment)
                 .await?;
@@ -706,6 +692,34 @@ impl OraclePeerWorker {
         Ok(WorkerExecution {
             stream: retain_worker_resources(Box::pin(output), worker_resources),
         })
+    }
+
+    /// Acquires the one remote-worker root or reuses leader-local query ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Capacity`] when the configured Oracle resources
+    /// cannot admit the remote worker quantum.
+    fn acquire_worker_resources(
+        &self,
+        capacity: WorkerCapacity,
+        query_class: QueryClass,
+    ) -> Result<Option<crate::resources::OracleWorkerResources>, DispatchError> {
+        match capacity {
+            WorkerCapacity::ReserveRunning => self
+                .resources
+                .as_ref()
+                .map(|resources| {
+                    let class = match query_class {
+                        QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
+                        QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
+                    };
+                    resources.try_acquire_worker(class)
+                })
+                .transpose()
+                .map_err(|_| DispatchError::Capacity),
+            WorkerCapacity::LeaderAdmitted => Ok(None),
+        }
     }
 
     /// Commits a system-chain audit before rejecting claims that lack a trusted tenant.

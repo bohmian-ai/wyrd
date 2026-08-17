@@ -2151,6 +2151,72 @@ impl ShardOwner {
         Ok(())
     }
 
+    /// Derives the ordered slice-set identity needed for one terminal COMMIT.
+    ///
+    /// Returns `None` when the batch has no durable slice or its complete retry
+    /// was already committed and synced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when retry state is mixed or the durable slices
+    /// are incomplete, inconsistent, or out of order.
+    fn batch_commit_identity(
+        state: &GroupWalState,
+        append: &PreparedAppend,
+    ) -> Result<Option<(usize, u32, [u8; 32])>, ScribeError> {
+        let batch_id = *append.batch_id.as_bytes();
+        let Some(first_index) = state
+            .durable
+            .iter()
+            .position(|slice| slice.batch_id == batch_id)
+        else {
+            return Ok(None);
+        };
+        let slice_count = state.durable[first_index].slice_count;
+        let batch_slice_len = state
+            .durable
+            .iter()
+            .filter(|slice| slice.batch_id == batch_id)
+            .count();
+        let committed_retries = state
+            .durable
+            .iter()
+            .filter(|slice| slice.batch_id == batch_id && slice.commit_already_synced)
+            .count();
+        if committed_retries == batch_slice_len {
+            return Ok(None);
+        }
+        if committed_retries != 0 {
+            return Err(ScribeError::Internal {
+                detail: "WAL retry mixed committed and uncommitted slices".to_owned(),
+            });
+        }
+        if slice_count == 0 || usize::try_from(slice_count).ok() != Some(batch_slice_len) {
+            return Err(ScribeError::Internal {
+                detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
+            });
+        }
+        let mut digest = Sha256::new();
+        for slice_index in 0..slice_count {
+            let slice = state
+                .durable
+                .iter()
+                .find(|slice| slice.batch_id == batch_id && slice.slice_index == slice_index)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
+                })?;
+            if slice.slice_count != slice_count {
+                return Err(ScribeError::Internal {
+                    detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
+                });
+            }
+            digest.update(slice.slice_index.to_le_bytes());
+            digest.update(slice.payload_len.to_le_bytes());
+            digest.update(slice.payload_digest);
+        }
+        Ok(Some((first_index, slice_count, digest.finalize().into())))
+    }
+
     /// Appends and fsyncs one v4 COMMIT record for every complete batch in a group.
     ///
     /// Each batch's SLICE records were fsynced before this method starts. The
@@ -2166,58 +2232,12 @@ impl ShardOwner {
         state: &mut GroupWalState,
     ) -> Result<(), ScribeError> {
         for append in &state.prepared {
-            let batch_id = *append.batch_id.as_bytes();
-            let Some(first_index) = state
-                .durable
-                .iter()
-                .position(|slice| slice.batch_id == batch_id)
+            let Some((first_index, slice_count, digest)) =
+                Self::batch_commit_identity(state, append)?
             else {
                 continue;
             };
-            let slice_count = state.durable[first_index].slice_count;
-            let batch_slice_len = state
-                .durable
-                .iter()
-                .filter(|slice| slice.batch_id == batch_id)
-                .count();
-            let committed_retries = state
-                .durable
-                .iter()
-                .filter(|slice| slice.batch_id == batch_id && slice.commit_already_synced)
-                .count();
-            if committed_retries == batch_slice_len {
-                continue;
-            }
-            if committed_retries != 0 {
-                return Err(ScribeError::Internal {
-                    detail: "WAL retry mixed committed and uncommitted slices".to_owned(),
-                });
-            }
-            if slice_count == 0 || usize::try_from(slice_count).ok() != Some(batch_slice_len) {
-                return Err(ScribeError::Internal {
-                    detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
-                });
-            }
-            let mut digest = Sha256::new();
-            for slice_index in 0..slice_count {
-                let slice = state
-                    .durable
-                    .iter()
-                    .find(|slice| slice.batch_id == batch_id && slice.slice_index == slice_index)
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
-                    })?;
-                if slice.slice_count != slice_count {
-                    return Err(ScribeError::Internal {
-                        detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
-                    });
-                }
-                digest.update(slice.slice_index.to_le_bytes());
-                digest.update(slice.payload_len.to_le_bytes());
-                digest.update(slice.payload_digest);
-            }
-            let digest: [u8; 32] = digest.finalize().into();
-            let result = match self
+            let ScribeWalIoResult::WalWritten { result } = self
                 .wal_io
                 .submit(ScribeWalIoOp::WritePrepared {
                     wal: self.wal_handle.clone(),
@@ -2229,13 +2249,10 @@ impl ShardOwner {
                     ),
                 })
                 .await?
-            {
-                ScribeWalIoResult::WalWritten { result } => result,
-                _ => {
-                    return Err(ScribeError::Internal {
-                        detail: "WAL IO lane returned the wrong batch commit result".to_owned(),
-                    });
-                }
+            else {
+                return Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong batch commit result".to_owned(),
+                });
             };
             let segment = result
                 .touched_segments

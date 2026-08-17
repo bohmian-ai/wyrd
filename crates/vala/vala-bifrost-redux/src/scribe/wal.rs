@@ -1131,7 +1131,7 @@ impl WalRecord {
         let Some(header) = Self::decode_header_from(reader)? else {
             return Ok(None);
         };
-        Self::decode_payload_from(reader, header).map(Some)
+        Self::decode_payload_from(reader, &header).map(Some)
     }
 
     /// Reads and validates one fixed record header without allocating payload memory.
@@ -1238,7 +1238,7 @@ impl WalRecord {
     /// supported target.
     fn decode_payload_from<R: Read>(
         reader: &mut R,
-        header: DecodedWalRecordHeader,
+        header: &DecodedWalRecordHeader,
     ) -> Result<Self, ScribeError> {
         let payload_len =
             usize::try_from(header.payload_len).expect("u32 fits usize on supported targets");
@@ -2100,6 +2100,45 @@ impl WalHandle {
 }
 
 impl WalWriter {
+    /// Restores segment and volume state after one prepared-record write fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rollback, failed-segment removal, or volume-retirement error
+    /// when physical state cannot be restored to its pre-append boundary.
+    fn rollback_prepared_append(
+        &self,
+        state: &mut WalState,
+        segment: &Arc<WalSegment>,
+        prior_file_len: u64,
+        new_segment_bytes: u64,
+    ) -> Result<(), ScribeError> {
+        if let Err(error) = segment.rollback_failed_append(prior_file_len) {
+            if let Some(volume) = &self.volume {
+                volume.poison_divergence();
+            }
+            return Err(error);
+        }
+        if new_segment_bytes == 0 {
+            return Ok(());
+        }
+        state.current_segment = None;
+        state.current_segment_size = 0;
+        state.current_segment_records = 0;
+        if let Err(error) = remove_failed_segment(segment.path()) {
+            if let Some(volume) = &self.volume {
+                volume.poison_divergence();
+            }
+            return Err(error);
+        }
+        if let Some(volume) = &self.volume {
+            volume
+                .retire(new_segment_bytes)
+                .map_err(resource_volume_error)?;
+        }
+        Ok(())
+    }
+
     /// Create a new pod-local WAL writer.
     ///
     /// Segment sizing is explicit and validated before the writer is returned.
@@ -2296,6 +2335,10 @@ impl WalWriter {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when either append or the terminal fsync fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed sixteen-shard routing domain cannot fit `u8`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn append_and_commit_for_replay_test(
         &self,
@@ -2434,28 +2477,12 @@ impl WalWriter {
         let (payload_digest, payload_len) = match append_result {
             Ok(identity) => identity,
             Err(error) => {
-                if let Err(rollback_error) = segment.rollback_failed_append(prior_file_len) {
-                    if let Some(volume) = &self.volume {
-                        volume.poison_divergence();
-                    }
-                    return Err(rollback_error);
-                }
-                if new_segment_bytes > 0 {
-                    state.current_segment = None;
-                    state.current_segment_size = 0;
-                    state.current_segment_records = 0;
-                    if let Err(cleanup_error) = remove_failed_segment(segment.path()) {
-                        if let Some(volume) = &self.volume {
-                            volume.poison_divergence();
-                        }
-                        return Err(cleanup_error);
-                    }
-                    if let Some(volume) = &self.volume {
-                        volume
-                            .retire(new_segment_bytes)
-                            .map_err(resource_volume_error)?;
-                    }
-                }
+                self.rollback_prepared_append(
+                    &mut state,
+                    &segment,
+                    prior_file_len,
+                    new_segment_bytes,
+                )?;
                 if matches!(error, ScribeError::WalDiskFull) {
                     self.disk.mark_hard_failed();
                 }
@@ -2857,6 +2884,9 @@ pub struct WalReader {
     segments: Vec<Arc<WalSegment>>,
 }
 
+/// Stream identity and shard grouping used to merge WAL segments by LSN.
+type WalStreams = BTreeMap<([u8; 16], i64), BTreeMap<u8, Vec<Arc<WalSegment>>>>;
+
 /// Lazy record cursor over one shard's ordered segment chain.
 ///
 /// The cursor retains only a fixed record header while participating in the
@@ -2929,7 +2959,7 @@ impl ShardRecordCursor {
         let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
             detail: "WAL replay cursor lost its current segment".to_owned(),
         })?;
-        let record = match WalRecord::decode_payload_from(file, header) {
+        let record = match WalRecord::decode_payload_from(file, &header) {
             Ok(record) => record,
             Err(error) if is_torn_tail_error(&error) => {
                 self.repair_torn_tail()?;
@@ -3137,8 +3167,7 @@ impl WalReader {
     where
         F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
-        let mut streams: BTreeMap<([u8; 16], i64), BTreeMap<u8, Vec<Arc<WalSegment>>>> =
-            BTreeMap::new();
+        let mut streams: WalStreams = BTreeMap::new();
         for segment in &self.segments {
             let header = segment.header();
             streams

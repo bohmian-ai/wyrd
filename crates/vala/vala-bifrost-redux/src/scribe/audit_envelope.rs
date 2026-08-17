@@ -102,12 +102,10 @@ pub(crate) fn publication_audit_events(events: &[AuditEvent]) -> Vec<AuditEvent>
         return Vec::new();
     };
     let mut event = source.clone();
-    event.operation = "bifrost.scribe.visibility.publish".to_owned();
-    event.payload_summary = "published durable Scribe generation".to_owned();
+    "bifrost.scribe.visibility.publish".clone_into(&mut event.operation);
+    "published durable Scribe generation".clone_into(&mut event.payload_summary);
     event.detail = None;
-    let mut publication = Vec::with_capacity(1);
-    publication.push(event);
-    publication
+    vec![event]
 }
 
 /// Decode an `AuditEvent` from JSON bytes (kind=1 WAL record payload).

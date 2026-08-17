@@ -2340,6 +2340,11 @@ impl ScribeImpl {
     /// # Errors
     /// Returns a Scribe error when exact object deletion, scratch cleanup, or
     /// immutable rollback fails. No prefix listing or broad cleanup is used.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when an unsettled commit attempt has lost its required
+    /// artifact owner, which violates the attempt state invariant.
     pub async fn abort_commit_attempts(
         &self,
         attempts: Vec<seal::ScribeCommitAttempt>,

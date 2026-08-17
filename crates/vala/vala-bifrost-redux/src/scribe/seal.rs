@@ -580,7 +580,119 @@ pub struct SealDriver {
     memory: Option<ScribeResources>,
 }
 
+/// Parquet stage output retained through object upload and SQL staging.
+struct PreparedSealEncoding {
+    /// Encoded artifacts plus their audit and append metadata.
+    encoded: ParquetEncoded,
+    /// Aggregate encoded artifact bytes used for stage telemetry.
+    encoded_bytes: usize,
+    /// Producer reservation retained until the commit attempt settles.
+    parquet_owner: ScribeMemoryLease,
+}
+
 impl SealDriver {
+    /// Encodes one frozen generation under its scratch and memory owners.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when memory or scratch admission, node identity,
+    /// artifact identity, encoding, or encoded-size accounting fails.
+    async fn prepare_seal_encoding(
+        &self,
+        frozen: &FrozenMemtable,
+        seal_key: &SealKey,
+        binding: &TenantTableBinding,
+        node_id: &str,
+        writer_epoch: i64,
+    ) -> Result<PreparedSealEncoding, ScribeError> {
+        let memory = self.memory.as_ref().ok_or_else(|| ScribeError::Internal {
+            detail: "Scribe writer-v2 memory owner is unavailable before encoding".to_owned(),
+        })?;
+        let mut parquet_owner = memory.try_reserve_maintenance(
+            MemoryCategory::Persistence,
+            parquet_producer_delta(frozen.arrow_bytes)?,
+        )?;
+        info!("seal stage: WriteParquet");
+        let parquet_started = std::time::Instant::now();
+        let output_scratch = self
+            .output_scratch
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "Scribe output scratch is unavailable before seal encoding".to_owned(),
+            })?;
+        let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
+            detail: format!("node_id is not a valid UUID: {error}"),
+        })?;
+        let scratch = output_scratch
+            .create_scribe_generation(
+                &node_uuid.simple().to_string(),
+                frozen.seal_id,
+                256 * 1024 * 1024,
+            )
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("Scribe seal scratch admission failed: {error}"),
+            })?;
+        let wal_lsn_min = frozen
+            .metas
+            .iter()
+            .map(|meta| meta.wal_lsn_min.as_u64())
+            .min()
+            .unwrap_or(0);
+        let wal_lsn_max = frozen
+            .metas
+            .iter()
+            .map(|meta| meta.wal_lsn_max.as_u64())
+            .max()
+            .unwrap_or(0);
+        let object_base = ScribeArtifactIdentity::new(
+            binding,
+            seal_key.day,
+            node_id,
+            writer_epoch,
+            frozen.shard_id,
+            wal_lsn_min,
+            wal_lsn_max,
+        )?
+        .object_base();
+        let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
+            &mut parquet_owner,
+            frozen.arrow_bytes,
+        )?;
+        let mut encoded = self
+            .encode_parquet(
+                frozen,
+                binding,
+                seal_key.tenant,
+                scratch.path(),
+                &object_base,
+                footer_reservation,
+            )
+            .await?;
+        encoded.artifacts.attach_scratch(scratch)?;
+        encoded.audit_events =
+            crate::scribe::audit_envelope::publication_audit_events(&encoded.audit_events);
+        let encoded_bytes = encoded
+            .artifacts
+            .iter()
+            .try_fold(0_usize, |sum, artifact| {
+                sum.checked_add(usize::try_from(artifact.file_size).ok()?)
+            })
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "Scribe seal artifact-set size overflows".to_owned(),
+            })?;
+        Self::record(
+            "parquet_encode",
+            parquet_started.elapsed(),
+            frozen.row_count(),
+            encoded_bytes,
+        );
+        Ok(PreparedSealEncoding {
+            encoded,
+            encoded_bytes,
+            parquet_owner,
+        })
+    }
+
     /// Construct a new `SealDriver` with the given opendal operator.
     #[must_use]
     pub fn new(operator: Arc<Operator>) -> Self {
@@ -658,89 +770,13 @@ impl SealDriver {
                 ),
             });
         }
-        let memory = self.memory.as_ref().ok_or_else(|| ScribeError::Internal {
-            detail: "Scribe writer-v2 memory owner is unavailable before encoding".to_owned(),
-        })?;
-        let mut parquet_owner = memory.try_reserve_maintenance(
-            MemoryCategory::Persistence,
-            parquet_producer_delta(frozen.arrow_bytes)?,
-        )?;
-
-        // 2. WriteParquet on the boot-owned persistence CPU lane.
-        info!("seal stage: WriteParquet");
-        let parquet_started = std::time::Instant::now();
-        let output_scratch = self
-            .output_scratch
-            .as_ref()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "Scribe output scratch is unavailable before seal encoding".to_owned(),
-            })?;
-        let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
-            detail: format!("node_id is not a valid UUID: {error}"),
-        })?;
-        let scratch = output_scratch
-            .create_scribe_generation(
-                &node_uuid.simple().to_string(),
-                frozen.seal_id,
-                256 * 1024 * 1024,
-            )
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("Scribe seal scratch admission failed: {error}"),
-            })?;
-        let wal_lsn_min = frozen
-            .metas
-            .iter()
-            .map(|meta| meta.wal_lsn_min.as_u64())
-            .min()
-            .unwrap_or(0);
-        let wal_lsn_max = frozen
-            .metas
-            .iter()
-            .map(|meta| meta.wal_lsn_max.as_u64())
-            .max()
-            .unwrap_or(0);
-        let object_base = ScribeArtifactIdentity::new(
-            binding,
-            seal_key.day,
-            node_id,
-            writer_epoch,
-            frozen.shard_id,
-            wal_lsn_min,
-            wal_lsn_max,
-        )?
-        .object_base();
-        let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
-            &mut parquet_owner,
-            frozen.arrow_bytes,
-        )?;
-        let mut encoded = self
-            .encode_parquet(
-                frozen,
-                binding,
-                seal_key.tenant,
-                scratch.path(),
-                &object_base,
-                footer_reservation,
-            )
-            .await?;
-        encoded.artifacts.attach_scratch(scratch)?;
-        encoded.audit_events =
-            crate::scribe::audit_envelope::publication_audit_events(&encoded.audit_events);
-        let encoded_bytes = encoded
-            .artifacts
-            .iter()
-            .try_fold(0_usize, |sum, artifact| {
-                sum.checked_add(usize::try_from(artifact.file_size).ok()?)
-            })
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "Scribe seal artifact-set size overflows".to_owned(),
-            })?;
-        Self::record(
-            "parquet_encode",
-            parquet_started.elapsed(),
-            frozen.row_count(),
+        let PreparedSealEncoding {
+            encoded,
             encoded_bytes,
-        );
+            parquet_owner,
+        } = self
+            .prepare_seal_encoding(frozen, seal_key, binding, node_id, writer_epoch)
+            .await?;
 
         // 3. PutObject
         info!("seal stage: PutObject");
@@ -788,18 +824,7 @@ impl SealDriver {
             encoded_bytes,
         );
 
-        let wal_lsn_min = encoded
-            .append_metas
-            .iter()
-            .map(|meta| meta.wal_lsn_min)
-            .min()
-            .unwrap_or_else(|| WalLsn::new(0));
-        let wal_lsn_max = encoded
-            .append_metas
-            .iter()
-            .map(|meta| meta.wal_lsn_max)
-            .max()
-            .unwrap_or_else(|| WalLsn::new(0));
+        let (wal_lsn_min, wal_lsn_max) = wal_bounds(&encoded.append_metas);
 
         visibility.arm_cancellation();
         uploads.disarm();
@@ -939,7 +964,7 @@ impl SealDriver {
                         terminal = Some(ScribeError::ObjectStorePutFailed(opendal::Error::new(
                             ErrorKind::Unexpected,
                             "Scribe artifact upload timed out",
-                        )))
+                        )));
                     }
                 }
                 if attempt < 4 {
@@ -955,4 +980,19 @@ impl SealDriver {
         }
         Ok(())
     }
+}
+
+/// Returns the inclusive WAL range covered by one encoded artifact set.
+fn wal_bounds(metas: &[crate::scribe::wal::ScribeAppendMeta]) -> (WalLsn, WalLsn) {
+    let minimum = metas
+        .iter()
+        .map(|meta| meta.wal_lsn_min)
+        .min()
+        .unwrap_or_else(|| WalLsn::new(0));
+    let maximum = metas
+        .iter()
+        .map(|meta| meta.wal_lsn_max)
+        .max()
+        .unwrap_or_else(|| WalLsn::new(0));
+    (minimum, maximum)
 }

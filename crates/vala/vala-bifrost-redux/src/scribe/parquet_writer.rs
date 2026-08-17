@@ -26,7 +26,7 @@ use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
 use crate::parquet::memory::{
-    BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, MAX_FILE_BYTES,
+    BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice, MAX_FILE_BYTES,
     MAX_LOGICAL_ROW_GROUP_BYTES, validate_writer_v2_structure,
 };
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
@@ -243,60 +243,165 @@ pub(crate) fn encode_batch(
     object_base: &str,
     footer_reservation: crate::scribe::memory::EncodedFooterReservation,
 ) -> Result<ParquetEncoded, ScribeError> {
-    debug_assert_eq!(
-        footer_reservation.bytes(),
-        crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
-    );
-    if binding.tenant != seal_tenant || binding.tenant != frozen.seal_key.tenant {
-        return Err(ScribeError::Internal {
-            detail: format!(
-                "tenant-table binding mismatch before encoding: binding tenant `{}`; seal tenant `{}`; frozen tenant `{}`",
-                binding.tenant, seal_tenant, frozen.seal_key.tenant
-            ),
-        });
+    ParquetBatchEncoder {
+        frozen,
+        binding,
+        seal_tenant,
+        scratch_dir,
+        object_base,
+        footer_reservation,
     }
-    if binding.table_ref != frozen.seal_key.table {
-        return Err(ScribeError::Internal {
-            detail: format!(
-                "tenant-table binding table mismatch before encoding: binding `{}`; seal table `{}`",
-                binding.table_ref, frozen.seal_key.table
-            ),
-        });
+    .encode()
+}
+
+/// Owns one bounded Parquet encoding workflow and its footer reservation.
+struct ParquetBatchEncoder<'a> {
+    /// Immutable generation being encoded.
+    frozen: &'a FrozenMemtable,
+    /// Tenant-qualified physical binding validated before materialization.
+    binding: &'a TenantTableBinding,
+    /// Authenticated tenant stamped into the physical batch.
+    seal_tenant: DataTenantId,
+    /// Generation-owned scratch directory for encoded artifacts.
+    scratch_dir: &'a Path,
+    /// Deterministic object identity prefix for artifact ordinals.
+    object_base: &'a str,
+    /// Move-only memory child retained through footer inspection.
+    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+}
+
+/// Result of encoding one candidate logical slice.
+enum ArtifactEncodingOutcome {
+    /// Candidate satisfied the physical row-group ceiling.
+    Accepted(BoundedParquetArtifact),
+    /// Candidate must be retried as two smaller ordered slices.
+    Bisected {
+        /// First half preserving the source row order.
+        left: BoundedRowSlice,
+        /// Second half preserving the source row order.
+        right: BoundedRowSlice,
+    },
+}
+
+impl ParquetBatchEncoder<'_> {
+    /// Executes validation, bounded materialization, and exact artifact encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] for an invalid binding, Arrow
+    /// materialization failure, or an invalid encoded artifact.
+    fn encode(self) -> Result<ParquetEncoded, ScribeError> {
+        debug_assert_eq!(
+            self.footer_reservation.bytes(),
+            crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
+        );
+        let sorted_batch = self.prepare_sorted_batch()?;
+        let (artifacts, row_group_stats) = self.encode_artifacts(&sorted_batch)?;
+        Ok(ParquetEncoded {
+            artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
+            row_group_stats,
+            partition_day: self.frozen.seal_key.day,
+            audit_events: self.frozen.events.clone(),
+            append_metas: self.frozen.metas.clone(),
+        })
     }
 
-    // 1. Materialize one temporary encoder batch in the bounded persistence
-    // worker, then stamp and sort by the same two keys for every physical
-    // table. FrozenMemtable retains only append batches so the merged form is
-    // not held alongside the originals.
-    let encoder_batch =
-        concat_batches(&frozen.schema, &frozen.batches).map_err(|error| ScribeError::Internal {
-            detail: format!("failed to materialize frozen memtable for encoding: {error}"),
-        })?;
-    let stamped_batch = stamp_tenant(&encoder_batch, seal_tenant)?;
-    let sorted_batch = sort_batch(&stamped_batch)?;
-
-    let slices =
-        BifrostArrowLogicalSizer::slice(&sorted_batch).map_err(|detail| ScribeError::Internal {
-            detail: format!("writer-v2 logical slicing refused: {detail}"),
-        })?;
-    if slices.is_empty() {
-        return Err(ScribeError::Internal {
-            detail: "writer-v2 cannot publish an empty artifact set".to_owned(),
-        });
+    /// Validates physical identity and builds the tenant-stamped sorted batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when identity, concatenation, tenant
+    /// stamping, or sort-key validation fails.
+    fn prepare_sorted_batch(&self) -> Result<RecordBatch, ScribeError> {
+        if self.binding.tenant != self.seal_tenant
+            || self.binding.tenant != self.frozen.seal_key.tenant
+        {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "tenant-table binding mismatch before encoding: binding tenant `{}`; seal tenant `{}`; frozen tenant `{}`",
+                    self.binding.tenant, self.seal_tenant, self.frozen.seal_key.tenant
+                ),
+            });
+        }
+        if self.binding.table_ref != self.frozen.seal_key.table {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "tenant-table binding table mismatch before encoding: binding `{}`; seal table `{}`",
+                    self.binding.table_ref, self.frozen.seal_key.table
+                ),
+            });
+        }
+        let encoder_batch =
+            concat_batches(&self.frozen.schema, &self.frozen.batches).map_err(|error| {
+                ScribeError::Internal {
+                    detail: format!("failed to materialize frozen memtable for encoding: {error}"),
+                }
+            })?;
+        let stamped_batch = stamp_tenant(&encoder_batch, self.seal_tenant)?;
+        sort_batch(&stamped_batch)
     }
-    let mut pending: std::collections::VecDeque<_> = slices.into();
-    let mut artifacts = Vec::with_capacity(pending.len());
-    let mut row_group_stats = Vec::with_capacity(pending.len());
-    while let Some(slice) = pending.pop_front() {
-        let ordinal = u16::try_from(artifacts.len()).map_err(|_| ScribeError::Internal {
-            detail: "writer-v2 artifact ordinal exceeds u16".to_owned(),
+
+    /// Encodes logical slices, bisecting any oversized physical row group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] for invalid logical slicing, scratch
+    /// IO, Parquet encoding, footer inspection, or artifact identity.
+    fn encode_artifacts(
+        &self,
+        sorted_batch: &RecordBatch,
+    ) -> Result<(Vec<BoundedParquetArtifact>, Vec<RowGroupStats>), ScribeError> {
+        let slices = BifrostArrowLogicalSizer::slice(sorted_batch).map_err(|detail| {
+            ScribeError::Internal {
+                detail: format!("writer-v2 logical slicing refused: {detail}"),
+            }
         })?;
-        let object_identity = format!("{object_base}-{ordinal:05}.parquet");
+        if slices.is_empty() {
+            return Err(ScribeError::Internal {
+                detail: "writer-v2 cannot publish an empty artifact set".to_owned(),
+            });
+        }
+        let mut pending: std::collections::VecDeque<_> = slices.into();
+        let mut artifacts = Vec::with_capacity(pending.len());
+        let mut row_group_stats = Vec::with_capacity(pending.len());
+        while let Some(slice) = pending.pop_front() {
+            let ordinal = u16::try_from(artifacts.len()).map_err(|_| ScribeError::Internal {
+                detail: "writer-v2 artifact ordinal exceeds u16".to_owned(),
+            })?;
+            match self.encode_artifact(sorted_batch, slice, ordinal)? {
+                ArtifactEncodingOutcome::Accepted(artifact) => {
+                    row_group_stats.extend(artifact.row_group_stats.iter().cloned());
+                    artifacts.push(artifact);
+                }
+                ArtifactEncodingOutcome::Bisected { left, right } => {
+                    pending.push_front(right);
+                    pending.push_front(left);
+                }
+            }
+        }
+        Ok((artifacts, row_group_stats))
+    }
+
+    /// Encodes and inspects one candidate artifact under the retained footer owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] for scratch IO, Parquet encoding,
+    /// footer validation, checksum, or unsplittable oversize failures.
+    fn encode_artifact(
+        &self,
+        sorted_batch: &RecordBatch,
+        slice: BoundedRowSlice,
+        ordinal: u16,
+    ) -> Result<ArtifactEncodingOutcome, ScribeError> {
+        let object_identity = format!("{}-{ordinal:05}.parquet", self.object_base);
         let artifact_batch = sorted_batch.slice(slice.offset, slice.len);
         let metadata =
             BifrostParquetMemoryEnvelope::metadata_for_batch(&artifact_batch, &object_identity)
                 .map_err(|detail| ScribeError::Internal { detail })?;
-        let scratch_path = scratch_dir.join(format!("artifact-{ordinal:05}.parquet"));
+        let scratch_path = self
+            .scratch_dir
+            .join(format!("artifact-{ordinal:05}.parquet"));
         let file = std::fs::File::create(&scratch_path).map_err(|error| ScribeError::Internal {
             detail: format!("create writer-v2 scratch artifact: {error}"),
         })?;
@@ -329,13 +434,22 @@ pub(crate) fn encode_batch(
                 detail: "writer-v2 sealed artifact violates its file ceiling".to_owned(),
             });
         }
-        let inspection = inspect_sealed_artifact(
+        match inspect_sealed_artifact(
             &scratch_path,
             artifact_batch.schema().as_ref(),
             &object_identity,
-        )?;
-        let stats = match inspection {
-            SealedArtifactInspection::Accepted(stats) => stats,
+        )? {
+            SealedArtifactInspection::Accepted(stats) => {
+                Ok(ArtifactEncodingOutcome::Accepted(BoundedParquetArtifact {
+                    ordinal,
+                    scratch_path: scratch_path.clone(),
+                    object_identity,
+                    file_size,
+                    checksum: checksum_file(&scratch_path)?,
+                    row_count: artifact_batch.num_rows(),
+                    row_group_stats: stats,
+                }))
+            }
             SealedArtifactInspection::OversizedRowGroup => {
                 std::fs::remove_file(&scratch_path).map_err(|error| ScribeError::Internal {
                     detail: format!("remove oversized writer-v2 scratch artifact: {error}"),
@@ -346,33 +460,12 @@ pub(crate) fn encode_batch(
                             .to_owned(),
                     });
                 }
-                let (left, right) = BifrostArrowLogicalSizer::bisect(&sorted_batch, slice)
+                let (left, right) = BifrostArrowLogicalSizer::bisect(sorted_batch, slice)
                     .map_err(|detail| ScribeError::Internal { detail })?;
-                pending.push_front(right);
-                pending.push_front(left);
-                continue;
+                Ok(ArtifactEncodingOutcome::Bisected { left, right })
             }
-        };
-        row_group_stats.extend(stats.iter().cloned());
-        artifacts.push(BoundedParquetArtifact {
-            ordinal,
-            scratch_path: scratch_path.clone(),
-            object_identity,
-            file_size,
-            checksum: checksum_file(&scratch_path)?,
-            row_count: artifact_batch.num_rows(),
-            row_group_stats: stats,
-        });
+        }
     }
-
-    // 4. Return encoded result with partition_day from seal-key (not row min/max)
-    Ok(ParquetEncoded {
-        artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
-        row_group_stats,
-        partition_day: frozen.seal_key.day,
-        audit_events: frozen.events.clone(),
-        append_metas: frozen.metas.clone(),
-    })
 }
 
 fn stamp_tenant(

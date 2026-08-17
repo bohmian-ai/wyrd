@@ -9,7 +9,6 @@ use wyrd_tonic::prost::Message;
 use crate::gate::error::IngestError;
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 
-#[path = "../gate/collector/map.rs"]
 pub(crate) mod map;
 use map::{
     MappedLogs, MappedMetrics, MappedSpans, logs_to_record_batch, map_resource_logs,

@@ -10,12 +10,12 @@ use std::mem::size_of;
 
 use arrow::ipc::writer::StreamWriter;
 use arrow::ipc::{
-    DateUnit, Endianness, IntervalUnit, MessageHeader, MetadataVersion, Precision, TimeUnit, Type,
-    root_as_message,
+    root_as_message, DateUnit, Endianness, IntervalUnit, MessageHeader, MetadataVersion, Precision,
+    TimeUnit, Type,
 };
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+use wyrd_tonic::otlp::common::v1::{any_value, AnyValue, KeyValue};
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics::v1::metric;
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
@@ -1401,16 +1401,18 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{
+        ArrayRef, Decimal128Array, Int64Array, NullArray, StringArray, Time64MicrosecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
-    use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, any_value};
+    use wyrd_tonic::otlp::common::v1::{any_value, AnyValue, ArrayValue, KeyValue};
     use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 
-    use super::ScribeIngressPlanner;
+    use super::{root_as_message, ScribeIngressPlanner};
     use crate::contracts::ScribeError;
 
     /// Encodes one canonical V5 stream for scanner tests.
@@ -1435,6 +1437,74 @@ mod tests {
         let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("stream writer");
         writer.write(&batch).expect("batch write");
         writer.finish().expect("stream finish");
+        Bytes::from(bytes)
+    }
+
+    /// Encodes one canonical scalar column for metadata mutation tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the supplied Arrow field and array cannot form or encode a
+    /// valid one-row stream fixture.
+    fn scalar_stream(field: Field, array: ArrayRef) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("scalar batch");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("stream writer");
+        writer.write(&batch).expect("batch write");
+        writer.finish().expect("stream finish");
+        bytes
+    }
+
+    /// Returns the first schema metadata range in one canonical stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test fixture lacks the canonical framing prefix.
+    fn schema_metadata_bounds(bytes: &[u8]) -> (usize, usize) {
+        let prefix = u32::from_le_bytes(bytes[..4].try_into().expect("schema prefix"));
+        let start = if prefix == u32::MAX { 8 } else { 4 };
+        let len = if prefix == u32::MAX {
+            usize::try_from(u32::from_le_bytes(
+                bytes[4..8].try_into().expect("schema length"),
+            ))
+            .expect("metadata length")
+        } else {
+            usize::try_from(prefix).expect("metadata length")
+        };
+        (start, start + len)
+    }
+
+    /// Encodes a nullable array, then marks its IPC field nonnullable in place.
+    ///
+    /// The mutation retains otherwise canonical FlatBuffer structure while
+    /// creating the contradictory field-node null count rejected by preflight.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if Arrow cannot encode or expose the canonical test frame.
+    fn nonnullable_stream_with_null() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![Some(1_i64), None]))],
+        )
+        .expect("nullable fixture");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("stream writer");
+        writer.write(&batch).expect("batch write");
+        writer.finish().expect("stream finish");
+        let (metadata_start, metadata_end) = schema_metadata_bounds(&bytes);
+        let nullable_offset = {
+            let message = root_as_message(&bytes[metadata_start..metadata_end]).expect("message");
+            let field = message
+                .header_as_schema()
+                .and_then(|value| value.fields())
+                .map(|value| value.get(0))
+                .expect("schema field");
+            field._tab.loc() + usize::from(field._tab.vtable().get(arrow::ipc::Field::VT_NULLABLE))
+        };
+        bytes[metadata_start + nullable_offset] = 0;
         Bytes::from(bytes)
     }
 
@@ -1465,6 +1535,115 @@ mod tests {
         let truncated = bytes.slice(..bytes.len() - 8);
         assert!(matches!(
             ScribeIngressPlanner::default().plan_native(&truncated, 0),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// Nonnullable metadata rejects a nonzero node null count before decode.
+    #[test]
+    fn native_preflight_rejects_nonnullable_nulls() {
+        assert!(matches!(
+            ScribeIngressPlanner::default().plan_native(&nonnullable_stream_with_null(), 0),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// Illegal Time unit/bit-width pairs are rejected from schema metadata.
+    #[test]
+    fn native_preflight_rejects_illegal_time_width() {
+        let mut bytes = scalar_stream(
+            Field::new(
+                "time",
+                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+                false,
+            ),
+            Arc::new(Time64MicrosecondArray::from(vec![1_i64])),
+        );
+        let (start, end) = schema_metadata_bounds(&bytes);
+        let bit_width_offset = {
+            let message = root_as_message(&bytes[start..end]).expect("message");
+            let field = message
+                .header_as_schema()
+                .and_then(|value| value.fields())
+                .map(|value| value.get(0))
+                .expect("schema field");
+            let time = field.type_as_time().expect("time metadata");
+            time._tab.loc() + usize::from(time._tab.vtable().get(arrow::ipc::Time::VT_BITWIDTH))
+        };
+        bytes[start + bit_width_offset..start + bit_width_offset + 4]
+            .copy_from_slice(&32_i32.to_le_bytes());
+        assert!(matches!(
+            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes), 0),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// Decimal precision beyond the public width limit is rejected pre-decode.
+    #[test]
+    fn native_preflight_rejects_decimal_precision_overflow() {
+        let array = Decimal128Array::from(vec![Some(123_i128)])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal fixture");
+        let mut bytes = scalar_stream(
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Arc::new(array),
+        );
+        let (start, end) = schema_metadata_bounds(&bytes);
+        let precision_offset = {
+            let message = root_as_message(&bytes[start..end]).expect("message");
+            let field = message
+                .header_as_schema()
+                .and_then(|value| value.fields())
+                .map(|value| value.get(0))
+                .expect("schema field");
+            let decimal = field.type_as_decimal().expect("decimal metadata");
+            decimal._tab.loc()
+                + usize::from(decimal._tab.vtable().get(arrow::ipc::Decimal::VT_PRECISION))
+        };
+        bytes[start + precision_offset..start + precision_offset + 4]
+            .copy_from_slice(&39_i32.to_le_bytes());
+        assert!(matches!(
+            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes), 0),
+            Err(ScribeError::InvalidFrame)
+        ));
+    }
+
+    /// Null arrays require every declared row to be represented as null.
+    #[test]
+    fn native_preflight_rejects_inconsistent_null_node() {
+        let mut bytes = scalar_stream(
+            Field::new("empty", DataType::Null, true),
+            Arc::new(NullArray::new(1)),
+        );
+        let original = Bytes::copy_from_slice(&bytes);
+        let plan = ScribeIngressPlanner::default()
+            .plan_native(&original, 0)
+            .expect("canonical null stream");
+        let frame_start = plan.sources[0].frame_start;
+        let prefix = u32::from_le_bytes(
+            bytes[frame_start..frame_start + 4]
+                .try_into()
+                .expect("batch prefix"),
+        );
+        let metadata_start = frame_start + if prefix == u32::MAX { 8 } else { 4 };
+        let metadata_end = plan.sources[0].body_start;
+        let null_count_offset = {
+            let metadata = &bytes[metadata_start..metadata_end];
+            let message = root_as_message(metadata).expect("batch message");
+            let node = message
+                .header_as_record_batch()
+                .and_then(|value| value.nodes())
+                .map(|value| value.get(0))
+                .expect("field node");
+            (node as *const arrow::ipc::FieldNode as usize)
+                .checked_sub(metadata.as_ptr() as usize)
+                .expect("node belongs to metadata")
+                + 8
+        };
+        bytes[metadata_start + null_count_offset..metadata_start + null_count_offset + 8]
+            .copy_from_slice(&0_i64.to_le_bytes());
+        assert!(matches!(
+            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes), 0),
             Err(ScribeError::InvalidFrame)
         ));
     }

@@ -4180,7 +4180,7 @@ mod tests {
         }
     }
 
-    /// A floor-only Scribe role admits a generation and its producer delta.
+    /// A floor-only Scribe budget in mixed topology admits a generation and producer delta.
     ///
     /// This models the production handoff: the immutable generation remains
     /// charged while the Parquet producer acquires only the complement to its
@@ -4195,9 +4195,9 @@ mod tests {
     #[test]
     fn scribe_exact_floor_admits_generation_and_transfer() {
         let roles = BifrostRuntimeResources::composed_for_test(
-            512 * MIB,
+            832 * MIB,
             512 * MIB as u64,
-            [BifrostRole::Scribe],
+            [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
         );
         let scribe = roles.scribe().expect("Scribe capability");
         assert_eq!(scribe.governor.plan().scribe_floor_bytes, 256 * MIB);
@@ -4244,7 +4244,7 @@ mod tests {
         );
     }
 
-    /// Ingress resize retains the full floor when no elastic memory exists.
+    /// Mixed-topology ingress resize retains the full floor without elastic memory.
     ///
     /// # Panics
     ///
@@ -4253,9 +4253,9 @@ mod tests {
     #[test]
     fn scribe_ingress_resize_uses_exact_floor_without_elastic() {
         let roles = BifrostRuntimeResources::composed_for_test(
-            512 * MIB,
+            832 * MIB,
             512 * MIB as u64,
-            [BifrostRole::Scribe],
+            [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
         );
         let scribe = roles.scribe().expect("Scribe capability");
         let mut ingress = scribe

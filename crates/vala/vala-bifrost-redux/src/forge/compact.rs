@@ -743,11 +743,10 @@ impl InterruptedStagingTask {
     }
 }
 
-/// Reconcile prepared compaction audits for one tenant/table before new work.
+/// Convert the configured staging-discovery count into the durable query domain.
 ///
-/// A prepared operation is marked committed when its output is still live in
-/// Iceberg, or reset when the output is absent after the uncertainty window.
-/// Converts the configured discovery count into the durable query domain.
+/// The returned positive count preserves the validated `usize` limit exactly
+/// for binding to a `PostgreSQL` `bigint` query parameter.
 ///
 /// # Errors
 ///

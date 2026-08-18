@@ -24,6 +24,7 @@ use crate::scribe::memtable::{
 };
 use crate::scribe::persistence::{
     ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
+    PersistenceSubmitError,
 };
 use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice, PreparedSliceSet};
 use crate::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};
@@ -41,6 +42,8 @@ struct PendingGeneration {
     generation: Arc<ImmutableGeneration>,
     binding: crate::catalog::TenantTableBinding,
     submitted: bool,
+    /// Whether replay owns one queued wakeup for a full persistence queue.
+    retry_scheduled: bool,
     replay_response: Option<
         tokio::sync::oneshot::Sender<
             Result<crate::scribe::replay::ReplayChunkResponse, ScribeError>,
@@ -393,6 +396,15 @@ pub(crate) enum ShardCommand {
         response: tokio::sync::oneshot::Sender<
             Result<crate::scribe::replay::ReplayChunkResponse, ScribeError>,
         >,
+    },
+    /// Re-drive one replay generation after persistence queue progress.
+    RetryReplayPersistence {
+        /// Seal key whose FIFO front was unable to enter the bounded queue.
+        seal_key: crate::scribe::seal_key::SealKey,
+        /// Exact generation protected against stale retry notifications.
+        generation_id: u64,
+        /// Queue progress or terminal runtime-close result.
+        progress: Result<(), ScribeError>,
     },
     FreezeKey {
         seal_key: crate::scribe::seal_key::SealKey,
@@ -1327,6 +1339,11 @@ impl ShardOwner {
             ShardCommand::Replay { chunk, response } => {
                 self.replay_state(*chunk, response).await;
             }
+            ShardCommand::RetryReplayPersistence {
+                seal_key,
+                generation_id,
+                progress,
+            } => self.retry_replay_persistence(&seal_key, generation_id, progress),
             ShardCommand::FreezeKey { seal_key, response } => {
                 let _ = response.send(self.freeze_key(&seal_key));
             }
@@ -1614,6 +1631,7 @@ impl ShardOwner {
                 generation: next.generation,
                 binding: next.binding,
                 submitted: false,
+                retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
             });
@@ -2041,6 +2059,7 @@ impl ShardOwner {
             generation,
             binding,
             submitted: false,
+            retry_scheduled: false,
             replay_response: None,
             replay_owned: false,
         });
@@ -2070,19 +2089,53 @@ impl ShardOwner {
         }
         let generation = Arc::clone(&front.generation);
         let binding = front.binding.clone();
-        if persistence
-            .try_submit(PersistenceJob {
-                generation: Arc::clone(&generation),
-                binding,
-                completion_tx: self.completion_tx.clone(),
-                completion_waiter: None,
-                defer_manifest_advance: front.replay_response.is_some() || front.replay_owned,
-            })
-            .is_err()
-        {
-            return;
+        let result = persistence.try_submit(PersistenceJob {
+            generation: Arc::clone(&generation),
+            binding,
+            completion_tx: self.completion_tx.clone(),
+            completion_waiter: None,
+            defer_manifest_advance: front.replay_response.is_some() || front.replay_owned,
+        });
+        match result {
+            Ok(()) => front.submitted = true,
+            Err(PersistenceSubmitError::Full(job)) if front.replay_owned => {
+                drop(job);
+                if !front.retry_scheduled {
+                    front.retry_scheduled = true;
+                    let persistence = Arc::clone(persistence);
+                    let completion_tx = self.completion_tx.clone();
+                    let seal_key = seal_key.clone();
+                    let generation_id = generation.generation_id.0;
+                    Handle::current().spawn(async move {
+                        let progress = persistence.wait_for_submission_progress().await;
+                        let _ = completion_tx
+                            .send(ShardCommand::RetryReplayPersistence {
+                                seal_key,
+                                generation_id,
+                                progress,
+                            })
+                            .await;
+                    });
+                }
+                return;
+            }
+            Err(PersistenceSubmitError::Closed(job)) if front.replay_owned => {
+                drop(job);
+                let generation_id = generation.generation_id.0;
+                self.fail_active_replay_submission(
+                    seal_key,
+                    generation_id,
+                    ScribeError::Internal {
+                        detail: "Scribe persistence queue closed during replay".to_owned(),
+                    },
+                );
+                return;
+            }
+            Err(PersistenceSubmitError::Full(job) | PersistenceSubmitError::Closed(job)) => {
+                drop(job);
+                return;
+            }
         }
-        front.submitted = true;
         let active_paths = self
             .wal_segments
             .values()
@@ -2094,6 +2147,68 @@ impl ShardOwner {
         {
             tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
         }
+    }
+
+    /// Re-drives the active replay generation after bounded queue progress.
+    fn retry_replay_persistence(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
+        progress: Result<(), ScribeError>,
+    ) {
+        let Some(front) = self
+            .pending_generations
+            .get_mut(seal_key)
+            .and_then(VecDeque::front_mut)
+        else {
+            return;
+        };
+        if front.generation.generation_id.0 != generation_id || !front.replay_owned {
+            return;
+        }
+        front.retry_scheduled = false;
+        if let Err(error) = progress {
+            self.fail_active_replay_submission(seal_key, generation_id, error);
+            return;
+        }
+        self.submit_front(seal_key);
+    }
+
+    /// Rolls back a replay generation that could not enter persistence.
+    fn fail_active_replay_submission(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
+        error: ScribeError,
+    ) {
+        let pending = self
+            .pending_generations
+            .get_mut(seal_key)
+            .and_then(|queue| {
+                (queue.front().is_some_and(|front| {
+                    front.generation.generation_id.0 == generation_id && front.replay_owned
+                }))
+                .then(|| queue.pop_front())
+                .flatten()
+            });
+        if self
+            .pending_generations
+            .get(seal_key)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.pending_generations.remove(seal_key);
+        }
+        if let Some(pending) = pending {
+            let rollback = self.rollback_replayed_generation(
+                pending.generation.generation_id.0,
+                pending.generation.arrow_bytes,
+            );
+            if let Err(rollback_error) = rollback {
+                self.fail_replay_chunk(rollback_error);
+                return;
+            }
+        }
+        self.fail_replay_chunk(error);
     }
 
     /// Retries the oldest unsubmitted generation for every seal key.
@@ -3814,14 +3929,18 @@ mod tests {
         assert_eq!(categories[MemoryCategory::Immutable as usize], 0);
     }
 
-    /// One multi-state chunk retains a single identity owner until serialization.
+    /// Replay retains one identity owner and owns retries across queue backpressure.
+    ///
+    /// The multi-state fixture proves identity serialization, while the
+    /// workerless one-slot runtime proves that capacity release posts the exact
+    /// generation-keyed retry command without relying on an age tick.
     ///
     /// # Panics
     ///
     /// Panics if adding multiple reconstructed states duplicates or releases
     /// the chunk's single committed-identity lease.
-    #[test]
-    fn replay_chunk_serializes_identity_across_multiple_states() {
+    #[tokio::test]
+    async fn replay_chunk_serializes_identity_across_multiple_states() {
         let resources =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let identity = resources
@@ -3869,6 +3988,152 @@ mod tests {
                 .scribe_memory_used_bytes,
             0
         );
+
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let generation = owner_generation(&key, &frozen, stream, wal_handle.clone());
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        let root_baseline = budget.snapshot().expect("root baseline");
+        owner
+            .memory_ownership
+            .reserve_immutable(generation.arrow_bytes)
+            .expect("replay immutable ownership");
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        owner.completion_tx = completion_tx.clone();
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        let persistence = Arc::new(persistence);
+        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
+            .expect("test binding");
+        persistence
+            .try_submit(PersistenceJob {
+                generation: Arc::clone(&generation),
+                binding: binding.clone(),
+                completion_tx,
+                completion_waiter: None,
+                defer_manifest_advance: true,
+            })
+            .expect("fill one-slot queue");
+        owner.persistence = Some(Arc::clone(&persistence));
+        owner.pending_generations.insert(
+            key.clone(),
+            VecDeque::from([PendingGeneration {
+                generation: Arc::clone(&generation),
+                binding,
+                submitted: false,
+                retry_scheduled: false,
+                replay_response: None,
+                replay_owned: true,
+            }]),
+        );
+        let (response, response_rx) = tokio::sync::oneshot::channel();
+        owner.replay_chunk = Some(ReplayChunkOwner {
+            remaining: VecDeque::new(),
+            current_generation: Some(generation.generation_id.0),
+            retirements: Vec::new(),
+            identity: None,
+            response: Some(response),
+        });
+
+        owner.submit_front(&key);
+        assert!(
+            owner
+                .pending_generations
+                .get(&key)
+                .and_then(VecDeque::front)
+                .is_some_and(|front| front.retry_scheduled && !front.submitted)
+        );
+        let blocker = persistence_rx.recv().await.expect("queued blocker");
+        persistence.complete_for_test(blocker.generation.arrow_bytes);
+        let retry = tokio::time::timeout(std::time::Duration::from_secs(1), completion_rx.recv())
+            .await
+            .expect("replay retry wakeup")
+            .expect("retry command");
+        assert!(!owner.handle_command(retry).await);
+        assert!(
+            owner
+                .pending_generations
+                .get(&key)
+                .and_then(VecDeque::front)
+                .is_some_and(|front| front.submitted && !front.retry_scheduled)
+        );
+        let submitted = persistence_rx.recv().await.expect("submitted replay");
+        persistence.complete_for_test(submitted.generation.arrow_bytes);
+        drop(submitted);
+        owner
+            .pending_generations
+            .get_mut(&key)
+            .and_then(VecDeque::front_mut)
+            .expect("active replay generation")
+            .submitted = false;
+        persistence
+            .try_submit(PersistenceJob {
+                generation: Arc::clone(&generation),
+                binding: crate::catalog::TenantTableBinding::resolve((
+                    key.tenant,
+                    key.table.clone(),
+                ))
+                .expect("blocker binding"),
+                completion_tx: owner.completion_tx.clone(),
+                completion_waiter: None,
+                defer_manifest_advance: true,
+            })
+            .expect("refill one-slot queue");
+        owner.submit_front(&key);
+        assert!(
+            owner
+                .pending_generations
+                .get(&key)
+                .and_then(VecDeque::front)
+                .is_some_and(|front| front.retry_scheduled && !front.submitted)
+        );
+
+        let runtime_weak = Arc::downgrade(&persistence);
+        assert_eq!(persistence.abort_retained(), 0);
+        let shutdown_retry =
+            tokio::time::timeout(std::time::Duration::from_secs(1), completion_rx.recv())
+                .await
+                .expect("shutdown wakes replay waiter")
+                .expect("shutdown retry command");
+        assert!(!owner.handle_command(shutdown_retry).await);
+        assert!(
+            response_rx
+                .await
+                .expect("replay shutdown response")
+                .is_err()
+        );
+        assert!(!owner.pending_generations.contains_key(&key));
+        assert!(owner.replay_chunk.is_none());
+        assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        assert_eq!(
+            budget
+                .snapshot()
+                .expect("shutdown ownership settlement")
+                .scribe_memory_used_bytes,
+            root_baseline.scribe_memory_used_bytes
+        );
+        drop(persistence_rx.recv().await.expect("aborted queued blocker"));
+        owner.persistence = None;
+        drop(persistence);
+        tokio::task::yield_now().await;
+        assert!(runtime_weak.upgrade().is_none());
     }
 
     /// Only typed WAL exhaustion is downgraded from an unexpected shard failure.
@@ -4738,6 +5003,7 @@ mod tests {
                 ))
                 .expect("binding"),
                 submitted: true,
+                retry_scheduled: false,
                 replay_response: None,
                 replay_owned: false,
             }]),

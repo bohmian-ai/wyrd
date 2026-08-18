@@ -443,6 +443,15 @@ pub struct PersistenceRuntime {
     reconciliation_sender: Option<mpsc::Sender<ScribeReconciliationJob>>,
 }
 
+/// Reason a non-blocking persistence submission retained ownership of its job.
+#[derive(Debug)]
+pub(crate) enum PersistenceSubmitError {
+    /// The bounded queue is temporarily full and worker progress can make room.
+    Full(Box<PersistenceJob>),
+    /// The persistence runtime no longer accepts jobs.
+    Closed(Box<PersistenceJob>),
+}
+
 /// Runtime-owned ambiguous caller publication and optional completion waiter.
 enum ScribeReconciliationJob {
     /// Caller-owned seal attempt transferred after an ambiguous COMMIT result.
@@ -511,6 +520,33 @@ impl PersistenceRuntime {
             reconciler: None,
             reconciliation_sender: None,
         }
+    }
+
+    /// Builds a one-slot workerless queue so shard tests can force backpressure.
+    #[cfg(test)]
+    pub(crate) fn bounded_for_test() -> (Self, mpsc::Receiver<Box<PersistenceJob>>) {
+        let (sender, receiver) = mpsc::channel(1);
+        let runtime = Self {
+            sender: Arc::new(Mutex::new(Some(sender))),
+            queued: Arc::new(AtomicUsize::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            drained: Arc::new(Notify::new()),
+            failures: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+            abort_handles: Arc::new(Mutex::new(Vec::new())),
+            output_scratch: None,
+            reconciler: None,
+            reconciliation_sender: None,
+        };
+        (runtime, receiver)
+    }
+
+    /// Accounts one workerless test job as completed and wakes capacity waiters.
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(&self, arrow_bytes: usize) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        self.queued_bytes.fetch_sub(arrow_bytes, Ordering::AcqRel);
+        self.drained.notify_waiters();
     }
 
     /// Spawns the cancellation-independent reconciliation queue owner.
@@ -680,13 +716,13 @@ impl PersistenceRuntime {
     }
 
     /// Try to enqueue a job without waiting in the shard owner.
-    pub(crate) fn try_submit(&self, job: PersistenceJob) -> Result<(), Box<PersistenceJob>> {
+    pub(crate) fn try_submit(&self, job: PersistenceJob) -> Result<(), PersistenceSubmitError> {
         let sender = match self.sender.lock() {
             Ok(sender) => sender.clone(),
-            Err(_) => return Err(Box::new(job)),
+            Err(_) => return Err(PersistenceSubmitError::Closed(Box::new(job))),
         };
         let Some(sender) = sender else {
-            return Err(Box::new(job));
+            return Err(PersistenceSubmitError::Closed(Box::new(job)));
         };
         let queued_bytes = job.generation.arrow_bytes;
         self.queued.fetch_add(1, Ordering::AcqRel);
@@ -707,24 +743,75 @@ impl PersistenceRuntime {
                 );
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(job) | mpsc::error::TrySendError::Closed(job)) => {
+            Err(error) => {
                 self.queued.fetch_sub(1, Ordering::AcqRel);
                 self.queued_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
                 metrics::counter!("bifrost_scribe_persistence_queue_rejections_total").increment(1);
                 super::record_scribe_rejection("queue");
-                Err(job)
+                Err(match error {
+                    mpsc::error::TrySendError::Full(job) => PersistenceSubmitError::Full(job),
+                    mpsc::error::TrySendError::Closed(job) => PersistenceSubmitError::Closed(job),
+                })
             }
         }
+    }
+
+    /// Waits until a persistence worker completes queued work or the runtime closes.
+    ///
+    /// Registering the notification before inspecting queue state prevents a
+    /// completion between those operations from stranding a replay retry.
+    /// Cancellation drops only this waiter; queued jobs and worker ownership
+    /// remain in the runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal Scribe error when the persistence queue is closed.
+    pub(crate) async fn wait_for_submission_progress(&self) -> Result<(), ScribeError> {
+        let notified = self.drained.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let queue_open = self
+            .sender
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "Scribe persistence sender lock poisoned".to_owned(),
+            })?
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed());
+        if !queue_open {
+            return Err(ScribeError::Internal {
+                detail: "Scribe persistence queue closed during replay".to_owned(),
+            });
+        }
+        if self.queued.load(Ordering::Acquire) != 0 {
+            notified.await;
+        }
+        let queue_open = self
+            .sender
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "Scribe persistence sender lock poisoned".to_owned(),
+            })?
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed());
+        if !queue_open {
+            return Err(ScribeError::Internal {
+                detail: "Scribe persistence queue closed during replay".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Stops accepting persistence jobs without awaiting worker progress.
     ///
     /// Already accepted jobs remain owned by retained worker handles until
-    /// graceful drain completes or [`Self::abort_retained`] cancels them.
+    /// graceful drain completes or [`Self::abort_retained`] cancels them. All
+    /// capacity waiters are awakened so they observe the closed queue.
     pub(crate) fn close(&self) {
         if let Ok(mut sender) = self.sender.lock() {
             sender.take();
         }
+        self.drained.notify_waiters();
     }
 
     /// Waits for queued persistence jobs after [`Self::close`] has run.
@@ -745,9 +832,12 @@ impl PersistenceRuntime {
     ///
     /// The abort-handle registry is drained before cancellation so repeated
     /// finalizer calls are idempotent and cannot double-count a worker.
+    /// Closing submissions first releases every capacity waiter even when an
+    /// aborted worker cannot decrement the retained queue counters.
     /// Poisoned registry state is recovered because shutdown must remain
     /// fail-closed after a panic in an unrelated join-registry owner.
     pub(crate) fn abort_retained(&self) -> usize {
+        self.close();
         let handles = match self.abort_handles.lock() {
             Ok(mut handles) => std::mem::take(&mut *handles),
             Err(poisoned) => {

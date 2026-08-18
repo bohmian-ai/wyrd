@@ -1,150 +1,102 @@
 ---
 name: wyrd-implement-v3
-description: Implement or resume exactly one decision-complete Ready Wyrd task from one accepted Git SHA in an isolated worktree, restrict edits to the task's declared write set, run focused development verification, and return one immutable candidate commit or a material BLOCKED result. Use only when an orchestrator supplies the exact v3 implementation request contract; never use for planning, UI work unless explicitly assigned, integration, review, or task-status mutation.
+description: Implement one decision-complete Wyrd task packet in an isolated worktree, stay within its declared scope, run its focused diagnostic verification, and return one immutable candidate commit or a material BLOCKED result. Use only when an orchestrator supplies the packet, parent SHA, and dedicated worktree; never use for planning, integration, review, or task-status mutation.
 ---
 
 # Wyrd Implement v3
 
-Produce one reviewable commit for one exact task. The candidate is a proposal;
-the orchestrator alone may accept, integrate, supersede, or update canonical
-task state.
+Produce one reviewable commit from one immutable task packet. The packet is the
+single source of task scope, acceptance, dependencies, and focused
+verification. The controller alone dispatches, verifies authoritatively,
+reviews, integrates, supersedes, and records execution state.
 
-This skill is self-contained. Never invoke or delegate to another implementation
-or review skill. Never spawn agents. When an orchestrator delegates this role,
-it must use `gpt-5.6-sol` with low reasoning effort.
+Never invoke another workflow or spawn children. When delegated, run as
+`gpt-5.6-sol` at low reasoning effort.
 
 ## Required input
 
-Accept exactly one YAML object with no omitted fields:
+Accept one complete YAML object:
 
 ```yaml
 protocol: wyrd-implement-v3
 request_id: <stable orchestration id>
 repository_root: <absolute path>
-task_artifact:
-  path: <repository-relative canonical task path>
+task_packet:
+  path: <repository-relative task packet path>
   sha256: <lowercase 64-hex digest of its exact bytes>
-task_id: <exact id inside the artifact>
-task_revision: <integer, including orchestrator-authored remediation revisions>
-task_status: Ready
-accepted_sha: <40-hex controller integration head accepted at dispatch>
-base_sha: <40-hex original task dispatch base>
-parent_sha: <40-hex only allowed parent; base initially or predecessor on remediation>
-worktree_path: <absolute dedicated worktree path>
-write_set:
-  - <repository-relative file or directory boundary>
-prohibited_writes:
-  - <repository-relative boundary>
-acceptance_criteria:
-  - id: <stable AC id>
-    text: <verbatim criterion>
-development_checks:
-  - id: <stable check id>
-    command: <exact worker diagnostic command>
-authoritative_checks:
-  - id: <stable controller proof id>
-    command: <exact command reserved to the controller verification lane>
-material_escalations:
-  - <decision reserved to the orchestrator>
-predecessor_candidate: <40-hex superseded candidate or null>
+parent_sha: <immutable commit checked out in the worktree>
+worktree_path: <absolute dedicated clean worktree path>
 ```
 
-Reject the request as `BLOCKED` before editing if a field is missing, the task
-is not `Ready`, the artifact digest differs, the task/revision or verbatim ACs
-do not match the artifact, a supplied SHA is not a commit, `parent_sha` is not
-`base_sha` for initial work or the named predecessor for remediation, the
-worktree is not dedicated and clean, or the write boundaries are ambiguous or
-overlapping with a prohibition. A reversible implementation or review finding
-produces a successor candidate generation under the same task revision. Require
-a new task revision only when contract, write-set authority, dependencies,
-acceptance criteria, or proof authority materially changes; review findings
-alone do not authorize such changes.
+The task packet begins with a `Task contract` YAML block:
+
+```yaml
+id: <stable task ID>
+depends_on: [<task IDs>]
+write_set: [<repository-relative paths>]
+prohibited_writes: [<repository-relative paths>]
+acceptance_criteria:
+  - id: AC1
+    text: <verbatim observable criterion>
+verification:
+  command: <exact focused mise command>
+```
+
+Return `BLOCKED` before editing if the request is incomplete, packet digest
+differs, its contract is missing or ambiguous, the worktree is not clean and
+checked out at `parent_sha`, a path overlaps a prohibition, or `parent_sha` is
+not a commit. Do not require a task status, revision, manifest, or controller
+proof record: controller dispatch is the authority to begin work.
 
 ## Establish the execution boundary
 
-1. Read `AGENTS.md`, `architecture/agent-rules.md`,
-   `architecture/wyrd-design.md`, the complete task artifact, and
-   `architecture/wyrd-doctrine.mdx` whenever behavior or a public/internal
-   contract is touched. Read routed architecture references required by the
-   task and inspect `mise.toml`, manifests, and lockfiles relevant to checks.
-2. Verify the artifact with `sha256sum`, then verify
-   `git -C <worktree> rev-parse HEAD` equals `parent_sha`, the worktree is
-   clean, and every supplied SHA resolves as a commit.
-3. When `.codegraph/` exists, use CodeGraph before grep/find for code discovery.
-4. Treat `write_set` as the behavioral ownership allowlist, with the incidental
-   repair closure defined below. `prohibited_writes` always wins. Do not edit
-   the canonical task, plan, orchestration state, or review artifacts unless
-   they are explicitly in the write set—and even then never change task status.
-5. Refuse unrelated dirty state instead of absorbing it. Never amend, rebase,
-   merge, cherry-pick, integrate, or push.
+Read `AGENTS.md`, `architecture/agent-rules.md`, the complete task packet, and
+the architecture/design/doctrine references relevant to its changed behavior.
+Inspect the named paths, consumers, tests, manifests, and `mise` command.
+Use CodeGraph first when indexed.
 
-## Implement
+Treat the packet's `write_set` as the behavioral ownership allowlist;
+`prohibited_writes` always wins. Refuse unrelated dirty state. Never amend,
+rebase, merge, cherry-pick, integrate, push, or modify the packet/plan.
 
-Map every acceptance criterion to concrete owners, behavior, and proof. Make
-the smallest cohesive change that satisfies the exact Ready task. Follow all
-repository ownership, struct-centered Rust, rustdoc, async, PyO3, contract,
-test-integrity, and user-journey rules. Do not redesign a material contract,
-resolve a material conflict, expand scope, or implement later tasks.
+## Implement and verify
 
-Compiler, formatter, lint, test, fixture, and repository-managed local setup
-failures are development feedback. Diagnose and repair them without refusing
-the task, requesting user authorization, or requiring a task revision.
+Map every acceptance criterion to source and test evidence. Make the smallest
+cohesive change that satisfies the packet. Follow repository ownership,
+struct-centered Rust, rustdoc, async, PyO3, contract, and journey-test rules.
+Do not reopen a material task decision or implement later work.
 
-The task automatically authorizes the smallest candidate-caused mechanical
-repair needed to make repository-required compile, format, Clippy, rustdoc,
-codegen, fixture, or focused-test checks pass, even when the exact adjacent file
-was omitted from `write_set`. This incidental repair closure includes imports,
-call-site type adjustments, generated outputs, test fixtures, rustdoc, and lint
-cleanup. It does not authorize new behavior, dependencies, owners, public or
-durable contracts, acceptance criteria, unrelated cleanup, broad formatting,
-or any `prohibited_writes` path. Record every such path and its diagnostic in
-`incidental_repair_paths`. If the repair cannot satisfy these limits, stop
-because of the material choice or prohibited path—not merely because the path
-was absent from `write_set`.
+Compiler, formatter, lint, test, fixture, codegen, and repository-managed
+setup failures are ordinary development feedback. Apply the smallest
+candidate-caused mechanical repair needed to pass a required check even when
+its adjacent path is outside `write_set`: imports, call-site type adjustments,
+generated output, fixtures, rustdoc, and lint cleanup are allowed. Record each
+such path and exact diagnostic. This repair closure never permits new behavior,
+owners, dependencies, public or durable contracts, acceptance scope, unrelated
+cleanup, broad formatting, or a prohibited path.
 
-A required material decision, unavailable authority, ambiguous acceptance
-outcome, prohibited write, or genuinely unavailable mandatory external proof
-is `BLOCKED`; difficulty, elapsed time, a failing first attempt, and a
-mechanical out-of-list repair are not.
+Run `verification.command` diagnostically when it is repeatable and safe. If
+it is destructive, non-repeatable, cross-task, or a terminal qualification
+gate, report why it was not run; the controller will run it once in its
+authoritative lane. Never weaken, replace, skip, or mask the command.
 
-## Verify and seal
+Return `BLOCKED` only for a material decision, unavailable authority,
+ambiguous acceptance outcome, prohibited write, or mandatory proof that cannot
+be safely run. A first failing check or ordinary mechanical repair is not a
+blocker.
 
-Run `development_checks` after inspecting what they execute. They are worker
-diagnostics only and can never satisfy controller proof. Before sealing, also
-run each repeatable task-focused `authoritative_checks` command diagnostically
-when its required lane and repository-managed state are available. Iterate on
-ordinary failures until it passes. Record these runs as development checks;
-they do not consume, replace, or predict the controller's authoritative attempt.
+## Seal the candidate
 
-Do not run an authoritative command diagnostically when it is destructive,
-non-repeatable, consumes unique external state, measures performance that a
-prior run would contaminate, emits a source-SHA-bound final report, requires
-cross-task integration, or is a terminal qualification gate. Report that exact
-reason as a diagnostic limitation and continue only when the remaining checks
-still justify sealing. The controller runs every authoritative proof fresh
-against the immutable candidate in its isolated lane.
-
-A stale, invalid, unsafe, or unavailable declared command is an authority
-defect; return `BLOCKED/AUTHORITY_REQUIRED` only when its authority must change.
-Never replace or reinterpret it unilaterally. Add only diagnostics already
-required by repository policy or the task's repeatable focused proof. Do not
-weaken, skip, ignore, or mask a gate.
-
-Before committing:
-
-1. Audit tracked and untracked paths against `write_set`, the documented
-   incidental repair closure, and `prohibited_writes`.
-2. Run `git diff --check` and map every changed path and AC to evidence.
-3. Confirm the Git identity already matches repository policy; never alter it.
-4. Create exactly one normal commit whose sole parent is `parent_sha`.
-5. Record `candidate_sha`, `parent_sha`, and
-   `diff_sha256 = sha256(git diff --binary <parent_sha>..<candidate_sha>)`.
-6. Confirm the worktree is clean and `git rev-list --parents -n 1` shows
-   exactly the reported parent. Never modify the commit after reporting it.
+Before committing, audit all tracked and untracked changes against the packet
+contract and repair closure; run `git diff --check`; and map changed paths and
+acceptance criteria to evidence. Confirm the configured Git identity already
+matches repository policy. Create exactly one normal commit with
+`parent_sha` as its sole parent, calculate the binary diff SHA-256, and leave
+the worktree clean. Never alter the commit after reporting it.
 
 ## Output contract
 
-Return exactly one YAML document and no additional status vocabulary.
+Return exactly one YAML document.
 
 Successful result:
 
@@ -152,29 +104,23 @@ Successful result:
 protocol: wyrd-implement-v3
 outcome: CANDIDATE
 request_id: <input value>
-task_artifact: {path: <input path>, sha256: <input digest>}
-task_id: <input value>
-task_revision: <input value>
-accepted_sha: <input value>
-base_sha: <input value>
-candidate_sha: <40-hex immutable commit>
-parent_sha: <input parent_sha>
+task_packet: {path: <input path>, sha256: <input digest>}
+task_id: <packet contract ID>
+candidate_sha: <immutable commit>
+parent_sha: <input parent SHA>
 diff_sha256: <lowercase 64-hex digest>
 changed_paths: [<sorted repository-relative paths>]
 incidental_repair_paths:
-  - path: <changed path outside write_set; use [] when none>
-    diagnostic: <exact compile/lint/rustdoc/codegen/fixture/test reason>
+  - path: <path outside write_set>
+    diagnostic: <exact diagnostic>
 acceptance_trace:
-  - ac_id: <every input AC exactly once>
+  - ac_id: <every packet AC exactly once>
     implementation: [<path:symbol or path:line evidence>]
-    tests: [<test or static proof>]
-development_checks:
-  - id: <input development check, diagnostic authoritative check, or repository-required diagnostic id>
-    command: <command actually run>
-    result: PASS
-    evidence: <concise result>
-authoritative_checks_run: []
-predecessor_candidate: <input value>
+    tests: [<test or source evidence>]
+diagnostic_verification:
+  command: <packet verification command>
+  result: <PASS|NOT_RUN>
+  evidence: <concise result or safety limitation>
 ```
 
 Blocked result:
@@ -183,28 +129,18 @@ Blocked result:
 protocol: wyrd-implement-v3
 outcome: BLOCKED
 request_id: <input value>
-task_artifact: {path: <input path>, sha256: <observed or input digest>}
-task_id: <input value>
-task_revision: <input value>
-accepted_sha: <input value>
-base_sha: <input value>
-parent_sha: <input value>
+task_packet: {path: <input path>, sha256: <observed or input digest>}
 category: <INVALID_REQUEST|AUTHORITY_REQUIRED|MATERIAL_CONFLICT|FORBIDDEN_WRITE|MANDATORY_PROOF_UNAVAILABLE>
 evidence: [<specific repository facts and attempted recovery>]
 decision_required: <single exact authority or correction needed>
 partial_commit: null
 ```
 
-Never return a partial candidate. Leave no commit on `BLOCKED`; preserve any
-working-tree evidence for the orchestrator unless safely reverting only this
-run's known changes is explicitly requested.
+Never return a partial candidate. Preserve working-tree evidence on `BLOCKED`
+unless reverting only this run's known changes is explicitly requested.
 
-## Successor invalidation
+## Invalidation
 
-A candidate is valid only for the exact tuple `(task artifact digest, task id,
-task revision, accepted SHA, base SHA, candidate SHA, parent SHA, diff digest)`. Any new
-task revision, accepted SHA, changed artifact bytes, amended/rebased commit, or
-successor candidate invalidates every earlier candidate and every review of it.
-The orchestrator must name the superseded SHA as `predecessor_candidate`; this
-worker never reuses approval or evidence from the predecessor without rerunning
-the checks required by the new request.
+A candidate is valid only for its task-packet digest, parent SHA, candidate
+SHA, and diff digest. A changed packet, parent, amended/rebased commit, or
+successor candidate requires fresh diagnostic verification and review.

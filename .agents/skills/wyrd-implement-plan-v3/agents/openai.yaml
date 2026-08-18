@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Implement Plan v3"
-  short_description: "Execute an approved v3 plan"
-  default_prompt: "Use $wyrd-implement-plan-v3 to execute an approved Wyrd v3 plan through bounded Sol-low workers, immutable candidates, review, and serial integration."
+  short_description: "Execute Wyrd task packets"
+  default_prompt: "Use $wyrd-implement-plan-v3 to execute this Wyrd plan through task packets, focused verification, review, and serial integration."

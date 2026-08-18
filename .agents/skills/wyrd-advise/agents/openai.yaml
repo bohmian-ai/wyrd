@@ -1,7 +1,7 @@
 interface:
   display_name: "Wyrd Advise"
   short_description: "Opinionated Wyrd product and technical guidance"
-  default_prompt: "Use $wyrd-advise for concise, doctrine-grounded advice on Wyrd product and technical choices."
+  default_prompt: "Use $wyrd-advise for doctrine-grounded Wyrd advice, research, or an explicitly requested bounded change."
 
 policy:
   allow_implicit_invocation: true

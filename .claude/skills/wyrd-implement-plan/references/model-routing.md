@@ -75,7 +75,7 @@ save effort, and never abandon a task.
    escalation. State explicitly in the task's evidence that the controller
    implemented it, so the reviewer knows the author changed.
 5. **Task or plan revision.** The task itself is wrong. Revise it, obtain
-   `ADVISORY_APPROVE` from `wyrd-plan-reviewer`, and restart the cycle.
+   `READY` from `wyrd-plan-reviewer`, and restart the cycle.
 
 ### Repetition trigger
 

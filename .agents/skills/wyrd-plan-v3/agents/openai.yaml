@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Plan v3"
-  short_description: "Create concurrent executable Wyrd plans"
-  default_prompt: "Use $wyrd-plan-v3 to investigate current Wyrd source, compare source-bound DAG alternatives, and create a decision-complete concurrency-optimized plan with task packets, execution manifest, and exact proof preflights."
+  short_description: "Decompose Wyrd work into clear tasks"
+  default_prompt: "Use $wyrd-plan-v3 to turn this Wyrd request into a concise plan and detailed implementation task packets."

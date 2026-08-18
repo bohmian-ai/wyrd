@@ -37,7 +37,7 @@ specialist inventory for a normal gate.
 
 ## Verdict and findings
 
-State `Approve`, `Revise`, or `Stop/rethink`. Order findings by severity.
+State `Ready`, `Revise`, or `Review blocked`. Order findings by severity.
 
 Each finding contains:
 
@@ -65,7 +65,7 @@ Overall approval requires both axes to pass.
 For a plan gate, summarize missing or confirmed mappings among:
 
 - requirements;
-- executable tasks and assigned models;
+- executable tasks and dependencies;
 - acceptance criteria, required tests, and focused commands;
 - integrated journeys and closeout gates.
 - impact-graph nodes and affected consumers;

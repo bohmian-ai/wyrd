@@ -122,9 +122,9 @@ invalid, incorrectly decomposed, or not executable:
 3. update affected requirements, decisions, consumers, tests, downstream
    tasks, plan version, and design authority cohesively;
 4. re-run `python3 .claude/skills/wyrd-plan/scripts/validate_plan_artifacts.py <plan-dir>`;
-5. dispatch a `wyrd-plan-reviewer` agent in advisory mode for every material
+5. dispatch a read-only `wyrd-plan-reviewer` agent for every material
    revision;
-6. resolve its findings autonomously and repeat until `ADVISORY_APPROVE`;
+6. resolve its findings autonomously and repeat until `READY`;
 7. continue execution.
 
 Do not return a defective plan to the user for routine planning. Stop only
@@ -133,7 +133,7 @@ unavailable external authority prevents any correct implementation.
 
 Do not dispatch product implementation until the canonical plan is `Approved`,
 the active task is `Ready`, structural validation passes, and any material
-repair has advisory approval.
+repair has a `READY` readiness-review verdict.
 
 ## Execute one serial task cycle
 

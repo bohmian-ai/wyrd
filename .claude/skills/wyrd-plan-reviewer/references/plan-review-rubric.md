@@ -21,9 +21,9 @@ Report a finding only when all are true:
 
 1. The artifact owns or changes the decision.
 2. Current Wyrd authority, CodeGraph, and the named local precedent do not make
-   the task instruction unambiguous for its assigned model.
+   the task instruction unambiguous for a competent implementer.
 3. Leaving it unresolved can produce incompatible implementations, material
-   failure, or force the assigned implementation model to redesign
+   failure, or force the implementer to redesign
    architecture, contracts, persistence, security, ownership, acceptance
    outcomes, or proof.
 4. The impact clears the Critical or Major threshold.
@@ -48,7 +48,7 @@ or cross-owner behavior, confirm the artifact settles:
 
 Do not require detail already fixed by current authority, CodeGraph, or the
 nearest named local pattern. The task must name that precedent when it relies
-on it; do not require the assigned model to discover which of several patterns
+on it; do not require the implementer to discover which of several patterns
 applies.
 
 ## Task Executability
@@ -58,7 +58,7 @@ For every implementation task, confirm:
 - the exact standardized headings exist in the required order;
 - every inapplicable section is retained as
   `Not applicable: <one-sentence reason>`;
-- one cohesive outcome, assigned model, requirement IDs, and dependencies;
+- one cohesive outcome, requirement IDs, and dependencies;
 - relevant current-state context;
 - allowed and prohibited paths, crates, packages, and public surfaces;
 - expected owners, current seams, callers, consumers, tests, and generated
@@ -76,16 +76,15 @@ For every implementation task, confirm:
   non-weaker proof;
 - escalation conditions and structured completion evidence.
 
-Judge the packet from the assigned Luna, Terra, or Sol risk tier's perspective. If
-the model must choose architecture, persistence, a public contract, task scope,
+Judge the packet against the consequence and reversibility of its decisions. If
+an implementer must choose architecture, persistence, a public contract, task scope,
 consequential control flow, failure semantics, dependencies/features, or proof
 design, the packet is not ready. Private helper extraction,
 repository-aligned names and paths, adjacent private fixtures, and equivalent
 command spelling remain implementation mechanics.
 
-Treat schema drift as material when it prevents `$wyrd-implement` from
-validating or extracting the task contract. Do not waive missing or renamed
-sections merely because similar prose appears elsewhere.
+Treat schema drift as material only when it obscures or contradicts the task
+contract. Executor-specific schema acceptance belongs to executor preflight.
 
 Do not require a stub or pseudocode for a trivial mechanic whose single
 implementation is established by a named source precedent. Do require the
@@ -98,7 +97,7 @@ At a plan gate, verify:
 - every requirement maps to one or more executable tasks;
 - every requirement maps to objective verification;
 - tasks own cohesive outcomes and have explicit dependencies;
-- each task is small enough for its assigned implementation model;
+- each task is bounded enough to execute and review coherently;
 - separate task packets inherit plan decisions while repeating the concrete
   contract details needed for execution;
 - focused checks cover the smallest complete affected surface;
@@ -134,7 +133,7 @@ Use only for:
   the stated scale or data path
 - a primary developer or agent workflow that will predictably fail, require
   private knowledge, or expose inconsistent durable semantics
-- an assigned Luna, Terra, or Sol task that requires material redesign, scope
+- an implementation task that requires material redesign, scope
   invention, or verification design before coding can begin
 - a new service, crate, registry, state machine, compatibility path, or
   extension mechanism whose unjustified cost is material
@@ -193,8 +192,8 @@ supply existing source bodies and incidental mechanics; do not use them as a
 substitute for owners, material responsibilities, interfaces, consequential
 control-flow semantics, test cases, proof semantics, or executable setup.
 
-Approve concise plans only when their tasks remain directly executable by the
-assigned model. Length alone is not a readiness signal; implementation detail
+Mark concise plans ready only when their tasks remain directly executable by a
+competent implementer. Length alone is not a readiness signal; implementation detail
 that transfers consequential reasoning is.
 
 For re-review, validate prior findings and consequences of the revision. Do not

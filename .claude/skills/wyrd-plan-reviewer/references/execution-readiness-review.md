@@ -37,7 +37,7 @@ ownership, or completion proof materially. Do not demand unrelated inventory.
 
 ## Validate each task
 
-For every task proposed as `Ready`, confirm:
+For every implementation task, confirm:
 
 1. objective, requirement IDs, dependencies, non-goals, and material
    prohibited scope are coherent;
@@ -54,8 +54,6 @@ For every task proposed as `Ready`, confirm:
    discoverable;
 9. focused commands prove the task without unrelated broad gates;
 10. living-task corrections and material stop boundaries are explicit;
-11. the declared execution skill accepts the complete write set: non-UI work
-    uses `$wyrd-implement`, while Svelte/UI work includes `$wyrd-ui`.
 
 Exact private paths and symbols are repository-grounded guidance, not a
 whitelist. Exact command strings are recipes unless lane, feature set, or
@@ -92,15 +90,12 @@ Rehearse from the task packet, repository, and normal authorities only:
 6. identify the first choice the implementer must make.
 
 The rehearsal passes when every remaining choice is a reversible local mechanic
-or bounded correction already authorized by the task's declared
-surface-appropriate execution skill or skill set.
+or bounded factual correction that preserves the plan's material decisions.
 
-Require planner evidence that every `Ready` task passed a documented cold
-rehearsal, using a fresh agent when the planning environment supported it. When
-delegation was unavailable, accept a documented self-rehearsal that covers the
-same steps; lack of a fresh-agent tool is not itself a readiness failure. Give
-any fresh agent the task packet rather than the planner's reasoning or expected
-answer.
+Require structured cold-rehearsal evidence for every implementation task. The
+reviewer may perform the rehearsal directly; prior planner evidence is useful
+but not mandatory workflow state. Give any fresh agent the task packet rather
+than the planner's reasoning or expected answer.
 
 For cross-cutting, persistence, security, migration, concurrency, generated
 contract, or multi-language work, independently repeat the rehearsal with a
@@ -133,3 +128,10 @@ Confirm the task distinguishes:
 Overly rigid private file whitelists, immutable helper names, or exact command
 identity are Major only when they predict implementation interruption or force
 weaker/incorrect proof. Do not report harmless verbosity.
+
+## Executor preflight boundary
+
+Do not gate readiness on plan status, parent approval, review-artifact
+existence, structural-validator state, manifest identity, execution-skill
+acceptance, worktree setup, model routing, or task transitions. The selected
+executor owns those handoff checks after the plan is `Ready`.

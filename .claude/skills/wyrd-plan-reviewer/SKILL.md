@@ -1,6 +1,6 @@
 ---
 name: wyrd-plan-reviewer
-description: Independently review Wyrd feature specs, architecture proposals, implementation plans, and risk-tiered Luna/Terra/Sol task packets before implementation on separate architecture-soundness and execution-readiness axes. Use for Wyrd plan gates, spec gates, task handoff gates, material revisions made by $wyrd-implement-plan, API/SDK/CLI/MCP contracts, crate-boundary changes, Vala/Bifrost or Skald designs, and risk-tiered review of artifacts produced by $wyrd-plan. Validate change-impact closure, material decisions, executable verification, cold rehearsal, and controlled implementation adaptability; report only blocking Critical and Major issues.
+description: Independently and adversarially review Wyrd feature specs, architecture proposals, implementation plans, and task packets for architecture soundness and decision completeness. Use for Wyrd plan gates, spec gates, task handoff gates, material revisions, API/SDK/CLI/MCP contracts, crate-boundary changes, and Vala/Bifrost or Skald designs. Validate repository-native design, change-impact closure, material decisions, proof quality, and controlled implementation adaptability without coupling readiness to a particular executor or controller.
 ---
 
 # Wyrd Plan Reviewer
@@ -9,38 +9,20 @@ description: Independently review Wyrd feature specs, architecture proposals, im
 and `Sol` are risk tiers, not model names.
 
 Determine independently whether a Wyrd artifact is architecturally sound and,
-for a plan gate, executable through its surface-appropriate implementation
-skill without a material decision during coding. Concision is not a defect;
-unsupported readiness is.
+for a plan gate, executable by a competent implementer without a material
+decision during coding. Readiness belongs to the plan; format, dispatch,
+worktree, model, and workflow-state compatibility belong to the selected
+executor's preflight.
 
 Report only blocking Critical and Major findings. Keep architecture correctness
 and execution readiness as separate axes. Do not modify the reviewed plan,
 task packets, implementation source, tests, manifests, or lockfiles. Write only
 the durable review artifact when requested.
 
-## Plan-execution advisory mode
-
-When `$wyrd-implement-plan` submits an orchestrator-authored material revision,
-this mode overrides conflicting standalone workflow and output instructions:
-
-- Review the original intended outcome, revised canonical plan/tasks, decision
-  record, repository evidence, affected authorities, downstream consumers, and
-  revised proof.
-- Perform static architecture, impact, contract, task, and cold-rehearsal
-  analysis only. Do not run tests, builds, lints, formatters, generators,
-  migrations, services, plan validators, or repository gates.
-- Validate that the revision is repository-grounded, cohesive, reasonable, and
-  no weaker in correctness, security, tenancy, auditability, ergonomics, user
-  experience, or verification.
-- Return `ADVISORY_APPROVE` only when architecture and executability both pass.
-  Return `ADVISORY_REVISE` with consolidated Critical/Major root causes and
-  required edits otherwise.
-- Do not write a review artifact, modify plan/task/source, invoke planning or
-  implementation, stop the user workflow, or communicate with the user.
-
-The `$wyrd-implement-plan` root owns every revision and resolves findings
-autonomously. Re-review prior findings first and repeat until
-`ADVISORY_APPROVE`.
+An orchestrator may request a read-only review and consume the normal verdict,
+but it does not define a separate readiness mode or standard. In a read-only
+binding, write no artifact and run only non-mutating inspection needed to judge
+the plan's architecture, decisions, impact closure, and proof.
 
 ## Establish authority
 
@@ -52,20 +34,17 @@ Use the active Wyrd repository or worktree. Read completely:
 4. `architecture/wyrd-doctrine.mdx`
 5. the reviewed artifact and every authority it explicitly names
 
-For a `$wyrd-plan` plan gate, also read:
+For a plan gate, also read:
 
 - `.claude/skills/wyrd-plan/SKILL.md`
-- `.claude/skills/wyrd-implement/SKILL.md`
 - `.claude/skills/wyrd-plan/references/plan-format.md`
 - `.claude/skills/wyrd-plan/references/task-packet-format.md`
 - `architecture/references/languages/implementation-execution.md`
 
-When any task writes the Wyrd Svelte/UI tree, also read
-`.claude/skills/wyrd-ui/SKILL.md`. Confirm the task's selected execution skills
-accept its complete write set.
-
-Run the structural plan validator for filesystem-backed artifacts. Structural
-success proves format only; it does not prove architecture or executability.
+Do not run the structural plan validator merely to prove compatibility with a
+selected executor. Validate artifact structure only when it carries a material
+plan contract; executor-specific format validation belongs to executor
+preflight.
 
 Current Wyrd design wins over generated artifacts, old plans, predecessor
 behavior, and implementation drift unless the proposal explicitly replaces a
@@ -114,7 +93,7 @@ State which conditional references were loaded and the decision each governs.
 For a plan gate, apply:
 
 ```text
-overall approval = architecture PASS and executability PASS
+readiness = architecture PASS and executability PASS
 ```
 
 ## Review architecture soundness
@@ -145,9 +124,9 @@ overall approval = architecture PASS and executability PASS
    advisory unless their exact shape protects a named material invariant.
 5. Validate commands, packages, features, targets, filters, fixtures, support
    exports, services, migrations, and environment against the repository.
-6. Confirm planner evidence that every `Ready` task passed a documented cold
+6. Confirm every implementation task can pass a documented cold
    implementation rehearsal from the task packet alone, using a fresh agent
-   when the planning environment supported it. Independently repeat the
+   for high-risk work when the review environment supports it. Independently repeat the
    rehearsal with a new read-only agent for cross-cutting or high-risk tasks
    when the review environment supports it.
 7. Confirm the task permits living factual corrections and equivalent
@@ -163,8 +142,8 @@ dependency resolution when execution is necessary.
 A task is executable when the implementer can begin and finish without
 inventing material architecture, public or durable contracts, persistence,
 security semantics, ownership direction, acceptance outcomes, or proof design.
-Its declared execution skill or skill set must accept the task's write set;
-non-UI work uses `$wyrd-implement`, while Svelte/UI work includes `$wyrd-ui`.
+Do not judge readiness from a declared execution skill, accepted write set,
+model assignment, or controller state. Those are executor-preflight concerns.
 
 Do not require immutable private file inventories, helper names, fixture
 layout, or exact command strings. Require responsibilities, material
@@ -196,9 +175,10 @@ Report only:
 
 All findings block overall approval:
 
-- **Approve:** architecture `PASS` and executability `PASS`.
-- **Revise:** one or more Major findings and no Critical findings.
-- **Stop/rethink:** one or more Critical findings.
+- **Ready:** architecture `PASS` and executability `PASS`.
+- **Revise:** one or more Critical or Major findings.
+- **Review blocked:** the target or governing repository authority is genuinely
+  inaccessible.
 
 For spec gates, base the verdict on architecture and mark executability
 `Not applicable`.
@@ -220,5 +200,5 @@ For a filesystem-backed review, read `references/review-format.md` and write:
 ```
 
 Lead the chat handoff with overall verdict, architecture axis, executability
-axis, Critical/Major counts, and one clickable review path. If approved, state
-plainly that implementation may proceed.
+axis, Critical/Major counts, and one clickable review path. If ready, state
+plainly that executor preflight may proceed.

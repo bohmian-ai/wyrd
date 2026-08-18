@@ -174,7 +174,7 @@ Agent({
 
 Provide:
 
-- mode: `plan-execution advisory`;
+- binding: read-only plan-readiness review;
 - original intended outcome;
 - revised canonical plan and affected tasks;
 - revision decision record and repository evidence;
@@ -184,7 +184,7 @@ Provide:
 Require:
 
 ```text
-Verdict: ADVISORY_APPROVE | ADVISORY_REVISE
+Verdict: READY | REVISE | REVIEW_BLOCKED
 Architecture axis: PASS | FAIL
 Executability axis: PASS | FAIL
 Findings: <Critical/Major root causes and required edits>
@@ -192,9 +192,11 @@ Validated effects: <contracts, owners, tasks, tests, closeout>
 Static limits: <none or material uncertainty>
 ```
 
-The advisory reviewer never edits, writes a review artifact, runs project
+The read-only reviewer never edits, writes a review artifact, runs project
 verification, invokes planning, or stops the user workflow. The orchestrator
-resolves findings, revises, and repeats until `ADVISORY_APPROVE`.
+resolves findings, revises, and repeats until `READY`. `REVIEW_BLOCKED` requires
+inaccessible target or authority evidence; controller preflight failures remain
+the orchestrator's responsibility.
 
 ## Controller ownership
 

@@ -1421,6 +1421,7 @@ impl ShardOwner {
             states,
             memory,
             identity_memory,
+            identity_owner_bytes,
         } = chunk;
         if self.replay_chunk.is_some() {
             let _ = response.send(Err(ScribeError::Internal {
@@ -1480,16 +1481,14 @@ impl ShardOwner {
         };
         self.admission
             .sync_memtable_bytes(owner_stats.writable_bytes, owner_stats.immutable_bytes);
-        let identity = match identity_memory {
-            Some(lease) => match self.memory_ownership.adopt_replay_identity(lease) {
-                Ok(identity) => Some(identity),
-                Err(error) => {
-                    self.rollback_prepared_replay(&mut prepared);
-                    let _ = response.send(Err(error));
-                    return;
-                }
-            },
-            None => None,
+        let identity = match self.adopt_replay_identity_owner(identity_memory, identity_owner_bytes)
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.rollback_prepared_replay(&mut prepared);
+                let _ = response.send(Err(error));
+                return;
+            }
         };
         if self.persistence.is_none() {
             let identity_memory = identity
@@ -1562,6 +1561,29 @@ impl ShardOwner {
             },
             arrow_bytes: frozen.arrow_bytes,
         })
+    }
+
+    /// Moves the current stream's identity lease into replay persistence ownership.
+    ///
+    /// `producer_owner_bytes` remains the aggregate identity charge across all
+    /// live replay streams so the producer workspace is bounded by the complete
+    /// Scribe role ownership, not only the stream being persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the lease cannot be transferred between
+    /// Scribe memory categories without violating root accounting.
+    fn adopt_replay_identity_owner(
+        &self,
+        identity_memory: Option<crate::resources::ScribeMemoryLease>,
+        producer_owner_bytes: usize,
+    ) -> Result<Option<crate::scribe::memory::ReplayIdentityOwnership>, ScribeError> {
+        identity_memory
+            .map(|lease| {
+                self.memory_ownership
+                    .adopt_replay_identity(lease, producer_owner_bytes)
+            })
+            .transpose()
     }
 
     /// Discards reconstructed values that failed before immutable adoption.
@@ -3950,6 +3972,7 @@ mod tests {
             states: HashMap::new(),
             memory: None,
             identity_memory: Some(identity),
+            identity_owner_bytes: 64,
         };
         let stream = StreamIdentity::new(
             crate::scribe::stream_identity::NodeId::generate(),

@@ -499,7 +499,9 @@ impl ScribeOwnership {
     /// Adopts a replay scanner's committed-identity lease without admission.
     ///
     /// The same root-backed lease moves from Decode to Immutable, so the
-    /// operation is net-zero at the role ceiling. The returned guard restores
+    /// operation is net-zero at the role ceiling. `producer_owner_bytes`
+    /// carries the complete replay-wide identity projection used to size the
+    /// producer delta; the returned guard restores only its move-only lease to
     /// Decode attribution on rollback or terminal settlement.
     ///
     /// # Errors
@@ -509,15 +511,15 @@ impl ScribeOwnership {
     pub(crate) fn adopt_replay_identity(
         &self,
         mut lease: crate::resources::ScribeMemoryLease,
+        producer_owner_bytes: usize,
     ) -> Result<ReplayIdentityOwnership, ScribeError> {
         drop(self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?);
-        let bytes = lease.bytes();
         lease.transfer_category(MemoryCategory::Immutable)?;
         Ok(ReplayIdentityOwnership {
             lease: Some(lease),
-            bytes,
+            bytes: producer_owner_bytes,
         })
     }
 
@@ -1046,7 +1048,7 @@ mod tests {
             .expect("replay identity lease");
         let admitted = resources.snapshot().expect("admitted snapshot");
         let identity = ownership
-            .adopt_replay_identity(lease)
+            .adopt_replay_identity(lease, 96)
             .expect("identity adoption");
         assert_eq!(identity.bytes(), 96);
         assert_eq!(

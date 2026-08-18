@@ -2539,10 +2539,7 @@ impl ShardOwner {
             });
         let retained = match retained {
             Ok(retained) => retained,
-            Err(error) => {
-                self.fail_replay_chunk(error);
-                return Ok(());
-            }
+            Err(error) => return Err(error.to_string()),
         };
         let Some(owner) = self.replay_chunk.as_mut() else {
             return Err("replay completion lost its chunk owner".to_owned());
@@ -4425,6 +4422,94 @@ mod tests {
                 .expect("identity-lock settlement")
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
+        );
+
+        let retirement_key = owner_key();
+        let retirement_memtable = Memtable::new();
+        retirement_memtable
+            .insert(
+                &retirement_key,
+                owner_event(),
+                owner_meta(&retirement_key),
+                owner_batch(),
+            )
+            .expect("retirement replay insert");
+        let retirement_frozen = retirement_memtable
+            .freeze(&retirement_key)
+            .expect("retirement replay freeze");
+        let retirement_generation = owner_generation(
+            &retirement_key,
+            &retirement_frozen,
+            stream,
+            owner.wal_handle.clone(),
+        );
+        let (mut retirement_owner, _retirement_budget) = owner_for_completion_test_with_budget(
+            retirement_memtable,
+            &wal,
+            owner.wal_handle.clone(),
+            stream,
+        );
+        retirement_owner
+            .memory_ownership
+            .reserve_immutable(retirement_generation.arrow_bytes)
+            .expect("retirement immutable ownership");
+        retirement_owner
+            .admission
+            .sync_memtable_bytes(0, retirement_generation.arrow_bytes);
+        retirement_owner.pending_generations.insert(
+            retirement_key.clone(),
+            VecDeque::from([PendingGeneration {
+                generation: Arc::clone(&retirement_generation),
+                binding: crate::catalog::TenantTableBinding::resolve((
+                    retirement_key.tenant,
+                    retirement_key.table.clone(),
+                ))
+                .expect("retirement binding"),
+                submitted: true,
+                retry_scheduled: false,
+                replay_response: None,
+                replay_owned: true,
+            }]),
+        );
+        let (retirement_response, retirement_rx) = tokio::sync::oneshot::channel();
+        retirement_owner.replay_chunk = Some(ReplayChunkOwner {
+            remaining: VecDeque::new(),
+            current_generation: Some(retirement_generation.generation_id.0),
+            retirements: Vec::new(),
+            identity: None,
+            response: Some(retirement_response),
+        });
+        retirement_owner.fail_next_retirement_release = true;
+        let visibility_error = retirement_owner
+            .handle_persistence_completion(
+                PersistenceCompletion {
+                    generation_id: retirement_generation.generation_id,
+                    file_list_key: Some(owner_file_list_key(&retirement_key)),
+                    wal_segments: Vec::new(),
+                    wal: retirement_generation.wal.clone(),
+                    arrow_bytes: retirement_generation.arrow_bytes,
+                    replay_identity: None,
+                    error: None,
+                },
+                None,
+            )
+            .expect_err("retirement release failure reaches visibility");
+        let replay_error = tokio::time::timeout(std::time::Duration::from_secs(1), retirement_rx)
+            .await
+            .expect("retirement failure settles replay response")
+            .expect("retirement response sender")
+            .expect_err("retirement replay response must fail")
+            .to_string();
+        assert_eq!(
+            replay_error,
+            format!("internal scribe failure: {visibility_error}")
+        );
+        assert!(retirement_owner.replay_chunk.is_none());
+        assert!(retirement_owner.pending_generations.is_empty());
+        assert_eq!(retirement_owner.retained_generations.len(), 1);
+        assert_eq!(
+            retirement_owner.memory_ownership.immutable_bytes(),
+            retirement_generation.arrow_bytes
         );
     }
 

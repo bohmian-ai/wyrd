@@ -13,6 +13,14 @@ use crate::contracts::ScribeError;
 #[cfg(test)]
 thread_local! {
     static CGROUP_CURRENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// One-shot terminal identity return failure used by replay settlement tests.
+    static FAIL_REPLAY_IDENTITY_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms a one-shot replay identity return failure on the calling test thread.
+#[cfg(test)]
+pub(crate) fn arm_replay_identity_return_failure_for_test() {
+    FAIL_REPLAY_IDENTITY_RETURN.with(|failure| failure.set(true));
 }
 
 /// Minimum managed memory accepted by the checked Scribe/Oracle ledger.
@@ -422,6 +430,12 @@ impl ReplayIdentityOwnership {
     pub(crate) fn return_to_decode(
         mut self,
     ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
+        #[cfg(test)]
+        if FAIL_REPLAY_IDENTITY_RETURN.with(|failure| failure.replace(false)) {
+            return Err(ScribeError::Internal {
+                detail: "forced replay identity return failure".to_owned(),
+            });
+        }
         let mut lease = self.lease.take().ok_or_else(|| ScribeError::Internal {
             detail: "replay identity guard lost its lease".to_owned(),
         })?;

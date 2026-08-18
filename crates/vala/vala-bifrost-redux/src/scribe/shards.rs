@@ -1615,10 +1615,16 @@ impl ShardOwner {
             return Ok(());
         };
         let Some(next) = owner.remaining.pop_front() else {
-            let identity_memory = owner
-                .identity
-                .map(crate::scribe::memory::ReplayIdentityOwnership::return_to_decode)
-                .transpose()?;
+            let identity_memory = match owner.identity.take() {
+                Some(identity) => match identity.return_to_decode() {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        self.replay_chunk = Some(owner);
+                        return Err(error);
+                    }
+                },
+                None => None,
+            };
             if let Some(response) = owner.response.take() {
                 let _ = response.send(Ok(crate::scribe::replay::ReplayChunkResponse {
                     retirements: owner.retirements,
@@ -1627,23 +1633,32 @@ impl ShardOwner {
             }
             return Ok(());
         };
+        let next_generation = Arc::clone(&next.generation);
+        let mut identity_slot = if owner.identity.is_some() {
+            let Ok(identity) = next_generation.replay_identity.lock() else {
+                owner.remaining.push_front(next);
+                self.replay_chunk = Some(owner);
+                return Err(ScribeError::Internal {
+                    detail: "replay identity owner lock poisoned".to_owned(),
+                });
+            };
+            Some(identity)
+        } else {
+            None
+        };
         if let Err(error) = self
             .wal_handle
             .retain_segments(&next.generation.wal_segments)
         {
+            drop(identity_slot);
             owner.remaining.push_front(next);
             self.replay_chunk = Some(owner);
             return Err(error);
         }
-        if let Some(identity) = owner.identity.take() {
-            next.generation
-                .replay_identity
-                .lock()
-                .map_err(|_| ScribeError::Internal {
-                    detail: "replay identity owner lock poisoned".to_owned(),
-                })?
-                .replace(identity);
+        if let (Some(identity), Some(slot)) = (owner.identity.take(), identity_slot.as_mut()) {
+            slot.replace(identity);
         }
+        drop(identity_slot);
         let seal_key = next.generation.seal_key.clone();
         owner.current_generation = Some(next.generation.generation_id.0);
         self.pending_generations
@@ -4298,6 +4313,116 @@ mod tests {
             budget
                 .snapshot()
                 .expect("advance-failure ownership settlement")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
+
+        let terminal_lease = budget
+            .try_reserve_maintenance(MemoryCategory::Decode, 64)
+            .expect("terminal identity lease");
+        let terminal_identity = owner
+            .memory_ownership
+            .adopt_replay_identity(terminal_lease, 64)
+            .expect("terminal identity adoption");
+        let (terminal_response, terminal_rx) = tokio::sync::oneshot::channel();
+        owner.replay_chunk = Some(ReplayChunkOwner {
+            remaining: VecDeque::new(),
+            current_generation: None,
+            retirements: Vec::new(),
+            identity: Some(terminal_identity),
+            response: Some(terminal_response),
+        });
+        crate::scribe::memory::arm_replay_identity_return_failure_for_test();
+        let terminal_error = owner
+            .advance_replay_chunk()
+            .expect_err("terminal identity return must fail");
+        owner.fail_replay_chunk(terminal_error);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), terminal_rx)
+                .await
+                .expect("terminal return settles response")
+                .expect("terminal response sender")
+                .is_err()
+        );
+        assert_eq!(
+            budget
+                .snapshot()
+                .expect("terminal return settlement")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
+
+        let lock_key = SealKey::new(
+            current_key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "replay-identity-lock"),
+            current_key.day,
+        );
+        owner
+            .memtable
+            .insert(
+                &lock_key,
+                owner_event(),
+                owner_meta(&lock_key),
+                owner_batch(),
+            )
+            .expect("lock-failure replay insert");
+        let lock_frozen = owner
+            .memtable
+            .freeze(&lock_key)
+            .expect("lock-failure replay freeze");
+        let poisoned_generation =
+            owner_generation(&lock_key, &lock_frozen, stream, owner.wal_handle.clone());
+        owner
+            .memory_ownership
+            .reserve_immutable(poisoned_generation.arrow_bytes)
+            .expect("lock-failure immutable ownership");
+        owner
+            .admission
+            .sync_memtable_bytes(0, poisoned_generation.arrow_bytes);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _identity = poisoned_generation
+                .replay_identity
+                .lock()
+                .expect("identity lock before poison");
+            panic!("poison replay identity lock");
+        }));
+        let lock_lease = budget
+            .try_reserve_maintenance(MemoryCategory::Decode, 64)
+            .expect("lock-failure identity lease");
+        let lock_identity = owner
+            .memory_ownership
+            .adopt_replay_identity(lock_lease, 64)
+            .expect("lock-failure identity adoption");
+        let (lock_response, lock_rx) = tokio::sync::oneshot::channel();
+        owner.replay_chunk = Some(ReplayChunkOwner {
+            remaining: VecDeque::from([ReplayChunkGeneration {
+                generation: Arc::clone(&poisoned_generation),
+                binding: crate::catalog::TenantTableBinding::resolve((
+                    lock_key.tenant,
+                    lock_key.table.clone(),
+                ))
+                .expect("lock-failure binding"),
+            }]),
+            current_generation: None,
+            retirements: Vec::new(),
+            identity: Some(lock_identity),
+            response: Some(lock_response),
+        });
+        let lock_error = owner
+            .advance_replay_chunk()
+            .expect_err("poisoned identity lock must fail advancement");
+        owner.fail_replay_chunk(lock_error);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), lock_rx)
+                .await
+                .expect("identity-lock failure settles response")
+                .expect("identity-lock response sender")
+                .is_err()
+        );
+        assert_eq!(
+            budget
+                .snapshot()
+                .expect("identity-lock settlement")
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
         );

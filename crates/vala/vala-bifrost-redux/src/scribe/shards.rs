@@ -4551,6 +4551,20 @@ mod tests {
             retirement_owner.memory_ownership.immutable_bytes(),
             retirement_generation.arrow_bytes
         );
+        let retirement_snapshot = retirement_budget.memory_snapshot();
+        assert_eq!(
+            retirement_snapshot.scribe_total_bytes,
+            retirement_generation.arrow_bytes + 64
+        );
+        let retirement_attribution = retirement_budget.accounting_snapshot_for_test();
+        assert_eq!(
+            retirement_attribution.category_bytes[MemoryCategory::Decode as usize],
+            0
+        );
+        assert_eq!(
+            retirement_attribution.category_bytes[MemoryCategory::Immutable as usize],
+            retirement_generation.arrow_bytes + 64
+        );
     }
 
     /// Only typed WAL exhaustion is downgraded from an unexpected shard failure.

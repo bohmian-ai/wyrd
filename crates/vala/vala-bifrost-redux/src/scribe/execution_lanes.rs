@@ -1784,39 +1784,51 @@ fn execute_replay_directory_stream(
         Some(wal),
         Some(cancelled),
         |chunk| {
-            let crate::scribe::replay::ReplayChunk { states, memory } = chunk;
-            drop(memory);
-            let mut every_state_retired = true;
-            for state in states.into_values() {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(ScribeError::Internal {
-                        detail: "WAL replay cancelled".to_owned(),
-                    });
-                }
-                let shard = usize::from(state.shard_id);
-                let (response, receiver) = tokio::sync::oneshot::channel();
-                shard_senders[shard]
-                    .blocking_send(crate::scribe::shards::ShardCommand::Replay {
-                        state: Box::new(state),
-                        response,
-                    })
-                    .map_err(|_| ScribeError::Internal {
-                        detail: "replay owner dropped its command channel".to_owned(),
-                    })?;
-                if let Some(retirement) =
-                    receiver
-                        .blocking_recv()
-                        .map_err(|_| ScribeError::Internal {
-                            detail: "replay owner dropped its completion response".to_owned(),
-                        })??
-                {
-                    retirement_settlement.settle(&retirement)?;
-                } else {
-                    every_state_retired = false;
-                }
-                restored = restored.saturating_add(1);
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ScribeError::Internal {
+                    detail: "WAL replay cancelled".to_owned(),
+                });
             }
-            Ok(every_state_retired)
+            let shard = chunk
+                .states
+                .values()
+                .next()
+                .map(|state| usize::from(state.shard_id))
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay chunk omitted reconstructed state".to_owned(),
+                })?;
+            if chunk
+                .states
+                .values()
+                .any(|state| usize::from(state.shard_id) != shard)
+            {
+                return Err(ScribeError::Internal {
+                    detail: "replay chunk crossed recorded shard lanes".to_owned(),
+                });
+            }
+            let state_count = chunk.states.len();
+            let (response, receiver) = tokio::sync::oneshot::channel();
+            shard_senders[shard]
+                .blocking_send(crate::scribe::shards::ShardCommand::Replay {
+                    chunk: Box::new(chunk),
+                    response,
+                })
+                .map_err(|_| ScribeError::Internal {
+                    detail: "replay owner dropped its command channel".to_owned(),
+                })?;
+            let outcome = receiver
+                .blocking_recv()
+                .map_err(|_| ScribeError::Internal {
+                    detail: "replay owner dropped its completion response".to_owned(),
+                })??;
+            for retirement in &outcome.retirements {
+                retirement_settlement.settle(retirement)?;
+            }
+            restored = restored.saturating_add(state_count);
+            Ok(crate::scribe::replay::ReplayChunkSettlement {
+                retired: outcome.retirements.len() == state_count,
+                identity_memory: outcome.identity_memory,
+            })
         },
     )?;
     Ok(ScribeWalIoResult::ReplayStreamCompleted {

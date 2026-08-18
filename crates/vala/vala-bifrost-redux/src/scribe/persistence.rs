@@ -200,7 +200,7 @@ impl Drop for ObjectWriteGuard {
 pub struct GenerationId(pub u64);
 
 /// Immutable state transferred from a shard owner to persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ImmutableGeneration {
     /// Logical tenant/table owning the generation.
     pub table_key: TenantTableKey,
@@ -235,6 +235,8 @@ pub struct ImmutableGeneration {
     pub row_count: usize,
     /// Estimated Arrow bytes retained by the generation.
     pub arrow_bytes: usize,
+    /// Replay-only committed identity retained through publication.
+    pub(crate) replay_identity: Mutex<Option<crate::scribe::memory::ReplayIdentityOwnership>>,
     /// Monotonic active-generation open time.
     pub opened_at: std::time::Instant,
     /// Monotonic detach time.
@@ -279,6 +281,7 @@ impl ImmutableGeneration {
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
+            replay_identity: Mutex::new(None),
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
         }
@@ -301,7 +304,7 @@ impl ImmutableGeneration {
 }
 
 /// Completion sent through the owning shard command queue.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PersistenceCompletion {
     /// Generation identity reconciled by the owning shard.
     pub(crate) generation_id: GenerationId,
@@ -313,6 +316,8 @@ pub(crate) struct PersistenceCompletion {
     pub(crate) wal: crate::scribe::wal::WalHandle,
     /// Arrow bytes released after the generation becomes retireable.
     pub(crate) arrow_bytes: usize,
+    /// Replay identity returned after the persistence attempt settles.
+    pub(crate) replay_identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
     /// Persistence detail when one durable stage failed.
     pub(crate) error: Option<String>,
 }
@@ -1012,41 +1017,7 @@ impl PersistenceWorker {
             wal_lsn_max = generation.wal_lsn_max.as_u64(),
             "persisting immutable Scribe generation"
         );
-        let generation_owned_bytes = generation.arrow_bytes;
-        let reservation = parquet_producer_delta(generation_owned_bytes)
-            .and_then(|workspace_bytes| {
-                self.memory
-                    .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
-            })
-            .and_then(|mut reservation| {
-                reservation
-                    .attach_shard(generation.shard_id)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: error.to_string(),
-                    })?;
-                Ok(reservation)
-            });
-        let result = match reservation {
-            Ok(reservation) => {
-                // Attribution-only: the exact originating shard is unavailable
-                // here; `generation.shard_id` carries the recorded lane but
-                // the memory-accounting shard is approximate under batch-spread
-                // routing and does not affect correctness.
-                let mut parquet_owner = Some(reservation);
-                let result = self
-                    .persist_once(
-                        &generation,
-                        &job.binding,
-                        job.defer_manifest_advance,
-                        &mut parquet_owner,
-                        generation_owned_bytes,
-                    )
-                    .await;
-                drop(parquet_owner);
-                result
-            }
-            Err(error) => Err(error),
-        };
+        let result = self.persist_generation(&generation, &job).await;
         let status = if result.is_ok() {
             "published"
         } else {
@@ -1077,6 +1048,11 @@ impl PersistenceWorker {
                 .as_secs_f64(),
         );
         let publication_succeeded = result.is_ok();
+        let replay_identity = generation
+            .replay_identity
+            .lock()
+            .ok()
+            .and_then(|mut identity| identity.take());
         let completion = match result {
             Ok(file_list_key) => PersistenceCompletion {
                 generation_id: generation.generation_id,
@@ -1084,6 +1060,7 @@ impl PersistenceWorker {
                 wal_segments: generation.wal_segments.clone(),
                 wal: generation.wal.clone(),
                 arrow_bytes: generation.arrow_bytes,
+                replay_identity,
                 error: None,
             },
             Err(error) => PersistenceCompletion {
@@ -1092,11 +1069,61 @@ impl PersistenceWorker {
                 wal_segments: generation.wal_segments.clone(),
                 wal: generation.wal.clone(),
                 arrow_bytes: generation.arrow_bytes,
+                replay_identity,
                 error: Some(error.to_string()),
             },
         };
         self.deliver_completion(job, completion, visibility, publication_succeeded)
             .await;
+    }
+
+    /// Reserves the exact producer delta and persists one immutable generation.
+    ///
+    /// Replay identity bytes participate in the producer tuple while the
+    /// existing footer transfer consumes that same complete owned-byte value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for ownership overflow, producer admission, or
+    /// any persistence-stage failure.
+    async fn persist_generation(
+        &self,
+        generation: &Arc<ImmutableGeneration>,
+        job: &PersistenceJob,
+    ) -> Result<FileListCommitKey, ScribeError> {
+        let identity_bytes = generation
+            .replay_identity
+            .lock()
+            .map(|identity| {
+                identity
+                    .as_ref()
+                    .map_or(0, super::memory::ReplayIdentityOwnership::bytes)
+            })
+            .unwrap_or_default();
+        let owned_bytes = generation
+            .arrow_bytes
+            .checked_add(identity_bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay producer ownership overflowed".to_owned(),
+            })?;
+        let workspace_bytes = parquet_producer_delta(owned_bytes)?;
+        let mut reservation = self
+            .memory
+            .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)?;
+        reservation
+            .attach_shard(generation.shard_id)
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        let mut parquet_owner = Some(reservation);
+        self.persist_once(
+            generation,
+            &job.binding,
+            job.defer_manifest_advance,
+            &mut parquet_owner,
+            owned_bytes,
+        )
+        .await
     }
 
     /// Delivers one completion to the owning shard and resolves its visibility span.
@@ -2045,6 +2072,7 @@ mod tests {
                         append_metas: Vec::new(),
                         row_count: 1,
                         arrow_bytes: 1,
+                        replay_identity: Mutex::new(None),
                         opened_at: std::time::Instant::now(),
                         closed_at: std::time::Instant::now(),
                         shard_id: 0,

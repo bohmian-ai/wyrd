@@ -41,8 +41,54 @@ struct PendingGeneration {
     generation: Arc<ImmutableGeneration>,
     binding: crate::catalog::TenantTableBinding,
     submitted: bool,
-    replay_response:
-        Option<tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>>,
+    replay_response: Option<
+        tokio::sync::oneshot::Sender<
+            Result<crate::scribe::replay::ReplayChunkResponse, ScribeError>,
+        >,
+    >,
+    /// Whether this generation belongs to the shard's synchronous replay owner.
+    replay_owned: bool,
+}
+
+/// One reconstructed generation waiting behind the sole replay identity owner.
+#[derive(Debug)]
+struct ReplayChunkGeneration {
+    /// Immutable generation prepared from one sorted seal-key state.
+    generation: Arc<ImmutableGeneration>,
+    /// Catalog binding used by the persistence worker.
+    binding: crate::catalog::TenantTableBinding,
+}
+
+/// Result of preparing one sorted seal-key state from a replay chunk.
+enum PreparedReplayState {
+    /// Durable identity already exists, so only WAL retirement remains.
+    Retired(ReplayRetirement),
+    /// Reconstructed generation and its exact Arrow ownership.
+    Generation {
+        /// Generation ready for serialized persistence.
+        prepared: ReplayChunkGeneration,
+        /// Exact reconstructed Arrow bytes adopted by the chunk owner.
+        arrow_bytes: usize,
+    },
+}
+
+/// Serializes every generation from one replay chunk through one identity lease.
+#[derive(Debug)]
+struct ReplayChunkOwner {
+    /// Prepared generations not yet submitted, in stable seal-key order.
+    remaining: VecDeque<ReplayChunkGeneration>,
+    /// Generation currently awaiting persistence completion.
+    current_generation: Option<u64>,
+    /// Durable retirements accumulated for the complete chunk.
+    retirements: Vec<ReplayRetirement>,
+    /// Sole identity owner, present only between persistence generations.
+    identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
+    /// Synchronous WAL-lane response completed after the final generation.
+    response: Option<
+        tokio::sync::oneshot::Sender<
+            Result<crate::scribe::replay::ReplayChunkResponse, ScribeError>,
+        >,
+    >,
 }
 
 type PendingGenerationsByKey =
@@ -341,8 +387,12 @@ pub(crate) enum ShardCommand {
         visibility_result: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Replay {
-        state: Box<crate::scribe::replay::ReplayedSealKey>,
-        response: tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
+        /// Complete synchronous replay handoff for one recorded shard lane.
+        chunk: Box<crate::scribe::replay::ReplayChunk>,
+        /// Settlement returned before the WAL scanner advances.
+        response: tokio::sync::oneshot::Sender<
+            Result<crate::scribe::replay::ReplayChunkResponse, ScribeError>,
+        >,
     },
     FreezeKey {
         seal_key: crate::scribe::seal_key::SealKey,
@@ -403,6 +453,8 @@ struct ShardOwner {
     synced_not_inserted: HashMap<AppendSliceId, WalSliceState>,
     /// Per-key immutable generations waiting for ordered persistence.
     pending_generations: PendingGenerationsByKey,
+    /// At most one synchronous replay chunk advanced one generation at a time.
+    replay_chunk: Option<ReplayChunkOwner>,
     /// Seal keys whose `flush_keys` attempt failed after the freeze but before
     /// the accounting move, leaving a stranded pending frozen generation
     /// (state A).
@@ -657,6 +709,7 @@ impl ScribeShardRuntime {
                 wal_segments: WalSegmentsByKey::new(),
                 synced_not_inserted: HashMap::new(),
                 pending_generations: PendingGenerationsByKey::new(),
+                replay_chunk: None,
                 seal_retry: HashSet::new(),
                 retained_generations: HashMap::new(),
                 retained_commit_ambiguity: None,
@@ -1271,8 +1324,8 @@ impl ShardOwner {
                 let result = self.handle_persistence_completion(*completion, waiter);
                 let _ = visibility_result.send(result);
             }
-            ShardCommand::Replay { state, response } => {
-                self.replay_state(*state, response).await;
+            ShardCommand::Replay { chunk, response } => {
+                self.replay_state(*chunk, response).await;
             }
             ShardCommand::FreezeKey { seal_key, response } => {
                 let _ = response.send(self.freeze_key(&seal_key));
@@ -1342,83 +1395,142 @@ impl ShardOwner {
     /// publication and checked immutable retirement finish.
     async fn replay_state(
         &mut self,
-        mut replayed_state: crate::scribe::replay::ReplayedSealKey,
-        response: tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
+        chunk: crate::scribe::replay::ReplayChunk,
+        response: tokio::sync::oneshot::Sender<
+            Result<crate::scribe::replay::ReplayChunkResponse, ScribeError>,
+        >,
     ) {
-        let mut response = Some(response);
-        if self
-            .settle_replay_fence(&mut replayed_state, &mut response)
-            .await
-        {
-            return;
-        }
-        let Some(response) = response else {
-            return;
-        };
-        let source_stream = replayed_state.stream;
-        let seal_key = replayed_state.seal_key.clone();
-        let segment_refs = replayed_state.wal_segments.clone();
-        let result = match self
-            .persistence_cpu
-            .submit(
-                crate::scribe::execution_lanes::ScribePersistenceCpuOp::RestoreReplay {
-                    replayed: Box::new(replayed_state),
-                },
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = response.send(Err(error));
-                return;
-            }
-        };
-        let crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored(frozen) =
-            result
-        else {
+        let crate::scribe::replay::ReplayChunk {
+            states,
+            memory,
+            identity_memory,
+        } = chunk;
+        if self.replay_chunk.is_some() {
             let _ = response.send(Err(ScribeError::Internal {
-                detail: "persistence CPU lane returned the wrong replay result".to_owned(),
+                detail: "a synchronous replay chunk is already active".to_owned(),
             }));
             return;
-        };
-        let frozen = match self.memtable.insert_replayed_frozen(*frozen) {
-            Ok(frozen) => frozen,
-            Err(error) => {
-                let _ = response.send(Err(error));
-                return;
+        }
+        let mut ordered = states.into_iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut prepared = VecDeque::new();
+        let mut retirements = Vec::new();
+        let mut total_arrow_bytes = 0_usize;
+        for (_, replayed) in ordered {
+            match self.prepare_replay_state(replayed).await {
+                Ok(PreparedReplayState::Retired(retirement)) => {
+                    retirements.push(retirement);
+                }
+                Ok(PreparedReplayState::Generation {
+                    prepared: generation,
+                    arrow_bytes,
+                }) => {
+                    let Some(total) = total_arrow_bytes.checked_add(arrow_bytes) else {
+                        self.discard_prepared_replay(&mut prepared);
+                        let _ = response.send(Err(ScribeError::Internal {
+                            detail: "replay chunk Arrow ownership overflowed".to_owned(),
+                        }));
+                        return;
+                    };
+                    total_arrow_bytes = total;
+                    prepared.push_back(generation);
+                }
+                Err(error) => {
+                    self.discard_prepared_replay(&mut prepared);
+                    let _ = response.send(Err(error));
+                    return;
+                }
             }
+        }
+        let adoption = match memory {
+            Some(memory) => self
+                .memory_ownership
+                .adopt_replay_immutable(memory, total_arrow_bytes),
+            None => self.memory_ownership.reserve_immutable(total_arrow_bytes),
         };
-        if let Err(error) = self.memory_ownership.reserve_immutable(frozen.arrow_bytes) {
-            let _ = self.memtable.discard_pending_generation(frozen.seal_id);
+        if let Err(error) = adoption {
+            self.discard_prepared_replay(&mut prepared);
             let _ = response.send(Err(error));
             return;
         }
         let owner_stats = match self.memtable.stats() {
             Ok(stats) => stats,
             Err(error) => {
-                let result = self
-                    .rollback_replayed_generation(frozen.seal_id, frozen.arrow_bytes)
-                    .map_or_else(Err, |()| Err(error));
-                let _ = response.send(result);
+                self.rollback_prepared_replay(&mut prepared);
+                let _ = response.send(Err(error));
                 return;
             }
         };
         self.admission
             .sync_memtable_bytes(owner_stats.writable_bytes, owner_stats.immutable_bytes);
+        let identity = match identity_memory {
+            Some(lease) => match self.memory_ownership.adopt_replay_identity(lease) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    self.rollback_prepared_replay(&mut prepared);
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            },
+            None => None,
+        };
         if self.persistence.is_none() {
-            let _ = response.send(Ok(None));
+            let identity_memory = identity
+                .map(crate::scribe::memory::ReplayIdentityOwnership::return_to_decode)
+                .transpose();
+            let _ = response.send(identity_memory.map(|identity_memory| {
+                crate::scribe::replay::ReplayChunkResponse {
+                    retirements,
+                    identity_memory,
+                }
+            }));
             return;
         }
-        let binding = match replay_binding(&seal_key) {
-            Ok(binding) => binding,
-            Err(error) => {
-                let result = self
-                    .rollback_replayed_generation(frozen.seal_id, frozen.arrow_bytes)
-                    .map_or_else(Err, |()| Err(error));
-                let _ = response.send(result);
-                return;
-            }
+        self.replay_chunk = Some(ReplayChunkOwner {
+            remaining: prepared,
+            current_generation: None,
+            retirements,
+            identity,
+            response: Some(response),
+        });
+        if let Err(error) = self.advance_replay_chunk() {
+            self.fail_replay_chunk(error);
+        }
+    }
+
+    /// Resolves, reconstructs, and retains one state for serialized persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for durable-fence conflicts, reconstruction or
+    /// memtable failure, invalid catalog identity, or WAL segment retention.
+    async fn prepare_replay_state(
+        &mut self,
+        mut replayed: crate::scribe::replay::ReplayedSealKey,
+    ) -> Result<PreparedReplayState, ScribeError> {
+        if let Some(retirement) = self.resolve_replay_fence(&mut replayed).await? {
+            return Ok(PreparedReplayState::Retired(retirement));
+        }
+        let source_stream = replayed.stream;
+        let seal_key = replayed.seal_key.clone();
+        let segment_refs = replayed.wal_segments.clone();
+        let binding = replay_binding(&seal_key)?;
+        let restored = self
+            .persistence_cpu
+            .submit(
+                crate::scribe::execution_lanes::ScribePersistenceCpuOp::RestoreReplay {
+                    replayed: Box::new(replayed),
+                },
+            )
+            .await?;
+        let crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored(frozen) =
+            restored
+        else {
+            return Err(ScribeError::Internal {
+                detail: "persistence CPU lane returned the wrong replay result".to_owned(),
+            });
         };
+        let frozen = self.memtable.insert_replayed_frozen(*frozen)?;
         let generation = Arc::new(ImmutableGeneration::from_frozen(
             &frozen,
             (seal_key.tenant, seal_key.table.clone()),
@@ -1426,46 +1538,103 @@ impl ShardOwner {
             segment_refs.clone(),
             self.wal_handle.clone(),
         ));
-        if let Err(error) = self.wal_handle.retain_segments(&segment_refs) {
-            let result = self
-                .rollback_replayed_generation(frozen.seal_id, frozen.arrow_bytes)
-                .map_or_else(Err, |()| Err(error));
-            let _ = response.send(result);
-            return;
+        Ok(PreparedReplayState::Generation {
+            prepared: ReplayChunkGeneration {
+                generation,
+                binding,
+            },
+            arrow_bytes: frozen.arrow_bytes,
+        })
+    }
+
+    /// Discards reconstructed values that failed before immutable adoption.
+    fn discard_prepared_replay(&mut self, prepared: &mut VecDeque<ReplayChunkGeneration>) {
+        for pending in prepared.drain(..) {
+            let _ = self
+                .memtable
+                .discard_pending_generation(pending.generation.generation_id.0);
         }
+    }
+
+    /// Rolls back reconstructed generations that never entered serialized persistence.
+    fn rollback_prepared_replay(&mut self, prepared: &mut VecDeque<ReplayChunkGeneration>) {
+        for pending in prepared.drain(..) {
+            let _ = self.rollback_replayed_generation(
+                pending.generation.generation_id.0,
+                pending.generation.arrow_bytes,
+            );
+        }
+    }
+
+    /// Submits the next sorted generation while moving the sole identity owner into it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when owner state is inconsistent or the identity lock is poisoned.
+    fn advance_replay_chunk(&mut self) -> Result<(), ScribeError> {
+        let Some(mut owner) = self.replay_chunk.take() else {
+            return Ok(());
+        };
+        let Some(next) = owner.remaining.pop_front() else {
+            let identity_memory = owner
+                .identity
+                .map(crate::scribe::memory::ReplayIdentityOwnership::return_to_decode)
+                .transpose()?;
+            if let Some(response) = owner.response.take() {
+                let _ = response.send(Ok(crate::scribe::replay::ReplayChunkResponse {
+                    retirements: owner.retirements,
+                    identity_memory,
+                }));
+            }
+            return Ok(());
+        };
+        if let Err(error) = self
+            .wal_handle
+            .retain_segments(&next.generation.wal_segments)
+        {
+            owner.remaining.push_front(next);
+            self.replay_chunk = Some(owner);
+            return Err(error);
+        }
+        if let Some(identity) = owner.identity.take() {
+            next.generation
+                .replay_identity
+                .lock()
+                .map_err(|_| ScribeError::Internal {
+                    detail: "replay identity owner lock poisoned".to_owned(),
+                })?
+                .replace(identity);
+        }
+        let seal_key = next.generation.seal_key.clone();
+        owner.current_generation = Some(next.generation.generation_id.0);
         self.pending_generations
             .entry(seal_key.clone())
             .or_default()
             .push_back(PendingGeneration {
-                generation,
-                binding,
+                generation: next.generation,
+                binding: next.binding,
                 submitted: false,
-                replay_response: Some(response),
+                replay_response: None,
+                replay_owned: true,
             });
+        self.replay_chunk = Some(owner);
         self.submit_front(&seal_key);
+        Ok(())
     }
 
-    /// Settles a suppressed or rejected replay before material reconstruction.
-    ///
-    /// Returns `true` after consuming the response for a terminal SQL decision;
-    /// `false` retains the response for canonical restoration.
-    async fn settle_replay_fence(
-        &self,
-        replayed: &mut crate::scribe::replay::ReplayedSealKey,
-        response: &mut Option<
-            tokio::sync::oneshot::Sender<Result<Option<ReplayRetirement>, ScribeError>>,
-        >,
-    ) -> bool {
-        let resolution = self.resolve_replay_fence(replayed).await;
-        let terminal = match resolution {
-            Ok(Some(retirement)) => Ok(Some(retirement)),
-            Ok(None) => return false,
-            Err(error) => Err(error),
-        };
-        if let Some(response) = response.take() {
-            let _ = response.send(terminal);
+    /// Terminates the active synchronous replay response after an owned failure.
+    fn fail_replay_chunk(&mut self, error: ScribeError) {
+        if let Some(mut owner) = self.replay_chunk.take() {
+            for pending in owner.remaining.drain(..) {
+                let _ = self.rollback_replayed_generation(
+                    pending.generation.generation_id.0,
+                    pending.generation.arrow_bytes,
+                );
+            }
+            if let Some(response) = owner.response.take() {
+                let _ = response.send(Err(error));
+            }
         }
-        true
     }
 
     /// Resolves one replay commit against the tenant-scoped durable batch fence.
@@ -1873,6 +2042,7 @@ impl ShardOwner {
             binding,
             submitted: false,
             replay_response: None,
+            replay_owned: false,
         });
         if should_submit {
             self.submit_front(seal_key);
@@ -1906,7 +2076,7 @@ impl ShardOwner {
                 binding,
                 completion_tx: self.completion_tx.clone(),
                 completion_waiter: None,
-                defer_manifest_advance: front.replay_response.is_some(),
+                defer_manifest_advance: front.replay_response.is_some() || front.replay_owned,
             })
             .is_err()
         {
@@ -2075,9 +2245,10 @@ impl ShardOwner {
     /// an invariant error when the owning FIFO cannot advance exactly once.
     fn handle_persistence_completion(
         &mut self,
-        completion: PersistenceCompletion,
+        mut completion: PersistenceCompletion,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), String> {
+        let mut replay_identity = completion.replay_identity.take();
         let generation_id = completion.generation_id.0;
         let seal_key = self.pending_generations.iter().find_map(|(key, queue)| {
             queue
@@ -2088,10 +2259,19 @@ impl ShardOwner {
         let Some(seal_key) = seal_key else {
             return self.handle_unowned_completion(completion, waiter);
         };
+        let replay_owned = self.front_is_replay_owned(&seal_key);
         if let Some(error) = completion.error.as_ref() {
             let detail = error.clone();
             self.mark_front_retryable(&seal_key);
             tracing::warn!(error = %error, generation_id, "shard persistence failed; retaining immutable generation");
+            if replay_owned {
+                if let Some(owner) = self.replay_chunk.as_mut() {
+                    owner.identity = replay_identity.take();
+                }
+                self.fail_replay_chunk(ScribeError::Internal {
+                    detail: detail.clone(),
+                });
+            }
             self.send_replay_error(&seal_key, &detail);
             Self::send_waiter_error(waiter, detail.clone());
             return Err(detail);
@@ -2099,6 +2279,14 @@ impl ShardOwner {
         let Some(file_list_key) = completion.file_list_key.clone() else {
             let detail = "persistence completion omitted its file-list key".to_owned();
             self.mark_front_retryable(&seal_key);
+            if replay_owned {
+                if let Some(owner) = self.replay_chunk.as_mut() {
+                    owner.identity = replay_identity.take();
+                }
+                self.fail_replay_chunk(ScribeError::Internal {
+                    detail: detail.clone(),
+                });
+            }
             self.send_replay_error(&seal_key, &detail);
             Self::send_waiter_error(waiter, detail.clone());
             return Err(detail);
@@ -2109,6 +2297,14 @@ impl ShardOwner {
         {
             let detail = error.to_string();
             self.mark_front_retryable(&seal_key);
+            if replay_owned {
+                if let Some(owner) = self.replay_chunk.as_mut() {
+                    owner.identity = replay_identity.take();
+                }
+                self.fail_replay_chunk(ScribeError::Internal {
+                    detail: detail.clone(),
+                });
+            }
             tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
             self.send_replay_error(&seal_key, &detail);
             Self::send_waiter_error(waiter, detail.clone());
@@ -2117,7 +2313,7 @@ impl ShardOwner {
         let Some(queue) = self.pending_generations.get_mut(&seal_key) else {
             return Err("persistence completion queue disappeared".to_owned());
         };
-        let Some(front) = queue.pop_front() else {
+        let Some(mut front) = queue.pop_front() else {
             return Err("persistence completion queue is empty".to_owned());
         };
         if front.generation.generation_id.0 != generation_id {
@@ -2135,37 +2331,128 @@ impl ShardOwner {
         if queue.is_empty() {
             self.pending_generations.remove(&seal_key);
         }
-        if let Some(replay_response) = front.replay_response {
-            let replay_result =
-                self.retire_committed_generation(generation_id)
-                    .and_then(|retained| {
-                        retained
-                        .map(|retained| ReplayRetirement {
-                            wal: retained.wal,
-                            segments: retained.wal_segments,
-                            stream: front.generation.stream,
-                            seal_key: front.generation.seal_key.clone(),
-                            sealed_lsn: front.generation.wal_lsn_max,
-                        })
-                        .ok_or_else(|| ScribeError::Internal {
-                            detail: format!(
-                                "replay generation {generation_id} was not eligible for retirement"
-                            ),
-                        })
-                    });
-            let detail = replay_result.as_ref().err().map(ToString::to_string);
-            let _ = replay_response.send(replay_result.map(Some));
-            if let Some(detail) = detail {
-                return Err(detail);
-            }
+        if front.replay_owned {
+            self.complete_replay_generation(&front, generation_id, replay_identity.take())?;
         }
-        if let Some(waiter) = waiter {
-            let _ = waiter.send(Ok(()));
+        if let Some(replay_response) = front.replay_response.take() {
+            self.complete_single_replay_generation(
+                &front,
+                generation_id,
+                replay_identity,
+                replay_response,
+            )?;
         }
+        Self::send_waiter_success(waiter);
         if self.persistence.is_some() {
             self.submit_front(&seal_key);
         }
         Ok(())
+    }
+
+    /// Reports whether one key's FIFO front belongs to the active replay chunk.
+    fn front_is_replay_owned(&self, seal_key: &crate::scribe::seal_key::SealKey) -> bool {
+        self.pending_generations
+            .get(seal_key)
+            .and_then(|queue| queue.front())
+            .is_some_and(|front| front.replay_owned)
+    }
+
+    /// Delivers a successful completion to an optional persistence waiter.
+    fn send_waiter_success(waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>) {
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(Ok(()));
+        }
+    }
+
+    /// Settles one serialized replay generation and advances the chunk owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant detail when retirement, active-owner identity, or
+    /// next-generation submission cannot advance exactly once.
+    fn complete_replay_generation(
+        &mut self,
+        front: &PendingGeneration,
+        generation_id: u64,
+        replay_identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
+    ) -> Result<(), String> {
+        let retained = self
+            .retire_committed_generation(generation_id)
+            .and_then(|retained| {
+                retained.ok_or_else(|| ScribeError::Internal {
+                    detail: format!(
+                        "replay generation {generation_id} was not eligible for retirement"
+                    ),
+                })
+            });
+        let retained = match retained {
+            Ok(retained) => retained,
+            Err(error) => {
+                self.fail_replay_chunk(error);
+                return Ok(());
+            }
+        };
+        let Some(owner) = self.replay_chunk.as_mut() else {
+            return Err("replay completion lost its chunk owner".to_owned());
+        };
+        if owner.current_generation != Some(generation_id) {
+            return Err("replay completion does not match the active generation".to_owned());
+        }
+        owner.current_generation = None;
+        owner.identity = replay_identity;
+        owner.retirements.push(ReplayRetirement {
+            wal: retained.wal,
+            segments: retained.wal_segments,
+            stream: front.generation.stream,
+            seal_key: front.generation.seal_key.clone(),
+            sealed_lsn: front.generation.wal_lsn_max,
+        });
+        self.advance_replay_chunk()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Completes the retained single-generation replay compatibility path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the retirement or identity-restoration failure delivered to the
+    /// synchronous replay caller.
+    fn complete_single_replay_generation(
+        &mut self,
+        front: &PendingGeneration,
+        generation_id: u64,
+        replay_identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
+        response: tokio::sync::oneshot::Sender<
+            Result<crate::scribe::replay::ReplayChunkResponse, ScribeError>,
+        >,
+    ) -> Result<(), String> {
+        let result = self
+            .retire_committed_generation(generation_id)
+            .and_then(|retained| {
+                retained.ok_or_else(|| ScribeError::Internal {
+                    detail: format!(
+                        "replay generation {generation_id} was not eligible for retirement"
+                    ),
+                })
+            })
+            .and_then(|retained| {
+                let identity_memory = replay_identity
+                    .map(crate::scribe::memory::ReplayIdentityOwnership::return_to_decode)
+                    .transpose()?;
+                Ok(crate::scribe::replay::ReplayChunkResponse {
+                    retirements: vec![ReplayRetirement {
+                        wal: retained.wal,
+                        segments: retained.wal_segments,
+                        stream: front.generation.stream,
+                        seal_key: front.generation.seal_key.clone(),
+                        sealed_lsn: front.generation.wal_lsn_max,
+                    }],
+                    identity_memory,
+                })
+            });
+        let detail = result.as_ref().err().map(ToString::to_string);
+        let _ = response.send(result);
+        detail.map_or(Ok(()), Err)
     }
 
     /// Marks a key's front generation for a later persistence retry.
@@ -3442,6 +3729,148 @@ mod tests {
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
+    /// Failed replay binding or adoption restores memtable and memory baselines.
+    ///
+    /// # Panics
+    ///
+    /// Panics if invalid catalog identity inserts reconstructed state, a
+    /// foreign-root lease merges, or either failure retains root/category bytes.
+    #[tokio::test]
+    async fn replay_insert_adoption_failure_rolls_back_identity_and_immutable() {
+        let owner_resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let foreign_resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let ownership =
+            crate::scribe::memory::ScribeOwnership::new(&owner_resources).expect("shard ownership");
+        let owner_baseline = owner_resources.snapshot().expect("owner baseline");
+        let foreign_baseline = foreign_resources.snapshot().expect("foreign baseline");
+        let lease = foreign_resources
+            .try_reserve_maintenance(MemoryCategory::Decode, 64)
+            .expect("foreign replay lease");
+        ownership
+            .adopt_replay_immutable(lease, 64)
+            .expect_err("foreign replay lease must not merge");
+        assert_eq!(ownership.immutable_bytes(), 0);
+        assert_eq!(
+            owner_resources
+                .snapshot()
+                .expect("owner restored")
+                .scribe_memory_used_bytes,
+            owner_baseline.scribe_memory_used_bytes
+        );
+        assert_eq!(
+            foreign_resources
+                .snapshot()
+                .expect("foreign restored")
+                .scribe_memory_used_bytes,
+            foreign_baseline.scribe_memory_used_bytes
+        );
+
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let root_baseline = budget.snapshot().expect("root baseline");
+        let memtable_baseline = owner.memtable.stats().expect("memtable baseline");
+        let replayed = crate::scribe::replay::ReplayedSealKey {
+            stream,
+            seal_key: owner_bad_binding_key(),
+            shard_id: 0,
+            audit_events: Vec::new(),
+            data_records: Vec::new(),
+            append_metas: Vec::new(),
+            wal_segments: Vec::new(),
+            commits: Vec::new(),
+        };
+        assert!(
+            owner.prepare_replay_state(replayed).await.is_err(),
+            "invalid catalog binding must fail before reconstruction"
+        );
+        assert_eq!(
+            owner.memtable.stats().expect("memtable restored"),
+            memtable_baseline
+        );
+        assert_eq!(owner.memory_ownership.active_bytes(), 0);
+        assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        let restored = budget.snapshot().expect("root restored");
+        assert_eq!(
+            restored.scribe_memory_used_bytes,
+            root_baseline.scribe_memory_used_bytes
+        );
+        let categories = budget.memory_snapshot().categories;
+        assert_eq!(categories[MemoryCategory::Decode as usize], 0);
+        assert_eq!(categories[MemoryCategory::Immutable as usize], 0);
+    }
+
+    /// One multi-state chunk retains a single identity owner until serialization.
+    ///
+    /// # Panics
+    ///
+    /// Panics if adding multiple reconstructed states duplicates or releases
+    /// the chunk's single committed-identity lease.
+    #[test]
+    fn replay_chunk_serializes_identity_across_multiple_states() {
+        let resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let identity = resources
+            .try_reserve_maintenance(MemoryCategory::Decode, 64)
+            .expect("identity lease");
+        let mut chunk = crate::scribe::replay::ReplayChunk {
+            states: HashMap::new(),
+            memory: None,
+            identity_memory: Some(identity),
+        };
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::generate(),
+            crate::scribe::stream_identity::WriterEpoch::new(1),
+        );
+        for table in ["state-b", "state-a"] {
+            let seal_key = SealKey::new(
+                DataTenantId::new_v7(),
+                TableRef::new(BifrostNamespace::Bifrost, table),
+                EventDay::new(NaiveDate::from_ymd_opt(2026, 8, 18).expect("date")),
+            );
+            chunk.states.insert(
+                seal_key.as_path_components(),
+                crate::scribe::replay::ReplayedSealKey {
+                    stream,
+                    seal_key,
+                    shard_id: 0,
+                    audit_events: Vec::new(),
+                    data_records: Vec::new(),
+                    append_metas: Vec::new(),
+                    wal_segments: Vec::new(),
+                    commits: Vec::new(),
+                },
+            );
+        }
+        assert_eq!(chunk.states.len(), 2);
+        assert_eq!(
+            chunk.identity_memory.as_ref().map(|lease| lease.bytes()),
+            Some(64)
+        );
+        drop(chunk);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("released identity")
+                .scribe_memory_used_bytes,
+            0
+        );
+    }
+
     /// Only typed WAL exhaustion is downgraded from an unexpected shard failure.
     ///
     /// # Panics
@@ -3754,6 +4183,7 @@ mod tests {
             wal_segments: WalSegmentsByKey::new(),
             synced_not_inserted: HashMap::new(),
             pending_generations: PendingGenerationsByKey::new(),
+            replay_chunk: None,
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
             retained_commit_ambiguity: None,
@@ -4266,6 +4696,7 @@ mod tests {
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
+            replay_identity: std::sync::Mutex::new(None),
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
             shard_id: frozen.shard_id,
@@ -4308,6 +4739,7 @@ mod tests {
                 .expect("binding"),
                 submitted: true,
                 replay_response: None,
+                replay_owned: false,
             }]),
         );
         let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
@@ -4320,6 +4752,7 @@ mod tests {
                     wal_segments: Vec::new(),
                     wal: wal_handle,
                     arrow_bytes: generation.arrow_bytes,
+                    replay_identity: None,
                     error: None,
                 }),
                 waiter: Some(waiter_tx),
@@ -4369,6 +4802,7 @@ mod tests {
                     wal_segments: Vec::new(),
                     wal: wal_handle,
                     arrow_bytes: 1,
+                    replay_identity: None,
                     error: None,
                 }),
                 waiter: Some(waiter_tx),

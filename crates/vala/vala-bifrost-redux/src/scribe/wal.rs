@@ -3311,6 +3311,27 @@ impl ShardRecordCursor {
     }
 }
 
+/// One validated WAL record paired with its already-charged payload owner.
+///
+/// Field order keeps the record alive until the payload lease is released on
+/// every callback exit. Replay consumes the value to merge that lease into its
+/// Decode owner without a release-and-reacquire window.
+pub(crate) struct AccountedWalRecord {
+    /// Durable segment path contributing the record.
+    path: PathBuf,
+    /// Validated decoded WAL record.
+    record: WalRecord,
+    /// Root-backed payload lease present for governed replay.
+    payload_memory: Option<ScribeMemoryLease>,
+}
+
+impl AccountedWalRecord {
+    /// Separates the owned record handoff for replay assembly.
+    pub(crate) fn into_parts(self) -> (PathBuf, WalRecord, Option<ScribeMemoryLease>) {
+        (self.path, self.record, self.payload_memory)
+    }
+}
+
 impl WalReader {
     /// Open only segments belonging to `stream`.
     ///
@@ -3501,7 +3522,9 @@ impl WalReader {
         F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
         let mut visit = visit;
-        self.for_each_stream_record_accounted(None, None, |stream, shard, path, record| {
+        self.for_each_stream_record_accounted(None, None, |stream, shard, accounted| {
+            let (path, record, memory) = accounted.into_parts();
+            drop(memory);
             visit(stream, shard, path, record).map(|()| false)
         })
     }
@@ -3526,7 +3549,7 @@ impl WalReader {
         mut visit: F,
     ) -> Result<(), ScribeError>
     where
-        F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<bool, ScribeError>,
+        F: FnMut(StreamIdentity, u8, AccountedWalRecord) -> Result<bool, ScribeError>,
     {
         let mut streams: WalStreams = BTreeMap::new();
         for segment in &self.segments {
@@ -3578,8 +3601,15 @@ impl WalReader {
                     });
                 }
                 previous_lsn = Some(record.lsn);
-                cursor.segment_retirement_safe = visit(stream, *shard_id, path, record)?;
-                drop(payload_memory);
+                cursor.segment_retirement_safe = visit(
+                    stream,
+                    *shard_id,
+                    AccountedWalRecord {
+                        path,
+                        record,
+                        payload_memory,
+                    },
+                )?;
             }
         }
         Ok(())
@@ -3715,6 +3745,89 @@ mod tests {
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "wal-test"),
             EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("test date")),
         )
+    }
+
+    /// Accounted replay transfers payload ownership through every callback exit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a successful, failed, or cancellation-shaped callback lacks
+    /// its payload lease or leaves charged root memory after returning.
+    #[test]
+    fn accounted_replay_handoff_owns_payload_on_success_error_and_cancellation() {
+        let directory = TempDir::new().expect("temporary WAL directory");
+        let writer =
+            WalWriter::new(directory.path(), [9; 16], 1, WalConfig::default()).expect("writer");
+        writer
+            .append_and_commit_for_replay_test(
+                &test_seal_key(crate::test_support::tenant()),
+                [7; 16],
+                b"audit",
+                b"payload",
+            )
+            .expect("complete replay batch");
+        let resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let baseline = resources.snapshot().expect("baseline snapshot");
+        let reader = WalReader::open_directory_unfiltered(directory.path()).expect("reader");
+
+        reader
+            .for_each_stream_record_accounted(Some(&resources), None, |_, _, accounted| {
+                let (_, _, payload) = accounted.into_parts();
+                assert!(payload.is_some());
+                Ok(false)
+            })
+            .expect("successful accounted handoff");
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("success snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
+
+        let error = reader
+            .for_each_stream_record_accounted(Some(&resources), None, |_, _, accounted| {
+                let (_, _, payload) = accounted.into_parts();
+                assert!(payload.is_some());
+                Err(ScribeError::Internal {
+                    detail: "injected replay callback failure".to_owned(),
+                })
+            })
+            .expect_err("callback failure");
+        assert!(
+            error
+                .to_string()
+                .contains("injected replay callback failure")
+        );
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("failure snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
+
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let _ = reader
+            .for_each_stream_record_accounted(Some(&resources), None, |_, _, accounted| {
+                let (_, _, payload) = accounted.into_parts();
+                assert!(payload.is_some());
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL replay cancelled".to_owned(),
+                    });
+                }
+                Ok(false)
+            })
+            .expect_err("cancellation-shaped callback failure");
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("cancel snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
     }
 
     /// Encodes one valid audit envelope for replay identity reconstruction.
@@ -4397,7 +4510,9 @@ mod tests {
         let writer = Arc::new(writer);
         let mut commits = 0_usize;
         let cancelled = reader
-            .for_each_stream_record_accounted(None, Some(writer.as_ref()), |_, _, _, record| {
+            .for_each_stream_record_accounted(None, Some(writer.as_ref()), |_, _, accounted| {
+                let (_, record, memory) = accounted.into_parts();
+                drop(memory);
                 if record.is_commit() {
                     commits = commits.saturating_add(1);
                     writer.retire_segments(std::slice::from_ref(&segment))?;
@@ -4431,7 +4546,9 @@ mod tests {
             .expect("restart reader");
         let mut restart_commits = 0_usize;
         replay
-            .for_each_stream_record_accounted(None, Some(restarted.as_ref()), |_, _, _, record| {
+            .for_each_stream_record_accounted(None, Some(restarted.as_ref()), |_, _, accounted| {
+                let (_, record, memory) = accounted.into_parts();
+                drop(memory);
                 if record.is_commit() {
                     restart_commits = restart_commits.saturating_add(1);
                     if restart_commits == 2 {

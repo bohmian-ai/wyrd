@@ -393,6 +393,54 @@ pub struct ScribeOwnership {
     lifecycle: Arc<Mutex<ScribeGenerationLifecycleSnapshot>>,
 }
 
+/// Move-only replay identity lease temporarily adopted by immutable ownership.
+///
+/// The guard preserves the exact root reservation while replay publication is
+/// pending. Returning it reclassifies the same lease to Decode; dropping it on
+/// an error path also restores that category before releasing capacity.
+#[derive(Debug)]
+pub(crate) struct ReplayIdentityOwnership {
+    /// Exact root-backed lease loaned by the replay scanner.
+    lease: Option<crate::resources::ScribeMemoryLease>,
+    /// Stable byte count used in the complete Parquet producer tuple.
+    bytes: usize,
+}
+
+impl ReplayIdentityOwnership {
+    /// Returns the exact identity bytes retained by this guard.
+    #[must_use]
+    pub(crate) const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Returns the same root-backed lease to Decode ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when root category attribution cannot be
+    /// restored. The guard retains the lease on failure.
+    pub(crate) fn return_to_decode(
+        mut self,
+    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
+        let mut lease = self.lease.take().ok_or_else(|| ScribeError::Internal {
+            detail: "replay identity guard lost its lease".to_owned(),
+        })?;
+        if let Err(error) = lease.transfer_category(MemoryCategory::Decode) {
+            self.lease = Some(lease);
+            return Err(error);
+        }
+        Ok(lease)
+    }
+}
+
+impl Drop for ReplayIdentityOwnership {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.as_mut() {
+            let _ = lease.transfer_category(MemoryCategory::Decode);
+        }
+    }
+}
+
 /// Fixed-size lifecycle observations emitted by the enforcing generation owner.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScribeGenerationLifecycleSnapshot {
@@ -446,6 +494,76 @@ impl ScribeOwnership {
             )),
             lifecycle: Arc::new(Mutex::new(ScribeGenerationLifecycleSnapshot::default())),
         })
+    }
+
+    /// Adopts a replay scanner's committed-identity lease without admission.
+    ///
+    /// The same root-backed lease moves from Decode to Immutable, so the
+    /// operation is net-zero at the role ceiling. The returned guard restores
+    /// Decode attribution on rollback or terminal settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when root category attribution cannot move to
+    /// Immutable. The supplied lease is released as Decode on failure.
+    pub(crate) fn adopt_replay_identity(
+        &self,
+        mut lease: crate::resources::ScribeMemoryLease,
+    ) -> Result<ReplayIdentityOwnership, ScribeError> {
+        drop(self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?);
+        let bytes = lease.bytes();
+        lease.transfer_category(MemoryCategory::Immutable)?;
+        Ok(ReplayIdentityOwnership {
+            lease: Some(lease),
+            bytes,
+        })
+    }
+
+    /// Adopts a replay chunk's decoded lease as immutable Arrow ownership.
+    ///
+    /// The existing lease is resized to the reconstructed Arrow footprint,
+    /// reclassified, and merged into the immutable ledger. No capacity is
+    /// released and reacquired between decode and persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when resize, category transfer, attribution
+    /// clearing, or immutable-ledger merging fails.
+    pub(crate) fn adopt_replay_immutable(
+        &self,
+        mut lease: crate::resources::ScribeMemoryLease,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        lease.resize_ingress(bytes)?;
+        lease.transfer_category(MemoryCategory::Immutable)?;
+        lease
+            .clear_identity_attribution()
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?;
+        immutable
+            .merge(lease)
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        self.observe(|lifecycle| {
+            lifecycle.plans = lifecycle.plans.saturating_add(1);
+            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
+            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
+            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
+            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
+            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
+            lifecycle.replay_materializations = lifecycle.replay_materializations.saturating_add(1);
+            lifecycle.replay_materialized_bytes =
+                lifecycle.replay_materialized_bytes.saturating_add(bytes);
+            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_add(bytes);
+        });
+        Ok(())
     }
 
     /// Applies one scalar observation transition without creating a second governor.
@@ -865,7 +983,7 @@ fn read_memory_limit(path: &str) -> Option<usize> {
 #[cfg(test)]
 /// Focused ownership and lifecycle reconciliation proofs.
 mod tests {
-    use super::ScribeOwnership;
+    use super::{MemoryCategory, ScribeOwnership};
 
     /// Generation observations follow the enforcing active/immutable owner exactly.
     #[test]
@@ -909,5 +1027,50 @@ mod tests {
         assert_eq!(lifecycle.active_bytes, 0);
         assert_eq!(lifecycle.immutable_bytes, 0);
         assert_eq!(resources.memory_snapshot().total_bytes(), 0);
+    }
+
+    /// Replay identity adoption and rollback preserve exact root ownership.
+    ///
+    /// # Panics
+    ///
+    /// Panics if admission, category adoption, Decode restoration, or terminal
+    /// release changes the root total or leaves category attribution behind.
+    #[test]
+    fn replay_identity_adoption_and_rollback_are_net_zero() {
+        let resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let ownership = ScribeOwnership::new(&resources).expect("generation owner");
+        let baseline = resources.snapshot().expect("baseline snapshot");
+        let lease = resources
+            .try_reserve_maintenance(MemoryCategory::Decode, 96)
+            .expect("replay identity lease");
+        let admitted = resources.snapshot().expect("admitted snapshot");
+        let identity = ownership
+            .adopt_replay_identity(lease)
+            .expect("identity adoption");
+        assert_eq!(identity.bytes(), 96);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("adopted snapshot")
+                .scribe_memory_used_bytes,
+            admitted.scribe_memory_used_bytes
+        );
+        let lease = identity.return_to_decode().expect("identity rollback");
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("rolled-back snapshot")
+                .scribe_memory_used_bytes,
+            admitted.scribe_memory_used_bytes
+        );
+        drop(lease);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("released snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
     }
 }

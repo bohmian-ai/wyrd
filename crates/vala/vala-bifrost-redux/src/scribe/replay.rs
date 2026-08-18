@@ -103,6 +103,26 @@ pub struct ReplayChunk {
     /// WAL lane. Dropping the chunk releases the reservation after recovery has
     /// transferred its Arrow ownership or publication has completed.
     pub(crate) memory: Option<ScribeMemoryLease>,
+    /// Committed-identity memory loaned until synchronous shard settlement.
+    pub(crate) identity_memory: Option<ScribeMemoryLease>,
+}
+
+/// Synchronous settlement returned before the replay scanner advances.
+#[derive(Debug)]
+pub(crate) struct ReplayChunkSettlement {
+    /// Whether every state in the chunk reached durable retirement.
+    pub(crate) retired: bool,
+    /// The same committed-identity lease restored to Decode ownership.
+    pub(crate) identity_memory: Option<ScribeMemoryLease>,
+}
+
+/// Shard response for one whole replay chunk.
+#[derive(Debug)]
+pub(crate) struct ReplayChunkResponse {
+    /// Durable retirements produced by the chunk's reconstructed states.
+    pub(crate) retirements: Vec<crate::scribe::shards::ReplayRetirement>,
+    /// The committed-identity lease returned to Decode ownership.
+    pub(crate) identity_memory: Option<ScribeMemoryLease>,
 }
 
 /// Per-append metadata derived during replay.
@@ -166,7 +186,10 @@ pub fn replay_wal_directory_stream(
 ) -> Result<(), ScribeError> {
     let mut emit = emit;
     replay_wal_directory_stream_accounted(wal_dir, None, None, None, None, |chunk| {
-        emit(chunk).map(|()| false)
+        emit(chunk).map(|()| ReplayChunkSettlement {
+            retired: false,
+            identity_memory: None,
+        })
     })
 }
 
@@ -188,7 +211,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
     governor: Option<&ScribeResources>,
     wal: Option<&crate::scribe::wal::WalWriter>,
     cancelled: Option<&AtomicBool>,
-    mut emit: impl FnMut(ReplayChunk) -> Result<bool, ScribeError>,
+    mut emit: impl FnMut(ReplayChunk) -> Result<ReplayChunkSettlement, ScribeError>,
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
     let reader = if let Some(current) = recovery_stream {
@@ -200,53 +223,52 @@ pub(crate) fn replay_wal_directory_stream_accounted(
     // independently with the correct shard_id threaded to ReplayedSealKey.
     let mut accumulators: HashMap<(StreamIdentity, u8), ReplayAccumulator<'_>> = HashMap::new();
 
-    reader.for_each_stream_record_accounted(
-        governor,
-        wal,
-        |stream, shard_id, segment_path, record| {
+    reader.for_each_stream_record_accounted(governor, wal, |stream, shard_id, accounted| {
+        let (segment_path, record, payload_memory) = accounted.into_parts();
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(ScribeError::Internal {
+                detail: "WAL replay cancelled".to_owned(),
+            });
+        }
+        if recovery_stream.is_some_and(|current| {
+            stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
+        }) {
+            return Ok(false);
+        }
+        let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
+        let key = (stream, shard_id);
+        if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
+            entry.insert(ReplayAccumulator::new(
+                stream,
+                shard_id,
+                sealed_lsn_map,
+                governor,
+            )?);
+        }
+        let accumulator = accumulators
+            .get_mut(&key)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay accumulator disappeared after insertion".to_owned(),
+            })?;
+        accumulator.append(segment_path, &record, payload_memory)?;
+        // A WAL record is the indivisible replay unit. Hand it off immediately
+        // so partial accumulators from other shard streams cannot retain decode
+        // reservations while publication owns immutable and encoding workspace.
+        // The existing synchronous callback supplies the required backpressure.
+        if let Some(chunk) = accumulator.take_chunk()? {
+            let settlement = emit(chunk)?;
+            accumulator.identity_memory = settlement.identity_memory;
+            if !settlement.retired {
+                accumulator.mark_current_segment_unsettled();
+            }
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                 return Err(ScribeError::Internal {
                     detail: "WAL replay cancelled".to_owned(),
                 });
             }
-            if recovery_stream.is_some_and(|current| {
-                stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
-            }) {
-                return Ok(false);
-            }
-            let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
-            let key = (stream, shard_id);
-            if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
-                entry.insert(ReplayAccumulator::new(
-                    stream,
-                    shard_id,
-                    sealed_lsn_map,
-                    governor,
-                )?);
-            }
-            let accumulator = accumulators
-                .get_mut(&key)
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "replay accumulator disappeared after insertion".to_owned(),
-                })?;
-            accumulator.append(segment_path, &record)?;
-            // A WAL record is the indivisible replay unit. Hand it off immediately
-            // so partial accumulators from other shard streams cannot retain decode
-            // reservations while publication owns immutable and encoding workspace.
-            // The existing synchronous callback supplies the required backpressure.
-            if let Some(chunk) = accumulator.take_chunk()? {
-                if !emit(chunk)? {
-                    accumulator.mark_current_segment_unsettled();
-                }
-                if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-                    return Err(ScribeError::Internal {
-                        detail: "WAL replay cancelled".to_owned(),
-                    });
-                }
-            }
-            Ok(accumulator.segment_retirement_safe())
-        },
-    )?;
+        }
+        Ok(accumulator.segment_retirement_safe())
+    })?;
 
     for accumulator in accumulators.values_mut() {
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
@@ -255,7 +277,8 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             });
         }
         if let Some(chunk) = accumulator.take_chunk()? {
-            let _ = emit(chunk)?;
+            let settlement = emit(chunk)?;
+            accumulator.identity_memory = settlement.identity_memory;
         }
     }
 
@@ -365,6 +388,7 @@ impl<'a> ReplayAccumulator<'a> {
         &mut self,
         segment_path: std::path::PathBuf,
         record: &crate::scribe::wal::WalRecord,
+        payload_memory: Option<ScribeMemoryLease>,
     ) -> Result<(), ScribeError> {
         if self.current_segment_path.as_ref() != Some(&segment_path) {
             self.current_segment_path = Some(segment_path.clone());
@@ -392,6 +416,16 @@ impl<'a> ReplayAccumulator<'a> {
             return Err(ScribeError::IngestBusy {
                 table: "WAL replay batch".to_owned(),
             });
+        }
+        if let Some(payload_memory) = payload_memory {
+            let memory = self.memory.as_mut().ok_or_else(|| ScribeError::Internal {
+                detail: "accounted WAL payload lacks a replay decode owner".to_owned(),
+            })?;
+            memory
+                .merge(payload_memory)
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
         }
         if let Some(memory) = self.memory.as_mut() {
             memory.resize_ingress(next_memory)?;
@@ -612,10 +646,10 @@ impl<'a> ReplayAccumulator<'a> {
         let chunk = ReplayChunk {
             states: std::mem::take(&mut self.states),
             memory: self.memory.take(),
+            identity_memory: self.identity_memory.take(),
         };
         self.memory = next_memory;
         self.memory_bytes = 0;
-        debug_assert!(self.identity_memory.is_some() || self.governor.is_none());
         Ok(Some(chunk))
     }
 
@@ -954,9 +988,10 @@ mod tests {
     use super::*;
     use crate::catalog::TableRef;
     use crate::scribe::seal_key::EventDay;
-    use crate::scribe::stream_identity::NodeId;
+    use crate::scribe::stream_identity::{NodeId, WriterEpoch};
     use crate::scribe::wal::{PreparedWalAppend, WalWriter};
     use chrono::NaiveDate;
+    use std::path::PathBuf;
     use tempfile::TempDir;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::ids::DataTenantId;
@@ -969,6 +1004,38 @@ mod tests {
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
             EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
         )
+    }
+
+    /// Decode failure drops payload ownership before any identity is retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if malformed replay unexpectedly decodes or any payload, decoded,
+    /// or identity lease remains charged after the failed accumulator drops.
+    #[test]
+    fn replay_decode_failure_drops_payload_before_identity_lease() {
+        let resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let baseline = resources.snapshot().expect("baseline snapshot");
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let mut accumulator = ReplayAccumulator::new(stream, 0, HashMap::new(), Some(&resources))
+            .expect("replay accumulator");
+        let payload = resources
+            .try_reserve_maintenance(MemoryCategory::Decode, 3)
+            .expect("payload lease");
+        let record = WalRecord::slice(WalLsn::new(0), [0; 16], [1; 16], 0, 1, vec![1, 2, 3]);
+        accumulator
+            .append(PathBuf::from("malformed.wal"), &record, Some(payload))
+            .expect_err("malformed slice must fail decode");
+        assert!(accumulator.committed_batches.is_empty());
+        drop(accumulator);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("released snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
     }
 
     #[test]
@@ -1133,9 +1200,12 @@ mod tests {
             None,
             None,
             None,
-            |chunk| {
+            |mut chunk| {
                 recovered.extend(chunk.states.into_values().map(|state| state.stream));
-                Ok(false)
+                Ok(ReplayChunkSettlement {
+                    retired: false,
+                    identity_memory: chunk.identity_memory.take(),
+                })
             },
         )
         .expect("recovery");
@@ -1305,9 +1375,13 @@ mod tests {
             Some(&budget),
             None,
             None,
-            |chunk| {
+            |mut chunk| {
+                let identity_memory = chunk.identity_memory.take();
                 chunks.push(chunk);
-                Ok(false)
+                Ok(ReplayChunkSettlement {
+                    retired: false,
+                    identity_memory,
+                })
             },
         )
         .expect("streamed replay");
@@ -1380,7 +1454,8 @@ mod tests {
             None,
             None,
             None,
-            |chunk| {
+            |mut chunk| {
+                let identity_memory = chunk.identity_memory.take();
                 restored = restored.saturating_add(
                     chunk
                         .states
@@ -1388,7 +1463,10 @@ mod tests {
                         .map(|state| state.append_metas.len())
                         .sum::<usize>(),
                 );
-                Ok(false)
+                Ok(ReplayChunkSettlement {
+                    retired: false,
+                    identity_memory,
+                })
             },
         )
         .expect("replay");
@@ -1426,7 +1504,12 @@ mod tests {
             Some(&budget),
             None,
             None,
-            |_| Ok(false),
+            |mut chunk| {
+                Ok(ReplayChunkSettlement {
+                    retired: false,
+                    identity_memory: chunk.identity_memory.take(),
+                })
+            },
         )
         .expect_err("payload admission must refuse");
         assert!(
@@ -1474,10 +1557,13 @@ mod tests {
             None,
             None,
             Some(&cancelled),
-            |chunk| {
+            |mut chunk| {
                 settled = settled.saturating_add(chunk.states.len());
                 cancelled.store(true, Ordering::Release);
-                Ok(false)
+                Ok(ReplayChunkSettlement {
+                    retired: false,
+                    identity_memory: chunk.identity_memory.take(),
+                })
             },
         )
         .expect_err("replay must observe cancellation");

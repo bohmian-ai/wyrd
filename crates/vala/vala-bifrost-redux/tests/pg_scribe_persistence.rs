@@ -454,7 +454,10 @@ impl PersistenceFixture {
                 .fetch_one(&mut **conn.transaction())
                 .await
                 .expect("failed-replay publication count");
-        assert_eq!(published, 0, "failed replay must not publish later state");
+        assert_eq!(
+            published, 0,
+            "failed replay must not publish later state; replay error: {error}"
+        );
         error
     }
 }
@@ -1529,6 +1532,53 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
     );
 }
 
+/// Exact-floor restart settles identity ownership and suppresses duplicate replay.
+///
+/// # Panics
+///
+/// Panics if mixed-role exact-floor recovery fails, publishes a duplicate,
+/// remains unready, or leaves any root-owned Scribe bytes after settlement.
+#[tokio::test]
+async fn replay_exact_floor_restart_duplicate_and_settlement() {
+    let memory = persistence_test_roles(768 * 1024 * 1024);
+    let baseline = memory.snapshot().expect("baseline root snapshot");
+    assert_eq!(baseline.plan.scribe_floor_bytes, 256 * 1024 * 1024);
+    assert_eq!(baseline.plan.elastic_memory_bytes, 0);
+    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
+        false,
+        &["exact_floor_replay"],
+        1,
+        &[Duration::from_millis(1)],
+        memory,
+        1,
+        10_000,
+    )
+    .await
+    .expect("exact-floor replay");
+    assert!(fixture.scribe.is_ready());
+    assert_eq!(
+        rows_for_table(&fixture, "exact_floor_replay").await.len(),
+        1
+    );
+
+    fixture
+        .scribe
+        .replay_wal_async()
+        .await
+        .expect("duplicate replay settles through the durable fence");
+    assert_eq!(
+        rows_for_table(&fixture, "exact_floor_replay").await.len(),
+        1
+    );
+    let settled = fixture.memory.snapshot().expect("settled root snapshot");
+    assert_eq!(
+        settled.scribe_memory_used_bytes,
+        baseline.scribe_memory_used_bytes
+    );
+    assert_eq!(settled.elastic_memory_used_bytes, 0);
+    fixture.stop().await;
+}
+
 /// Replay applies publication-driven backpressure when aggregate WAL ownership exceeds memory.
 #[tokio::test]
 async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
@@ -1621,9 +1671,19 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
         Err(error) => error,
     };
     match &error {
-        ScribeError::IngestBusy { table } => assert_eq!(table, "WAL replay batch"),
+        ScribeError::IngestBusy { table } => assert!(
+            matches!(table.as_str(), "WAL recovery segment" | "WAL replay batch"),
+            "replay refusal must name its bounded WAL owner"
+        ),
         ScribeError::Internal { detail } => {
-            assert_eq!(detail, "ingest busy for table: WAL replay batch");
+            assert!(
+                matches!(
+                    detail.as_str(),
+                    "ingest busy for table: WAL recovery segment"
+                        | "ingest busy for table: WAL replay batch"
+                ),
+                "replay refusal must retain its structural capacity error"
+            );
         }
         _ => panic!("replay refusal must retain its structural capacity error: {error:?}"),
     }

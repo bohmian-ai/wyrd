@@ -1627,13 +1627,22 @@ impl ScribeResources {
             .saturating_add(plan.elastic_memory_bytes)
     }
 
-    /// Returns the ingress ceiling after retaining one producer workspace.
+    /// Returns the full checked Scribe role ceiling for ingress ownership.
+    ///
+    /// Immutable generation bytes transfer into the fixed Parquet producer
+    /// owner, whose incremental reservation charges only the remaining delta.
+    /// Reserving that target here would therefore double-count the producer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the validated root plan's Scribe floor and elastic allowance
+    /// cannot be represented by `usize`.
     #[must_use]
     pub(crate) fn ingress_limit_bytes(&self) -> usize {
-        let limit = self.limit_bytes();
-        limit
-            .saturating_sub(crate::scribe::memory::PARQUET_PRODUCER_OWNER_BYTES.min(limit))
-            .max(limit / 4)
+        let plan = self.governor.plan();
+        plan.scribe_floor_bytes
+            .checked_add(plan.elastic_memory_bytes)
+            .expect("validated Scribe role ceiling must fit usize")
     }
 
     /// Returns the bounded active-bucket target derived from root Scribe capacity.
@@ -3069,20 +3078,19 @@ impl ScribeMemoryLease {
     ///
     /// # Errors
     ///
-    /// Returns the stable Scribe error projection on refusal or poison.
+    /// Returns the stable Scribe error projection on role-ceiling overflow,
+    /// refusal, or poison.
     pub(crate) fn resize_ingress(
         &mut self,
         bytes: usize,
     ) -> Result<(), crate::contracts::ScribeError> {
-        let ingress_limit = {
-            let plan = self.root.plan();
-            let role_limit = plan
-                .scribe_floor_bytes
-                .saturating_add(plan.elastic_memory_bytes);
-            role_limit
-                .saturating_sub(crate::scribe::memory::PARQUET_PRODUCER_OWNER_BYTES.min(role_limit))
-                .max(role_limit / 4)
-        };
+        let plan = self.root.plan();
+        let ingress_limit = plan
+            .scribe_floor_bytes
+            .checked_add(plan.elastic_memory_bytes)
+            .ok_or_else(|| crate::contracts::ScribeError::Internal {
+                detail: "validated Scribe role ceiling overflowed".to_owned(),
+            })?;
         self.resize_with_limit(bytes, Some(ingress_limit))
             .map_err(scribe_resource_error)
     }
@@ -4170,6 +4178,111 @@ mod tests {
                 Err(BifrostResourceError::InvalidPlan { .. })
             ));
         }
+    }
+
+    /// A floor-only Scribe role admits a generation and its producer delta.
+    ///
+    /// This models the production handoff: the immutable generation remains
+    /// charged while the Parquet producer acquires only the complement to its
+    /// 256 MiB owner. Together they consume, but never exceed, the same role
+    /// floor, and dropping both owners returns root attribution to baseline.
+    ///
+    /// # Panics
+    ///
+    /// Panics if exact-floor composition, ingress admission, category transfer,
+    /// producer admission, attribution inspection, or release reconciliation
+    /// violates the Scribe ownership contract.
+    #[test]
+    fn scribe_exact_floor_admits_generation_and_transfer() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            512 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe],
+        );
+        let scribe = roles.scribe().expect("Scribe capability");
+        assert_eq!(scribe.governor.plan().scribe_floor_bytes, 256 * MIB);
+        assert_eq!(scribe.governor.plan().elastic_memory_bytes, 0);
+        assert_eq!(scribe.ingress_limit_bytes(), 256 * MIB);
+
+        let generation_bytes = 96 * MIB;
+        let mut generation = scribe
+            .try_reserve_ingress(ScribeMemoryCategory::Active, generation_bytes)
+            .expect("representative generation must fit the exact Scribe floor");
+        generation
+            .transfer_category(ScribeMemoryCategory::Immutable)
+            .expect("generation ownership must transfer to immutable");
+        let producer_delta = crate::scribe::memory::parquet_producer_delta(generation_bytes)
+            .expect("representative generation must fit the producer owner");
+        let producer = scribe
+            .try_reserve_maintenance(ScribeMemoryCategory::Persistence, producer_delta)
+            .expect("producer delta must complete the exact Scribe floor");
+
+        let occupied = scribe.snapshot().expect("occupied Scribe snapshot");
+        assert_eq!(occupied.scribe_memory_used_bytes, 256 * MIB);
+        assert_eq!(occupied.elastic_memory_used_bytes, 0);
+        let attribution = scribe
+            .governor
+            .attribution_snapshot()
+            .expect("producer handoff attribution");
+        assert_eq!(
+            attribution.category_bytes[ScribeMemoryCategory::Immutable as usize],
+            generation_bytes
+        );
+        assert_eq!(
+            attribution.category_bytes[ScribeMemoryCategory::Persistence as usize],
+            producer_delta
+        );
+
+        drop(producer);
+        drop(generation);
+        assert_eq!(
+            scribe
+                .snapshot()
+                .expect("released Scribe snapshot")
+                .scribe_memory_used_bytes,
+            0
+        );
+    }
+
+    /// Ingress resize retains the full floor when no elastic memory exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a floor-sized resize is refused, a byte beyond the floor is
+    /// admitted, or releasing the resized owner fails to restore baseline.
+    #[test]
+    fn scribe_ingress_resize_uses_exact_floor_without_elastic() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            512 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe],
+        );
+        let scribe = roles.scribe().expect("Scribe capability");
+        let mut ingress = scribe
+            .try_reserve_ingress(ScribeMemoryCategory::Raw, 1)
+            .expect("initial ingress owner");
+
+        ingress
+            .resize_ingress(256 * MIB)
+            .expect("full floor resize must remain admissible");
+        assert!(ingress.resize_ingress(256 * MIB + 1).is_err());
+        assert_eq!(ingress.bytes(), 256 * MIB);
+        assert_eq!(
+            scribe
+                .snapshot()
+                .expect("floor-sized ingress snapshot")
+                .elastic_memory_used_bytes,
+            0
+        );
+
+        drop(ingress);
+        assert_eq!(
+            scribe
+                .snapshot()
+                .expect("released ingress snapshot")
+                .scribe_memory_used_bytes,
+            0
+        );
     }
 
     /// Concurrent ingress requests enforce their shared sublimit in one root transition.

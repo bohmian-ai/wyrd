@@ -18,6 +18,34 @@ use super::right_size::{
 };
 use crate::catalog::TenantTableBinding;
 
+/// Checked count and byte ceilings for one live Iceberg manifest projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ForgeDiscoveryLimits {
+    /// Maximum live data files accepted from one current snapshot.
+    pub(super) max_files: usize,
+    /// Maximum checked sum of live data-file bytes accepted from one snapshot.
+    pub(super) max_bytes: u64,
+}
+
+impl ForgeDiscoveryLimits {
+    /// Constructs the discovery envelope from the already validated Forge configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when either ceiling is zero.
+    pub(super) fn from_config(config: &super::ForgeConfig) -> Result<Self, ForgeError> {
+        if config.max_files_per_tick == 0 || config.max_bytes_per_tick == 0 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge live discovery limits must be positive".to_owned(),
+            });
+        }
+        Ok(Self {
+            max_files: config.max_files_per_tick,
+            max_bytes: config.max_bytes_per_tick,
+        })
+    }
+}
+
 impl Forge {
     /// Inspect the current live data files and production right-size bounds.
     ///
@@ -72,7 +100,10 @@ impl Forge {
             table.metadata().default_partition_spec_id(),
             table.metadata().default_sort_order_id(),
         )?;
-        let mut files = self.live_candidates(binding, table, snapshot).await?;
+        let limits = ForgeDiscoveryLimits::from_config(&self.core.config)?;
+        let mut files = self
+            .live_candidates_bounded(binding, table, snapshot, limits)
+            .await?;
         files.sort_by(|left, right| left.catalog_path().cmp(right.catalog_path()));
         Ok((snapshot.snapshot_id(), policy, files))
     }
@@ -133,9 +164,11 @@ impl Forge {
             table.metadata().default_partition_spec_id(),
             table.metadata().default_sort_order_id(),
         )?;
+        let limits = ForgeDiscoveryLimits::from_config(&self.core.config)?;
         Ok(plan_candidates(
             &policy,
-            self.live_candidates(binding, table, snapshot).await?,
+            self.live_candidates_bounded(binding, table, snapshot, limits)
+                .await?,
             snapshot.snapshot_id(),
             current_day,
         ))
@@ -234,6 +267,40 @@ impl Forge {
         table: &Table,
         snapshot: &iceberg::spec::SnapshotRef,
     ) -> Result<Vec<IcebergCandidateFile>, ForgeError> {
+        self.live_candidates_with_limits(binding, table, snapshot, None)
+            .await
+    }
+
+    /// Converts alive entries while enforcing one checked discovery envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns capacity, catalog, or manifest invariant errors. Cancellation
+    /// leaves no durable state or retained partial projection.
+    pub(super) async fn live_candidates_bounded(
+        &self,
+        binding: &TenantTableBinding,
+        table: &Table,
+        snapshot: &iceberg::spec::SnapshotRef,
+        limits: ForgeDiscoveryLimits,
+    ) -> Result<Vec<IcebergCandidateFile>, ForgeError> {
+        self.live_candidates_with_limits(binding, table, snapshot, Some(limits))
+            .await
+    }
+
+    /// Implements optionally bounded manifest projection for planning and recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns capacity, catalog, or manifest invariant errors. Cancellation
+    /// performs no durable write.
+    async fn live_candidates_with_limits(
+        &self,
+        binding: &TenantTableBinding,
+        table: &Table,
+        snapshot: &iceberg::spec::SnapshotRef,
+        limits: Option<ForgeDiscoveryLimits>,
+    ) -> Result<Vec<IcebergCandidateFile>, ForgeError> {
         let manifests = table
             .manifest_list_reader(snapshot)
             .load()
@@ -241,6 +308,7 @@ impl Forge {
             .map_err(ForgeError::Catalog)?;
         let mut candidates = Vec::new();
         let mut seen_paths = BTreeSet::new();
+        let mut live_bytes = 0_u64;
         for manifest_file in manifests.entries() {
             let manifest = manifest_file
                 .load_manifest(table.file_io())
@@ -283,6 +351,12 @@ impl Forge {
                     });
                 }
                 let data_file = entry.data_file();
+                live_bytes = advance_discovery_envelope(
+                    candidates.len(),
+                    live_bytes,
+                    data_file.file_size_in_bytes(),
+                    limits,
+                )?;
                 let partition_day = partition_day(data_file.partition().fields())?;
                 let min_event_time =
                     event_time_bound(data_file.lower_bounds(), event_time_field_id)?;
@@ -318,6 +392,36 @@ impl Forge {
         }
         Ok(candidates)
     }
+}
+
+/// Advances the checked live-file envelope before retaining one candidate.
+///
+/// # Errors
+///
+/// Returns an invariant error for count overflow and capacity pressure for byte
+/// overflow or either configured ceiling.
+fn advance_discovery_envelope(
+    current_files: usize,
+    current_bytes: u64,
+    file_bytes: u64,
+    limits: Option<ForgeDiscoveryLimits>,
+) -> Result<u64, ForgeError> {
+    let next_files = current_files
+        .checked_add(1)
+        .ok_or_else(|| ForgeError::Invariant {
+            detail: "Forge live discovery file count overflowed".to_owned(),
+        })?;
+    let next_bytes = current_bytes
+        .checked_add(file_bytes)
+        .ok_or_else(|| ForgeError::Capacity {
+            detail: "Forge live discovery byte sum overflowed".to_owned(),
+        })?;
+    if limits.is_some_and(|limit| next_files > limit.max_files || next_bytes > limit.max_bytes) {
+        return Err(ForgeError::Capacity {
+            detail: "Forge live snapshot exceeds the configured discovery envelope".to_owned(),
+        });
+    }
+    Ok(next_bytes)
 }
 
 /// Reject a current snapshot that retains a live delete-file entry.

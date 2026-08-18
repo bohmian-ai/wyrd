@@ -791,6 +791,29 @@ impl ScratchVolumeIdentity {
     }
 }
 
+/// Completed fenced execution state awaiting settlement and telemetry.
+struct ClaimExecutionOutcome<'task> {
+    /// Durable task claim being settled.
+    task: &'task ForgeTaskClaim,
+    /// Exact claim attempt identity.
+    attempt: Uuid,
+    /// Closed metric stage derived from the validated payload.
+    stage: ForgeMetricStage,
+    /// Table fence held through settlement.
+    lease: ForgeLease,
+    /// Task span receiving the terminal result.
+    task_span: tracing::Span,
+    /// Complete execution duration.
+    elapsed: Duration,
+    /// Fenced execution result.
+    result: Result<(), ForgeError>,
+}
+
+/// Classifies whether prepared evidence represents progress beyond its base.
+fn prepared_effect_progressed(evidence: &ForgeTaskEvidence, base_snapshot_id: i64) -> bool {
+    evidence.committed_snapshot_id != Some(base_snapshot_id) || evidence.deleted_candidate_count > 0
+}
+
 /// Claim-driven Forge executor shared by embedded and dedicated topologies.
 #[derive(Clone)]
 pub struct ForgeWorker {
@@ -894,7 +917,7 @@ impl ForgeWorker {
             // backlog occupying every other slot. With a single-slot worker that
             // one slot carries the reservation.
             let reserved_maintenance = index == 0;
-            slots.spawn(async move { worker.run_slot(stop, reserved_maintenance).await });
+            slots.spawn(async move { Box::pin(worker.run_slot(stop, reserved_maintenance)).await });
         }
         while let Some(result) = slots.join_next().await {
             result.map_err(|error| ForgeError::Invariant {
@@ -1369,6 +1392,37 @@ impl ForgeWorker {
         )
         .await;
         let elapsed = started.elapsed();
+        self.settle_claim_execution(ClaimExecutionOutcome {
+            task,
+            attempt,
+            stage,
+            lease,
+            task_span,
+            elapsed,
+            result,
+        })
+        .await
+    }
+
+    /// Settles failure, records telemetry, and releases one task's table lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original execution failure after best-effort settlement and
+    /// lease release; successful execution returns after the same bookkeeping.
+    async fn settle_claim_execution(
+        &self,
+        outcome: ClaimExecutionOutcome<'_>,
+    ) -> Result<(), ForgeError> {
+        let ClaimExecutionOutcome {
+            task,
+            attempt,
+            stage,
+            lease,
+            task_span,
+            elapsed,
+            result,
+        } = outcome;
         if let Err(error) = &result {
             tracing::warn!(
                 task_id = %task.task_id,
@@ -1538,8 +1592,7 @@ impl ForgeWorker {
             operation_stop.clone(),
             operation_stop.clone(),
         )?;
-        let progressed = evidence.committed_snapshot_id != Some(task.base_snapshot_id)
-            || evidence.deleted_candidate_count > 0;
+        let progressed = prepared_effect_progressed(evidence, task.base_snapshot_id);
         let reconciliation = self
             .resume_prepared_effect(
                 task,

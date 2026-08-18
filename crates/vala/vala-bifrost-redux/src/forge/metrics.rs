@@ -610,39 +610,10 @@ impl ForgeTelemetry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            failure_classes: [
-                super::error::ForgeFailureClass::DataRefusal,
-                super::error::ForgeFailureClass::TransientObjectStore,
-                super::error::ForgeFailureClass::TransientCoordination,
-                super::error::ForgeFailureClass::StorageHealth,
-                super::error::ForgeFailureClass::CapacityRefused,
-                super::error::ForgeFailureClass::InternalInvariant,
-            ]
-            .into_iter()
-            .map(|class| {
-                (
-                    class,
-                    metrics::counter!(
-                        "bifrost_forge_task_failures_total",
-                        "failure_class" => class.as_str()
-                    ),
-                )
-            })
-            .collect(),
+            failure_classes: failure_class_counters("bifrost_forge_task_failures_total"),
             attempt_resource_bytes: attempt_resource_histograms(),
             attempt_resource_releases: attempt_resource_release_counters(),
-            execution_envelope_failures: ForgeAttemptResource::ALL
-                .into_iter()
-                .map(|resource| {
-                    (
-                        resource,
-                        metrics::counter!(
-                            "bifrost_forge_execution_envelope_failures_total",
-                            "resource" => resource.as_str()
-                        ),
-                    )
-                })
-                .collect(),
+            execution_envelope_failures: attempt_resource_counters(),
             legacy_envelopes_superseded: ["replanned", "failed"]
                 .into_iter()
                 .map(|result| {
@@ -657,52 +628,11 @@ impl ForgeTelemetry {
                 .collect(),
             retries: failure_class_counters("bifrost_forge_retries_total"),
             terminal_poisons: failure_class_counters("bifrost_forge_terminal_poisons_total"),
-            capacity_refusals: ForgeCapacityRefusalPhase::ALL
-                .into_iter()
-                .map(|phase| {
-                    (
-                        phase,
-                        metrics::counter!(
-                            "bifrost_forge_capacity_refusals_total",
-                            "phase" => phase.as_str()
-                        ),
-                    )
-                })
-                .collect(),
-            compaction_debt: ["files", "bytes"]
-                .into_iter()
-                .map(|unit| {
-                    (
-                        unit,
-                        metrics::gauge!("bifrost_forge_compaction_debt", "unit" => unit),
-                    )
-                })
-                .collect(),
-            progress_effects: ForgeProgressEffect::ALL
-                .into_iter()
-                .map(|effect| {
-                    (
-                        effect,
-                        metrics::counter!(
-                            "bifrost_forge_progress_effects_total",
-                            "effect" => effect.as_str()
-                        ),
-                    )
-                })
-                .collect(),
+            capacity_refusals: capacity_refusal_counters(),
+            compaction_debt: compaction_debt_gauges(),
+            progress_effects: progress_effect_counters(),
             quarantine_state: metrics::gauge!("bifrost_forge_worker_quarantined"),
-            demand_transitions: ForgeDemandTransitionResult::ALL
-                .into_iter()
-                .map(|result| {
-                    (
-                        result,
-                        metrics::counter!(
-                            "bifrost_forge_demand_transitions_total",
-                            "result" => result.as_str()
-                        ),
-                    )
-                })
-                .collect(),
+            demand_transitions: demand_transition_counters(),
             discovered_candidate_files: strategy_histograms(
                 "bifrost_forge_discovered_candidate_files",
             ),
@@ -1067,6 +997,39 @@ fn failure_class_counters(
         )
     })
     .collect()
+}
+
+/// Registers execution-envelope counters for every attempt resource.
+fn attempt_resource_counters() -> BTreeMap<ForgeAttemptResource, Counter> {
+    ForgeAttemptResource::ALL.into_iter().map(|resource| (resource, metrics::counter!("bifrost_forge_execution_envelope_failures_total", "resource" => resource.as_str()))).collect()
+}
+
+/// Registers capacity-refusal counters for every admission phase.
+fn capacity_refusal_counters() -> BTreeMap<ForgeCapacityRefusalPhase, Counter> {
+    ForgeCapacityRefusalPhase::ALL.into_iter().map(|phase| (phase, metrics::counter!("bifrost_forge_capacity_refusals_total", "phase" => phase.as_str()))).collect()
+}
+
+/// Registers the two exact live-compaction debt gauges.
+fn compaction_debt_gauges() -> BTreeMap<&'static str, Gauge> {
+    ["files", "bytes"]
+        .into_iter()
+        .map(|unit| {
+            (
+                unit,
+                metrics::gauge!("bifrost_forge_compaction_debt", "unit" => unit),
+            )
+        })
+        .collect()
+}
+
+/// Registers progress counters for every durable effect classification.
+fn progress_effect_counters() -> BTreeMap<ForgeProgressEffect, Counter> {
+    ForgeProgressEffect::ALL.into_iter().map(|effect| (effect, metrics::counter!("bifrost_forge_progress_effects_total", "effect" => effect.as_str()))).collect()
+}
+
+/// Registers demand-transition counters for every closed transition result.
+fn demand_transition_counters() -> BTreeMap<ForgeDemandTransitionResult, Counter> {
+    ForgeDemandTransitionResult::ALL.into_iter().map(|result| (result, metrics::counter!("bifrost_forge_demand_transitions_total", "result" => result.as_str()))).collect()
 }
 
 impl Default for ForgeTelemetry {

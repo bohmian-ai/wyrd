@@ -747,6 +747,17 @@ impl InterruptedStagingTask {
 ///
 /// A prepared operation is marked committed when its output is still live in
 /// Iceberg, or reset when the output is absent after the uncertainty window.
+/// Converts the configured discovery count into the durable query domain.
+///
+/// # Errors
+///
+/// Returns invalid configuration when the count exceeds `PostgreSQL` `bigint`.
+fn staging_discovery_limit(limit: usize) -> Result<i64, ForgeError> {
+    i64::try_from(limit).map_err(|_| ForgeError::InvalidConfig {
+        detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
+    })
+}
+
 impl Forge {
     /// Loads one Iceberg table under Forge's bounded catalog timeout.
     ///
@@ -834,13 +845,9 @@ impl Forge {
         .bind(binding.tenant.as_uuid())
         .bind(&binding.logical_namespace)
         .bind(&binding.table_name)
-        .bind(
-            i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
-                }
-            })?,
-        )
+        .bind(staging_discovery_limit(
+            self.core.config.max_files_per_tick,
+        )?)
         .fetch_all(self.core.operator_pool.pool())
         .await
         .map_err(|error| ForgeError::Sql(error.into()))?;

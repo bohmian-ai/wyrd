@@ -933,17 +933,32 @@ mod pg_tests {
             count: usize,
             aged: bool,
         ) {
-            self.seed_files_for_binding_contract(binding, start, count, aged, true)
+            self.seed_files_for_binding_contract(binding, start, count, aged, true, false)
+                .await;
+        }
+
+        /// Seed writer-v2 objects directly under Forge's current recipe layout.
+        ///
+        /// # Panics
+        ///
+        /// Panics when encoding, storage, or durable file-list writes fail.
+        async fn seed_current_recipe_files(&self, count: usize, aged: bool) {
+            self.seed_files_for_binding_contract(&self.binding, 0, count, aged, true, true)
                 .await;
         }
 
         /// Seeds legacy unmarked inputs through the same physical fixture path.
         async fn seed_unmarked_files(&self, count: usize, aged: bool) {
-            self.seed_files_for_binding_contract(&self.binding, 0, count, aged, false)
+            self.seed_files_for_binding_contract(&self.binding, 0, count, aged, false, false)
                 .await;
         }
 
-        /// Seeds physical inputs with caller-selected writer-v2 footer stamping.
+        /// Seeds physical inputs with caller-selected footer and path identity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when schema conversion, encoding, storage, or durable
+        /// file-list persistence fails.
         async fn seed_files_for_binding_contract(
             &self,
             binding: &TenantTableBinding,
@@ -951,6 +966,7 @@ mod pg_tests {
             count: usize,
             aged: bool,
             writer_v2: bool,
+            current_recipe_layout: bool,
         ) {
             let table = self
                 .catalog
@@ -1014,7 +1030,7 @@ mod pg_tests {
                     ],
                 )
                 .expect("batch");
-                let path = format!("{}/input-{index}.parquet", binding.object_prefix);
+                let path = seed_object_path(binding, index, current_recipe_layout);
                 let metadata = if writer_v2 {
                     vala_bifrost_redux::parquet::BifrostParquetMemoryEnvelope::metadata_for_batch(
                         &batch, &path,
@@ -1043,16 +1059,33 @@ mod pg_tests {
                     .expect("object");
                 rows.push((path, index, row_count));
             }
+            self.persist_seed_rows(binding, rows, base, day, aged).await;
+        }
+
+        /// Persists generated fixture objects into the durable staging roster.
+        async fn persist_seed_rows(
+            &self,
+            binding: &TenantTableBinding,
+            rows: Vec<(String, i64, i64)>,
+            base: i64,
+            day: chrono::NaiveDate,
+            aged: bool,
+        ) {
             let mut conn = vala_sql::TenantConn::acquire(self.pg.app_pool(), self.tenant)
                 .await
                 .expect("tenant conn");
-            for (path, index, row_count) in rows {
-                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).bind(path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
+            for (object_path, index, row_count) in rows {
+                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).bind(object_path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
             }
             conn.commit().await.expect("commit");
             if aged {
-                sqlx::query("UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1 AND namespace=$2 AND table_name=$3").bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).execute(self.operator_pool.pool()).await.expect("age");
+                self.age_seeded_files(binding).await;
             }
+        }
+
+        /// Ages the seeded staging rows beyond the right-size open-window threshold.
+        async fn age_seeded_files(&self, binding: &TenantTableBinding) {
+            sqlx::query("UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1 AND namespace=$2 AND table_name=$3").bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).execute(self.operator_pool.pool()).await.expect("age");
         }
 
         /// Registers and seeds a second table in this fixture's exact backend.
@@ -1170,9 +1203,59 @@ mod pg_tests {
                 "{}/input-{index}.parquet",
                 table.metadata().location().trim_end_matches('/')
             );
+            self.append_seed_manifest_paths_at(table, &object_path, catalog_path, event_time)
+                .await;
+        }
+
+        /// Append one seed object under Forge's current writer-recipe layout.
+        ///
+        /// The object is encoded at its final identity so its footer and catalog
+        /// path agree while live discovery classifies it by right size instead
+        /// of as an obsolete-writer singleton.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the seeded object is absent or its manifest cannot commit.
+        async fn append_current_recipe_seed_manifest(
+            &self,
+            table: &iceberg::table::Table,
+            index: i64,
+        ) {
+            let object_path = format!(
+                "{}/data/forge/bifrost-writer-v2/fixture-{index}.parquet",
+                self.binding.object_prefix
+            );
+            let catalog_path = format!(
+                "{}/data/forge/bifrost-writer-v2/fixture-{index}.parquet",
+                table.metadata().location().trim_end_matches('/')
+            );
+            self.append_seed_manifest_paths_at(
+                table,
+                &object_path,
+                catalog_path,
+                chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+                    .expect("fixed event time")
+                    .into(),
+            )
+            .await;
+        }
+
+        /// Append one physical seed path with a caller-selected catalog identity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when object metadata, Iceberg identity construction, or the
+        /// catalog commit fails.
+        async fn append_seed_manifest_paths_at(
+            &self,
+            table: &iceberg::table::Table,
+            object_path: &str,
+            catalog_path: String,
+            event_time: chrono::DateTime<chrono::Utc>,
+        ) {
             let size = self
                 .staging
-                .stat(&object_path)
+                .stat(object_path)
                 .await
                 .expect("seed object metadata")
                 .content_length();
@@ -1238,6 +1321,80 @@ mod pg_tests {
                 .commit(self.catalog.as_ref())
                 .await
                 .expect("live target property commit");
+        }
+
+        /// Build one deterministic two-file live group and return its exact debt.
+        ///
+        /// # Panics
+        ///
+        /// Panics when seed encoding, catalog commits, manifest discovery, or
+        /// checked debt accounting fails to establish the fixture invariant.
+        async fn prepare_two_file_live_debt(&self) -> (u64, u64) {
+            self.seed_current_recipe_files(2, true).await;
+            let table = self
+                .catalog
+                .load_table(&self.binding.table_ident())
+                .await
+                .expect("empty convergence table");
+            self.set_live_target_file_size(&table, 100_000_000).await;
+            let table = self
+                .catalog
+                .load_table(&self.binding.table_ident())
+                .await
+                .expect("target-sized convergence table");
+            self.append_current_recipe_seed_manifest(&table, 0).await;
+            let table = self
+                .catalog
+                .load_table(&self.binding.table_ident())
+                .await
+                .expect("first convergence snapshot");
+            self.append_current_recipe_seed_manifest(&table, 1).await;
+            let table = self
+                .catalog
+                .load_table(&self.binding.table_ident())
+                .await
+                .expect("two-file convergence snapshot");
+            assert_eq!(self.delete_file_list_history().await, 2);
+            let live = self
+                .forge
+                .discover_live_rewrites_for_test(
+                    &self.binding,
+                    &table,
+                    chrono::Utc::now().date_naive(),
+                )
+                .await
+                .expect("two-file live debt");
+            let [group] = live.groups_for_test() else {
+                panic!("expected exactly one live rewrite group: {live:?}");
+            };
+            let files =
+                u64::try_from(group.files_for_test().len()).expect("live file count fits u64");
+            let bytes = group
+                .files_for_test()
+                .iter()
+                .try_fold(0_u64, |total, file| {
+                    total.checked_add(file.file_size_bytes_for_test())
+                })
+                .expect("live file bytes fit u64");
+            assert_eq!(files, 2);
+            assert!(bytes > 0);
+            (files, bytes)
+        }
+    }
+
+    /// Return the physical seed identity selected for one fixture file.
+    fn seed_object_path(
+        binding: &TenantTableBinding,
+        index: i64,
+        current_recipe_layout: bool,
+    ) -> String {
+        if current_recipe_layout {
+            format!(
+                "{}/data/forge/bifrost-writer-v2/fixture-{index}.parquet",
+                binding.object_prefix
+            )
+        } else {
+            format!("{}/input-{index}.parquet", binding.object_prefix)
         }
     }
 
@@ -3371,7 +3528,7 @@ mod pg_tests {
             MaintenanceAuthorityLoss::Claim,
             MaintenanceAuthorityLoss::TableLease,
         ] {
-            assert_maintenance_authority_loss(expiry_submission, loss).await;
+            Box::pin(assert_maintenance_authority_loss(expiry_submission, loss)).await;
         }
         Box::pin(assert_maintenance_shutdown_completes_through(
             expiry_submission,
@@ -3791,6 +3948,11 @@ mod pg_tests {
             (1, 2)
         );
         assert_completed_cleanup_evidence(&fixture).await;
+        assert_exact_cleanup_attempts(&fixture, task_id).await;
+    }
+
+    /// Proves recovery deletes every durable cleanup candidate exactly once.
+    async fn assert_exact_cleanup_attempts(fixture: &Fixture, task_id: uuid::Uuid) {
         let evidence: serde_json::Value =
             sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
                 .bind(task_id)
@@ -3802,11 +3964,11 @@ mod pg_tests {
             .expect("accepted cleanup candidates");
         assert!(!candidates.is_empty());
         for candidate in candidates {
-            let path = candidate["path"].as_str().expect("cleanup candidate path");
+            let object_path = candidate["path"].as_str().expect("cleanup candidate path");
             assert_eq!(
-                fixture.reads.delete_attempts_for(path),
+                fixture.reads.delete_attempts_for(object_path),
                 1,
-                "cleanup candidate must be attempted exactly once: {path}"
+                "cleanup candidate must be attempted exactly once: {object_path}"
             );
         }
         assert_eq!(
@@ -4344,6 +4506,103 @@ mod pg_tests {
         .expect("committed live fence detail");
         assert_eq!(fenced_base_snapshot_id, base_snapshot_id);
         assert!(!outcome.incomplete, "outcome: {outcome:?}");
+    }
+
+    /// Bounded live discovery refuses before reservation and durable debt drains to zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when bounded discovery reserves work or live debt fails to converge.
+    #[tokio::test]
+    async fn bounded_live_discovery_and_debt_converge() {
+        let bounded = Fixture::new_with_config(
+            ForgeConfig {
+                min_files: 2,
+                max_files_per_bin: 2,
+                max_files_per_tick: 2,
+                ..ForgeConfig::default()
+            },
+            true,
+            3,
+            fixture_snapshot(),
+        )
+        .await;
+        let table = bounded
+            .catalog
+            .load_table(&bounded.binding.table_ident())
+            .await
+            .expect("empty bounded table");
+        bounded.append_seed_manifest(&table, 0).await;
+        let table = bounded
+            .catalog
+            .load_table(&bounded.binding.table_ident())
+            .await
+            .expect("first bounded snapshot");
+        bounded.append_seed_manifest(&table, 1).await;
+        let table = bounded
+            .catalog
+            .load_table(&bounded.binding.table_ident())
+            .await
+            .expect("second bounded snapshot");
+        bounded.append_seed_manifest(&table, 2).await;
+        let table = bounded
+            .catalog
+            .load_table(&bounded.binding.table_ident())
+            .await
+            .expect("cap-plus-one bounded snapshot");
+        let refusal = bounded
+            .forge
+            .discover_live_rewrites_for_test(
+                &bounded.binding,
+                &table,
+                chrono::Utc::now().date_naive(),
+            )
+            .await;
+        assert!(matches!(refusal, Err(ForgeError::Capacity { .. })));
+        let refused_tasks: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1")
+                .bind(bounded.tenant.as_uuid())
+                .fetch_one(bounded.operator_pool.pool())
+                .await
+                .expect("refused task count");
+        assert_eq!(refused_tasks, 0);
+
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                min_files: 2,
+                max_files_per_bin: 8,
+                max_files_per_tick: 8,
+                max_bins_per_tick: 8,
+                ..ForgeConfig::default()
+            },
+            true,
+            0,
+            fixture_snapshot(),
+        )
+        .await;
+        let (expected_debt_files, expected_debt_bytes) = fixture.prepare_two_file_live_debt().await;
+        let debt = fixture.schedule_and_execute().await;
+        assert_eq!(debt.tasks_enqueued, 1, "{debt:?}");
+        assert_eq!(
+            (debt.compaction_debt_files, debt.compaction_debt_bytes),
+            (expected_debt_files, expected_debt_bytes),
+            "{debt:?}"
+        );
+        let durable_inputs: i64 = sqlx::query_scalar("SELECT jsonb_array_length(plan->'inputs')::bigint FROM vala.forge_tasks WHERE data_tenant_id=$1 AND strategy='small_files' ORDER BY created_at DESC LIMIT 1").bind(fixture.tenant.as_uuid()).fetch_one(fixture.operator_pool.pool()).await.expect("durable inputs");
+        assert_eq!(
+            debt.compaction_debt_files,
+            u64::try_from(durable_inputs).expect("input count")
+        );
+        let converged = fixture.schedule_and_execute().await;
+        assert_eq!(
+            (
+                converged.compaction_debt_files,
+                converged.compaction_debt_bytes,
+                converged.tasks_enqueued
+            ),
+            (0, 0, 0),
+            "{converged:?}"
+        );
     }
 
     /// A superseded base cancels before rewrite IO and durably requests its successor.

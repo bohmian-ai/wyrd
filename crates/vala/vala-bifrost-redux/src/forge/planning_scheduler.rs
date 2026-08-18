@@ -575,23 +575,8 @@ impl<'forge> ForgeScheduler<'forge> {
         demand: &ForgePlanningDemand,
         fence: i64,
     ) -> Result<DemandPlanningResult, ForgeError> {
-        let snapshot = self.discover_snapshot(demand).await?;
-        let compaction_debt_files = snapshot
-            .candidates
-            .iter()
-            .try_fold(0_u64, |total, candidate| {
-                total.checked_add(u64::try_from(candidate.inputs.len()).unwrap_or(u64::MAX))
-            })
-            .ok_or_else(|| ForgeError::Invariant {
-                detail: "Forge candidate file debt exceeds u64".to_owned(),
-            })?;
-        let compaction_debt_bytes = snapshot
-            .candidates
-            .iter()
-            .try_fold(0_u64, |total, candidate| total.checked_add(candidate.bytes))
-            .ok_or_else(|| ForgeError::Invariant {
-                detail: "Forge candidate byte debt exceeds u64".to_owned(),
-            })?;
+        let (snapshot, compaction_debt_files, compaction_debt_bytes) =
+            self.discover_snapshot(demand).await?;
         for candidate in &snapshot.candidates {
             self.forge.core.telemetry.record_discovered_candidate(
                 ForgeTaskMetricStrategy::try_from(candidate.strategy).map_err(|strategy| {
@@ -721,7 +706,7 @@ impl<'forge> ForgeScheduler<'forge> {
     async fn discover_snapshot(
         &self,
         demand: &ForgePlanningDemand,
-    ) -> Result<ForgeTableSnapshot, ForgeError> {
+    ) -> Result<(ForgeTableSnapshot, u64, u64), ForgeError> {
         let binding = task_table_binding(
             demand.data_tenant_id,
             demand.data_tenant_id,
@@ -733,6 +718,25 @@ impl<'forge> ForgeScheduler<'forge> {
             .forge
             .discover_live_rewrites(&binding, &table, current_day)
             .await?;
+        let compaction_debt_files = discovered
+            .groups()
+            .iter()
+            .try_fold(0_u64, |total, group| {
+                total.checked_add(u64::try_from(group.files().len()).unwrap_or(u64::MAX))
+            })
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge live candidate file debt exceeds u64".to_owned(),
+            })?;
+        let compaction_debt_bytes = discovered
+            .groups()
+            .iter()
+            .flat_map(super::right_size::IcebergRewriteGroup::files)
+            .try_fold(0_u64, |total, file| {
+                total.checked_add(file.file_size_bytes())
+            })
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge live candidate byte debt exceeds u64".to_owned(),
+            })?;
         let mut candidates = self
             .forge
             .discover_staging_task_candidates(&binding, current_day, self.capacity)
@@ -762,10 +766,14 @@ impl<'forge> ForgeScheduler<'forge> {
         if maintenance_due && let Some(candidate) = self.maintenance_candidate(&table).await? {
             candidates.insert(0, candidate);
         }
-        Ok(ForgeTableSnapshot {
-            snapshot_id: discovered.base_snapshot_id(),
-            candidates,
-        })
+        Ok((
+            ForgeTableSnapshot {
+                snapshot_id: discovered.base_snapshot_id(),
+                candidates,
+            },
+            compaction_debt_files,
+            compaction_debt_bytes,
+        ))
     }
 
     /// Evaluates the independent snapshot-expiry trigger for one table.

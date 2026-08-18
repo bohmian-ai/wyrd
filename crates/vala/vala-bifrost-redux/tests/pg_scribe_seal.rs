@@ -41,6 +41,25 @@ mod pg_tests {
         setup_with_faults_at_memory_limit(faults, 1152 * 1024 * 1024).await
     }
 
+    /// Creates the three explicit scratch-volume roots used by the seal fixture.
+    fn seal_volume_roots(
+        temp_dir: &tempfile::TempDir,
+        scratch_dir: &tempfile::TempDir,
+    ) -> vala_bifrost_redux::resources::BifrostVolumeRoots {
+        let scribe_output_scratch = scratch_dir.path().join("scribe-output");
+        let forge_scratch = scratch_dir.path().join("forge");
+        let oracle_scratch = scratch_dir.path().join("oracle");
+        for volume_root in [&scribe_output_scratch, &forge_scratch, &oracle_scratch] {
+            std::fs::create_dir(volume_root).expect("test volume root");
+        }
+        vala_bifrost_redux::resources::BifrostVolumeRoots {
+            wal: temp_dir.path().to_owned(),
+            scribe_output_scratch,
+            forge_scratch,
+            oracle_scratch,
+        }
+    }
+
     /// Starts the production seal fixture with explicit faults and memory capacity.
     async fn setup_with_faults_at_memory_limit(
         faults: PersistenceFaults,
@@ -74,12 +93,7 @@ mod pg_tests {
 
         let temp_dir = tempfile::tempdir().expect("temp WAL dir");
         let scratch_dir = tempfile::tempdir().expect("temp scratch dir");
-        let scribe_output = scratch_dir.path().join("scribe-output");
-        let forge_scratch = scratch_dir.path().join("forge");
-        let oracle_scratch = scratch_dir.path().join("oracle");
-        for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
-            std::fs::create_dir(root).expect("test volume root");
-        }
+        let volume_roots = seal_volume_roots(&temp_dir, &scratch_dir);
         let mut node_id_bytes = *node_id.unwrap_or_else(Uuid::now_v7).as_bytes();
         // The current seal filename seam accepts a PodId string while
         // file_list stores the same value as UUID; use a UUID whose first
@@ -115,12 +129,7 @@ mod pg_tests {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     scratch_root: scratch_dir.path().to_owned(),
-                    volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
-                        wal: temp_dir.path().to_owned(),
-                        scribe_output_scratch: scribe_output,
-                        forge_scratch,
-                        oracle_scratch,
-                    }),
+                    volume_roots: Some(volume_roots),
                 },
             )
             .expect("test Bifrost resources");
@@ -434,14 +443,18 @@ mod pg_tests {
         assert_eq!(audit_count, 2);
     }
 
-    /// Proves the caller-owned seal driver emits writer-v2 at the 832 MiB floor.
-    #[tokio::test]
-    async fn scribe_seal_driver_writer_v2_is_bounded_at_exact_floor() {
+    /// Appends and seals the canonical writer-v2 batch at the exact memory floor.
+    async fn seal_writer_v2_at_floor() -> (
+        PgFixture,
+        DataTenantId,
+        Arc<opendal::Operator>,
+        TenantTableBinding,
+        chrono::NaiveDate,
+    ) {
         let (fixture, tenant, scribe, operator) =
             setup_with_faults_at_memory_limit(PersistenceFaults::default(), 832 * 1024 * 1024)
                 .await;
         let binding = TenantTableBinding::resolve((tenant, events_table())).expect("binding");
-        // 1. Append 50k rows to trigger seal predicate
         let expected_day = Utc::now().date_naive();
         let base_time = expected_day
             .and_hms_opt(12, 0, 0)
@@ -449,21 +462,18 @@ mod pg_tests {
             .and_utc()
             .timestamp_micros();
         let batch = make_batch(50_000, base_time);
-        let principal = principal_for_tenant(tenant);
-        let fingerprint = schema_fingerprint(&batch);
-
-        let req = ScribeAppend {
-            principal,
-            table: events_table(),
-            rows: batch,
-            schema_fingerprint: fingerprint,
-            request_id: RequestId::now_v7(),
-            batch_id: uuid::Uuid::now_v7(),
-            measured_wire_bytes: 0,
-        };
-
-        scribe.append(req).await.expect("append");
-        // 2. Force seal
+        scribe
+            .append(ScribeAppend {
+                principal: principal_for_tenant(tenant),
+                table: events_table(),
+                schema_fingerprint: schema_fingerprint(&batch),
+                rows: batch,
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: 0,
+            })
+            .await
+            .expect("append");
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
@@ -471,57 +481,61 @@ mod pg_tests {
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         assert_eq!(
             scribe.memory_snapshot().scribe_total_bytes,
-            (256 - 8) * 1024 * 1024,
-            "the complete owner releases its exact footer child after inspection"
+            (256 - 8) * 1024 * 1024
         );
         let commit_result = conn.commit().await;
         complete_post_commit(&scribe, post_commit, &commit_result).await;
         assert_eq!(
             scribe.memory_snapshot().categories
                 [vala_bifrost_redux::scribe::memory::MemoryCategory::Persistence as usize],
-            0,
-            "committed settlement releases the complete producer delta"
+            0
         );
+        (fixture, tenant, operator, binding, expected_day)
+    }
 
-        // 3. Verify file_list row and its organization-qualified object identity
-        let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
+    /// One complete durable file-list projection for a sealed writer-v2 object.
+    type SealedFileRow = (
+        Uuid,
+        Uuid,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        Uuid,
+        i64,
+        DateTime<chrono::Utc>,
+        DateTime<chrono::Utc>,
+        i16,
+        Option<String>,
+    );
+
+    /// Loads the sole durable writer-v2 row emitted by the fixture.
+    async fn load_sealed_file_row(fixture: &PgFixture, tenant: DataTenantId) -> SealedFileRow {
+        let mut connection = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant conn2");
-        let tx = conn2.transaction();
-
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(
-            Uuid,                  // id
-            Uuid,                  // data_tenant_id
-            String,                // namespace
-            String,                // table_name
-            String,                // file_path
-            i64,                   // row_count
-            i64,                   // file_size
-            String,                // partition_day
-            i64,                   // wal_lsn_min
-            i64,                   // wal_lsn_max
-            Uuid,                  // node_id
-            i64,                   // writer_epoch
-            DateTime<chrono::Utc>, // min_event_time
-            DateTime<chrono::Utc>, // max_event_time
-            i16,                   // file_ordinal
-            Option<String>,        // file_checksum
-        )> = sqlx::query_as(
-            r"
-            SELECT id, data_tenant_id, namespace, table_name, file_path, row_count, file_size,
-                   partition_day::text, wal_lsn_min, wal_lsn_max,
-                   node_id, writer_epoch, min_event_time, max_event_time,
-                   file_ordinal, file_checksum
-            FROM vala.file_list
-            WHERE namespace = 'vala.bifrost' AND table_name = 'events'
-            ",
+        let rows: Vec<SealedFileRow> = sqlx::query_as(
+            r"SELECT id,data_tenant_id,namespace,table_name,file_path,row_count,file_size,
+               partition_day::text,wal_lsn_min,wal_lsn_max,node_id,writer_epoch,
+               min_event_time,max_event_time,file_ordinal,file_checksum
+               FROM vala.file_list WHERE namespace='vala.bifrost' AND table_name='events'",
         )
-        .fetch_all(&mut **tx)
+        .fetch_all(&mut **connection.transaction())
         .await
         .expect("file_list query");
-
         assert_eq!(rows.len(), 1, "expected exactly one file_list row");
+        rows.into_iter().next().expect("sole sealed row")
+    }
+
+    /// Proves the caller-owned seal driver emits writer-v2 at the 832 MiB floor.
+    #[tokio::test]
+    async fn scribe_seal_driver_writer_v2_is_bounded_at_exact_floor() {
+        let (fixture, tenant, operator, binding, expected_day) = seal_writer_v2_at_floor().await;
+        let row = load_sealed_file_row(&fixture, tenant).await;
         let (
             id,
             data_tenant_id,
@@ -539,7 +553,7 @@ mod pg_tests {
             max_event_time,
             file_ordinal,
             file_checksum,
-        ) = &rows[0];
+        ) = &row;
 
         assert_ne!(*id, Uuid::nil(), "id should be non-nil UUID");
         assert_eq!(*data_tenant_id, tenant.as_uuid());

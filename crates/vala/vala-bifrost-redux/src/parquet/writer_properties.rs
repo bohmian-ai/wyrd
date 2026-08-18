@@ -48,6 +48,10 @@ pub fn bifrost_writer_properties(row_count: usize) -> WriterProperties {
 ///
 /// The caller must construct metadata through the common memory-contract
 /// owner so producer paths cannot invent alternate field spellings.
+///
+/// # Panics
+///
+/// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
 #[must_use]
 pub fn bifrost_writer_properties_with_metadata(
     row_count: usize,

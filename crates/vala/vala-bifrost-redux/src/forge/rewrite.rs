@@ -298,7 +298,7 @@ impl ForgeAttemptResources {
             task_id,
             attempt_id,
             ForgeAttemptEnvelope {
-                spill_limit_bytes: lease.scratch_bytes(),
+                spill_limit: lease.scratch_bytes(),
                 sort_spill_limit_bytes: sort_spill_bytes,
                 output_allowance_bytes: output_allowance,
                 decoded_batch_bytes,
@@ -1151,6 +1151,22 @@ struct OutputMetadataRequest {
     checksum_chunk_bytes: usize,
 }
 
+/// Owned state detached from one rotated output before asynchronous publication.
+struct FinishOutputParts {
+    /// Completed bounded Parquet writer.
+    writer: ArrowWriter<ScratchBoundedWriter>,
+    /// Footer-phase guard retained through metadata validation.
+    footer_phase: ForgeFooterPhaseGuard,
+    /// Attempt-local scratch file containing the output.
+    scratch_path: PathBuf,
+    /// Per-column NaN counts accumulated during encoding.
+    nan_value_counts: HashMap<i32, u64>,
+    /// Exact encoded row count.
+    rows: u64,
+    /// Stable output ordinal within the attempt.
+    ordinal: usize,
+}
+
 /// Bytes and Iceberg metadata derived together from one completed Parquet output.
 struct FinalizedOutput {
     /// Sealed attempt-owned Parquet path to upload in bounded chunks.
@@ -1400,6 +1416,80 @@ fn requeue_bisected_file(
     Ok(())
 }
 
+/// Opens a sealed output and validates its footer memory contract.
+///
+/// # Errors
+///
+/// Returns scratch IO, Parquet, footer-length, or data-refusal errors.
+fn read_finalized_output(
+    scratch_path: &Path,
+    expected_schema: &arrow::datatypes::Schema,
+    object_identity: &str,
+) -> Result<
+    (
+        std::fs::File,
+        u64,
+        Arc<parquet::file::metadata::ParquetMetaData>,
+    ),
+    ForgeError,
+> {
+    let source_file = std::fs::File::open(scratch_path).map_err(|error| ForgeError::ScratchIo {
+        kind: error.kind(),
+        detail: format!("open {}: {error}", scratch_path.display()),
+    })?;
+    let output_size = source_file
+        .metadata()
+        .map_err(|error| ForgeError::ScratchIo {
+            kind: error.kind(),
+            detail: format!("stat {}: {error}", scratch_path.display()),
+        })?
+        .len();
+    validate_footer_length(&source_file, output_size)?;
+    let metadata = Arc::new(
+        parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&source_file)
+            .map_err(|error| ForgeError::Parquet {
+                detail: format!("Forge output footer parsing failed: {error}"),
+            })?,
+    );
+    crate::parquet::memory::BifrostParquetMemoryEnvelope::from_footer(
+        metadata.file_metadata(),
+        expected_schema,
+        object_identity,
+    )
+    .map_err(|detail| ForgeError::DataRefusal { detail })?;
+    Ok((source_file, output_size, metadata))
+}
+
+/// Projects one physical row-group selection into its owned output batch.
+///
+/// # Errors
+///
+/// Returns an invariant error when the group is empty or its row count overflows.
+fn physical_output_batch(
+    batch: &RecordBatch,
+    group: &[BoundedRowSlice],
+) -> Result<(RecordBatch, Vec<BoundedRowSlice>), ForgeError> {
+    let first = group.first().ok_or_else(|| ForgeError::Invariant {
+        detail: "physical output grouping returned no row groups".to_owned(),
+    })?;
+    let row_count = group.iter().try_fold(0_usize, |sum, slice| {
+        sum.checked_add(slice.len)
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "physical output row count overflowed usize".to_owned(),
+            })
+    })?;
+    let output_groups = group
+        .iter()
+        .map(|slice| BoundedRowSlice {
+            offset: slice.offset - first.offset,
+            len: slice.len,
+            logical_bytes: slice.logical_bytes,
+        })
+        .collect();
+    Ok((batch.slice(first.offset, row_count), output_groups))
+}
+
 /// Close one Parquet writer and derive the matching Iceberg data-file metadata.
 ///
 /// This pure blocking stage owns no `ForgeRewritePipeline` state: it converts a
@@ -1442,32 +1532,8 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         })?;
     drop(sink);
     let _footer_phase = footer_phase.into_metadata();
-    let source_file =
-        std::fs::File::open(&scratch_path).map_err(|error| ForgeError::ScratchIo {
-            kind: error.kind(),
-            detail: format!("open {}: {error}", scratch_path.display()),
-        })?;
-    let output_size = source_file
-        .metadata()
-        .map_err(|error| ForgeError::ScratchIo {
-            kind: error.kind(),
-            detail: format!("stat {}: {error}", scratch_path.display()),
-        })?
-        .len();
-    validate_footer_length(&source_file, output_size)?;
-    let parquet_metadata = Arc::new(
-        parquet::file::metadata::ParquetMetaDataReader::new()
-            .parse_and_finish(&source_file)
-            .map_err(|error| ForgeError::Parquet {
-                detail: format!("Forge output footer parsing failed: {error}"),
-            })?,
-    );
-    crate::parquet::memory::BifrostParquetMemoryEnvelope::from_footer(
-        parquet_metadata.file_metadata(),
-        expected_schema.as_ref(),
-        &object_identity,
-    )
-    .map_err(|detail| ForgeError::DataRefusal { detail })?;
+    let (source_file, output_size, parquet_metadata) =
+        read_finalized_output(&scratch_path, expected_schema.as_ref(), &object_identity)?;
     if let Some((row_group, group)) =
         parquet_metadata
             .row_groups()
@@ -1766,24 +1832,7 @@ impl ForgeRewritePipeline {
                 )
                 .await?;
             }
-            let first = group.first().ok_or_else(|| ForgeError::Invariant {
-                detail: "physical output grouping returned no row groups".to_owned(),
-            })?;
-            let row_count = group.iter().try_fold(0_usize, |sum, slice| {
-                sum.checked_add(slice.len)
-                    .ok_or_else(|| ForgeError::Invariant {
-                        detail: "physical output row count overflowed usize".to_owned(),
-                    })
-            })?;
-            let output_batch = batch.slice(first.offset, row_count);
-            let output_groups = group
-                .iter()
-                .map(|slice| BoundedRowSlice {
-                    offset: slice.offset - first.offset,
-                    len: slice.len,
-                    logical_bytes: slice.logical_bytes,
-                })
-                .collect::<Vec<_>>();
+            let (output_batch, output_groups) = physical_output_batch(batch, &group)?;
             let footer_phase = tokio::select! {
                 () = stop.cancelled() => return Err(ForgeError::Shutdown),
                 phase = self.runtime().footer_phase.enter_execution() => phase?,
@@ -1898,12 +1947,14 @@ impl ForgeRewritePipeline {
         let nan_value_counts = state.take_nan_value_counts();
         let (file, path) = self
             .finish_output(
-                writer,
-                footer_phase,
-                scratch_path,
-                nan_value_counts,
-                state.writer_rows,
-                state.files.len(),
+                FinishOutputParts {
+                    writer,
+                    footer_phase,
+                    scratch_path,
+                    nan_value_counts,
+                    rows: state.writer_rows,
+                    ordinal: state.files.len(),
+                },
                 context,
             )
             .await?;
@@ -2006,16 +2057,16 @@ impl ForgeRewritePipeline {
         &self,
         request: &RewriteRequest<'_>,
     ) -> Result<(SendableRecordBatchStream, MetricsSet), ForgeError> {
-        let source = Arc::new(StagingParquetExec::new(
-            request.source_files.to_vec(),
-            request.binding.clone(),
-            Arc::clone(&request.schema),
-            Arc::clone(&self.object_store),
-            self.max_concurrent_reads,
-            Arc::clone(&self.runtime().runtime.memory_pool),
-            self.runtime().decoded_batch_bytes,
-            Arc::clone(&self.runtime().footer_phase),
-        ));
+        let source = Arc::new(StagingParquetExec::new(StagingParquetExecConfig {
+            files: request.source_files.to_vec(),
+            binding: request.binding.clone(),
+            schema: Arc::clone(&request.schema),
+            object_store: Arc::clone(&self.object_store),
+            max_concurrent_reads: self.max_concurrent_reads,
+            memory_pool: Arc::clone(&self.runtime().runtime.memory_pool),
+            decoded_batch_bytes: self.runtime().decoded_batch_bytes,
+            footer_phase: Arc::clone(&self.runtime().footer_phase),
+        }));
         let tenant_index =
             request
                 .schema
@@ -2064,6 +2115,34 @@ impl ForgeRewritePipeline {
         Ok((stream, metrics))
     }
 
+    /// Derives and validates both object-store and catalog output identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error when the table location or output prefix is invalid.
+    fn validated_output_identity(
+        &self,
+        request: &RewriteRequest<'_>,
+        ordinal: usize,
+    ) -> Result<(String, String), ForgeError> {
+        let object_path = deterministic_output_path(
+            &request.binding.object_prefix,
+            request.attempt_generation,
+            ordinal,
+        );
+        self.validate_table_location(request.binding, request.table_location)?;
+        request
+            .binding
+            .validate_object_path(&object_path)
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: format!("Forge output escaped table prefix: {object_path}"),
+            })?;
+        Ok((
+            object_path,
+            forge_table_output_path(request.table_location, request.attempt_generation, ordinal),
+        ))
+    }
+
     /// Close, PUT, and derive Iceberg metadata for one rotated output.
     ///
     /// # Errors
@@ -2079,14 +2158,17 @@ impl ForgeRewritePipeline {
     /// path or deletes that just-written path before returning an error.
     async fn finish_output(
         &self,
-        writer: ArrowWriter<ScratchBoundedWriter>,
-        footer_phase: ForgeFooterPhaseGuard,
-        scratch_path: PathBuf,
-        nan_value_counts: HashMap<i32, u64>,
-        rows: u64,
-        ordinal: usize,
+        parts: FinishOutputParts,
         context: RewriteOutputContext<'_, '_>,
     ) -> Result<(DataFile, String), ForgeError> {
+        let FinishOutputParts {
+            writer,
+            footer_phase,
+            scratch_path,
+            nan_value_counts,
+            rows,
+            ordinal,
+        } = parts;
         let RewriteOutputContext {
             request,
             stop,
@@ -2096,18 +2178,7 @@ impl ForgeRewritePipeline {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        let object_path = deterministic_output_path(
-            &request.binding.object_prefix,
-            request.attempt_generation,
-            ordinal,
-        );
-        self.validate_table_location(request.binding, request.table_location)?;
-        request
-            .binding
-            .validate_object_path(&object_path)
-            .ok_or_else(|| ForgeError::Invariant {
-                detail: format!("Forge output escaped table prefix: {object_path}"),
-            })?;
+        let (object_path, table_path) = self.validated_output_identity(request, ordinal)?;
         self.object_store
             .before_output_put(&object_path)
             .await
@@ -2119,8 +2190,6 @@ impl ForgeRewritePipeline {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        let table_path =
-            forge_table_output_path(request.table_location, request.attempt_generation, ordinal);
         let object_identity = object_path.clone();
         let partition_day = request.partition_day;
         let partition_spec_id = request.partition_spec_id;
@@ -2509,18 +2578,39 @@ struct StagingParquetExec {
     properties: Arc<PlanProperties>,
 }
 
+/// Complete dependency bundle for one bounded staging source plan.
+struct StagingParquetExecConfig {
+    /// Deterministically ordered sources.
+    files: Vec<RewriteSourceFile>,
+    /// Tenant/table path authority.
+    binding: TenantTableBinding,
+    /// Projected physical schema.
+    schema: SchemaRef,
+    /// Object-store source seam.
+    object_store: Arc<dyn ForgeObjectStore>,
+    /// Maximum simultaneous source reads.
+    max_concurrent_reads: usize,
+    /// Attempt-local memory pool.
+    memory_pool: Arc<dyn MemoryPool>,
+    /// Per-reader decoded allowance.
+    decoded_batch_bytes: usize,
+    /// Serial footer phase owner.
+    footer_phase: Arc<ForgeFooterPhase>,
+}
+
 impl StagingParquetExec {
     /// Build one bounded source plan for a deterministic candidate sequence.
-    fn new(
-        files: Vec<RewriteSourceFile>,
-        binding: TenantTableBinding,
-        schema: SchemaRef,
-        object_store: Arc<dyn ForgeObjectStore>,
-        max_concurrent_reads: usize,
-        memory_pool: Arc<dyn MemoryPool>,
-        decoded_batch_bytes: usize,
-        footer_phase: Arc<ForgeFooterPhase>,
-    ) -> Self {
+    fn new(config: StagingParquetExecConfig) -> Self {
+        let StagingParquetExecConfig {
+            files,
+            binding,
+            schema,
+            object_store,
+            max_concurrent_reads,
+            memory_pool,
+            decoded_batch_bytes,
+            footer_phase,
+        } = config;
         let properties = Arc::new(
             PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(&schema)),
@@ -2869,16 +2959,16 @@ impl ExecutionPlan for StagingParquetExec {
                 let memory_pool = Arc::clone(&memory_pool);
                 let footer_phase = Arc::clone(&footer_phase);
                 async move {
-                    StagingParquetExec::new(
-                        Vec::new(),
+                    StagingParquetExec::new(StagingParquetExecConfig {
+                        files: Vec::new(),
                         binding,
                         schema,
-                        store,
+                        object_store: store,
                         max_concurrent_reads,
                         memory_pool,
                         decoded_batch_bytes,
                         footer_phase,
-                    )
+                    })
                     .open_staging_stream_with_permits(file, permits)
                     .await
                 }
@@ -2942,7 +3032,7 @@ pub struct ForgeRewriteRuntime {
 #[derive(Clone, Copy)]
 pub(crate) struct ForgeAttemptEnvelope {
     /// Aggregate scratch lease.
-    spill_limit_bytes: u64,
+    spill_limit: u64,
     /// Scratch sibling assigned to `DataFusion` sort spill.
     sort_spill_limit_bytes: u64,
     /// Combined encoder and upload resident allowance.
@@ -3092,7 +3182,7 @@ impl ForgeRewriteRuntime {
         envelope: ForgeAttemptEnvelope,
     ) -> Result<Self, ForgeError> {
         let ForgeAttemptEnvelope {
-            spill_limit_bytes,
+            spill_limit: spill_limit_bytes,
             sort_spill_limit_bytes,
             output_allowance_bytes,
             decoded_batch_bytes,
@@ -3505,7 +3595,7 @@ mod tests {
             Uuid::nil(),
             Uuid::now_v7(),
             ForgeAttemptEnvelope {
-                spill_limit_bytes: 1024,
+                spill_limit: 1024,
                 sort_spill_limit_bytes: 600,
                 output_allowance_bytes: 300,
                 decoded_batch_bytes: 101,
@@ -3634,7 +3724,7 @@ mod tests {
             max_bytes: 4_096,
             max_parallelism: 8,
             max_memory_bytes: 256 * 1024 * 1024,
-            max_spill_bytes: 4_096,
+            max_spill_bytes: 2 * 1024 * 1024,
             max_large_task_bytes: 8_192,
         }
     }
@@ -3721,7 +3811,7 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             ForgeAttemptEnvelope {
-                spill_limit_bytes: 0,
+                spill_limit: 0,
                 sort_spill_limit_bytes: 0,
                 output_allowance_bytes: 2,
                 decoded_batch_bytes: 1,
@@ -3749,7 +3839,7 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             ForgeAttemptEnvelope {
-                spill_limit_bytes: 1_024,
+                spill_limit: 1_024,
                 sort_spill_limit_bytes: 512,
                 output_allowance_bytes: 2,
                 decoded_batch_bytes: 1,
@@ -3780,7 +3870,7 @@ mod tests {
             Uuid::nil(),
             Uuid::now_v7(),
             ForgeAttemptEnvelope {
-                spill_limit_bytes: 1024,
+                spill_limit: 1024,
                 sort_spill_limit_bytes: 640,
                 output_allowance_bytes: 128,
                 decoded_batch_bytes: 32,
@@ -3815,7 +3905,7 @@ mod tests {
             Uuid::nil(),
             Uuid::now_v7(),
             ForgeAttemptEnvelope {
-                spill_limit_bytes: 1024,
+                spill_limit: 1024,
                 sort_spill_limit_bytes: 640,
                 output_allowance_bytes: 128,
                 decoded_batch_bytes: 32,

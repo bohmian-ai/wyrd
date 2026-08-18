@@ -525,18 +525,48 @@ fn field_slice_bytes(
             len,
             8,
         )?,
+        DataType::Struct(_)
+        | DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _)
+        | DataType::Dictionary(_, _) => nested_field_slice_bytes(field, array, offset, len)?,
+        DataType::Null => 0,
+        DataType::Union(_, _) | DataType::RunEndEncoded(_, _) => {
+            return Err(format!("unsupported Arrow layout `{}`", array.data_type()));
+        }
+        other => return Err(format!("unsupported Arrow layout `{other}`")),
+    };
+    validity
+        .checked_add(body)
+        .ok_or_else(|| "field slice bytes overflow".to_owned())
+}
+
+/// Measures nested and dictionary storage for one selected field slice.
+///
+/// # Errors
+///
+/// Returns layout, downcast, range, or checked-arithmetic failures.
+fn nested_field_slice_bytes(
+    field: &Field,
+    array: &dyn Array,
+    offset: usize,
+    len: usize,
+) -> Result<u64, String> {
+    match field.data_type() {
         DataType::Struct(_) => {
             let values = array
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| "Arrow struct array type does not match schema".to_owned())?;
-            values.fields().iter().zip(values.columns()).try_fold(
-                0_u64,
-                |sum, (child, values)| {
+            values
+                .fields()
+                .iter()
+                .zip(values.columns())
+                .try_fold(0_u64, |sum, (child, values)| {
                     sum.checked_add(field_slice_bytes(child, values.as_ref(), offset, len)?)
                         .ok_or_else(|| "struct slice bytes overflow".to_owned())
-                },
-            )?
+                })
         }
         DataType::List(child) => {
             let values = array
@@ -550,7 +580,7 @@ fn field_slice_bytes(
                 offset,
                 len,
                 4,
-            )?
+            )
         }
         DataType::LargeList(child) => {
             let values = array
@@ -564,7 +594,7 @@ fn field_slice_bytes(
                 offset,
                 len,
                 8,
-            )?
+            )
         }
         DataType::FixedSizeList(child, width) => {
             let values = array
@@ -581,7 +611,7 @@ fn field_slice_bytes(
                     .ok_or_else(|| "fixed-list offset overflows".to_owned())?,
                 len.checked_mul(width)
                     .ok_or_else(|| "fixed-list length overflows".to_owned())?,
-            )?
+            )
         }
         DataType::Map(entries, _) => {
             let values = array
@@ -595,28 +625,21 @@ fn field_slice_bytes(
                 offset,
                 len,
                 4,
-            )?
+            )
         }
         DataType::Dictionary(key, _) => match key.as_ref() {
-            DataType::Int8 => dictionary_slice_bytes::<Int8Type>(field, array, offset, len)?,
-            DataType::Int16 => dictionary_slice_bytes::<Int16Type>(field, array, offset, len)?,
-            DataType::Int32 => dictionary_slice_bytes::<Int32Type>(field, array, offset, len)?,
-            DataType::Int64 => dictionary_slice_bytes::<Int64Type>(field, array, offset, len)?,
-            DataType::UInt8 => dictionary_slice_bytes::<UInt8Type>(field, array, offset, len)?,
-            DataType::UInt16 => dictionary_slice_bytes::<UInt16Type>(field, array, offset, len)?,
-            DataType::UInt32 => dictionary_slice_bytes::<UInt32Type>(field, array, offset, len)?,
-            DataType::UInt64 => dictionary_slice_bytes::<UInt64Type>(field, array, offset, len)?,
-            _ => return Err("unsupported dictionary key layout".to_owned()),
+            DataType::Int8 => dictionary_slice_bytes::<Int8Type>(field, array, offset, len),
+            DataType::Int16 => dictionary_slice_bytes::<Int16Type>(field, array, offset, len),
+            DataType::Int32 => dictionary_slice_bytes::<Int32Type>(field, array, offset, len),
+            DataType::Int64 => dictionary_slice_bytes::<Int64Type>(field, array, offset, len),
+            DataType::UInt8 => dictionary_slice_bytes::<UInt8Type>(field, array, offset, len),
+            DataType::UInt16 => dictionary_slice_bytes::<UInt16Type>(field, array, offset, len),
+            DataType::UInt32 => dictionary_slice_bytes::<UInt32Type>(field, array, offset, len),
+            DataType::UInt64 => dictionary_slice_bytes::<UInt64Type>(field, array, offset, len),
+            _ => Err("unsupported dictionary key layout".to_owned()),
         },
-        DataType::Null => 0,
-        DataType::Union(_, _) | DataType::RunEndEncoded(_, _) => {
-            return Err(format!("unsupported Arrow layout `{}`", array.data_type()));
-        }
-        other => return Err(format!("unsupported Arrow layout `{other}`")),
-    };
-    validity
-        .checked_add(body)
-        .ok_or_else(|| "field slice bytes overflow".to_owned())
+        _ => Err("nested field helper received a flat layout".to_owned()),
+    }
 }
 
 /// Computes one fixed-width selected buffer length.
@@ -774,12 +797,7 @@ fn dictionary_slice_bytes<K: ArrowDictionaryKeyType>(
 fn field_row_leaf_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<Vec<u64>, String> {
     let validity = u64::from(field.is_nullable());
     if array.is_null(row) {
-        let leaves = field_leaf_count(field)?;
-        let mut values = vec![u64::from(field.is_nullable()); leaves];
-        if values.iter().all(|value| *value == 0) {
-            values[0] = 1;
-        }
-        return Ok(values);
+        return null_row_leaf_bytes(field);
     }
     match field.data_type() {
         DataType::Struct(_) => {
@@ -873,9 +891,35 @@ fn field_row_leaf_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<
         _ => {}
     }
 
+    flat_row_leaf_bytes(field, array, row, validity)
+}
+
+/// Normalizes one null row across the field's physical leaves.
+///
+/// # Errors
+///
+/// Returns schema-shape errors from leaf counting.
+fn null_row_leaf_bytes(field: &Field) -> Result<Vec<u64>, String> {
+    let mut values = vec![u64::from(field.is_nullable()); field_leaf_count(field)?];
+    if values.iter().all(|value| *value == 0) {
+        values[0] = 1;
+    }
+    Ok(values)
+}
+
+/// Measures one non-nested field value as a single normalized leaf.
+///
+/// # Errors
+///
+/// Returns overflow, downcast, or unsupported-layout failures.
+fn flat_row_leaf_bytes(
+    field: &Field,
+    array: &dyn Array,
+    row: usize,
+    validity: u64,
+) -> Result<Vec<u64>, String> {
     let fixed = match array.data_type() {
-        DataType::Boolean => Some(1 + validity),
-        DataType::Int8 | DataType::UInt8 => Some(1 + validity),
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1 + validity),
         DataType::Int16 | DataType::UInt16 | DataType::Float16 => Some(2 + validity),
         DataType::Int32
         | DataType::UInt32

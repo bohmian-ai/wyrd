@@ -416,6 +416,36 @@ impl ScribeImpl {
         })
     }
 
+    /// Transfers an admitted memory lease through decode into prepared ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resource owner's typed category-transition failure.
+    fn mark_memory_prepared(
+        memory: &mut crate::resources::ScribeMemoryLease,
+    ) -> Result<(), ScribeError> {
+        memory.transfer_category(MemoryCategory::Decode)?;
+        memory.transfer_category(MemoryCategory::Prepared)
+    }
+
+    /// Returns accepted rows from a published OTLP outcome or the planned fallback.
+    fn accepted_otlp_rows(
+        outcome: Option<&crate::contracts::ScribeOtlpOutcome>,
+        planned: u64,
+    ) -> u64 {
+        outcome.map_or(planned, |outcome| match outcome {
+            crate::contracts::ScribeOtlpOutcome::Traces(value) => {
+                u64::try_from(value.accepted_spans).unwrap_or(u64::MAX)
+            }
+            crate::contracts::ScribeOtlpOutcome::Metrics(value) => {
+                u64::try_from(value.accepted_points).unwrap_or(u64::MAX)
+            }
+            crate::contracts::ScribeOtlpOutcome::Logs(value) => {
+                u64::try_from(value.accepted_records).unwrap_or(u64::MAX)
+            }
+        })
+    }
+
     /// Prepares one request and dispatches its owned packet to its fixed shard.
     ///
     /// The global item reservation is acquired before decoding and remains
@@ -481,11 +511,7 @@ impl ScribeImpl {
                 return Err(error);
             }
         };
-        if let Err(error) = memory.transfer_category(MemoryCategory::Decode) {
-            lifecycle.refuse();
-            return Err(error);
-        }
-        if let Err(error) = memory.transfer_category(MemoryCategory::Prepared) {
+        if let Err(error) = Self::mark_memory_prepared(&mut memory) {
             lifecycle.refuse();
             return Err(error);
         }
@@ -529,19 +555,8 @@ impl ScribeImpl {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
         let published_outcome = otlp_outcome.get().cloned();
-        let rows_accepted = published_outcome
-            .as_ref()
-            .map_or(planned_rows_accepted, |outcome| match outcome {
-                crate::contracts::ScribeOtlpOutcome::Traces(value) => {
-                    u64::try_from(value.accepted_spans).unwrap_or(u64::MAX)
-                }
-                crate::contracts::ScribeOtlpOutcome::Metrics(value) => {
-                    u64::try_from(value.accepted_points).unwrap_or(u64::MAX)
-                }
-                crate::contracts::ScribeOtlpOutcome::Logs(value) => {
-                    u64::try_from(value.accepted_records).unwrap_or(u64::MAX)
-                }
-            });
+        let rows_accepted =
+            Self::accepted_otlp_rows(published_outcome.as_ref(), planned_rows_accepted);
         record_accepted_frame(rows_accepted, append_started.elapsed());
         Ok(FrameAdmission {
             batch_id: frame.batch_id,

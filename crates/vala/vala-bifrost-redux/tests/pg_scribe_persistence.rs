@@ -42,6 +42,48 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_storage::BackendConfig;
 
+/// Composes the shared Scribe/Oracle fixture resources and volume layout.
+fn compose_persistence_resources(
+    requested: &BifrostRoleResources,
+    wal_root: &TempDir,
+    scratch_root: &TempDir,
+) -> BifrostRoleResources {
+    let scribe_output = scratch_root.path().join("scribe-output");
+    let forge_scratch = scratch_root.path().join("forge");
+    let oracle_scratch = scratch_root.path().join("oracle");
+    for volume_root in [&scribe_output, &forge_scratch, &oracle_scratch] {
+        std::fs::create_dir(volume_root).expect("test volume root");
+    }
+    let snapshot = requested.snapshot().expect("root snapshot");
+    BifrostRuntimeResources::from_snapshot(
+        SystemResourceSnapshot {
+            memory_limit_bytes: snapshot.plan.memory_limit_bytes,
+            effective_cpu: 4,
+            scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+            memory_source: ResourceSource::Injected,
+            cpu_source: ResourceSource::Injected,
+        },
+        BifrostResourcePolicy {
+            roles: std::collections::BTreeSet::from([BifrostRole::Scribe, BifrostRole::Oracle]),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: None,
+            effective_cpu: None,
+            scratch_root: scratch_root.path().to_owned(),
+            volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
+                wal: wal_root.path().to_owned(),
+                scribe_output_scratch: scribe_output,
+                forge_scratch,
+                oracle_scratch,
+            }),
+        },
+    )
+    .expect("test Bifrost resources")
+    .compose_roles()
+    .expect("test role resources")
+}
+
 struct PersistenceFixture {
     database: PgFixture,
     operator: Arc<opendal::Operator>,
@@ -58,6 +100,48 @@ struct PersistenceFixture {
     tenant: DataTenantId,
     /// Aggregate decoded Arrow ownership represented by the seeded replay WAL.
     replay_decoded_bytes: usize,
+}
+
+/// Dependency bundle for the restarted replay owner.
+struct RestartedScribeConfig {
+    /// Object store shared with the first owner.
+    operator: Arc<opendal::Operator>,
+    /// Reopened epoch-two WAL.
+    wal: Arc<WalWriter>,
+    /// Stable node identity.
+    node_id: uuid::Uuid,
+    /// Replay admission policy.
+    admission: vala_bifrost_redux::scribe::admission::AdmissionConfig,
+    /// Durable persistence owner.
+    persistence: ScribePersistenceConfig,
+    /// Scribe resource capability.
+    resources: vala_bifrost_redux::resources::ScribeResources,
+    /// Staging publication channel.
+    publisher: vala_bifrost_redux::maintenance::StagingFilePublisher,
+    /// Replay WAL lane width.
+    wal_io_threads: usize,
+}
+
+/// Builds the epoch-two Scribe owner used by replay tests.
+fn restarted_scribe(config: RestartedScribeConfig) -> Arc<ScribeImpl> {
+    let pools = ScribeExecutionPools::new(
+        ScribeIngressCpuPool::new_with_capacity(1, 256),
+        ScribePersistenceCpuPool::new_with_capacity(2, 64),
+        ScribeWalIoPool::new_with_capacity(config.wal_io_threads, 256),
+    );
+    Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+        catalog: None,
+        operator: config.operator,
+        wal: config.wal,
+        stream: StreamIdentity::new(NodeId::new(config.node_id), WriterEpoch::new(2)),
+        admission: config.admission,
+        coordination_runtime: tokio::runtime::Handle::current(),
+        execution_pools: pools,
+        persistence: Some(config.persistence),
+        resources: config.resources,
+        ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
+        staging_file_publisher: Some(config.publisher),
+    }))
 }
 
 /// Composes production-equivalent Scribe and Oracle capabilities for persistence fixtures.
@@ -137,45 +221,7 @@ impl PersistenceFixture {
         );
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let scratch_root = tempfile::tempdir().expect("scratch directory");
-        let scribe_output = scratch_root.path().join("scribe-output");
-        let forge_scratch = scratch_root.path().join("forge");
-        let oracle_scratch = scratch_root.path().join("oracle");
-        for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
-            std::fs::create_dir(root).expect("test volume root");
-        }
-        let requested_snapshot = requested_memory.snapshot().expect("root snapshot");
-        let runtime_resources =
-            vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
-                vala_bifrost_redux::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: requested_snapshot.plan.memory_limit_bytes,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
-                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
-                    memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                    cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                },
-                vala_bifrost_redux::resources::BifrostResourcePolicy {
-                    roles: std::collections::BTreeSet::from([
-                        vala_bifrost_redux::resources::BifrostRole::Scribe,
-                        vala_bifrost_redux::resources::BifrostRole::Oracle,
-                    ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: None,
-                    effective_cpu: None,
-                    scratch_root: scratch_root.path().to_owned(),
-                    volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
-                        wal: wal_root.path().to_owned(),
-                        scribe_output_scratch: scribe_output,
-                        forge_scratch,
-                        oracle_scratch,
-                    }),
-                },
-            )
-            .expect("test Bifrost resources");
-        let resources = runtime_resources
-            .compose_roles()
-            .expect("test role resources");
+        let resources = compose_persistence_resources(&requested_memory, &wal_root, &scratch_root);
         let scribe_resources = resources.scribe().expect("test Scribe resources");
         let memory = resources.clone();
         let (_, output_scratch) = scribe_resources
@@ -299,45 +345,7 @@ impl PersistenceFixture {
         register_replay_tables(&catalog, table_names, tenant).await;
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let scratch_root = tempfile::tempdir().expect("scratch directory");
-        let scribe_output = scratch_root.path().join("scribe-output");
-        let forge_scratch = scratch_root.path().join("forge");
-        let oracle_scratch = scratch_root.path().join("oracle");
-        for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
-            std::fs::create_dir(root).expect("test volume root");
-        }
-        let requested_snapshot = memory.snapshot().expect("root snapshot");
-        let runtime_resources =
-            vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
-                vala_bifrost_redux::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: requested_snapshot.plan.memory_limit_bytes,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
-                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
-                    memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                    cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                },
-                vala_bifrost_redux::resources::BifrostResourcePolicy {
-                    roles: std::collections::BTreeSet::from([
-                        vala_bifrost_redux::resources::BifrostRole::Scribe,
-                        vala_bifrost_redux::resources::BifrostRole::Oracle,
-                    ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: None,
-                    effective_cpu: None,
-                    scratch_root: scratch_root.path().to_owned(),
-                    volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
-                        wal: wal_root.path().to_owned(),
-                        scribe_output_scratch: scribe_output,
-                        forge_scratch,
-                        oracle_scratch,
-                    }),
-                },
-            )
-            .expect("test Bifrost resources");
-        let resources = runtime_resources
-            .compose_roles()
-            .expect("test role resources");
+        let resources = compose_persistence_resources(&memory, &wal_root, &scratch_root);
         let scribe_resources = resources.scribe().expect("test Scribe resources");
         let memory = resources.clone();
         let (_, output_scratch) = scribe_resources
@@ -389,24 +397,16 @@ impl PersistenceFixture {
             )
             .expect("restarted WAL writer"),
         );
-        let pools = ScribeExecutionPools::new(
-            ScribeIngressCpuPool::new_with_capacity(1, 256),
-            ScribePersistenceCpuPool::new_with_capacity(2, 64),
-            ScribeWalIoPool::new_with_capacity(wal_io_threads, 256),
-        );
-        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-            catalog: None,
+        let scribe = restarted_scribe(RestartedScribeConfig {
             operator: Arc::clone(&operator),
             wal,
-            stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(2)),
+            node_id,
             admission,
-            coordination_runtime: tokio::runtime::Handle::current(),
-            execution_pools: pools,
-            persistence: Some(persistence),
+            persistence,
             resources: scribe_resources,
-            ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
-            staging_file_publisher: Some(staging_file_publisher),
-        }));
+            publisher: staging_file_publisher,
+            wal_io_threads,
+        });
         if let Err(error) = scribe.replay_wal_async().await {
             return Err(Self::assert_failed_replay(&database, tenant, &scribe, error).await);
         }
@@ -1623,7 +1623,7 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
     match &error {
         ScribeError::IngestBusy { table } => assert_eq!(table, "WAL replay batch"),
         ScribeError::Internal { detail } => {
-            assert_eq!(detail, "ingest busy for table: WAL replay batch")
+            assert_eq!(detail, "ingest busy for table: WAL replay batch");
         }
         _ => panic!("replay refusal must retain its structural capacity error: {error:?}"),
     }

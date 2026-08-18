@@ -2469,7 +2469,7 @@ impl ShardOwner {
             self.pending_generations.remove(&seal_key);
         }
         if front.replay_owned {
-            self.complete_replay_generation(&front, generation_id, replay_identity.take())?;
+            self.complete_owned_replay_generation(&front, generation_id, replay_identity.take())?;
         }
         if let Some(replay_response) = front.replay_response.take() {
             self.complete_single_replay_generation(
@@ -2546,6 +2546,30 @@ impl ShardOwner {
         });
         self.advance_replay_chunk()
             .map_err(|error| error.to_string())
+    }
+
+    /// Completes one replay generation and terminally settles any advancement failure.
+    ///
+    /// The visibility result and synchronous WAL replay response observe the
+    /// same failure. Remaining reconstructed generations are rolled back by
+    /// [`Self::fail_replay_chunk`] before the visibility result returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the replay completion invariant or advancement failure after
+    /// the active chunk response and remaining ownership have been settled.
+    fn complete_owned_replay_generation(
+        &mut self,
+        front: &PendingGeneration,
+        generation_id: u64,
+        replay_identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
+    ) -> Result<(), String> {
+        self.complete_replay_generation(front, generation_id, replay_identity)
+            .inspect_err(|detail| {
+                self.fail_replay_chunk(ScribeError::Internal {
+                    detail: detail.clone(),
+                });
+            })
     }
 
     /// Completes the retained single-generation replay compatibility path.
@@ -4157,6 +4181,126 @@ mod tests {
         drop(persistence);
         tokio::task::yield_now().await;
         assert!(runtime_weak.upgrade().is_none());
+
+        let current_key = owner_key();
+        let next_key = SealKey::new(
+            current_key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "replay-advance-failure"),
+            current_key.day,
+        );
+        let memtable = Memtable::new();
+        memtable
+            .insert(
+                &current_key,
+                owner_event(),
+                owner_meta(&current_key),
+                owner_batch(),
+            )
+            .expect("current replay insert");
+        let current_frozen = memtable
+            .freeze(&current_key)
+            .expect("current replay freeze");
+        memtable
+            .insert(
+                &next_key,
+                owner_event(),
+                owner_meta(&next_key),
+                owner_batch(),
+            )
+            .expect("next replay insert");
+        let next_frozen = memtable.freeze(&next_key).expect("next replay freeze");
+        let wal_root = tempfile::tempdir().expect("advance-failure WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("advance-failure WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("advance-failure WAL handle");
+        let current = owner_generation(&current_key, &current_frozen, stream, wal_handle.clone());
+        let next = owner_generation(&next_key, &next_frozen, stream, wal_handle.clone());
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        let baseline = budget.snapshot().expect("advance-failure baseline");
+        let replay_bytes = current
+            .arrow_bytes
+            .checked_add(next.arrow_bytes)
+            .expect("replay immutable byte sum");
+        owner
+            .memory_ownership
+            .reserve_immutable(replay_bytes)
+            .expect("advance-failure immutable ownership");
+        owner.admission.sync_memtable_bytes(0, replay_bytes);
+        owner.pending_generations.insert(
+            current_key.clone(),
+            VecDeque::from([PendingGeneration {
+                generation: Arc::clone(&current),
+                binding: crate::catalog::TenantTableBinding::resolve((
+                    current_key.tenant,
+                    current_key.table.clone(),
+                ))
+                .expect("current replay binding"),
+                submitted: true,
+                retry_scheduled: false,
+                replay_response: None,
+                replay_owned: true,
+            }]),
+        );
+        let (response, response_rx) = tokio::sync::oneshot::channel();
+        owner.replay_chunk = Some(ReplayChunkOwner {
+            remaining: VecDeque::from([ReplayChunkGeneration {
+                generation: next,
+                binding: crate::catalog::TenantTableBinding::resolve((
+                    next_key.tenant,
+                    next_key.table.clone(),
+                ))
+                .expect("next replay binding"),
+            }]),
+            current_generation: Some(current.generation_id.0),
+            retirements: Vec::new(),
+            identity: None,
+            response: Some(response),
+        });
+        crate::scribe::wal::arm_retain_failure_for_test();
+        let completion_result = owner.handle_persistence_completion(
+            PersistenceCompletion {
+                generation_id: current.generation_id,
+                file_list_key: Some(owner_file_list_key(&current_key)),
+                wal_segments: Vec::new(),
+                wal: current.wal.clone(),
+                arrow_bytes: current.arrow_bytes,
+                replay_identity: None,
+                error: None,
+            },
+            None,
+        );
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+            .await
+            .expect("advance failure settles replay response")
+            .expect("advance failure response sender");
+        let response_error = response.expect_err("advance failure response must be an error");
+        assert!(
+            response_error
+                .to_string()
+                .contains("forced WAL retention failure"),
+            "unexpected response: {response_error}; completion: {completion_result:?}"
+        );
+        assert!(completion_result.is_err());
+        assert!(owner.replay_chunk.is_none());
+        assert!(owner.pending_generations.is_empty());
+        assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
+        assert_eq!(
+            budget
+                .snapshot()
+                .expect("advance-failure ownership settlement")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
     }
 
     /// Only typed WAL exhaustion is downgraded from an unexpected shard failure.

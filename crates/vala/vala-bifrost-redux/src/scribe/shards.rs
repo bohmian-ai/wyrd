@@ -138,6 +138,8 @@ struct RetainedGeneration {
     arrow_bytes: usize,
     wal_segments: Vec<crate::scribe::wal::WalSegmentRef>,
     wal: crate::scribe::wal::WalHandle,
+    /// Replay identity retained when committed retirement cannot finish.
+    replay_identity: Arc<Mutex<Option<crate::scribe::memory::ReplayIdentityOwnership>>>,
 }
 
 /// WAL ownership deferred until the directory replay worker has stopped reading.
@@ -2291,6 +2293,7 @@ impl ShardOwner {
                 arrow_bytes,
                 wal_segments: segment_refs,
                 wal: self.wal_handle.clone(),
+                replay_identity: Arc::new(Mutex::new(None)),
             },
         );
         Ok(())
@@ -2478,6 +2481,7 @@ impl ShardOwner {
                 arrow_bytes: completion.arrow_bytes,
                 wal_segments: completion.wal_segments,
                 wal: completion.wal,
+                replay_identity: Arc::new(Mutex::new(None)),
             },
         );
         if queue.is_empty() {
@@ -2527,7 +2531,7 @@ impl ShardOwner {
         front: &PendingGeneration,
         generation_id: u64,
         replay_identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ScribeError> {
         let retained = self
             .retire_committed_generation(generation_id)
             .and_then(|retained| {
@@ -2539,13 +2543,32 @@ impl ShardOwner {
             });
         let retained = match retained {
             Ok(retained) => retained,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                if let Some(identity) = replay_identity {
+                    self.retained_generations
+                        .get(&generation_id)
+                        .ok_or_else(|| ScribeError::Internal {
+                            detail: "replay retirement lost retained generation".to_owned(),
+                        })?
+                        .replay_identity
+                        .lock()
+                        .map_err(|_| ScribeError::Internal {
+                            detail: "retained replay identity lock poisoned".to_owned(),
+                        })?
+                        .replace(identity);
+                }
+                return Err(error);
+            }
         };
         let Some(owner) = self.replay_chunk.as_mut() else {
-            return Err("replay completion lost its chunk owner".to_owned());
+            return Err(ScribeError::Internal {
+                detail: "replay completion lost its chunk owner".to_owned(),
+            });
         };
         if owner.current_generation != Some(generation_id) {
-            return Err("replay completion does not match the active generation".to_owned());
+            return Err(ScribeError::Internal {
+                detail: "replay completion does not match the active generation".to_owned(),
+            });
         }
         owner.current_generation = None;
         owner.identity = replay_identity;
@@ -2557,7 +2580,6 @@ impl ShardOwner {
             sealed_lsn: front.generation.wal_lsn_max,
         });
         self.advance_replay_chunk()
-            .map_err(|error| error.to_string())
     }
 
     /// Completes one replay generation and terminally settles any advancement failure.
@@ -2576,12 +2598,14 @@ impl ShardOwner {
         generation_id: u64,
         replay_identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
     ) -> Result<(), String> {
-        self.complete_replay_generation(front, generation_id, replay_identity)
-            .inspect_err(|detail| {
-                self.fail_replay_chunk(ScribeError::Internal {
-                    detail: detail.clone(),
-                });
-            })
+        match self.complete_replay_generation(front, generation_id, replay_identity) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let detail = error.to_string();
+                self.fail_replay_chunk(error);
+                Err(detail)
+            }
+        }
     }
 
     /// Completes the retained single-generation replay compatibility path.
@@ -2698,6 +2722,7 @@ impl ShardOwner {
                 arrow_bytes: completion.arrow_bytes,
                 wal_segments: completion.wal_segments,
                 wal: completion.wal,
+                replay_identity: Arc::new(Mutex::new(None)),
             },
         );
         if let Some(waiter) = waiter {
@@ -4443,7 +4468,7 @@ mod tests {
             stream,
             owner.wal_handle.clone(),
         );
-        let (mut retirement_owner, _retirement_budget) = owner_for_completion_test_with_budget(
+        let (mut retirement_owner, retirement_budget) = owner_for_completion_test_with_budget(
             retirement_memtable,
             &wal,
             owner.wal_handle.clone(),
@@ -4479,6 +4504,15 @@ mod tests {
             identity: None,
             response: Some(retirement_response),
         });
+        let retirement_identity = retirement_owner
+            .memory_ownership
+            .adopt_replay_identity(
+                retirement_budget
+                    .try_reserve_maintenance(MemoryCategory::Decode, 64)
+                    .expect("retirement identity lease"),
+                64,
+            )
+            .expect("retirement identity adoption");
         retirement_owner.fail_next_retirement_release = true;
         let visibility_error = retirement_owner
             .handle_persistence_completion(
@@ -4488,7 +4522,7 @@ mod tests {
                     wal_segments: Vec::new(),
                     wal: retirement_generation.wal.clone(),
                     arrow_bytes: retirement_generation.arrow_bytes,
-                    replay_identity: None,
+                    replay_identity: Some(retirement_identity),
                     error: None,
                 },
                 None,
@@ -4500,13 +4534,19 @@ mod tests {
             .expect("retirement response sender")
             .expect_err("retirement replay response must fail")
             .to_string();
-        assert_eq!(
-            replay_error,
-            format!("internal scribe failure: {visibility_error}")
-        );
+        assert_eq!(replay_error, visibility_error);
         assert!(retirement_owner.replay_chunk.is_none());
         assert!(retirement_owner.pending_generations.is_empty());
         assert_eq!(retirement_owner.retained_generations.len(), 1);
+        assert_eq!(
+            retirement_owner.retained_generations[&retirement_generation.generation_id.0]
+                .replay_identity
+                .lock()
+                .expect("retained retirement identity")
+                .as_ref()
+                .map(crate::scribe::memory::ReplayIdentityOwnership::bytes),
+            Some(64)
+        );
         assert_eq!(
             retirement_owner.memory_ownership.immutable_bytes(),
             retirement_generation.arrow_bytes
@@ -5034,6 +5074,7 @@ mod tests {
                 arrow_bytes: frozen.arrow_bytes,
                 wal_segments: Vec::new(),
                 wal: wal_handle,
+                replay_identity: Arc::new(Mutex::new(None)),
             },
         );
         (owner, frozen.seal_id, wal, wal_root, budget)
@@ -6069,6 +6110,7 @@ mod tests {
                 arrow_bytes: frozen.arrow_bytes,
                 wal_segments: Vec::new(),
                 wal: wal_handle,
+                replay_identity: Arc::new(Mutex::new(None)),
             },
         );
         let governor_before = budget.accounting_snapshot_for_test();

@@ -3459,7 +3459,7 @@ impl ForgeWorker {
 /// Forge owns its protected floor and may borrow the elastic remainder. The
 /// saturating sum and widening conversion keep the claim bound representable
 /// without turning a valid positive floor into a zero-memory SQL claim.
-fn forge_claim_memory_limit(
+pub(super) fn forge_claim_memory_limit(
     configured_max_memory_bytes: u64,
     forge_floor_bytes: usize,
     elastic_memory_bytes: usize,

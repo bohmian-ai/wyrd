@@ -31,8 +31,9 @@ use super::metrics::{ForgeDemandTransitionResult, ForgeTaskMetricStrategy};
 use super::planner::{
     ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
 };
-use super::worker::ForgeLifecycleEvent;
+use super::worker::{ForgeLifecycleEvent, forge_claim_memory_limit};
 use crate::maintenance::StagingFileCommitted;
+use crate::resources::ResourcePlan;
 
 /// Complete classification from one bounded durable scheduler pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -180,20 +181,7 @@ impl<'forge> ForgeScheduler<'forge> {
             .map_err(|error| ForgeError::Capacity {
                 detail: error.to_string(),
             })?;
-        let capacity = ForgeCapacity {
-            max_files: configured.max_files,
-            max_bytes: configured.max_bytes,
-            max_parallelism: configured
-                .max_parallelism
-                .min(u16::try_from(governor.plan.effective_cpu).unwrap_or(u16::MAX)),
-            max_memory_bytes: configured
-                .max_memory_bytes
-                .min(u64::try_from(governor.plan.elastic_memory_bytes).unwrap_or(u64::MAX)),
-            max_spill_bytes: configured
-                .max_spill_bytes
-                .min(governor.plan.scratch_limit_bytes),
-            max_large_task_bytes: configured.max_large_task_bytes,
-        };
+        let capacity = governed_capacity(configured, &governor.plan);
         Ok(Self {
             forge,
             planner: ForgePlanner::new(capacity),
@@ -991,23 +979,11 @@ impl<'forge> ForgeScheduler<'forge> {
                 .map_err(|error| ForgeError::Capacity {
                     detail: error.to_string(),
                 })?;
-        let capacity = ForgeCapacity::try_from(&self.forge.core.config)?;
-        let limits = ForgeClaimLimits {
-            max_active_per_tenant: u32::MAX,
-            lease_seconds: 1,
-            max_files: capacity.max_files,
-            max_bytes: capacity.max_bytes,
-            max_parallelism: capacity
-                .max_parallelism
-                .min(u16::try_from(governor.plan.effective_cpu).unwrap_or(u16::MAX)),
-            max_memory_bytes: capacity
-                .max_memory_bytes
-                .min(u64::try_from(governor.plan.elastic_memory_bytes).unwrap_or(u64::MAX)),
-            max_spill_bytes: capacity
-                .max_spill_bytes
-                .min(governor.plan.scratch_limit_bytes),
-            max_large_task_bytes: capacity.max_large_task_bytes,
-        };
+        let capacity = governed_capacity(
+            ForgeCapacity::try_from(&self.forge.core.config)?,
+            &governor.plan,
+        );
+        let limits = status_claim_limits(capacity);
         let unclaimable_task_ids = self
             .tasks
             .unclaimable_ready_task_ids(limits)
@@ -1043,6 +1019,46 @@ impl<'forge> ForgeScheduler<'forge> {
             outcome.incomplete = true;
         }
         Ok(())
+    }
+}
+
+/// Apply the live resource plan to configured scheduler planning capacity.
+///
+/// Forge owns its protected floor plus the elastic remainder, while CPU and
+/// scratch retain their existing live-plan ceilings.
+#[must_use]
+fn governed_capacity(configured: ForgeCapacity, plan: &ResourcePlan) -> ForgeCapacity {
+    ForgeCapacity {
+        max_files: configured.max_files,
+        max_bytes: configured.max_bytes,
+        max_parallelism: configured
+            .max_parallelism
+            .min(u16::try_from(plan.effective_cpu).unwrap_or(u16::MAX)),
+        max_memory_bytes: forge_claim_memory_limit(
+            configured.max_memory_bytes,
+            plan.forge_floor_bytes,
+            plan.elastic_memory_bytes,
+        ),
+        max_spill_bytes: configured.max_spill_bytes.min(plan.scratch_limit_bytes),
+        max_large_task_bytes: configured.max_large_task_bytes,
+    }
+}
+
+/// Project governed scheduler capacity into status claimability limits.
+///
+/// This preserves the exact planning envelope so status never marks a task
+/// unclaimable under a stricter memory interpretation than construction uses.
+#[must_use]
+fn status_claim_limits(capacity: ForgeCapacity) -> ForgeClaimLimits {
+    ForgeClaimLimits {
+        max_active_per_tenant: u32::MAX,
+        lease_seconds: 1,
+        max_files: capacity.max_files,
+        max_bytes: capacity.max_bytes,
+        max_parallelism: capacity.max_parallelism,
+        max_memory_bytes: capacity.max_memory_bytes,
+        max_spill_bytes: capacity.max_spill_bytes,
+        max_large_task_bytes: capacity.max_large_task_bytes,
     }
 }
 
@@ -1116,7 +1132,42 @@ fn unschedulable_event(task_id: Uuid) -> AuditEvent {
 mod source_tests {
     use std::time::Duration;
 
-    use super::{ForgeScheduleOutcome, maintenance_trigger_due, should_publish_gauges};
+    use super::{
+        ForgeScheduleOutcome, governed_capacity, maintenance_trigger_due, should_publish_gauges,
+        status_claim_limits,
+    };
+    use crate::forge::planner::ForgeCapacity;
+    use crate::resources::ResourcePlan;
+
+    /// Scheduler construction and status retain a positive Forge floor without elasticity.
+    #[test]
+    fn scheduler_capacity_and_status_use_forge_floor_without_elastic_memory() {
+        let configured = ForgeCapacity {
+            max_files: 8,
+            max_bytes: 128 * 1024 * 1024,
+            max_parallelism: 2,
+            max_memory_bytes: 128 * 1024 * 1024,
+            max_spill_bytes: 256 * 1024 * 1024,
+            max_large_task_bytes: 128 * 1024 * 1024,
+        };
+        let plan = ResourcePlan {
+            memory_limit_bytes: 256 * 1024 * 1024,
+            effective_cpu: 2,
+            unmanaged_reserve_bytes: 64 * 1024 * 1024,
+            managed_memory_bytes: 192 * 1024 * 1024,
+            scribe_floor_bytes: 64 * 1024 * 1024,
+            oracle_floor_bytes: 64 * 1024 * 1024,
+            forge_floor_bytes: 64 * 1024 * 1024,
+            elastic_memory_bytes: 0,
+            scratch_limit_bytes: 256 * 1024 * 1024,
+        };
+
+        let scheduler_capacity = governed_capacity(configured, &plan);
+        let status_limits = status_claim_limits(scheduler_capacity);
+
+        assert_eq!(scheduler_capacity.max_memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(status_limits.max_memory_bytes, 64 * 1024 * 1024);
+    }
 
     /// The count arm fires at threshold once the oldest snapshot is eligible.
     #[test]

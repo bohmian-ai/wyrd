@@ -3440,10 +3440,11 @@ impl ForgeWorker {
                 .capacity
                 .max_parallelism
                 .min(u16::try_from(governor.plan.effective_cpu).unwrap_or(u16::MAX)),
-            max_memory_bytes: self
-                .capacity
-                .max_memory_bytes
-                .min(u64::try_from(governor.plan.elastic_memory_bytes).unwrap_or(u64::MAX)),
+            max_memory_bytes: forge_claim_memory_limit(
+                self.capacity.max_memory_bytes,
+                governor.plan.forge_floor_bytes,
+                governor.plan.elastic_memory_bytes,
+            ),
             max_spill_bytes: self
                 .capacity
                 .max_spill_bytes
@@ -3451,6 +3452,21 @@ impl ForgeWorker {
             max_large_task_bytes: self.capacity.max_large_task_bytes,
         })
     }
+}
+
+/// Return the maximum memory assigned to Forge by the current resource plan.
+///
+/// Forge owns its protected floor and may borrow the elastic remainder. The
+/// saturating sum and widening conversion keep the claim bound representable
+/// without turning a valid positive floor into a zero-memory SQL claim.
+fn forge_claim_memory_limit(
+    configured_max_memory_bytes: u64,
+    forge_floor_bytes: usize,
+    elastic_memory_bytes: usize,
+) -> u64 {
+    configured_max_memory_bytes.min(
+        u64::try_from(forge_floor_bytes.saturating_add(elastic_memory_bytes)).unwrap_or(u64::MAX),
+    )
 }
 
 /// Probes one scratch root through create, fsync, and exact-file deletion.
@@ -3564,6 +3580,21 @@ fn task_progress_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A protected Forge floor remains a positive bounded claim without elasticity.
+    #[test]
+    fn claim_memory_uses_forge_floor_when_elastic_memory_is_zero() {
+        let forge_floor_bytes = 64 * 1024 * 1024;
+
+        assert_eq!(
+            forge_claim_memory_limit(u64::MAX, forge_floor_bytes, 0),
+            u64::try_from(forge_floor_bytes).expect("Forge floor fits u64")
+        );
+        assert_eq!(
+            forge_claim_memory_limit(32 * 1024 * 1024, forge_floor_bytes, 0),
+            32 * 1024 * 1024
+        );
+    }
 
     /// Retryable classes terminalize on the fifth failure while data refusal is immediate.
     #[test]
